@@ -269,8 +269,17 @@ where
 /// Sleeps for `duration` or until `cancel` fires. Returns `true` if
 /// cancelled, `false` if the sleep completed. Lets the loop respect
 /// shutdown promptly.
+///
+/// Biased, cancellation first: when the timer and a fired token are BOTH
+/// ready an un-biased `select!` coin-flips between them. The only
+/// observable difference here is which answer a tie returns — every caller
+/// re-checks `cancel.is_cancelled()` at the top of its loop and returns, so
+/// losing the coin flip costs one backoff bump and nothing else. Same
+/// select shape as the usage poller's run loop, where losing that tie DID
+/// buy an extra full network tick (fixed there by the same `biased;`).
 async fn wait_or_cancelled(cancel: &CancellationToken, duration: Duration) -> bool {
     tokio::select! {
+        biased;
         _ = cancel.cancelled() => true,
         _ = tokio::time::sleep(duration) => false,
     }

@@ -26,14 +26,32 @@
 
 #![cfg(target_os = "linux")]
 
-use super::{file::FileVault, SecretError, SlotKey, Vault, VAULT_OP_TIMEOUT};
+use super::{file::FileVault, NamedKey, SecretError, SlotKey, Vault, VAULT_OP_TIMEOUT};
 use crate::types::AccountNum;
 use secrecy::{ExposeSecret, SecretString};
 use secret_service::{Collection, EncryptionType, Item, SecretService};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
+use std::time::Duration;
 use tokio::runtime::Builder as RtBuilder;
+
+// Secret Service 5 uses AES 0.9 and CBC 0.2, independently of the AEAD
+// AES 0.8 anchor. Keep the owning schedule and IV Drop feature promises
+// checked in every Linux build. This does not establish scrubbing of
+// Session/DH buffers, VAES temporaries, registers, or other secret copies.
+const _: () = {
+    fn assert_secret_service_owner_zeroizes_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+    let _ = assert_secret_service_owner_zeroizes_on_drop::<secret_service_aes::Aes128>;
+    let _ = assert_secret_service_owner_zeroizes_on_drop::<secret_service_aes::Aes128Enc>;
+    let _ = assert_secret_service_owner_zeroizes_on_drop::<secret_service_aes::Aes128Dec>;
+    let _ = assert_secret_service_owner_zeroizes_on_drop::<
+        secret_service_cbc::Encryptor<secret_service_aes::Aes128>,
+    >;
+    let _ = assert_secret_service_owner_zeroizes_on_drop::<
+        secret_service_cbc::Decryptor<secret_service_aes::Aes128>,
+    >;
+};
 
 /// Attribute key — the surface tag a slot belongs to. Values come
 /// from [`crate::providers::catalog::Surface::as_str`]; today only
@@ -75,6 +93,108 @@ impl Default for SecretServiceVault {
 }
 
 impl Vault for SecretServiceVault {
+    fn set_named(&self, key: &NamedKey, secret: &SecretString) -> Result<(), SecretError> {
+        if secret.expose_secret().is_empty() {
+            return Err(SecretError::InvalidKey {
+                reason: "secret must not be empty".into(),
+            });
+        }
+        let name = key.native_name();
+        let bytes = zeroize::Zeroizing::new(secret.expose_secret().as_bytes().to_vec());
+        super::named_mutation_result(block_named_with_timeout(async move {
+            let service = connect_service().await?;
+            let collection = open_default_collection(&service).await?;
+            ensure_unlocked(&collection).await?;
+            collection
+                .create_item(
+                    &name,
+                    HashMap::from([
+                        ("csq-pool-name", name.as_str()),
+                        (ATTR_VERSION, SCHEMA_VERSION),
+                    ]),
+                    &bytes,
+                    true,
+                    SECRET_MIME,
+                )
+                .await
+                .map(|_| ())
+                .map_err(map_ss_error)
+        }))
+    }
+    fn get_named(&self, key: &NamedKey) -> Result<SecretString, SecretError> {
+        let name = key.native_name();
+        let bytes = zeroize::Zeroizing::new(block_named_with_timeout(async move {
+            let service = connect_service().await?;
+            let collection = open_default_collection(&service).await?;
+            ensure_unlocked(&collection).await?;
+            let items = collection
+                .search_items(HashMap::from([
+                    ("csq-pool-name", name.as_str()),
+                    (ATTR_VERSION, SCHEMA_VERSION),
+                ]))
+                .await
+                .map_err(map_ss_error)?;
+            let item = sole_named_match(items)?;
+            ensure_item_unlocked(&item).await?;
+            item.get_secret().await.map_err(map_ss_error)
+        })?);
+        let value = std::str::from_utf8(&bytes).map_err(|_| SecretError::DecryptionFailed)?;
+        Ok(SecretString::new(value.to_owned().into()))
+    }
+    fn delete_named(&self, key: &NamedKey) -> Result<(), SecretError> {
+        let name = key.native_name();
+        super::named_mutation_result(block_named_with_timeout(async move {
+            let service = connect_service().await?;
+            let collection = open_default_collection(&service).await?;
+            ensure_unlocked(&collection).await?;
+            let items = collection
+                .search_items(HashMap::from([
+                    ("csq-pool-name", name.as_str()),
+                    (ATTR_VERSION, SCHEMA_VERSION),
+                ]))
+                .await
+                .map_err(map_ss_error)?;
+            for item in items {
+                item.delete().await.map_err(map_ss_error)?;
+            }
+            Ok(())
+        }))
+    }
+    fn contains_named(&self, key: &NamedKey) -> Result<bool, SecretError> {
+        let name = key.native_name();
+        block_named_with_timeout(async move {
+            let service = connect_service().await?;
+            let collection = open_default_collection(&service).await?;
+            let locked = collection.is_locked().await.map_err(map_ss_error)?;
+            named_metadata_presence(locked, async {
+                collection
+                    .search_items(HashMap::from([
+                        ("csq-pool-name", name.as_str()),
+                        (ATTR_VERSION, SCHEMA_VERSION),
+                    ]))
+                    .await
+                    .map(|items| items.len())
+                    .map_err(map_ss_error)
+            })
+            .await
+        })
+    }
+    fn contains_named_for_recovery(&self, key: &NamedKey) -> Result<bool, SecretError> {
+        let name = key.native_name();
+        block_named_with_timeout(async move {
+            let service = connect_service().await?;
+            let collection = open_default_collection(&service).await?;
+            let items = collection
+                .search_items(HashMap::from([
+                    ("csq-pool-name", name.as_str()),
+                    (ATTR_VERSION, SCHEMA_VERSION),
+                ]))
+                .await
+                .map_err(map_ss_error)?;
+            named_recovery_presence(items, ensure_unlocked(&collection)).await
+        })
+    }
+
     fn set(&self, slot: SlotKey, secret: &SecretString) -> Result<(), SecretError> {
         if secret.expose_secret().is_empty() {
             return Err(SecretError::InvalidKey {
@@ -188,6 +308,40 @@ impl Vault for SecretServiceVault {
 }
 
 // ── async helpers ─────────────────────────────────────────────────────
+
+fn sole_named_match<T>(mut items: Vec<T>) -> Result<T, SecretError> {
+    match items.len() {
+        0 => Err(SecretError::NamedNotFound),
+        1 => Ok(items.pop().expect("one item")),
+        _ => Err(SecretError::InvalidKey {
+            reason: "ambiguous named secret matches".into(),
+        }),
+    }
+}
+
+async fn named_recovery_presence<T, F>(items: Vec<T>, unlock: F) -> Result<bool, SecretError>
+where
+    F: std::future::Future<Output = Result<(), SecretError>>,
+{
+    match sole_named_match(items) {
+        Ok(_) => {
+            unlock.await?;
+            Ok(true)
+        }
+        Err(SecretError::NamedNotFound) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+async fn named_metadata_presence<F>(locked: bool, search: F) -> Result<bool, SecretError>
+where
+    F: std::future::Future<Output = Result<usize, SecretError>>,
+{
+    if locked {
+        return Err(SecretError::Locked);
+    }
+    Ok(search.await? > 0)
+}
 
 async fn connect_service() -> Result<SecretService<'static>, SecretError> {
     SecretService::connect(EncryptionType::Dh)
@@ -323,6 +477,27 @@ where
     F: Future<Output = Result<T, SecretError>> + Send + 'static,
     T: Send + 'static,
 {
+    block_with_timeout_at(fut, VAULT_OP_TIMEOUT)
+}
+
+fn block_named_with_timeout<F, T>(fut: F) -> Result<T, SecretError>
+where
+    F: Future<Output = Result<T, SecretError>> + Send + 'static,
+    T: Send + 'static,
+{
+    block_with_timeout_at(fut, named_operation_timeout())
+}
+
+fn named_operation_timeout() -> Duration {
+    let interactive = crate::credentials::keychain::interactive_scope_active();
+    super::named_native_timeout(interactive)
+}
+
+fn block_with_timeout_at<F, T>(fut: F, timeout: Duration) -> Result<T, SecretError>
+where
+    F: Future<Output = Result<T, SecretError>> + Send + 'static,
+    T: Send + 'static,
+{
     let join = std::thread::Builder::new()
         .name("csq-vault-ss".into())
         .spawn(move || -> Result<T, SecretError> {
@@ -333,7 +508,7 @@ where
                     reason: format!("failed to build tokio runtime for vault op: {e}"),
                 })?;
             rt.block_on(async move {
-                match tokio::time::timeout(VAULT_OP_TIMEOUT, fut).await {
+                match tokio::time::timeout(timeout, fut).await {
                     Ok(inner) => inner,
                     Err(_) => Err(SecretError::Timeout),
                 }
@@ -398,6 +573,78 @@ mod tests {
 
     use super::*;
     use crate::types::AccountNum;
+
+    #[test]
+    fn recovery_presence_refuses_duplicates_before_polling_unlock() {
+        let rt = RtBuilder::new_current_thread().build().unwrap();
+        let polls = std::cell::Cell::new(0);
+        let result = rt.block_on(named_recovery_presence(vec![1u8, 2], async {
+            polls.set(polls.get() + 1);
+            Ok(())
+        }));
+        assert!(matches!(result, Err(SecretError::InvalidKey { .. })));
+        assert_eq!(polls.get(), 0);
+        assert!(!rt
+            .block_on(named_recovery_presence(Vec::<u8>::new(), async {
+                polls.set(polls.get() + 1);
+                Ok(())
+            }))
+            .unwrap());
+        assert_eq!(polls.get(), 0);
+        assert!(rt
+            .block_on(named_recovery_presence(vec![1u8], async {
+                polls.set(polls.get() + 1);
+                Ok(())
+            }))
+            .unwrap());
+        assert_eq!(polls.get(), 1);
+        assert!(matches!(
+            rt.block_on(named_recovery_presence(vec![1u8], async {
+                Err(SecretError::Locked)
+            })),
+            Err(SecretError::Locked)
+        ));
+    }
+
+    #[test]
+    fn named_budget_uses_callers_interactive_scope() {
+        assert_eq!(named_operation_timeout(), Duration::from_secs(5));
+        crate::credentials::keychain::with_interactive_keychain(|| {
+            assert_eq!(named_operation_timeout(), Duration::from_secs(60));
+        });
+        assert_eq!(named_operation_timeout(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn named_lookup_refuses_ambiguous_metadata_matches() {
+        assert!(matches!(
+            sole_named_match::<u8>(vec![]),
+            Err(SecretError::NamedNotFound)
+        ));
+        assert_eq!(sole_named_match(vec![7u8]).unwrap(), 7);
+        assert!(matches!(
+            sole_named_match(vec![7u8, 8]),
+            Err(SecretError::InvalidKey { .. })
+        ));
+    }
+
+    #[test]
+    fn named_presence_refuses_locked_collection_without_polling_search() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polls = std::sync::Arc::new(AtomicUsize::new(0));
+        let worker_polls = polls.clone();
+        let result = block_with_timeout(async move {
+            named_metadata_presence(true, async move {
+                worker_polls.fetch_add(1, Ordering::SeqCst);
+                Ok(1)
+            })
+            .await
+        });
+        assert!(matches!(result, Err(SecretError::Locked)));
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        assert!(block_with_timeout(named_metadata_presence(false, async { Ok(1) })).unwrap());
+        assert!(!block_with_timeout(named_metadata_presence(false, async { Ok(0) })).unwrap());
+    }
 
     fn slot(n: u16) -> SlotKey {
         SlotKey {

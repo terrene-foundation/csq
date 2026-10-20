@@ -123,6 +123,13 @@ pub const STATE_TTL: Duration = Duration::from_secs(600);
 /// 32 bytes of entropy → 43 chars — overkill for CSRF but free.
 const STATE_BYTES: usize = 32;
 
+/// Original identity authority captured before the browser receives a URL.
+#[derive(Debug)]
+pub struct PendingLogin {
+    pub base: std::path::PathBuf,
+    pub prior: crate::accounts::anthropic_identity::LoginPrior,
+}
+
 /// One pending login. Consumed (removed and returned) on callback.
 ///
 /// # INVARIANT: every field must have a leak-safe `Debug` impl.
@@ -144,6 +151,9 @@ pub struct PendingState {
     /// login-initiation time so the callback handler doesn't need
     /// to receive it as a query parameter.
     pub account: AccountNum,
+    /// Present only for organization-verified login initiators. Never recaptured
+    /// at submission; absent authority must refuse affected production flows.
+    pub verified_login: Option<PendingLogin>,
     /// Wall-clock `Instant` at which this entry was created. Used
     /// for TTL checks and eviction ordering.
     pub created_at: Instant,
@@ -204,10 +214,20 @@ impl OAuthStateStore {
         code_verifier: CodeVerifier,
         account: AccountNum,
     ) -> Result<String, OAuthError> {
+        self.insert_with_login_prior(code_verifier, account, None)
+    }
+
+    pub fn insert_with_login_prior(
+        &self,
+        code_verifier: CodeVerifier,
+        account: AccountNum,
+        verified_login: Option<PendingLogin>,
+    ) -> Result<String, OAuthError> {
         let state = random_state_token();
         let pending = PendingState {
             code_verifier,
             account,
+            verified_login,
             created_at: Instant::now(),
         };
 

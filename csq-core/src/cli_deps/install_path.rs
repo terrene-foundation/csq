@@ -215,6 +215,27 @@ pub fn classify_install_manager(canonical_path: &Path) -> InstallManager {
 
 #[cfg(test)]
 mod tests {
+    struct FixtureEnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl FixtureEnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self(
+                keys.iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            )
+        }
+    }
+    impl Drop for FixtureEnvRestore {
+        fn drop(&mut self) {
+            for (key, previous) in self.0.drain(..).rev() {
+                match previous {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     use super::*;
     use std::path::PathBuf;
 
@@ -303,8 +324,8 @@ mod tests {
     #[test]
     fn known_install_dirs_maps_kimi_and_grok_only() {
         let _env_guard = crate::platform::test_env::lock();
-        let old_home = std::env::var_os("HOME");
-        // SAFETY: env lock held; restored below.
+        let _restore = FixtureEnvRestore::capture(&["HOME"]);
+        // SAFETY: env lock held; Drop restores on success and unwind.
         unsafe { std::env::set_var("HOME", "/home/tester") };
 
         let kimi = known_install_dirs("kimi");
@@ -314,14 +335,6 @@ mod tests {
         // No fallback for the session surfaces.
         assert!(known_install_dirs("claude").is_empty());
         assert!(known_install_dirs("codex").is_empty());
-
-        // Restore.
-        unsafe {
-            match old_home {
-                Some(h) => std::env::set_var("HOME", h),
-                None => std::env::remove_var("HOME"),
-            }
-        }
     }
 
     #[test]

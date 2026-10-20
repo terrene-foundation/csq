@@ -35,6 +35,7 @@ let mockResponses: Record<string, unknown> = {};
 
 function setupMocks(overrides: Record<string, unknown> = {}) {
   mockResponses = {
+    pool_list: [],
     get_autostart_enabled: false,
     set_autostart_enabled: undefined,
     is_dock_hide_supported: true,

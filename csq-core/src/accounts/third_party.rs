@@ -367,6 +367,15 @@ pub fn bind_provider_to_slot(
         });
     }
 
+    // SEC-2.15 (unified, R1 M1): secure the accounts root (config-N's
+    // parent) fail-closed before creating the handle dir.
+    crate::platform::fs::ensure_private_dir_root(base_dir).map_err(|e| {
+        ConfigError::InvalidJson {
+            path: base_dir.to_path_buf(),
+            reason: format!("accounts_root_refused: {e}"),
+        }
+    })?;
+
     let config_dir = base_dir.join(format!("config-{}", slot));
     std::fs::create_dir_all(&config_dir).map_err(|e| ConfigError::InvalidJson {
         path: config_dir.clone(),
@@ -399,12 +408,28 @@ pub fn bind_provider_to_slot(
     //    so only one writer can read-modify-write at a time.
     let settings_path = config_dir.join("settings.json");
     let settings_lock_path = settings_path.with_extension("lock");
-    let _settings_lock = crate::platform::lock::lock_file(&settings_lock_path).map_err(|e| {
-        ConfigError::InvalidJson {
-            path: settings_lock_path.clone(),
-            reason: format!("lock: {e}"),
+    // Bounded credential lock: the RMW under it is a local read + serialize
+    // + atomic replace; a wedged holder must not pin setkey. Expiry refuses
+    // the write rather than proceeding without the lock.
+    let _settings_lock = match crate::platform::lock::lock_credential_file(&settings_lock_path) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            return Err(ConfigError::InvalidJson {
+                path: settings_lock_path.clone(),
+                reason: format!(
+                    "lock: timed out after {}ms — another process holds the credential \
+                     settings lock; refusing the read-modify-write",
+                    crate::platform::lock::CREDENTIAL_LOCK_BUDGET_MS
+                ),
+            })
         }
-    })?;
+        Err(e) => {
+            return Err(ConfigError::InvalidJson {
+                path: settings_lock_path.clone(),
+                reason: format!("lock: {e}"),
+            })
+        }
+    };
     let mut settings_value: Value = match std::fs::read_to_string(&settings_path) {
         Ok(content) if !content.trim().is_empty() => {
             serde_json::from_str(&content).unwrap_or_else(|_| {
@@ -543,7 +568,7 @@ pub fn bind_provider_to_slot(
     //
     // The v1 `profiles.accounts` field is empty-write in production. 3P
     // bindings have NO OAuth identity (no `by_slot` UUID, no `by_email`
-    // mapping) because the api-key flow does not run `mint_for_login`.
+    // mapping) because the api-key flow does not run `commit_anthropic_login`.
     // The 3P binding identity is now carried by `settings.json` at the
     // slot level (provider_id, model keys, env keys) plus the
     // `.csq-account` marker — both written above and below this block.
@@ -775,6 +800,15 @@ pub fn bind_cloud_claude_backend_to_slot(
     // 5. RMW config-N/settings.json under the settings flock. Purge prior
     //    cloud/3P routing keys, overlay the new backend's, preserve every other
     //    field. Mirrors bind_provider_to_slot (incl. §5a tmp cleanup on failure).
+    //
+    // SEC-2.15 (unified, R1 M1): secure the accounts root (config-N's
+    // parent) fail-closed before creating the handle dir.
+    crate::platform::fs::ensure_private_dir_root(base_dir).map_err(|e| {
+        ConfigError::InvalidJson {
+            path: base_dir.to_path_buf(),
+            reason: format!("accounts_root_refused: {e}"),
+        }
+    })?;
     let config_dir = base_dir.join(format!("config-{}", slot));
     std::fs::create_dir_all(&config_dir).map_err(|e| ConfigError::InvalidJson {
         path: config_dir.clone(),
@@ -782,12 +816,26 @@ pub fn bind_cloud_claude_backend_to_slot(
     })?;
     let settings_path = config_dir.join("settings.json");
     let settings_lock_path = settings_path.with_extension("lock");
-    let _settings_lock = crate::platform::lock::lock_file(&settings_lock_path).map_err(|e| {
-        ConfigError::InvalidJson {
-            path: settings_lock_path.clone(),
-            reason: format!("lock: {e}"),
+    // Bounded credential lock: expiry refuses the write (fail closed).
+    let _settings_lock = match crate::platform::lock::lock_credential_file(&settings_lock_path) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            return Err(ConfigError::InvalidJson {
+                path: settings_lock_path.clone(),
+                reason: format!(
+                    "lock: timed out after {}ms — another process holds the credential \
+                     settings lock; refusing the read-modify-write",
+                    crate::platform::lock::CREDENTIAL_LOCK_BUDGET_MS
+                ),
+            })
         }
-    })?;
+        Err(e) => {
+            return Err(ConfigError::InvalidJson {
+                path: settings_lock_path.clone(),
+                reason: format!("lock: {e}"),
+            })
+        }
+    };
 
     let mut settings_value: Value = match std::fs::read_to_string(&settings_path) {
         Ok(content) if !content.trim().is_empty() => {
@@ -866,7 +914,7 @@ pub fn bind_cloud_claude_backend_to_slot(
 /// `env` object is empty it is removed; if the resulting settings file
 /// is empty it is deleted outright.
 ///
-/// Called by `accounts::login::finalize_login` so that `csq login N`
+/// Called by `accounts::login::finalize_verified_login` so that `csq login N`
 /// on a slot currently bound to MiniMax / Z.AI transitions the slot
 /// back to OAuth cleanly — otherwise CC would keep routing through
 /// the 3P endpoint because `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`
@@ -878,28 +926,26 @@ pub fn bind_cloud_claude_backend_to_slot(
 ///
 /// # Errors
 ///
-/// Propagated only from the filesystem write path. Missing files,
-/// malformed JSON, and already-unbound slots all return `Ok(false)` —
-/// never an error — because `finalize_login` treats this as cleanup
-/// and should not fail a login just because settings.json is weird.
+/// A missing file, malformed JSON and an already-unbound slot return `Ok(false)`.
+/// A failure to take the `settings.json` flock (including a dangling `settings.lock`
+/// link inside an existing `config-N`), to read the file, or to remove or rewrite it
+/// returns `Err`. `finalize_verified_login` propagates that error with `?`, so it fails
+/// the finalization.
 ///
 /// # Lock-ordering contract (AB-BA deadlock avoidance)
 ///
-/// The caller MUST NOT hold [`crate::accounts::profiles_lock::ProfilesFileLock`]
-/// when calling this function. [`bind_provider_to_slot`] (the sibling rebind
-/// path) acquires `ProfilesFileLock` FIRST, then the `settings.json` flock
-/// (the lock this function acquires inside). A caller that already holds
-/// `ProfilesFileLock` and then calls this function would acquire the locks
-/// in the opposite order (settings.json flock first, ProfilesFileLock second),
-/// forming an AB-BA cycle the moment a concurrent `bind_provider_to_slot`
-/// is in flight on the same slot.
+/// This function takes only the `settings.json` flock and does NOT take
+/// [`crate::accounts::profiles_lock::ProfilesFileLock`]. The order across the module is
+/// `ProfilesFileLock` FIRST, then the `settings.json` flock: [`bind_provider_to_slot`]
+/// acquires `ProfilesFileLock` and then the same flock, and the only production caller
+/// of this function, `accounts::login::finalize_verified_login`, holds `ProfilesFileLock`
+/// from its acquisition until after the unbind returns. So the call here runs inside the
+/// caller's profiles lock and the order is the same as bind's.
 ///
-/// Today's only production caller (`finalize_login` via
-/// `accounts/login.rs::finalize_login`) does not hold `ProfilesFileLock` at
-/// the unbind call site, so no cycle exists in current code. This contract
-/// exists to forbid future callers from introducing the cycle. If a future
-/// caller needs both locks held across the unbind, the correct fix is to
-/// drop `ProfilesFileLock` before calling here and re-acquire after.
+/// A caller MUST either hold `ProfilesFileLock` already or hold no lock the profiles
+/// store depends on. A caller that holds the `settings.json` flock and then waits for
+/// `ProfilesFileLock` would invert the order and form an AB-BA cycle with a concurrent
+/// `bind_provider_to_slot` on the same slot.
 pub fn unbind_provider_from_slot(base_dir: &Path, slot: AccountNum) -> Result<bool, ConfigError> {
     let settings_path = base_dir
         .join(format!("config-{}", slot))
@@ -909,17 +955,72 @@ pub fn unbind_provider_from_slot(base_dir: &Path, slot: AccountNum) -> Result<bo
     // RMW. Hold the flock (same lock path as bind_provider_to_slot) for the
     // full read-check-write span so the two operations serialize correctly.
     let settings_lock_path = settings_path.with_extension("lock");
-    // Ensure the parent directory exists before trying to create the lock
-    // file — unbind may be called on a slot that never had settings.json.
-    if let Some(parent) = settings_lock_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    // SEC-2.15 (unified, R1 M1): secure the accounts root through the
+    // shared helper before any read-side filesystem use (best-effort; the
+    // read-side path continues either way).
+    // R2 LOW 6: no silent discard — a failed secure is surfaced with a
+    // fixed-vocabulary tag (redacted).
+    if let Err(e) = crate::platform::fs::ensure_private_dir_root(base_dir) {
+        tracing::warn!(
+            error_kind = "accounts_root_secure_failed",
+            "read-side path: accounts root could not be secured: {}",
+            crate::error::redact_tokens(&e.to_string())
+        );
     }
-    let _settings_lock = crate::platform::lock::lock_file(&settings_lock_path).map_err(|e| {
-        ConfigError::InvalidJson {
-            path: settings_lock_path.clone(),
-            reason: format!("lock: {e}"),
+    // R3-fix-check HIGH: the lock's parent is config-N, NOT the root the
+    // helper above secures. When config-N does not exist there was never a
+    // binding to unbind — a NO-OP (exactly like a missing settings.json
+    // below), never an error, and creating config-N is not this path's
+    // job. (Found by the fix check: the former trailing
+    // `create_dir_all(parent)` was the only reason this lock could be
+    // taken on a bare base.) fixcheck2 LOW 3 refines the same arm: only a
+    // MISSING config-N is the no-op; an ENOENT produced by a dangling
+    // `settings.lock` link inside an EXISTING config-N refuses.
+    // Bounded credential lock: expiry REFUSES the unbind (fail closed) rather
+    // than leaving a live credential bound behind a wedged holder.
+    let _settings_lock = match crate::platform::lock::lock_credential_file(&settings_lock_path) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            return Err(ConfigError::InvalidJson {
+                path: settings_lock_path.clone(),
+                reason: format!(
+                    "lock: timed out after {}ms — another process holds the credential \
+                     settings lock; refusing the unbind",
+                    crate::platform::lock::CREDENTIAL_LOCK_BUDGET_MS
+                ),
+            });
         }
-    })?;
+        Err(crate::error::PlatformError::Io(io)) if io.kind() == std::io::ErrorKind::NotFound => {
+            // fixcheck2 LOW 3: ENOENT here is TWO states. A missing config-N
+            // means the slot was never bound → a no-op. But the SAME ENOENT
+            // is produced by a DANGLING `settings.lock` symlink inside an
+            // EXISTING config-N (open follows the link; the target's parent
+            // is missing) — a degraded, possibly hostile state whose unbind
+            // must REFUSE, not silently leave the credential bound.
+            // Distinguish by the lock's parent; anything unverifiable fails
+            // closed.
+            let parent_missing = match settings_lock_path.parent() {
+                Some(parent) => matches!(
+                    std::fs::symlink_metadata(parent),
+                    Err(ref pe) if pe.kind() == std::io::ErrorKind::NotFound
+                ),
+                None => false,
+            };
+            if parent_missing {
+                return Ok(false);
+            }
+            return Err(ConfigError::InvalidJson {
+                path: settings_lock_path.clone(),
+                reason: format!("lock: {io}"),
+            });
+        }
+        Err(e) => {
+            return Err(ConfigError::InvalidJson {
+                path: settings_lock_path.clone(),
+                reason: format!("lock: {e}"),
+            });
+        }
+    };
 
     let content = match std::fs::read_to_string(&settings_path) {
         Ok(s) => s,
@@ -960,7 +1061,7 @@ pub fn unbind_provider_from_slot(base_dir: &Path, slot: AccountNum) -> Result<bo
         removed |= env.remove(*key).is_some();
     }
     // Purge stale cloud-Claude routing keys too (an internal ticket, redteam H1): `csq login N`
-    // runs this via finalize_login, so moving a Vertex/Bedrock slot back to OAuth
+    // runs this via finalize_verified_login, so moving a Vertex/Bedrock slot back to OAuth
     // must strip CLAUDE_CODE_USE_* + the live GOOGLE_APPLICATION_CREDENTIALS /
     // AWS_BEARER_TOKEN_BEDROCK — else the OAuth slot retains a live cloud cred on
     // disk and backend_for_slot still reports [vertex]/[bedrock].
@@ -1018,6 +1119,98 @@ pub fn unbind_provider_from_slot(base_dir: &Path, slot: AccountNum) -> Result<bo
     }
 
     Ok(true)
+}
+
+/// Is slot `slot` bound to a third-party API-key provider? READ-ONLY, and reads
+/// ONLY `config-<slot>/settings.json` (never another slot's, never a directory
+/// listing), so a per-render caller (the statusline cost gate) neither scans every
+/// slot nor logs for the other slots' broken files.
+///
+/// `Ok(true)` when `env.ANTHROPIC_BASE_URL` (or the bare top-level key) names a
+/// recognised provider host, the same classification
+/// `discovery::discover_per_slot_third_party` applies. `Ok(false)` when there is
+/// no settings file, no base URL, or an unrecognised/Anthropic host (a gateway in
+/// front of Anthropic is not a third-party provider). Cloud Claude (Vertex /
+/// Bedrock) is a separate axis: [`crate::providers::settings::backend_for_slot`].
+///
+/// # Errors
+///
+/// A symlinked `config-<slot>`, a non-regular or unreadable settings file,
+/// an oversized file or invalid JSON is an `Err`, never `Ok(false)`.
+/// Canonical slot writers publish regular files. User-supplied settings links
+/// are not evidence of a third-party binding and are refused, even within base.
+pub fn is_third_party_slot(base_dir: &Path, slot: AccountNum) -> Result<bool, ConfigError> {
+    is_third_party_slot_with(base_dir, slot, &|path| {
+        // Reject static links/non-regular entries on every platform. The shared
+        // reader also uses a non-blocking, no-follow open on Unix and checks the
+        // opened descriptor before its bounded read, including a raced FIFO.
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "slot settings must be a regular file",
+            ));
+        }
+        let bytes =
+            crate::session::handle_dir::read_regular_bounded(path, true).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "slot settings unavailable or oversized",
+                )
+            })?;
+        String::from_utf8(bytes).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "slot settings are not UTF-8",
+            )
+        })
+    })
+}
+
+/// [`is_third_party_slot`] with the settings reader injected, so a test can prove
+/// which paths are read.
+pub fn is_third_party_slot_with(
+    base_dir: &Path,
+    slot: AccountNum,
+    read: &dyn Fn(&Path) -> std::io::Result<String>,
+) -> Result<bool, ConfigError> {
+    let config_dir = base_dir.join(format!("config-{slot}"));
+    let settings_path = config_dir.join("settings.json");
+    match std::fs::symlink_metadata(&config_dir) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err(ConfigError::InvalidJson {
+                path: settings_path,
+                reason: "config dir is a symlink".into(),
+            })
+        }
+        // A missing config dir is a slot with no settings: not third-party.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        _ => {}
+    }
+    let content = match read(&settings_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(ConfigError::InvalidJson {
+                path: settings_path,
+                reason: format!("read: {}", e.kind()),
+            })
+        }
+    };
+    // Fixed vocabulary only: settings.json carries 3P tokens and a serde error
+    // can echo a fragment of the document (security.md MUST 2).
+    let json: Value = serde_json::from_str(&content).map_err(|_| ConfigError::InvalidJson {
+        path: settings_path.clone(),
+        reason: "invalid JSON".into(),
+    })?;
+    let base_url = json
+        .get("env")
+        .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
+        .or_else(|| json.get("ANTHROPIC_BASE_URL"))
+        .and_then(|v| v.as_str());
+    Ok(base_url
+        .and_then(crate::accounts::discovery::provider_from_base_url)
+        .is_some())
 }
 
 #[cfg(test)]
@@ -1810,7 +2003,7 @@ mod tests {
     // ── redteam H1: reverse-cleanup parity (no stale cloud key / retained cred) ──
 
     /// Community-buildable: a slot carrying stale cloud keys is cleaned by
-    /// `unbind_provider_from_slot` (the path `csq login N` runs via finalize_login).
+    /// `unbind_provider_from_slot` (the path `csq login N` runs via finalize_verified_login).
     #[test]
     fn unbind_purges_stale_cloud_keys() {
         let dir = TempDir::new().unwrap();
@@ -1841,7 +2034,7 @@ mod tests {
     #[cfg(feature = "enterprise")]
     #[test]
     fn cloud_to_oauth_via_unbind_purges_cloud_keys() {
-        // Provision Vertex, then run the unbind finalize_login performs → the slot
+        // Provision Vertex, then run the unbind finalize_verified_login performs → the slot
         // must retain NO cloud flag or live SA path.
         let dir = TempDir::new().unwrap();
         let sa = write_fake_sa(dir.path());
@@ -3078,5 +3271,280 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn r2_published_window_fixture() -> (TempDir, std::path::PathBuf, Vec<u8>) {
+        let dir = TempDir::new().unwrap();
+        let slot = slot_n(9);
+        bind_provider_to_slot(dir.path(), "zai", slot, Some("sk-fixture-zai"), None).unwrap();
+        let config = dir.path().join("config-9");
+        assert!(
+            matches!(std::fs::symlink_metadata(config.join(".credentials.json")), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        );
+        assert!(
+            matches!(std::fs::symlink_metadata(dir.path().join("credentials/9.json")), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        );
+        let path = config.join("settings.json");
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = serde_json::json!("1048576");
+        let bytes = serde_json::to_vec(&value).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(is_third_party_slot(dir.path(), slot).unwrap());
+        (dir, config, bytes)
+    }
+
+    fn r2_source_evidence(base: &Path, config: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        [base.join("profiles.json"), config.join(".csq-account")]
+            .into_iter()
+            .map(|p| {
+                let bytes = std::fs::read(&p).unwrap();
+                (p, bytes)
+            })
+            .collect()
+    }
+
+    fn r2_assert_evidence_unchanged(sources: Vec<(std::path::PathBuf, Vec<u8>)>) {
+        for (path, bytes) in sources {
+            assert!(
+                std::fs::read(path).unwrap() == bytes,
+                "published source evidence changed"
+            );
+        }
+    }
+
+    fn r2_assert_unknown_window_source(base: &Path) {
+        let report = crate::session::settings_diagnostics::collect_autocompact_settings(base);
+        assert!(report
+            .unreadable
+            .iter()
+            .any(|p| p == "config-9/settings.json"));
+        assert!(!report
+            .findings
+            .iter()
+            .any(|f| f.location == "config-9/settings.json"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r2_final_reader_fifo_returns_without_blocking_and_denies_window() {
+        use std::ffi::CString;
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+        use std::sync::mpsc::{self, RecvTimeoutError};
+        let _guard = crate::platform::test_env::lock();
+        let (dir, config, bytes) = r2_published_window_fixture();
+        let evidence = r2_source_evidence(dir.path(), &config);
+        let published: Value = serde_json::from_slice(&bytes).unwrap();
+        let release_json = serde_json::to_vec(&serde_json::json!({
+            "env": {"ANTHROPIC_BASE_URL": published["env"]["ANTHROPIC_BASE_URL"]}
+        }))
+        .unwrap();
+        assert!(
+            release_json.len() < 512,
+            "release must fit POSIX minimum PIPE_BUF"
+        );
+        let path = config.join("settings.json");
+        std::fs::remove_file(&path).unwrap();
+        let fifo = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: owned TempDir path, valid C string, no shared/live session state.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let before = std::fs::symlink_metadata(&path).unwrap();
+        assert!(before.file_type().is_fifo());
+        // Open the owned release writer before spawning: open/setup errors cannot
+        // strand a live worker. No bytes are supplied until the timeout branch.
+        let mut release = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        let owned_base = dir.path().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(is_third_party_slot(&owned_base, slot_n(9)))
+                .unwrap();
+        });
+        let received = rx.recv_timeout(std::time::Duration::from_secs(2));
+        let timed_out = matches!(&received, Err(RecvTimeoutError::Timeout));
+        let release_result = if timed_out {
+            // OLD read_to_string waits for data/EOF. The small valid provider JSON
+            // fits minimum PIPE_BUF. Closing the owned writer supplies EOF.
+            release.write_all(&release_json)
+        } else {
+            Ok(())
+        };
+        drop(release);
+        // Reap before any timeout/write assertion; unexpected I/O is never a RED remap.
+        worker.join().expect("callee thread panicked");
+        release_result.expect("FIFO release write failed");
+        let result = match received {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => {
+                rx.try_recv().expect("callee failed after FIFO release")
+            }
+            Err(RecvTimeoutError::Disconnected) => panic!("callee channel disconnected"),
+        };
+        let after = std::fs::symlink_metadata(&path).unwrap();
+        assert!(after.file_type().is_fifo());
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        r2_assert_evidence_unchanged(evidence);
+        assert!(
+            !timed_out,
+            "actual classifier exceeded the 2s FIFO budget; FIFO released and thread joined"
+        );
+        assert!(
+            result.is_err(),
+            "nonregular settings must be unknown, never eligible"
+        );
+        // This is reached only after the actual callee has proved a bounded return.
+        assert!(!crate::session::settings_policy::slot_allows_provider_window(dir.path(), &config));
+        r2_assert_unknown_window_source(dir.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r2_final_reader_outside_settings_symlink_is_unknown_and_denies_window() {
+        let _guard = crate::platform::test_env::lock();
+        let (dir, config, bytes) = r2_published_window_fixture();
+        let evidence = r2_source_evidence(dir.path(), &config);
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("provider.json");
+        std::fs::write(&target, &bytes).unwrap();
+        let path = config.join("settings.json");
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let result = is_third_party_slot(dir.path(), slot_n(9));
+        let eligible =
+            crate::session::settings_policy::slot_allows_provider_window(dir.path(), &config);
+        r2_assert_unknown_window_source(dir.path());
+        assert_eq!(std::fs::read_link(&path).unwrap(), target);
+        assert!(std::fs::read(&target).unwrap() == bytes);
+        r2_assert_evidence_unchanged(evidence);
+        assert!(
+            result.is_err() && !eligible,
+            "final symlink to recognized provider was accepted"
+        );
+    }
+
+    #[test]
+    fn r2_final_reader_valid_provider_over_one_mib_is_unknown_and_denies_window() {
+        let _guard = crate::platform::test_env::lock();
+        let (dir, config, bytes) = r2_published_window_fixture();
+        let evidence = r2_source_evidence(dir.path(), &config);
+        let mut value: Value = serde_json::from_slice(&bytes).unwrap();
+        value["padding"] = Value::String("x".repeat((1 << 20) + 1));
+        let oversized = serde_json::to_vec(&value).unwrap();
+        assert!(oversized.len() > 1 << 20);
+        let path = config.join("settings.json");
+        std::fs::write(&path, &oversized).unwrap();
+        let result = is_third_party_slot(dir.path(), slot_n(9));
+        let eligible =
+            crate::session::settings_policy::slot_allows_provider_window(dir.path(), &config);
+        r2_assert_unknown_window_source(dir.path());
+        assert!(std::fs::read(&path).unwrap() == oversized);
+        r2_assert_evidence_unchanged(evidence);
+        assert!(
+            result.is_err() && !eligible,
+            "oversized valid provider JSON was accepted"
+        );
+    }
+
+    // ── is_third_party_slot: per-slot, read-only ────────────────────────────
+
+    fn slot_n(n: u16) -> AccountNum {
+        AccountNum::try_from(n).unwrap()
+    }
+
+    #[test]
+    fn is_third_party_slot_classifies_this_slot_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mk = |n: u16, body: &str| {
+            let d = dir.path().join(format!("config-{n}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("settings.json"), body).unwrap();
+        };
+        mk(
+            1,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.deepseek.com/anthropic"}}"#,
+        );
+        mk(
+            2,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://llm-gateway.example.com"}}"#,
+        );
+        mk(3, r#"{"env":{}}"#);
+        mk(4, r#"{not json"#);
+        assert!(is_third_party_slot(dir.path(), slot_n(1)).unwrap());
+        assert!(!is_third_party_slot(dir.path(), slot_n(2)).unwrap());
+        assert!(!is_third_party_slot(dir.path(), slot_n(3)).unwrap());
+        assert!(is_third_party_slot(dir.path(), slot_n(4)).is_err());
+        // Absent config dir / absent file: not third-party, not an error.
+        assert!(!is_third_party_slot(dir.path(), slot_n(9)).unwrap());
+    }
+
+    #[test]
+    fn is_third_party_slot_reads_only_its_own_settings_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for n in 1..=20u16 {
+            let d = dir.path().join(format!("config-{n}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("settings.json"), "{not json").unwrap();
+        }
+        let seen = std::cell::RefCell::new(Vec::new());
+        let r = is_third_party_slot_with(dir.path(), slot_n(7), &|p| {
+            seen.borrow_mut().push(p.to_path_buf());
+            std::fs::read_to_string(p)
+        });
+        assert!(r.is_err());
+        assert_eq!(
+            *seen.borrow(),
+            vec![dir.path().join("config-7").join("settings.json")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_third_party_slot_refuses_a_symlinked_config_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(
+            real.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.deepseek.com/anthropic"}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("config-5")).unwrap();
+        assert!(is_third_party_slot(dir.path(), slot_n(5)).is_err());
+    }
+
+    /// fixcheck2 LOW 3: a DANGLING `settings.lock` link inside an EXISTING
+    /// config-N must refuse. The ENOENT it produces at open is the same
+    /// errno as a missing config-N, so the fix discriminates on the lock's
+    /// parent — this test reds on the former behavior (Ok(false)).
+    #[cfg(unix)]
+    #[test]
+    fn unbind_refuses_a_dangling_settings_lock_link() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(3u16).unwrap();
+        let config = dir.path().join("config-3");
+        std::fs::create_dir(&config).unwrap();
+        // Dangling: the target's parent does not exist, so open(O_CREAT)
+        // FOLLOWS the link and reports ENOENT.
+        std::os::unix::fs::symlink(
+            "/definitely-missing-csq-parent-x9/settings.lock",
+            config.join("settings.lock"),
+        )
+        .unwrap();
+
+        let err = unbind_provider_from_slot(dir.path(), slot)
+            .expect_err("a dangling settings.lock inside an existing config-N must refuse");
+        assert!(
+            format!("{err}").contains("lock"),
+            "the refusal must name the lock step: {err}"
+        );
+
+        // The never-bound case (missing config-N entirely) stays a no-op.
+        let bare = TempDir::new().unwrap();
+        assert!(!unbind_provider_from_slot(bare.path(), slot).unwrap());
     }
 }

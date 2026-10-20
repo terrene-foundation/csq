@@ -27,6 +27,26 @@
 
 use std::collections::BTreeSet;
 
+/// CI-environment sentinel variables: any of these set means a non-interactive
+/// CI/CD run where interactive consent is refused (`csq cli install/upgrade`,
+/// spec 13 section 10 non-TTY refusal).
+///
+/// Single source: the production detector (`cli.rs::is_ci_environment`)
+/// iterates this slice, and subprocess tests strip exactly this slice from the
+/// child env (`csq/tests/common/mod.rs::strip_ci_env`), so the two cannot
+/// drift. Add a new CI vendor variable HERE and both pick it up.
+pub const CI_SENTINEL_VARS: &[&str] = &[
+    "CI",
+    "GITHUB_ACTIONS",
+    "GITLAB_CI",
+    "JENKINS_URL",
+    "BUILDKITE",
+    "CIRCLECI",
+    "TEAMCITY_VERSION",
+    "DRONE",
+    "TF_BUILD",
+];
+
 /// Suffix patterns that flag an env-var name as production-shaped.
 /// Heuristic intentionally tightened in PR-CA8 round-2 R2-M2 and
 /// re-tuned in round-3 R3-M1 / R4-M1: dropped bare `_KEY` / `_PASS`

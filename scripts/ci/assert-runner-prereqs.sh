@@ -37,6 +37,11 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+. "$HERE/../lib/strmatch.sh" || {
+    echo "FATAL: cannot source scripts/lib/strmatch.sh — membership tests would be unmeasurable" >&2
+    exit 2
+}
 MANIFEST="${PREREQ_MANIFEST:-$HERE/runner-prereqs.json}"
 
 OK=0; MISSING=1; UNDETERMINED=2
@@ -60,7 +65,12 @@ have_pkg() {
   case ":${PREREQ_FAKE_MISSING_PKG:-}:" in *":$1:"*) return 1 ;; esac
   # Absence of dpkg is not absence of the package — it is inability to tell.
   command -v dpkg-query >/dev/null 2>&1 || return 2
-  dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "ok installed"
+  local status
+  # Captured, then tested with a bash builtin: `dpkg-query … | grep -q` under  # pipefail-ok: prose quoting the refused form
+  # pipefail reads a PRESENT status as absent when grep exits first and dpkg
+  # takes SIGPIPE.
+  status="$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null)" || true
+  strmatch_contains "$status" "ok installed"
 }
 
 [ "${1:-}" = "--selftest" ] && { exec bash "$HERE/../tests/assert-runner-prereqs.test.sh"; }

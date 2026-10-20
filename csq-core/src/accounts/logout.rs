@@ -27,6 +27,22 @@ use crate::providers::native;
 use crate::types::AccountNum;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+type LogoutOrderingHook = Box<dyn FnMut(&Path, IdentityId, bool)>;
+#[cfg(test)]
+thread_local! {
+    static LOGOUT_ORDERING_HOOK: std::cell::RefCell<Option<LogoutOrderingHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn run_logout_ordering_hook(base: &Path, identity: IdentityId, before_profiles_save: bool) {
+    LOGOUT_ORDERING_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(base, identity, before_profiles_save);
+        }
+    });
+}
+
 /// Every surface whose canonical credential file logout MUST sweep.
 /// Adding a future surface (e.g. Bedrock) means landing a single line
 /// here so logout cleanup remains exhaustive.
@@ -56,6 +72,21 @@ pub struct LogoutSummary {
     /// orphan-identity GC source-fix). `false` when the UUID is still
     /// referenced by another slot (shared identity) or no UUID resolved.
     pub identity_dir_removed: bool,
+    /// `true` when logout dropped the last reference to the slot's identity
+    /// UUID but the `identities/<UUID>/` directory — which holds the local
+    /// copy of the credential — is STILL ON DISK at return: the identity's
+    /// canonical credential lock could not be taken within
+    /// `platform::lock::CREDENTIAL_LOCK_BUDGET` (or errored), or
+    /// `remove_dir_all` failed. This is a refused delete, never a silent one:
+    /// a fixed-vocabulary WARN (`error_kind = "logout_identity_dir_lock_busy"`
+    /// / `"logout_identity_dir_lock_failed"` / `"logout_identity_dir_remove_failed"`)
+    /// is emitted on each branch, and the identity tombstone (written before
+    /// the delete attempt) already blocks writers. The orphan-identity GC
+    /// (`accounts::orphan_identity_gc::prune_orphan_identities`) removes the
+    /// directory on the next reconciler tick / daemon start. Callers MUST
+    /// surface this plainly: the credential folder was NOT removed by this
+    /// logout.
+    pub identity_dir_pending_removal: bool,
     /// `true` when a native-CLI (Kimi/Grok) vendor home directory
     /// (`native-homes/<surface>-<N>/`) was removed for this slot (0135
     /// design lock, Wave C shard C3). `false` when the slot was never bound
@@ -82,6 +113,65 @@ pub struct LogoutSummary {
     /// keychain FIRST, keyed by the handle dir's own path, which
     /// `logout_account` never touched before this field existed.
     pub keychain_cleared: bool,
+    /// `true` when at least one UNCONFIRMED keychain clear could not be
+    /// queued for automatic retry (the retry spool was at its cap or
+    /// unwritable). Distinct from `keychain_cleared`: that field says the
+    /// clear was not confirmed, this one says the automatic retry will NOT
+    /// happen either — so the keychain item may survive this logout with no
+    /// daemon sweep to remove it. Surfaced so the operator can act; the
+    /// refusal itself is also logged at a fixed-vocabulary ERROR/WARN where
+    /// it happens.
+    pub keychain_retry_queue_failed: bool,
+}
+
+/// What the in-use scan found: live pids, and the NAMES of bound handle dirs whose pid
+/// marker could not be read (possibly live — fail closed, but not a pid).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LiveHandleDirScan {
+    pub pids: Vec<u32>,
+    pub unreadable_dirs: Vec<String>,
+}
+
+impl LiveHandleDirScan {
+    pub fn is_empty(&self) -> bool {
+        self.pids.is_empty() && self.unreadable_dirs.is_empty()
+    }
+}
+
+/// A handle dir name safe to put in an operator message: the `term-<…>` name only, never a
+/// path. Anything outside `[A-Za-z0-9_-]` (or over 64 bytes) collapses to a placeholder.
+fn display_dir_name(name: &str) -> String {
+    if name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        name.to_string()
+    } else {
+        "term-?".to_string()
+    }
+}
+
+/// Operator text for [`LogoutError::InUse`]; shared by the CLI and desktop renderers.
+pub fn in_use_message(account: AccountNum, pids: &[u32], unreadable_dirs: &[String]) -> String {
+    let mut parts = Vec::new();
+    if !pids.is_empty() {
+        parts.push(format!(
+            "account {account} is in use by live claude process(es) {pids:?} — exit those terminals first, then retry"
+        ));
+    }
+    if !unreadable_dirs.is_empty() {
+        let names = unreadable_dirs.join(", ");
+        let (noun, verb) = if unreadable_dirs.len() == 1 {
+            ("handle dir", "has a pid marker")
+        } else {
+            ("handle dirs", "have pid markers")
+        };
+        parts.push(format!(
+            "account {account}: {noun} {names} {verb} that cannot be read; inspect it and remove it if stale, then retry"
+        ));
+    }
+    parts.join("; ")
 }
 
 /// Failure modes for [`logout_account`].
@@ -91,7 +181,15 @@ pub enum LogoutError {
     /// processes via handle dirs. The user must exit those terminals
     /// before logging out — refusing to delete state from under a
     /// running process is the safest default.
-    InUse { account: AccountNum, pids: Vec<u32> },
+    ///
+    /// `unreadable_dirs` names (dir NAME only, never a path) each bound handle dir whose
+    /// pid marker could not be read, so liveness cannot be ruled out. It is a separate
+    /// field, not a sentinel pid, so no renderer can print it as a process id.
+    InUse {
+        account: AccountNum,
+        pids: Vec<u32>,
+        unreadable_dirs: Vec<String>,
+    },
     /// No credential file or config dir exists for this account.
     /// Logout is a no-op against an empty slot.
     NotConfigured { account: AccountNum },
@@ -100,6 +198,10 @@ pub enum LogoutError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// A removal marker is a nonregular entry; never follow or replace it.
+    NonregularTombstone { path: PathBuf },
+    /// The identities namespace is not an actual directory; refuse aliases.
+    UnsafeTombstoneNamespace { path: PathBuf },
     /// Loading or saving `profiles.json` failed.
     Profiles(crate::error::ConfigError),
     /// The Gemini API-key OS-keychain vault could not be opened, or the
@@ -118,19 +220,32 @@ pub enum LogoutError {
 impl std::fmt::Display for LogoutError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LogoutError::InUse { account, pids } => write!(
-                f,
-                "account {} is in use by live claude process(es): {:?} — exit those terminals first",
-                account, pids
-            ),
+            LogoutError::InUse {
+                account,
+                pids,
+                unreadable_dirs,
+            } => f.write_str(&in_use_message(*account, pids, unreadable_dirs)),
             LogoutError::NotConfigured { account } => {
                 write!(f, "account {} is not configured", account)
             }
             LogoutError::Io { path, source } => {
                 write!(f, "filesystem error at {}: {}", path.display(), source)
             }
+            LogoutError::NonregularTombstone { path } => write!(
+                f,
+                "identity_removal_marker_nonregular at {}: tombstone is not a regular file",
+                path.display()
+            ),
+            LogoutError::UnsafeTombstoneNamespace { path } => write!(
+                f,
+                "identity_removal_namespace_nonregular at {}: identities namespace must be a directory, not an alias",
+                path.display()
+            ),
             LogoutError::Profiles(e) => write!(f, "profiles.json error: {}", e),
-            LogoutError::VaultUnavailable { account, error_kind } => write!(
+            LogoutError::VaultUnavailable {
+                account,
+                error_kind,
+            } => write!(
                 f,
                 "account {}: gemini vault unavailable ({})",
                 account, error_kind
@@ -188,12 +303,13 @@ pub fn logout_account(base_dir: &Path, account: AccountNum) -> Result<LogoutSumm
         return Err(LogoutError::NotConfigured { account });
     }
 
-    let bound_pids = scan_live_handle_dirs_for_account(base_dir, account);
-    if !bound_pids.is_empty() {
+    let bound = scan_live_handle_dirs_for_account(base_dir, account);
+    if !bound.is_empty() {
         // LogoutError::InUse — pre-side-effect rejection: emit NO INTENT (WBS T5).
         return Err(LogoutError::InUse {
             account,
-            pids: bound_pids,
+            pids: bound.pids,
+            unreadable_dirs: bound.unreadable_dirs,
         });
     }
 
@@ -305,7 +421,8 @@ pub fn logout_account(base_dir: &Path, account: AccountNum) -> Result<LogoutSumm
     // become permanent orphans (see `clear_bound_keychain_items`'s doc for
     // the full fail-open rationale — it does not abort logout on a
     // locked/unreachable keychain).
-    let keychain_cleared = clear_bound_keychain_items(base_dir, account);
+    let keychain = clear_bound_keychain_items(base_dir, account);
+    let keychain_cleared = keychain.any_confirmed;
 
     // SAFETY-ORDERING: credential files removed BEFORE ProfilesFileLock acquired (M9 + FM-9(c)). Crash here leaves an unidentifiable slot, never a falsely-identifiable one.
     // Sweep the canonical credential file for every surface. A slot
@@ -446,24 +563,17 @@ pub fn logout_account(base_dir: &Path, account: AccountNum) -> Result<LogoutSumm
     // falsely-identifiable"). A shared UUID (another slot still references it)
     // yields `orphaned_uuid == None` → the dir is preserved for the sibling
     // slot. NotFound is treated as success (the GC pass may have raced).
-    let identity_dir_removed = match orphaned_uuid {
-        Some(uuid) => {
-            let removed = match std::fs::remove_dir_all(identity_path(base_dir, uuid)) {
-                Ok(()) => true,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                Err(_) => false, // best-effort; the GC pass collects it next start
-            };
-            // `keychain-fix-r11.md` D-5: mark this uuid REMOVED regardless of
-            // whether the dir physically existed to delete — the intent
-            // ("this identity is logged out") is the same either way, and
-            // the tombstone is what stops a racing refresher/backsync/adopt
-            // write (`credentials::file::save_uuid_credentials`, which
-            // shares no lock with this call) from silently recreating it.
-            // A fresh login for this SAME uuid clears the marker.
-            crate::accounts::identity_store::mark_identity_removed(base_dir, uuid);
-            removed
-        }
-        None => false,
+    //
+    // A lock that could NOT be taken is never bypassed on this destructive
+    // path (guard-reader-writer-parity MUST-2): the tombstone written above
+    // already blocks writers; the refusal is logged with a fixed-vocabulary
+    // tag; and `LogoutSummary::identity_dir_pending_removal` tells the caller
+    // the local credential folder is STILL ON DISK. The orphan GC collects it
+    // on the next reconciler tick — the same claim the base code made, now
+    // proven by `logout_lock_busy_leaves_dir_that_the_orphan_gc_then_collects`.
+    let (identity_dir_removed, identity_dir_pending_removal) = match orphaned_uuid {
+        Some(uuid) => remove_orphan_identity_dir(base_dir, uuid, account),
+        None => (false, false),
     };
 
     let quota_entry_removed = remove_quota_entry(base_dir, account);
@@ -487,10 +597,106 @@ pub fn logout_account(base_dir: &Path, account: AccountNum) -> Result<LogoutSumm
         profiles_entry_removed,
         quota_entry_removed,
         identity_dir_removed,
+        identity_dir_pending_removal,
         native_home_removed,
         gemini_vault_cleared,
         keychain_cleared,
+        keychain_retry_queue_failed: keychain.retry_queue_failed,
     })
+}
+
+/// Deletes `identities/<uuid>/` for a slot that just dropped the last
+/// reference to `uuid`, under that identity's canonical credential lock.
+///
+/// The lock MUST be held across the delete: the lineage writer takes the same
+/// lock and re-checks the tombstone, so a refresh racing this logout either
+/// finished its write before we took the lock (and is deleted with the dir) or
+/// sees the tombstone and refuses to create a missing dir (R2-M1).
+///
+/// Returns `(removed, pending_removal)`:
+///
+/// - `(true, false)` — the directory was deleted under the lock.
+/// - `(false, false)` — the directory was already absent (the orphan GC or a
+///   concurrent logout won the race, or the identity never materialized).
+/// - `(false, true)` — the directory — and with it the local copy of the
+///   credential — is STILL ON DISK. The canonical lock could not be taken
+///   within [`crate::platform::lock::CREDENTIAL_LOCK_BUDGET`] (`Ok(None)`),
+///   locking failed (`Err`), or `remove_dir_all` failed. The refusal is never
+///   silent: each branch logs a fixed-vocabulary `error_kind` (no `{e}` —
+///   `PlatformError`'s Display carries the lock path; `security.md` MUST-2 /
+///   `zero-tolerance.md` Rule 3), and the caller reports the pending cleanup
+///   on [`LogoutSummary::identity_dir_pending_removal`]. The tombstone written
+///   before this call blocks writers; `orphan_identity_gc` collects the dir on
+///   the next reconciler tick.
+fn remove_orphan_identity_dir(
+    base_dir: &Path,
+    uuid: IdentityId,
+    account: AccountNum,
+) -> (bool, bool) {
+    let identity_dir = identity_path(base_dir, uuid);
+    let canonical_lock = crate::accounts::identity_store::credentials_path_for(base_dir, uuid)
+        .with_extension("lock");
+    // The lock file lives inside the dir; only lock a dir that exists (the
+    // lock call would otherwise fail, and must not create it). Bounded
+    // acquisition: a wedged holder must not pin logout (the class and bound
+    // are `platform::lock::lock_credential_file`'s).
+    let guard = if identity_dir.is_dir() {
+        match crate::platform::lock::lock_credential_file(&canonical_lock) {
+            Ok(Some(guard)) => Some(guard),
+            Ok(None) => {
+                tracing::warn!(
+                    error_kind = "logout_identity_dir_lock_busy",
+                    account = account.get(),
+                    budget_ms = crate::platform::lock::CREDENTIAL_LOCK_BUDGET_MS,
+                    "logout: identity credential lock was still held at the bounded wait — \
+                     the local credential folder was NOT removed (the identity tombstone \
+                     blocks writers; the next orphan-identity GC removes it)"
+                );
+                None
+            }
+            Err(_) => {
+                // Fixed tag only: `PlatformError`'s Display carries the lock
+                // file path (`security.md` MUST-2).
+                tracing::warn!(
+                    error_kind = "logout_identity_dir_lock_failed",
+                    account = account.get(),
+                    "logout: could not lock the identity credential file — the local \
+                     credential folder was NOT removed (the identity tombstone blocks \
+                     writers; the next orphan-identity GC removes it)"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(test)]
+    run_logout_ordering_hook(base_dir, uuid, false);
+    // An open lock file blocks directory removal on Windows.
+    let locked = guard.is_some();
+    #[cfg(windows)]
+    drop(guard);
+    let result = if identity_dir.is_dir() && !locked {
+        (false, true)
+    } else {
+        match std::fs::remove_dir_all(&identity_dir) {
+            Ok(()) => (true, false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, false),
+            Err(_) => {
+                // Best-effort, but never silent: the GC retries next tick.
+                tracing::warn!(
+                    error_kind = "logout_identity_dir_remove_failed",
+                    account = account.get(),
+                    "logout: identity credential folder removal failed — it was NOT \
+                     removed (best-effort; the next orphan-identity GC retries)"
+                );
+                (false, true)
+            }
+        }
+    };
+    #[cfg(not(windows))]
+    drop(guard);
+    result
 }
 
 /// Removes the per-slot vendor home directories (0135 design lock —
@@ -620,7 +826,7 @@ pub(crate) fn remove_quota_entry(base_dir: &Path, account: AccountNum) -> bool {
         Err(_) => return false,
     };
 
-    let mut quota = match quota_state::load_state(base_dir) {
+    let mut quota = match quota_state::load_state_or_skip(base_dir) {
         Ok(q) => q,
         Err(_) => return false,
     };
@@ -646,22 +852,31 @@ pub(crate) fn remove_quota_entry(base_dir: &Path, account: AccountNum) -> bool {
 pub(crate) fn scan_live_handle_dirs_for_account_pub(
     base_dir: &Path,
     account: AccountNum,
-) -> Vec<u32> {
+) -> LiveHandleDirScan {
     scan_live_handle_dirs_for_account(base_dir, account)
 }
 
-fn scan_live_handle_dirs_for_account(base_dir: &Path, account: AccountNum) -> Vec<u32> {
-    let mut bound = Vec::new();
+fn scan_live_handle_dirs_for_account(base_dir: &Path, account: AccountNum) -> LiveHandleDirScan {
+    let mut bound = LiveHandleDirScan::default();
     for path in bound_handle_dirs(base_dir, account) {
         let name = match path.file_name().and_then(|n| n.to_str()) {
             Some(n) => n.to_string(),
             None => continue,
         };
-        let pid = markers::read_live_pid(&path)
-            .or_else(|| name.strip_prefix("term-").and_then(|s| s.parse().ok()));
-        let Some(pid) = pid else { continue };
-        if is_pid_alive(pid) {
-            bound.push(pid);
+        // Either marker, and an unreadable one counts as IN USE (reported by dir NAME):
+        // this guard refuses a destructive logout, so "cannot read" fails closed.
+        let fallback = name.strip_prefix("term-").and_then(|s| s.parse().ok());
+        match markers::handle_dir_in_use(&path, fallback, is_pid_alive) {
+            Some(markers::HandleDirInUse::Pid(pid)) => bound.pids.push(pid),
+            Some(markers::HandleDirInUse::MarkerUnreadable) => {
+                tracing::warn!(
+                    error_kind = "logout_pid_marker_unreadable",
+                    dir_name = %display_dir_name(&name),
+                    "handle dir has an unreadable pid marker; treating it as in use"
+                );
+                bound.unreadable_dirs.push(display_dir_name(&name));
+            }
+            None => {}
         }
     }
     bound
@@ -730,8 +945,8 @@ fn bound_handle_dirs(base_dir: &Path, account: AccountNum) -> Vec<PathBuf> {
     // The UUID our OWN config dir's marker claims, if it holds one.
     //
     // Load-bearing when `account_uuid` is None (redteam C1). "Attributed to
-    // another slot" does NOT imply "not ours": `identity_mint::mint_for_login`
-    // REUSES `by_email[email]`, so two slots can legitimately share one UUID,
+    // another slot" does NOT imply "not ours": the retired email-only
+    // `mint_for_login` REUSED `by_email[email]`, so a legacy install can still have two slots share one UUID,
     // and the codex partial-mint rollback (`profiles::remove_slot_mapping`,
     // called from `providers/codex/{login,desktop_login}.rs`) drops
     // `by_slot[N]` while leaving `config-N/` and its UUID marker intact.
@@ -872,9 +1087,11 @@ fn bound_handle_dirs(base_dir: &Path, account: AccountNum) -> Vec<PathBuf> {
 /// 3): each unconfirmed clear is logged at WARN with a fixed-vocabulary
 /// `error_kind` (handle-dir NAME only, never an absolute path —
 /// `security.md` MUST-2), and the aggregate result is reported on
-/// `LogoutSummary::keychain_cleared`.
-fn clear_bound_keychain_items(base_dir: &Path, account: AccountNum) -> bool {
-    let mut any_confirmed = false;
+/// `LogoutSummary::keychain_cleared` — plus
+/// `LogoutSummary::keychain_retry_queue_failed` when an unconfirmed clear
+/// could not even be queued for automatic retry (R3 sec M-D / corr L-3).
+fn clear_bound_keychain_items(base_dir: &Path, account: AccountNum) -> KeychainClearOutcome {
+    let mut outcome = KeychainClearOutcome::default();
     for path in bound_handle_dirs(base_dir, account) {
         let dir_name = path
             .file_name()
@@ -902,18 +1119,8 @@ fn clear_bound_keychain_items(base_dir: &Path, account: AccountNum) -> bool {
         };
         let result = crate::credentials::keychain::clear_handle_dir_reporting(&abs);
         let (confirmed, needs_retry) = note_clear_result(result);
-        if confirmed {
-            any_confirmed = true;
-        }
+        let mut queued = true;
         if needs_retry {
-            tracing::warn!(
-                error_kind = "keychain_clear_unconfirmed",
-                account = account.get(),
-                dir = %dir_name,
-                "logout: could not confirm the keychain OAuth item was cleared for \
-                 this handle dir (non-fatal — keychain may be locked or unavailable; \
-                 queued for automatic retry; logout continues)"
-            );
             // Security review 1386 H1: the file-based copies of this
             // credential are deleted later in THIS SAME logout_account call
             // (ALL_SURFACES sweep, config_dir removal, identity dir removal),
@@ -927,7 +1134,7 @@ fn clear_bound_keychain_items(base_dir: &Path, account: AccountNum) -> bool {
             // call just attempted (`clear_handle_dir_reporting`, above),
             // never decide+adopt. No candidate email or account-attribute
             // hint is needed for that disposition.
-            crate::credentials::keychain::record_pending_clear(
+            queued = crate::credentials::keychain::record_pending_clear(
                 base_dir,
                 &crate::credentials::keychain::service_name(&abs),
                 Some(account),
@@ -935,9 +1142,65 @@ fn clear_bound_keychain_items(base_dir: &Path, account: AccountNum) -> bool {
                 None,
                 None,
             );
+            // R3 sec M-D / corr L-3: a refused queue write is NOT "queued for
+            // automatic retry". The item may survive this logout with nothing
+            // left to retry it, so the refusal is both logged accurately and
+            // carried on the summary for the operator.
+            if queued {
+                tracing::warn!(
+                    error_kind = "keychain_clear_unconfirmed",
+                    account = account.get(),
+                    dir = %dir_name,
+                    "logout: could not confirm the keychain OAuth item was cleared for \
+                     this handle dir (non-fatal — keychain may be locked or unavailable; \
+                     queued for automatic retry; logout continues)"
+                );
+            } else {
+                tracing::warn!(
+                    error_kind = "keychain_clear_unconfirmed_not_queued",
+                    account = account.get(),
+                    dir = %dir_name,
+                    "logout: could not confirm the keychain OAuth item was cleared for \
+                     this handle dir, and the automatic retry could NOT be queued \
+                     (the retry spool is full or unwritable); the item may survive \
+                     this logout — logout continues"
+                );
+            }
         }
+        fold_clear_outcome(&mut outcome, confirmed, needs_retry, queued);
     }
-    any_confirmed
+    outcome
+}
+
+/// Fold ONE handle dir's outcome into the aggregate (R3 sec M-D / corr L-3).
+///
+/// `queued` is the durable-retry result: `false` means the unconfirmed clear
+/// could NOT be persisted, so the keychain item may survive with no sweep to
+/// retry it. The refusal is no longer log-only — it sets
+/// [`KeychainClearOutcome::retry_queue_failed`], which [`LogoutSummary`]
+/// carries to the CLI and IPC result.
+fn fold_clear_outcome(
+    outcome: &mut KeychainClearOutcome,
+    confirmed: bool,
+    needs_retry: bool,
+    queued: bool,
+) {
+    if confirmed {
+        outcome.any_confirmed = true;
+    }
+    if needs_retry && !queued {
+        outcome.retry_queue_failed = true;
+    }
+}
+
+/// What [`clear_bound_keychain_items`] reports: whether ANY bound handle
+/// dir's keychain item was confirmed cleared, and whether any unconfirmed
+/// clear could not even be QUEUED for automatic retry (R3 sec M-D / corr
+/// L-3). Both are operator-visible through [`LogoutSummary`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct KeychainClearOutcome {
+    any_confirmed: bool,
+    retry_queue_failed: bool,
 }
 
 /// Pure decision for one handle dir's keychain-clear result: does
@@ -1005,9 +1268,51 @@ fn note_clear_result(
 /// `orphan_identity_gc::prune_orphan_identities` GC pass uses, applied at the
 /// source so the GC has nothing to collect in the steady state.
 fn remove_profiles_entry(
+    lock: &ProfilesFileLock,
+    base_dir: &Path,
+    account: AccountNum,
+) -> Result<(bool, Option<IdentityId>), LogoutError> {
+    remove_profiles_entry_with(lock, base_dir, account, profiles::save)
+}
+
+fn remove_profiles_entry_with(
+    lock: &ProfilesFileLock,
+    base_dir: &Path,
+    account: AccountNum,
+    save: impl FnOnce(&Path, &profiles::ProfilesFile) -> Result<(), crate::error::ConfigError>,
+) -> Result<(bool, Option<IdentityId>), LogoutError> {
+    remove_profiles_entry_with_stat(lock, base_dir, account, save, |path| {
+        std::fs::symlink_metadata(path)
+    })
+}
+
+fn remove_profiles_entry_with_stat(
+    lock: &ProfilesFileLock,
+    base_dir: &Path,
+    account: AccountNum,
+    save: impl FnOnce(&Path, &profiles::ProfilesFile) -> Result<(), crate::error::ConfigError>,
+    confirm_stat: impl FnOnce(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> Result<(bool, Option<IdentityId>), LogoutError> {
+    remove_profiles_entry_with_marker(
+        lock,
+        base_dir,
+        account,
+        save,
+        confirm_stat,
+        crate::accounts::identity_store::mark_identity_removed_checked,
+    )
+}
+
+fn remove_profiles_entry_with_marker(
     _lock: &ProfilesFileLock,
     base_dir: &Path,
     account: AccountNum,
+    save: impl FnOnce(&Path, &profiles::ProfilesFile) -> Result<(), crate::error::ConfigError>,
+    confirm_stat: impl FnOnce(&Path) -> std::io::Result<std::fs::Metadata>,
+    mark: impl FnOnce(
+        &Path,
+        IdentityId,
+    ) -> std::io::Result<crate::accounts::identity_store::RemovalMarker>,
 ) -> Result<(bool, Option<IdentityId>), LogoutError> {
     let path = profiles::profiles_path(base_dir);
     if !path.exists() {
@@ -1057,6 +1362,37 @@ fn remove_profiles_entry(
         let _ = legacy_email;
     }
 
+    if let Some(uuid) = removed_uuid {
+        if !file.by_slot.values().any(|other| *other == uuid) {
+            // Remove only this exact local identity's context entries. A same
+            // email belonging to another org/UUID remains reuse-eligible.
+            file.anthropic_contexts
+                .retain(|entry| entry.identity_uuid != uuid);
+        }
+    }
+    // Increment the slot generation even when it becomes unbound: an ABA rebind
+    // cannot revive an old HTTP capture.
+    let generation = file
+        .slot_binding_generations
+        .entry(key.clone())
+        .or_default();
+    *generation = generation.checked_add(1).ok_or_else(|| {
+        LogoutError::Profiles(crate::error::ConfigError::InvalidJson {
+            path: path.clone(),
+            reason: "slot_generation_exhausted".into(),
+        })
+    })?;
+
+    // Review R2 L-R2-1: the slot's bounded binding history is cleared in
+    // this same locked mutation. Logout tombstones only the identity that
+    // logged out, never its predecessors — leaving `history[N]` in place
+    // means a later `csq login N` as a NEW identity E still admits N's
+    // earlier tenants' stored tokens (the reader admits unbound,
+    // non-removed history members). Clearing it makes the vacated slot
+    // admit nothing, so a stale foreign token in E's item takes the
+    // harvest-first refusal.
+    let _ = file.slot_binding_history.remove(&key);
+
     // Remove the legacy `accounts[key]` entry from extra if present.
     let accounts_had_entry = if let Some(accounts_val) = file.extra.get_mut("accounts") {
         if let Some(obj) = accounts_val.as_object_mut() {
@@ -1079,10 +1415,56 @@ fn remove_profiles_entry(
     // reusing `still_referenced` (by_slot only) — a by_email straggler under a
     // different email key must still KEEP the dir (reuse-eligible).
     let orphaned_uuid = removed_uuid.filter(|u| {
-        !file.by_slot.values().any(|x| x == u) && !file.by_email.values().any(|x| x == u)
+        !file.by_slot.values().any(|x| x == u)
+            && !file.by_email.values().any(|x| x == u)
+            && !file
+                .anthropic_contexts
+                .iter()
+                .any(|entry| entry.identity_uuid == *u)
     });
 
-    profiles::save(&path, &file).map_err(LogoutError::Profiles)?;
+    let mut removal_marker = None;
+    // Publish the last-reference tombstone while profiles authority is still
+    // held, before an unbound row can become visible to legacy repair.
+    if let Some(uuid) = orphaned_uuid {
+        let marker = crate::accounts::identity_store::identity_removed_marker_path(base_dir, uuid);
+        let witness = mark(base_dir, uuid).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::InvalidData {
+                LogoutError::NonregularTombstone {
+                    path: marker.clone(),
+                }
+            } else if source.kind() == std::io::ErrorKind::NotADirectory {
+                LogoutError::UnsafeTombstoneNamespace {
+                    path: crate::accounts::identity_store::identities_dir(base_dir),
+                }
+            } else {
+                LogoutError::Io {
+                    path: marker.clone(),
+                    source,
+                }
+            }
+        })?;
+        // A writer's fail-closed "removed or unreadable" result is not proof
+        // that logout has confirmed a regular marker before unlinking profiles.
+        if !confirm_stat(&marker).is_ok_and(|metadata| metadata.is_file()) {
+            witness.rollback_if_created();
+            return Err(LogoutError::Io {
+                path: marker,
+                source: std::io::Error::other("identity removal tombstone could not be confirmed"),
+            });
+        }
+        removal_marker = Some(witness);
+        #[cfg(test)]
+        run_logout_ordering_hook(base_dir, uuid, true);
+    }
+    if let Err(error) = save(&path, &file) {
+        // Profiles still authorizes the old binding. Undo only the marker this
+        // attempt created; never clear a previously removed identity's guard.
+        if let Some(marker) = removal_marker {
+            marker.rollback_if_created();
+        }
+        return Err(LogoutError::Profiles(error));
+    }
     // Return true if EITHER channel had an entry to clean. Under M4-9
     // the post-mint normal case has by_slot[N] populated but
     // accounts[N] empty — that still counts as a successful removal.
@@ -1099,6 +1481,81 @@ mod tests {
 
     fn account(n: u16) -> AccountNum {
         AccountNum::try_from(n).unwrap()
+    }
+
+    /// Minimal structured tracing capture for logout's fixed-vocabulary WARNs.
+    /// Same shape as the crate's other capture fixtures: thread-local
+    /// `set_default`/`with_default`, never a global subscriber, and it records
+    /// only `error_kind` + `message` (no credentials, no paths asserted).
+    #[derive(Clone, Debug, Default)]
+    struct CapturedWarn {
+        error_kind: Option<String>,
+        message: Option<String>,
+    }
+
+    #[derive(Clone, Default)]
+    struct WarnLog(std::sync::Arc<std::sync::Mutex<Vec<CapturedWarn>>>);
+
+    impl WarnLog {
+        fn error_kinds(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|event| event.error_kind.clone())
+                .collect()
+        }
+
+        fn has_error_kind(&self, tag: &str) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.error_kind.as_deref() == Some(tag))
+        }
+    }
+
+    struct WarnVisitor<'a>(&'a mut CapturedWarn);
+
+    impl tracing::field::Visit for WarnVisitor<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            match field.name() {
+                "error_kind" => self.0.error_kind = Some(value.to_owned()),
+                "message" => self.0.message = Some(value.to_owned()),
+                _ => {}
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" && self.0.message.is_none() {
+                self.0.message = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl tracing::Subscriber for WarnLog {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::level_filters::LevelFilter::WARN
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::WARN)
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut captured = CapturedWarn::default();
+            event.record(&mut WarnVisitor(&mut captured));
+            self.0.lock().unwrap().push(captured);
+        }
     }
 
     fn provision_account(base: &Path, n: u16) {
@@ -1158,6 +1615,48 @@ mod tests {
         assert!(summary.config_dir_removed);
         assert!(!dir.path().join("credentials/3.json").exists());
         assert!(!dir.path().join("config-3").exists());
+    }
+
+    /// Review R2 L-R2-1: `csq logout N` clears the slot's bounded binding
+    /// history in the same locked mutation that unbinds it. Logout
+    /// tombstones only the identity that logged out, never its
+    /// predecessors — without this clear, a later `csq login N` as a NEW
+    /// identity E still admits N's earlier tenants' stored tokens (the
+    /// reader admits unbound, non-removed history members).
+    #[test]
+    fn logout_clears_the_slots_binding_history() {
+        use crate::accounts::identity_store::IdentityId;
+
+        let dir = TempDir::new().unwrap();
+        provision_account(dir.path(), 1);
+        let uuid = IdentityId::new_v4();
+        write_profiles_with_identity(dir.path(), &[(1, "history@test.invalid", uuid)]);
+        plant_identity_dir(dir.path(), uuid);
+        // The slot's earlier tenant, planted exactly as the rebind writer
+        // records it.
+        let prior = IdentityId::new_v4();
+        let path = profiles::profiles_path(dir.path());
+        let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+        {
+            let mut file = profiles::load(&path).unwrap();
+            profiles::record_binding_displacement(&mut file, 1, prior);
+            profiles::save(&path, &file).unwrap();
+        }
+        assert_eq!(
+            profiles::load(&path).unwrap().slot_binding_history.get("1"),
+            Some(&vec![prior]),
+            "fixture precondition: the slot carries lineage before logout"
+        );
+
+        remove_profiles_entry(&lock, dir.path(), account(1)).unwrap();
+
+        let after = profiles::load(&path).unwrap();
+        assert!(!after.by_slot.contains_key("1"), "the slot is unbound");
+        assert_eq!(
+            after.slot_binding_history.get("1"),
+            None,
+            "logout must clear the slot's binding history (review R2 L-R2-1)"
+        );
     }
 
     /// Removing an account RESOLVES the broker-failed condition permanently —
@@ -1483,6 +1982,119 @@ mod tests {
         assert!(!reloaded.accounts_for_test().contains_key("2"));
     }
 
+    /// A handle dir named `term-<name_pid>` bound to account `n` via the real symlink.
+    #[cfg(unix)]
+    fn bound_term_dir(base: &Path, n: u16, name_pid: u32) -> PathBuf {
+        let handle = base.join(format!("term-{name_pid}"));
+        fs::create_dir_all(&handle).unwrap();
+        std::os::unix::fs::symlink(
+            base.join(format!("config-{n}")).join(".csq-account"),
+            handle.join(".csq-account"),
+        )
+        .unwrap();
+        handle
+    }
+
+    /// `.live-pid` names a dead process; `.live-cc-pid` names THIS (live) process, the
+    /// SIGKILLed-csq-parent shape. Logout must refuse.
+    #[cfg(unix)]
+    #[test]
+    fn logout_refuses_when_only_live_cc_pid_is_alive() {
+        let dir = TempDir::new().unwrap();
+        provision_account(dir.path(), 4);
+        let handle = bound_term_dir(dir.path(), 4, 999_999_031);
+        fs::write(handle.join(".live-pid"), "999999032").unwrap();
+        fs::write(handle.join(".live-cc-pid"), std::process::id().to_string()).unwrap();
+        match logout_account(dir.path(), account(4)) {
+            Err(LogoutError::InUse { pids, .. }) => {
+                assert_eq!(pids, vec![std::process::id()])
+            }
+            other => panic!("expected InUse, got {other:?}"),
+        }
+        assert!(dir.path().join("config-4").exists());
+    }
+
+    /// Both markers dead: logout is NOT blocked by the new check (guards against
+    /// over-refusal).
+    #[cfg(unix)]
+    #[test]
+    fn logout_proceeds_when_both_markers_dead() {
+        let dir = TempDir::new().unwrap();
+        provision_account(dir.path(), 4);
+        let handle = bound_term_dir(dir.path(), 4, 999_999_033);
+        fs::write(handle.join(".live-pid"), "999999034").unwrap();
+        fs::write(handle.join(".live-cc-pid"), "999999035").unwrap();
+        assert!(scan_live_handle_dirs_for_account(dir.path(), account(4)).is_empty());
+    }
+
+    /// An unreadable marker (a directory; an oversized file) counts as IN USE.
+    #[cfg(unix)]
+    #[test]
+    fn logout_refuses_when_pid_marker_unreadable() {
+        for (marker, kind) in [
+            (".live-cc-pid", "dir"),
+            (".live-cc-pid", "oversized"),
+            (".live-pid", "dir"),
+            (".live-pid", "oversized"),
+        ] {
+            let dir = TempDir::new().unwrap();
+            provision_account(dir.path(), 4);
+            let handle = bound_term_dir(dir.path(), 4, 999_999_036);
+            if marker == ".live-cc-pid" {
+                fs::write(handle.join(".live-pid"), "999999037").unwrap();
+            }
+            let p = handle.join(marker);
+            if kind == "dir" {
+                fs::create_dir(&p).unwrap();
+            } else {
+                fs::write(&p, "9".repeat(4096)).unwrap();
+            }
+            match logout_account(dir.path(), account(4)) {
+                Err(LogoutError::InUse {
+                    pids,
+                    unreadable_dirs,
+                    ..
+                }) => {
+                    assert!(
+                        pids.is_empty(),
+                        "{marker} {kind}: no sentinel pid: {pids:?}"
+                    );
+                    assert_eq!(unreadable_dirs, vec!["term-999999036".to_string()]);
+                }
+                other => panic!("{marker} {kind}: expected InUse, got {other:?}"),
+            }
+            assert!(dir.path().join("config-4").exists(), "{marker} {kind}");
+        }
+    }
+
+    #[test]
+    fn in_use_message_names_unreadable_dir_never_pid_zero() {
+        let a = account(4);
+        let m = in_use_message(a, &[], &["term-1234".to_string()]);
+        assert_eq!(
+            m,
+            "account 4: handle dir term-1234 has a pid marker that cannot be read; inspect it and remove it if stale, then retry"
+        );
+        assert!(!m.contains("[0]") && !m.contains("claude process"), "{m}");
+        let e = LogoutError::InUse {
+            account: a,
+            pids: vec![77],
+            unreadable_dirs: vec!["term-1".into(), "term-2".into()],
+        };
+        let m = e.to_string();
+        assert!(
+            m.contains("[77]") && m.contains("term-1, term-2") && m.contains("have pid markers"),
+            "{m}"
+        );
+        assert!(!m.contains("[0"), "{m}");
+    }
+
+    #[test]
+    fn display_dir_name_never_leaks_a_path() {
+        assert_eq!(display_dir_name("term-12"), "term-12");
+        assert_eq!(display_dir_name("term-/Users/x"), "term-?");
+    }
+
     #[test]
     fn logout_refuses_when_handle_dir_alive() {
         let dir = TempDir::new().unwrap();
@@ -1509,7 +2121,9 @@ mod tests {
         fs::write(handle.join(".live-pid"), my_pid.to_string()).unwrap();
 
         match logout_account(dir.path(), account(4)) {
-            Err(LogoutError::InUse { account: a, pids }) => {
+            Err(LogoutError::InUse {
+                account: a, pids, ..
+            }) => {
                 assert_eq!(a, account(4));
                 assert!(pids.contains(&my_pid), "expected my PID in {pids:?}");
             }
@@ -1569,7 +2183,9 @@ mod tests {
         fs::write(handle.join(".live-pid"), my_pid.to_string()).unwrap();
 
         match logout_account(dir.path(), account(slot_n)) {
-            Err(LogoutError::InUse { account: a, pids }) => {
+            Err(LogoutError::InUse {
+                account: a, pids, ..
+            }) => {
                 assert_eq!(a, account(slot_n));
                 assert!(pids.contains(&my_pid), "expected my PID in {pids:?}");
             }
@@ -1700,8 +2316,8 @@ mod tests {
     /// REGRESSION (redteam C1): a slot can lose its `by_slot` entry while
     /// KEEPING its config dir and that dir's UUID marker — the codex
     /// partial-mint rollback (`profiles::remove_slot_mapping`) does exactly
-    /// this — and `identity_mint::mint_for_login` REUSES `by_email[email]`,
-    /// so a sibling slot can legitimately hold the same UUID.
+    /// this — and a legacy install minted by the retired email-only `mint_for_login`
+    /// (which REUSED `by_email[email]`) can have a sibling slot hold the same UUID.
     ///
     /// In that state the dir's UUID IS attributable (to the sibling), but the
     /// live handle dir resolves into OUR config dir. Treating "attributable
@@ -1748,7 +2364,9 @@ mod tests {
         fs::write(handle.join(".live-pid"), my_pid.to_string()).unwrap();
 
         match logout_account(dir.path(), account(target)) {
-            Err(LogoutError::InUse { account: a, pids }) => {
+            Err(LogoutError::InUse {
+                account: a, pids, ..
+            }) => {
                 assert_eq!(a, account(target));
                 assert!(pids.contains(&my_pid), "expected my PID in {pids:?}");
             }
@@ -2327,6 +2945,509 @@ mod tests {
         );
     }
 
+    /// ROOT ruling D (D237 round 2; findings logout M2/M1 + sec M1): when the
+    /// identity's canonical credential lock is still held past the bounded
+    /// wait, logout REFUSES the delete (never deletes without the lock),
+    /// emits the fixed-vocabulary `logout_identity_dir_lock_busy` warning,
+    /// reports `identity_dir_pending_removal`, and leaves the credential
+    /// folder on disk with the tombstone in place. The next orphan-identity
+    /// GC pass then collects that leftover directory — the disposition the
+    /// base code CLAIMED without proving.
+    ///
+    /// Non-vacuity (RED): the holder keeps the lock until the test has read
+    /// logout's outcome, so a logout that WAITS for the lock is proven to have
+    /// returned only after the holder released. A logout that (a) skips the
+    /// fixed-vocabulary warning, (b) does not report the pending removal,
+    /// (c) deletes without the lock, or (d) waits instead of refusing reds by
+    /// ASSERTION (no hang: the holder's safety release is test-bounded).
+    #[test]
+    fn logout_lock_busy_leaves_dir_that_the_orphan_gc_then_collects() {
+        use crate::accounts::identity_store::{
+            credentials_path_for, is_identity_removed, IdentityId,
+        };
+
+        // Captured tracing is process-wide-filter-sensitive; share the crate
+        // capture lock (see `crate::testing::TRACING_CAPTURE_LOCK`).
+        let _capture_guard = crate::testing::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().to_path_buf();
+        provision_account(&base, 1);
+        provision_account(&base, 2);
+        let going = IdentityId::new_v4();
+        let staying = IdentityId::new_v4();
+        write_profiles_with_identity(
+            &base,
+            &[
+                (1, "gone@test.invalid", going),
+                (2, "kept@test.invalid", staying),
+            ],
+        );
+        plant_identity_dir(&base, going);
+        plant_identity_dir(&base, staying);
+
+        // Another writer holds the canonical credential lock for the identity
+        // being logged out, and KEEPS holding it until the test has observed
+        // logout's outcome. The hold is event-synchronised on purpose: the
+        // product's bounded wait is COUNT-based (`CREDENTIAL_LOCK_ATTEMPTS` x
+        // `CREDENTIAL_LOCK_DELAY`), not a wall-clock deadline, so a descheduled
+        // waiter stretches it without bound. A fixed sleep here (the old
+        // `budget + 1.5s`) races that stretch: on a loaded host the loop can
+        // still be running past the release and then acquire a lock logout
+        // should have refused. `test_guard` is the TEST's hang guard -- how far
+        // scheduling may stretch a CORRECT logout before the holder releases and
+        // a waiting implementation reds by assertion instead of hanging.
+        // `logout_bound` is a derived BOUND on how long logout may wait: a raised
+        // attempt count would extend the wait past it and red. The holder's safety
+        // release is STRICTLY longer, so load can never release the holder while a
+        // correct logout is still inside its bound (that would false-red and blame
+        // the implementation).
+        const SCHEDULING_STRETCH: u32 = 10;
+        let logout_bound = crate::platform::lock::CREDENTIAL_LOCK_BUDGET * SCHEDULING_STRETCH;
+        let holder_safety = logout_bound * 2;
+        let lock_path = credentials_path_for(&base, going).with_extension("lock");
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let still_held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let still_held_bg = std::sync::Arc::clone(&still_held);
+        let holder = std::thread::spawn(move || {
+            let guard = crate::platform::lock::lock_file(&lock_path)
+                .expect("holder takes the canonical credential lock");
+            still_held_bg.store(true, std::sync::atomic::Ordering::SeqCst);
+            held_tx.send(()).expect("signal held");
+            // Released by the test once it has read logout's outcome; the
+            // timeout only lets a WAITING implementation return and red.
+            let _ = release_rx.recv_timeout(holder_safety);
+            still_held_bg.store(false, std::sync::atomic::Ordering::SeqCst);
+            drop(guard);
+        });
+        held_rx
+            .recv_timeout(holder_safety)
+            .expect("holder must acquire before logout runs");
+
+        let log = WarnLog::default();
+        let started = std::time::Instant::now();
+        let result =
+            tracing::subscriber::with_default(log.clone(), || logout_account(&base, account(1)));
+        let elapsed = started.elapsed();
+        // Read the holder's state BEFORE releasing it: a refusal must return
+        // while the lock is genuinely held, within the derived bounded wait.
+        let held_through_logout = still_held.load(std::sync::atomic::Ordering::SeqCst);
+        let _ = release_tx.send(());
+        holder.join().expect("holder thread must exit");
+
+        let summary = result.expect("logout completes — the dir delete is deferred, not fatal");
+        assert!(
+            held_through_logout,
+            "logout must return while the canonical lock is STILL held: a holder \
+             that was released first let a waiting implementation pass"
+        );
+        assert!(
+            elapsed < logout_bound,
+            "logout must refuse within its derived bounded wait {logout_bound:?}; waited {elapsed:?}"
+        );
+        assert!(
+            !summary.identity_dir_removed,
+            "logout must NOT report the identity dir removed when it was refused"
+        );
+        assert!(
+            summary.identity_dir_pending_removal,
+            "logout must report the pending removal so callers can tell the operator \
+             the local credential folder was NOT removed"
+        );
+        assert!(
+            log.has_error_kind("logout_identity_dir_lock_busy"),
+            "logout must emit the fixed-vocabulary expiry warning; captured: {:?}",
+            log.error_kinds()
+        );
+
+        // The refusal is real: dir, credential copy, and tombstone all on disk;
+        // the sibling identity (still bound) is untouched.
+        assert!(
+            identity_path(&base, going).is_dir(),
+            "the refused delete must leave the identity dir on disk"
+        );
+        assert!(
+            identity_path(&base, going)
+                .join("credentials.json")
+                .is_file(),
+            "the local credential copy must still be on disk after the refusal"
+        );
+        assert!(
+            is_identity_removed(&base, going),
+            "the tombstone written before the delete attempt must remain"
+        );
+        assert!(identity_path(&base, staying).is_dir());
+
+        // The next cleanup pass collects exactly the leftover dir: it is
+        // unreferenced by both maps (the tombstone does not reference it),
+        // the bound sibling is kept, and the tombstone survives the GC.
+        let gc_lock = ProfilesFileLock::acquire(&base).expect("gc profiles lock");
+        let report = crate::accounts::orphan_identity_gc::prune_orphan_identities(&gc_lock, &base)
+            .expect("orphan-identity GC run");
+        drop(gc_lock);
+        assert_eq!(
+            report.pruned_count, 1,
+            "the next cleanup must collect the leftover identity dir"
+        );
+        assert!(
+            !identity_path(&base, going).exists(),
+            "the GC must remove the leftover credential folder"
+        );
+        assert!(
+            identity_path(&base, staying).is_dir(),
+            "the still-bound sibling identity must be kept"
+        );
+        assert!(
+            is_identity_removed(&base, going),
+            "the GC must not clear the tombstone"
+        );
+    }
+
+    /// R2-M1: logout writes the tombstone BEFORE deleting, and deletes under
+    /// `credentials.lock`. A concurrent writer holding that lock keeps the
+    /// dir alive, but the tombstone is already visible to it.
+    #[cfg(unix)]
+    #[test]
+    fn logout_tombstones_before_delete_and_deletes_under_canonical_lock() {
+        use crate::accounts::identity_store::{credentials_path_for, is_identity_removed};
+        let dir = TempDir::new().unwrap();
+        provision_account(dir.path(), 1);
+        let uuid = IdentityId::new_v4();
+        write_profiles_with_identity(dir.path(), &[(1, "alice@x.com", uuid)]);
+        plant_identity_dir(dir.path(), uuid);
+        let lock_path = credentials_path_for(dir.path(), uuid).with_extension("lock");
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let base = dir.path().to_path_buf();
+        let handle = std::thread::spawn(move || {
+            LOGOUT_ORDERING_HOOK.with(|hook| {
+                let mut before_save_calls = 0;
+                *hook.borrow_mut() = Some(Box::new(move |base, identity, before_save| {
+                    assert_eq!(identity, uuid);
+                    assert!(is_identity_removed(base, uuid));
+                    let profiles = profiles::load(&profiles::profiles_path(base)).unwrap();
+                    if before_save {
+                        assert_eq!(before_save_calls, 0, "before-save hook must run only once");
+                        before_save_calls += 1;
+                        assert_eq!(
+                            profiles.by_slot.get("1"),
+                            Some(&uuid),
+                            "tombstone must precede the durable profiles unlink"
+                        );
+                    } else {
+                        assert_eq!(
+                            before_save_calls, 1,
+                            "before-save hook must run exactly once before delete"
+                        );
+                        assert!(!profiles.by_slot.contains_key("1"));
+                        assert!(
+                            crate::platform::lock::try_lock_file(&lock_path)
+                                .unwrap()
+                                .is_none(),
+                            "logout must hold the real canonical lock before deleting"
+                        );
+                        reached_tx.send(()).unwrap();
+                        continue_rx
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .unwrap();
+                    }
+                }));
+            });
+            logout_account(&base, account(1))
+        });
+        reached_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(identity_path(dir.path(), uuid).exists());
+        continue_tx.send(()).unwrap();
+        let summary = handle.join().unwrap().unwrap();
+        assert!(summary.identity_dir_removed);
+        assert!(!identity_path(dir.path(), uuid).exists());
+    }
+
+    #[test]
+    fn logout_tombstone_confirmation_stat_error_preserves_profiles() {
+        for marker_state in [0, 1, 2] {
+            let dir = TempDir::new().unwrap();
+            provision_account(dir.path(), 1);
+            let uuid = IdentityId::new_v4();
+            write_profiles_with_identity(dir.path(), &[(1, "confirmation@test.invalid", uuid)]);
+            plant_identity_dir(dir.path(), uuid);
+            let marker =
+                crate::accounts::identity_store::identity_removed_marker_path(dir.path(), uuid);
+            if marker_state == 1 {
+                fs::write(&marker, b"preexisting nonsecret guard").unwrap();
+            }
+            let path = profiles::profiles_path(dir.path());
+            let before = fs::read(&path).unwrap();
+            let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+            let confirmed = std::cell::Cell::new(false);
+            let saved = std::cell::Cell::new(false);
+            let result = remove_profiles_entry_with_stat(
+                &lock,
+                dir.path(),
+                account(1),
+                |path, file| {
+                    saved.set(true);
+                    profiles::save(path, file)
+                },
+                |marker| {
+                    assert_eq!(
+                        marker,
+                        crate::accounts::identity_store::identity_removed_marker_path(
+                            dir.path(),
+                            uuid
+                        )
+                    );
+                    assert!(fs::symlink_metadata(marker).unwrap().is_file());
+                    if marker_state == 2 {
+                        fs::rename(marker, marker.with_extension("attempt-owned")).unwrap();
+                        fs::write(marker, b"replacement nonsecret guard").unwrap();
+                    }
+                    confirmed.set(true);
+                    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                },
+            );
+            assert!(confirmed.get(), "the confirmation stat must execute");
+            assert!(matches!(result, Err(LogoutError::Io { .. })));
+            assert!(
+                !saved.get(),
+                "an unconfirmed tombstone must not publish unlink"
+            );
+            assert_eq!(fs::read(path).unwrap(), before);
+            assert!(identity_path(dir.path(), uuid).is_dir());
+            if marker_state == 1 {
+                assert_eq!(fs::read(marker).unwrap(), b"preexisting nonsecret guard");
+            } else if marker_state == 2 {
+                assert_eq!(fs::read(marker).unwrap(), b"replacement nonsecret guard");
+            } else {
+                assert_eq!(
+                    fs::symlink_metadata(marker).unwrap_err().kind(),
+                    std::io::ErrorKind::NotFound,
+                    "confirmation failure must remove only this attempt's marker"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn logout_nonregular_tombstone_names_marker_and_preserves_profiles() {
+        let dir = TempDir::new().unwrap();
+        provision_account(dir.path(), 1);
+        let uuid = IdentityId::new_v4();
+        write_profiles_with_identity(dir.path(), &[(1, "nonregular@test.invalid", uuid)]);
+        plant_identity_dir(dir.path(), uuid);
+        let marker =
+            crate::accounts::identity_store::identity_removed_marker_path(dir.path(), uuid);
+        fs::create_dir(&marker).unwrap();
+        let path = profiles::profiles_path(dir.path());
+        let before = fs::read(&path).unwrap();
+        let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+        let error = remove_profiles_entry(&lock, dir.path(), account(1)).unwrap_err();
+        assert!(matches!(&error, LogoutError::NonregularTombstone { path } if *path == marker));
+        assert!(error
+            .to_string()
+            .contains("identity_removal_marker_nonregular"));
+        assert!(error
+            .to_string()
+            .contains("tombstone is not a regular file"));
+        assert!(error.to_string().contains(&marker.display().to_string()));
+        assert_eq!(fs::read(path).unwrap(), before);
+        assert!(marker.is_dir());
+        assert!(identity_path(dir.path(), uuid).is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logout_hardlinked_tombstone_has_distinct_diagnostic_and_preserves_profiles() {
+        let dir = TempDir::new().unwrap();
+        provision_account(dir.path(), 1);
+        let uuid = IdentityId::new_v4();
+        write_profiles_with_identity(dir.path(), &[(1, "hardlink@test.invalid", uuid)]);
+        plant_identity_dir(dir.path(), uuid);
+        let marker =
+            crate::accounts::identity_store::identity_removed_marker_path(dir.path(), uuid);
+        let target = dir.path().join("nonsecret-owned-target");
+        fs::write(&target, b"must remain intact").unwrap();
+        fs::hard_link(&target, &marker).unwrap();
+        let before = fs::read(profiles::profiles_path(dir.path())).unwrap();
+        let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+        let error = remove_profiles_entry(&lock, dir.path(), account(1)).unwrap_err();
+        assert!(
+            matches!(&error, LogoutError::NonregularTombstone { path } if *path == marker),
+            "hardlink must use distinct tombstone diagnostic"
+        );
+        assert!(error
+            .to_string()
+            .contains("identity_removal_marker_nonregular"));
+        assert_eq!(fs::read(&target).unwrap(), b"must remain intact");
+        assert_eq!(
+            fs::read(profiles::profiles_path(dir.path())).unwrap(),
+            before
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logout_symlinked_namespace_has_distinct_diagnostic_and_preserves_profiles() {
+        let dir = TempDir::new().unwrap();
+        provision_account(dir.path(), 1);
+        let uuid = IdentityId::new_v4();
+        write_profiles_with_identity(dir.path(), &[(1, "namespace@test.invalid", uuid)]);
+        plant_identity_dir(dir.path(), uuid);
+        let namespace = crate::accounts::identity_store::identities_dir(dir.path());
+        let real = dir.path().join("owned-real-identities");
+        fs::rename(&namespace, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &namespace).unwrap();
+        let before = fs::read(profiles::profiles_path(dir.path())).unwrap();
+        let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+        let error = remove_profiles_entry(&lock, dir.path(), account(1)).unwrap_err();
+        assert!(
+            matches!(&error, LogoutError::UnsafeTombstoneNamespace { path } if *path == namespace),
+            "namespace alias must use distinct diagnostic"
+        );
+        assert!(error
+            .to_string()
+            .contains("identity_removal_namespace_nonregular"));
+        assert!(error.to_string().contains(&namespace.display().to_string()));
+        assert_eq!(
+            fs::read(profiles::profiles_path(dir.path())).unwrap(),
+            before
+        );
+        let marker =
+            crate::accounts::identity_store::identity_removed_marker_path(dir.path(), uuid);
+        assert!(!real.join(marker.file_name().unwrap()).exists());
+        assert!(real.join(uuid.to_string()).is_dir());
+    }
+
+    #[test]
+    fn logout_marker_sync_failure_preserves_profiles_and_rolls_back_own_marker() {
+        #[cfg(unix)]
+        let stages = [false, true];
+        #[cfg(not(unix))]
+        let stages = [false];
+        for directory_failure in stages {
+            let dir = TempDir::new().unwrap();
+            provision_account(dir.path(), 1);
+            let uuid = IdentityId::new_v4();
+            write_profiles_with_identity(dir.path(), &[(1, "sync-error@test.invalid", uuid)]);
+            plant_identity_dir(dir.path(), uuid);
+            let path = profiles::profiles_path(dir.path());
+            let before = fs::read(&path).unwrap();
+            let saved = std::cell::Cell::new(false);
+            let sync_failed = std::cell::Cell::new(false);
+            let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+            let result = remove_profiles_entry_with_marker(
+                &lock,
+                dir.path(),
+                account(1),
+                |path, file| {
+                    saved.set(true);
+                    profiles::save(path, file)
+                },
+                |path| fs::symlink_metadata(path),
+                |base, id| {
+                    crate::accounts::identity_store::mark_identity_removed_with_sync(
+                        base,
+                        id,
+                        |file| {
+                            if file.metadata()?.is_dir() == directory_failure {
+                                sync_failed.set(true);
+                                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                            } else {
+                                file.sync_all()
+                            }
+                        },
+                    )
+                },
+            );
+            assert!(
+                sync_failed.get(),
+                "selected marker or directory sync must execute"
+            );
+            assert!(
+                matches!(result, Err(LogoutError::Io { .. })),
+                "sync failure must refuse profiles publication"
+            );
+            assert!(!saved.get());
+            assert_eq!(fs::read(path).unwrap(), before);
+            let marker =
+                crate::accounts::identity_store::identity_removed_marker_path(dir.path(), uuid);
+            assert_eq!(
+                fs::symlink_metadata(marker).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
+            assert!(identity_path(dir.path(), uuid).is_dir());
+        }
+    }
+
+    #[test]
+    fn logout_preexisting_marker_survives_profiles_save_failure() {
+        let dir = TempDir::new().unwrap();
+        provision_account(dir.path(), 1);
+        let uuid = IdentityId::new_v4();
+        write_profiles_with_identity(dir.path(), &[(1, "save-error@test.invalid", uuid)]);
+        plant_identity_dir(dir.path(), uuid);
+        let marker =
+            crate::accounts::identity_store::identity_removed_marker_path(dir.path(), uuid);
+        fs::write(&marker, b"preexisting nonsecret guard").unwrap();
+        let path = profiles::profiles_path(dir.path());
+        let before = fs::read(&path).unwrap();
+        let attempted = std::cell::Cell::new(false);
+        let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+        let result = remove_profiles_entry_with(&lock, dir.path(), account(1), |path, _| {
+            attempted.set(true);
+            Err(crate::error::ConfigError::InvalidJson {
+                path: path.to_path_buf(),
+                reason: "fixture_save_refused".into(),
+            })
+        });
+        assert!(attempted.get());
+        assert!(matches!(result, Err(LogoutError::Profiles(_))));
+        assert_eq!(fs::read(path).unwrap(), before);
+        assert_eq!(
+            fs::read(marker).unwrap(),
+            b"preexisting nonsecret guard",
+            "save failure must preserve a preexisting marker"
+        );
+        assert!(identity_path(dir.path(), uuid).is_dir());
+    }
+
+    #[test]
+    fn logout_failed_profiles_save_does_not_tombstone_a_still_bound_identity() {
+        use crate::accounts::identity_store::is_identity_removed;
+        let dir = TempDir::new().unwrap();
+        provision_account(dir.path(), 1);
+        let uuid = IdentityId::new_v4();
+        write_profiles_with_identity(dir.path(), &[(1, "logout-failure@test.invalid", uuid)]);
+        plant_identity_dir(dir.path(), uuid);
+        let before = fs::read(profiles::profiles_path(dir.path())).unwrap();
+        let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+        let result = remove_profiles_entry_with(&lock, dir.path(), account(1), |path, _| {
+            assert!(
+                is_identity_removed(dir.path(), uuid),
+                "marker exists before attempted unlink"
+            );
+            Err(crate::error::ConfigError::InvalidJson {
+                path: path.to_path_buf(),
+                reason: "fixture_profiles_save_refused".into(),
+            })
+        });
+        assert!(matches!(result, Err(LogoutError::Profiles(_))));
+        assert_eq!(
+            fs::read(profiles::profiles_path(dir.path())).unwrap(),
+            before
+        );
+        assert!(
+            !is_identity_removed(dir.path(), uuid),
+            "failed unlink must restore bound identity write authority"
+        );
+        assert!(identity_path(dir.path(), uuid).exists());
+    }
+
     /// AC-LOGOUT-2: a UUID shared by two slots (M1-4 reuse-by-email) MUST NOT
     /// have its identity dir deleted when only ONE slot logs out — the sibling
     /// slot still reads those credentials.
@@ -2784,6 +3905,39 @@ mod tests {
         );
     }
 
+    /// R3 sec M-D / corr L-3: an unconfirmed clear whose durable retry could
+    /// NOT be queued must raise `retry_queue_failed` on the aggregate — the
+    /// field `LogoutSummary` carries to the CLI and IPC result. A queued
+    /// retry, a confirmed clear, and a structural no-op must NOT raise it.
+    ///
+    /// RED mutation: drop the `needs_retry && !queued` branch — the first
+    /// assertion below fails.
+    #[test]
+    fn fold_clear_outcome_reports_only_an_unqueued_retry() {
+        let mut unqueued = KeychainClearOutcome::default();
+        fold_clear_outcome(&mut unqueued, false, true, false);
+        assert!(
+            unqueued.retry_queue_failed,
+            "a refused retry queue must be operator-visible"
+        );
+        assert!(!unqueued.any_confirmed);
+
+        let mut queued = KeychainClearOutcome::default();
+        fold_clear_outcome(&mut queued, false, true, true);
+        assert!(!queued.retry_queue_failed, "a queued retry is fine");
+
+        let mut confirmed = KeychainClearOutcome::default();
+        fold_clear_outcome(&mut confirmed, true, false, true);
+        assert!(confirmed.any_confirmed && !confirmed.retry_queue_failed);
+
+        let mut noop = KeychainClearOutcome::default();
+        fold_clear_outcome(&mut noop, false, false, false);
+        assert!(
+            !noop.any_confirmed && !noop.retry_queue_failed,
+            "a structural no-op (non-macOS / disabled) is not a failure"
+        );
+    }
+
     /// M1: a handle dir whose path cannot be canonicalized must be SKIPPED
     /// (WARN + `continue`), never fall back to the non-canonical path — that
     /// would hash to a keychain service name CC never uses and let
@@ -2822,5 +3976,42 @@ mod tests {
         assert!(std::fs::canonicalize(&handle).is_ok());
         let summary = logout_account(dir.path(), account(27)).unwrap();
         assert!(summary.config_dir_removed);
+    }
+    #[test]
+    fn logout_org_identity_regression_same_email_foreign_org_context_is_preserved() {
+        let dir = TempDir::new().unwrap();
+        let source = IdentityId::new_v4();
+        let sibling = IdentityId::new_v4();
+        let mut profiles = profiles::ProfilesFile::empty();
+        profiles.by_slot.insert("1".into(), source);
+        profiles.by_slot.insert("2".into(), sibling);
+        profiles
+            .by_email
+            .insert("same@example.test".into(), sibling);
+        for (id, org) in [
+            (source, "22222222-2222-4222-8222-222222222222"),
+            (sibling, "33333333-3333-4333-8333-333333333333"),
+        ] {
+            profiles.anthropic_contexts.push(
+                crate::accounts::anthropic_identity::AnthropicContextEntry {
+                    email: "same@example.test".into(),
+                    account_uuid: uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+                        .unwrap(),
+                    organization_uuid: uuid::Uuid::parse_str(org).unwrap(),
+                    identity_uuid: id,
+                    extra: Default::default(),
+                },
+            );
+        }
+        profiles::save(&profiles::profiles_path(dir.path()), &profiles).unwrap();
+        let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+        remove_profiles_entry(&lock, dir.path(), account(1)).unwrap();
+        let actual = profiles::load(&profiles::profiles_path(dir.path())).unwrap();
+        assert!(!actual.by_slot.contains_key("1"));
+        assert_eq!(actual.by_slot.get("2"), Some(&sibling));
+        assert_eq!(actual.by_email.get("same@example.test"), Some(&sibling));
+        assert_eq!(actual.anthropic_contexts.len(), 1);
+        assert_eq!(actual.anthropic_contexts[0].identity_uuid, sibling);
+        assert_eq!(actual.slot_binding_generations.get("1"), Some(&1));
     }
 }

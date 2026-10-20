@@ -98,6 +98,7 @@ fn test_state(base: &std::path::Path) -> server::RouterState {
         audit_health: csq_core::audit::new_shared(csq_core::audit::AuditHealth::Verified),
         audit_records_unverified: 0,
         anchor_sink: None,
+        usage_poller_wake: std::sync::Arc::new(csq_core::daemon::usage_poller::WakeChannel::new()),
         #[cfg(feature = "enterprise")]
         interactive: Arc::new(csq_core::daemon::InteractiveSessionRegistry::empty()),
     }

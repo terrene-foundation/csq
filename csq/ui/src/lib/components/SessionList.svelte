@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { homeDir, join } from "@tauri-apps/api/path";
+  import { untrack } from "svelte";
 
   // ── Types ─────────────────────────────────────────────────
   //
@@ -158,25 +159,6 @@
     setTimeout(() => { justMovedPid = null; }, 600);
   }
 
-  async function getBaseDir(): Promise<string> {
-    // `join` honors the platform path separator and Tauri 2.10's
-    // `homeDir()` has no trailing separator — see an internal journal entry
-    const home = await homeDir();
-    return await join(home, ".claude", "accounts");
-  }
-
-  async function fetchSessions() {
-    try {
-      const baseDir = await getBaseDir();
-      sessions = await invoke<SessionView[]>("list_sessions", { baseDir });
-      error = null;
-    } catch (e) {
-      error = String(e);
-    } finally {
-      loading = false;
-    }
-  }
-
   function formatCwd(cwd: string): string {
     // Collapse `/Users/example` → `~` so long paths fit the row.
     // We don't have the real home path client-side without another
@@ -240,14 +222,44 @@
 
   // Poll every 5s so rotation / new terminals show up quickly.
   $effect(() => {
-    try {
-      const raw = localStorage.getItem('csq-session-order');
-      sessionOrder = raw ? JSON.parse(raw) : [];
-    } catch { sessionOrder = []; }
-    sessionNames = loadSessionNames();
-    fetchSessions();
-    const interval = setInterval(fetchSessions, 5000);
-    return () => clearInterval(interval);
+    let active = true;
+    let inFlight = false;
+    untrack(() => {
+      try {
+        const raw = localStorage.getItem('csq-session-order');
+        sessionOrder = raw ? JSON.parse(raw) : [];
+      } catch { sessionOrder = []; }
+      sessionNames = loadSessionNames();
+    });
+
+    async function fetchSessions() {
+      // Polling is read-only; skip busy ticks rather than queueing work.
+      if (!active || inFlight) return;
+      inFlight = true;
+      try {
+        const home = await homeDir();
+        if (!active) return;
+        const baseDir = await join(home, ".claude", "accounts");
+        if (!active) return;
+        const next = await invoke<SessionView[]>("list_sessions", { baseDir });
+        if (active) {
+          sessions = next;
+          error = null;
+        }
+      } catch (e) {
+        if (active) error = String(e);
+      } finally {
+        inFlight = false;
+        if (active) loading = false;
+      }
+    }
+
+    void fetchSessions();
+    const interval = setInterval(() => void fetchSessions(), 5000);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
   });
 </script>
 

@@ -60,10 +60,15 @@ DETECTOR = "csq-core/src/accounts/binding_guard.rs"
 # binding state — never a conflict guard. The predicate's own definition module
 # is allowlisted (it defines the fn).
 ALLOWLIST: dict[str, set[str]] = {
-    # Codex/Anthropic detection is the most guard-specific: consolidated to the
-    # detector alone (identity_store defines is_anthropic_bound_slot and uses it
-    # from sibling identity predicates).
-    "is_codex_bound_slot_identity_aware": {DETECTOR},
+    # Codex/Anthropic detection is guard-specific. Apart from the explicitly
+    # justified Codex diagnostic below, keep detection in the detector
+    # (identity_store defines Anthropic detection and sibling predicates).
+    "is_codex_bound_slot_identity_aware": {
+        DETECTOR,
+        # check_codex_project_trust: read-only Codex trust-drift rows;
+        # no conflict refusal, binding, or vendor launch. Allowlist is per-file.
+        "csq/src/cli/commands/doctor.rs",
+    },
     "is_anthropic_bound_slot": {
         DETECTOR,
         "csq-core/src/accounts/identity_store.rs",  # definition + sibling predicates

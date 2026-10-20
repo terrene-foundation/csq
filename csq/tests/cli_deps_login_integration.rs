@@ -79,6 +79,7 @@ fn sandbox_home() -> std::path::PathBuf {
 fn clean_cmd(path_override: Option<&str>) -> Command {
     let mut cmd = Command::new(csq_bin());
     cmd.env_clear();
+    common::strip_ci_env(&mut cmd);
     // Hermetic: the spawned `csq` binary must NOT shell `security` against the
     // operator's real login keychain (rules/test-hermeticity.md).
     cmd.env("CSQ_DISABLE_KEYCHAIN_MIRROR", "1");
@@ -1148,130 +1149,17 @@ fn test_gemini_22_ok_with_ignore_no_warn() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// handle_direct (Anthropic) end-to-end fresh-install test (an internal ticket)
+// (25) an internal ticket fresh-install Anthropic login — moved in-process
 // ═══════════════════════════════════════════════════════════════════════════
-
-/// Write a stub `claude` binary that simulates `claude auth login`: on
-/// invocation it writes the OAuth `.credentials.json` + `.claude.json`
-/// (with `oauthAccount.emailAddress`) into `$CLAUDE_CONFIG_DIR` and exits 0
-/// — exactly what real CC does after a successful browser auth. This lets
-/// the FULL Anthropic `handle_direct` path run end-to-end without real OAuth.
-#[cfg(unix)]
-fn write_claude_auth_stub(stub_dir: &std::path::Path, creds_json: &str, email: &str) -> PathBuf {
-    let path = stub_dir.join("claude");
-    // Single-quote the heredoc delimiters so the shell does not expand the
-    // JSON payloads; escape any embedded single quotes in creds_json.
-    let creds_escaped = creds_json.replace('\'', "'\\''");
-    let claude_json = format!(r#"{{"oauthAccount":{{"emailAddress":"{email}"}}}}"#);
-    let claude_json_escaped = claude_json.replace('\'', "'\\''");
-    // The stub only acts on `auth login`; any other invocation exits 0 quietly.
-    // No `mkdir` — `handle_direct` creates `config-N` before spawning, and the
-    // test PATH is the stub dir only (no /bin), so external commands are absent.
-    // `printf`, `[`, and `exit` are POSIX-sh builtins → the stub is PATH-independent.
-    let script = format!(
-        "#!/bin/sh\n\
-         if [ \"$1\" = \"auth\" ] && [ \"$2\" = \"login\" ]; then\n\
-         printf '%s' '{creds_escaped}' > \"$CLAUDE_CONFIG_DIR/.credentials.json\"\n\
-         printf '%s' '{claude_json_escaped}' > \"$CLAUDE_CONFIG_DIR/.claude.json\"\n\
-         fi\n\
-         exit 0\n"
-    );
-    std::fs::write(&path, script.as_bytes()).unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
-    }
-    path
-}
-
-/// (25) an internal ticket regression — the originating bug: on a FRESH install (empty
-/// profiles.json, no `by_slot` mapping), the first `csq login N` (Anthropic)
-/// must complete and persist credentials. Before the fix, `save_canonical_for`
-/// fail-closed on the absent UUID (M4-12) because the mint ran only in
-/// `finalize` AFTER the save → "no credentials configured".
-///
-/// This drives the REAL `handle_direct` → stub-`claude auth login` →
-/// `ensure_login_identity_minted` → `save_canonical_for` chain end-to-end.
-#[test]
-#[cfg(unix)]
-fn test_anthropic_25_fresh_install_login_mints_uuid_and_persists_creds() {
-    use csq_core::credentials::{AnthropicCredentialFile, CredentialFile, OAuthPayload};
-    use csq_core::types::{AccessToken, RefreshToken};
-
-    let _serial_guard = SERIAL.lock().unwrap_or_else(|p| {
-        SERIAL.clear_poison();
-        p.into_inner()
-    });
-    let base = TempDir::new().unwrap();
-    let stubs = TempDir::new().unwrap();
-
-    // Serialize a real CredentialFile so the stub writes a byte-shape that
-    // credentials::load actually parses (no hand-rolled rename guesswork).
-    let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
-        claude_ai_oauth: OAuthPayload {
-            access_token: AccessToken::new("sk-ant-oat01-e2e-633".into()),
-            refresh_token: RefreshToken::new("sk-ant-ort01-e2e-633".into()),
-            expires_at: 4_102_444_800_000, // 2100-01-01 — no time-bomb (testing.md Rule 1)
-            scopes: vec!["user:inference".into()],
-            subscription_type: Some("max".into()),
-            rate_limit_tier: None,
-            extra: std::collections::HashMap::new(),
-        },
-        extra: std::collections::HashMap::new(),
-    });
-    let creds_json = serde_json::to_string(&creds).unwrap();
-
-    write_claude_auth_stub(stubs.path(), &creds_json, "e2e-633@test.invalid");
-
-    // FRESH install: empty base, no profiles.json, no by_slot mapping.
-    let output = clean_cmd(Some(stubs.path().to_str().unwrap()))
-        .env("CSQ_BASE_DIR", base.path())
-        .args(["login", "1"]) // no --provider → Anthropic handle_direct
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("failed to spawn csq login");
-
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    // 1. The command must SUCCEED (pre-fix: non-zero "no credentials configured").
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "an internal ticket: fresh-install `csq login 1` must exit 0; got {:?}\noutput:\n{combined}",
-        output.status.code()
-    );
-
-    // 2. The slot's UUID must be minted into profiles.json::by_slot.
-    let profiles_path = base.path().join("profiles.json");
-    let profiles_raw = std::fs::read_to_string(&profiles_path)
-        .expect("an internal ticket: profiles.json must exist after login");
-    let profiles: serde_json::Value = serde_json::from_str(&profiles_raw).unwrap();
-    let uuid = profiles
-        .get("by_slot")
-        .and_then(|m| m.get("1"))
-        .and_then(|v| v.as_str())
-        .expect("an internal ticket: by_slot[\"1\"] must hold a minted UUID after fresh login");
-
-    // 3. The canonical credential file must exist at the UUID-keyed path —
-    //    proving save_canonical_for ran (it would have fail-closed pre-fix).
-    let uuid_creds = base
-        .path()
-        .join("identities")
-        .join(uuid)
-        .join("credentials.json");
-    assert!(
-        uuid_creds.exists(),
-        "an internal ticket: identities/{uuid}/credentials.json must exist after login;\noutput:\n{combined}"
-    );
-}
+//
+// The subprocess form (stub `claude auth login` -> `csq login 1`) cannot run
+// hermetically any more: `commit_anthropic_login` verifies the captured token
+// against the live `api.anthropic.com/api/oauth/profile` endpoint and requires
+// `accountUuid` + `organizationUuid` in `.claude.json`. A black-box run would
+// need a real network call with a fake token (401 -> `profile_refused`). The
+// regression now lives where the profile transport is injectable:
+// `csq/src/cli/commands/login.rs` tests,
+// `fresh_install_login_mints_uuid_and_persists_creds`.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Cross-cutting clap tests (tests 23-24)

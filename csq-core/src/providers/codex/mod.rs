@@ -11,13 +11,18 @@
 //! ordering).
 
 pub mod ancestry;
+#[cfg(unix)]
+pub mod child_wake;
 pub mod desktop_login;
 pub mod keychain;
 pub mod login;
+#[cfg(unix)]
+pub mod managed_backend;
 pub mod models;
 pub mod provisioning;
 pub mod surface;
 pub mod thread_id;
 pub mod tos;
+pub mod trust;
 
-pub use login::{perform, LoginOutcome};
+pub use login::LoginOutcome;

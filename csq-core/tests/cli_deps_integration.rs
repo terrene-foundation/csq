@@ -10,6 +10,11 @@
 //! Per `rules/probe-driven-verification.md` MUST 1: assertions are structural
 //! (match enum variant + field values), NOT regex/keyword matches.
 
+// Uses the `test-utils` surface of csq-core; a plain `cargo test -p csq-core` builds it
+// as an empty test binary instead of failing to compile. Gated here rather than with
+// `required-features` so the manifest never names a file the community extraction removes.
+#![cfg(feature = "test-utils")]
+
 use csq_core::cli_deps::probe::invalidate;
 // `probe()` itself is only called from `probe_with_isolated_path` and from
 // unix-gated subprocess tests; on a windows build neither exists, so the

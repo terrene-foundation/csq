@@ -145,6 +145,27 @@ pub(crate) fn breaker_record_success(map: &BreakerMap, account: u16) {
 /// transport, applies the circuit breaker, writes `quota.json` on
 /// success, and captures the raw body to disk for operator diagnosis.
 pub(crate) async fn tick(base_dir: &Path, http_get_codex: &HttpGetFn, breakers: &BreakerMap) {
+    tick_filtered(base_dir, http_get_codex, breakers, None).await;
+}
+
+/// Targeted re-poll of ONE Codex slot for the rebind wake path
+/// (login-followup LOW-6). Same body as [`tick`], including the circuit
+/// breaker, so a wake never overrides an open breaker.
+pub(crate) async fn tick_slot(
+    base_dir: &Path,
+    http_get_codex: &HttpGetFn,
+    breakers: &BreakerMap,
+    slot: u16,
+) {
+    tick_filtered(base_dir, http_get_codex, breakers, Some(slot)).await;
+}
+
+async fn tick_filtered(
+    base_dir: &Path,
+    http_get_codex: &HttpGetFn,
+    breakers: &BreakerMap,
+    only_slot: Option<u16>,
+) {
     debug!("codex usage poller tick starting");
 
     // Quota rows are keyed by slot, not surface. Use the same winning
@@ -154,6 +175,7 @@ pub(crate) async fn tick(base_dir: &Path, http_get_codex: &HttpGetFn, breakers: 
     let mut accounts: Vec<_> = discovery::discover_all(base_dir)
         .into_iter()
         .filter(|info| info.source == AccountSource::Codex)
+        .filter(|info| only_slot.is_none_or(|s| info.id == s))
         .collect();
     if accounts.len() > MAX_ACCOUNTS_PER_TICK {
         accounts.truncate(MAX_ACCOUNTS_PER_TICK);
@@ -1011,6 +1033,20 @@ mod tests {
         // No by_slot_identity label: credential presence alone previously
         // enrolled a restored Claude slot in the independent Codex poller.
         profiles::save(&path, &pf).unwrap();
+        let identity_dir = identity_store::identity_path(base, uuid);
+        std::fs::create_dir_all(&identity_dir).unwrap();
+        crate::platform::fs::secure_dir(&base.join("identities")).unwrap();
+        crate::platform::fs::secure_dir(&identity_dir).unwrap();
+        crate::platform::fs::write_new_private(
+            &identity_dir.join("identity.json"),
+            &serde_json::to_vec(&serde_json::json!({
+                "provider": if anthropic { "anthropic" } else { "codex" },
+                "email": format!("ownership-{slot}@example.test"),
+                "created_at": "fixture", "key_id": null,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         if anthropic {
             let creds: CredentialFile = serde_json::from_value(serde_json::json!({
                 "claudeAiOauth": {
@@ -1352,6 +1388,12 @@ mod tests {
         };
 
         // Identity-keyed: distinctive token (this is what the poller MUST read).
+        let identity_dir = crate::accounts::identity_store::identity_path(base, uuid);
+        std::fs::create_dir_all(&identity_dir).unwrap();
+        crate::platform::fs::secure_dir(&base.join("identities")).unwrap();
+        crate::platform::fs::secure_dir(&identity_dir).unwrap();
+        crate::platform::fs::write_new_private(&identity_dir.join("identity.json"),
+            br#"{"provider":"codex","email":"m4-4-codex-poller@test.invalid","created_at":"fixture","key_id":null}"#).unwrap();
         let identity_path = crate::accounts::identity_store::credentials_codex_path_for(base, uuid);
         credentials::save(&identity_path, &make_codex("CODEX-IDENTITY-KEYED-TOKEN")).unwrap();
 

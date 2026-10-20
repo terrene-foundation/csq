@@ -52,6 +52,29 @@ pub fn parse_environment_block(block: &[u16]) -> HashMap<String, String> {
     map
 }
 
+/// `ERROR_INVALID_PARAMETER`: what `OpenProcess` reports for a pid that does not exist.
+const ERROR_INVALID_PARAMETER: u32 = 87;
+
+/// Whether a failed `OpenProcess`'s `GetLastError` means the process is gone. Any other
+/// code (notably `ERROR_ACCESS_DENIED`) is a refusal to read it, which says nothing about
+/// whether it exists, so it is undetermined, never "not a session".
+pub fn open_failure_means_gone(code: u32) -> bool {
+    code == ERROR_INVALID_PARAMETER
+}
+
+/// Whether two process-token user SIDs name the same user, from their raw bytes. `None`
+/// when either could not be read or is not a well-formed SID (revision 1, total length
+/// `8 + 4 * sub-authority count`): an unreadable owner is undetermined, never "another
+/// user" and never "the same user". For two well-formed SIDs, byte equality is what
+/// `EqualSid` compares (revision, sub-authority count, authority, sub-authorities).
+pub fn owner_verdict(target: Option<&[u8]>, own: Option<&[u8]>) -> Option<bool> {
+    fn well_formed(sid: &[u8]) -> bool {
+        sid.len() >= 8 && sid[0] == 1 && sid.len() == 8 + 4 * usize::from(sid[1])
+    }
+    let (t, o) = (target?, own?);
+    (well_formed(t) && well_formed(o)).then(|| t == o)
+}
+
 /// Returns true if a UTF-16 NUL-terminated buffer holds
 /// `claude.exe` case-insensitively. Compares as allocated
 /// `String` after finding the NUL — the 260-char tax of
@@ -63,9 +86,113 @@ pub fn exe_matches_claude(buf: &[u16]) -> bool {
     name == "claude.exe"
 }
 
+/// Whether a UTF-16 NUL-terminated image name is a CLI csq launches (`claude`, `codex`,
+/// `codex-<triple>`, `gemini`, `kimi`, `grok`, each with `.exe`, case-insensitive): a session
+/// image for the between-hop check ([`super::is_cli_image_name`]).
+pub fn exe_is_session_image(buf: &[u16]) -> bool {
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    super::is_cli_image_name(&String::from_utf16_lossy(&buf[..len]))
+}
+
+/// The between-hop probe of a Windows process from its image name (read from the process
+/// snapshot), whatever its owner: a CLI image is a session, any other readable image is
+/// not. LIMIT: the snapshot carries the image NAME only, so a `node.exe` running a CLI's
+/// script, and a renamed image, are not seen here (the full image path and argv need
+/// `QueryFullProcessImageNameW` and a PEB read, neither implemented).
+pub fn hop_probe_from_image(image: &[u16]) -> super::HopProbe {
+    super::HopProbe::Process {
+        session_image: exe_is_session_image(image),
+        codex_wrapper: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn w(s: &str) -> Vec<u16> {
+        let mut v: Vec<u16> = s.encode_utf16().collect();
+        v.push(0);
+        v.resize(260, 0);
+        v
+    }
+
+    #[test]
+    fn claude_and_codex_images_are_sessions_and_any_other_readable_image_is_not() {
+        for yes in ["claude.exe", "CLAUDE.EXE", "codex.exe", "Codex.exe"] {
+            assert!(exe_is_session_image(&w(yes)), "{yes}");
+        }
+        for no in [
+            "powershell.exe",
+            "node.exe",
+            "codex.cmd",
+            "codex-helper.exe",
+            "claude.exe.bak",
+            "xcodex.exe",
+        ] {
+            assert!(!exe_is_session_image(&w(no)), "{no}");
+        }
+    }
+
+    #[test]
+    fn a_windows_hop_is_classified_by_image_whatever_its_owner() {
+        use super::super::classify_hop;
+        for yes in [
+            "codex.exe",
+            "codex-x86_64-pc-windows-msvc.exe",
+            "gemini.exe",
+            "grok.exe",
+        ] {
+            assert_eq!(
+                classify_hop(hop_probe_from_image(&w(yes))),
+                Some(true),
+                "{yes}"
+            );
+        }
+        assert_eq!(
+            classify_hop(hop_probe_from_image(&w("pwsh.exe"))),
+            Some(false)
+        );
+    }
+
+    /// S-1-5-21-1-2-3-1001: revision 1, 5 sub-authorities.
+    fn sid(rid: u32) -> Vec<u8> {
+        let mut v = vec![1u8, 5, 0, 0, 0, 0, 0, 5];
+        for sub in [21u32, 1, 2, 3, rid] {
+            v.extend_from_slice(&sub.to_le_bytes());
+        }
+        v
+    }
+
+    #[test]
+    fn owner_verdict_same_different_and_unreadable_are_three_outcomes() {
+        assert_eq!(
+            owner_verdict(Some(&sid(1001)), Some(&sid(1001))),
+            Some(true)
+        );
+        assert_eq!(
+            owner_verdict(Some(&sid(1002)), Some(&sid(1001))),
+            Some(false),
+            "a different user is a determinate no"
+        );
+        assert_eq!(owner_verdict(None, Some(&sid(1001))), None, "target token");
+        assert_eq!(owner_verdict(Some(&sid(1001)), None), None, "own token");
+        let mut torn = sid(1001);
+        torn.pop();
+        assert_eq!(
+            owner_verdict(Some(&torn), Some(&torn)),
+            None,
+            "truncated SID"
+        );
+        let mut bad_rev = sid(1001);
+        bad_rev[0] = 2;
+        assert_eq!(
+            owner_verdict(Some(&bad_rev), Some(&bad_rev)),
+            None,
+            "revision"
+        );
+        assert_eq!(owner_verdict(Some(&[]), Some(&[])), None, "empty");
+    }
 
     fn build_env_block(entries: &[&str]) -> Vec<u16> {
         let mut out = Vec::new();
@@ -150,6 +277,16 @@ mod tests {
             env.get("USERPROFILE").map(String::as_str),
             Some("C:\\Users\\Ålice")
         );
+    }
+
+    #[test]
+    fn only_invalid_parameter_means_the_process_is_gone() {
+        assert!(open_failure_means_gone(87));
+        assert!(
+            !open_failure_means_gone(5),
+            "access denied is a refusal, not absence"
+        );
+        assert!(!open_failure_means_gone(0));
     }
 
     #[test]

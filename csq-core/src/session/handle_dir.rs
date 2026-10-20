@@ -302,6 +302,766 @@ fn link_shared_codex_item(
     })
 }
 
+/// Handle-dir name of the Codex hooks file linked to the user-global layer.
+const CODEX_HOOKS_FILE: &str = "hooks.json";
+
+/// What `csq doctor` prints when the user-global Codex hooks file is absent. A missing
+/// global creates no link (no dangling symlink, no per-handle copy), so the terminal runs
+/// without global hooks; this text makes that visible.
+pub const CODEX_HOOKS_GLOBAL_MISSING_MESSAGE: &str =
+    "global hooks.json missing \u{2014} terminals run without global hooks";
+
+/// Doctor note printed with the per-handle hooks rows: the handle `hooks.json` is a
+/// write-through symlink to the one shared global file.
+pub const CODEX_HOOKS_WRITE_THROUGH_NOTE: &str =
+    "handle hooks.json is a symlink to the shared global hooks.json: an edit made through \
+     one terminal edits it for every terminal";
+
+/// Largest hooks file the subset check will read; a bigger file is foreign. Enforced AT READ
+/// by `read_regular_bounded` (open, fstat, `take(limit + 1)`), never by a prior stat.
+const CODEX_HOOKS_MAX_BYTES: u64 = 1 << 20;
+
+/// The user-global Codex hooks file, `~/.codex/hooks.json`, resolved from the real home
+/// directory exactly as `providers::codex::trust::source_path` resolves `~/.codex/config.toml`.
+///
+/// Test builds (`cfg(test)` or the `test-utils` feature) NEVER read the real home: the
+/// fixture seam `CSQ_TEST_CODEX_GLOBAL_HOOKS` names the file, and an unset seam yields `None`
+/// (no link), so a test that does not opt in cannot touch the developer's `~/.codex`.
+pub fn codex_global_hooks_path() -> Option<PathBuf> {
+    #[cfg(any(test, feature = "test-utils"))]
+    {
+        std::env::var_os("CSQ_TEST_CODEX_GLOBAL_HOOKS").map(PathBuf::from)
+    }
+    #[cfg(not(any(test, feature = "test-utils")))]
+    dirs::home_dir().map(|home| home.join(".codex").join(CODEX_HOOKS_FILE))
+}
+
+/// The ONE predicate for "the user-global hooks file exists", shared by the link path and
+/// `csq doctor`: after resolving symlinks it is a REGULAR file that can be opened and read.
+/// A directory, a FIFO, a dangling link or an unreadable file all count as missing. One
+/// non-blocking open, then `fstat` on the open handle, then a bounded read (`open_regular`):
+/// a path swapped for a FIFO between a check and the open cannot hang it.
+#[must_use]
+pub fn codex_global_hooks_usable(global: &Path) -> bool {
+    use std::io::Read;
+    let Some(file) = open_regular(global, false) else {
+        return false;
+    };
+    let mut probe = [0u8; 1];
+    file.take(1).read(&mut probe).is_ok()
+}
+
+/// Whether `local` is a subset of `global`, both parsed JSON.
+///
+/// Definition: every key path and every array element in `local` is present in `global`.
+/// - Objects: each key of `local` exists in `global` and its value is a subset of the
+///   global value at that key (extra global keys are allowed).
+/// - Arrays: each element of `local` is a subset of SOME element of `global` (order and
+///   extra global elements are ignored).
+/// - Scalars (string, number, bool, null): equal. A type mismatch is never a subset.
+///
+/// An empty local object or array is a subset of any global value of the same type.
+fn json_is_subset(local: &serde_json::Value, global: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (local, global) {
+        (Value::Object(l), Value::Object(g)) => l
+            .iter()
+            .all(|(k, lv)| g.get(k).is_some_and(|gv| json_is_subset(lv, gv))),
+        (Value::Array(l), Value::Array(g)) => {
+            l.iter().all(|le| g.iter().any(|ge| json_is_subset(le, ge)))
+        }
+        (l, g) => l == g,
+    }
+}
+
+/// Opens `path` once: non-blocking on unix (so a FIFO cannot hang the open) and without
+/// following a final symlink when `nofollow`; then requires the OPEN handle to be a regular
+/// file (`fstat`). A device, a FIFO or an unreadable path is `None`.
+fn open_regular(path: &Path, nofollow: bool) -> Option<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut flags = libc::O_NONBLOCK;
+        if nofollow {
+            flags |= libc::O_NOFOLLOW;
+        }
+        opts.custom_flags(flags);
+    }
+    #[cfg(not(unix))]
+    let _ = nofollow;
+    let file = opts.open(path).ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
+/// Reads the regular file at `path` with the size bound enforced AT READ: `open_regular`
+/// then `take(CODEX_HOOKS_MAX_BYTES + 1)`. A device, a FIFO, an unreadable file or one over
+/// the limit is `None`. There is no stat-then-read gap.
+pub(crate) fn read_regular_bounded(path: &Path, nofollow: bool) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let file = open_regular(path, nofollow)?;
+    let mut buf = Vec::new();
+    file.take(CODEX_HOOKS_MAX_BYTES + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    (buf.len() as u64 <= CODEX_HOOKS_MAX_BYTES).then_some(buf)
+}
+
+/// Whether `local` (the bytes already read from the handle's regular file) is parseable JSON
+/// that is a subset of the parseable JSON file `global` ([`json_is_subset`]). Unreadable,
+/// oversize or unparseable input on either side is `false`: the caller then keeps the file
+/// (never deletes user content).
+fn local_hooks_is_subset_of_global(local: &[u8], global: &Path) -> bool {
+    let parse = |bytes: &[u8]| serde_json::from_slice::<serde_json::Value>(bytes).ok();
+    match (
+        parse(local),
+        read_regular_bounded(global, false).and_then(|b| parse(&b)),
+    ) {
+        (Some(l), Some(g)) => json_is_subset(&l, &g),
+        _ => false,
+    }
+}
+
+/// Removes `path`, logging a failure with the fixed `tag` (a missing entry is not a failure).
+/// The main action paths use this instead of discarding the error.
+fn remove_file_logged(path: &Path, tag: &'static str) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(error_kind = tag, io_kind = ?e.kind(), "could not remove a handle-dir entry");
+        }
+    }
+}
+
+/// Removes a leftover `.swap-tmp` of ours before it is reused: a file or symlink with
+/// `remove_file`, an EMPTY directory with `remove_dir`. A non-empty directory (or anything
+/// else that cannot be removed) is an error: the caller refuses the link.
+fn clear_swap_tmp(tmp: &Path) -> std::io::Result<()> {
+    match tmp.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+        Ok(m) if m.is_dir() => std::fs::remove_dir(tmp),
+        Ok(_) => std::fs::remove_file(tmp),
+    }
+}
+
+/// Name prefix of a foreign `hooks.json` csq moved aside instead of overwriting (the content is
+/// preserved, never deleted).
+const CODEX_HOOKS_FOREIGN_PREFIX: &str = "hooks.json.csq-foreign-";
+
+/// Marker csq writes beside a COPY of the global hooks (a host that cannot create symlinks):
+/// the SHA-256 of the copied bytes. It is what tells a csq copy from a foreign regular file.
+const CODEX_HOOKS_COPY_MARKER: &str = "hooks.json.csq-copy-sha256";
+
+/// The temp name the link is staged under.
+const CODEX_HOOKS_SWAP_TMP: &str = "hooks.json.swap-tmp";
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Whether the symlink `link` points at `target`. On Windows `read_link` may spell the target
+/// with a `\\?\` prefix, so the two are compared canonicalized there as well.
+fn link_points_to(link: &Path, target: &Path) -> bool {
+    let Ok(read) = std::fs::read_link(link) else {
+        return false;
+    };
+    read == target
+        || (cfg!(windows)
+            && matches!(
+                (std::fs::canonicalize(&read), std::fs::canonicalize(target)),
+                (Ok(a), Ok(b)) if a == b
+            ))
+}
+
+/// Whether a leftover `.swap-tmp` is something [`clear_swap_tmp`] cannot clear: a NON-EMPTY
+/// directory. A file, a symlink or an empty directory is cleared, so it raises no alarm. The
+/// link path and `csq doctor` share this predicate.
+fn swap_tmp_blocked(tmp: &Path) -> bool {
+    match tmp.symlink_metadata() {
+        Ok(m) if m.is_dir() => std::fs::read_dir(tmp).map_or(true, |mut d| d.next().is_some()),
+        _ => false,
+    }
+}
+
+/// Names (never paths or content) of the foreign hooks entries csq moved aside in `handle_dir`.
+#[must_use]
+pub fn codex_hooks_preserved_foreign(handle_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(handle_dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+        .filter(|n| n.starts_with(CODEX_HOOKS_FOREIGN_PREFIX))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Per-handle state of `hooks.json` against the user-global hooks file, as `csq doctor`
+/// reports it. Derived from the disk by [`codex_hooks_link_state`], which uses the same
+/// [`codex_global_hooks_usable`] predicate the link path uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexHooksLinkState {
+    /// A symlink to the usable global file.
+    Ok,
+    /// No `hooks.json` although the global exists (a pre-upgrade handle, or the global
+    /// appeared later): the next launch or repoint links it.
+    Unlinked,
+    /// A regular file (or other non-link) sits where the link belongs; the next launch or
+    /// repoint moves it aside (content preserved) and links.
+    ForeignFile,
+    /// A symlink to somewhere other than the global whose target does not exist.
+    Dangling,
+    /// A symlink to somewhere other than the global.
+    WrongTarget,
+    /// The global file is absent, unreadable or not a regular file.
+    MissingGlobal,
+    /// A leftover non-empty `hooks.json.swap-tmp` directory csq cannot remove blocks the link.
+    SwapTmpBlocked,
+    /// A csq COPY of the global (the host cannot create symlinks) whose bytes equal the global.
+    CopyCurrent,
+    /// A csq COPY of the global that no longer equals it: relaunch or swap re-syncs it.
+    CopyStale,
+}
+
+impl CodexHooksLinkState {
+    /// Whether this state needs an operator row.
+    #[must_use]
+    pub fn is_problem(self) -> bool {
+        self != Self::Ok
+    }
+
+    /// The doctor text for this state.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Ok => "linked to the global hooks.json",
+            Self::Unlinked => {
+                "hooks.json is not linked to the global hooks (relaunch or swap this terminal)"
+            }
+            Self::ForeignFile => {
+                "hooks.json is a regular file, not the global link; the next launch or swap moves \
+                 it aside (kept as hooks.json.csq-foreign-*) and links the global hooks"
+            }
+            Self::Dangling => "hooks.json is a symlink to a missing file other than the global",
+            Self::WrongTarget => {
+                "hooks.json is a symlink to a file other than the global hooks.json"
+            }
+            Self::MissingGlobal => CODEX_HOOKS_GLOBAL_MISSING_MESSAGE,
+            Self::SwapTmpBlocked => {
+                "hooks.json.swap-tmp cannot be removed; the hooks link was refused (remove it)"
+            }
+            Self::CopyCurrent => {
+                "hooks.json is a copy of the global hooks (no symlink privilege); enable Windows \
+                 Developer Mode for a live link"
+            }
+            Self::CopyStale => {
+                "hooks.json is a STALE copy of the global hooks (no symlink privilege); relaunch \
+                 or swap this terminal to re-sync, or enable Windows Developer Mode for a live link"
+            }
+        }
+    }
+}
+
+/// The [`CodexHooksLinkState`] of `handle_dir`'s `hooks.json` against `global`.
+#[must_use]
+pub fn codex_hooks_link_state(handle_dir: &Path, global: Option<&Path>) -> CodexHooksLinkState {
+    use CodexHooksLinkState as S;
+    let state = link_state_ignoring_swap_tmp(handle_dir, global);
+    let relink_needed = matches!(
+        state,
+        S::Unlinked | S::ForeignFile | S::WrongTarget | S::Dangling | S::CopyStale
+    );
+    if relink_needed && swap_tmp_blocked(&handle_dir.join(CODEX_HOOKS_SWAP_TMP)) {
+        S::SwapTmpBlocked
+    } else {
+        state
+    }
+}
+
+fn link_state_ignoring_swap_tmp(handle_dir: &Path, global: Option<&Path>) -> CodexHooksLinkState {
+    use CodexHooksLinkState as S;
+    let link = handle_dir.join(CODEX_HOOKS_FILE);
+    let usable = global.filter(|g| codex_global_hooks_usable(g));
+    match link.symlink_metadata() {
+        Ok(m) if m.file_type().is_symlink() => {
+            let Some(global) = global else {
+                return S::MissingGlobal;
+            };
+            if link_points_to(&link, global) {
+                if usable.is_some() {
+                    S::Ok
+                } else {
+                    S::MissingGlobal
+                }
+            } else if link.exists() {
+                S::WrongTarget
+            } else {
+                S::Dangling
+            }
+        }
+        Ok(_) => copy_state(handle_dir, &link, usable).unwrap_or(S::ForeignFile),
+        Err(_) if usable.is_none() => S::MissingGlobal,
+        Err(_) => S::Unlinked,
+    }
+}
+
+/// `Some` only when csq's copy marker sits beside `link`: the copy compared with the global by
+/// digest. `None` is a foreign regular file.
+fn copy_state(
+    handle_dir: &Path,
+    link: &Path,
+    usable: Option<&Path>,
+) -> Option<CodexHooksLinkState> {
+    read_regular_bounded(&handle_dir.join(CODEX_HOOKS_COPY_MARKER), true)?;
+    let Some(global) = usable else {
+        return Some(CodexHooksLinkState::MissingGlobal);
+    };
+    let digest = |p: &Path, nofollow| read_regular_bounded(p, nofollow).map(|b| sha256_hex(&b));
+    Some(match (digest(link, true), digest(global, false)) {
+        (Some(local), Some(global)) if local == global => CodexHooksLinkState::CopyCurrent,
+        _ => CodexHooksLinkState::CopyStale,
+    })
+}
+
+/// Whether a Codex config turns hooks off, as observed on codex-cli 0.162.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexHooksConfigState {
+    /// Hooks are on (the default; csq never sets the flag).
+    Enabled,
+    /// `[features] hooks = false`, or `codex_hooks = false` when no `hooks` key is set.
+    Disabled,
+    /// The config is unparseable, oversize, unreadable, non-regular, or the flag has a
+    /// non-boolean type (Codex refuses to load it). NEVER reported as "not disabled".
+    Unknown,
+    /// A top-level `profile = "…"` key: Codex 0.162.1 fails every command on it.
+    LegacyProfileKey,
+}
+
+/// A handle's [`CodexHooksConfigState`] plus the profile files that would disable hooks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexHooksConfig {
+    /// The state the base `config.toml` sets.
+    pub state: CodexHooksConfigState,
+    /// Names of `<name>.config.toml` profile files in the handle that set hooks off; the base
+    /// state is NOT changed by them (they only apply under `--profile <name>`).
+    pub profile_disabled: Vec<String>,
+}
+
+/// The state one Codex config file sets. Observed precedence: a `hooks` key, when present,
+/// always wins over the legacy alias `codex_hooks` (which applies only when no `hooks` key is
+/// set; key order is irrelevant); `[profiles.*]` tables are ignored by Codex; a top-level
+/// `profile` key is a hard load error. An absent file is `Enabled`; a dangling link,
+/// unreadable, oversize, non-UTF-8 or unparseable file, or a non-boolean flag, is `Unknown`.
+fn hooks_state_of_file(path: &Path) -> CodexHooksConfigState {
+    use CodexHooksConfigState as C;
+    match std::fs::metadata(path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return if path.symlink_metadata().is_ok() {
+                C::Unknown
+            } else {
+                C::Enabled
+            };
+        }
+        Err(_) => return C::Unknown,
+    }
+    let Some(bytes) = read_regular_bounded(path, false) else {
+        return C::Unknown;
+    };
+    let Ok(text) = String::from_utf8(bytes) else {
+        return C::Unknown;
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&text) else {
+        return C::Unknown;
+    };
+    if value.get("profile").is_some() {
+        return C::LegacyProfileKey;
+    }
+    let Some(features) = value.get("features") else {
+        return C::Enabled;
+    };
+    if !features.is_table() {
+        return C::Unknown;
+    }
+    let (hooks, alias) = (features.get("hooks"), features.get("codex_hooks"));
+    if [hooks, alias].into_iter().flatten().any(|v| !v.is_bool()) {
+        return C::Unknown;
+    }
+    match hooks.or(alias).and_then(toml::Value::as_bool) {
+        Some(false) => C::Disabled,
+        _ => C::Enabled,
+    }
+}
+
+/// The hooks-config state of the Codex config a handle resolves (`<handle>/config.toml`, the
+/// per-slot symlink or the regular file a layered launch materializes), plus the profile files
+/// (`<name>.config.toml`, layered by `codex --profile <name>`) that would disable hooks.
+/// Read-only, for `csq doctor`.
+#[must_use]
+pub fn codex_hooks_config(handle_dir: &Path) -> CodexHooksConfig {
+    let state = hooks_state_of_file(&handle_dir.join("config.toml"));
+    let mut profile_disabled: Vec<String> = std::fs::read_dir(handle_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+        .filter_map(|n| n.strip_suffix(".config.toml").map(str::to_owned))
+        .filter(|n| {
+            !n.is_empty()
+                && n.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        })
+        .filter(|n| {
+            hooks_state_of_file(&handle_dir.join(format!("{n}.config.toml")))
+                == CodexHooksConfigState::Disabled
+        })
+        .collect();
+    profile_disabled.sort();
+    CodexHooksConfig {
+        state,
+        profile_disabled,
+    }
+}
+
+/// Whether the Codex config a handle resolves turns hooks off. Equivalent to
+/// `codex_hooks_config(..).state == Disabled`: an unreadable or unparseable config is `false`
+/// here, so a caller that must not treat that as "enabled" uses [`codex_hooks_config`].
+#[must_use]
+pub fn codex_hooks_disabled_by_config(handle_dir: &Path) -> bool {
+    codex_hooks_config(handle_dir).state == CodexHooksConfigState::Disabled
+}
+
+/// Whether `handle_dir` has the Codex handle shape csq creates: `auth.json` is a symlink (the
+/// credential link no launch path replaces) and `config.toml` is a symlink (plain launch) or a
+/// regular file (the capability-layer / MCP-proxy launch materializes one in its place, see
+/// `run.rs`). The same dual-marker shape [`repoint_handle_dir_codex`] guards on, relaxed only
+/// for the `config.toml` a layered launch replaces.
+fn is_codex_handle_shape(handle_dir: &Path) -> bool {
+    let auth_is_link = handle_dir
+        .join("auth.json")
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink());
+    let config_ok = handle_dir
+        .join("config.toml")
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink() || m.is_file());
+    auth_is_link && config_ok
+}
+
+/// Every Codex handle dir under `base_dir`: a `term-*` directory with the Codex handle shape
+/// (`is_codex_handle_shape`), whether its `config.toml` is the per-slot symlink or the
+/// regular file a capability-layer launch materializes.
+#[must_use]
+pub fn codex_handle_dirs(base_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(base_dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("term-"))
+        })
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && is_codex_handle_shape(p))
+        .collect();
+    out.sort();
+    out
+}
+
+/// A free `hooks.json.csq-foreign-<unix-ts>[-n]` name, or `None` when 1000 are taken.
+fn foreign_aside_path(handle_dir: &Path) -> Option<PathBuf> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let free = |p: &PathBuf| p.symlink_metadata().is_err();
+    let first = handle_dir.join(format!("{CODEX_HOOKS_FOREIGN_PREFIX}{ts}"));
+    if free(&first) {
+        return Some(first);
+    }
+    (1..1000)
+        .map(|n| handle_dir.join(format!("{CODEX_HOOKS_FOREIGN_PREFIX}{ts}-{n}")))
+        .find(free)
+}
+
+/// Puts a detached `aside` entry back at `link` when nothing has taken its place; otherwise
+/// keeps it under a foreign-aside name. Never deletes it.
+fn restore_aside(handle_dir: &Path, aside: &Path, link: &Path) {
+    let dest = if link.symlink_metadata().is_err() {
+        Some(link.to_path_buf())
+    } else {
+        foreign_aside_path(handle_dir)
+    };
+    let restored = dest.is_some_and(|d| std::fs::rename(aside, d).is_ok());
+    if !restored {
+        warn!(
+            error_kind = "codex_hooks_aside_restore_failed",
+            "could not put the detached hooks.json back; it is kept beside the handle's hooks"
+        );
+    }
+}
+
+/// Records the digest of a csq copy of the global hooks beside it.
+fn write_copy_marker(handle_dir: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let marker = handle_dir.join(CODEX_HOOKS_COPY_MARKER);
+    let tmp = crate::platform::fs::unique_tmp_path(&marker);
+    let result = crate::platform::fs::write_new_private(&tmp, sha256_hex(bytes).as_bytes())
+        .and_then(|()| crate::platform::fs::atomic_replace(&tmp, &marker));
+    result.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        std::io::Error::other(e.to_string())
+    })
+}
+
+/// Whether `bytes` (the handle's regular `hooks.json`) is an unmodified csq copy: the marker's
+/// digest equals the bytes' digest.
+fn copy_is_ours(handle_dir: &Path, bytes: &[u8]) -> bool {
+    read_regular_bounded(&handle_dir.join(CODEX_HOOKS_COPY_MARKER), true)
+        .and_then(|m| String::from_utf8(m).ok())
+        .is_some_and(|m| m.trim() == sha256_hex(bytes))
+}
+
+/// Links `<handle_dir>/hooks.json` to the user-global Codex `hooks.json` so a csq-launched
+/// Codex terminal runs the same hooks as a vanilla one (owner directive: terminal settings
+/// come from the global layer only). Used by both handle creation and repoint.
+///
+/// WRITE-THROUGH: `hooks.json` in a handle is a symlink to the ONE shared global file, so a
+/// write through `$CODEX_HOOKS/hooks.json` in any terminal edits the global file for every
+/// terminal and for vanilla Codex. `csq doctor` prints [`CODEX_HOOKS_WRITE_THROUGH_NOTE`]
+/// beside the per-handle rows.
+///
+/// SANDBOX CAVEAT (observed, codex-cli 0.162.1, probe N10): a `workspace-write` sandboxed
+/// Codex cannot write `$CODEX_HOME/hooks.json`, the symlink or its target while they sit
+/// outside the workspace and `/tmp` (the real `~/.codex` layout). Codex gives `CODEX_HOME` no
+/// special protection: a workspace containing `$HOME`, or a home under `/tmp`, IS writable.
+/// The residual is bounded by Codex's hook trust: an edited hook is `modified` and does not
+/// run until the user re-approves it, so a write-through edit cannot silently run new code.
+///
+/// - `global` is `None` or fails [`codex_global_hooks_usable`]: NO link is created. A
+///   pre-existing hooks.json symlink whose target IS the global path is removed (it would
+///   dangle; a failed removal is logged, `codex_hooks_stale_link_remove_failed`); anything else
+///   is never touched. A later launch or repoint re-attempts the link once the global exists.
+/// - Existing symlink already pointing at the global: kept, nothing is written.
+/// - FOREIGN entry (a symlink elsewhere, or a regular file that is not a subset of the global,
+///   is unparseable, oversize or not a regular file): MOVED ASIDE to
+///   `hooks.json.csq-foreign-<unix-ts>` (content preserved, never deleted; warn
+///   `codex_hooks_foreign_moved_aside`), then the global is linked. `csq doctor` lists it.
+/// - Existing REGULAR file that is a subset of the global ([`json_is_subset`]), or an unmodified
+///   csq copy: detached by a rename to an aside name, compared with what was read, and only then
+///   replaced. A file that changed in the window is put back (`codex_hooks_changed_during_link`).
+///   The final link creation never overwrites a file Codex recreated in the gap.
+/// - A leftover `hooks.json.swap-tmp` is removed before use; if it cannot be (a non-empty
+///   directory), the link is REFUSED (`codex_hooks_swap_tmp_blocked`, an `Err`) and doctor
+///   shows it ([`swap_tmp_blocked`] is the shared predicate).
+/// - Where the platform cannot create a symlink (Windows without Developer Mode) it makes a
+///   copy or hard link instead. Launch does NOT fail: csq writes a COPY of the global, plus a
+///   digest marker, re-synced on every launch and repoint; doctor reports `copy-current` or
+///   `copy-stale` by digest.
+fn link_codex_global_hooks(handle_dir: &Path, global: Option<&Path>) -> Result<(), std::io::Error> {
+    let link = handle_dir.join(CODEX_HOOKS_FILE);
+    let existing = link.symlink_metadata().ok();
+    let Some(global) = global.filter(|g| codex_global_hooks_usable(g)) else {
+        if let (Some(meta), Some(g)) = (existing.as_ref(), global) {
+            if meta.file_type().is_symlink() && link_points_to(&link, g) {
+                remove_file_logged(&link, "codex_hooks_stale_link_remove_failed");
+            }
+        }
+        return Ok(());
+    };
+    let mut expected_local: Option<Vec<u8>> = None;
+    let mut move_foreign = false;
+    if let Some(meta) = existing.as_ref() {
+        if meta.file_type().is_symlink() {
+            if link_points_to(&link, global) {
+                return Ok(());
+            }
+            warn!(
+                error_kind = "codex_hooks_foreign_link",
+                "handle-dir hooks.json is a symlink to a file other than the user-global \
+                 Codex hooks; moving it aside"
+            );
+            move_foreign = true;
+        } else {
+            let bytes = meta
+                .is_file()
+                .then(|| read_regular_bounded(&link, true))
+                .flatten()
+                .filter(|b| {
+                    copy_is_ours(handle_dir, b) || local_hooks_is_subset_of_global(b, global)
+                });
+            match bytes {
+                Some(b) => expected_local = Some(b),
+                None => {
+                    warn!(
+                        error_kind = "codex_hooks_foreign_file",
+                        "handle-dir hooks.json is not a subset of the user-global Codex hooks; \
+                         moving it aside"
+                    );
+                    move_foreign = true;
+                }
+            }
+        }
+    }
+    let tmp = handle_dir.join(CODEX_HOOKS_SWAP_TMP);
+    if let Err(e) = clear_swap_tmp(&tmp) {
+        warn!(
+            error_kind = "codex_hooks_swap_tmp_blocked",
+            io_kind = ?e.kind(),
+            "a leftover hooks.json.swap-tmp cannot be removed; hooks link refused"
+        );
+        return Err(e);
+    }
+    create_symlink(global, &tmp)?;
+    #[cfg(test)]
+    if FORCE_COPY_LINK.with(std::cell::Cell::get) {
+        std::fs::remove_file(&tmp)?;
+        std::fs::copy(global, &tmp)?;
+    }
+    let is_exact_link = tmp
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+        && link_points_to(&tmp, global);
+    let mut copy_bytes: Option<Vec<u8>> = None;
+    if !is_exact_link {
+        remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
+        let staged = read_regular_bounded(global, false)
+            .filter(|b| crate::platform::fs::write_new_private_synced(&tmp, b).is_ok());
+        let Some(bytes) = staged else {
+            remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
+            warn!(
+                error_kind = "codex_hooks_copy_failed",
+                "no symlink could be made and the global hooks could not be copied; not linked"
+            );
+            return Ok(());
+        };
+        warn!(
+            error_kind = "codex_hooks_link_copy_fallback",
+            "the platform cannot create a symlink; hooks.json is a copy of the global hooks, \
+             re-synced on every launch and repoint (enable Windows Developer Mode for a link)"
+        );
+        copy_bytes = Some(bytes);
+    }
+    let mut aside: Option<PathBuf> = None;
+    if existing.is_some() {
+        #[cfg(test)]
+        BEFORE_REREAD.with(|hook| {
+            if let Some(f) = hook.borrow().as_ref() {
+                f();
+            }
+        });
+        if move_foreign {
+            let Some(dest) = foreign_aside_path(handle_dir) else {
+                remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
+                warn!(
+                    error_kind = "codex_hooks_foreign_aside_names_exhausted",
+                    "no free hooks.json.csq-foreign-* name; the foreign entry is left in place"
+                );
+                return Ok(());
+            };
+            match std::fs::rename(&link, &dest) {
+                Ok(()) => warn!(
+                    error_kind = "codex_hooks_foreign_moved_aside",
+                    "a foreign handle-dir hooks.json was moved aside (content kept)"
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
+                    warn!(
+                        error_kind = "codex_hooks_foreign_move_failed",
+                        io_kind = ?e.kind(),
+                        "could not move a foreign hooks.json aside; left in place"
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            let detached = handle_dir.join(format!(
+                "{CODEX_HOOKS_FILE}.csq-aside-{}",
+                std::process::id()
+            ));
+            match std::fs::rename(&link, &detached) {
+                Ok(()) => {
+                    if read_regular_bounded(&detached, true).as_deref() != expected_local.as_deref()
+                    {
+                        restore_aside(handle_dir, &detached, &link);
+                        remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
+                        warn!(
+                            error_kind = "codex_hooks_changed_during_link",
+                            "handle-dir hooks.json changed while it was being linked; kept"
+                        );
+                        return Ok(());
+                    }
+                    aside = Some(detached);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
+                    warn!(
+                        error_kind = "codex_hooks_aside_failed",
+                        io_kind = ?e.kind(),
+                        "could not detach hooks.json to link it; left in place"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    }
+    #[cfg(test)]
+    AFTER_ASIDE.with(|hook| {
+        if let Some(f) = hook.borrow().as_ref() {
+            f();
+        }
+    });
+    let placed = match copy_bytes.as_deref() {
+        Some(bytes) => {
+            std::fs::rename(&tmp, &link).and_then(|()| write_copy_marker(handle_dir, bytes))
+        }
+        None => {
+            let made = create_symlink(global, &link);
+            remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
+            remove_file_logged(
+                &handle_dir.join(CODEX_HOOKS_COPY_MARKER),
+                "codex_hooks_marker_remove_failed",
+            );
+            made
+        }
+    };
+    match placed {
+        Ok(()) => {
+            if let Some(a) = aside.as_deref() {
+                remove_file_logged(a, "codex_hooks_aside_remove_failed");
+            }
+            debug!(item = CODEX_HOOKS_FILE, "linked codex global hooks");
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
+            if let Some(a) = aside.as_deref() {
+                remove_file_logged(a, "codex_hooks_aside_remove_failed");
+            }
+            warn!(
+                error_kind = "codex_hooks_changed_during_link",
+                "handle-dir hooks.json was recreated while it was being linked; kept"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
+            if let Some(a) = aside.as_deref() {
+                restore_aside(handle_dir, a, &link);
+            }
+            Err(e)
+        }
+    }
+}
+
 const ACCOUNT_BOUND_ITEMS: &[&str] = &[
     ".credentials.json",
     ".csq-account",
@@ -374,6 +1134,24 @@ pub const EPHEMERAL_HANDLE_DIR_PREFIXES: &[&str] = &[
     EXEC_CODEX_DIR_PREFIX,
     EXEC_GEMINI_DIR_PREFIX,
 ];
+
+/// `true` when `name` is exactly a csq per-terminal handle dir name: `term-<digits>`.
+/// The one name predicate shared by the cost cache and the Codex hook-trust prune.
+#[must_use]
+pub fn is_term_handle_dir_name(name: &str) -> bool {
+    name.strip_prefix("term-")
+        .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The directory name csq mints for the terminal whose csq process is `pid`
+/// (`term-<pid>`). THE one place the shape is spelled: the creators above and the
+/// keychain orphan sweep (`credentials::keychain::orphans`), which recomputes the
+/// service names of the items those dirs' terminals wrote, both call it, so the
+/// sweep can never recognise a different shape than the writer produces
+/// (`guard-reader-writer-parity.md` MUST-1).
+pub fn term_handle_dir_name(pid: u32) -> String {
+    format!("term-{pid}")
+}
 
 /// `true` when `name` starts with a registered ephemeral-handle-dir prefix.
 pub fn is_registered_ephemeral_handle_dir_name(name: &str) -> bool {
@@ -513,32 +1291,128 @@ pub fn create_handle_dir(
     account: AccountNum,
     pid: u32,
 ) -> Result<PathBuf, CredentialError> {
-    create_handle_dir_named(base_dir, claude_home, account, pid, &format!("term-{pid}"))
+    create_handle_dir_named(
+        base_dir,
+        claude_home,
+        account,
+        pid,
+        &term_handle_dir_name(pid),
+    )
 }
 
-/// The child recorded in `.live-cc-pid` is still running. Plain liveness,
-/// exactly as `sweep_dead_handles` uses: the marker is also written for
-/// codex and other non-claude children, so an identity check would make this
-/// guard inert for them, and a refusal here only costs one retry with a new
-/// PID. On macOS `csq exec` spawns `claude` as a child, and a SIGKILLed csq
-/// leaves it running while `.live-pid` names a dead PID. An unreadable
-/// marker is ignored (current behaviour) with a debug line.
-fn cc_child_is_live(handle_dir: &Path) -> Option<u32> {
-    let path = handle_dir.join(".live-cc-pid");
-    if path.symlink_metadata().is_err() {
-        return None;
-    }
-    match markers::read_live_cc_pid(handle_dir) {
-        Some(cc) if is_pid_alive(cc) => Some(cc),
-        Some(_) => None,
-        None => {
-            tracing::debug!(
-                error_kind = "handle_dir_live_cc_pid_unreadable",
-                "ignoring an unreadable .live-cc-pid"
-            );
-            None
+/// Refuses (`Err`) when an existing handle dir may still be in use, so the caller may
+/// remove it only on `Ok`. Returns the `.live-pid` pid recorded there (dead or absent) for
+/// the caller's log line. Thin wrapper over [`refuse_if_existing_handle_dir_live_with`]
+/// binding this process's pid and the real liveness probe.
+fn refuse_if_existing_handle_dir_live(
+    handle_dir: &Path,
+    dir_name: &str,
+) -> Result<Option<u32>, CredentialError> {
+    refuse_if_existing_handle_dir_live_with(handle_dir, dir_name, std::process::id(), is_pid_alive)
+}
+
+/// The decision, with `own_pid` and liveness injected.
+///
+/// Fail CLOSED on every dir EXCEPT the one case below, because the removal that follows
+/// is irreversible (`guard-reader-writer-parity.md` MUST-2). The exception: `dir_name ==
+/// term-<own_pid>`, i.e. the dir a launch of THIS process is about to create. Our pid
+/// cannot belong to another live process, so whatever sits there was left by a dead
+/// previous holder of the pid. For that dir only:
+/// - `.live-pid` is ignored when unreadable or when it names our own pid; it refuses only
+///   when it is readable and names a DIFFERENT live pid;
+/// - `.live-cc-pid` refuses when it names a live pid other than ours, or is present but
+///   unreadable (a surviving orphan child may still hold the dir's keychain item).
+///
+/// Every other dir name (capture and exec dirs owned by the daemon) refuses on an
+/// unreadable or live marker of either kind. An absent marker is "no holder".
+fn refuse_if_existing_handle_dir_live_with(
+    handle_dir: &Path,
+    dir_name: &str,
+    own_pid: u32,
+    is_alive: impl Fn(u32) -> bool,
+) -> Result<Option<u32>, CredentialError> {
+    let own_dir = dir_name == format!("term-{own_pid}");
+    let busy = |marker: &'static str, live_pid: Option<u32>| CredentialError::HandleDirBusy {
+        dir_name: dir_name.to_string(),
+        marker,
+        live_pid,
+    };
+
+    let recorded_pid = match markers::read_live_pid_checked(handle_dir) {
+        Ok(p) => p,
+        // Unreadable `.live-pid` on our own pid's dir: written by a dead previous holder.
+        Err(markers::MarkerUnreadable) if own_dir => None,
+        Err(markers::MarkerUnreadable) => {
+            return Err(busy(".live-pid", None));
+        }
+    };
+    if let Some(recorded) = recorded_pid {
+        let ours = own_dir && recorded == own_pid;
+        if !ours && is_alive(recorded) {
+            return Err(busy(".live-pid", Some(recorded)));
         }
     }
+    // `.live-cc-pid`: plain liveness, as `sweep_dead_handles` uses — the marker is also
+    // written for codex and other non-claude children, so an identity check would make
+    // this inert for them. On macOS `csq exec` spawns `claude` as a child and a SIGKILLed
+    // csq leaves it running while `.live-pid` names a dead pid.
+    match markers::read_live_cc_pid_checked(handle_dir) {
+        Ok(Some(cc)) if is_alive(cc) && !(own_dir && cc == own_pid) => {
+            Err(busy(".live-cc-pid", Some(cc)))
+        }
+        Ok(_) => Ok(recorded_pid),
+        Err(markers::MarkerUnreadable) => Err(busy(".live-cc-pid", None)),
+    }
+}
+
+/// `create_dir` of a handle dir, under the term mint lock when `dir_name` is a
+/// `term-<pid>` (see [`super::term_mint`]): the keychain orphan sweep holds that
+/// lock from its last "this `term-<pid>` is gone" check through its delete, so a
+/// terminal minted while the sweep is deciding either is seen by the check or
+/// waits for the delete. The lock is held for the `create_dir` alone (a LEAF:
+/// no other lock is taken inside it) and released before anything else is
+/// written into the dir.
+///
+/// A creator that cannot get the lock inside its bounded wait REFUSES, with a
+/// fixed message; it never creates a `term-<pid>` unlocked. Capture and exec
+/// dirs are not part of the sweep's contract and create unlocked, as before.
+fn create_term_dir_under_mint_lock(
+    base_dir: &Path,
+    dir_name: &str,
+    handle_dir: &Path,
+) -> Result<(), CredentialError> {
+    let mint = match super::term_mint::term_pid_of(dir_name) {
+        Some(_) => Some(super::term_mint::acquire_for_mint(base_dir).map_err(|e| {
+            warn!(
+                error_kind = "term_mint_lock_unavailable",
+                "refusing to create a term dir without the term mint lock"
+            );
+            CredentialError::Io {
+                path: super::term_mint::mint_lock_path(base_dir),
+                source: std::io::Error::other(e.message()),
+            }
+        })?),
+        None => None,
+    };
+    std::fs::create_dir(handle_dir).map_err(|e| CredentialError::Io {
+        path: handle_dir.to_path_buf(),
+        source: e,
+    })?;
+    // The mint ledger (still under the lock): the sweep only considers a
+    // `term-<pid>` item whose pid csq recorded minting. A failed record only
+    // means this terminal's item is never swept (a leak, never a delete).
+    if let (Some(pid), Some(guard)) = (super::term_mint::term_pid_of(dir_name), mint.as_ref()) {
+        // The launcher's own unique id and boot session, so the sweep can later tell its
+        // descendants from every other process; unreadable means unrecorded (kept).
+        let launcher = super::term_mint::launcher_identity(pid);
+        if super::term_mint::record_mint(base_dir, pid, launcher, guard).is_err() {
+            warn!(
+                error_kind = "term_mint_ledger_write_failed",
+                "could not record this terminal in the mint ledger; its keychain item will not be swept"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `create_handle_dir` generalized to an explicit `dir_name`.
@@ -573,41 +1447,14 @@ pub fn create_handle_dir_named(
 
     // Detect orphan from prior crash with same PID.
     //
-    // SAFETY: Before removing, read `.live-pid` and verify the recorded
-    // PID is dead. Without this check, PID recycling could make us wipe
-    // out a live terminal's handle dir. We only remove dirs whose PID
-    // is definitely dead OR whose `.live-pid` is missing/unreadable
-    // (corrupt orphan from our own earlier crash).
+    // SAFETY: Before removing, `refuse_if_existing_handle_dir_live` reads `.live-pid` and
+    // `.live-cc-pid` and verifies no recorded PID is alive. Without this check, PID
+    // recycling could make us wipe out a live terminal's handle dir. We remove only a dir
+    // whose markers are absent or name dead PIDs. An UNREADABLE marker refuses (it may
+    // belong to a live holder) with ONE exception: the `term-<own pid>` dir, where our
+    // own pid proves the previous holder is dead, so an unreadable `.live-pid` is ignored.
     if handle_dir.exists() {
-        let live_pid_path = handle_dir.join(".live-pid");
-        let recorded_pid: Option<u32> = std::fs::read_to_string(&live_pid_path)
-            .ok()
-            .and_then(|s| s.trim().parse().ok());
-
-        if let Some(recorded) = recorded_pid {
-            if is_pid_alive(recorded) {
-                return Err(CredentialError::Corrupt {
-                    path: handle_dir.clone(),
-                    reason: format!(
-                        "handle dir {dir_name} is in use by live PID {recorded}. \
-                         Refusing to remove. If you believe this is stale, stop \
-                         the process and rerun."
-                    ),
-                });
-            }
-        }
-        if let Some(cc) = cc_child_is_live(&handle_dir) {
-            return Err(CredentialError::Corrupt {
-                path: handle_dir.clone(),
-                reason: format!(
-                    "handle dir {dir_name} may still be in use by a child process \
-                     (PID {cc}); it was left untouched. Retry the launch — a new \
-                     launch normally gets a different process id and so a different \
-                     directory. Do not stop PID {cc} unless you have confirmed it is \
-                     a leftover csq child."
-                ),
-            });
-        }
+        let recorded_pid = refuse_if_existing_handle_dir_live(&handle_dir, dir_name)?;
 
         warn!(
             pid,
@@ -649,10 +1496,7 @@ pub fn create_handle_dir_named(
     }
 
     // Use create_dir (not create_dir_all) to detect collisions
-    std::fs::create_dir(&handle_dir).map_err(|e| CredentialError::Io {
-        path: handle_dir.clone(),
-        source: e,
-    })?;
+    create_term_dir_under_mint_lock(base_dir, dir_name, &handle_dir)?;
 
     // Symlink account-bound items — heterogeneous target set per an internal journal entry OQ #2.
     //
@@ -851,7 +1695,7 @@ pub fn create_handle_dir_codex(
     account: AccountNum,
     pid: u32,
 ) -> Result<PathBuf, CredentialError> {
-    create_handle_dir_codex_named(base_dir, account, pid, &format!("term-{pid}"))
+    create_handle_dir_codex_named(base_dir, account, pid, &term_handle_dir_name(pid))
 }
 
 /// `create_handle_dir_codex` generalized to an explicit `dir_name`. See
@@ -907,35 +1751,7 @@ pub fn create_handle_dir_codex_named(
     // Same orphan-detection semantics as create_handle_dir — only
     // remove a stale handle dir whose recorded PID is dead or absent.
     if handle_dir.exists() {
-        let live_pid_path = handle_dir.join(".live-pid");
-        let recorded_pid: Option<u32> = std::fs::read_to_string(&live_pid_path)
-            .ok()
-            .and_then(|s| s.trim().parse().ok());
-
-        if let Some(recorded) = recorded_pid {
-            if is_pid_alive(recorded) {
-                return Err(CredentialError::Corrupt {
-                    path: handle_dir.clone(),
-                    reason: format!(
-                        "handle dir {dir_name} is in use by live PID {recorded}. \
-                         Refusing to remove. If you believe this is stale, stop \
-                         the process and rerun."
-                    ),
-                });
-            }
-        }
-        if let Some(cc) = cc_child_is_live(&handle_dir) {
-            return Err(CredentialError::Corrupt {
-                path: handle_dir.clone(),
-                reason: format!(
-                    "handle dir {dir_name} may still be in use by a child process \
-                     (PID {cc}); it was left untouched. Retry the launch — a new \
-                     launch normally gets a different process id and so a different \
-                     directory. Do not stop PID {cc} unless you have confirmed it is \
-                     a leftover csq child."
-                ),
-            });
-        }
+        let recorded_pid = refuse_if_existing_handle_dir_live(&handle_dir, dir_name)?;
 
         warn!(
             pid,
@@ -949,10 +1765,8 @@ pub fn create_handle_dir_codex_named(
         })?;
     }
 
-    std::fs::create_dir(&handle_dir).map_err(|e| CredentialError::Io {
-        path: handle_dir.clone(),
-        source: e,
-    })?;
+    crate::providers::codex::trust::sync_before_handle(base_dir, account);
+    create_term_dir_under_mint_lock(base_dir, dir_name, &handle_dir)?;
 
     // Codex symlink set per spec 07 §7.2.2 — heterogeneous target set per
     // an internal journal entry OQ #2 + OQ #3.
@@ -1032,6 +1846,35 @@ pub fn create_handle_dir_codex_named(
             source: e,
         })?;
         debug!(item = name, "linked codex item");
+    }
+
+    // User-global hooks (owner directive: terminal settings come from the global layer
+    // only). No global hooks.json => no link.
+    link_codex_global_hooks(&handle_dir, codex_global_hooks_path().as_deref()).map_err(|e| {
+        CredentialError::Io {
+            path: handle_dir.join(CODEX_HOOKS_FILE),
+            source: e,
+        }
+    })?;
+    // Carry existing owner approvals to this handle's keys (never originates one) after
+    // dropping every stale key under this handle's name. If the slot this terminal runs on
+    // cannot be cleared of a predecessor's keys (one drop-only retry already failed), the
+    // launch is REFUSED: a reused PID must never inherit its predecessor's approvals or
+    // `enabled = false` decisions.
+    if let Err(e) = super::codex_hook_trust::carry_hook_trust(
+        base_dir,
+        &handle_dir,
+        account,
+        codex_global_hooks_path().as_deref(),
+        super::codex_hook_trust::CarryMode::Create,
+    ) {
+        warn!(
+            error_kind = "codex_hook_trust_launch_refused",
+            io_kind = ?e.kind(),
+            "refusing to create the Codex handle: stale hook approvals could not be cleared"
+        );
+        let _ = std::fs::remove_dir_all(&handle_dir);
+        return Err(hook_trust_refusal(&config_dir, &e));
     }
 
     // SHARED state: conversation history and codex's schema-versioned sqlite
@@ -1131,8 +1974,193 @@ pub fn materialize_handle_settings(
 /// whatever CC's built-in default is (currently `xhigh`); users who
 /// explicitly set `effortLevel` in their global, or a slot overlay that
 /// sets it (3P bindings pin their own), keep their choice untouched.
+///
+/// `crossSessionInbound: "accept"` — lets the Claude Code sessions csq
+/// materializes take cross-session messages without an approval dialog.
+/// Without it a bypass-permissions receiver HOLDS csq's inbox-socket notice
+/// (it does not attest its permission mode) and an idle session is never
+/// woken (spec 32a §5.2).
+///
+/// EFFECT, stated plainly: for a bypass-permissions session, ANY process
+/// running as the same user that can reach the session's inbox socket can
+/// put text in front of a model that can run tools without prompts, with no
+/// human in the loop. The only defence is that the model treats peer text
+/// as data (Claude Code frames it as a peer message, and csq's
+/// `peer-message-trust` rule reinforces that); that is a model behaviour,
+/// not an access control, and it does not make a bypass session safe
+/// against a hostile same-user process. User approval on 2026-10-06 after
+/// security review is recorded in
+/// `internal-design-docs`.
+/// Remove this exception and narrow accept when Claude offers per-sender or
+/// allow-listed inbound mode, or csq validates the notice sender's identity;
+/// revisit by the 2.22.0 release cut or 2026-12-31, whichever comes first.
+/// Only csq's terminal-local materialization is written, never user-global settings.
+///
+/// What `accept` ADDS, precisely: peer text already reaches a bypass session through csq's
+/// hook on its next turn, and csq's own MCP relay lets ANY session with csq messaging (sandboxed
+/// or not) address it. `accept` makes an IDLE bypass session start a turn on peer text with no
+/// human present. Live reload of this key is an upstream behavior; see the dated evidence in spec 32a.
+///
+/// Scope: only sessions csq materializes, not the machine. Valid in-session
+/// choices take precedence over slot overlay > user-global > this default.
+/// If an existing layer is unusable, the accept default is withheld; an empty
+/// terminal-local file is unusable too (see `prepare_handle_settings_tmp`).
 fn default_settings() -> Value {
-    serde_json::json!({ "effortLevel": "medium" })
+    serde_json::json!({ "effortLevel": "medium", "crossSessionInbound": "accept" })
+}
+
+/// Account-neutral preference keys carried from the PREVIOUS handle `settings.json` into a
+/// re-materialization, because Claude Code (`/config`) writes them into the handle file during
+/// a session and a swap or auto-rotate would otherwise drop them. An explicit allowlist: a key
+/// is added only when it is a pure UI/cost preference that cannot route a request or name a
+/// credential. NEVER `env`, `apiKeyHelper`, provider, model or routing keys.
+const CARRIED_PREFERENCE_KEYS: &[&str] = &["subagentPromptCacheTtl", "disableClaudeAiConnectors"];
+
+/// Sidecar in the handle dir recording the allowlisted values csq's LAYERS supplied at the last
+/// materialization (defaults < global < slot overlay, plus csq's session defaults). The previous
+/// handle `settings.json` is the merged view, so a value equal to this record came from a layer
+/// (it must follow that layer: removed from global it must vanish, and slot A's overlay value
+/// must not cross to slot B); a value that DIFFERS from the record was written by Claude Code.
+const LAYER_RECORD_FILE: &str = ".csq-layer-prefs.json";
+const LAYER_RECORD_MAX_BYTES: u64 = 4096;
+
+type LayerRecord = serde_json::Map<String, Value>;
+
+/// The allowlisted entries of `layers` (the merged layers, before any carry-over).
+fn layer_record(layers: &Value) -> LayerRecord {
+    let mut rec = LayerRecord::new();
+    if let Some(obj) = layers.as_object() {
+        for key in CARRIED_PREFERENCE_KEYS {
+            if let Some(v) = obj.get(*key) {
+                rec.insert((*key).to_string(), v.clone());
+            }
+        }
+    }
+    rec
+}
+
+/// The record of the last materialization, or `None` when it is absent, oversized or
+/// unreadable. With no record nothing can be attributed to Claude Code, so
+/// [`carry_preferences`] carries NOTHING (a value Claude Code wrote is reset once, which is the
+/// safe direction: no layer-sourced value ever crosses accounts).
+fn read_layer_record(handle_dir: &Path) -> Option<LayerRecord> {
+    let path = handle_dir.join(LAYER_RECORD_FILE);
+    match std::fs::metadata(&path) {
+        Ok(m) if m.is_file() && m.len() <= LAYER_RECORD_MAX_BYTES => {}
+        _ => return None,
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| match v {
+            Value::Object(m) => Some(m),
+            _ => None,
+        })
+}
+
+/// Persist `rec` (0600, atomic, tmp removed on every error branch: `security.md` §5a). On a
+/// failed write the OLD record is removed so it can never be read as current; a warn with a
+/// fixed tag is the only report (the settings commit it follows already succeeded).
+fn write_layer_record(handle_dir: &Path, rec: &LayerRecord) {
+    let path = handle_dir.join(LAYER_RECORD_FILE);
+    let tmp = crate::platform::fs::unique_tmp_path(&path);
+    let body = serde_json::to_string(rec).unwrap_or_else(|_| "{}".to_string());
+    let result = crate::platform::fs::write_new_private(&tmp, body.as_bytes())
+        .and_then(|()| crate::platform::fs::secure_file(&tmp))
+        .and_then(|()| crate::platform::fs::atomic_replace(&tmp, &path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&path);
+        warn!(
+            error_kind = "layer_record_write_failed",
+            "layer preference record could not be written"
+        );
+    }
+}
+
+/// Last-known-good copy of the user-global Claude `hooks`, csq-owned and written beside the
+/// handle dirs (`<accounts>/`), never inside one. Read only when the global settings file is
+/// unusable.
+const GLOBAL_HOOKS_RECORD_FILE: &str = ".csq-global-hooks.json";
+
+fn global_hooks_record_path(handle_dir: &Path) -> Option<PathBuf> {
+    handle_dir
+        .parent()
+        .map(|accounts| accounts.join(GLOBAL_HOOKS_RECORD_FILE))
+}
+
+/// Records the global's `hooks` (an empty object when it has none) after a SUCCESSFUL read,
+/// atomically at 0600 (`security.md` §5a: tmp removed on every failure branch), and only when
+/// the bytes changed. A failed write leaves the older record in place and logs a fixed tag.
+fn write_global_hooks_record(path: &Path, base: &Value) {
+    let hooks = base
+        .get("hooks")
+        .filter(|h| h.is_object())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Ok(body) = serde_json::to_vec(&serde_json::json!({ "hooks": hooks })) else {
+        return;
+    };
+    if read_regular_bounded(path, true).as_deref() == Some(body.as_slice()) {
+        return;
+    }
+    let tmp = crate::platform::fs::unique_tmp_path(path);
+    let result = crate::platform::fs::write_new_private(&tmp, &body)
+        .and_then(|()| crate::platform::fs::secure_file(&tmp))
+        .and_then(|()| crate::platform::fs::atomic_replace(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        warn!(
+            error_kind = "global_hooks_record_write_failed",
+            "last-known-good global hooks record could not be written"
+        );
+    }
+}
+
+/// The recorded global hooks as a `{"hooks": …}` layer, or `None` when absent, oversize,
+/// non-regular or unparseable.
+fn read_global_hooks_record(path: &Path) -> Option<Value> {
+    let bytes = read_regular_bounded(path, true)?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    let hooks = v.get("hooks").filter(|h| h.is_object())?;
+    Some(serde_json::json!({ "hooks": hooks }))
+}
+
+/// Carry [`CARRIED_PREFERENCE_KEYS`] from `previous` into `merged` when no layer sets the key
+/// (an explicit user-global or slot value is newer than a stale handle copy) AND the previous
+/// value is not merely the one csq itself wrote from a layer last time (`recorded`): only a
+/// value Claude Code wrote survives.
+fn carry_preferences(previous: &Value, recorded: Option<&LayerRecord>, merged: &mut Value) {
+    // No record (a pre-sidecar handle file, or a failed record write): nothing is attributable
+    // to Claude Code, so nothing is carried.
+    let (Some(recorded), Some(prev), Some(dst)) =
+        (recorded, previous.as_object(), merged.as_object_mut())
+    else {
+        return;
+    };
+    for key in CARRIED_PREFERENCE_KEYS {
+        if dst.contains_key(*key) {
+            continue;
+        }
+        if let Some(v) = prev.get(*key) {
+            if recorded.get(*key) != Some(v) {
+                dst.insert((*key).to_string(), v.clone());
+            }
+        }
+    }
+}
+
+/// Settings csq applies to every Claude session it launches, AFTER the
+/// defaults < user-global < slot-overlay merge (an internal ticket): `disableClaudeAiConnectors` defaults to
+/// `true` ONLY when no layer sets it (an explicit `false` passes through). csq neither sets nor
+/// rewrites `subagentPromptCacheTtl`. Neither key touches credentials or identity; both are
+/// re-applied on every materialization.
+fn apply_session_keys(merged: &mut Value) {
+    if let Some(settings) = merged.as_object_mut() {
+        settings
+            .entry("disableClaudeAiConnectors")
+            .or_insert(Value::Bool(true));
+    }
 }
 
 /// Internal implementation for [`materialize_handle_settings`] with optional
@@ -1157,12 +2185,17 @@ fn materialize_handle_settings_inner(
     config_dir: &Path,
     uuid_settings_path: Option<&Path>,
 ) -> Result<(), CredentialError> {
-    let tmp = prepare_handle_settings_tmp(handle_dir, claude_home, config_dir, uuid_settings_path)?;
+    let (tmp, record) =
+        prepare_handle_settings(handle_dir, claude_home, config_dir, uuid_settings_path)?;
     let settings_path = handle_dir.join("settings.json");
-    commit_prepared_handle_settings(&tmp, &settings_path).map_err(|e| CredentialError::Corrupt {
-        path: settings_path,
-        reason: format!("atomic replace: {e}"),
-    })
+    commit_prepared_handle_settings(&tmp, &settings_path).map_err(|e| {
+        CredentialError::Corrupt {
+            path: settings_path,
+            reason: format!("atomic replace: {e}"),
+        }
+    })?;
+    write_layer_record(handle_dir, &record);
+    Ok(())
 }
 
 /// L2 (`security.md` §5a): creates `tmp` EXCLUSIVELY (`O_EXCL` via
@@ -1207,13 +2240,32 @@ fn create_tmp_exclusive(tmp: &Path, content: &[u8]) -> std::io::Result<()> {
 ///
 /// Returns the prepared temp path on success; the caller commits it via
 /// [`commit_prepared_handle_settings`].
+#[cfg(all(test, unix))]
 fn prepare_handle_settings_tmp(
     handle_dir: &Path,
     claude_home: &Path,
     config_dir: &Path,
     uuid_settings_path: Option<&Path>,
 ) -> Result<PathBuf, CredentialError> {
-    let base = read_json_object_or_empty(&claude_home.join("settings.json"));
+    prepare_handle_settings(handle_dir, claude_home, config_dir, uuid_settings_path)
+        .map(|(tmp, _)| tmp)
+}
+
+/// [`prepare_handle_settings_tmp`]'s body, also returning the layer record the caller persists
+/// with [`write_layer_record`] AFTER the settings commit succeeds (so a rolled-back swap never
+/// leaves a record describing a file that was not written).
+fn prepare_handle_settings(
+    handle_dir: &Path,
+    claude_home: &Path,
+    config_dir: &Path,
+    uuid_settings_path: Option<&Path>,
+) -> Result<(PathBuf, LayerRecord), CredentialError> {
+    let (base, base_usable, _) = read_settings_layer(&claude_home.join("settings.json"), true);
+    let settings_path = handle_dir.join("settings.json");
+    let (mut previous, previous_usable, previous_absent) =
+        read_settings_layer(&settings_path, false);
+    // Previous terminal state is not an authority for compaction policy.
+    super::settings_policy::strip_autocompact_overrides(&mut previous);
 
     // M2-3: prefer the UUID-keyed settings.json when present (Phase 2 active
     // path). Fall back to config-<N>/settings.json for legacy-only layouts.
@@ -1227,15 +2279,130 @@ fn prepare_handle_settings_tmp(
         }
         _ => config_dir.join("settings.json"),
     };
-    let overlay = read_json_object_or_empty(&overlay_path);
-    // Three-layer merge: csq defaults < user-global < slot overlay. The
-    // defaults layer fills in keys (currently `effortLevel`) only when
-    // neither the user-global nor the slot overlay sets them — an
-    // explicit user setting always wins, and the user-global file itself
-    // is never written.
-    let merged = merge_settings(&merge_settings(&default_settings(), &base), &overlay);
+    let (mut overlay, overlay_usable, _) = read_settings_layer(&overlay_path, true);
+    // Strip slot policy before merge so the user's global JSON settings remain intact.
+    super::settings_policy::strip_autocompact_overrides(&mut overlay);
+    // Slot-supplied percentage overrides are global-only; provider windows require
+    // a published third-party binding. Filter the overlay so global values survive.
+    // Only the canonical numeric overlay can use this exception. A selected
+    // UUID overlay is distinct input and cannot borrow the numeric slot's proof.
+    let allow_provider_window = overlay_path == config_dir.join("settings.json")
+        && config_dir.parent().is_some_and(|base_dir| {
+            super::settings_policy::slot_allows_provider_window(base_dir, config_dir)
+        });
+    super::settings_policy::strip_slot_autocompact_env(&mut overlay, allow_provider_window);
+    // A slot may never switch off the global hooks: `disableAllHooks` is global-only, so it
+    // is stripped from the slot layer BEFORE the merge and can never override the global value.
+    if overlay
+        .as_object_mut()
+        .is_some_and(|m| m.remove(SLOT_FORBIDDEN_HOOK_KEY).is_some())
+    {
+        warn!(
+            error_kind = "slot_disable_all_hooks_stripped",
+            "slot settings carried disableAllHooks; stripped so global hooks keep running"
+        );
+    }
+    // Three-layer merge, lowest to highest: csq defaults < user-global <
+    // slot overlay (overlay > global > default). The defaults layer fills in
+    // the keys of `default_settings` only when neither the user-global nor
+    // the slot overlay sets them — an explicit user setting always wins, and
+    // the user-global file itself is never written.
+    let mut defaults = default_settings();
+    // Fail closed: a settings file that EXISTS but cannot be read as a JSON
+    // object (the SAME read that produced `base`/`overlay`, so no race between a check and a
+    // use) is treated as `{}` above, which would let a user's explicit
+    // `crossSessionInbound: "refuse"` inside it be silently replaced by
+    // csq's `accept`. So no csq default for that key is applied then.
+    if !base_usable || !overlay_usable || !previous_usable {
+        warn!(
+            reason = "settings_unusable_no_cross_session_default",
+            "a settings file is unreadable; crossSessionInbound default withheld"
+        );
+        if let Some(m) = defaults.as_object_mut() {
+            m.remove("crossSessionInbound");
+        }
+    }
+    let mut merged = merge_settings(&merge_settings(&defaults, &base), &overlay);
+    // An unusable GLOBAL settings file yields `{}` above, which would write a handle file with
+    // no global hooks. Seed the hooks ONLY from the last-known-good GLOBAL hooks record
+    // (`GLOBAL_HOOKS_RECORD_FILE`, written each time the global was read successfully). The
+    // previous handle file is NEVER the seed: it already holds the previous slot's own hooks
+    // and csq's messaging hooks, so seeding from it would carry one slot's hooks into another.
+    // With no record the terminal gets no global hooks; `csq doctor` reports the unusable file.
+    let record_path = global_hooks_record_path(handle_dir);
+    let hooks_base = if base_usable {
+        if let Some(path) = record_path.as_deref() {
+            write_global_hooks_record(path, &base);
+        }
+        base.clone()
+    } else if let Some(record) = record_path.as_deref().and_then(read_global_hooks_record) {
+        warn!(
+            error_kind = "global_settings_unusable_hooks_from_record",
+            "global settings.json is unusable; using the last-known-good global hooks record"
+        );
+        record
+    } else {
+        warn!(
+            error_kind = "global_settings_unusable_no_hooks_record",
+            "global settings.json is unusable and no last-known-good hooks record exists; \
+             this terminal gets no global hooks"
+        );
+        base.clone()
+    };
+    concat_hook_arrays(&mut merged, &[&hooks_base, &overlay]);
 
-    let settings_path = handle_dir.join("settings.json");
+    // Preserve a stricter in-session choice, but never let the previous default
+    // accept weaken the newly merged account policy. Refuse is strongest;
+    // approval/hold (including the native default when absent) beats accept.
+    // Other previous account settings must not survive the swap. Registration
+    // below consumes this same read.
+    let inbound_restriction = |choice: Option<&Value>| match choice.and_then(Value::as_str) {
+        Some("accept") => 0,
+        Some("refuse") => 2,
+        _ => 1,
+    };
+    match previous.get("crossSessionInbound") {
+        Some(choice) if matches!(choice.as_str(), Some("accept" | "hold" | "refuse")) => {
+            let merged_unknown = merged
+                .get("crossSessionInbound")
+                .is_some_and(|value| !matches!(value.as_str(), Some("accept" | "hold" | "refuse")));
+            if inbound_restriction(Some(choice))
+                > inbound_restriction(merged.get("crossSessionInbound"))
+                || (inbound_restriction(Some(choice)) >= 1 && merged_unknown)
+            {
+                merged["crossSessionInbound"] = choice.clone();
+            }
+        }
+        // Every existing local file without a known choice retains native
+        // approval, including a usable object whose key was withheld on a prior
+        // swap. Only confirmed absence means a fresh handle may default to accept.
+        // A newly merged refusal/approval remains in force.
+        _ if !previous_absent && inbound_restriction(merged.get("crossSessionInbound")) == 0 => {
+            if let Some(settings) = merged.as_object_mut() {
+                settings.remove("crossSessionInbound");
+            }
+        }
+        _ => {}
+    }
+
+    // Spec 32 §6: a terminal launched with messaging registered keeps its hooks and allow
+    // rules across a swap. The handle dir's PREVIOUS settings.json is the only source of
+    // that fact, so a dir without a registration (messaging off, or never launched by
+    // `csq run`) gains none here. Fail-open: a refusal logs a fixed tag and the swap
+    // proceeds without the layer.
+    if let Err(e) = crate::messaging::register::carry_over(handle_dir, &previous, &mut merged) {
+        warn!(
+            error_kind = crate::messaging::register::LOG_TAG_FAILED,
+            reason = e.tag(),
+            "handle settings re-materialized without the messaging layer"
+        );
+    }
+    let recorded = read_layer_record(handle_dir);
+    let mut layers = merged.clone();
+    apply_session_keys(&mut layers);
+    let record = layer_record(&layers);
+    carry_preferences(&previous, recorded.as_ref(), &mut merged);
+    apply_session_keys(&mut merged);
     let json = serde_json::to_string_pretty(&merged).map_err(|e| CredentialError::Corrupt {
         path: settings_path.clone(),
         reason: format!("merged settings serialize failed: {e}"),
@@ -1265,7 +2432,7 @@ fn prepare_handle_settings_tmp(
             reason: format!("secure_file: {e}"),
         });
     }
-    Ok(tmp)
+    Ok((tmp, record))
 }
 
 /// S-H1/D-F1: commits a temp file prepared by [`prepare_handle_settings_tmp`]
@@ -1301,24 +2468,112 @@ fn commit_prepared_handle_settings(tmp: &Path, settings_path: &Path) -> std::io:
     Ok(())
 }
 
-/// Reads a JSON file and returns its root object, or an empty object if
-/// the file is missing, unreadable, malformed, or not an object at the
-/// top level. Warnings are logged for malformed non-empty content so
-/// users see why their customization vanished.
-fn read_json_object_or_empty(path: &Path) -> Value {
+/// The settings key a slot may never set: it switches every hook off, so it is global-only.
+const SLOT_FORBIDDEN_HOOK_KEY: &str = "disableAllHooks";
+
+/// Rebuilds `merged.hooks` from the `layers` (lowest first: user-global, then slot overlay) so
+/// every GLOBAL `hooks.<Event>` entry survives whatever a later layer holds. `merge_settings`
+/// lets a later layer's `hooks` value (`null`, `[]`, a string, a per-event non-array) replace
+/// the global one, so `merged.hooks` is not trusted: the first layer whose `hooks` is an
+/// object seeds the result verbatim, and each later layer's object-valued `hooks` is folded in
+/// per event. A later layer's `hooks` that is not an object is ignored. Per event: array +
+/// array CONCATENATES in layer order, de-duplicating ONLY across layers (an entry already in
+/// the earlier layers' array is not added again; duplicates inside one layer are kept); an
+/// event only the later layer has is inserted as is; a later non-array value never replaces an
+/// existing earlier value. The messaging layer is applied after this and appends. Keys other
+/// than `hooks` keep `merge_settings` semantics. If no layer's `hooks` is an object, `merged`
+/// is left as `merge_settings` produced it.
+fn concat_hook_arrays(merged: &mut Value, layers: &[&Value]) {
+    let mut acc: Option<serde_json::Map<String, Value>> = None;
+    for layer in layers {
+        let Some(hooks) = layer.get("hooks").and_then(Value::as_object) else {
+            continue;
+        };
+        if acc.is_none() {
+            acc = Some(hooks.clone());
+            continue;
+        }
+        let Some(acc) = acc.as_mut() else {
+            continue;
+        };
+        for (event, value) in hooks {
+            match (acc.get(event), value) {
+                (Some(Value::Array(prior)), Value::Array(entries)) => {
+                    let prior = prior.clone();
+                    let mut combined = prior.clone();
+                    combined.extend(entries.iter().filter(|e| !prior.contains(e)).cloned());
+                    acc.insert(event.clone(), Value::Array(combined));
+                }
+                (Some(_), _) => {}
+                (None, _) => {
+                    acc.insert(event.clone(), value.clone());
+                }
+            }
+        }
+    }
+    if let (Some(acc), Some(obj)) = (acc, merged.as_object_mut()) {
+        obj.insert("hooks".to_owned(), Value::Object(acc));
+    }
+}
+
+/// Whether the settings file at `path` (a slot overlay) carries the global-only
+/// `disableAllHooks` key. A missing, unreadable, oversize, non-regular (FIFO, device) or
+/// unparseable file is `false`; the read is bounded and cannot block (`read_regular_bounded`). Used by
+/// `csq doctor`; the merge strips the key regardless.
+#[must_use]
+pub fn settings_file_has_disable_all_hooks(path: &Path) -> bool {
+    read_regular_bounded(path, false)
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .is_some_and(|v| v.get(SLOT_FORBIDDEN_HOOK_KEY).is_some())
+}
+
+/// Whether the user-global `<claude_home>/settings.json` EXISTS but cannot be used as a JSON
+/// object (the same classification the materializer applies), so global hooks are not being
+/// merged from it. A missing or empty file is usable (`false`).
+#[must_use]
+pub fn global_claude_settings_unusable(claude_home: &Path) -> bool {
+    !read_settings_layer(&claude_home.join("settings.json"), true).1
+}
+
+/// One settings layer, read ONCE: its root object, usability and absence.
+/// Invalid JSON, nonobjects and read errors are unusable. The terminal-local
+/// layer treats NotFound as usable only when lstat confirms the entry is absent;
+/// global/slot layers retain their historical missing-target compatibility.
+/// The value and both flags share one content read; lstat reads only metadata.
+/// Local absence is confirmed only on NotFound plus an absent directory entry;
+/// all other failures conservatively retain previous-file policy.
+/// Empty global/slot files retain their historical absent-layer semantics. An
+/// existing empty terminal-local file is unusable: a partial write must not
+/// replace an unknown in-session inbound refusal with the accept default.
+fn read_settings_layer(path: &Path, empty_usable: bool) -> (Value, bool, bool) {
+    let empty = || Value::Object(serde_json::Map::new());
     let content = match std::fs::read_to_string(path) {
-        Ok(s) if !s.trim().is_empty() => s,
-        _ => return Value::Object(serde_json::Map::new()),
+        Ok(s) if s.trim().is_empty() => return (empty(), empty_usable, false),
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // A missing local target does not mean the settings entry is absent:
+            // a dangling symlink (or a read/lstat race) must not restore accept.
+            // Global/slot layers retain their historical NotFound behavior. This
+            // inspects only the entry; it never performs a second content read.
+            let absent = empty_usable
+                || std::fs::symlink_metadata(path)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            return (empty(), absent, absent);
+        }
+        Err(e) => {
+            warn!(path = %path.display(), error_kind = ?e.kind(), "settings file unreadable, treating as empty");
+            return (empty(), false, false);
+        }
     };
     match serde_json::from_str::<Value>(&content) {
-        Ok(v) if v.is_object() => v,
+        Ok(v) if v.is_object() => (v, true, false),
         Ok(_) => {
             warn!(path = %path.display(), "settings file is not a JSON object, treating as empty");
-            Value::Object(serde_json::Map::new())
+            (empty(), false, false)
         }
         Err(e) => {
             warn!(path = %path.display(), error = %e, "settings file has invalid JSON, treating as empty");
-            Value::Object(serde_json::Map::new())
+            (empty(), false, false)
         }
     }
 }
@@ -1646,6 +2901,33 @@ fn repoint_fail_settings_commit_for_test() -> bool {
     false
 }
 
+// R2 NEW-1/N2 test-only seam: runs once, with the handle dir, right after the
+// `ACCOUNT_BOUND_ITEMS` rename loop and before any commit — lets a test mutate
+// `.claude.json` at exactly the point a live CC writer can. Thread-local, so
+// it never leaks across tests; callers reset it with `None`.
+#[cfg(all(test, unix))]
+type RepointAfterLoopHook = Box<dyn Fn(&Path)>;
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static REPOINT_AFTER_LOOP_HOOK: std::cell::RefCell<Option<RepointAfterLoopHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn set_repoint_after_loop_hook_for_test(hook: Option<RepointAfterLoopHook>) {
+    REPOINT_AFTER_LOOP_HOOK.with(|c| *c.borrow_mut() = hook);
+}
+
+#[cfg(all(test, unix))]
+fn run_repoint_after_loop_hook_for_test(handle_dir: &Path) {
+    REPOINT_AFTER_LOOP_HOOK.with(|c| {
+        if let Some(hook) = c.borrow().as_ref() {
+            hook(handle_dir);
+        }
+    });
+}
+
 /// Resolve the per-handle-dir rename-serialization lock path (`.swap.lock`,
 /// dot) used by [`repoint_handle_dir`] and [`repoint_handle_dir_codex`].
 ///
@@ -1679,11 +2961,521 @@ fn repoint_lock_path(handle_dir: &Path) -> PathBuf {
 /// - If the handle dir is not a `term-<pid>` dir (refuses legacy `config-N`)
 /// - If `config-<target>` doesn't exist
 /// - On any I/O failure during repoint
+///
+/// Opaque preoperation native/source snapshot. Metadata is an expectation,
+/// never a provider ownership proof. Captured while the caller holds swap lock.
+pub struct NativeSwapCapture {
+    handle: PathBuf,
+    raw: Option<String>,
+    marker: Option<AccountNum>,
+    source_binding: Option<crate::accounts::anthropic_identity::CapturedBinding>,
+}
+impl NativeSwapCapture {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn marker_account(&self) -> Option<AccountNum> {
+        self.marker
+    }
+}
+
+/// Native receipt reads preserve absence separately from every refusal. The
+/// held descriptor is regular and bounded; path identity is checked again
+/// before returning so an open-time replacement cannot become an expectation.
+pub(crate) fn read_native_swap_raw(handle: &Path) -> Result<Option<String>, CredentialError> {
+    use crate::accounts::anthropic_identity as ai;
+    use std::io::Read;
+    // Same native JSON ceiling as credentials::claude_json's legacy reader.
+    const MAX_NATIVE_BYTES: u64 = 16 * 1024 * 1024;
+    let path = handle.join(".claude.json");
+    #[cfg(windows)]
+    let before_file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x0020_0000)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(ai::credential_refusal()),
+        }
+    };
+    #[cfg(windows)]
+    let before = before_file
+        .metadata()
+        .map_err(|_| ai::credential_refusal())?;
+    #[cfg(not(windows))]
+    let before = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(ai::credential_refusal()),
+    };
+    if !before.is_file() || before.len() > MAX_NATIVE_BYTES {
+        return Err(ai::credential_refusal());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let mut file = options.open(&path).map_err(|_| ai::credential_refusal())?;
+    let opened = file.metadata().map_err(|_| ai::credential_refusal())?;
+    if !opened.is_file() || opened.len() > MAX_NATIVE_BYTES {
+        return Err(ai::credential_refusal());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if opened.dev() != before.dev()
+            || opened.ino() != before.ino()
+            || opened.nlink() != 1
+            || opened.uid() != unsafe { libc::geteuid() }
+        {
+            return Err(ai::credential_refusal());
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if before.file_attributes() & 0x0400 != 0
+            || opened.file_attributes() & 0x0400 != 0
+            || ai::windows_file_identity(&before_file).map_err(|_| ai::credential_refusal())?
+                != ai::windows_file_identity(&file).map_err(|_| ai::credential_refusal())?
+            || before.len() != opened.len()
+            || before.last_write_time() != opened.last_write_time()
+            || before.creation_time() != opened.creation_time()
+        {
+            return Err(ai::credential_refusal());
+        }
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(MAX_NATIVE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ai::credential_refusal())?;
+    let after = file.metadata().map_err(|_| ai::credential_refusal())?;
+    let current = std::fs::symlink_metadata(&path).map_err(|_| ai::credential_refusal())?;
+    if bytes.len() as u64 > MAX_NATIVE_BYTES
+        || bytes.len() as u64 != opened.len()
+        || !after.is_file()
+        || !current.is_file()
+        || after.len() != opened.len()
+        || current.len() != opened.len()
+        || after.modified().map_err(|_| ai::credential_refusal())?
+            != opened.modified().map_err(|_| ai::credential_refusal())?
+        || current.modified().map_err(|_| ai::credential_refusal())?
+            != opened.modified().map_err(|_| ai::credential_refusal())?
+    {
+        return Err(ai::credential_refusal());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if after.dev() != opened.dev()
+            || after.ino() != opened.ino()
+            || current.dev() != opened.dev()
+            || current.ino() != opened.ino()
+            || after.ctime() != opened.ctime()
+            || after.ctime_nsec() != opened.ctime_nsec()
+            || current.ctime() != opened.ctime()
+            || current.ctime_nsec() != opened.ctime_nsec()
+        {
+            return Err(ai::credential_refusal());
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        let named_file = options.open(&path).map_err(|_| ai::credential_refusal())?;
+        let named = named_file
+            .metadata()
+            .map_err(|_| ai::credential_refusal())?;
+        if current.file_attributes() & 0x0400 != 0
+            || after.file_attributes() & 0x0400 != 0
+            || ai::windows_file_identity(&named_file).map_err(|_| ai::credential_refusal())?
+                != ai::windows_file_identity(&file).map_err(|_| ai::credential_refusal())?
+            || named.len() != after.len()
+            || named.last_write_time() != after.last_write_time()
+            || named.creation_time() != after.creation_time()
+            || after.last_write_time() != opened.last_write_time()
+            || after.creation_time() != opened.creation_time()
+        {
+            return Err(ai::credential_refusal());
+        }
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| ai::credential_refusal())
+}
+
+/// `reason` carried by [`profiles_lock_busy`].
+const PROFILES_LOCK_BUSY_REASON: &str = "profiles_lock_busy";
+
+/// N5: another holder (daemon verifier, sentinel clear, custodian adopt) has
+/// the profiles lock. Nothing is wrong with the account's identity and
+/// nothing changed — the caller must say "busy, retry", never "run csq login".
+fn profiles_lock_busy() -> CredentialError {
+    CredentialError::Corrupt {
+        path: "anthropic-identity".into(),
+        reason: PROFILES_LOCK_BUSY_REASON.into(),
+    }
+}
+
+/// True when `error` is the busy-profiles-lock refusal of
+/// [`capture_native_swap`] / [`repoint_handle_dir_guarded`].
+pub fn is_profiles_lock_busy(error: &CredentialError) -> bool {
+    matches!(error, CredentialError::Corrupt { reason, .. } if reason == PROFILES_LOCK_BUSY_REASON)
+}
+
+pub fn capture_native_swap(
+    base: &Path,
+    handle: &Path,
+) -> Result<NativeSwapCapture, CredentialError> {
+    use crate::accounts::{anthropic_identity as ai, profiles_lock::ProfilesFileLock};
+    let lock = ProfilesFileLock::try_acquire(base)
+        .map_err(|_| ai::credential_refusal())?
+        .ok_or_else(profiles_lock_busy)?;
+    capture_native_swap_locked(&lock, base, handle)
+}
+
+/// Capture native/source expectations using existing profile custody.
+pub(crate) fn capture_native_swap_locked(
+    lock: &crate::accounts::profiles_lock::ProfilesFileLock,
+    base: &Path,
+    handle: &Path,
+) -> Result<NativeSwapCapture, CredentialError> {
+    use crate::accounts::anthropic_identity as ai;
+    if !lock.protects(base) {
+        return Err(ai::credential_refusal());
+    }
+    let canonical_handle = std::fs::canonicalize(handle).map_err(|_| ai::credential_refusal())?;
+    if !canonical_handle.is_dir() {
+        return Err(ai::credential_refusal());
+    }
+    let marker = crate::accounts::markers::resolve_marker_to_slot(base, handle);
+    let source_binding =
+        marker.and_then(|slot| ai::capture_anthropic_binding_locked(lock, base, slot).ok());
+    let raw = read_native_swap_raw(handle)?;
+    if raw.as_deref().is_some_and(|raw| {
+        serde_json::from_str::<Value>(raw).map_or(true, |json| !json.is_object())
+    }) {
+        return Err(ai::credential_refusal());
+    }
+    Ok(NativeSwapCapture {
+        handle: canonical_handle,
+        raw,
+        marker,
+        source_binding,
+    })
+}
+fn native_context_can_rewrite(
+    raw: Option<&str>,
+    target: &crate::accounts::anthropic_identity::AnthropicContext,
+    source: Option<&crate::accounts::anthropic_identity::AnthropicContext>,
+) -> bool {
+    let Some(raw) = raw else {
+        return true;
+    };
+    let Ok(json) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    if !json.is_object() {
+        return false;
+    }
+    let Some(account) = json.get("oauthAccount") else {
+        return true;
+    };
+    if account.is_null()
+        || account
+            .as_object()
+            .is_some_and(|account| account.is_empty())
+    {
+        return true;
+    }
+    let Ok(expected) = crate::accounts::anthropic_identity::parse_native_expectation(&json) else {
+        return false;
+    };
+    expected.context() == target || source.is_some_and(|source| expected.context() == source)
+}
+
+fn native_context_matches_captured_binding(
+    raw: Option<&str>,
+    binding: &crate::accounts::anthropic_identity::CapturedBinding,
+) -> bool {
+    use crate::accounts::anthropic_identity as ai;
+    let Some(raw) = raw else {
+        return true;
+    };
+    let Ok(json) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    if !json.is_object() {
+        return false;
+    }
+    let Some(account) = json.get("oauthAccount") else {
+        return true;
+    };
+    if account.is_null() || account.as_object().is_some_and(|value| value.is_empty()) {
+        return true;
+    }
+    match binding.context() {
+        ai::StoredAnthropicContext::Known(context) => {
+            ai::parse_native_expectation(&json).is_ok_and(|expected| expected.context() == context)
+        }
+        ai::StoredAnthropicContext::LegacyUnknown => {
+            // A local expectation for this exact captured UUID, not provider
+            // ownership. Never derive context/index/identity authority from it.
+            account
+                .get("emailAddress")
+                .and_then(Value::as_str)
+                .zip(binding.recorded_legacy_email())
+                .is_some_and(|(native, recorded)| native.trim().eq_ignore_ascii_case(recorded))
+        }
+    }
+}
+pub(crate) fn native_swap_is_current_locked(
+    lock: &crate::accounts::profiles_lock::ProfilesFileLock,
+    base: &Path,
+    handle: &Path,
+    capture: &NativeSwapCapture,
+    target: &crate::accounts::anthropic_identity::CapturedBinding,
+) -> bool {
+    use crate::accounts::anthropic_identity as ai;
+    if std::fs::canonicalize(handle).ok().as_ref() != Some(&capture.handle) {
+        return false;
+    }
+    let Ok(current_native) = read_native_swap_raw(handle) else {
+        return false;
+    };
+    if crate::accounts::markers::resolve_marker_to_slot(base, handle) != capture.marker
+        || current_native != capture.raw
+    {
+        return false;
+    }
+    if capture
+        .source_binding
+        .as_ref()
+        .is_some_and(|source| !ai::binding_matches_locked(lock, base, source).unwrap_or(false))
+    {
+        return false;
+    }
+    let source = capture.source_binding.as_ref();
+    if matches!(target.context(), ai::StoredAnthropicContext::LegacyUnknown) {
+        // Both sides need independent local canonical custody. A missing source
+        // is never turned into a legacy UUID by an email or directory fallback.
+        return target.recorded_legacy_email().is_some()
+            && source.is_some()
+            && (native_context_matches_captured_binding(capture.raw.as_deref(), target)
+                || source.is_some_and(|source| {
+                    native_context_matches_captured_binding(capture.raw.as_deref(), source)
+                }));
+    }
+    let ai::StoredAnthropicContext::Known(target_context) = target.context() else {
+        return false;
+    };
+    if source.is_some_and(|source| {
+        matches!(source.context(), ai::StoredAnthropicContext::LegacyUnknown)
+            && native_context_matches_captured_binding(capture.raw.as_deref(), source)
+    }) {
+        return true;
+    }
+    let source = capture
+        .source_binding
+        .as_ref()
+        .and_then(|binding| match binding.context() {
+            ai::StoredAnthropicContext::Known(context) => Some(context),
+            ai::StoredAnthropicContext::LegacyUnknown => None,
+        });
+    native_context_can_rewrite(capture.raw.as_deref(), target_context, source)
+}
+pub(crate) fn native_swap_is_current(
+    base: &Path,
+    handle: &Path,
+    capture: &NativeSwapCapture,
+    target: &crate::accounts::anthropic_identity::CapturedBinding,
+) -> bool {
+    let Ok(Some(lock)) = crate::accounts::profiles_lock::ProfilesFileLock::try_acquire(base) else {
+        return false;
+    };
+    native_swap_is_current_locked(&lock, base, handle, capture, target)
+}
+
+/// Handle-repoint lock acquired before profile custody; both remain held
+/// across force-write, symlink publication and compensation.
+pub(crate) struct RepointCustody {
+    pub(crate) profiles: crate::accounts::profiles_lock::ProfilesFileLock,
+    handle: PathBuf,
+    _repoint_guard: crate::platform::lock::FileLockGuard,
+}
+
+pub(crate) fn lock_repoint_custody(
+    base: &Path,
+    handle: &Path,
+) -> Result<RepointCustody, CredentialError> {
+    use crate::accounts::{anthropic_identity as ai, profiles_lock::ProfilesFileLock};
+    if !handle
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|n| n.starts_with("term-"))
+    {
+        return Err(ai::credential_refusal());
+    }
+    let canonical = std::fs::canonicalize(handle).map_err(|_| ai::credential_refusal())?;
+    let repoint = crate::platform::lock::lock_file(&repoint_lock_path(handle))
+        .map_err(|_| ai::credential_refusal())?;
+    let profiles = ProfilesFileLock::try_acquire(base)
+        .map_err(|_| ai::credential_refusal())?
+        .ok_or_else(profiles_lock_busy)?;
+    Ok(RepointCustody {
+        profiles,
+        handle: canonical,
+        _repoint_guard: repoint,
+    })
+}
+
+pub fn repoint_handle_dir_guarded(
+    base_dir: &Path,
+    claude_home: &Path,
+    handle_dir: &Path,
+    target_binding: &crate::accounts::anthropic_identity::CapturedBinding,
+    native_capture: &NativeSwapCapture,
+) -> Result<(), CredentialError> {
+    let custody = lock_repoint_custody(base_dir, handle_dir)?;
+    repoint_handle_dir_guarded_locked(
+        &custody,
+        base_dir,
+        claude_home,
+        handle_dir,
+        target_binding,
+        native_capture,
+    )
+}
+
+pub(crate) fn repoint_handle_dir_guarded_locked(
+    custody: &RepointCustody,
+    base_dir: &Path,
+    claude_home: &Path,
+    handle_dir: &Path,
+    target_binding: &crate::accounts::anthropic_identity::CapturedBinding,
+    native_capture: &NativeSwapCapture,
+) -> Result<(), CredentialError> {
+    use crate::accounts::anthropic_identity as ai;
+    if !custody.profiles.protects(base_dir)
+        || std::fs::canonicalize(handle_dir).ok().as_ref() != Some(&custody.handle)
+    {
+        return Err(ai::credential_refusal());
+    }
+    if !ai::binding_matches_locked(&custody.profiles, base_dir, target_binding).unwrap_or(false)
+        || !native_swap_is_current_locked(
+            &custody.profiles,
+            base_dir,
+            handle_dir,
+            native_capture,
+            target_binding,
+        )
+    {
+        return Err(ai::credential_refusal());
+    }
+    repoint_handle_dir_impl(
+        base_dir,
+        claude_home,
+        handle_dir,
+        target_binding.slot(),
+        Some(target_binding),
+        Some(native_capture),
+        true,
+    )
+}
+
 pub fn repoint_handle_dir(
     base_dir: &Path,
     claude_home: &Path,
     handle_dir: &Path,
     target: AccountNum,
+) -> Result<(), CredentialError> {
+    // Raw callers cannot repoint an Anthropic login without complete captured
+    // custody. The non-Anthropic route keeps its existing provider semantics.
+    let Some(uuid) = crate::accounts::profiles::resolve_slot_to_uuid(base_dir, target.get()) else {
+        // API-key binding deliberately has no OAuth UUID. Require both its
+        // explicit publication label and recognized provider settings; missing
+        // OAuth metadata alone never authorizes this compatibility route.
+        let third_party_target = || {
+            profiles::load(&profiles::profiles_path(base_dir)).is_ok_and(|profiles| {
+                !profiles.by_slot.contains_key(&target.get().to_string())
+                    && profiles
+                        .by_slot_identity
+                        .get(&target.get().to_string())
+                        .and_then(|label| label.strip_prefix("apikey:"))
+                        .and_then(crate::providers::get_provider)
+                        .is_some()
+                    && crate::accounts::third_party::is_third_party_slot(base_dir, target)
+                        .unwrap_or(false)
+                    && matches!(
+                        std::fs::symlink_metadata(
+                            base_dir.join(format!("config-{target}")).join(".credentials.json")
+                        ),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                    )
+            })
+        };
+        // Refuse without creating lock files for an unverified legacy target.
+        if !third_party_target()
+            || !handle_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("term-"))
+        {
+            return Err(crate::accounts::anthropic_identity::credential_refusal());
+        }
+        let _repoint_guard = crate::platform::lock::lock_file(&repoint_lock_path(handle_dir))
+            .map_err(|_| crate::accounts::anthropic_identity::credential_refusal())?;
+        let _profiles_guard =
+            crate::accounts::profiles_lock::ProfilesFileLock::try_acquire(base_dir)
+                .map_err(|_| crate::accounts::anthropic_identity::credential_refusal())?
+                .ok_or_else(crate::accounts::anthropic_identity::credential_refusal)?;
+        // A compliant login/rebind cannot change provider custody through the
+        // rename. Preserve the handle-before-profiles lock order.
+        if !third_party_target() {
+            return Err(crate::accounts::anthropic_identity::credential_refusal());
+        }
+        return repoint_handle_dir_impl(
+            base_dir,
+            claude_home,
+            handle_dir,
+            target,
+            None,
+            None,
+            true,
+        );
+    };
+    // Missing/corrupt credentials are not evidence of a non-Anthropic identity.
+    // Positive provider metadata is required for this compatibility route.
+    let provider = crate::accounts::identity_store::read_identity_provider(base_dir, uuid);
+    if !matches!(provider.as_deref(), Some("codex" | "gemini" | "3p"))
+        || crate::credentials::file::load(&crate::accounts::identity_store::credentials_path_for(
+            base_dir, uuid,
+        ))
+        .is_ok_and(|creds| creds.anthropic().is_some())
+    {
+        return Err(crate::accounts::anthropic_identity::credential_refusal());
+    }
+    repoint_handle_dir_impl(base_dir, claude_home, handle_dir, target, None, None, false)
+}
+
+fn repoint_handle_dir_impl(
+    base_dir: &Path,
+    claude_home: &Path,
+    handle_dir: &Path,
+    target: AccountNum,
+    target_binding: Option<&crate::accounts::anthropic_identity::CapturedBinding>,
+    native_capture: Option<&NativeSwapCapture>,
+    repoint_lock_held: bool,
 ) -> Result<(), CredentialError> {
     // Verify this is a handle dir, not a config dir
     let dir_name = handle_dir
@@ -1802,11 +3594,16 @@ pub fn repoint_handle_dir(
     // when the handle dir is swept. `lock_file` blocks until the lock is available
     // (blocking, not try_lock) so the slower caller is serialized, not dropped.
     let lock_path = repoint_lock_path(handle_dir);
-    let _swap_guard =
-        crate::platform::lock::lock_file(&lock_path).map_err(|e| CredentialError::Corrupt {
-            path: lock_path.clone(),
-            reason: format!("repoint lock acquisition failed: {e}"),
-        })?;
+    let _swap_guard = if repoint_lock_held {
+        None
+    } else {
+        Some(crate::platform::lock::lock_file(&lock_path).map_err(|e| {
+            CredentialError::Corrupt {
+                path: lock_path.clone(),
+                reason: format!("repoint lock acquisition failed: {e}"),
+            }
+        })?)
+    };
 
     // M3-4: Resolve the identity-keyed paths for the swap target BEFORE the
     // mtime bump and symlink rebuild.  The bump target MUST match the
@@ -1833,7 +3630,9 @@ pub fn repoint_handle_dir(
     // (no UUID mapping) fall through to the `else` branch and target
     // `config-N/.credentials.json` which CC's own `claude auth login`
     // subprocess writes (M3-7 retired only csq's writers, not CC's).
-    let new_creds_symlink_target = if target_identity_paths.is_identity_keyed {
+    let new_creds_symlink_target = if let Some(binding) = target_binding {
+        crate::accounts::identity_store::credentials_path_for(base_dir, binding.identity())
+    } else if target_identity_paths.is_identity_keyed {
         // UUID-keyed slot: always target the identity path.
         target_identity_paths.credentials_path.clone()
     } else {
@@ -1958,10 +3757,13 @@ pub fn repoint_handle_dir(
     // `repoint_rolled_back() == None`, which callers combine via
     // `.unwrap_or(true)` and read as "fully rolled back", even though the
     // account had in fact fully switched).
-    let uuid_settings_swap =
-        crate::accounts::profiles::resolve_slot_to_uuid(base_dir, target.get())
-            .map(|uuid| settings_path_for(base_dir, uuid));
-    let settings_tmp = prepare_handle_settings_tmp(
+    let uuid_settings_swap = target_binding
+        .map(|binding| settings_path_for(base_dir, binding.identity()))
+        .or_else(|| {
+            crate::accounts::profiles::resolve_slot_to_uuid(base_dir, target.get())
+                .map(|uuid| settings_path_for(base_dir, uuid))
+        });
+    let (settings_tmp, layer_rec) = prepare_handle_settings(
         handle_dir,
         claude_home,
         &new_config,
@@ -1991,6 +3793,76 @@ pub fn repoint_handle_dir(
             }
         }
     }
+
+    // Re-materialize .claude.json for the new slot. This is the bug fix
+    // for alpha.10: `csq swap` used to repoint credential symlinks but
+    // leave `.claude.json` as the stale copy from whichever slot the
+    // handle dir was created with. CC reads account-scoped caches from
+    // .claude.json — `oauthAccount`, `overageCreditGrantCache`,
+    // `cachedExtraUsageDisabledReason`, `cachedGrowthBookFeatures`,
+    // `additionalModelCostsCache`, `clientDataCache`, etc. — and
+    // displays "you've hit your limit" from those caches without
+    // necessarily making a fresh API call. Swapping without refreshing
+    // .claude.json meant CC continued reporting the pre-swap account's
+    // state for the remainder of the session.
+    //
+    // Session-scoped project entries from the old handle dir (CC writes
+    // them during the session) are preserved so `--resume` and per-CWD
+    // state survive the swap. See `rebuild_claude_json_for_swap` for
+    // the atomic write + projects merge.
+    // Compare the full account/org/email tuple; equal email alone is not
+    // idempotence. Capture the exact native bytes before reconstruction and
+    // refuse if a concurrent native writer changes them before publication.
+    let staged_native: Option<StagedNativeMetadata> =
+        if let Some((binding, capture)) = target_binding.zip(native_capture) {
+            let staged_native = match binding.context() {
+                crate::accounts::anthropic_identity::StoredAnthropicContext::Known(context) => {
+                    let source = capture.source_binding.as_ref().and_then(|binding| {
+                        match binding.context() {
+                    crate::accounts::anthropic_identity::StoredAnthropicContext::Known(context) => {
+                        Some(context)
+                    }
+                    crate::accounts::anthropic_identity::StoredAnthropicContext::LegacyUnknown => {
+                        None
+                    }
+                }
+                    });
+                    stage_claude_json_for_swap_context_captured(
+                        &new_config,
+                        handle_dir,
+                        context,
+                        source,
+                        capture.raw.as_deref(),
+                        capture.source_binding.as_ref(),
+                    )
+                }
+                crate::accounts::anthropic_identity::StoredAnthropicContext::LegacyUnknown => {
+                    stage_claude_json_for_swap_legacy_context(
+                        handle_dir,
+                        binding,
+                        capture.source_binding.as_ref(),
+                        capture.raw.as_deref(),
+                    )
+                }
+            };
+            Some(staged_native.map_err(|failure| {
+                let _ = std::fs::remove_file(&settings_tmp);
+                warn!(
+                    error_kind = "swap_native_metadata_not_reconciled",
+                    reason = failure.fixed_tag(),
+                    "swap native identity metadata reconciliation failed before any mutation"
+                );
+                CredentialError::Corrupt {
+                    path: handle_dir.join(".claude.json"),
+                    reason: format!(
+                        "swap_native_metadata_not_reconciled: {}",
+                        failure.fixed_tag()
+                    ),
+                }
+            })?)
+        } else {
+            None
+        };
 
     let snapshots: Vec<(&'static str, PreRepointLinkState)> = processing_order
         .iter()
@@ -2093,12 +3965,52 @@ pub fn repoint_handle_dir(
         debug!(item, account = %target, "repointed symlink");
     }
 
+    #[cfg(all(test, unix))]
+    run_repoint_after_loop_hook_for_test(handle_dir);
+
+    // Publish the staged `.claude.json` (built and written to a tmp file
+    // BEFORE the rename loop). The compare-and-replace runs here, inside the
+    // rollback-tracked set: a failure restores every moved link and reports
+    // `RepointFailed { rolled_back }`, never a bare error after the account
+    // already switched (R2 NEW-1/N2).
+    let prior_native: Option<Option<String>> = staged_native
+        .as_ref()
+        .map(|staged| staged.expected().map(str::to_owned));
+    let mut published_native = None;
+    if let Some(staged) = staged_native {
+        match staged.commit() {
+            Ok(published) => published_native = Some(published),
+            Err(failure) => {
+                let _ = std::fs::remove_file(&settings_tmp);
+                let rolled_back = rollback_repoint(handle_dir, &snapshots, &repointed);
+                warn!(
+                    error_kind = "swap_native_metadata_not_reconciled",
+                    reason = failure.fixed_tag(),
+                    repointed = ?repointed,
+                    account = %target,
+                    rolled_back,
+                    "repoint_handle_dir: failed publishing the staged .claude.json — attempted a best-effort restore of every already-moved item to its pre-repoint state"
+                );
+                return Err(CredentialError::RepointFailed {
+                    path: handle_dir.join(".claude.json"),
+                    source: std::io::Error::other(format!(
+                        "swap_native_metadata_not_reconciled: {}",
+                        failure.fixed_tag()
+                    )),
+                    rolled_back,
+                });
+            }
+        }
+    }
+
     // Commit settings.json for the new slot so the user's global
     // customization is preserved and any 3P env block from the new
     // config-<target>/settings.json overlays correctly. `settings_tmp` was
     // PREPARED before the rename loop above (see the S-H1/D-F1 comment at
     // its call site); this is the single rename that commits it into
-    // place, and it is the LAST fallible step of this call. atomic_replace
+    // place. It is the last fallible step that can still be folded into the
+    // rollback below (the `.claude.json` publish ran just before it and is
+    // undone by `restore_native_metadata` if this commit fails). atomic_replace
     // keeps the swap semantics of INV-04: CC sees either the pre-swap or
     // post-swap file, never a half-written one.
     //
@@ -2118,7 +4030,13 @@ pub fn repoint_handle_dir(
     // shape this fold prevents from ever being constructible).
     let settings_path = handle_dir.join("settings.json");
     if let Err(e) = commit_prepared_handle_settings(&settings_tmp, &settings_path) {
-        let rolled_back = rollback_repoint(handle_dir, &snapshots, &repointed);
+        let native_restored = prior_native
+            .as_ref()
+            .zip(published_native.as_deref())
+            .is_none_or(|(prior, published)| {
+                restore_native_metadata(handle_dir, prior.as_deref(), published)
+            });
+        let rolled_back = rollback_repoint(handle_dir, &snapshots, &repointed) && native_restored;
         warn!(
             item = "settings.json",
             repointed = ?repointed,
@@ -2132,47 +4050,7 @@ pub fn repoint_handle_dir(
             rolled_back,
         });
     }
-
-    // Re-materialize .claude.json for the new slot. This is the bug fix
-    // for alpha.10: `csq swap` used to repoint credential symlinks but
-    // leave `.claude.json` as the stale copy from whichever slot the
-    // handle dir was created with. CC reads account-scoped caches from
-    // .claude.json — `oauthAccount`, `overageCreditGrantCache`,
-    // `cachedExtraUsageDisabledReason`, `cachedGrowthBookFeatures`,
-    // `additionalModelCostsCache`, `clientDataCache`, etc. — and
-    // displays "you've hit your limit" from those caches without
-    // necessarily making a fresh API call. Swapping without refreshing
-    // .claude.json meant CC continued reporting the pre-swap account's
-    // state for the remainder of the session.
-    //
-    // Session-scoped project entries from the old handle dir (CC writes
-    // them during the session) are preserved so `--resume` and per-CWD
-    // state survive the swap. See `rebuild_claude_json_for_swap` for
-    // the atomic write + projects merge.
-    // an internal ticket: capture the pre-rebuild `.claude.json` oauthAccount email (the stale/old
-    // value, before the rebuild overwrites it) so the reconcile can distinguish a
-    // stale copy it MAY overwrite from a foreign-account signal (a concurrent CC
-    // in-session `/login`) it MUST NOT overwrite. Read BEFORE the rebuild.
-    let pre_swap_oauth_email = crate::credentials::claude_json::read_oauth_email(handle_dir);
-
-    rebuild_claude_json_for_swap(&new_config, handle_dir);
-
-    // an internal ticket: the rebuild sources `oauthAccount` from `config-<target>/.claude.json`,
-    // which can be absent (rebuild bails → stale copy retained) or carry no email.
-    // Reconcile `oauthAccount.emailAddress` to the authoritative identity anchor so
-    // the custodian wrong-account gate matches on the next tick instead of
-    // false-refusing the freshly-mirrored token — but ONLY when it is safe to
-    // overwrite (absent or the pre-swap value), never a foreign `/login` signal.
-    if let Some(identity_email) =
-        crate::accounts::profiles::resolve_slot_to_uuid(base_dir, target.get())
-            .and_then(|uuid| crate::accounts::identity_store::read_identity_email(base_dir, uuid))
-    {
-        reconcile_handle_dir_oauth_email(
-            handle_dir,
-            &identity_email,
-            pre_swap_oauth_email.as_deref(),
-        );
-    }
+    write_layer_record(handle_dir, &layer_rec);
 
     // an internal ticket observability: capture post-swap target stat and emit at
     // INFO so `CSQ_LOG=info csq swap N` exposes the mtime/inode that CC's
@@ -2259,6 +4137,22 @@ fn mtime_collision(pre: &Option<CredsTargetStat>, post: &Option<CredsTargetStat>
     match (pre, post) {
         (Some(p), Some(q)) => p.mtime_ns == q.mtime_ns,
         _ => false,
+    }
+}
+
+/// The error a Codex create or repoint returns when the stale hook approvals of a previous
+/// terminal could not be cleared from the slot the terminal would run on. Names the cause
+/// class (never a path or file content beyond the slot config path in the error).
+fn hook_trust_refusal(config_dir: &Path, e: &std::io::Error) -> CredentialError {
+    CredentialError::Io {
+        path: config_dir.join("config.toml"),
+        source: std::io::Error::new(
+            e.kind(),
+            format!(
+                "could not clear a previous terminal's hook approvals from this slot's config.toml ({}); refusing to launch (run `csq doctor`)",
+                crate::providers::codex::surface::describe_slot_error(e)
+            ),
+        ),
     }
 }
 
@@ -2418,6 +4312,7 @@ pub fn repoint_handle_dir_codex(
         });
     }
 
+    crate::providers::codex::trust::sync_before_handle(base_dir, target);
     // Per-handle flock (mirrors ClaudeCode VP-final F4) so concurrent
     // swaps cannot interleave renames into a split state. The lock
     // file lives inside the handle dir so it is reaped with the dir.
@@ -2436,6 +4331,26 @@ pub fn repoint_handle_dir_codex(
             reason: format!("repoint lock acquisition failed: {e}"),
         })?;
 
+    // Hook approvals, BEFORE any link moves: a handle with no purge marker (a reused PID, or a
+    // create that skipped a slot) must not run on a slot whose predecessor keys could not be
+    // cleared, so a failed purge of the target slot refuses the repoint and the handle stays
+    // on its old slot (same error text as a create refusal). A marked handle is the owner's
+    // own: its carry failure is logged and never fails the swap.
+    super::codex_hook_trust::carry_hook_trust_for_repoint(
+        base_dir,
+        handle_dir,
+        target,
+        codex_global_hooks_path().as_deref(),
+    )
+    .map_err(|e| {
+        warn!(
+            error_kind = "codex_hook_trust_launch_refused",
+            io_kind = ?e.kind(),
+            "refusing to repoint the Codex handle: stale hook approvals could not be cleared"
+        );
+        hook_trust_refusal(&new_config, &e)
+    })?;
+
     // M3-4: Resolve the identity-keyed auth path for the Codex surface.
     //
     // `credentials_codex_path_for` returns `identities/<UUID>/credentials-codex.json`.
@@ -2447,7 +4362,7 @@ pub fn repoint_handle_dir_codex(
     // IS written: `credentials::file::save_canonical_for`'s `Surface::Codex` arm
     // calls `save_codex_canonical_for_uuid`, reached from the Codex login paths
     // (`providers::codex::login`, `providers::codex::desktop_login`) and the
-    // refresh paths (`refresh::check`, `refresh::sync`).
+    // daemon refresh path (`refresh::check`).
     //
     // So the branch order below is now: identity-keyed path FIRST as the normal
     // case; the legacy numeric mirror is the FALLBACK for a pre-mapping (legacy)
@@ -2542,7 +4457,7 @@ pub fn repoint_handle_dir_codex(
         // pointed at the old slot.
         if !new_target.exists() && new_target.symlink_metadata().is_err() {
             if link_path.symlink_metadata().is_ok() {
-                let _ = std::fs::remove_file(&link_path);
+                remove_file_logged(&link_path, "codex_repoint_stale_link_remove_failed");
             }
             continue;
         }
@@ -2551,7 +4466,7 @@ pub fn repoint_handle_dir_codex(
         // (matches ClaudeCode INV-04 swap semantics: codex-cli sees
         // either the pre-swap or post-swap symlink, never a half-state).
         if tmp_path.symlink_metadata().is_ok() {
-            let _ = std::fs::remove_file(&tmp_path);
+            remove_file_logged(&tmp_path, "codex_repoint_tmp_remove_failed");
         }
         create_symlink(new_target, &tmp_path).map_err(|e| CredentialError::Io {
             path: tmp_path.clone(),
@@ -2562,6 +4477,17 @@ pub fn repoint_handle_dir_codex(
             source: e,
         })?;
         debug!(item = name, account = %target, "repointed codex symlink");
+    }
+
+    // Keep the user-global hooks link. The account-bound items above are already
+    // repointed, so a failure here is logged with a fixed tag, not returned: failing the
+    // swap now would report a half-done repoint that has in fact completed.
+    if let Err(e) = link_codex_global_hooks(handle_dir, codex_global_hooks_path().as_deref()) {
+        warn!(
+            error_kind = "codex_hooks_link_failed",
+            io_kind = ?e.kind(),
+            "could not refresh the codex global hooks link after repoint"
+        );
     }
 
     // SHARED persistent conversation state (sessions/, history.jsonl,
@@ -2629,8 +4555,8 @@ pub fn repoint_handle_dir_codex(
 /// to enumerate resumable sessions. If we copy the full map, `--resume`
 /// shows sessions from every directory this account was ever used in.
 /// If we strip it entirely, CC thinks there are no projects. The middle
-/// ground: keep only entries whose key matches the current CWD or is a
-/// subdirectory of it.
+/// ground: keep entries in the CWD scope, and the exact native workspace's
+/// already-persisted trust flag without its unrelated resume state.
 ///
 /// On swap (`preserve_handle_projects = Some`), project entries that CC
 /// has written to the handle dir's own `.claude.json` during the session
@@ -2643,13 +4569,19 @@ pub fn repoint_handle_dir_codex(
 /// source file is missing or unparseable (in which case the caller
 /// should leave the existing handle-dir file alone).
 fn build_scoped_claude_json(source: &Path, preserve_handle: Option<&Path>) -> Option<Value> {
+    let cwd = std::env::current_dir().ok()?;
+    build_scoped_claude_json_at(source, preserve_handle, &cwd)
+}
+
+fn build_scoped_claude_json_at(
+    source: &Path,
+    preserve_handle: Option<&Path>,
+    cwd: &Path,
+) -> Option<Value> {
     let content = std::fs::read_to_string(source).ok()?;
     let mut json: Value = serde_json::from_str(&content).ok()?;
-
-    let cwd = match std::env::current_dir() {
-        Ok(c) => c.to_string_lossy().to_string(),
-        Err(_) => return Some(json),
-    };
+    let workspace_key = super::workspace_trust::native_key(cwd).ok();
+    let cwd = cwd.to_str()?;
 
     // Collect session-scoped project entries that CC wrote into the
     // handle dir during this session. These are newer than the entries
@@ -2660,9 +4592,16 @@ fn build_scoped_claude_json(source: &Path, preserve_handle: Option<&Path>) -> Op
             if let Ok(Value::Object(old_obj)) = serde_json::from_str::<Value>(&old_content) {
                 if let Some(Value::Object(old_projects)) = old_obj.get("projects") {
                     for (k, v) in old_projects {
-                        if k == &cwd || k.starts_with(&format!("{cwd}/")) {
+                        if k == cwd || k.starts_with(&format!("{cwd}/")) {
                             session_projects.insert(k.clone(), v.clone());
                         }
+                    }
+                    if let Some(key) = workspace_key.as_deref() {
+                        super::workspace_trust::preserve_exact_workspace_state(
+                            &mut session_projects,
+                            old_projects,
+                            key,
+                        );
                     }
                 }
             }
@@ -2675,9 +4614,16 @@ fn build_scoped_claude_json(source: &Path, preserve_handle: Option<&Path>) -> Op
     if let Some(obj) = json.as_object() {
         if let Some(Value::Object(src_projects)) = obj.get("projects") {
             for (k, v) in src_projects {
-                if k == &cwd || k.starts_with(&format!("{cwd}/")) {
+                if k == cwd || k.starts_with(&format!("{cwd}/")) {
                     scoped.insert(k.clone(), v.clone());
                 }
+            }
+            if let Some(key) = workspace_key.as_deref() {
+                super::workspace_trust::preserve_exact_workspace_state(
+                    &mut scoped,
+                    src_projects,
+                    key,
+                );
             }
         }
     }
@@ -2784,6 +4730,265 @@ fn materialize_handle_claude_json(config_dir: &Path, handle_dir: &Path) {
 ///   still-un-round-trippable handle file after the rebuild (config-target absent AND
 ///   the retained copy itself corrupt) therefore keeps the pre-existing tick-based
 ///   self-heal — the AC's "no wait" guarantee is best-effort for that narrow sub-case.
+#[derive(Debug, PartialEq, Eq)]
+enum NativeMetadataReconcileFailure {
+    ReadUnavailable,
+    ContextChanged,
+    UntrustedContext,
+    WriteFailed,
+}
+const ACCOUNT_CACHE_KEYS: &[&str] = &[
+    "overageCreditGrantCache",
+    "cachedExtraUsageDisabledReason",
+    "cachedGrowthBookFeatures",
+    "additionalModelCostsCache",
+    "clientDataCache",
+];
+impl NativeMetadataReconcileFailure {
+    fn fixed_tag(&self) -> &'static str {
+        match self {
+            Self::ReadUnavailable => "native_read_unavailable",
+            Self::ContextChanged => "native_context_changed",
+            Self::UntrustedContext => "native_context_untrusted",
+            Self::WriteFailed => "native_write_failed",
+        }
+    }
+}
+#[cfg(test)]
+fn rebuild_claude_json_for_swap_context(
+    config_dir: &Path,
+    handle_dir: &Path,
+    target: &crate::accounts::anthropic_identity::AnthropicContext,
+    source: Option<&crate::accounts::anthropic_identity::AnthropicContext>,
+    expected_native: Option<&str>,
+) -> Result<(), NativeMetadataReconcileFailure> {
+    stage_claude_json_for_swap_context_captured(
+        config_dir,
+        handle_dir,
+        target,
+        source,
+        expected_native,
+        None,
+    )?
+    .commit()
+    .map(|_| ())
+}
+
+fn stage_claude_json_for_swap_context_captured(
+    config_dir: &Path,
+    handle_dir: &Path,
+    target: &crate::accounts::anthropic_identity::AnthropicContext,
+    source: Option<&crate::accounts::anthropic_identity::AnthropicContext>,
+    expected_native: Option<&str>,
+    source_binding: Option<&crate::accounts::anthropic_identity::CapturedBinding>,
+) -> Result<StagedNativeMetadata, NativeMetadataReconcileFailure> {
+    use crate::accounts::anthropic_identity as ai;
+    use NativeMetadataReconcileFailure as Failure;
+    let current = read_native_swap_raw(handle_dir).map_err(|_| Failure::ReadUnavailable)?;
+    if current.as_deref() != expected_native {
+        return Err(Failure::ContextChanged);
+    }
+    if !native_context_can_rewrite(current.as_deref(), target, source)
+        && !source_binding.is_some_and(|binding| {
+            matches!(binding.context(), ai::StoredAnthropicContext::LegacyUnknown)
+                && native_context_matches_captured_binding(current.as_deref(), binding)
+        })
+    {
+        return Err(Failure::UntrustedContext);
+    }
+    let mut json = match current.as_deref() {
+        Some(raw) => serde_json::from_str::<Value>(raw).map_err(|_| Failure::UntrustedContext)?,
+        None => serde_json::json!({}),
+    };
+    let object = json.as_object_mut().ok_or(Failure::UntrustedContext)?;
+    // Remove the old organization/account caches even when the target's native
+    // metadata is missing. Preserve unrelated globals and session projects.
+    for key in ACCOUNT_CACHE_KEYS {
+        object.remove(*key);
+    }
+    // oauthAccount siblings (roles, billing metadata, feature entitlement)
+    // belong to the source account too; an unavailable target never inherits them.
+    let mut target_account = serde_json::json!({});
+    if let Ok(Some(raw)) = read_native_swap_raw(config_dir) {
+        if let Ok(target_json) = serde_json::from_str::<Value>(&raw) {
+            if ai::parse_native_expectation(&target_json)
+                .is_ok_and(|context| context.context() == target)
+            {
+                for key in ACCOUNT_CACHE_KEYS {
+                    if let Some(value) = target_json.get(*key) {
+                        object.insert((*key).into(), value.clone());
+                    }
+                }
+                if let Some(account) = target_json
+                    .get("oauthAccount")
+                    .filter(|value| value.is_object())
+                {
+                    target_account = account.clone();
+                }
+            }
+        }
+    }
+    object.insert("oauthAccount".into(), target_account);
+    let account = object
+        .get_mut("oauthAccount")
+        .ok_or(Failure::UntrustedContext)?;
+    if account.is_null() {
+        *account = serde_json::json!({});
+    }
+    let account = account.as_object_mut().ok_or(Failure::UntrustedContext)?;
+    account.insert("emailAddress".into(), Value::String(target.email().into()));
+    account.insert(
+        "accountUuid".into(),
+        Value::String(target.account_uuid().to_string()),
+    );
+    account.insert(
+        "organizationUuid".into(),
+        Value::String(target.organization_uuid().to_string()),
+    );
+    stage_native_swap_metadata(handle_dir, &json, expected_native)
+}
+
+fn stage_claude_json_for_swap_legacy_context(
+    handle_dir: &Path,
+    target: &crate::accounts::anthropic_identity::CapturedBinding,
+    source: Option<&crate::accounts::anthropic_identity::CapturedBinding>,
+    expected_native: Option<&str>,
+) -> Result<StagedNativeMetadata, NativeMetadataReconcileFailure> {
+    use NativeMetadataReconcileFailure as Failure;
+    let email = target
+        .recorded_legacy_email()
+        .ok_or(Failure::UntrustedContext)?;
+    let current = read_native_swap_raw(handle_dir).map_err(|_| Failure::ReadUnavailable)?;
+    if current.as_deref() != expected_native {
+        return Err(Failure::ContextChanged);
+    }
+    if source.is_none()
+        || !(native_context_matches_captured_binding(current.as_deref(), target)
+            || source.is_some_and(|source| {
+                native_context_matches_captured_binding(current.as_deref(), source)
+            }))
+    {
+        return Err(Failure::UntrustedContext);
+    }
+    let mut json = match current.as_deref() {
+        Some(raw) => serde_json::from_str::<Value>(raw).map_err(|_| Failure::UntrustedContext)?,
+        None => serde_json::json!({}),
+    };
+    let object = json.as_object_mut().ok_or(Failure::UntrustedContext)?;
+    for key in ACCOUNT_CACHE_KEYS {
+        object.remove(*key);
+    }
+    // Unknown provider context stays unknown. Never copy guessed account/org
+    // UUIDs or entitlements from a same-email native file into this target.
+    object.insert(
+        "oauthAccount".into(),
+        serde_json::json!({"emailAddress":email}),
+    );
+    stage_native_swap_metadata(handle_dir, &json, expected_native)
+}
+
+/// A `.claude.json` rebuilt for a swap, written to a private tmp file but
+/// NOT yet published. Staging happens BEFORE the symlink rename loop so every
+/// build/serialize/write failure fires while nothing has mutated; only the
+/// compare-and-replace in [`Self::commit`] runs after the loop, inside the
+/// rollback-tracked set. Dropping an uncommitted stage removes the tmp file
+/// (security.md 5a: the tmp carries the account email).
+#[derive(Debug)]
+struct StagedNativeMetadata {
+    tmp: PathBuf,
+    path: PathBuf,
+    handle_dir: PathBuf,
+    expected: Option<String>,
+    published: String,
+}
+
+impl StagedNativeMetadata {
+    /// The native bytes this stage was built against (`None` = file absent).
+    fn expected(&self) -> Option<&str> {
+        self.expected.as_deref()
+    }
+
+    /// Assertion, not an OS CAS: uncooperative native writers can still race
+    /// after this final held-fd comparison. A measured refusal is surfaced.
+    fn commit(self) -> Result<String, NativeMetadataReconcileFailure> {
+        use NativeMetadataReconcileFailure as Failure;
+        match read_native_swap_raw(&self.handle_dir) {
+            Ok(raw) if raw.as_deref() == self.expected.as_deref() => (),
+            Ok(_) => return Err(Failure::ContextChanged),
+            Err(_) => return Err(Failure::ReadUnavailable),
+        }
+        crate::platform::fs::atomic_replace(&self.tmp, &self.path)
+            .map_err(|_| Failure::WriteFailed)?;
+        Ok(self.published.clone())
+    }
+}
+
+impl Drop for StagedNativeMetadata {
+    fn drop(&mut self) {
+        // After a successful commit the tmp was renamed away (NotFound);
+        // on every other path this removes the leftover secret-bearing tmp.
+        let _ = std::fs::remove_file(&self.tmp);
+    }
+}
+
+fn stage_native_swap_metadata(
+    handle_dir: &Path,
+    json: &Value,
+    expected_native: Option<&str>,
+) -> Result<StagedNativeMetadata, NativeMetadataReconcileFailure> {
+    use NativeMetadataReconcileFailure as Failure;
+    let path = handle_dir.join(".claude.json");
+    let published = serde_json::to_string(&json).map_err(|_| Failure::WriteFailed)?;
+    let tmp = crate::platform::fs::unique_tmp_path(&path);
+    if crate::platform::fs::write_new_private(&tmp, published.as_bytes()).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Failure::WriteFailed);
+    }
+    Ok(StagedNativeMetadata {
+        tmp,
+        path,
+        handle_dir: handle_dir.to_path_buf(),
+        expected: expected_native.map(str::to_owned),
+        published,
+    })
+}
+
+/// Best-effort restore of `.claude.json` to the bytes captured before the
+/// swap (`None` = it did not exist). Used only when a step AFTER the native
+/// commit fails. Returns `true` only on a complete restore.
+fn restore_native_metadata(handle_dir: &Path, prior: Option<&str>, published: &str) -> bool {
+    // Assertion, not an OS CAS: never knowingly overwrite an intervening
+    // native writer, including deleting its file when the prior was absent.
+    if !matches!(read_native_swap_raw(handle_dir), Ok(Some(raw)) if raw == published) {
+        return false;
+    }
+    let path = handle_dir.join(".claude.json");
+    match prior {
+        None => match std::fs::remove_file(&path) {
+            Ok(()) => true,
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        },
+        Some(raw) => {
+            let tmp = crate::platform::fs::unique_tmp_path(&path);
+            if crate::platform::fs::write_new_private(&tmp, raw.as_bytes()).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+                return false;
+            }
+            if !matches!(read_native_swap_raw(handle_dir), Ok(Some(current)) if current == published)
+            {
+                let _ = std::fs::remove_file(&tmp);
+                return false;
+            }
+            if crate::platform::fs::atomic_replace(&tmp, &path).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+                return false;
+            }
+            true
+        }
+    }
+}
+
+#[cfg(test)]
 fn reconcile_handle_dir_oauth_email(
     handle_dir: &Path,
     identity_email: &str,
@@ -2862,6 +5067,7 @@ fn reconcile_handle_dir_oauth_email(
     debug!("swap: reconciled .claude.json oauthAccount.emailAddress to identity anchor (an internal ticket)");
 }
 
+#[cfg(all(test, unix))]
 fn rebuild_claude_json_for_swap(config_dir: &Path, handle_dir: &Path) {
     let handle_claude_json = handle_dir.join(".claude.json");
     let Some(json) =
@@ -3139,6 +5345,10 @@ fn clear_dead_handle_keychain_item_inner(
 /// `keychain-fix-r8c.md` SHARD KA's file scope: `handle_dir.rs`,
 /// `keychain.rs`, `custodian.rs`).
 pub fn sweep_dead_handles(base_dir: &Path, claude_home: Option<&Path>) -> usize {
+    let _ = crate::sessions::lifecycle::reconcile_owned(
+        base_dir,
+        claude_home.and_then(crate::sessions::lifecycle::registry_home),
+    );
     let http_get: crate::daemon::usage_poller::HttpGetFn =
         std::sync::Arc::new(|url: &str, token: &str, headers: &[(&str, &str)]| {
             crate::http::get_bearer_node(url, token, headers)
@@ -3150,6 +5360,53 @@ pub fn sweep_dead_handles(base_dir: &Path, claude_home: Option<&Path>) -> usize 
             )
         })
     })
+}
+
+/// Most distinct skipped-dir names remembered for warn-once; at the cap the set is cleared
+/// (bounded memory, at worst one repeat warning per 1000 distinct names).
+const SKIP_WARN_CAP: usize = 1000;
+
+thread_local! {
+    /// Test-only: warnings actually emitted on this thread by [`warn_skip_once`].
+    #[cfg(test)]
+    static SKIP_WARNS_EMITTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `true` the first time `key` is seen in `seen`. Clears `seen` when it is full.
+fn first_sighting(seen: &std::sync::Mutex<std::collections::HashSet<String>>, key: &str) -> bool {
+    // A poisoned lock only means another thread panicked mid-insert; the set is still usable.
+    let mut set = seen.lock().unwrap_or_else(|p| p.into_inner());
+    if set.contains(key) {
+        return false;
+    }
+    if set.len() >= SKIP_WARN_CAP {
+        set.clear();
+    }
+    set.insert(key.to_string());
+    true
+}
+
+/// A sweep skipped `dir_name` because a pid marker is unreadable. The sweeps run every 60 s
+/// and the same dir is skipped every tick, so warn ONCE per (kind, dir name) per process and
+/// log at debug afterwards. Dir name only, never a path (`security.md`).
+fn warn_skip_once(error_kind: &'static str, dir_name: &str) {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    if first_sighting(seen, &format!("{error_kind}:{dir_name}")) {
+        #[cfg(test)]
+        SKIP_WARNS_EMITTED.with(|c| c.set(c.get() + 1));
+        warn!(
+            error_kind,
+            dir_name,
+            "sweep: unreadable pid marker; skipping the handle dir (further skips of this dir are logged at debug)"
+        );
+    } else {
+        debug!(
+            error_kind,
+            dir_name, "sweep: unreadable pid marker; skipping the handle dir"
+        );
+    }
 }
 
 /// Test seam for [`sweep_dead_handles`]: `clear_keychain_item` is the
@@ -3227,7 +5484,16 @@ fn sweep_dead_handles_inner(
         // disappears between the two reads, which would signal a
         // racing `create_handle_dir` that has not yet finished
         // writing `.live-pid`.
-        let initial_marker = markers::read_live_pid(&path);
+        // An UNREADABLE marker (not merely absent) means "possibly live": skip the
+        // dir (`guard-reader-writer-parity.md` MUST-2). The dir-name fallback applies
+        // only when `.live-pid` is ABSENT.
+        let initial_marker = match markers::read_live_pid_checked(&path) {
+            Ok(m) => m,
+            Err(markers::MarkerUnreadable) => {
+                warn_skip_once("sweep_live_pid_unreadable", &name);
+                continue;
+            }
+        };
         let owner_pid = initial_marker.unwrap_or(dir_pid);
         if is_pid_alive(owner_pid) {
             continue;
@@ -3237,7 +5503,13 @@ fn sweep_dead_handles_inner(
         // spawn-capture launch (`csq run` OneShot/Interactive spawn modes,
         // `csq exec`, the codex supervisor) and on Windows; the plain Unix
         // `csq run` exec path writes none.
-        let cc_pid = markers::read_live_cc_pid(&path);
+        let cc_pid = match markers::read_live_cc_pid_checked(&path) {
+            Ok(c) => c,
+            Err(markers::MarkerUnreadable) => {
+                warn_skip_once("sweep_live_cc_pid_unreadable", &name);
+                continue;
+            }
+        };
         if let Some(cc) = cc_pid {
             if is_pid_alive(cc) {
                 continue;
@@ -3247,7 +5519,7 @@ fn sweep_dead_handles_inner(
         info!(
             pid = owner_pid,
             cc_pid = ?cc_pid,
-            path = %path.display(),
+            dir_name = %name,
             "sweeping orphaned handle dir"
         );
 
@@ -3268,12 +5540,18 @@ fn sweep_dead_handles_inner(
         //   3. The marker was present initially but has now disappeared
         //      — this means the dir was replaced by a `csq run` that
         //      has not yet finished writing `.live-pid`; bail.
-        let current_marker = markers::read_live_pid(&path);
+        let Ok(current_marker) = markers::read_live_pid_checked(&path) else {
+            warn!(
+                error_kind = "sweep_live_pid_unreadable",
+                "sweep: .live-pid became unreadable mid-sweep, bailing"
+            );
+            continue;
+        };
         match (initial_marker, current_marker) {
             (Some(_), None) => {
                 warn!(
                     original = owner_pid,
-                    path = %path.display(),
+                    dir_name = %name,
                     "sweep: .live-pid disappeared mid-sweep, bailing"
                 );
                 continue;
@@ -3284,7 +5562,7 @@ fn sweep_dead_handles_inner(
                 warn!(
                     original = owner_pid,
                     current = current_owner,
-                    path = %path.display(),
+                    dir_name = %name,
                     "sweep: handle dir ownership changed mid-sweep, bailing"
                 );
                 continue;
@@ -3293,15 +5571,23 @@ fn sweep_dead_handles_inner(
         }
 
         // Also re-check the child CC marker on the second pass.
-        if let Some(cc) = markers::read_live_cc_pid(&path) {
-            if is_pid_alive(cc) {
+        match markers::read_live_cc_pid_checked(&path) {
+            Ok(Some(cc)) if is_pid_alive(cc) => {
                 warn!(
                     cc_pid = cc,
-                    path = %path.display(),
+                    dir_name = %name,
                     "sweep: CC child became alive mid-sweep, bailing"
                 );
                 continue;
             }
+            Err(markers::MarkerUnreadable) => {
+                warn!(
+                    error_kind = "sweep_live_cc_pid_unreadable",
+                    "sweep: .live-cc-pid became unreadable mid-sweep, bailing"
+                );
+                continue;
+            }
+            _ => {}
         }
 
         // Clear this dir's macOS keychain OAuth item BEFORE it is deleted —
@@ -3477,7 +5763,7 @@ fn promote_codex_sqlite_state(handle_dir: &Path) {
 /// wide reader and would fail open on the form it did not recognise. The
 /// `config.toml` link is unambiguous — csq wrote it, and it points at exactly
 /// one `config-N`.
-fn codex_config_dir_of_handle(handle_dir: &Path) -> Option<PathBuf> {
+pub(super) fn codex_config_dir_of_handle(handle_dir: &Path) -> Option<PathBuf> {
     let target = std::fs::read_link(handle_dir.join("config.toml")).ok()?;
     let parent = target.parent()?;
     let base = parent.file_name()?.to_str()?;
@@ -3500,12 +5786,15 @@ pub(crate) fn sweep_stale_capture_dirs(base_dir: &Path) -> usize {
             continue;
         }
         let dir = entry.path();
-        let recorded: Option<u32> = std::fs::read_to_string(dir.join(".live-pid"))
-            .ok()
-            .and_then(|s| s.trim().parse().ok());
-        let reapable = match recorded {
-            Some(pid) => !is_pid_alive(pid),
-            None => dir_age_exceeds(&dir, CAPTURE_REAP_GRACE),
+        // Absent marker -> age fallback; UNREADABLE marker -> possibly live, skip
+        // (never age-reap on an unreadable marker).
+        let reapable = match markers::read_live_pid_checked(&dir) {
+            Ok(Some(pid)) => !is_pid_alive(pid),
+            Ok(None) => dir_age_exceeds(&dir, CAPTURE_REAP_GRACE),
+            Err(markers::MarkerUnreadable) => {
+                warn_skip_once("capture_sweep_live_pid_unreadable", name);
+                false
+            }
         };
         if reapable && std::fs::remove_dir_all(&dir).is_ok() {
             removed += 1;
@@ -3555,9 +5844,15 @@ fn sweep_exec_dirs_with_prefix(base_dir: &Path, prefix: &str) -> usize {
             continue;
         };
         let dir = entry.path();
-        let marker_pid: Option<u32> = std::fs::read_to_string(dir.join(".live-pid"))
-            .ok()
-            .and_then(|s| s.trim().parse().ok());
+        // The dir-name pid is the fallback only for an ABSENT marker; an unreadable
+        // one means "possibly live", so the dir is kept.
+        let marker_pid = match markers::read_live_pid_checked(&dir) {
+            Ok(m) => m,
+            Err(markers::MarkerUnreadable) => {
+                warn_skip_once("exec_sweep_live_pid_unreadable", name);
+                continue;
+            }
+        };
         let owner_pid = marker_pid.unwrap_or(name_pid);
         if is_pid_alive(owner_pid) {
             continue;
@@ -4187,6 +6482,9 @@ pub fn spawn_sweep(
             _ = tokio::time::sleep(Duration::from_secs(10)) => {}
         }
 
+        // Worklist for the keychain orphan sweep, carried across ticks so a
+        // large backlog drains a bounded batch per tick.
+        let mut orphan_state = Some(keychain::orphans::OrphanSweepState::default());
         loop {
             let dir = base_dir.clone();
             let home = claude_home.clone();
@@ -4206,6 +6504,30 @@ pub fn spawn_sweep(
             })
             .await;
 
+            // Delete `Claude Code-credentials-<hash>` items whose dir no longer
+            // exists and that are provably not the last copy of a login —
+            // the items the per-dir reaper above never reaches (dir removed
+            // by a crash/rm, or its clear evicted from the retry queue).
+            // Bounded batch per tick; see `keychain::orphans`.
+            if let Some(mut state) = orphan_state.take() {
+                let dir = base_dir.clone();
+                orphan_state = tokio::task::spawn_blocking(move || {
+                    keychain::orphans::sweep_orphans(&dir, &mut state);
+                    state
+                })
+                .await
+                .ok();
+                if orphan_state.is_none() {
+                    // The blocking task panicked; the worklist is lost, so
+                    // start over (the next enumeration rebuilds it).
+                    warn!(
+                        error_kind = "keychain_orphan_sweep_task_failed",
+                        "orphan sweep task failed; restarting its worklist"
+                    );
+                    orphan_state = Some(keychain::orphans::OrphanSweepState::default());
+                }
+            }
+
             tokio::select! {
                 _ = shutdown.cancelled() => {
                     info!("handle-dir sweep cancelled, exiting");
@@ -4219,6 +6541,21 @@ pub fn spawn_sweep(
     SweepHandle { join }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs just before the local `hooks.json` is detached in
+    /// [`link_codex_global_hooks`], so a test can edit the local file in that window.
+    static BEFORE_REREAD: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Test seam: makes [`link_codex_global_hooks`] see a COPY where the symlink should be,
+    /// as a platform without symlink privilege would.
+    static FORCE_COPY_LINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test seam: runs right after a hooks entry was detached and before the link is created,
+    /// so a test can recreate `hooks.json` in that window.
+    static AFTER_ASIDE: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Platform-specific symlink creation.
 fn create_symlink(target: &Path, link: &Path) -> Result<(), std::io::Error> {
     isolation::create_symlink_pub(target, link)
@@ -4226,6 +6563,51 @@ fn create_symlink(target: &Path, link: &Path) -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn materializer_keeps_exact_native_root_trust_without_root_resume_state() {
+        use super::build_scoped_claude_json_at;
+        use serde_json::json;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let cwd = root.join("child");
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir(&cwd).unwrap();
+        let root_key = root.to_str().unwrap();
+        let cwd_key = cwd.to_str().unwrap();
+        let source = root.join("source.json");
+        let old = root.join("old.json");
+        std::fs::write(&source, json!({"projects":{root_key:{"hasTrustDialogAccepted":true,"disabledMcpServers":["source-disabled"],"enabledMcpServers":["source-enabled"],"lastSessionId":"foreign-session"},cwd_key:{"lastSessionId":"current-session"},"/unrelated":{"hasTrustDialogAccepted":true}}}).to_string()).unwrap();
+        let actual = build_scoped_claude_json_at(&source, None, &cwd).unwrap();
+        assert_eq!(
+            actual["projects"][root_key],
+            json!({"hasTrustDialogAccepted":true,"disabledMcpServers":["source-disabled"],"enabledMcpServers":["source-enabled"]}),
+            "the already-accepted native root must survive materialization"
+        );
+        assert_eq!(
+            actual["projects"][cwd_key]["lastSessionId"],
+            "current-session"
+        );
+        assert!(actual["projects"].get("/unrelated").is_none());
+        std::fs::write(&old, json!({"projects":{root_key:{"hasTrustDialogAccepted":false,"disabledMcpServers":[],"enabledMcpServers":[],"lastSessionId":"another-root-session"}}}).to_string()).unwrap();
+        let swapped = build_scoped_claude_json_at(&source, Some(&old), &cwd).unwrap();
+        assert_eq!(
+            swapped["projects"][root_key],
+            json!({"hasTrustDialogAccepted":false,"disabledMcpServers":[],"enabledMcpServers":[]}),
+            "a newer exact session trust revocation must win on swap"
+        );
+        std::fs::write(
+            &source,
+            json!({"projects":{"/":{"hasTrustDialogAccepted":true}}}).to_string(),
+        )
+        .unwrap();
+        let untrusted = build_scoped_claude_json_at(&source, None, &cwd).unwrap();
+        assert!(
+            untrusted["projects"].get(root_key).is_none(),
+            "ancestor trust cannot manufacture exact root trust"
+        );
+    }
+
     /// Self-heal: an EMPTY directory where a file belongs is repaired, because a
     /// host provisioned before the kind was declared already has one and the
     /// create branch never runs for an existing target.
@@ -4668,6 +7050,381 @@ mod tests {
         config
     }
 
+    // Positive swap fixtures establish authority through the real verified-login
+    // publication/finalization APIs. The fake transport proves the exact grant;
+    // no direct CapturedBinding/VerifiedAnthropicContext constructor is used.
+    fn stage_verified_repoint_slots(base: &Path, slots: &[u16]) {
+        use crate::accounts::anthropic_identity as ai;
+        use crate::credentials::{AnthropicCredentialFile, CredentialFile, OAuthPayload};
+        // Two passes, deliberately: every commit below walks EVERY sibling's saved
+        // credential for the held-elsewhere comparison, so every slot's prior must be
+        // structurally valid BEFORE the first walk. Old coexisting fixtures carry
+        // deliberately minimal '{}' bytes, which the strict comparison reader cannot
+        // parse (SiblingCustodyUnreadable), so a single stage-then-commit pass refuses
+        // on the still-minimal priors of the slots staged after the first one.
+        struct Staged {
+            slot: AccountNum,
+            native_path: std::path::PathBuf,
+            native: Option<Vec<u8>>,
+            json: Value,
+            email: String,
+            account_uuid: uuid::Uuid,
+            organization_uuid: uuid::Uuid,
+            access: String,
+            credential: CredentialFile,
+        }
+        let mut staged: Vec<Staged> = Vec::new();
+        for &n in slots {
+            let config = base.join(format!("config-{n}"));
+            if !config.exists() {
+                continue;
+            }
+            let slot = AccountNum::try_from(n).unwrap();
+            let native_path = config.join(".claude.json");
+            let native = std::fs::read(&native_path).ok();
+            let json: Value = native
+                .as_ref()
+                .map(|b| serde_json::from_slice(b).unwrap())
+                .unwrap_or_else(|| serde_json::json!({}));
+            let email = json
+                .pointer("/oauthAccount/emailAddress")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("fixture-slot-{n}@test.invalid"));
+            let account_uuid =
+                uuid::Uuid::parse_str(&format!("00000000-0000-4000-8000-{n:012x}")).unwrap();
+            let organization_uuid =
+                uuid::Uuid::parse_str(&format!("11111111-1111-4111-8111-{n:012x}")).unwrap();
+            let access = format!("fake-repoint-access-{n}");
+            let credential = CredentialFile::Anthropic(AnthropicCredentialFile {
+                claude_ai_oauth: OAuthPayload {
+                    access_token: crate::types::AccessToken::new(access.clone()),
+                    refresh_token: crate::types::RefreshToken::new(format!(
+                        "fake-repoint-refresh-{n}"
+                    )),
+                    expires_at: 4_102_444_800_000, // 2100: fixture must outlive the codebase.
+                    scopes: vec![],
+                    subscription_type: None,
+                    rate_limit_tier: None,
+                    extra: std::collections::HashMap::new(),
+                },
+                extra: std::collections::HashMap::new(),
+            });
+            // Make that prior credential structurally valid before any capture roams
+            // it; it remains LegacyUnknown, and verified publication selects a new ID.
+            if let Some(id) = profiles::resolve_slot_to_uuid(base, n) {
+                let prior_path = crate::accounts::identity_store::credentials_path_for(base, id);
+                crate::credentials::save(&prior_path, &credential).unwrap();
+            }
+            staged.push(Staged {
+                slot,
+                native_path,
+                native,
+                json,
+                email,
+                account_uuid,
+                organization_uuid,
+                access,
+                credential,
+            });
+        }
+        for Staged {
+            slot,
+            native_path,
+            native,
+            mut json,
+            email,
+            account_uuid,
+            organization_uuid,
+            access,
+            credential,
+        } in staged
+        {
+            let http: crate::daemon::usage_poller::HttpGetFn =
+                std::sync::Arc::new(move |url, bearer, headers| {
+                    assert_eq!(url, "https://api.anthropic.com/api/oauth/profile");
+                    assert_eq!(
+                        bearer, access,
+                        "fixture must prove its exact incoming grant"
+                    );
+                    assert_eq!(headers, &[("anthropic-beta", "oauth-2025-04-20")]);
+                    Ok((
+                        200,
+                        serde_json::to_vec(&serde_json::json!({
+                            "account":{"uuid":account_uuid,"email":email},
+                            "organization":{"uuid":organization_uuid},
+                        }))
+                        .unwrap(),
+                    ))
+                });
+            let prior = ai::capture_login_prior(base, slot).unwrap();
+            let committed =
+                ai::commit_anthropic_login_with(base, slot, &credential, &http, None, prior)
+                    .unwrap();
+            let ai::StoredAnthropicContext::Known(context) = committed.context() else {
+                panic!("verified fixture publication must yield Known context");
+            };
+            let native_account = serde_json::json!({"emailAddress":context.email(),
+                "accountUuid":context.account_uuid(),"organizationUuid":context.organization_uuid()});
+            crate::accounts::login::finalize_verified_login(base, slot, committed).unwrap();
+            // Retain an intentionally absent target file; the missing-target
+            // reconciliation test still exercises that exact branch.
+            if native.is_some() {
+                json["oauthAccount"] = native_account;
+                std::fs::write(&native_path, serde_json::to_vec(&json).unwrap()).unwrap();
+                crate::platform::fs::secure_file(&native_path).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn verified_fixture_credentials(base: &Path, slot: u16) -> PathBuf {
+        let id = profiles::resolve_slot_to_uuid(base, slot).unwrap();
+        crate::accounts::identity_store::credentials_path_for(base, id)
+    }
+
+    fn repoint_verified_fixture(
+        base: &Path,
+        home: &Path,
+        handle: &Path,
+        slot: AccountNum,
+    ) -> Result<(), CredentialError> {
+        let binding = crate::accounts::anthropic_identity::capture_anthropic_binding(base, slot)
+            .map_err(|_| crate::accounts::anthropic_identity::credential_refusal())?;
+        let native = capture_native_swap(base, handle)?;
+        repoint_handle_dir_guarded(base, home, handle, &binding, &native)
+    }
+
+    fn repoint_fixture_snapshot(
+        base: &Path,
+    ) -> std::collections::BTreeMap<PathBuf, (u32, u8, Vec<u8>, std::time::SystemTime)> {
+        fn visit(
+            root: &Path,
+            path: &Path,
+            out: &mut std::collections::BTreeMap<
+                PathBuf,
+                (u32, u8, Vec<u8>, std::time::SystemTime),
+            >,
+        ) {
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            #[cfg(unix)]
+            let mode = {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode()
+            };
+            #[cfg(not(unix))]
+            let mode = u32::from(metadata.permissions().readonly());
+            let (kind, bytes) = if metadata.file_type().is_symlink() {
+                (
+                    1,
+                    std::fs::read_link(path)
+                        .unwrap()
+                        .to_string_lossy()
+                        .as_bytes()
+                        .to_vec(),
+                )
+            } else if metadata.is_dir() {
+                (2, vec![])
+            } else {
+                (3, std::fs::read(path).unwrap())
+            };
+            out.insert(
+                path.strip_prefix(root).unwrap().to_path_buf(),
+                (mode, kind, bytes, metadata.modified().unwrap()),
+            );
+            if metadata.is_dir() {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    visit(root, &entry.unwrap().path(), out);
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        visit(base, base, &mut out);
+        out
+    }
+
+    #[cfg(unix)]
+    fn assert_verified_repoint_race(
+        base: &Path,
+        home: &Path,
+        handle: &Path,
+        first: (
+            Result<(), CredentialError>,
+            crate::accounts::anthropic_identity::CapturedBinding,
+            NativeSwapCapture,
+        ),
+        second: (
+            Result<(), CredentialError>,
+            crate::accounts::anthropic_identity::CapturedBinding,
+            NativeSwapCapture,
+        ),
+    ) {
+        assert_ne!(
+            first.0.is_ok(),
+            second.0.is_ok(),
+            "same-source snapshots must yield exactly one winner"
+        );
+        let (winner, loser) = if first.0.is_ok() {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
+        assert!(
+            matches!(&loser.0, Err(CredentialError::Corrupt { reason, .. }) if reason == "identity_authority_refused")
+        );
+        assert_eq!(
+            markers::resolve_marker_to_slot(base, handle),
+            Some(winner.1.slot())
+        );
+        assert!(handle_dir_symlinks_are_consistent(base, handle));
+        assert_eq!(
+            std::fs::read_link(handle.join(".credentials.json")).unwrap(),
+            verified_fixture_credentials(base, winner.1.slot().get())
+        );
+        assert_eq!(
+            read_materialized_settings(handle)["fixtureWinner"],
+            serde_json::json!(winner.1.slot().get())
+        );
+        let native: Value =
+            serde_json::from_slice(&std::fs::read(handle.join(".claude.json")).unwrap()).unwrap();
+        let crate::accounts::anthropic_identity::StoredAnthropicContext::Known(context) =
+            winner.1.context()
+        else {
+            panic!("Known winner required")
+        };
+        assert_eq!(
+            crate::accounts::anthropic_identity::parse_native_expectation(&native)
+                .unwrap()
+                .context(),
+            context
+        );
+        // Replay the exact rejected snapshot after the winner has closed. This
+        // verifies the loser cannot write a partial channel after serialization.
+        let before = (
+            repoint_fixture_snapshot(base),
+            repoint_fixture_snapshot(home),
+        );
+        let replay = repoint_handle_dir_guarded(base, home, handle, &loser.1, &loser.2);
+        assert!(
+            matches!(replay, Err(CredentialError::Corrupt { reason, .. }) if reason == "identity_authority_refused")
+        );
+        assert_eq!(
+            before,
+            (
+                repoint_fixture_snapshot(base),
+                repoint_fixture_snapshot(home)
+            )
+        );
+    }
+
+    /// Hold the term mint lock from ANOTHER thread, as a sweep in another
+    /// process would; returns (release, join).
+    fn hold_mint_lock_elsewhere(
+        base: &Path,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let base = base.to_path_buf();
+        let join = std::thread::spawn(move || {
+            let _guard = crate::session::term_mint::acquire_for_mint(&base).unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().unwrap();
+        (release_tx, join)
+    }
+
+    /// RED against a creator that does not take the term mint lock: with the
+    /// lock held elsewhere, a `term-<pid>` creation REFUSES with the fixed
+    /// message and creates nothing; once the lock is free it succeeds.
+    #[test]
+    fn create_handle_dir_refuses_without_the_term_mint_lock_and_creates_nothing() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        setup_config_dir(base, 1);
+        let account = AccountNum::try_from(1u16).unwrap();
+        let _short = crate::session::term_mint::ShortWait::set();
+
+        let (release, join) = hold_mint_lock_elsewhere(base);
+        let err = create_handle_dir(base, &claude_home, account, 77_001).unwrap_err();
+        let shown = format!("{err}");
+        assert!(
+            shown.contains("term mint lock busy"),
+            "fixed refusal message, got {shown}"
+        );
+        assert!(
+            !base.join("term-77001").exists(),
+            "a refused creation must not leave a dir behind"
+        );
+        release.send(()).unwrap();
+        join.join().unwrap();
+        create_handle_dir(base, &claude_home, account, 77_001).unwrap();
+        assert!(base.join("term-77001").is_dir());
+    }
+
+    /// The Codex creator mints the same `term-<pid>` shape, so it takes the same
+    /// lock: refused with the fixed message and no dir while it is held.
+    #[test]
+    fn create_handle_dir_codex_refuses_without_the_term_mint_lock() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        setup_config_dir(base, 1);
+        std::fs::create_dir_all(base.join("credentials")).unwrap();
+        std::fs::write(base.join("credentials").join("codex-1.json"), "{}").unwrap();
+        let account = AccountNum::try_from(1u16).unwrap();
+        let _short = crate::session::term_mint::ShortWait::set();
+
+        let (release, join) = hold_mint_lock_elsewhere(base);
+        let err = create_handle_dir_codex(base, account, 77_002).unwrap_err();
+        assert!(
+            format!("{err}").contains("term mint lock busy"),
+            "fixed refusal message, got {err}"
+        );
+        assert!(!base.join("term-77002").exists());
+        release.send(()).unwrap();
+        join.join().unwrap();
+    }
+
+    /// Capture dirs are not `term-<pid>` and are outside the sweep's contract:
+    /// they never wait on the term mint lock.
+    #[test]
+    fn a_capture_dir_does_not_take_the_term_mint_lock() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        setup_config_dir(base, 1);
+        let account = AccountNum::try_from(1u16).unwrap();
+        let _short = crate::session::term_mint::ShortWait::set();
+
+        let (release, join) = hold_mint_lock_elsewhere(base);
+        let name = format!("{CAPTURE_DIR_PREFIX}test-1");
+        create_handle_dir_named(base, &claude_home, account, 77_003, &name).unwrap();
+        assert!(base.join(&name).is_dir());
+        release.send(()).unwrap();
+        join.join().unwrap();
+    }
+
+    /// The lock is held for the `create_dir` alone: after a creation returns it
+    /// is free (a sweep can take it), and the creation took no other lock
+    /// while holding it (the order violation would have refused it).
+    #[test]
+    fn create_handle_dir_releases_the_term_mint_lock_before_it_returns() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        setup_config_dir(base, 1);
+        let account = AccountNum::try_from(1u16).unwrap();
+        create_handle_dir(base, &claude_home, account, 77_004).unwrap();
+        assert!(matches!(
+            crate::session::term_mint::try_acquire_for_sweep(base),
+            crate::session::term_mint::SweepLock::Held(_)
+        ));
+    }
+
     #[test]
     fn create_handle_dir_populates_symlinks() {
         let dir = TempDir::new().unwrap();
@@ -4768,6 +7525,7 @@ mod tests {
 
     #[test]
     fn repoint_handle_dir_changes_targets() {
+        let _env_guard = crate::platform::test_env::lock();
         let dir = TempDir::new().unwrap();
         let base = dir.path();
         let claude_home = dir.path().join(".claude");
@@ -4777,17 +7535,304 @@ mod tests {
 
         let account1 = AccountNum::try_from(1u16).unwrap();
         let account2 = AccountNum::try_from(2u16).unwrap();
+        stage_verified_repoint_slots(base, &[1, 2, 3]);
         let handle = create_handle_dir(base, &claude_home, account1, 88888).unwrap();
 
         // Repoint to account 2
-        repoint_handle_dir(base, &claude_home, &handle, account2).unwrap();
+        repoint_verified_fixture(base, &claude_home, &handle, account2).unwrap();
 
         #[cfg(unix)]
         {
             let target = std::fs::read_link(handle.join(".credentials.json")).unwrap();
-            assert!(target.ends_with("config-2/.credentials.json"));
+            assert_eq!(target, verified_fixture_credentials(base, 2));
             let target = std::fs::read_link(handle.join(".csq-account")).unwrap();
             assert!(target.ends_with("config-2/.csq-account"));
+        }
+    }
+
+    #[test]
+    fn repoint_guarded_profiles_contention_refuses_without_namespace_change() {
+        use crate::accounts::anthropic_identity as ai;
+        let _env_guard = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        setup_config_dir(dir.path(), 1);
+        setup_config_dir(dir.path(), 2);
+        stage_verified_repoint_slots(dir.path(), &[1, 2]);
+        let source = AccountNum::try_from(1u16).unwrap();
+        let target = AccountNum::try_from(2u16).unwrap();
+        let handle = create_handle_dir(dir.path(), home.path(), source, 88889).unwrap();
+        let binding = ai::capture_anthropic_binding(dir.path(), target).unwrap();
+        let native = capture_native_swap(dir.path(), &handle).unwrap();
+        // Initialize the persistent repoint lock before the byte/mode/mtime
+        // snapshot. Only lock contention, not first-use lock creation, is tested.
+        drop(crate::platform::lock::lock_file(&repoint_lock_path(&handle)).unwrap());
+        // Another thread: a Windows mutex is re-entrant for its holding thread.
+        let profiles = crate::accounts::profiles_lock::HeldOnOtherThread::profiles(dir.path());
+        let before = repoint_fixture_snapshot(dir.path());
+        assert!(capture_native_swap(dir.path(), &handle).is_err());
+        // N5: contention is reported as BUSY (retry), not the identity refusal.
+        let busy = repoint_handle_dir_guarded(dir.path(), home.path(), &handle, &binding, &native)
+            .unwrap_err();
+        assert!(is_profiles_lock_busy(&busy), "got {busy:?}");
+        assert_ne!(busy.to_string(), ai::credential_refusal().to_string());
+        assert_eq!(repoint_fixture_snapshot(dir.path()), before);
+        drop(profiles);
+        // The same captured authority succeeds once contention is gone.
+        repoint_handle_dir_guarded(dir.path(), home.path(), &handle, &binding, &native).unwrap();
+        assert_eq!(
+            markers::resolve_marker_to_slot(dir.path(), &handle),
+            Some(target)
+        );
+    }
+
+    fn stage_legacy_repoint_slots(base: &Path) {
+        use crate::accounts::{identity_store, profiles_lock::ProfilesFileLock};
+        profiles::save(
+            &profiles::profiles_path(base),
+            &profiles::ProfilesFile::empty(),
+        )
+        .unwrap();
+        for slot in [1u16, 2] {
+            setup_config_dir(base, slot);
+            let id = identity_store::IdentityId::new_v4();
+            crate::daemon::identity_mint::write_legacy_anthropic_metadata_fixture(
+                base,
+                id,
+                "same@example.test",
+            )
+            .unwrap();
+            let credential: crate::credentials::CredentialFile = serde_json::from_value(serde_json::json!({
+                "claudeAiOauth":{"accessToken":format!("fake-legacy-access-{slot}"),
+                    "refreshToken":format!("fake-legacy-refresh-{slot}"),"expiresAt":4102444800000u64,"scopes":[]}
+            })).unwrap();
+            crate::credentials::save(&identity_store::credentials_path_for(base, id), &credential)
+                .unwrap();
+            let lock = ProfilesFileLock::acquire(base).unwrap();
+            profiles::reserve_legacy_anthropic_slot(&lock, base, slot, id).unwrap();
+            drop(lock);
+            let config = base.join(format!("config-{slot}"));
+            markers::write_csq_account(&config, id).unwrap();
+            std::fs::write(
+                config.join(".claude.json"),
+                br#"{"oauthAccount":{"emailAddress":"same@example.test"},"fixtureRetain":true}"#,
+            )
+            .unwrap();
+            crate::platform::fs::secure_file(&config.join(".claude.json")).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                for directory in [
+                    base.join("identities"),
+                    identity_store::identity_path(base, id),
+                ] {
+                    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                }
+            }
+        }
+        assert!(profiles::load(&profiles::profiles_path(base))
+            .unwrap()
+            .anthropic_contexts
+            .is_empty());
+    }
+
+    #[test]
+    fn repoint_legacy_local_custody_keeps_own_uuid_and_never_invents_context() {
+        use crate::accounts::{anthropic_identity as ai, identity_store};
+        let _env_guard = crate::platform::test_env::lock();
+        for known in [None, Some(1u16), Some(2u16)] {
+            let dir = TempDir::new().unwrap();
+            let home = TempDir::new().unwrap();
+            stage_legacy_repoint_slots(dir.path());
+            if let Some(slot) = known {
+                stage_verified_repoint_slots(dir.path(), &[slot]);
+            }
+            let source = AccountNum::try_from(1u16).unwrap();
+            let target = AccountNum::try_from(2u16).unwrap();
+            let source_id = profiles::resolve_slot_to_uuid(dir.path(), 1).unwrap();
+            let target_id = profiles::resolve_slot_to_uuid(dir.path(), 2).unwrap();
+            assert_ne!(source_id, target_id);
+            let paths = [
+                identity_store::identity_json_path_for(dir.path(), source_id),
+                identity_store::identity_json_path_for(dir.path(), target_id),
+                profiles::profiles_path(dir.path()),
+            ];
+            let before = paths
+                .iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect::<Vec<_>>();
+            let handle = create_handle_dir(dir.path(), home.path(), source, 88890).unwrap();
+            let path = handle.join(".claude.json");
+            let mut native: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            native["cachedGrowthBookFeatures"] = serde_json::json!({"source-only":true});
+            native["oauthAccount"]["organizationRole"] = Value::String("source-only".into());
+            std::fs::write(&path, serde_json::to_vec(&native).unwrap()).unwrap();
+            let binding = ai::capture_anthropic_binding(dir.path(), target).unwrap();
+            let capture = capture_native_swap(dir.path(), &handle).unwrap();
+            repoint_handle_dir_guarded(dir.path(), home.path(), &handle, &binding, &capture)
+                .unwrap();
+            assert_eq!(
+                markers::resolve_marker_to_slot(dir.path(), &handle),
+                Some(target)
+            );
+            assert_eq!(
+                std::fs::read_link(handle.join(".credentials.json")).unwrap(),
+                identity_store::credentials_path_for(dir.path(), target_id)
+            );
+            assert_eq!(
+                paths
+                    .iter()
+                    .map(|path| std::fs::read(path).unwrap())
+                    .collect::<Vec<_>>(),
+                before
+            );
+            let rebuilt: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert!(rebuilt.get("cachedGrowthBookFeatures").is_none());
+            assert!(rebuilt["oauthAccount"].get("organizationRole").is_none());
+            if known != Some(2) {
+                assert_eq!(
+                    rebuilt["oauthAccount"],
+                    serde_json::json!({"emailAddress":"same@example.test"})
+                );
+                assert_eq!(
+                    ai::read_stored_anthropic_context(dir.path(), target_id).unwrap(),
+                    ai::StoredAnthropicContext::LegacyUnknown
+                );
+            } else {
+                let ai::StoredAnthropicContext::Known(context) = binding.context() else {
+                    panic!("verified target must remain Known");
+                };
+                assert_eq!(
+                    ai::parse_native_expectation(&rebuilt).unwrap().context(),
+                    context
+                );
+            }
+        }
+    }
+
+    /// N5: a busy profiles lock is reported as busy (retry), distinct from the
+    /// identity refusal that tells the operator to run `csq login`.
+    #[cfg(unix)]
+    #[test]
+    fn capture_native_swap_busy_profiles_lock_is_distinct_from_identity_refusal() {
+        use crate::accounts::profiles_lock::ProfilesFileLock;
+        let _env_guard = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        stage_legacy_repoint_slots(dir.path());
+        let source = AccountNum::try_from(1u16).unwrap();
+        let handle = create_handle_dir(dir.path(), home.path(), source, 88894).unwrap();
+        let held = ProfilesFileLock::acquire(dir.path()).unwrap();
+        let busy = capture_native_swap(dir.path(), &handle)
+            .err()
+            .expect("busy lock must refuse");
+        assert!(is_profiles_lock_busy(&busy), "got {busy:?}");
+        drop(held);
+        // A genuine identity refusal (non-directory handle) is NOT busy.
+        let refused = capture_native_swap(dir.path(), &dir.path().join("missing"))
+            .err()
+            .expect("missing handle must refuse");
+        assert!(!is_profiles_lock_busy(&refused), "got {refused:?}");
+    }
+
+    /// R2 NEW-1/N2: CC rewrites `.claude.json` AFTER the symlink loop but
+    /// before the publish. The repoint must roll every link back and report
+    /// `RepointFailed { rolled_back: true }` — never a bare `Corrupt` after
+    /// the account already switched. RED without the staged-commit-inside-
+    /// rollback change: the late mutation surfaces as `Corrupt` with the
+    /// symlinks and marker left on the target.
+    #[cfg(unix)]
+    #[test]
+    fn repoint_native_metadata_mutated_after_loop_rolls_back_fully() {
+        use crate::accounts::anthropic_identity as ai;
+        let _env_guard = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        stage_legacy_repoint_slots(dir.path());
+        let source = AccountNum::try_from(1u16).unwrap();
+        let target = AccountNum::try_from(2u16).unwrap();
+        let handle = create_handle_dir(dir.path(), home.path(), source, 88893).unwrap();
+        let binding = ai::capture_anthropic_binding(dir.path(), target).unwrap();
+        let capture = capture_native_swap(dir.path(), &handle).unwrap();
+        let pre_targets: Vec<(&str, Option<PathBuf>)> = ACCOUNT_BOUND_ITEMS
+            .iter()
+            .map(|item| (*item, std::fs::read_link(handle.join(item)).ok()))
+            .collect();
+        let native_path = handle.join(".claude.json");
+        let before_native = std::fs::read(&native_path).unwrap();
+        let _guard = RepointFaultGuard;
+        set_repoint_after_loop_hook_for_test(Some(Box::new(|handle_dir: &Path| {
+            std::fs::write(
+                handle_dir.join(".claude.json"),
+                br#"{"oauthAccount":{"emailAddress":"cc-wrote-this@example.test"}}"#,
+            )
+            .unwrap();
+        })));
+        let err = repoint_handle_dir_guarded(dir.path(), home.path(), &handle, &binding, &capture)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CredentialError::RepointFailed {
+                    rolled_back: true,
+                    ..
+                }
+            ),
+            "expected RepointFailed{{rolled_back:true}}, got {err:?}"
+        );
+        for (item, before) in &pre_targets {
+            assert_eq!(
+                std::fs::read_link(handle.join(item)).ok(),
+                *before,
+                "{item} must be restored"
+            );
+        }
+        assert_ne!(
+            std::fs::read(&native_path).unwrap(),
+            before_native,
+            "CC's own write is left alone"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&handle)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "tmp leftovers: {leftovers:?}");
+    }
+
+    #[test]
+    fn repoint_legacy_native_race_and_rebind_refuse_without_partial_writes() {
+        use crate::accounts::{anthropic_identity as ai, profiles_lock::ProfilesFileLock};
+        let _env_guard = crate::platform::test_env::lock();
+        for rebind in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let home = TempDir::new().unwrap();
+            stage_legacy_repoint_slots(dir.path());
+            let source = AccountNum::try_from(1u16).unwrap();
+            let target = AccountNum::try_from(2u16).unwrap();
+            let handle = create_handle_dir(dir.path(), home.path(), source, 88891).unwrap();
+            let binding = ai::capture_anthropic_binding(dir.path(), target).unwrap();
+            let capture = capture_native_swap(dir.path(), &handle).unwrap();
+            drop(crate::platform::lock::lock_file(&repoint_lock_path(&handle)).unwrap());
+            if rebind {
+                let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+                profiles::swap_slot_mapping(&lock, dir.path(), 1, 2).unwrap();
+            } else {
+                std::fs::write(
+                    handle.join(".claude.json"),
+                    br#"{"oauthAccount":{"emailAddress":"foreign@example.test"}}"#,
+                )
+                .unwrap();
+            }
+            let before = repoint_fixture_snapshot(dir.path());
+            assert_eq!(
+                repoint_handle_dir_guarded(dir.path(), home.path(), &handle, &binding, &capture)
+                    .unwrap_err()
+                    .to_string(),
+                ai::credential_refusal().to_string()
+            );
+            assert_eq!(repoint_fixture_snapshot(dir.path()), before);
         }
     }
 
@@ -4803,6 +7848,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn repoint_handle_dir_changes_credentials_target_inode() {
+        let _env_guard = crate::platform::test_env::lock();
         use std::os::unix::fs::MetadataExt;
 
         let dir = TempDir::new().unwrap();
@@ -4814,12 +7860,13 @@ mod tests {
 
         let account1 = AccountNum::try_from(1u16).unwrap();
         let account2 = AccountNum::try_from(2u16).unwrap();
+        stage_verified_repoint_slots(base, &[1, 2, 3]);
         let handle = create_handle_dir(base, &claude_home, account1, 77777).unwrap();
 
         let pre_meta = std::fs::metadata(handle.join(".credentials.json")).unwrap();
         let pre_ino = pre_meta.ino();
 
-        repoint_handle_dir(base, &claude_home, &handle, account2).unwrap();
+        repoint_verified_fixture(base, &claude_home, &handle, account2).unwrap();
 
         let post_meta = std::fs::metadata(handle.join(".credentials.json")).unwrap();
         let post_ino = post_meta.ino();
@@ -4840,6 +7887,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn repoint_handle_dir_rolls_back_every_item_on_rename_failure_at_each_index() {
+        let _env_guard = crate::platform::test_env::lock();
         for k in 0..4usize {
             let dir = TempDir::new().unwrap();
             let base = dir.path();
@@ -4858,6 +7906,7 @@ mod tests {
 
             let account1 = AccountNum::try_from(1u16).unwrap();
             let account2 = AccountNum::try_from(2u16).unwrap();
+            stage_verified_repoint_slots(base, &[1, 2, 3]);
             let handle = create_handle_dir(base, &claude_home, account1, 60000 + k as u32).unwrap();
 
             // Snapshot the pre-repoint targets of every item.
@@ -4869,7 +7918,7 @@ mod tests {
             let _guard = RepointFaultGuard;
             set_repoint_fail_at_rename_index_for_test(Some(k));
 
-            let result = repoint_handle_dir(base, &claude_home, &handle, account2);
+            let result = repoint_verified_fixture(base, &claude_home, &handle, account2);
             assert!(
                 result.is_err(),
                 "k={k}: repoint must fail when the fault seam fires"
@@ -4908,6 +7957,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn repoint_handle_dir_rollback_restores_f2c_deleted_items() {
+        let _env_guard = crate::platform::test_env::lock();
         let dir = TempDir::new().unwrap();
         let base = dir.path();
         let claude_home = dir.path().join(".claude");
@@ -4920,6 +7970,7 @@ mod tests {
 
         let account1 = AccountNum::try_from(1u16).unwrap();
         let account2 = AccountNum::try_from(2u16).unwrap();
+        stage_verified_repoint_slots(base, &[1, 2, 3]);
         let handle = create_handle_dir(base, &claude_home, account1, 60300).unwrap();
 
         let pre_targets: Vec<(&str, PathBuf)> = ACCOUNT_BOUND_ITEMS
@@ -4933,7 +7984,7 @@ mod tests {
         // (.csq-account), processed after both F2(c) deletions above.
         set_repoint_fail_at_rename_index_for_test(Some(3));
 
-        let result = repoint_handle_dir(base, &claude_home, &handle, account2);
+        let result = repoint_verified_fixture(base, &claude_home, &handle, account2);
         match result {
             Err(CredentialError::RepointFailed { rolled_back, .. }) => {
                 assert!(rolled_back, "rollback must fully succeed here");
@@ -4961,6 +8012,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn repoint_handle_dir_rollback_restores_identity_keyed_credentials_target() {
+        let _env_guard = crate::platform::test_env::lock();
         use crate::testing::identity_fixtures::{
             coexisting_fixture, fixture_uuid_for_slot, write_uuid_account_marker,
         };
@@ -4986,6 +8038,7 @@ mod tests {
 
         let account1 = AccountNum::try_from(1u16).unwrap();
         let account2 = AccountNum::try_from(2u16).unwrap();
+        stage_verified_repoint_slots(base, &[1, 2, 3]);
         let handle = create_handle_dir(base, claude_home.path(), account1, 60301).unwrap();
 
         let pre_creds_target = std::fs::read_link(handle.join(".credentials.json")).unwrap();
@@ -5000,7 +8053,7 @@ mod tests {
         // been renamed and must be rolled back.
         set_repoint_fail_at_rename_index_for_test(Some(3));
 
-        let result = repoint_handle_dir(base, claude_home.path(), &handle, account2);
+        let result = repoint_verified_fixture(base, claude_home.path(), &handle, account2);
         assert!(
             result.is_err(),
             "repoint must fail when the fault seam fires"
@@ -5027,6 +8080,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn repoint_handle_dir_reports_rolled_back_false_when_restore_itself_fails() {
+        let _env_guard = crate::platform::test_env::lock();
         let dir = TempDir::new().unwrap();
         let base = dir.path();
         let claude_home = dir.path().join(".claude");
@@ -5035,6 +8089,7 @@ mod tests {
         setup_config_dir(base, 2);
         let account1 = AccountNum::try_from(1u16).unwrap();
         let account2 = AccountNum::try_from(2u16).unwrap();
+        stage_verified_repoint_slots(base, &[1, 2, 3]);
         let handle = create_handle_dir(base, &claude_home, account1, 60302).unwrap();
 
         let _guard = RepointFaultGuard;
@@ -5045,7 +8100,7 @@ mod tests {
         set_repoint_fail_at_rename_index_for_test(Some(3));
         set_repoint_fail_restore_for_item_for_test(Some(".credentials.json"));
 
-        let result = repoint_handle_dir(base, &claude_home, &handle, account2);
+        let result = repoint_verified_fixture(base, &claude_home, &handle, account2);
         match result {
             Err(CredentialError::RepointFailed { rolled_back, .. }) => {
                 assert!(
@@ -5080,6 +8135,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn repoint_handle_dir_rolls_back_symlinks_when_settings_commit_fails() {
+        let _env_guard = crate::platform::test_env::lock();
         let dir = TempDir::new().unwrap();
         let base = dir.path();
         let claude_home = dir.path().join(".claude");
@@ -5099,6 +8155,7 @@ mod tests {
         }
         let account1 = AccountNum::try_from(1u16).unwrap();
         let account2 = AccountNum::try_from(2u16).unwrap();
+        stage_verified_repoint_slots(base, &[1, 2, 3]);
         let handle = create_handle_dir(base, &claude_home, account1, 60310).unwrap();
 
         let pre_targets: Vec<(&str, PathBuf)> = ACCOUNT_BOUND_ITEMS
@@ -5112,7 +8169,7 @@ mod tests {
         // commit — the true final step per S-H1/D-F1 — fails.
         set_repoint_fail_settings_commit_for_test(true);
 
-        let result = repoint_handle_dir(base, &claude_home, &handle, account2);
+        let result = repoint_verified_fixture(base, &claude_home, &handle, account2);
         match result {
             Err(ref e @ CredentialError::RepointFailed { rolled_back, .. }) => {
                 assert!(
@@ -5164,6 +8221,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn native_metadata_rollback_preserves_concurrent_writer_and_restores_own_publication() {
+        for prior in [None, Some(r#"{"projects":{"old":true}}"#)] {
+            for concurrent_writer in [false, true] {
+                let dir = TempDir::new().unwrap();
+                let path = dir.path().join(".claude.json");
+                if let Some(raw) = prior {
+                    crate::platform::fs::write_new_private(&path, raw.as_bytes()).unwrap();
+                }
+                let staged = stage_native_swap_metadata(
+                    dir.path(),
+                    &serde_json::json!({"oauthAccount":{"emailAddress":"target@example.test"}}),
+                    prior,
+                )
+                .unwrap();
+                let published = staged.commit().unwrap();
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), published);
+                let concurrent = r#"{"projects":{"native-writer":true}}"#;
+                if concurrent_writer {
+                    std::fs::write(&path, concurrent).unwrap();
+                }
+                let restored = restore_native_metadata(dir.path(), prior, &published);
+                assert_eq!(
+                    restored, !concurrent_writer,
+                    "rollback must report an intervening writer as incomplete"
+                );
+                if concurrent_writer {
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(), concurrent);
+                } else if let Some(raw) = prior {
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+                } else {
+                    assert!(!path.exists());
+                }
+                assert!(std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .flatten()
+                    .all(|entry| entry.file_name() == ".claude.json"));
+            }
+        }
+    }
+
     /// S-H1/D-F1 companion: when a settings-commit failure's OWN rollback
     /// ALSO fails to restore one item, the error must report `rolled_back:
     /// false` (never silently drop to `None`), and the disk-level
@@ -5174,6 +8272,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn repoint_handle_dir_reports_rolled_back_false_when_settings_commit_and_restore_both_fail() {
+        let _env_guard = crate::platform::test_env::lock();
         let dir = TempDir::new().unwrap();
         let base = dir.path();
         let claude_home = dir.path().join(".claude");
@@ -5182,13 +8281,14 @@ mod tests {
         setup_config_dir(base, 2);
         let account1 = AccountNum::try_from(1u16).unwrap();
         let account2 = AccountNum::try_from(2u16).unwrap();
+        stage_verified_repoint_slots(base, &[1, 2, 3]);
         let handle = create_handle_dir(base, &claude_home, account1, 60311).unwrap();
 
         let _guard = RepointFaultGuard;
         set_repoint_fail_settings_commit_for_test(true);
         set_repoint_fail_restore_for_item_for_test(Some(".credentials.json"));
 
-        let result = repoint_handle_dir(base, &claude_home, &handle, account2);
+        let result = repoint_verified_fixture(base, &claude_home, &handle, account2);
         match result {
             Err(CredentialError::RepointFailed { rolled_back, .. }) => {
                 assert!(
@@ -5230,6 +8330,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn repoint_handle_dir_reports_none_when_failure_is_before_any_mutation() {
+        let _env_guard = crate::platform::test_env::lock();
         use std::os::unix::fs::PermissionsExt as _;
 
         let dir = TempDir::new().unwrap();
@@ -5249,6 +8350,7 @@ mod tests {
         }
         let account1 = AccountNum::try_from(1u16).unwrap();
         let account2 = AccountNum::try_from(2u16).unwrap();
+        stage_verified_repoint_slots(base, &[1, 2, 3]);
         let handle = create_handle_dir(base, &claude_home, account1, 60312).unwrap();
 
         let pre_targets: Vec<(&str, PathBuf)> = ACCOUNT_BOUND_ITEMS
@@ -5263,7 +8365,7 @@ mod tests {
         // loop ever run; nothing has been mutated yet (RED-proof verified;
         // see the doc comment above this test).
         std::fs::set_permissions(&handle, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let result = repoint_handle_dir(base, &claude_home, &handle, account2);
+        let result = repoint_verified_fixture(base, &claude_home, &handle, account2);
         std::fs::set_permissions(&handle, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         match result {
@@ -5300,6 +8402,7 @@ mod tests {
             set_repoint_fail_at_rename_index_for_test(None);
             set_repoint_fail_restore_for_item_for_test(None);
             set_repoint_fail_settings_commit_for_test(false);
+            set_repoint_after_loop_hook_for_test(None);
         }
     }
 
@@ -5313,6 +8416,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn repoint_handle_dir_refuses_when_item_is_a_real_file_not_symlink() {
+        let _env_guard = crate::platform::test_env::lock();
         let dir = TempDir::new().unwrap();
         let base = dir.path();
         let claude_home = dir.path().join(".claude");
@@ -5321,6 +8425,7 @@ mod tests {
         setup_config_dir(base, 2);
         let account1 = AccountNum::try_from(1u16).unwrap();
         let account2 = AccountNum::try_from(2u16).unwrap();
+        stage_verified_repoint_slots(base, &[1, 2, 3]);
         let handle = create_handle_dir(base, &claude_home, account1, 60200).unwrap();
 
         // Replace `.current-account` with a REAL file (not a symlink) —
@@ -5329,7 +8434,7 @@ mod tests {
 
         let pre_creds_target = std::fs::read_link(handle.join(".credentials.json")).unwrap();
 
-        let result = repoint_handle_dir(base, &claude_home, &handle, account2);
+        let result = repoint_verified_fixture(base, &claude_home, &handle, account2);
         let err = result.expect_err("must refuse rather than rename over a real file");
 
         // K3: this fires before any mutation — `repoint_rolled_back()` must
@@ -5616,6 +8721,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn repoint_handle_dir_advances_mtime_when_targets_collide() {
+        let _env_guard = crate::platform::test_env::lock();
         use std::time::{Duration, SystemTime};
 
         let dir = TempDir::new().unwrap();
@@ -5628,9 +8734,10 @@ mod tests {
         // Force IDENTICAL mtimes on both slots' credentials files — the
         // exact an internal ticket bug condition. Pick a fixed mtime in the past so the
         // bump's `max(now, ...)` branch is the one being exercised.
+        stage_verified_repoint_slots(base, &[1, 2, 3]);
         let collision_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         for slot in [1u16, 2u16] {
-            let creds = base.join(format!("config-{slot}/.credentials.json"));
+            let creds = verified_fixture_credentials(base, slot);
             let f = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&creds)
@@ -5653,7 +8760,7 @@ mod tests {
             "test setup invariant: pre-swap symlink resolves to slot 1's collision mtime"
         );
 
-        repoint_handle_dir(base, &claude_home, &handle, account2).unwrap();
+        repoint_verified_fixture(base, &claude_home, &handle, account2).unwrap();
 
         // Post-swap: stat through the symlink (now resolves to slot 2).
         // The fix MUST have bumped slot 2's target mtime strictly above
@@ -6023,6 +9130,7 @@ mod tests {
 
     #[test]
     fn repoint_rewrites_claude_json_for_new_slot() {
+        let _env_guard = crate::platform::test_env::lock();
         // Alpha.10 regression fix: csq swap used to leave .claude.json
         // as the copy from whichever slot the handle dir was created
         // with. CC reads per-account caches from that file
@@ -6065,6 +9173,7 @@ mod tests {
         )
         .unwrap();
 
+        stage_verified_repoint_slots(base, &[1, 2, 3]);
         let handle = create_handle_dir(
             base,
             &claude_home,
@@ -6090,7 +9199,7 @@ mod tests {
         );
 
         // Swap to slot 2.
-        repoint_handle_dir(
+        repoint_verified_fixture(
             base,
             &claude_home,
             &handle,
@@ -6121,6 +9230,7 @@ mod tests {
 
     #[test]
     fn repoint_preserves_session_scoped_projects() {
+        let _env_guard = crate::platform::test_env::lock();
         // CC writes per-project state into .claude.json's projects map
         // during a session (MCP server state, model selection, resume
         // list, etc.). That state is scoped to the current CWD and must
@@ -6146,6 +9256,7 @@ mod tests {
         )
         .unwrap();
 
+        stage_verified_repoint_slots(base, &[1, 2, 3]);
         let handle = create_handle_dir(
             base,
             &claude_home,
@@ -6177,7 +9288,7 @@ mod tests {
         .unwrap();
 
         // Swap to slot 2.
-        repoint_handle_dir(
+        repoint_verified_fixture(
             base,
             &claude_home,
             &handle,
@@ -6216,6 +9327,7 @@ mod tests {
 
     #[test]
     fn repoint_rewrites_materialized_settings_for_new_slot() {
+        let _env_guard = crate::platform::test_env::lock();
         // Swap from OAuth slot 1 (no env block) to 3P slot 9 (has env
         // block). The handle dir's settings.json must be re-materialized
         // so the new slot's env lands in it.
@@ -6230,15 +9342,17 @@ mod tests {
         .unwrap();
         setup_config_dir(base, 1);
 
-        // 3P slot
-        let slot9 = base.join("config-9");
-        std::fs::create_dir_all(&slot9).unwrap();
-        std::fs::write(slot9.join(".csq-account"), "9").unwrap();
-        std::fs::write(
-            slot9.join("settings.json"),
-            r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.z.ai/api/anthropic","ANTHROPIC_AUTH_TOKEN":"zai-tok"}}"#,
+        stage_verified_repoint_slots(base, &[1]);
+        // Exercise the real API-key publication shape: no OAuth UUID.
+        crate::accounts::third_party::bind_provider_to_slot(
+            base,
+            "zai",
+            AccountNum::try_from(9u16).unwrap(),
+            Some("sk-fixture-zai"),
+            None,
         )
         .unwrap();
+        assert!(profiles::resolve_slot_to_uuid(base, 9).is_none());
 
         let handle = create_handle_dir(
             base,
@@ -6280,12 +9394,95 @@ mod tests {
         assert_eq!(
             post.pointer("/env/ANTHROPIC_AUTH_TOKEN")
                 .and_then(|v| v.as_str()),
-            Some("zai-tok")
+            Some("sk-fixture-zai")
         );
     }
 
     #[test]
+    fn repoint_third_party_refuses_incomplete_authority_without_mutation() {
+        let _env_guard = crate::platform::test_env::lock();
+        for damage in ["label", "profiles", "oauth_file", "uuid"] {
+            let dir = TempDir::new().unwrap();
+            let base = dir.path();
+            let home = base.join(".claude");
+            std::fs::create_dir_all(&home).unwrap();
+            setup_config_dir(base, 1);
+            stage_verified_repoint_slots(base, &[1]);
+            crate::accounts::third_party::bind_provider_to_slot(
+                base,
+                "zai",
+                AccountNum::try_from(9u16).unwrap(),
+                Some("sk-fixture-zai"),
+                None,
+            )
+            .unwrap();
+            let handle =
+                create_handle_dir(base, &home, AccountNum::try_from(1u16).unwrap(), 33334).unwrap();
+            let path = profiles::profiles_path(base);
+            match damage {
+                "label" => {
+                    let mut value = profiles::load(&path).unwrap();
+                    value.by_slot_identity.remove("9");
+                    profiles::save(&path, &value).unwrap();
+                }
+                "profiles" => std::fs::write(&path, b"{broken").unwrap(),
+                "oauth_file" => {
+                    std::fs::write(base.join("config-9/.credentials.json"), b"{}").unwrap();
+                }
+                "uuid" => {
+                    let mut value = profiles::load(&path).unwrap();
+                    let oauth = *value.by_slot.get("1").unwrap();
+                    value.by_slot.insert("9".into(), oauth);
+                    profiles::save(&path, &value).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = repoint_fixture_snapshot(base);
+            let result =
+                repoint_handle_dir(base, &home, &handle, AccountNum::try_from(9u16).unwrap());
+            assert!(
+                matches!(result, Err(CredentialError::Corrupt { reason, .. }) if reason == "identity_authority_refused"),
+                "unverified target must refuse: {damage}"
+            );
+            assert_eq!(before, repoint_fixture_snapshot(base), "{damage}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repoint_third_party_refuses_dangling_credential_symlink() {
+        let _env_guard = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let home = base.join(".claude");
+        std::fs::create_dir_all(&home).unwrap();
+        setup_config_dir(base, 1);
+        stage_verified_repoint_slots(base, &[1]);
+        crate::accounts::third_party::bind_provider_to_slot(
+            base,
+            "zai",
+            AccountNum::try_from(9u16).unwrap(),
+            Some("sk-fixture-zai"),
+            None,
+        )
+        .unwrap();
+        let handle =
+            create_handle_dir(base, &home, AccountNum::try_from(1u16).unwrap(), 33335).unwrap();
+        std::os::unix::fs::symlink(
+            base.join("absent-oauth"),
+            base.join("config-9/.credentials.json"),
+        )
+        .unwrap();
+        let before = repoint_fixture_snapshot(base);
+        assert!(
+            repoint_handle_dir(base, &home, &handle, AccountNum::try_from(9u16).unwrap(),).is_err()
+        );
+        assert_eq!(before, repoint_fixture_snapshot(base));
+    }
+
+    #[test]
     fn repoint_refuses_legacy_config_dir() {
+        let _env_guard = crate::platform::test_env::lock();
         let dir = TempDir::new().unwrap();
         let base = dir.path();
         let claude_home = dir.path().join(".claude");
@@ -6293,6 +9490,7 @@ mod tests {
         let config = base.join("config-1");
         std::fs::create_dir_all(&config).unwrap();
 
+        let before = repoint_fixture_snapshot(base);
         let result = repoint_handle_dir(
             base,
             &claude_home,
@@ -6300,8 +9498,10 @@ mod tests {
             AccountNum::try_from(2u16).unwrap(),
         );
         assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("term-"), "error should mention term-: {err}");
+        assert!(
+            matches!(result, Err(CredentialError::Corrupt { reason, .. }) if reason == "identity_authority_refused")
+        );
+        assert_eq!(before, repoint_fixture_snapshot(base));
     }
 
     #[test]
@@ -8008,6 +11208,653 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn handle_local_cross_session_refuse_survives_account_swap() {
+        let _env_guard = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let global = base.join(".claude");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::write(global.join("settings.json"), "{}").unwrap();
+        setup_config_dir(base, 1);
+        setup_config_dir(base, 2);
+        stage_verified_repoint_slots(base, &[1, 2, 3]);
+        let handle =
+            create_handle_dir(base, &global, AccountNum::try_from(1u16).unwrap(), 77801).unwrap();
+        let mut settings = read_materialized_settings(&handle);
+        settings["crossSessionInbound"] = serde_json::json!("refuse");
+        std::fs::write(
+            handle.join("settings.json"),
+            serde_json::to_vec(&settings).unwrap(),
+        )
+        .unwrap();
+        repoint_verified_fixture(base, &global, &handle, AccountNum::try_from(2u16).unwrap())
+            .unwrap();
+        assert_eq!(
+            read_materialized_settings(&handle)["crossSessionInbound"],
+            serde_json::json!("refuse")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn default_accept_cannot_override_new_slot_refuse_on_swap() {
+        let _env_guard = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let global = dir.path().join(".claude");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::write(global.join("settings.json"), "{}").unwrap();
+        setup_config_dir(dir.path(), 1);
+        let next = setup_config_dir(dir.path(), 2);
+        std::fs::write(
+            next.join("settings.json"),
+            r#"{"crossSessionInbound":"refuse"}"#,
+        )
+        .unwrap();
+        stage_verified_repoint_slots(dir.path(), &[1, 2, 3]);
+        let handle = create_handle_dir(
+            dir.path(),
+            &global,
+            AccountNum::try_from(1u16).unwrap(),
+            77803,
+        )
+        .unwrap();
+        assert_eq!(
+            read_materialized_settings(&handle)["crossSessionInbound"],
+            serde_json::json!("accept")
+        );
+        repoint_verified_fixture(
+            dir.path(),
+            &global,
+            &handle,
+            AccountNum::try_from(2u16).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_materialized_settings(&handle)["crossSessionInbound"],
+            serde_json::json!("refuse")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handle_local_cross_session_choices_keep_the_stricter_swap_policy() {
+        let _env_guard = crate::platform::test_env::lock();
+        for (previous_choice, next_choice, expected) in [
+            ("accept", "accept", "accept"),
+            ("accept", "hold", "hold"),
+            ("accept", "refuse", "refuse"),
+            ("hold", "accept", "hold"),
+            ("hold", "hold", "hold"),
+            ("hold", "refuse", "refuse"),
+            ("refuse", "accept", "refuse"),
+            ("refuse", "hold", "refuse"),
+            ("refuse", "refuse", "refuse"),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let global = dir.path().join(".claude");
+            std::fs::create_dir_all(&global).unwrap();
+            std::fs::write(global.join("settings.json"), "{}").unwrap();
+            setup_config_dir(dir.path(), 1);
+            let next = setup_config_dir(dir.path(), 2);
+            std::fs::write(
+                next.join("settings.json"),
+                serde_json::json!({"crossSessionInbound":next_choice,"effortLevel":"high"})
+                    .to_string(),
+            )
+            .unwrap();
+            stage_verified_repoint_slots(dir.path(), &[1, 2, 3]);
+            let handle = create_handle_dir(
+                dir.path(),
+                &global,
+                AccountNum::try_from(1u16).unwrap(),
+                77804,
+            )
+            .unwrap();
+            let mut previous = read_materialized_settings(&handle);
+            previous["crossSessionInbound"] = serde_json::json!(previous_choice);
+            previous["effortLevel"] = serde_json::json!("low");
+            std::fs::write(
+                handle.join("settings.json"),
+                serde_json::to_vec(&previous).unwrap(),
+            )
+            .unwrap();
+            repoint_verified_fixture(
+                dir.path(),
+                &global,
+                &handle,
+                AccountNum::try_from(2u16).unwrap(),
+            )
+            .unwrap();
+            let materialized = read_materialized_settings(&handle);
+            assert_eq!(
+                materialized["crossSessionInbound"],
+                serde_json::json!(expected),
+                "previous={previous_choice}, next={next_choice}"
+            );
+            assert_eq!(materialized["effortLevel"], serde_json::json!("high"));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn changed_global_refuse_overrides_previous_default_accept() {
+        let _env_guard = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let global = dir.path().join(".claude");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::write(global.join("settings.json"), "{}").unwrap();
+        setup_config_dir(dir.path(), 1);
+        setup_config_dir(dir.path(), 2);
+        stage_verified_repoint_slots(dir.path(), &[1, 2, 3]);
+        let handle = create_handle_dir(
+            dir.path(),
+            &global,
+            AccountNum::try_from(1u16).unwrap(),
+            77805,
+        )
+        .unwrap();
+        std::fs::write(
+            global.join("settings.json"),
+            r#"{"crossSessionInbound":"refuse"}"#,
+        )
+        .unwrap();
+        repoint_verified_fixture(
+            dir.path(),
+            &global,
+            &handle,
+            AccountNum::try_from(2u16).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_materialized_settings(&handle)["crossSessionInbound"],
+            serde_json::json!("refuse")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn invalid_previous_inbound_choice_never_widens_to_accept() {
+        let _env_guard = crate::platform::test_env::lock();
+        for invalid in [
+            serde_json::json!("unknown"),
+            serde_json::json!(42),
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            for next_choice in ["accept", "hold", "refuse"] {
+                let dir = TempDir::new().unwrap();
+                let global = dir.path().join(".claude");
+                std::fs::create_dir_all(&global).unwrap();
+                std::fs::write(global.join("settings.json"), "{}").unwrap();
+                setup_config_dir(dir.path(), 1);
+                let next = setup_config_dir(dir.path(), 2);
+                std::fs::write(
+                    next.join("settings.json"),
+                    serde_json::json!({"crossSessionInbound":next_choice}).to_string(),
+                )
+                .unwrap();
+                stage_verified_repoint_slots(dir.path(), &[1, 2, 3]);
+                let handle = create_handle_dir(
+                    dir.path(),
+                    &global,
+                    AccountNum::try_from(1u16).unwrap(),
+                    77807,
+                )
+                .unwrap();
+                let mut previous = read_materialized_settings(&handle);
+                previous["crossSessionInbound"] = invalid.clone();
+                std::fs::write(
+                    handle.join("settings.json"),
+                    serde_json::to_vec(&previous).unwrap(),
+                )
+                .unwrap();
+                repoint_verified_fixture(
+                    dir.path(),
+                    &global,
+                    &handle,
+                    AccountNum::try_from(2u16).unwrap(),
+                )
+                .unwrap();
+                let actual = read_materialized_settings(&handle);
+                if next_choice == "accept" {
+                    assert!(
+                        actual.get("crossSessionInbound").is_none(),
+                        "invalid={invalid}"
+                    );
+                } else {
+                    assert_eq!(
+                        actual["crossSessionInbound"],
+                        serde_json::json!(next_choice)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn r4_missing_previous_choice_remains_native_approval_across_swaps() {
+        let _env_guard = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let global = dir.path().join(".claude");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::write(global.join("settings.json"), "{}").unwrap();
+        setup_config_dir(dir.path(), 1);
+        setup_config_dir(dir.path(), 2);
+        stage_verified_repoint_slots(dir.path(), &[1, 2, 3]);
+        let handle = create_handle_dir(
+            dir.path(),
+            &global,
+            AccountNum::try_from(1u16).unwrap(),
+            77808,
+        )
+        .unwrap();
+        let mut previous = read_materialized_settings(&handle);
+        previous
+            .as_object_mut()
+            .unwrap()
+            .remove("crossSessionInbound");
+        std::fs::write(
+            handle.join("settings.json"),
+            serde_json::to_vec(&previous).unwrap(),
+        )
+        .unwrap();
+        for next in [2u16, 1] {
+            repoint_verified_fixture(
+                dir.path(),
+                &global,
+                &handle,
+                AccountNum::try_from(next).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                read_materialized_settings(&handle)
+                    .get("crossSessionInbound")
+                    .is_none(),
+                "existing native approval widened on swap to {next}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn r4_unknown_or_unusable_choice_never_accepts_after_two_swaps() {
+        let _env_guard = crate::platform::test_env::lock();
+        for previous in [
+            r#"{"crossSessionInbound":"unknown"}"#,
+            r#"{"crossSessionInbound":42}"#,
+            "",
+            r#"{"crossSessionInbound":"refuse", "#,
+            "[]",
+        ] {
+            let dir = TempDir::new().unwrap();
+            let global = dir.path().join(".claude");
+            std::fs::create_dir_all(&global).unwrap();
+            std::fs::write(global.join("settings.json"), "{}").unwrap();
+            setup_config_dir(dir.path(), 1);
+            setup_config_dir(dir.path(), 2);
+            stage_verified_repoint_slots(dir.path(), &[1, 2, 3]);
+            let handle = create_handle_dir(
+                dir.path(),
+                &global,
+                AccountNum::try_from(1u16).unwrap(),
+                77809,
+            )
+            .unwrap();
+            std::fs::write(handle.join("settings.json"), previous).unwrap();
+            for (swap, next) in [2u16, 1].into_iter().enumerate() {
+                repoint_verified_fixture(
+                    dir.path(),
+                    &global,
+                    &handle,
+                    AccountNum::try_from(next).unwrap(),
+                )
+                .unwrap();
+                assert!(
+                    read_materialized_settings(&handle)
+                        .get("crossSessionInbound")
+                        .is_none(),
+                    "previous={previous:?} widened on swap {}",
+                    swap + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn r4_known_approval_replaces_unknown_merged_choice() {
+        let _env_guard = crate::platform::test_env::lock();
+        for prior_choice in ["hold", "refuse"] {
+            for unknown in [
+                serde_json::json!("unknown"),
+                serde_json::json!(42),
+                serde_json::json!(null),
+                serde_json::json!([]),
+                serde_json::json!({}),
+            ] {
+                let dir = TempDir::new().unwrap();
+                let global = dir.path().join(".claude");
+                std::fs::create_dir_all(&global).unwrap();
+                std::fs::write(global.join("settings.json"), "{}").unwrap();
+                setup_config_dir(dir.path(), 1);
+                let config = setup_config_dir(dir.path(), 2);
+                std::fs::write(
+                    config.join("settings.json"),
+                    serde_json::json!({"crossSessionInbound":unknown}).to_string(),
+                )
+                .unwrap();
+                stage_verified_repoint_slots(dir.path(), &[1, 2, 3]);
+                let handle = create_handle_dir(
+                    dir.path(),
+                    &global,
+                    AccountNum::try_from(1u16).unwrap(),
+                    77810,
+                )
+                .unwrap();
+                let mut previous = read_materialized_settings(&handle);
+                previous["crossSessionInbound"] = serde_json::json!(prior_choice);
+                std::fs::write(
+                    handle.join("settings.json"),
+                    serde_json::to_vec(&previous).unwrap(),
+                )
+                .unwrap();
+                repoint_verified_fixture(
+                    dir.path(),
+                    &global,
+                    &handle,
+                    AccountNum::try_from(2u16).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    read_materialized_settings(&handle)["crossSessionInbound"],
+                    serde_json::json!(prior_choice),
+                    "unknown={unknown}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unusable_handle_local_settings_withholds_accept_on_rematerialization() {
+        let dir = TempDir::new().unwrap();
+        let global = dir.path().join(".claude");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::write(global.join("settings.json"), "{}").unwrap();
+        let config = setup_config_dir(dir.path(), 1);
+        let handle = create_handle_dir(
+            dir.path(),
+            &global,
+            AccountNum::try_from(1u16).unwrap(),
+            77802,
+        )
+        .unwrap();
+        std::fs::write(
+            handle.join("settings.json"),
+            r#"{"crossSessionInbound":"refuse", "#,
+        )
+        .unwrap();
+        materialize_handle_settings(&handle, &global, &config).unwrap();
+        assert!(read_materialized_settings(&handle)
+            .get("crossSessionInbound")
+            .is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn empty_local_settings_withholds_accept_but_empty_account_layers_keep_default() {
+        for empty in ["", " \n\t"] {
+            let dir = TempDir::new().unwrap();
+            let global = dir.path().join(".claude");
+            std::fs::create_dir_all(&global).unwrap();
+            std::fs::write(global.join("settings.json"), empty).unwrap();
+            let config = setup_config_dir(dir.path(), 1);
+            std::fs::write(config.join("settings.json"), empty).unwrap();
+            let handle = create_handle_dir(
+                dir.path(),
+                &global,
+                AccountNum::try_from(1u16).unwrap(),
+                77804,
+            )
+            .unwrap();
+            assert_eq!(
+                read_materialized_settings(&handle)["crossSessionInbound"],
+                serde_json::json!("accept")
+            );
+            std::fs::write(handle.join("settings.json"), empty).unwrap();
+            materialize_handle_settings(&handle, &global, &config).unwrap();
+            assert!(read_materialized_settings(&handle)
+                .get("crossSessionInbound")
+                .is_none());
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dangling_local_settings_withhold_accept_and_account_layers_keep_default() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        let global = dir.path().join(".claude");
+        std::fs::create_dir_all(&global).unwrap();
+        let config = setup_config_dir(dir.path(), 1);
+        let missing_global = global.join("missing-settings-target");
+        let missing_slot = config.join("missing-settings-target");
+        symlink(&missing_global, global.join("settings.json")).unwrap();
+        std::fs::remove_file(config.join("settings.json")).unwrap();
+        symlink(&missing_slot, config.join("settings.json")).unwrap();
+        let handle = create_handle_dir(
+            dir.path(),
+            &global,
+            AccountNum::try_from(1u16).unwrap(),
+            77806,
+        )
+        .unwrap();
+        assert_eq!(
+            read_materialized_settings(&handle)["crossSessionInbound"],
+            serde_json::json!("accept")
+        );
+        let missing_local = handle.join("missing-settings-target");
+        std::fs::remove_file(handle.join("settings.json")).unwrap();
+        symlink(&missing_local, handle.join("settings.json")).unwrap();
+        materialize_handle_settings(&handle, &global, &config).unwrap();
+        assert!(read_materialized_settings(&handle)
+            .get("crossSessionInbound")
+            .is_none());
+        assert!(!missing_local.exists() && !missing_global.exists() && !missing_slot.exists());
+        assert!(std::fs::symlink_metadata(handle.join("settings.json"))
+            .unwrap()
+            .is_file());
+        assert!(std::fs::symlink_metadata(global.join("settings.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::symlink_metadata(config.join("settings.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn nonobject_and_nonfile_local_settings_withhold_accept() {
+        for content in ["[]", "null"] {
+            let dir = TempDir::new().unwrap();
+            let global = dir.path().join(".claude");
+            std::fs::create_dir_all(&global).unwrap();
+            let config = setup_config_dir(dir.path(), 1);
+            let handle = create_handle_dir(
+                dir.path(),
+                &global,
+                AccountNum::try_from(1u16).unwrap(),
+                77805,
+            )
+            .unwrap();
+            std::fs::write(handle.join("settings.json"), content).unwrap();
+            materialize_handle_settings(&handle, &global, &config).unwrap();
+            assert!(read_materialized_settings(&handle)
+                .get("crossSessionInbound")
+                .is_none());
+            std::fs::remove_file(handle.join("settings.json")).unwrap();
+            std::fs::create_dir(handle.join("settings.json")).unwrap();
+            let prepared = prepare_handle_settings_tmp(&handle, &global, &config, None).unwrap();
+            let settings: Value =
+                serde_json::from_str(&std::fs::read_to_string(&prepared).unwrap()).unwrap();
+            assert!(settings.get("crossSessionInbound").is_none());
+            std::fs::remove_file(prepared).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn materialized_settings_accept_cross_session_inbound_by_default() {
+        // Falsifier: without the default key the handle has no
+        // `crossSessionInbound` and a bypass-permissions receiver holds the notice.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = base.join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        std::fs::write(claude_home.join("settings.json"), "{}").unwrap();
+        setup_config_dir(base, 1);
+        let account = AccountNum::try_from(1u16).unwrap();
+        let handle = create_handle_dir(base, &claude_home, account, 77779).unwrap();
+        assert_eq!(
+            read_materialized_settings(&handle)
+                .pointer("/crossSessionInbound")
+                .and_then(|v| v.as_str()),
+            Some("accept"),
+        );
+        let global: Value = serde_json::from_str(
+            &std::fs::read_to_string(claude_home.join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(global.get("crossSessionInbound").is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn materialized_settings_user_global_cross_session_inbound_wins() {
+        for choice in ["refuse", "hold"] {
+            let dir = TempDir::new().unwrap();
+            let base = dir.path();
+            let claude_home = base.join(".claude");
+            std::fs::create_dir_all(&claude_home).unwrap();
+            std::fs::write(
+                claude_home.join("settings.json"),
+                format!(r#"{{ "crossSessionInbound": "{choice}" }}"#),
+            )
+            .unwrap();
+            setup_config_dir(base, 1);
+            let account = AccountNum::try_from(1u16).unwrap();
+            let handle = create_handle_dir(base, &claude_home, account, 77780).unwrap();
+            assert_eq!(
+                read_materialized_settings(&handle)
+                    .pointer("/crossSessionInbound")
+                    .and_then(|v| v.as_str()),
+                Some(choice),
+            );
+        }
+    }
+
+    /// Falsifier: with no unparseable-file guard, the malformed global reads as `{}`
+    /// and the default `accept` is applied over the user's `refuse`.
+    #[test]
+    #[cfg(unix)]
+    fn malformed_settings_file_withholds_the_accept_default() {
+        for which in ["global", "overlay"] {
+            let dir = TempDir::new().unwrap();
+            let base = dir.path();
+            let claude_home = base.join(".claude");
+            std::fs::create_dir_all(&claude_home).unwrap();
+            setup_config_dir(base, 1);
+            let bad = r#"{"crossSessionInbound":"refuse", "#; // truncated JSON
+            if which == "global" {
+                std::fs::write(claude_home.join("settings.json"), bad).unwrap();
+            } else {
+                std::fs::write(base.join("config-1").join("settings.json"), bad).unwrap();
+            }
+            let account = AccountNum::try_from(1u16).unwrap();
+            let handle = create_handle_dir(base, &claude_home, account, 77781).unwrap();
+            let m = read_materialized_settings(&handle);
+            assert_ne!(
+                m.pointer("/crossSessionInbound").and_then(|v| v.as_str()),
+                Some("accept"),
+                "{which}"
+            );
+            assert!(m.get("crossSessionInbound").is_none(), "{which}");
+        }
+    }
+
+    /// INVEST-2: every shape of unusable global settings withholds `accept`. Falsifier: the
+    /// pre-fix read treated each as `{}` and applied the default.
+    #[test]
+    #[cfg(unix)]
+    fn every_unusable_settings_shape_withholds_the_accept_default() {
+        use std::os::unix::fs::PermissionsExt;
+        for shape in ["chmod000", "directory", "array"] {
+            let dir = TempDir::new().unwrap();
+            let base = dir.path();
+            let claude_home = base.join(".claude");
+            std::fs::create_dir_all(&claude_home).unwrap();
+            setup_config_dir(base, 1);
+            let g = claude_home.join("settings.json");
+            match shape {
+                "chmod000" => {
+                    std::fs::write(&g, r#"{"crossSessionInbound":"refuse"}"#).unwrap();
+                    std::fs::set_permissions(&g, std::fs::Permissions::from_mode(0o000)).unwrap();
+                    // This case cannot execute as root: that privilege bypasses mode bits.
+                    // SAFETY: geteuid takes no arguments and touches no memory.
+                    if unsafe { libc::geteuid() } == 0 {
+                        std::fs::set_permissions(&g, std::fs::Permissions::from_mode(0o600))
+                            .unwrap();
+                        continue;
+                    }
+                }
+                "directory" => std::fs::create_dir(&g).unwrap(),
+                _ => std::fs::write(&g, "[]").unwrap(),
+            }
+            let account = AccountNum::try_from(1u16).unwrap();
+            let handle = create_handle_dir(base, &claude_home, account, 77790).unwrap();
+            let m = read_materialized_settings(&handle);
+            assert!(m.get("crossSessionInbound").is_none(), "{shape}");
+            if shape == "chmod000" {
+                std::fs::set_permissions(&g, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn slot_overlay_cross_session_inbound_beats_global_beats_default() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = base.join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        std::fs::write(
+            claude_home.join("settings.json"),
+            r#"{ "crossSessionInbound": "hold" }"#,
+        )
+        .unwrap();
+        setup_config_dir(base, 1);
+        std::fs::write(
+            base.join("config-1").join("settings.json"),
+            r#"{ "crossSessionInbound": "refuse" }"#,
+        )
+        .unwrap();
+        let account = AccountNum::try_from(1u16).unwrap();
+        let handle = create_handle_dir(base, &claude_home, account, 77782).unwrap();
+        assert_eq!(
+            read_materialized_settings(&handle)
+                .pointer("/crossSessionInbound")
+                .and_then(|v| v.as_str()),
+            Some("refuse"),
+            "overlay > global"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn materialized_settings_user_global_effort_wins_over_default() {
         // An explicit `effortLevel` in the user-global is an override,
         // not a candidate for the default: "xhigh" must survive into the
@@ -8126,6 +11973,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn repoint_aborts_when_target_config_missing_csq_account() {
+        let _env_guard = crate::platform::test_env::lock();
         let dir = TempDir::new().unwrap();
         let base = dir.path();
         let claude_home = base.join(".claude");
@@ -8143,11 +11991,13 @@ mod tests {
 
         let account1 = AccountNum::try_from(1u16).unwrap();
         let account2 = AccountNum::try_from(2u16).unwrap();
+        stage_verified_repoint_slots(base, &[1, 2, 3]);
+        std::fs::remove_file(config_2.join(".csq-account")).unwrap();
         let handle = create_handle_dir(base, &claude_home, account1, 55551).unwrap();
 
         // Attempt to repoint to account 2 — should fail because .csq-account
         // is missing from config-2, preventing a mixed-state handle dir.
-        let result = repoint_handle_dir(base, &claude_home, &handle, account2);
+        let result = repoint_verified_fixture(base, &claude_home, &handle, account2);
 
         assert!(
             result.is_err(),
@@ -8165,7 +12015,7 @@ mod tests {
 
         // Handle dir must still be bound to account 1 (no partial repoint)
         assert_eq!(
-            markers::read_csq_account(&handle),
+            markers::resolve_marker_to_slot(base, &handle),
             Some(account1),
             "handle dir must remain on account 1 after aborted repoint"
         );
@@ -8249,14 +12099,15 @@ mod tests {
     ///
     /// Two threads both calling `repoint_handle_dir` on the SAME handle dir
     /// but with DIFFERENT targets must produce a consistent final state:
-    /// all 4 symlinks must point at the SAME config-<N> dir (whichever
-    /// thread won the lock). Without the flock the two threads can interleave
+    /// all symlinks must resolve to the SAME winning binding (credential UUID
+    /// plus slot markers). Without the flock the two threads can interleave
     /// rename operations, leaving the handle dir in a mixed-state where
     /// `.credentials.json` points at config-2 but `.csq-account` still
     /// points at config-3.
     #[test]
     #[cfg(unix)]
     fn repoint_handle_dir_serializes_concurrent_writers() {
+        let _env_guard = crate::platform::test_env::lock();
         use std::sync::{Arc, Barrier};
         use std::thread;
 
@@ -8274,9 +12125,33 @@ mod tests {
         let account2 = AccountNum::try_from(2u16).unwrap();
         let account3 = AccountNum::try_from(3u16).unwrap();
 
+        std::fs::write(
+            base.join("config-1/settings.json"),
+            serde_json::json!({"fixtureWinner":1}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("config-2/settings.json"),
+            serde_json::json!({"fixtureWinner":2}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("config-3/settings.json"),
+            serde_json::json!({"fixtureWinner":3}).to_string(),
+        )
+        .unwrap();
+        stage_verified_repoint_slots(&base, &[1, 2, 3]);
         let handle = create_handle_dir(dir.path(), &claude_home, account1, 55552).unwrap();
 
-        // Barrier: both threads enter repoint_handle_dir at the same time
+        let binding_a =
+            crate::accounts::anthropic_identity::capture_anthropic_binding(&base, account2)
+                .unwrap();
+        let binding_b =
+            crate::accounts::anthropic_identity::capture_anthropic_binding(&base, account3)
+                .unwrap();
+        let native_a = capture_native_swap(&base, &handle).unwrap();
+        let native_b = capture_native_swap(&base, &handle).unwrap();
+        // Both snapshots capture the same source before the barrier.
         let barrier = Arc::new(Barrier::new(2));
 
         let base_a = base.clone();
@@ -8285,7 +12160,9 @@ mod tests {
         let barrier_a = barrier.clone();
         let t1 = thread::spawn(move || {
             barrier_a.wait();
-            repoint_handle_dir(&base_a, &claude_a, &handle_a, account2)
+            let result =
+                repoint_handle_dir_guarded(&base_a, &claude_a, &handle_a, &binding_a, &native_a);
+            (result, binding_a, native_a)
         });
 
         let base_b = base.clone();
@@ -8294,19 +12171,19 @@ mod tests {
         let barrier_b = barrier.clone();
         let t2 = thread::spawn(move || {
             barrier_b.wait();
-            repoint_handle_dir(&base_b, &claude_b, &handle_b, account3)
+            let result =
+                repoint_handle_dir_guarded(&base_b, &claude_b, &handle_b, &binding_b, &native_b);
+            (result, binding_b, native_b)
         });
 
         let r1 = t1.join().unwrap();
         let r2 = t2.join().unwrap();
 
-        // Both must succeed (no panic, no I/O error from interleaving)
-        assert!(r1.is_ok(), "thread 1 repoint failed: {:?}", r1);
-        assert!(r2.is_ok(), "thread 2 repoint failed: {:?}", r2);
+        assert_verified_repoint_race(&base, &claude_home, &handle, r1, r2);
 
         // The handle dir must be in a CONSISTENT state: all symlinks point
         // at the SAME config-<N>. Read the account marker to determine winner.
-        let final_account = markers::read_csq_account(&handle)
+        let final_account = markers::resolve_marker_to_slot(&base, &handle)
             .expect("handle dir must have a readable .csq-account after concurrent repoint");
 
         // Verify every symlink that EXISTS in the handle dir resolves to the
@@ -8324,8 +12201,13 @@ mod tests {
             let resolved = std::fs::read_link(&link).unwrap_or_else(|e| {
                 panic!("{item} link exists but read_link failed: {e}");
             });
+            let expected = if *item == ".credentials.json" {
+                verified_fixture_credentials(&base, final_account.get())
+            } else {
+                winner_config.join(item)
+            };
             assert!(
-                resolved.starts_with(&winner_config),
+                resolved == expected,
                 "{item} points at {} but winner config is {} — mixed-state handle dir \
                  (concurrent repoint without flock would allow this)",
                 resolved.display(),
@@ -8400,6 +12282,2279 @@ mod tests {
         .unwrap();
 
         config
+    }
+
+    /// Holds the shared env lock and points the Codex global-hooks fixture seam at a
+    /// hermetic path; restores the previous value on drop (panic included).
+    #[cfg(unix)]
+    struct GlobalHooksEnv {
+        _lock: crate::platform::test_env::EnvTestGuard,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl GlobalHooksEnv {
+        fn set(path: Option<&Path>) -> Self {
+            let lock = crate::platform::test_env::lock();
+            let prev = std::env::var_os("CSQ_TEST_CODEX_GLOBAL_HOOKS");
+            // SAFETY: the workspace-wide env lock is held for this guard's lifetime.
+            unsafe {
+                match path {
+                    Some(p) => std::env::set_var("CSQ_TEST_CODEX_GLOBAL_HOOKS", p),
+                    None => std::env::remove_var("CSQ_TEST_CODEX_GLOBAL_HOOKS"),
+                }
+            }
+            Self { _lock: lock, prev }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for GlobalHooksEnv {
+        fn drop(&mut self) {
+            // SAFETY: the env lock is still held (the field drops after this body).
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("CSQ_TEST_CODEX_GLOBAL_HOOKS", v),
+                    None => std::env::remove_var("CSQ_TEST_CODEX_GLOBAL_HOOKS"),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    const GLOBAL_HOOKS: &str = r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"x"}]}],"Stop":[{"hooks":[{"type":"command","command":"y"}]}]}}"#;
+
+    #[cfg(unix)]
+    fn write_global_hooks(dir: &Path) -> PathBuf {
+        let p = dir.join("global-codex").join("hooks.json");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, GLOBAL_HOOKS).unwrap();
+        p
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_handle_links_user_global_hooks_json() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        setup_codex_slot(&base, 2);
+        let global = write_global_hooks(dir.path());
+        let _env = GlobalHooksEnv::set(Some(&global));
+
+        let handle =
+            create_handle_dir_codex(&base, AccountNum::try_from(2u16).unwrap(), 88801).unwrap();
+
+        let link = handle.join("hooks.json");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_link(&link).unwrap(), global);
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), GLOBAL_HOOKS);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_repoint_keeps_or_recreates_global_hooks_link() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        setup_codex_slot(&base, 4);
+        setup_codex_slot(&base, 9);
+        let global = write_global_hooks(dir.path());
+        let _env = GlobalHooksEnv::set(Some(&global));
+        let handle =
+            create_handle_dir_codex(&base, AccountNum::try_from(4u16).unwrap(), 88802).unwrap();
+        let to = AccountNum::try_from(9u16).unwrap();
+
+        // Kept: present before, present after.
+        repoint_handle_dir_codex(&base, &handle, to).unwrap();
+        assert_eq!(
+            std::fs::read_link(handle.join("hooks.json")).unwrap(),
+            global
+        );
+
+        // Recreated: a handle dir that lost the link regains it on the next repoint.
+        std::fs::remove_file(handle.join("hooks.json")).unwrap();
+        repoint_handle_dir_codex(&base, &handle, AccountNum::try_from(4u16).unwrap()).unwrap();
+        assert_eq!(
+            std::fs::read_link(handle.join("hooks.json")).unwrap(),
+            global
+        );
+
+        // A symlink pointing elsewhere is moved aside (kept) and the global linked.
+        std::fs::remove_file(handle.join("hooks.json")).unwrap();
+        let elsewhere = dir.path().join("elsewhere.json");
+        std::os::unix::fs::symlink(&elsewhere, handle.join("hooks.json")).unwrap();
+        repoint_handle_dir_codex(&base, &handle, to).unwrap();
+        assert_eq!(
+            std::fs::read_link(handle.join("hooks.json")).unwrap(),
+            global
+        );
+        let kept = codex_hooks_preserved_foreign(&handle);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(
+            std::fs::read_link(handle.join(&kept[0])).unwrap(),
+            elsewhere
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_handle_without_global_hooks_gets_no_link_and_no_file() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        setup_codex_slot(&base, 2);
+        setup_codex_slot(&base, 3);
+        // The seam names a path that does not exist.
+        let missing = dir.path().join("no-such-dir").join("hooks.json");
+        let _env = GlobalHooksEnv::set(Some(&missing));
+
+        let handle =
+            create_handle_dir_codex(&base, AccountNum::try_from(2u16).unwrap(), 88803).unwrap();
+        assert!(handle.join("hooks.json").symlink_metadata().is_err());
+        repoint_handle_dir_codex(&base, &handle, AccountNum::try_from(3u16).unwrap()).unwrap();
+        assert!(handle.join("hooks.json").symlink_metadata().is_err());
+        assert!(!missing.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_hooks_regular_file_replaced_only_when_subset_of_global() {
+        let dir = TempDir::new().unwrap();
+        let global = write_global_hooks(dir.path());
+        let _env = GlobalHooksEnv::set(None);
+
+        // Foreign (not a subset): MOVED ASIDE byte-identical, never deleted, then linked.
+        let foreign_dir = dir.path().join("h-foreign");
+        std::fs::create_dir_all(&foreign_dir).unwrap();
+        let foreign = br#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"NOT-IN-GLOBAL"}]}]}}"#;
+        std::fs::write(foreign_dir.join("hooks.json"), foreign).unwrap();
+        link_codex_global_hooks(&foreign_dir, Some(&global)).unwrap();
+        assert_eq!(
+            std::fs::read_link(foreign_dir.join("hooks.json")).unwrap(),
+            global
+        );
+        let kept = codex_hooks_preserved_foreign(&foreign_dir);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(kept[0].starts_with("hooks.json.csq-foreign-"));
+        assert_eq!(std::fs::read(foreign_dir.join(&kept[0])).unwrap(), foreign);
+        assert!(foreign_dir
+            .join("hooks.json.swap-tmp")
+            .symlink_metadata()
+            .is_err());
+
+        // Subset: replaced by the link, nothing preserved.
+        let subset_dir = dir.path().join("h-subset");
+        std::fs::create_dir_all(&subset_dir).unwrap();
+        std::fs::write(
+            subset_dir.join("hooks.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"y"}]}]}}"#,
+        )
+        .unwrap();
+        link_codex_global_hooks(&subset_dir, Some(&global)).unwrap();
+        assert_eq!(
+            std::fs::read_link(subset_dir.join("hooks.json")).unwrap(),
+            global
+        );
+        assert!(codex_hooks_preserved_foreign(&subset_dir).is_empty());
+        assert_eq!(
+            std::fs::read_dir(&subset_dir).unwrap().count(),
+            1,
+            "the detached subset file must not be left behind"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_hooks_unparseable_local_file_is_preserved() {
+        let dir = TempDir::new().unwrap();
+        let global = write_global_hooks(dir.path());
+        let _env = GlobalHooksEnv::set(None);
+        let h = dir.path().join("h");
+        std::fs::create_dir_all(&h).unwrap();
+        let junk = b"{ this is not json";
+        std::fs::write(h.join("hooks.json"), junk).unwrap();
+        link_codex_global_hooks(&h, Some(&global)).unwrap();
+        assert_eq!(std::fs::read_link(h.join("hooks.json")).unwrap(), global);
+        let kept = codex_hooks_preserved_foreign(&h);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(std::fs::read(h.join(&kept[0])).unwrap(), junk);
+    }
+
+    /// OWNER RULING 2026-10-15: carry approvals over. csq copies existing owner approvals for
+    /// byte-identical hooks, and never originates one. End to end through the real create and
+    /// repoint paths: a new handle inherits an existing approval for an unchanged hook, a
+    /// repoint onto the slot does too, a dead handle's key is pruned, and an edited global
+    /// carries nothing.
+    #[cfg(unix)]
+    #[test]
+    fn codex_create_and_repoint_carry_existing_hook_approvals() {
+        const STOP_TRUE: &str =
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}"#;
+        const H_TRUE: &str =
+            "sha256:2ba34c7a02841fada06b868a093d041fd3d9de81883c789a321916b0aa118851";
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().canonicalize().unwrap().join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        setup_codex_slot(&base, 4);
+        setup_codex_slot(&base, 9);
+        let global = dir.path().join("g-hooks.json");
+        std::fs::write(&global, STOP_TRUE).unwrap();
+        let _env = GlobalHooksEnv::set(Some(&global));
+        let key = |h: &Path| format!("{}/hooks.json:stop:0:0", h.display());
+        let slot_cfg = |n: u16| base.join(format!("config-{n}/config.toml"));
+        let state = |n: u16| -> toml::Table {
+            let doc: toml::Table =
+                toml::from_str(&std::fs::read_to_string(slot_cfg(n)).unwrap()).unwrap();
+            doc.get("hooks")
+                .and_then(|h| h.get("state"))
+                .and_then(|s| s.as_table())
+                .cloned()
+                .unwrap_or_default()
+        };
+        let a4 = AccountNum::try_from(4u16).unwrap();
+        let a9 = AccountNum::try_from(9u16).unwrap();
+
+        // First handle: nothing to copy from, so nothing is created.
+        let first = create_handle_dir_codex(&base, a4, 88901).unwrap();
+        assert!(state(4).is_empty(), "an entry appeared without a source");
+
+        // Codex approves the first handle's hook (written by Codex, not csq), plus a stale
+        // key of a handle that no longer exists.
+        let dead = base.join("term-88999");
+        let mut cfg = std::fs::read_to_string(slot_cfg(4)).unwrap();
+        cfg.push_str(&format!(
+            "\n[hooks.state.\"{}\"]\ntrusted_hash = \"{H_TRUE}\"\nenabled = true\n\n[hooks.state.\"{}\"]\ntrusted_hash = \"{H_TRUE}\"\n",
+            key(&first),
+            key(&dead)
+        ));
+        std::fs::write(slot_cfg(4), cfg).unwrap(); // CI-ALLOW-fs-write-config-toml
+
+        // Second handle on the slot inherits it; the dead handle's key is pruned.
+        let second = create_handle_dir_codex(&base, a4, 88902).unwrap();
+        let st = state(4);
+        assert_eq!(st[&key(&second)]["trusted_hash"].as_str(), Some(H_TRUE));
+        assert_eq!(st[&key(&second)]["enabled"].as_bool(), Some(true));
+        assert!(st.contains_key(&key(&first)));
+        assert!(!st.contains_key(&key(&dead)), "dead handle key survived");
+
+        // Repoint a handle onto slot 9, which holds an approval under another handle's key.
+        let mut cfg9 = std::fs::read_to_string(slot_cfg(9)).unwrap();
+        cfg9.push_str(&format!(
+            "\n[hooks.state.\"{}\"]\ntrusted_hash = \"{H_TRUE}\"\nenabled = true\n",
+            key(&first)
+        ));
+        std::fs::write(slot_cfg(9), cfg9).unwrap(); // CI-ALLOW-fs-write-config-toml
+        repoint_handle_dir_codex(&base, &second, a9).unwrap();
+        assert_eq!(
+            state(9)[&key(&second)]["trusted_hash"].as_str(),
+            Some(H_TRUE)
+        );
+
+        // An edited global: a third handle gets nothing (the source hash is stale).
+        std::fs::write(
+            &global,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true "}]}]}}"#,
+        )
+        .unwrap();
+        let third = create_handle_dir_codex(&base, a4, 88903).unwrap();
+        assert!(!state(4).contains_key(&key(&third)));
+    }
+
+    #[cfg(unix)]
+    const TC_STOP_TRUE: &str =
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}"#;
+    #[cfg(unix)]
+    const TC_H_TRUE: &str =
+        "sha256:2ba34c7a02841fada06b868a093d041fd3d9de81883c789a321916b0aa118851";
+
+    /// A hermetic accounts base (canonical path) with Codex slots 4 and 9 and a global hooks
+    /// file holding one Stop hook.
+    #[cfg(unix)]
+    fn trust_world() -> (TempDir, PathBuf, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().canonicalize().unwrap().join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        setup_codex_slot(&base, 4);
+        setup_codex_slot(&base, 9);
+        let global = dir.path().join("g-hooks.json");
+        std::fs::write(&global, TC_STOP_TRUE).unwrap();
+        (dir, base, global)
+    }
+
+    #[cfg(unix)]
+    fn tc_key(home: &Path) -> String {
+        format!("{}/hooks.json:stop:0:0", home.display())
+    }
+
+    #[cfg(unix)]
+    fn tc_entry(home: &Path, enabled: Option<bool>) -> String {
+        let en = enabled.map_or(String::new(), |b| format!("enabled = {b}\n"));
+        format!(
+            "\n[hooks.state.\"{}\"]\ntrusted_hash = \"{TC_H_TRUE}\"\n{en}",
+            tc_key(home)
+        )
+    }
+
+    #[cfg(unix)]
+    fn tc_append(base: &Path, slot: u16, text: &str) {
+        let p = base.join(format!("config-{slot}/config.toml"));
+        let mut cur = std::fs::read_to_string(&p).unwrap();
+        cur.push_str(text);
+        std::fs::write(&p, cur).unwrap(); // CI-ALLOW-fs-write-config-toml
+    }
+
+    #[cfg(unix)]
+    fn tc_state(base: &Path, slot: u16) -> toml::Table {
+        let doc: toml::Table = toml::from_str(
+            &std::fs::read_to_string(base.join(format!("config-{slot}/config.toml"))).unwrap(),
+        )
+        .unwrap();
+        doc.get("hooks")
+            .and_then(|h| h.get("state"))
+            .and_then(|s| s.as_table())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Item 1: sources that disagree on `enabled` copy NOTHING; a single disable is copied
+    /// faithfully (one source, nothing to disagree with).
+    #[cfg(unix)]
+    #[test]
+    fn codex_carry_copies_nothing_when_sources_disagree_on_enabled() {
+        let (_d, base, global) = trust_world();
+        let _env = GlobalHooksEnv::set(Some(&global));
+        let a4 = AccountNum::try_from(4u16).unwrap();
+        tc_append(&base, 4, &tc_entry(&base.join("term-88001"), Some(true)));
+        tc_append(&base, 4, &tc_entry(&base.join("term-88002"), Some(false)));
+        let h = create_handle_dir_codex(&base, a4, 88010).unwrap();
+        assert!(
+            !tc_state(&base, 4).contains_key(&tc_key(&h)),
+            "disagreeing sources were copied"
+        );
+        // one remaining source: its decision is copied faithfully
+        std::fs::write(
+            base.join("config-4/config.toml"),
+            "[model]\nname = \"o1\"\n",
+        )
+        .unwrap(); // CI-ALLOW-fs-write-config-toml
+        tc_append(&base, 4, &tc_entry(&base.join("term-88002"), Some(false)));
+        let h2 = create_handle_dir_codex(&base, a4, 88011).unwrap();
+        assert_eq!(
+            tc_state(&base, 4)[&tc_key(&h2)]["enabled"].as_bool(),
+            Some(false),
+            "a single source's decision is copied faithfully"
+        );
+    }
+
+    /// Item 2: a PID reused on another slot never inherits a predecessor's keys in a third
+    /// slot after a swap: create purges the handle's own keys from EVERY slot.
+    #[cfg(unix)]
+    #[test]
+    fn codex_reused_pid_stale_key_in_another_slot_is_gone_after_swap() {
+        let (_d, base, global) = trust_world();
+        let _env = GlobalHooksEnv::set(Some(&global));
+        let a4 = AccountNum::try_from(4u16).unwrap();
+        let a9 = AccountNum::try_from(9u16).unwrap();
+        tc_append(&base, 9, &tc_entry(&base.join("term-88020"), Some(false)));
+        let h = create_handle_dir_codex(&base, a4, 88020).unwrap();
+        assert!(
+            !tc_state(&base, 9).contains_key(&tc_key(&h)),
+            "create left the stale own key in slot 9"
+        );
+        repoint_handle_dir_codex(&base, &h, a9).unwrap();
+        assert!(
+            !tc_state(&base, 9).contains_key(&tc_key(&h)),
+            "the swap adopted a predecessor's disabled entry"
+        );
+    }
+
+    /// Items 3 and 4: a write that lands while csq's create-time carry is mid-write (Codex
+    /// takes no lock) is neither lost nor allowed to skip the carry: the pass re-runs, so the
+    /// reused PID's stale own key is still dropped and the approval is still copied.
+    #[cfg(unix)]
+    #[test]
+    fn codex_create_survives_a_concurrent_write_and_still_drops_stale_own_keys() {
+        use crate::providers::codex::surface::test_seam::BEFORE_RENAME;
+        let (_d, base, global) = trust_world();
+        let _env = GlobalHooksEnv::set(Some(&global));
+        let a4 = AccountNum::try_from(4u16).unwrap();
+        tc_append(&base, 4, &tc_entry(&base.join("term-88060"), Some(true)));
+        tc_append(&base, 4, &tc_entry(&base.join("term-88061"), Some(false)));
+        let cfg = base.join("config-4/config.toml");
+        let fired = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let f2 = fired.clone();
+        BEFORE_RENAME.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |t: &Path| {
+                f2.set(f2.get() + 1);
+                if f2.get() == 1 {
+                    let mut cur = std::fs::read_to_string(t).unwrap();
+                    cur.push_str("\n[codex_user]\nkeep = 1\n");
+                    std::fs::write(t, cur).unwrap(); // CI-ALLOW-fs-write-config-toml
+                }
+            }));
+        });
+        let h = create_handle_dir_codex(&base, a4, 88061).unwrap();
+        BEFORE_RENAME.with(|h| *h.borrow_mut() = None);
+        let doc: toml::Table = toml::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            doc.get("codex_user")
+                .and_then(|t| t.get("keep"))
+                .and_then(|v| v.as_integer()),
+            Some(1),
+            "a write landing mid-carry was lost"
+        );
+        let st = tc_state(&base, 4);
+        assert_eq!(
+            st.get(&tc_key(&h))
+                .and_then(|e| e.get("enabled"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "stale own key survived or the copy was skipped"
+        );
+    }
+
+    /// Item 3: two terminals created together on one slot both drop their stale own keys and
+    /// both end with their copied approval.
+    #[cfg(unix)]
+    #[test]
+    fn codex_two_terminals_created_together_on_one_slot_both_carry() {
+        let (_d, base, global) = trust_world();
+        let _env = GlobalHooksEnv::set(Some(&global));
+        let a4 = AccountNum::try_from(4u16).unwrap();
+        tc_append(&base, 4, &tc_entry(&base.join("term-88070"), Some(true)));
+        // stale own keys of the two reused PIDs: a disable under a hash that is no longer
+        // current, so neither can act as a source for the other terminal's copy
+        for pid in [88071, 88072] {
+            tc_append(
+                &base,
+                4,
+                &tc_entry(&base.join(format!("term-{pid}")), Some(false))
+                    .replace(TC_H_TRUE, "sha256:stale"),
+            );
+        }
+        let handles: Vec<PathBuf> = std::thread::scope(|sc| {
+            let jobs: Vec<_> = [88071u32, 88072]
+                .into_iter()
+                .map(|pid| {
+                    let base = &base;
+                    sc.spawn(move || create_handle_dir_codex(base, a4, pid).unwrap())
+                })
+                .collect();
+            jobs.into_iter().map(|j| j.join().unwrap()).collect()
+        });
+        let st = tc_state(&base, 4);
+        for h in &handles {
+            let e = st.get(&tc_key(h));
+            assert!(
+                e.is_some_and(|e| e.get("trusted_hash").and_then(|v| v.as_str())
+                    == Some(TC_H_TRUE)
+                    && e.get("enabled").and_then(|v| v.as_bool()) != Some(false)),
+                "{} lost its carry or kept the stale disable",
+                h.display()
+            );
+        }
+    }
+
+    /// Item 4: a target slot that cannot be cleared of a predecessor's keys REFUSES the
+    /// launch (no half-built handle dir), with a clear message and a doctor flag.
+    #[cfg(unix)]
+    #[test]
+    fn codex_create_refuses_when_the_target_slot_cannot_be_purged() {
+        let (_d, base, global) = trust_world();
+        let _env = GlobalHooksEnv::set(Some(&global));
+        let a4 = AccountNum::try_from(4u16).unwrap();
+        std::fs::write(base.join("config-4/config.toml"), "x = [").unwrap(); // CI-ALLOW-fs-write-config-toml
+        let e = create_handle_dir_codex(&base, a4, 88100).unwrap_err();
+        assert!(e.to_string().contains("refusing to launch"), "{e}");
+        assert!(
+            !base.join("term-88100").exists(),
+            "half-built handle dir left"
+        );
+        assert!(
+            crate::providers::codex::surface::slot_write_statuses(&base, a4)
+                .contains(&crate::providers::codex::surface::SlotWriteStatus::PurgeFailed)
+        );
+    }
+
+    /// Item 4: the refusal comes only after ONE drop-only retry: five consecutive concurrent
+    /// writes exhaust the first pass, the retry succeeds, and the stale own key is gone.
+    #[cfg(unix)]
+    #[test]
+    fn codex_create_retries_the_drop_once_before_refusing() {
+        use crate::providers::codex::surface::test_seam::BEFORE_RENAME;
+        let (_d, base, global) = trust_world();
+        let _env = GlobalHooksEnv::set(Some(&global));
+        let a4 = AccountNum::try_from(4u16).unwrap();
+        tc_append(&base, 4, &tc_entry(&base.join("term-88110"), Some(false)));
+        let n = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let n2 = n.clone();
+        BEFORE_RENAME.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |t: &Path| {
+                n2.set(n2.get() + 1);
+                if n2.get() <= 5 {
+                    let mut cur = std::fs::read_to_string(t).unwrap();
+                    cur.push_str(&format!("\n# concurrent {}\n", n2.get()));
+                    std::fs::write(t, cur).unwrap(); // CI-ALLOW-fs-write-config-toml
+                }
+            }));
+        });
+        let r = create_handle_dir_codex(&base, a4, 88110);
+        BEFORE_RENAME.with(|h| *h.borrow_mut() = None);
+        let h = r.expect("one drop-only retry must precede the refusal");
+        assert!(
+            !tc_state(&base, 4).contains_key(&tc_key(&h)),
+            "the stale own key survived the retry"
+        );
+    }
+
+    /// Resets every thread-local test seam the r4 tests set (panic included).
+    #[cfg(unix)]
+    struct R4Seams;
+    #[cfg(unix)]
+    impl Drop for R4Seams {
+        fn drop(&mut self) {
+            use crate::providers::codex::surface::test_seam as s;
+            s::BEFORE_RENAME.with(|h| *h.borrow_mut() = None);
+            s::AFTER_EXCHANGE.with(|h| *h.borrow_mut() = None);
+            s::EXCHANGE_FAIL_NTH.with(|c| c.set(None));
+            s::EXCHANGE_COUNT.with(|c| c.set(0));
+            s::LOCK_ATTEMPTS.with(|c| c.set(None));
+            super::super::codex_hook_trust::test_seam::AFTER_TARGET_REWRITE
+                .with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    #[cfg(unix)]
+    fn slot_statuses(
+        base: &Path,
+        slot: u16,
+    ) -> Vec<crate::providers::codex::surface::SlotWriteStatus> {
+        crate::providers::codex::surface::slot_write_statuses(
+            base,
+            AccountNum::try_from(slot).unwrap(),
+        )
+    }
+
+    /// r4 item 3 (sec L2): a handle whose dir carries no purge marker (a reused PID, or a
+    /// create that skipped a slot) must not swap onto a slot it could not purge: the repoint
+    /// is refused, the handle stays on its old slot, and the slot is flagged. A handle WITH
+    /// the marker is the owner's own and is not refused.
+    #[cfg(unix)]
+    #[test]
+    fn codex_repoint_without_a_marker_is_refused_when_the_target_slot_cannot_be_purged() {
+        let (_d, base, global) = trust_world();
+        let _env = GlobalHooksEnv::set(Some(&global));
+        let a4 = AccountNum::try_from(4u16).unwrap();
+        let a9 = AccountNum::try_from(9u16).unwrap();
+        let h = create_handle_dir_codex(&base, a4, 88200).unwrap();
+        // a reused PID's handle never had a marker; the predecessor's key sits in slot 9
+        std::fs::remove_file(h.join(".csq-hook-trust-purged")).unwrap();
+        std::fs::write(base.join("config-9/config.toml"), "x = [").unwrap(); // CI-ALLOW-fs-write-config-toml
+        let e = repoint_handle_dir_codex(&base, &h, a9).unwrap_err();
+        assert!(e.to_string().contains("refusing"), "{e}");
+        let link = std::fs::read_link(h.join("config.toml")).unwrap();
+        assert!(
+            link.ends_with("config-4/config.toml"),
+            "the handle moved off its old slot: {}",
+            link.display()
+        );
+        let acct = std::fs::read_to_string(h.join(".csq-account"))
+            .or_else(|_| std::fs::read_to_string(base.join("config-4/.csq-account")))
+            .unwrap();
+        assert_eq!(acct.trim(), "4");
+        assert!(slot_statuses(&base, 9)
+            .contains(&crate::providers::codex::surface::SlotWriteStatus::PurgeFailed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_repoint_with_a_marker_proceeds_over_a_broken_target_config() {
+        let (_d, base, global) = trust_world();
+        let _env = GlobalHooksEnv::set(Some(&global));
+        let a4 = AccountNum::try_from(4u16).unwrap();
+        let a9 = AccountNum::try_from(9u16).unwrap();
+        let h = create_handle_dir_codex(&base, a4, 88201).unwrap();
+        assert!(h.join(".csq-hook-trust-purged").is_file());
+        std::fs::write(base.join("config-9/config.toml"), "x = [").unwrap(); // CI-ALLOW-fs-write-config-toml
+        repoint_handle_dir_codex(&base, &h, a9).expect("a marked handle is the owner's own");
+        let link = std::fs::read_link(h.join("config.toml")).unwrap();
+        assert!(link.ends_with("config-9/config.toml"), "{}", link.display());
+    }
+
+    /// r4 item 6 (corr L3): the refusal keeps the cause class.
+    #[cfg(unix)]
+    #[test]
+    fn codex_create_refusal_names_the_cause_class() {
+        use crate::providers::codex::surface::test_seam as s;
+        let a4 = AccountNum::try_from(4u16).unwrap();
+        // malformed
+        {
+            let (_d, base, global) = trust_world();
+            let _env = GlobalHooksEnv::set(Some(&global));
+            std::fs::write(base.join("config-4/config.toml"), "x = [").unwrap(); // CI-ALLOW-fs-write-config-toml
+            let e = create_handle_dir_codex(&base, a4, 88240).unwrap_err();
+            assert!(e.to_string().contains("is malformed"), "{e}");
+        }
+        // oversize
+        {
+            let (_d, base, global) = trust_world();
+            let _env = GlobalHooksEnv::set(Some(&global));
+            std::fs::write(
+                base.join("config-4/config.toml"), // CI-ALLOW-fs-write-config-toml
+                format!("#{}\n", "x".repeat((1 << 20) + 16)),
+            )
+            .unwrap();
+            let e = create_handle_dir_codex(&base, a4, 88241).unwrap_err();
+            assert!(e.to_string().contains("exceeds 1 MiB"), "{e}");
+        }
+        // kept changing (both the first pass and the drop-only retry exhaust)
+        {
+            let (_d, base, global) = trust_world();
+            let _env = GlobalHooksEnv::set(Some(&global));
+            let _r = R4Seams;
+            let n = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let n2 = n.clone();
+            s::BEFORE_RENAME.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |t: &Path| {
+                    n2.set(n2.get() + 1);
+                    let mut cur = std::fs::read_to_string(t).unwrap();
+                    cur.push_str(&format!("\n# concurrent {}\n", n2.get()));
+                    std::fs::write(t, cur).unwrap(); // CI-ALLOW-fs-write-config-toml
+                }));
+            });
+            tc_append(&base, 4, &tc_entry(&base.join("term-88242"), Some(false)));
+            let e = create_handle_dir_codex(&base, a4, 88242).unwrap_err();
+            assert!(e.to_string().contains("kept changing"), "{e}");
+        }
+        // locked by another csq writer
+        {
+            let (_d, base, global) = trust_world();
+            let _env = GlobalHooksEnv::set(Some(&global));
+            let _r = R4Seams;
+            s::LOCK_ATTEMPTS.with(|c| c.set(Some(2)));
+            let _held = crate::providers::codex::surface::lock_slot_config(&base, a4).unwrap();
+            let e = create_handle_dir_codex(&base, a4, 88243).unwrap_err();
+            assert!(e.to_string().contains("locked by another csq"), "{e}");
+        }
+    }
+
+    /// r4 item 4 (corr L1): another terminal's successful purge of the slot must not clear
+    /// the flag for a handle whose stale keys are still there; only that handle's own later
+    /// successful purge of that slot clears it.
+    #[cfg(unix)]
+    #[test]
+    fn codex_purge_failed_is_cleared_only_by_the_same_handles_success() {
+        use crate::providers::codex::surface::SlotWriteStatus::PurgeFailed;
+        let (_d, base, global) = trust_world();
+        let _env = GlobalHooksEnv::set(Some(&global));
+        let a4 = AccountNum::try_from(4u16).unwrap();
+        let a9 = AccountNum::try_from(9u16).unwrap();
+        std::fs::write(base.join("config-9/config.toml"), "x = [").unwrap(); // CI-ALLOW-fs-write-config-toml
+        let a = create_handle_dir_codex(&base, a4, 88210).unwrap();
+        assert!(
+            slot_statuses(&base, 9).contains(&PurgeFailed),
+            "create did not flag slot 9"
+        );
+        // slot 9 is repaired; another terminal's create purges it successfully
+        std::fs::write(
+            base.join("config-9/config.toml"),
+            "[model]\nname = \"o1\"\n",
+        )
+        .unwrap(); // CI-ALLOW-fs-write-config-toml
+        let _b = create_handle_dir_codex(&base, a4, 88211).unwrap();
+        assert!(
+            slot_statuses(&base, 9).contains(&PurgeFailed),
+            "another terminal's success cleared this handle's purge-failed flag"
+        );
+        // the failing handle's own successful purge of slot 9 (a repoint onto it) clears it
+        repoint_handle_dir_codex(&base, &a, a9).unwrap();
+        assert!(
+            !slot_statuses(&base, 9).contains(&PurgeFailed),
+            "the handle's own successful purge did not clear the flag"
+        );
+    }
+
+    /// r4 item 5 (corr L2): a carry skipped because the first pass failed with a raced
+    /// exchange (not only "kept changing") is flagged for the doctor.
+    #[cfg(unix)]
+    #[test]
+    fn codex_carry_skipped_is_flagged_for_a_raced_exchange_too() {
+        use crate::providers::codex::surface::test_seam as s;
+        use crate::providers::codex::surface::SlotWriteStatus::CarrySkipped;
+        let (_d, base, global) = trust_world();
+        let _env = GlobalHooksEnv::set(Some(&global));
+        let _r = R4Seams;
+        let a4 = AccountNum::try_from(4u16).unwrap();
+        tc_append(&base, 4, &tc_entry(&base.join("term-88220"), Some(true)));
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let f2 = fired.clone();
+        s::BEFORE_RENAME.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |t: &Path| {
+                if !f2.replace(true) {
+                    let mut cur = std::fs::read_to_string(t).unwrap();
+                    cur.push_str("\n# concurrent\n");
+                    std::fs::write(t, cur).unwrap(); // CI-ALLOW-fs-write-config-toml
+                }
+            }));
+        });
+        s::EXCHANGE_COUNT.with(|c| c.set(0));
+        s::EXCHANGE_FAIL_NTH.with(|c| c.set(Some(2)));
+        let h = create_handle_dir_codex(&base, a4, 88221).unwrap();
+        assert!(
+            slot_statuses(&base, 4).contains(&CarrySkipped),
+            "a raced first pass skipped the carry without a flag"
+        );
+        assert!(
+            !tc_state(&base, 4).contains_key(&tc_key(&h)),
+            "the approval was copied although the carry was abandoned"
+        );
+    }
+
+    /// r4 item 8 (sec note): a predecessor's own-key entry that reappears between the carry's
+    /// write and the launch (a Codex rename landing late) is purged again once; if it keeps
+    /// coming back the launch is refused.
+    #[cfg(unix)]
+    #[test]
+    fn codex_post_carry_reread_purges_a_resurrected_own_key_once_then_refuses() {
+        use super::super::codex_hook_trust::test_seam::AFTER_TARGET_REWRITE;
+        let a4 = AccountNum::try_from(4u16).unwrap();
+        let resurrect = |home: PathBuf| {
+            move |cfg: &Path| {
+                let mut cur = std::fs::read_to_string(cfg).unwrap();
+                cur.push_str(&format!(
+                    "\n[hooks.state.\"{}/hooks.json:stop:7:0\"]\ntrusted_hash = \"{TC_H_TRUE}\"\nenabled = false\n",
+                    home.display()
+                ));
+                std::fs::write(cfg, cur).unwrap(); // CI-ALLOW-fs-write-config-toml
+            }
+        };
+        // once: purged again, launch proceeds, the carried approval is intact
+        {
+            let (_d, base, global) = trust_world();
+            let _env = GlobalHooksEnv::set(Some(&global));
+            let _r = R4Seams;
+            // a LIVE source handle (a dead one is pruned by the first pass, leaving the second
+            // pass nothing to copy from)
+            std::fs::create_dir(base.join("term-88230")).unwrap();
+            tc_append(&base, 4, &tc_entry(&base.join("term-88230"), Some(true)));
+            let fire = resurrect(base.join("term-88231"));
+            let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+            AFTER_TARGET_REWRITE.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |cfg: &Path| {
+                    if !fired.replace(true) {
+                        fire(cfg);
+                    }
+                }));
+            });
+            let h = create_handle_dir_codex(&base, a4, 88231).unwrap();
+            let st = tc_state(&base, 4);
+            let stray = format!("{}/hooks.json:stop:7:0", h.display());
+            assert!(!st.contains_key(&stray), "the resurrected key survived");
+            assert!(
+                st.contains_key(&tc_key(&h)),
+                "the carried approval was lost"
+            );
+        }
+        // every time: refused, no half-built dir
+        {
+            let (_d, base, global) = trust_world();
+            let _env = GlobalHooksEnv::set(Some(&global));
+            let _r = R4Seams;
+            let fire = resurrect(base.join("term-88232"));
+            AFTER_TARGET_REWRITE.with(|h| *h.borrow_mut() = Some(Box::new(fire)));
+            let e = create_handle_dir_codex(&base, a4, 88232).unwrap_err();
+            assert!(e.to_string().contains("refusing to launch"), "{e}");
+            assert!(!base.join("term-88232").exists());
+        }
+    }
+
+    /// r4 item 5: a global hooks file csq cannot use skips the carry (the terminal starts
+    /// untrusted); the flag is per handle, survives another terminal's complete carry, and is
+    /// cleared only when THAT handle's own carry completes.
+    #[cfg(unix)]
+    #[test]
+    fn codex_carry_skipped_is_per_handle_and_cleared_only_by_its_own_carry() {
+        use crate::providers::codex::surface::SlotWriteStatus::CarrySkipped;
+        let (d, base, global) = trust_world();
+        let a4 = AccountNum::try_from(4u16).unwrap();
+        let bad = d.path().join("bad-hooks.json");
+        std::fs::write(&bad, "{ not json").unwrap();
+        let h1 = {
+            let _env = GlobalHooksEnv::set(Some(&bad));
+            create_handle_dir_codex(&base, a4, 88250).unwrap()
+        };
+        assert!(
+            slot_statuses(&base, 4).contains(&CarrySkipped),
+            "an unusable global hooks file skipped the carry without a flag"
+        );
+        let _env = GlobalHooksEnv::set(Some(&global));
+        let _h2 = create_handle_dir_codex(&base, a4, 88251).unwrap();
+        assert!(
+            slot_statuses(&base, 4).contains(&CarrySkipped),
+            "another terminal's complete carry cleared this handle's flag"
+        );
+        super::super::codex_hook_trust::carry_hook_trust(
+            &base,
+            &h1,
+            a4,
+            Some(&global),
+            super::super::codex_hook_trust::CarryMode::Repoint,
+        )
+        .unwrap();
+        assert!(
+            !slot_statuses(&base, 4).contains(&CarrySkipped),
+            "the handle's own complete carry did not clear its flag"
+        );
+    }
+
+    /// r4 item 5: a config near the size bound skips the copy half; that is a skipped carry
+    /// and is flagged like every other.
+    #[cfg(unix)]
+    #[test]
+    fn codex_carry_skipped_is_flagged_when_the_config_is_near_the_size_bound() {
+        use crate::providers::codex::surface::SlotWriteStatus::CarrySkipped;
+        let (_d, base, global) = trust_world();
+        let _env = GlobalHooksEnv::set(Some(&global));
+        let a4 = AccountNum::try_from(4u16).unwrap();
+        std::fs::create_dir(base.join("term-88260")).unwrap();
+        std::fs::write(
+            base.join("config-4/config.toml"), // CI-ALLOW-fs-write-config-toml
+            format!("# {}\n", "p".repeat(800_000)),
+        )
+        .unwrap();
+        tc_append(&base, 4, &tc_entry(&base.join("term-88260"), Some(true)));
+        let h = create_handle_dir_codex(&base, a4, 88261).unwrap();
+        assert!(
+            slot_statuses(&base, 4).contains(&CarrySkipped),
+            "a size-skipped carry was not flagged"
+        );
+        assert!(
+            !tc_state(&base, 4).contains_key(&tc_key(&h)),
+            "the near-limit config still received an approval"
+        );
+    }
+
+    /// Corr L5: a `codex-exec-<pid>` create drops its own stale keys (no copy).
+    #[cfg(unix)]
+    #[test]
+    fn codex_exec_create_drops_its_own_stale_keys_and_copies_nothing() {
+        let (_d, base, global) = trust_world();
+        let _env = GlobalHooksEnv::set(Some(&global));
+        let a4 = AccountNum::try_from(4u16).unwrap();
+        tc_append(&base, 4, &tc_entry(&base.join("term-88090"), Some(true)));
+        tc_append(
+            &base,
+            4,
+            &tc_entry(&base.join("codex-exec-88091"), Some(false)),
+        );
+        let exec = create_handle_dir_codex_named(&base, a4, 88091, "codex-exec-88091").unwrap();
+        assert!(
+            !tc_state(&base, 4).contains_key(&tc_key(&exec)),
+            "an exec create inherited (or copied) a key under its own name"
+        );
+    }
+
+    /// Items 5 and 9: project keys and other bases' keys are not sources; exec dirs do not
+    /// carry; dead exec and capture keys are pruned by a term create.
+    #[cfg(unix)]
+    #[test]
+    fn codex_carry_sources_exec_dirs_and_prune_scope() {
+        let (_d, base, global) = trust_world();
+        let _env = GlobalHooksEnv::set(Some(&global));
+        let a4 = AccountNum::try_from(4u16).unwrap();
+        tc_append(
+            &base,
+            4,
+            &tc_entry(Path::new("/some/repo/.codex"), Some(true)),
+        );
+        tc_append(
+            &base,
+            4,
+            &tc_entry(Path::new("/other/accounts/term-100"), Some(true)),
+        );
+        let h = create_handle_dir_codex(&base, a4, 88040).unwrap();
+        assert!(
+            !tc_state(&base, 4).contains_key(&tc_key(&h)),
+            "a project or foreign-base key was used as a source"
+        );
+
+        // a real source for the slot, then an exec dir: nothing is copied to it
+        tc_append(&base, 4, &tc_entry(&base.join("term-88041"), Some(true)));
+        let exec = create_handle_dir_codex_named(&base, a4, 88042, "codex-exec-88042").unwrap();
+        assert!(
+            !tc_state(&base, 4).contains_key(&tc_key(&exec)),
+            "an exec dir carried"
+        );
+
+        // dead exec and capture keys are pruned by the next term create
+        tc_append(&base, 4, &tc_entry(&exec, None));
+        tc_append(&base, 4, &tc_entry(&base.join("codex-exec-555"), None));
+        tc_append(
+            &base,
+            4,
+            &tc_entry(&base.join("interactive-capture-9-1"), None),
+        );
+        let _h2 = create_handle_dir_codex(&base, a4, 88043).unwrap();
+        let st = tc_state(&base, 4);
+        assert!(
+            !st.contains_key(&tc_key(&base.join("codex-exec-555"))),
+            "dead exec key kept"
+        );
+        assert!(
+            !st.contains_key(&tc_key(&base.join("interactive-capture-9-1"))),
+            "dead capture key kept"
+        );
+        assert!(st.contains_key(&tc_key(&exec)), "live exec key must stay");
+    }
+
+    /// `codex sandbox` creates `$CODEX_HOME/tmp/arg0/...` inside the handle dir (probed).
+    /// No csq handle check may read that subtree as foreign or corrupt.
+    #[cfg(unix)]
+    #[test]
+    fn a_codex_tmp_subtree_in_a_handle_dir_is_not_foreign_or_corrupt() {
+        let (_d, base, global) = trust_world();
+        let _env = GlobalHooksEnv::set(Some(&global));
+        let a4 = AccountNum::try_from(4u16).unwrap();
+        let a9 = AccountNum::try_from(9u16).unwrap();
+        let h = create_handle_dir_codex(&base, a4, 88050).unwrap();
+        let arg0 = h.join("tmp/arg0/codex-arg0abc123");
+        std::fs::create_dir_all(&arg0).unwrap();
+        std::fs::write(arg0.join(".lock"), "").unwrap();
+        std::os::unix::fs::symlink("/bin/sh", arg0.join("apply_patch")).unwrap();
+        assert!(codex_hooks_preserved_foreign(&h).is_empty());
+        assert_eq!(
+            codex_hooks_link_state(&h, Some(&global)),
+            CodexHooksLinkState::Ok
+        );
+        assert_eq!(codex_hooks_config(&h).state, CodexHooksConfigState::Enabled);
+        repoint_handle_dir_codex(&base, &h, a9).unwrap();
+        assert!(
+            arg0.join(".lock").exists(),
+            "repoint touched the tmp subtree"
+        );
+    }
+
+    /// csq's OWN hooks-link writes add no hook trust/approval state. Codex keeps hook trust
+    /// in `config.toml` under `[hooks.state."<key>"]` and writes it itself when the user
+    /// approves; csq never authors it. This asserts only that creating and repointing with a
+    /// global hooks file adds EXACTLY the `hooks.json` link to the handle dir (compared
+    /// against the same flow with no global file) and that no slot `config.toml` gains a
+    /// `hooks` mention. It does NOT claim `config.toml` never changes: Codex rewrites it on
+    /// approval, and the slot-config writers carry `[hooks.state]` through
+    /// (`providers::codex::surface`, `trust`, `coc::translate::codex_merge`).
+    #[cfg(unix)]
+    #[test]
+    fn codex_hooks_link_writes_no_trust_state() {
+        let names = |h: &Path| -> std::collections::BTreeSet<String> {
+            std::fs::read_dir(h)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        };
+        let run = |global: Option<&Path>, pid: u32| {
+            let dir = TempDir::new().unwrap();
+            let base = dir.path().join("accounts");
+            std::fs::create_dir_all(&base).unwrap();
+            setup_codex_slot(&base, 4);
+            setup_codex_slot(&base, 9);
+            let _env = GlobalHooksEnv::set(global);
+            let handle =
+                create_handle_dir_codex(&base, AccountNum::try_from(4u16).unwrap(), pid).unwrap();
+            let after_create = names(&handle);
+            repoint_handle_dir_codex(&base, &handle, AccountNum::try_from(9u16).unwrap()).unwrap();
+            let cfgs: Vec<Vec<u8>> = [4, 9]
+                .iter()
+                .map(|n| std::fs::read(base.join(format!("config-{n}/config.toml"))).unwrap())
+                .collect();
+            (after_create, names(&handle), cfgs)
+        };
+        let g = TempDir::new().unwrap();
+        let global = write_global_hooks(g.path());
+        let (c0, r0, cfg0) = run(None, 88820);
+        let (c1, r1, cfg1) = run(Some(&global), 88821);
+        let only_hooks = std::collections::BTreeSet::from(["hooks.json".to_owned()]);
+        assert_eq!(
+            c1.difference(&c0)
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            only_hooks
+        );
+        assert_eq!(
+            r1.difference(&r0)
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            only_hooks
+        );
+        assert!(c0.difference(&c1).next().is_none() && r0.difference(&r1).next().is_none());
+        assert_eq!(
+            cfg0, cfg1,
+            "slot config.toml must not change because of the hooks link"
+        );
+        for c in &cfg1 {
+            let text = String::from_utf8_lossy(c).to_lowercase();
+            assert!(
+                !text.contains("hook"),
+                "no hook state in config.toml: {text}"
+            );
+        }
+    }
+
+    /// Fixture: global settings + slot overlay settings, then materialize; returns the
+    /// command list of `hooks.<event>` in the written handle settings.
+    fn materialized_hook_commands(global: &str, slot: &str, event: &str) -> Vec<String> {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let config = base.join("config-2");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("settings.json"), slot).unwrap();
+        let claude_home = base.join("claude_home");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        std::fs::write(claude_home.join("settings.json"), global).unwrap();
+        let handle = base.join("term-88830");
+        std::fs::create_dir_all(&handle).unwrap();
+        materialize_handle_settings(&handle, &claude_home, &config).unwrap();
+        let out: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(handle.join("settings.json")).unwrap())
+                .unwrap();
+        out["hooks"][event]
+            .as_array()
+            .unwrap_or_else(|| panic!("hooks.{event} missing in {out}"))
+            .iter()
+            .filter_map(|e| e.pointer("/hooks/0/command").and_then(|c| c.as_str()))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn global_and_slot_hook_arrays_concatenate_global_first() {
+        let cmds = materialized_hook_commands(
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"global-pre"}]}]}}"#,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"slot-pre"}]}]}}"#,
+            "PreToolUse",
+        );
+        assert_eq!(cmds, vec!["global-pre".to_owned(), "slot-pre".to_owned()]);
+    }
+
+    #[test]
+    fn identical_global_and_slot_hook_entry_is_kept_once() {
+        let entry = r#"{"matcher":"Bash","hooks":[{"type":"command","command":"same"}]}"#;
+        let cmds = materialized_hook_commands(
+            &format!(r#"{{"hooks":{{"PreToolUse":[{entry}]}}}}"#),
+            &format!(
+                r#"{{"hooks":{{"PreToolUse":[{entry},{{"hooks":[{{"type":"command","command":"slot-only"}}]}}]}}}}"#
+            ),
+            "PreToolUse",
+        );
+        assert_eq!(cmds, vec!["same".to_owned(), "slot-only".to_owned()]);
+    }
+
+    /// Fixture: materialize `global` + `slot` settings (an optional PREVIOUS handle file) and
+    /// return the written handle settings.
+    fn materialized_settings(global: &str, slot: &str) -> serde_json::Value {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let config = base.join("config-2");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("settings.json"), slot).unwrap();
+        let claude_home = base.join("claude_home");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        std::fs::write(claude_home.join("settings.json"), global).unwrap();
+        let handle = base.join("term-88831");
+        std::fs::create_dir_all(&handle).unwrap();
+        materialize_handle_settings(&handle, &claude_home, &config).unwrap();
+        assert_eq!(
+            std::fs::read(config.join("settings.json")).unwrap(),
+            slot.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(claude_home.join("settings.json")).unwrap(),
+            global.as_bytes()
+        );
+        serde_json::from_str(&std::fs::read_to_string(handle.join("settings.json")).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn autocompact_root_override_is_global_only() {
+        let _env_guard = crate::platform::test_env::lock();
+        for (global, slot) in [
+            (r#"{"autoCompactWindow":1000000,"keepGlobal":true}"#, "{}"),
+            ("{}", r#"{"autoCompactWindow":null,"keepSlot":true}"#),
+        ] {
+            let out = materialized_settings(global, slot);
+            let global_value: Value = serde_json::from_str(global).unwrap();
+            assert_eq!(
+                out.get("autoCompactWindow"),
+                global_value.get("autoCompactWindow")
+            );
+            for source in [global, slot] {
+                let source: Value = serde_json::from_str(source).unwrap();
+                for key in ["keepGlobal", "keepSlot"] {
+                    if let Some(value) = source.get(key) {
+                        assert_eq!(out.get(key), Some(value));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn autocompact_model_overrides_respect_global_scope_and_provider_env() {
+        let _env_guard = crate::platform::test_env::lock();
+        let models = serde_json::json!({
+            "modelSettings": {
+                "remove-only": {"autoCompactWindow": 1000000},
+                "keep-other": {"autoCompactWindow": false, "effort": "high"},
+                "already-empty": {},
+                "non-object": null
+            },
+            "env": {
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1048576",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1048576",
+                "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50"
+            },
+            "unrelated": {"autoCompactWindow": 42}
+        });
+        let expected_models = serde_json::json!({
+            "keep-other": {"effort": "high"}, "already-empty": {}, "non-object": null
+        });
+        for (global, slot) in [
+            (models.to_string(), "{}".to_owned()),
+            ("{}".to_owned(), models.to_string()),
+        ] {
+            let out = materialized_settings(&global, &slot);
+            if global != "{}" {
+                assert_eq!(out["modelSettings"], models["modelSettings"]);
+            } else {
+                assert_eq!(out["modelSettings"], expected_models);
+            }
+            let mut expected_env = models["env"].clone();
+            if slot != "{}" {
+                expected_env
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE");
+                expected_env
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("CLAUDE_CODE_AUTO_COMPACT_WINDOW");
+            }
+            assert_eq!(out["env"], expected_env);
+            assert_eq!(out["unrelated"], models["unrelated"]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn autocompact_launch_and_guarded_uuid_swap_preserve_sources_and_sibling() {
+        let _env_guard = crate::platform::test_env::lock();
+        use crate::testing::identity_fixtures::coexisting_fixture;
+
+        let dir = coexisting_fixture(3);
+        let base = dir.path();
+        for slot in [2u16, 3u16] {
+            let config = base.join(format!("config-{slot}"));
+            std::fs::write(config.join(".claude.json"), b"{}").unwrap();
+        }
+        stage_verified_repoint_slots(base, &[1, 2, 3]);
+        let home = TempDir::new().unwrap();
+        let global_path = home.path().join("settings.json");
+        let global = br#"{"autoCompactWindow":777777,"modelSettings":{"global-only":{"autoCompactWindow":888888}},"globalKeep":true}"#;
+        std::fs::write(&global_path, global).unwrap();
+        let mut sources = vec![(global_path, global.to_vec())];
+        for slot in [2u16, 3u16] {
+            let id = profiles::resolve_slot_to_uuid(base, slot).unwrap();
+            let uuid_path = settings_path_for(base, id);
+            let overlay = serde_json::json!({
+                "autoCompactWindow": 1000000,
+                "modelSettings": {"slot-only": {"autoCompactWindow": 1000000, "effort": "high"}},
+                "env": {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1048576"},
+                "slotKeep": slot
+            });
+            let bytes = serde_json::to_vec_pretty(&overlay).unwrap();
+            std::fs::write(&uuid_path, &bytes).unwrap();
+            sources.push((uuid_path, bytes));
+            let legacy_path = base.join(format!("config-{slot}/settings.json"));
+            let legacy = br#"{"legacyMustNotWin":true,"autoCompactWindow":1000000}"#;
+            std::fs::write(&legacy_path, legacy).unwrap();
+            sources.push((legacy_path, legacy.to_vec()));
+        }
+        let account2 = AccountNum::try_from(2u16).unwrap();
+        let handle = create_handle_dir(base, home.path(), account2, 21831).unwrap();
+        let sibling = create_handle_dir(base, home.path(), account2, 21832).unwrap();
+        let sibling_bytes = std::fs::read(sibling.join("settings.json")).unwrap();
+        let sibling_target = std::fs::read_link(sibling.join(".credentials.json")).unwrap();
+        let assert_settings = |handle: &Path, slot: u16| {
+            let out: Value =
+                serde_json::from_slice(&std::fs::read(handle.join("settings.json")).unwrap())
+                    .unwrap();
+            assert_eq!(out["autoCompactWindow"], 777777);
+            assert_eq!(
+                out["modelSettings"],
+                serde_json::json!({"global-only":{"autoCompactWindow":888888},"slot-only":{"effort":"high"}})
+            );
+            assert!(out
+                .pointer("/env/CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+                .is_none());
+            assert_eq!(out["globalKeep"], true);
+            assert_eq!(out["slotKeep"], slot);
+            assert!(out.get("legacyMustNotWin").is_none());
+        };
+        assert_settings(&handle, 2);
+        // Simulate Claude writing both forbidden forms in the previous handle as well.
+        let previous_path = handle.join("settings.json");
+        let mut previous: Value =
+            serde_json::from_slice(&std::fs::read(&previous_path).unwrap()).unwrap();
+        previous["autoCompactWindow"] = serde_json::json!(1000000);
+        previous["modelSettings"]["previous"] = serde_json::json!({"autoCompactWindow":1000000});
+        std::fs::write(previous_path, serde_json::to_vec(&previous).unwrap()).unwrap();
+        repoint_verified_fixture(
+            base,
+            home.path(),
+            &handle,
+            AccountNum::try_from(3u16).unwrap(),
+        )
+        .unwrap();
+        assert_settings(&handle, 3);
+        let target_id = profiles::resolve_slot_to_uuid(base, 3).unwrap();
+        assert_eq!(
+            std::fs::read_link(handle.join(".credentials.json")).unwrap(),
+            crate::accounts::identity_store::credentials_path_for(base, target_id)
+        );
+        assert_eq!(
+            std::fs::read(sibling.join("settings.json")).unwrap(),
+            sibling_bytes
+        );
+        assert_eq!(
+            std::fs::read_link(sibling.join(".credentials.json")).unwrap(),
+            sibling_target
+        );
+        for (path, bytes) in sources {
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                bytes,
+                "source settings changed"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r2_final_materializer_uuid_overlay_does_not_borrow_stale_legacy_provider_proof() {
+        let _guard = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let slot = AccountNum::try_from(9u16).unwrap();
+        crate::accounts::third_party::bind_provider_to_slot(
+            base,
+            "zai",
+            slot,
+            Some("sk-fixture-zai"),
+            None,
+        )
+        .unwrap();
+        let config = base.join("config-9");
+        assert!(crate::session::settings_policy::slot_allows_provider_window(base, &config));
+        assert!(!config.join(".credentials.json").exists());
+        assert!(!base.join("credentials/9.json").exists());
+        let uuid = "11111111-1111-4111-8111-111111111111"
+            .parse::<crate::accounts::identity_store::IdentityId>()
+            .unwrap();
+        let uuid_path = crate::accounts::identity_store::settings_path_for(base, uuid);
+        std::fs::create_dir_all(uuid_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &uuid_path,
+            br#"{"env":{"CLAUDE_CODE_AUTO_COMPACT_WINDOW":"1048576","keepUUID":"yes"}}"#,
+        )
+        .unwrap();
+        let home = TempDir::new().unwrap();
+        std::fs::write(
+            home.path().join("settings.json"),
+            br#"{"env":{"CLAUDE_CODE_AUTO_COMPACT_WINDOW":"777777"}}"#,
+        )
+        .unwrap();
+        let handle = base.join("term-21839");
+        std::fs::create_dir(&handle).unwrap();
+        let sources: Vec<_> = [
+            config.join("settings.json"),
+            config.join(".csq-account"),
+            base.join("profiles.json"),
+            uuid_path.clone(),
+            home.path().join("settings.json"),
+        ]
+        .into_iter()
+        .map(|p| {
+            let b = std::fs::read(&p).unwrap();
+            (p, b)
+        })
+        .collect();
+        let prepared =
+            prepare_handle_settings_tmp(&handle, home.path(), &config, Some(&uuid_path)).unwrap();
+        let value: Value = serde_json::from_slice(&std::fs::read(&prepared).unwrap()).unwrap();
+        std::fs::remove_file(prepared).unwrap();
+        for (path, bytes) in sources {
+            assert!(
+                std::fs::read(path).unwrap() == bytes,
+                "source settings changed"
+            );
+        }
+        assert_eq!(
+            value["env"]["keepUUID"], "yes",
+            "actual UUID overlay was not selected"
+        );
+        assert_eq!(
+            value["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "777777",
+            "UUID window borrowed stale legacy API-key proof"
+        );
+    }
+
+    #[test]
+    fn r1_h2_slot_percentage_is_removed_before_global_merge() {
+        let _guard = crate::platform::test_env::lock();
+        let out = materialized_settings(
+            r#"{"env":{"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE":"70","keepGlobal":"yes"}}"#,
+            r#"{"env":{"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE":"50","keepSlot":"yes"}}"#,
+        );
+        assert_eq!(out["env"]["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "70");
+        assert_eq!(out["env"]["keepGlobal"], "yes");
+        assert_eq!(out["env"]["keepSlot"], "yes");
+    }
+
+    #[test]
+    fn r1_h2_unproven_slot_window_is_removed_before_global_merge() {
+        let _guard = crate::platform::test_env::lock();
+        let out = materialized_settings(
+            r#"{"env":{"CLAUDE_CODE_AUTO_COMPACT_WINDOW":"777777"}}"#,
+            r#"{"env":{"CLAUDE_CODE_AUTO_COMPACT_WINDOW":"1048576","CLAUDE_CODE_MAX_CONTEXT_TOKENS":"1048576"}}"#,
+        );
+        assert_eq!(out["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "777777");
+        assert_eq!(out["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "1048576");
+    }
+
+    #[test]
+    fn r1_h2_published_third_party_keeps_window_but_removes_percentage() {
+        let _guard = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let slot = AccountNum::try_from(9u16).unwrap();
+        crate::accounts::third_party::bind_provider_to_slot(
+            base,
+            "zai",
+            slot,
+            Some("sk-fixture-zai"),
+            None,
+        )
+        .unwrap();
+        let config = base.join("config-9");
+        let overlay_path = config.join("settings.json");
+        let mut overlay: Value =
+            serde_json::from_slice(&std::fs::read(&overlay_path).unwrap()).unwrap();
+        overlay["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = serde_json::json!("1048576");
+        overlay["env"]["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = serde_json::json!("50");
+        let source = serde_json::to_vec(&overlay).unwrap();
+        std::fs::write(&overlay_path, &source).unwrap();
+        let home = TempDir::new().unwrap();
+        std::fs::write(home.path().join("settings.json"), b"{}").unwrap();
+        let handle = create_handle_dir(base, home.path(), slot, 21835).unwrap();
+        let out: Value =
+            serde_json::from_slice(&std::fs::read(handle.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(out["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "1048576");
+        assert!(
+            out.pointer("/env/CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")
+                .is_none(),
+            "slot percentage leaked"
+        );
+        assert_eq!(std::fs::read(overlay_path).unwrap(), source);
+    }
+
+    #[test]
+    fn r1_h2_global_only_environment_overrides_pass_unchanged() {
+        let _guard = crate::platform::test_env::lock();
+        let global = serde_json::json!({"env": {
+            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE":"70",
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW":"777777"
+        }});
+        let out = materialized_settings(&global.to_string(), "{}");
+        assert_eq!(out["env"], global["env"]);
+    }
+
+    #[test]
+    fn r1_m1_global_root_override_survives_conflicting_slot_override() {
+        let _guard = crate::platform::test_env::lock();
+        let out = materialized_settings(
+            r#"{"autoCompactWindow":777777,"keepGlobal":true}"#,
+            r#"{"autoCompactWindow":1048576,"keepSlot":true}"#,
+        );
+        assert_eq!(
+            out["autoCompactWindow"], 777777,
+            "global root override was removed"
+        );
+        assert_eq!(out["keepGlobal"], true);
+        assert_eq!(out["keepSlot"], true);
+    }
+
+    #[test]
+    fn r1_m1_global_model_override_survives_conflicting_slot_override() {
+        let _guard = crate::platform::test_env::lock();
+        let out = materialized_settings(
+            r#"{"modelSettings":{"shared":{"autoCompactWindow":777777,"globalKeep":true},"globalOnly":{"autoCompactWindow":888888}}}"#,
+            r#"{"modelSettings":{"shared":{"autoCompactWindow":1048576,"effort":"high"},"slotOnly":{"autoCompactWindow":1048576},"alreadyEmpty":{}}}"#,
+        );
+        assert_eq!(
+            out["modelSettings"],
+            serde_json::json!({
+                "shared":{"autoCompactWindow":777777,"globalKeep":true,"effort":"high"},
+                "globalOnly":{"autoCompactWindow":888888},"alreadyEmpty":{}
+            }),
+            "global per-model override was removed"
+        );
+    }
+
+    const GLOBAL_PRE: &str = r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"global-pre"}]}]}}"#;
+
+    fn commands_of(out: &serde_json::Value, event: &str) -> Vec<String> {
+        out["hooks"][event]
+            .as_array()
+            .unwrap_or_else(|| panic!("hooks.{event} missing in {out}"))
+            .iter()
+            .filter_map(|e| e.pointer("/hooks/0/command").and_then(|c| c.as_str()))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Whatever the slot's `hooks` value is, every global event entry survives.
+    #[test]
+    fn slot_hooks_value_of_any_shape_never_drops_global_hooks() {
+        for slot_hooks in [
+            r#"null"#,
+            r#"[]"#,
+            r#""x""#,
+            r#"false"#,
+            r#"0"#,
+            r#"{"PreToolUse":null}"#,
+            r#"{"PreToolUse":"x"}"#,
+            r#"{"PreToolUse":{}}"#,
+            r#"{"PreToolUse":[]}"#,
+        ] {
+            let out = materialized_settings(GLOBAL_PRE, &format!(r#"{{"hooks":{slot_hooks}}}"#));
+            assert_eq!(
+                commands_of(&out, "PreToolUse"),
+                vec!["global-pre".to_owned()],
+                "slot hooks={slot_hooks}"
+            );
+        }
+    }
+
+    /// A slot `disableAllHooks` never reaches the handle and never overrides the global value.
+    #[test]
+    fn slot_disable_all_hooks_is_stripped_before_the_merge() {
+        let out = materialized_settings(GLOBAL_PRE, r#"{"disableAllHooks":true}"#);
+        assert!(out.get("disableAllHooks").is_none(), "leaked: {out}");
+        assert_eq!(
+            commands_of(&out, "PreToolUse"),
+            vec!["global-pre".to_owned()]
+        );
+
+        let global_false = r#"{"disableAllHooks":false,"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"global-pre"}]}]}}"#;
+        let out = materialized_settings(global_false, r#"{"disableAllHooks":true}"#);
+        assert_eq!(out["disableAllHooks"], serde_json::json!(false), "{out}");
+
+        let dir = TempDir::new().unwrap();
+        let carrier = dir.path().join("settings.json");
+        std::fs::write(&carrier, r#"{"disableAllHooks":false}"#).unwrap();
+        assert!(settings_file_has_disable_all_hooks(&carrier));
+        std::fs::write(&carrier, r#"{"other":1}"#).unwrap();
+        assert!(!settings_file_has_disable_all_hooks(&carrier));
+        assert!(!settings_file_has_disable_all_hooks(
+            &dir.path().join("absent.json")
+        ));
+    }
+
+    /// An unparseable global settings file never yields a hookless handle file: the hooks the
+    /// previous materialization wrote are kept.
+    #[test]
+    fn unusable_global_settings_keeps_previously_materialized_hooks() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let config = base.join("config-2");
+        std::fs::create_dir_all(&config).unwrap();
+        let claude_home = base.join("claude_home");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        std::fs::write(claude_home.join("settings.json"), GLOBAL_PRE).unwrap();
+        let handle = base.join("term-88832");
+        std::fs::create_dir_all(&handle).unwrap();
+        materialize_handle_settings(&handle, &claude_home, &config).unwrap();
+        assert!(!global_claude_settings_unusable(&claude_home));
+
+        for broken in ["{ not json", "[1,2]"] {
+            std::fs::write(claude_home.join("settings.json"), broken).unwrap();
+            assert!(global_claude_settings_unusable(&claude_home), "{broken}");
+            materialize_handle_settings(&handle, &claude_home, &config).unwrap();
+            let out: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(handle.join("settings.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                commands_of(&out, "PreToolUse"),
+                vec!["global-pre".to_owned()],
+                "global={broken}"
+            );
+        }
+    }
+
+    /// Fixture for the unusable-global cases: two slots (`config-2`, `config-3`) with their own
+    /// overlay hooks, one shared `claude_home`, one accounts dir.
+    struct HooksFixture {
+        _dir: TempDir,
+        base: PathBuf,
+        claude_home: PathBuf,
+    }
+
+    impl HooksFixture {
+        fn new(global: &str) -> Self {
+            let dir = TempDir::new().unwrap();
+            let base = dir.path().to_path_buf();
+            for (n, cmd) in [(2, "slot-a-own"), (3, "slot-b-own")] {
+                let c = base.join(format!("config-{n}"));
+                std::fs::create_dir_all(&c).unwrap();
+                std::fs::write(
+                    c.join("settings.json"),
+                    format!(
+                        r#"{{"hooks":{{"Stop":[{{"hooks":[{{"type":"command","command":"{cmd}"}}]}}]}}}}"#
+                    ),
+                )
+                .unwrap();
+            }
+            let claude_home = base.join("claude_home");
+            std::fs::create_dir_all(&claude_home).unwrap();
+            std::fs::write(claude_home.join("settings.json"), global).unwrap();
+            Self {
+                _dir: dir,
+                base,
+                claude_home,
+            }
+        }
+
+        fn materialize(&self, slot: u16, pid: &str) -> serde_json::Value {
+            let handle = self.base.join(format!("term-{pid}"));
+            std::fs::create_dir_all(&handle).unwrap();
+            materialize_handle_settings(
+                &handle,
+                &self.claude_home,
+                &self.base.join(format!("config-{slot}")),
+            )
+            .unwrap();
+            serde_json::from_str(&std::fs::read_to_string(handle.join("settings.json")).unwrap())
+                .unwrap()
+        }
+    }
+
+    const GLOBAL_STOP: &str =
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"global-stop"}]}]}}"#;
+
+    /// F7/N9: with the global unusable and a last-known-good global record, a terminal gets
+    /// the RECORDED global hooks plus its own slot's hooks, and never another slot's.
+    #[test]
+    fn unusable_global_seeds_hooks_from_the_global_record_never_another_slot() {
+        let fx = HooksFixture::new(GLOBAL_STOP);
+        let a = fx.materialize(2, "1001");
+        assert_eq!(
+            commands_of(&a, "Stop"),
+            vec!["global-stop".to_owned(), "slot-a-own".to_owned()]
+        );
+        std::fs::write(fx.claude_home.join("settings.json"), "{ not json").unwrap();
+        // Slot B terminal, created fresh and repointed from slot A's handle.
+        let b = fx.materialize(3, "1002");
+        let cmds = commands_of(&b, "Stop");
+        assert!(cmds.contains(&"global-stop".to_owned()), "{cmds:?}");
+        assert!(cmds.contains(&"slot-b-own".to_owned()), "{cmds:?}");
+        assert!(!cmds.contains(&"slot-a-own".to_owned()), "leaked: {cmds:?}");
+        // Re-materializing slot A's handle as slot B (a swap) also never carries A's hooks.
+        let handle_a = fx.base.join("term-1001");
+        materialize_handle_settings(&handle_a, &fx.claude_home, &fx.base.join("config-3")).unwrap();
+        let swapped: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(handle_a.join("settings.json")).unwrap())
+                .unwrap();
+        let cmds = commands_of(&swapped, "Stop");
+        assert!(!cmds.contains(&"slot-a-own".to_owned()), "leaked: {cmds:?}");
+        assert!(cmds.contains(&"slot-b-own".to_owned()), "{cmds:?}");
+    }
+
+    /// An unusable global with NO record gives no global hooks (and no other slot's), and the
+    /// record file is private (0600) when written.
+    #[test]
+    fn unusable_global_without_a_record_gives_no_hooks_and_never_another_slots() {
+        let fx = HooksFixture::new("{ not json");
+        let a = fx.materialize(2, "2001");
+        assert_eq!(commands_of(&a, "Stop"), vec!["slot-a-own".to_owned()]);
+        let b = fx.materialize(3, "2002");
+        assert_eq!(commands_of(&b, "Stop"), vec!["slot-b-own".to_owned()]);
+        let record = fx.base.join(GLOBAL_HOOKS_RECORD_FILE);
+        assert!(record.symlink_metadata().is_err(), "no record may appear");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_hooks_record_is_written_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let fx = HooksFixture::new(GLOBAL_STOP);
+        fx.materialize(2, "3001");
+        let record = fx.base.join(GLOBAL_HOOKS_RECORD_FILE);
+        let mode = std::fs::metadata(&record).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+        assert_eq!(
+            v["hooks"]["Stop"][0]["hooks"][0]["command"],
+            serde_json::json!("global-stop")
+        );
+    }
+
+    /// De-dup is ACROSS layers only: duplicates inside one layer are kept.
+    #[test]
+    fn duplicate_hook_entries_inside_one_layer_are_kept() {
+        let a = r#"{"hooks":[{"type":"command","command":"a"}]}"#;
+        let b = r#"{"hooks":[{"type":"command","command":"b"}]}"#;
+        let cmds = materialized_hook_commands(
+            &format!(r#"{{"hooks":{{"Stop":[{a},{a}]}}}}"#),
+            &format!(r#"{{"hooks":{{"Stop":[{b},{b},{a}]}}}}"#),
+            "Stop",
+        );
+        assert_eq!(
+            cmds,
+            ["a", "a", "b", "b"].map(str::to_owned).to_vec(),
+            "global dupes kept, slot dupes kept, slot copy of a global entry dropped"
+        );
+    }
+
+    /// F3a: the handle's resolved config (the slot config symlink) disables hooks.
+    #[cfg(unix)]
+    #[test]
+    fn codex_hooks_disabled_by_config_reads_features_hooks_and_the_legacy_alias() {
+        let dir = TempDir::new().unwrap();
+        let check = |name: &str, cfg: Option<&str>| -> bool {
+            let h = dir.path().join(name);
+            std::fs::create_dir_all(&h).unwrap();
+            if let Some(cfg) = cfg {
+                let slot_cfg = dir.path().join(format!("{name}-slot.toml"));
+                std::fs::write(&slot_cfg, cfg).unwrap(); // CI-ALLOW-fs-write-config-toml
+                std::os::unix::fs::symlink(&slot_cfg, h.join("config.toml")).unwrap();
+            }
+            codex_hooks_disabled_by_config(&h)
+        };
+        assert!(check("a", Some("[features]\nhooks = false\n")));
+        assert!(check("b", Some("[features]\ncodex_hooks = false\n")));
+        assert!(!check("c", Some("[features]\nhooks = true\n")));
+        assert!(!check(
+            "d",
+            Some("[features]\nhooks = true\ncodex_hooks = false\n")
+        ));
+        assert!(!check("e", Some("model = \"m\"\n")));
+        assert!(check("f", Some("[features]\nhooks = false")));
+        assert!(!check("g", Some("not = [toml")));
+        assert!(!check("h", None));
+    }
+
+    #[cfg(unix)]
+    fn fixture_handle(dir: &Path, name: &str) -> PathBuf {
+        let h = dir.join(name);
+        std::fs::create_dir_all(&h).unwrap();
+        h
+    }
+
+    /// Falsifying result: with the link removal branch deleted the dangling link survives.
+    /// N5: the observed codex-cli 0.162.1 precedence, case by case.
+    #[cfg(unix)]
+    #[test]
+    fn codex_hooks_config_follows_the_observed_precedence() {
+        use CodexHooksConfigState as C;
+        let dir = TempDir::new().unwrap();
+        let state = |name: &str, cfg: &str| -> C {
+            let h = dir.path().join(name);
+            std::fs::create_dir_all(&h).unwrap();
+            std::fs::write(h.join("config.toml"), cfg).unwrap(); // CI-ALLOW-fs-write-config-toml
+            codex_hooks_config(&h).state
+        };
+        // A `hooks` key wins over `codex_hooks`, whichever comes first.
+        assert_eq!(
+            state("c3", "[features]\nhooks = true\ncodex_hooks = false\n"),
+            C::Enabled
+        );
+        assert_eq!(
+            state("c3r", "[features]\ncodex_hooks = false\nhooks = true\n"),
+            C::Enabled
+        );
+        assert_eq!(
+            state("c4", "[features]\nhooks = false\ncodex_hooks = true\n"),
+            C::Disabled
+        );
+        assert_eq!(
+            state("c4r", "[features]\ncodex_hooks = true\nhooks = false\n"),
+            C::Disabled
+        );
+        // The alias applies only when no `hooks` key is set.
+        assert_eq!(
+            state("c2", "[features]\ncodex_hooks = false\n"),
+            C::Disabled
+        );
+        assert_eq!(state("c1", "[features]\nhooks = false\n"), C::Disabled);
+        assert_eq!(state("c0", ""), C::Enabled);
+        // `[profiles.*]` tables are ignored by Codex: they never disable.
+        assert_eq!(
+            state("p5a", "[profiles.p.features]\nhooks = false\n"),
+            C::Enabled
+        );
+        // A top-level `profile` key makes Codex fail every command.
+        assert_eq!(
+            state(
+                "p6a",
+                "profile = \"p\"\n[profiles.p.features]\nhooks = false\n"
+            ),
+            C::LegacyProfileKey
+        );
+        // Unparseable, mistyped or duplicate-key configs are UNKNOWN, never "not disabled".
+        assert_eq!(state("u7a", "[features"), C::Unknown);
+        assert_eq!(state("u7b", "[features]\nhooks = \"nope\"\n"), C::Unknown);
+        assert_eq!(
+            state("u7c", "[features]\nhooks = true\nhooks = false\n"),
+            C::Unknown
+        );
+        assert_eq!(state("u7e", "features = 3\n"), C::Unknown);
+        let over = dir.path().join("over");
+        std::fs::create_dir_all(&over).unwrap();
+        std::fs::write(
+            over.join("config.toml"),
+            vec![b'#'; CODEX_HOOKS_MAX_BYTES as usize + 1],
+        )
+        .unwrap(); // CI-ALLOW-fs-write-config-toml
+        assert_eq!(codex_hooks_config(&over).state, C::Unknown);
+        let dangling = dir.path().join("dangling");
+        std::fs::create_dir_all(&dangling).unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("nowhere.toml"),
+            dangling.join("config.toml"),
+        )
+        .unwrap();
+        assert_eq!(codex_hooks_config(&dangling).state, C::Unknown);
+        let absent = dir.path().join("absent");
+        std::fs::create_dir_all(&absent).unwrap();
+        assert_eq!(codex_hooks_config(&absent).state, C::Enabled);
+        // The bool wrapper keeps "unknown" distinct from disabled.
+        assert!(!codex_hooks_disabled_by_config(&over));
+    }
+
+    /// N5: `<name>.config.toml` profile files are noted, without changing the base state.
+    #[test]
+    fn codex_hooks_config_notes_profile_files_that_disable_hooks() {
+        let dir = TempDir::new().unwrap();
+        let h = dir.path().join("h");
+        std::fs::create_dir_all(&h).unwrap();
+        let put = |name: &str, cfg: &str| {
+            std::fs::write(h.join(name), cfg).unwrap(); // CI-ALLOW-fs-write-config-toml
+        };
+        put("config.toml", "[features]\nhooks = true\n");
+        put("off.config.toml", "[features]\nhooks = false\n");
+        put("alias.config.toml", "[features]\ncodex_hooks = false\n");
+        put(
+            "winner.config.toml",
+            "[features]\nhooks = true\ncodex_hooks = false\n",
+        );
+        put("bad name.config.toml", "[features]\nhooks = false\n");
+        put("broken.config.toml", "[features");
+        let cfg = codex_hooks_config(&h);
+        assert_eq!(cfg.state, CodexHooksConfigState::Enabled);
+        assert_eq!(
+            cfg.profile_disabled,
+            vec!["alias".to_owned(), "off".to_owned()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_planted_link_is_removed_when_global_is_deleted() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        setup_codex_slot(&base, 4);
+        setup_codex_slot(&base, 9);
+        let global = write_global_hooks(dir.path());
+        let _env = GlobalHooksEnv::set(Some(&global));
+        let handle =
+            create_handle_dir_codex(&base, AccountNum::try_from(4u16).unwrap(), 88840).unwrap();
+        assert_eq!(
+            std::fs::read_link(handle.join("hooks.json")).unwrap(),
+            global
+        );
+
+        std::fs::remove_file(&global).unwrap();
+        repoint_handle_dir_codex(&base, &handle, AccountNum::try_from(9u16).unwrap()).unwrap();
+        assert!(
+            handle.join("hooks.json").symlink_metadata().is_err(),
+            "the stale link must be removed"
+        );
+        assert_eq!(
+            codex_hooks_link_state(&handle, Some(&global)),
+            CodexHooksLinkState::MissingGlobal
+        );
+    }
+
+    /// F5: a handle whose link is missing because the global was absent re-links once the
+    /// global appears, on the next repoint and on the next create.
+    #[cfg(unix)]
+    #[test]
+    fn codex_missing_link_self_heals_when_the_global_appears() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        setup_codex_slot(&base, 4);
+        setup_codex_slot(&base, 9);
+        let global = dir.path().join("global-codex").join("hooks.json");
+        let _env = GlobalHooksEnv::set(Some(&global));
+        let handle =
+            create_handle_dir_codex(&base, AccountNum::try_from(4u16).unwrap(), 88841).unwrap();
+        assert!(handle.join("hooks.json").symlink_metadata().is_err());
+
+        write_global_hooks(dir.path());
+        assert_eq!(
+            codex_hooks_link_state(&handle, Some(&global)),
+            CodexHooksLinkState::Unlinked
+        );
+        repoint_handle_dir_codex(&base, &handle, AccountNum::try_from(9u16).unwrap()).unwrap();
+        assert_eq!(
+            std::fs::read_link(handle.join("hooks.json")).unwrap(),
+            global
+        );
+        assert_eq!(
+            codex_hooks_link_state(&handle, Some(&global)),
+            CodexHooksLinkState::Ok
+        );
+    }
+
+    /// One shared predicate: a directory (or dangling link) at the global path is MISSING for
+    /// both the link path and doctor.
+    #[cfg(unix)]
+    #[test]
+    fn codex_global_hooks_directory_counts_as_missing_everywhere() {
+        let dir = TempDir::new().unwrap();
+        let global_dir = dir.path().join("hooks.json");
+        std::fs::create_dir_all(&global_dir).unwrap();
+        assert!(!codex_global_hooks_usable(&global_dir));
+        let h = fixture_handle(dir.path(), "h");
+        link_codex_global_hooks(&h, Some(&global_dir)).unwrap();
+        assert!(h.join("hooks.json").symlink_metadata().is_err());
+        assert_eq!(
+            codex_hooks_link_state(&h, Some(&global_dir)),
+            CodexHooksLinkState::MissingGlobal
+        );
+        let real = write_global_hooks(dir.path());
+        assert!(codex_global_hooks_usable(&real));
+        let dangling = dir.path().join("dangling.json");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+        assert!(!codex_global_hooks_usable(&dangling));
+    }
+
+    /// Every doctor state, each produced by a distinct on-disk shape.
+    #[cfg(unix)]
+    #[test]
+    fn codex_hooks_link_state_names_each_shape() {
+        use CodexHooksLinkState as S;
+        let dir = TempDir::new().unwrap();
+        let global = write_global_hooks(dir.path());
+        let elsewhere = dir.path().join("elsewhere.json");
+        std::fs::write(&elsewhere, "{}").unwrap();
+        let link = |h: &Path, target: &Path| {
+            std::os::unix::fs::symlink(target, h.join("hooks.json")).unwrap();
+        };
+        let g = Some(global.as_path());
+
+        let ok = fixture_handle(dir.path(), "ok");
+        link(&ok, &global);
+        assert_eq!(codex_hooks_link_state(&ok, g), S::Ok);
+
+        let unlinked = fixture_handle(dir.path(), "unlinked");
+        assert_eq!(codex_hooks_link_state(&unlinked, g), S::Unlinked);
+
+        let foreign = fixture_handle(dir.path(), "foreign");
+        std::fs::write(foreign.join("hooks.json"), "{}").unwrap();
+        assert_eq!(codex_hooks_link_state(&foreign, g), S::ForeignFile);
+
+        let dangling = fixture_handle(dir.path(), "dangling");
+        link(&dangling, &dir.path().join("nowhere.json"));
+        assert_eq!(codex_hooks_link_state(&dangling, g), S::Dangling);
+
+        let wrong = fixture_handle(dir.path(), "wrong");
+        link(&wrong, &elsewhere);
+        assert_eq!(codex_hooks_link_state(&wrong, g), S::WrongTarget);
+
+        let blocked = fixture_handle(dir.path(), "blocked");
+        std::fs::create_dir_all(blocked.join("hooks.json.swap-tmp")).unwrap();
+        std::fs::write(blocked.join("hooks.json.swap-tmp/keep"), "x").unwrap();
+        assert_eq!(codex_hooks_link_state(&blocked, g), S::SwapTmpBlocked);
+
+        assert_eq!(codex_hooks_link_state(&unlinked, None), S::MissingGlobal);
+        assert_eq!(codex_hooks_link_state(&ok, None), S::MissingGlobal);
+        assert!(!S::Ok.is_problem() && S::Unlinked.is_problem());
+    }
+
+    /// F6: a leftover `.swap-tmp` of a non-file type is removed before use; one that cannot
+    /// be removed refuses the link (an `Err`, and doctor shows it).
+    #[cfg(unix)]
+    #[test]
+    fn codex_swap_tmp_of_non_file_type_is_cleared_or_link_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let global = write_global_hooks(dir.path());
+        let elsewhere = dir.path().join("elsewhere.json");
+        std::fs::write(&elsewhere, "{}").unwrap();
+
+        let planted_link = fixture_handle(dir.path(), "h-link");
+        std::os::unix::fs::symlink(&elsewhere, planted_link.join("hooks.json.swap-tmp")).unwrap();
+        link_codex_global_hooks(&planted_link, Some(&global)).unwrap();
+        assert_eq!(
+            std::fs::read_link(planted_link.join("hooks.json")).unwrap(),
+            global
+        );
+        assert!(planted_link
+            .join("hooks.json.swap-tmp")
+            .symlink_metadata()
+            .is_err());
+
+        let empty_dir = fixture_handle(dir.path(), "h-emptydir");
+        std::fs::create_dir(empty_dir.join("hooks.json.swap-tmp")).unwrap();
+        link_codex_global_hooks(&empty_dir, Some(&global)).unwrap();
+        assert_eq!(
+            std::fs::read_link(empty_dir.join("hooks.json")).unwrap(),
+            global
+        );
+
+        let full_dir = fixture_handle(dir.path(), "h-fulldir");
+        let tmp = full_dir.join("hooks.json.swap-tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        std::fs::write(tmp.join("keep"), "x").unwrap();
+        assert!(link_codex_global_hooks(&full_dir, Some(&global)).is_err());
+        assert!(full_dir.join("hooks.json").symlink_metadata().is_err());
+        assert_eq!(
+            codex_hooks_link_state(&full_dir, Some(&global)),
+            CodexHooksLinkState::SwapTmpBlocked
+        );
+        assert!(
+            tmp.join("keep").exists(),
+            "an unremovable tmp is never emptied"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_symlink_elsewhere_is_moved_aside_not_deleted() {
+        let dir = TempDir::new().unwrap();
+        let global = write_global_hooks(dir.path());
+        let elsewhere = dir.path().join("elsewhere.json");
+        std::fs::write(&elsewhere, "{}").unwrap();
+        let h = fixture_handle(dir.path(), "h");
+        std::os::unix::fs::symlink(&elsewhere, h.join("hooks.json")).unwrap();
+        assert_eq!(
+            codex_hooks_link_state(&h, Some(&global)),
+            CodexHooksLinkState::WrongTarget
+        );
+        link_codex_global_hooks(&h, Some(&global)).unwrap();
+        assert_eq!(std::fs::read_link(h.join("hooks.json")).unwrap(), global);
+        assert_eq!(
+            codex_hooks_link_state(&h, Some(&global)),
+            CodexHooksLinkState::Ok
+        );
+        let kept = codex_hooks_preserved_foreign(&h);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(std::fs::read_link(h.join(&kept[0])).unwrap(), elsewhere);
+        assert_eq!(std::fs::read(&elsewhere).unwrap(), b"{}");
+        // The missing-global branch never touches a link that is not ours.
+        let gone = dir.path().join("gone.json");
+        link_codex_global_hooks(&h, Some(&gone)).unwrap();
+        assert_eq!(std::fs::read_link(h.join("hooks.json")).unwrap(), global);
+    }
+
+    /// N8 window: `hooks.json` recreated between the detach and the link creation is never
+    /// overwritten by the link.
+    #[cfg(unix)]
+    #[test]
+    fn codex_hooks_recreated_in_the_detach_window_is_never_overwritten() {
+        let dir = TempDir::new().unwrap();
+        let global = write_global_hooks(dir.path());
+        let h = fixture_handle(dir.path(), "h");
+        let local = h.join("hooks.json");
+        std::fs::write(
+            &local,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"y"}]}]}}"#,
+        )
+        .unwrap();
+        let writer = local.clone();
+        AFTER_ASIDE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(&writer, b"RECREATED-BY-CODEX").unwrap()
+            }));
+        });
+        link_codex_global_hooks(&h, Some(&global)).unwrap();
+        AFTER_ASIDE.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(std::fs::read(&local).unwrap(), b"RECREATED-BY-CODEX");
+        assert!(local.symlink_metadata().unwrap().is_file());
+        assert!(h.join("hooks.json.swap-tmp").symlink_metadata().is_err());
+    }
+
+    /// The doctor's swap-tmp predicate equals the link path's: an empty directory is cleared
+    /// (no alarm), a non-empty one blocks whatever else sits at `hooks.json`.
+    #[cfg(unix)]
+    #[test]
+    fn codex_swap_tmp_doctor_predicate_matches_the_link_path() {
+        use CodexHooksLinkState as S;
+        let dir = TempDir::new().unwrap();
+        let global = write_global_hooks(dir.path());
+        let g = Some(global.as_path());
+        // An EMPTY swap-tmp directory is cleared by the link path, so doctor raises no alarm.
+        let empty = fixture_handle(dir.path(), "h-empty");
+        std::fs::create_dir(empty.join("hooks.json.swap-tmp")).unwrap();
+        assert_eq!(codex_hooks_link_state(&empty, g), S::Unlinked);
+        link_codex_global_hooks(&empty, g).unwrap();
+        assert_eq!(codex_hooks_link_state(&empty, g), S::Ok);
+        // A blocked swap-tmp next to a foreign file is SwapTmpBlocked, not ForeignFile.
+        let blocked = fixture_handle(dir.path(), "h-blocked");
+        std::fs::write(blocked.join("hooks.json"), "{}").unwrap();
+        let tmp = blocked.join("hooks.json.swap-tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        std::fs::write(tmp.join("keep"), "x").unwrap();
+        assert_eq!(codex_hooks_link_state(&blocked, g), S::SwapTmpBlocked);
+        assert!(link_codex_global_hooks(&blocked, g).is_err());
+        // Beside a wrong-target link too.
+        let wrong = fixture_handle(dir.path(), "h-wrong");
+        std::os::unix::fs::symlink(dir.path().join("elsewhere.json"), wrong.join("hooks.json"))
+            .unwrap();
+        let tmp = wrong.join("hooks.json.swap-tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        std::fs::write(tmp.join("keep"), "x").unwrap();
+        assert_eq!(codex_hooks_link_state(&wrong, g), S::SwapTmpBlocked);
+        // A correct link never reports the blocked tmp (the link path returns early too).
+        let ok = fixture_handle(dir.path(), "h-ok");
+        std::os::unix::fs::symlink(&global, ok.join("hooks.json")).unwrap();
+        let tmp = ok.join("hooks.json.swap-tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        std::fs::write(tmp.join("keep"), "x").unwrap();
+        assert_eq!(codex_hooks_link_state(&ok, g), S::Ok);
+        link_codex_global_hooks(&ok, g).unwrap();
+    }
+
+    /// Subset-to-rename race: the local file changing after the subset check aborts the
+    /// handle; the user's new content survives.
+    #[cfg(unix)]
+    #[test]
+    fn codex_local_hooks_changed_before_rename_aborts_the_handle() {
+        let dir = TempDir::new().unwrap();
+        let global = write_global_hooks(dir.path());
+        let h = fixture_handle(dir.path(), "h");
+        let local = h.join("hooks.json");
+        std::fs::write(
+            &local,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"y"}]}]}}"#,
+        )
+        .unwrap();
+        let edited =
+            br#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"USER-EDIT"}]}]}}"#;
+        let writer = local.clone();
+        BEFORE_REREAD.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || std::fs::write(&writer, edited).unwrap()));
+        });
+        link_codex_global_hooks(&h, Some(&global)).unwrap();
+        BEFORE_REREAD.with(|hook| *hook.borrow_mut() = None);
+        let meta = local.symlink_metadata().unwrap();
+        assert!(meta.is_file() && !meta.file_type().is_symlink());
+        assert_eq!(std::fs::read(&local).unwrap(), edited);
+        assert!(h.join("hooks.json.swap-tmp").symlink_metadata().is_err());
+        assert_eq!(
+            codex_hooks_link_state(&h, Some(&global)),
+            CodexHooksLinkState::ForeignFile
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_copy_fallback_materializes_a_resynced_copy() {
+        use CodexHooksLinkState as S;
+        let dir = TempDir::new().unwrap();
+        let global = write_global_hooks(dir.path());
+        let g = Some(global.as_path());
+        let h = fixture_handle(dir.path(), "h");
+        let set_copy = |on: bool| FORCE_COPY_LINK.with(|c| c.set(on));
+
+        // No symlink privilege: launch does NOT fail; hooks.json is a COPY plus a digest marker.
+        set_copy(true);
+        link_codex_global_hooks(&h, g).unwrap();
+        let meta = h.join("hooks.json").symlink_metadata().unwrap();
+        assert!(meta.is_file() && !meta.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read(h.join("hooks.json")).unwrap(),
+            std::fs::read(&global).unwrap()
+        );
+        assert!(h.join("hooks.json.swap-tmp").symlink_metadata().is_err());
+        assert_eq!(codex_hooks_link_state(&h, g), S::CopyCurrent);
+        assert!(S::CopyCurrent.message().contains("Developer Mode"));
+
+        // The global changes: doctor says STALE; the next launch re-syncs (no foreign file).
+        std::fs::write(&global, r#"{"hooks":{"Stop":[]}}"#).unwrap();
+        assert_eq!(codex_hooks_link_state(&h, g), S::CopyStale);
+        link_codex_global_hooks(&h, g).unwrap();
+        assert_eq!(codex_hooks_link_state(&h, g), S::CopyCurrent);
+        assert_eq!(
+            std::fs::read(h.join("hooks.json")).unwrap(),
+            br#"{"hooks":{"Stop":[]}}"#
+        );
+        assert!(codex_hooks_preserved_foreign(&h).is_empty());
+
+        // A user-edited copy is foreign: preserved, then a fresh copy is made.
+        std::fs::write(h.join("hooks.json"), b"USER-EDIT").unwrap();
+        link_codex_global_hooks(&h, g).unwrap();
+        let kept = codex_hooks_preserved_foreign(&h);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(std::fs::read(h.join(&kept[0])).unwrap(), b"USER-EDIT");
+        assert_eq!(codex_hooks_link_state(&h, g), S::CopyCurrent);
+
+        // Once symlinks work again the copy is replaced by the link and the marker removed.
+        set_copy(false);
+        link_codex_global_hooks(&h, g).unwrap();
+        assert_eq!(std::fs::read_link(h.join("hooks.json")).unwrap(), global);
+        assert!(h
+            .join("hooks.json.csq-copy-sha256")
+            .symlink_metadata()
+            .is_err());
+        assert_eq!(codex_hooks_link_state(&h, g), S::Ok);
+    }
+
+    /// F8: the bound is enforced at read on the OPEN handle.
+    #[cfg(unix)]
+    #[test]
+    fn read_regular_bounded_refuses_devices_fifos_symlinks_and_oversize() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = TempDir::new().unwrap();
+        let ok = dir.path().join("ok.json");
+        std::fs::write(&ok, b"{}").unwrap();
+        assert_eq!(read_regular_bounded(&ok, true).as_deref(), Some(&b"{}"[..]));
+
+        let at_limit = dir.path().join("at-limit");
+        std::fs::write(&at_limit, vec![b' '; CODEX_HOOKS_MAX_BYTES as usize]).unwrap();
+        assert!(read_regular_bounded(&at_limit, true).is_some());
+        let over = dir.path().join("over");
+        std::fs::write(&over, vec![b' '; CODEX_HOOKS_MAX_BYTES as usize + 1]).unwrap();
+        assert!(read_regular_bounded(&over, true).is_none());
+
+        // A character device reports length 0 and never ends: refused by the fstat.
+        assert!(read_regular_bounded(Path::new("/dev/zero"), true).is_none());
+
+        let fifo = dir.path().join("fifo");
+        let c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(read_regular_bounded(&fifo, true).is_none());
+
+        let sym = dir.path().join("sym.json");
+        std::os::unix::fs::symlink(&ok, &sym).unwrap();
+        assert!(read_regular_bounded(&sym, true).is_none(), "nofollow");
+        assert!(read_regular_bounded(&sym, false).is_some());
+    }
+
+    /// Runs `f` on a thread and fails (instead of hanging the suite) when it does not finish.
+    #[cfg(unix)]
+    fn finishes_within<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the call blocked on a FIFO")
+    }
+
+    /// N7: a FIFO at the global hooks path, or at a slot `settings.json`, cannot hang the
+    /// link predicate or the doctor's `disableAllHooks` read.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_cannot_hang_the_link_predicate_or_the_disable_all_hooks_read() {
+        let dir = TempDir::new().unwrap();
+        let fifo = dir.path().join("fifo");
+        make_fifo(&fifo);
+        let f = fifo.clone();
+        assert!(!finishes_within(move || codex_global_hooks_usable(&f)));
+        let f = fifo.clone();
+        assert!(!finishes_within(move || {
+            settings_file_has_disable_all_hooks(&f)
+        }));
+        let handle = dir.path().join("h");
+        std::fs::create_dir_all(&handle).unwrap();
+        let f = fifo.clone();
+        let h = handle.clone();
+        assert_eq!(
+            finishes_within(move || codex_hooks_link_state(&h, Some(&f))),
+            CodexHooksLinkState::MissingGlobal
+        );
+        let ok = dir.path().join("ok.json");
+        std::fs::write(&ok, b"{}").unwrap();
+        assert!(codex_global_hooks_usable(&ok));
+    }
+
+    #[test]
+    fn json_subset_semantics() {
+        use serde_json::json;
+        let g = json!({"a":{"b":1,"c":[1,2,{"d":3,"e":4}]},"f":"x"});
+        assert!(json_is_subset(&json!({}), &g));
+        assert!(json_is_subset(&json!({"a":{"c":[{"d":3}]}}), &g));
+        assert!(json_is_subset(&json!({"a":{"c":[2,1]}}), &g));
+        assert!(!json_is_subset(&json!({"a":{"b":2}}), &g));
+        assert!(!json_is_subset(&json!({"z":1}), &g));
+        assert!(!json_is_subset(&json!({"a":{"c":[9]}}), &g));
+        assert!(!json_is_subset(&json!({"f":["x"]}), &g));
+    }
+
+    /// A user-global Claude hook must reach the terminal beside csq's messaging hook:
+    /// arrays under `hooks.<Event>` are concatenated, never replaced.
+    #[test]
+    fn materialize_handle_settings_keeps_global_hooks_beside_messaging_stop() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let config = base.join("config-2");
+        std::fs::create_dir_all(&config).unwrap();
+        let claude_home = base.join("claude_home");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        std::fs::write(
+            claude_home.join("settings.json"),
+            r#"{"hooks":{
+                "PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"global-pre"}]}],
+                "Stop":[{"hooks":[{"type":"command","command":"global-stop"}]}]}}"#,
+        )
+        .unwrap();
+        // The terminal was launched with messaging registered.
+        let handle = base.join("term-88810");
+        std::fs::create_dir_all(&handle).unwrap();
+        let mut previous = serde_json::json!({});
+        crate::messaging::register::apply_settings_layer(&mut previous, "csq").unwrap();
+        std::fs::write(handle.join("settings.json"), previous.to_string()).unwrap();
+
+        materialize_handle_settings(&handle, &claude_home, &config).unwrap();
+
+        let out: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(handle.join("settings.json")).unwrap())
+                .unwrap();
+        let cmds = |ev: &str| -> Vec<String> {
+            out["hooks"][ev]
+                .as_array()
+                .unwrap_or_else(|| panic!("hooks.{ev} missing in {out}"))
+                .iter()
+                .filter_map(|e| e.pointer("/hooks/0/command").and_then(|c| c.as_str()))
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(cmds("PreToolUse"), vec!["global-pre".to_owned()]);
+        let stop = cmds("Stop");
+        assert!(stop.contains(&"global-stop".to_owned()), "stop={stop:?}");
+        assert!(
+            stop.iter()
+                .any(|c| c.ends_with("sessions inbox --messages --hook Stop")),
+            "messaging Stop hook missing: {stop:?}"
+        );
     }
 
     #[test]
@@ -8667,23 +14822,24 @@ mod tests {
         setup_codex_slot(base, 7);
 
         let account = AccountNum::try_from(7u16).unwrap();
-        // Pre-create a handle dir with a PID that is definitely alive
-        // — use our own PID. The function must refuse rather than
-        // clobber it.
-        let own_pid = std::process::id();
-        let handle = base.join(format!("term-{own_pid}"));
+        // Pre-create a handle dir (NOT our own pid's name, so the own-pid rule does
+        // not apply) whose `.live-pid` names a live process (ours). The function must
+        // refuse rather than clobber it.
+        let live = std::process::id();
+        let pid = 999_999_021u32;
+        let handle = base.join(format!("term-{pid}"));
         std::fs::create_dir_all(&handle).unwrap();
-        std::fs::write(handle.join(".live-pid"), own_pid.to_string()).unwrap();
+        std::fs::write(handle.join(".live-pid"), live.to_string()).unwrap();
 
-        let result = create_handle_dir_codex(base, account, own_pid);
+        let result = create_handle_dir_codex(base, account, pid);
         match result {
-            Err(CredentialError::Corrupt { reason, .. }) => {
-                assert!(
-                    reason.contains("in use by live PID"),
-                    "error must refuse live-pid collision: {reason}"
-                );
+            Err(CredentialError::HandleDirBusy {
+                marker, live_pid, ..
+            }) => {
+                assert_eq!(marker, ".live-pid");
+                assert_eq!(live_pid, Some(live));
             }
-            other => panic!("expected Corrupt for live pid collision, got: {other:?}"),
+            other => panic!("expected HandleDirBusy for live pid collision, got: {other:?}"),
         }
     }
 
@@ -8714,11 +14870,9 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         match result {
-            Err(CredentialError::Corrupt { reason, .. }) => {
-                assert!(
-                    reason.contains("may still be in use by a child process"),
-                    "{reason}"
-                );
+            Err(ref e @ CredentialError::HandleDirBusy { .. }) => {
+                let reason = e.to_string();
+                assert!(reason.contains(".live-cc-pid"), "{reason}");
                 assert!(reason.contains("left untouched"), "{reason}");
                 assert!(
                     reason.contains("a different process id and so a different directory"),
@@ -8730,28 +14884,389 @@ mod tests {
         assert!(handle.join("sentinel").exists(), "dir must be untouched");
     }
 
-    /// Any live process named in `.live-cc-pid` counts, whatever it is.
-    #[cfg(unix)]
+    // --- warn-once ---
+
     #[test]
-    fn cc_child_is_live_true_for_any_live_pid() {
-        let dir = TempDir::new().unwrap();
-        let mut foreign = crate::platform::process::spawn_foreign_test_process();
-        std::fs::write(dir.path().join(".live-cc-pid"), foreign.id().to_string()).unwrap();
-        let live = cc_child_is_live(dir.path());
-        let expected = Some(foreign.id());
-        let _ = foreign.kill();
-        let _ = foreign.wait();
-        assert_eq!(live, expected);
+    fn first_sighting_is_true_once_and_bounded() {
+        let seen = std::sync::Mutex::new(std::collections::HashSet::new());
+        assert!(first_sighting(&seen, "k:term-1"));
+        assert!(!first_sighting(&seen, "k:term-1"));
+        assert!(first_sighting(&seen, "k:term-2"));
+        for i in 0..(SKIP_WARN_CAP * 3) {
+            first_sighting(&seen, &format!("k:flood-{i}"));
+        }
+        assert!(
+            seen.lock().unwrap().len() <= SKIP_WARN_CAP,
+            "set must stay bounded"
+        );
     }
 
-    /// Both dead (and an unreadable marker): proceeds as before.
     #[test]
-    fn cc_child_is_live_false_when_dead_or_unreadable() {
+    fn repeated_sweeps_of_an_unreadable_marker_warn_once() {
+        let base = TempDir::new().unwrap();
+        // Unique name: the seen-set is process-global.
+        let pid = 999_999_031u32;
+        let handle = orphan_dir_with(base.path(), pid, "999999032", None);
+        plant_unreadable(&handle.join(".live-cc-pid"), "oversized");
+        let before = SKIP_WARNS_EMITTED.with(|c| c.get());
+        for _ in 0..5 {
+            assert_eq!(
+                sweep_dead_handles_inner(base.path(), None, |_| Ok(false)),
+                0
+            );
+        }
+        let after = SKIP_WARNS_EMITTED.with(|c| c.get());
+        assert_eq!(
+            after - before,
+            1,
+            "five ticks over one dir must emit one warning"
+        );
+        assert!(handle.join("sentinel").exists());
+    }
+
+    // --- own-pid rule, with own_pid + liveness injected (no dependence on the real pid) ---
+
+    const OWN: u32 = 4_242_001;
+    const OTHER_LIVE: u32 = 4_242_002;
+    const DEAD: u32 = 4_242_003;
+    fn alive(pid: u32) -> bool {
+        pid == OWN || pid == OTHER_LIVE
+    }
+
+    fn leftover(base: &Path, name: &str, live: Option<&str>, cc: Option<&str>) -> PathBuf {
+        let h = base.join(name);
+        std::fs::create_dir_all(&h).unwrap();
+        if let Some(v) = live {
+            std::fs::write(h.join(".live-pid"), v).unwrap();
+        }
+        if let Some(v) = cc {
+            std::fs::write(h.join(".live-cc-pid"), v).unwrap();
+        }
+        h
+    }
+
+    fn verdict(h: &Path, name: &str) -> Result<Option<u32>, CredentialError> {
+        refuse_if_existing_handle_dir_live_with(h, name, OWN, alive)
+    }
+
+    #[test]
+    fn own_pid_dir_with_own_live_pid_marker_is_removable() {
+        let t = TempDir::new().unwrap();
+        let name = format!("term-{OWN}");
+        let h = leftover(t.path(), &name, Some(&OWN.to_string()), None);
+        assert_eq!(verdict(&h, &name).unwrap(), Some(OWN));
+    }
+
+    #[test]
+    fn own_pid_dir_with_unreadable_live_pid_is_removable() {
+        let t = TempDir::new().unwrap();
+        let name = format!("term-{OWN}");
+        let h = leftover(t.path(), &name, Some("not-a-pid"), None);
+        assert_eq!(verdict(&h, &name).unwrap(), None);
+    }
+
+    #[test]
+    fn own_pid_dir_with_other_live_pid_marker_refuses() {
+        let t = TempDir::new().unwrap();
+        let name = format!("term-{OWN}");
+        let h = leftover(t.path(), &name, Some(&OTHER_LIVE.to_string()), None);
+        match verdict(&h, &name) {
+            Err(CredentialError::HandleDirBusy {
+                marker, live_pid, ..
+            }) => {
+                assert_eq!((marker, live_pid), (".live-pid", Some(OTHER_LIVE)));
+            }
+            other => panic!("expected refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn own_pid_dir_with_live_other_cc_pid_refuses() {
+        let t = TempDir::new().unwrap();
+        let name = format!("term-{OWN}");
+        let h = leftover(
+            t.path(),
+            &name,
+            Some(&OWN.to_string()),
+            Some(&OTHER_LIVE.to_string()),
+        );
+        match verdict(&h, &name) {
+            Err(CredentialError::HandleDirBusy {
+                marker, live_pid, ..
+            }) => assert_eq!((marker, live_pid), (".live-cc-pid", Some(OTHER_LIVE))),
+            other => panic!("expected refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn own_pid_dir_with_unreadable_cc_pid_refuses() {
+        let t = TempDir::new().unwrap();
+        let name = format!("term-{OWN}");
+        let h = leftover(t.path(), &name, Some(&OWN.to_string()), Some("garbage"));
+        match verdict(&h, &name) {
+            Err(CredentialError::HandleDirBusy {
+                marker, live_pid, ..
+            }) => assert_eq!((marker, live_pid), (".live-cc-pid", None)),
+            other => panic!("expected refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn own_pid_dir_with_own_or_dead_cc_pid_is_removable() {
+        let t = TempDir::new().unwrap();
+        let name = format!("term-{OWN}");
+        let h = leftover(
+            t.path(),
+            &name,
+            Some(&OWN.to_string()),
+            Some(&OWN.to_string()),
+        );
+        assert!(verdict(&h, &name).is_ok(), "own pid in cc marker");
+        std::fs::write(h.join(".live-cc-pid"), DEAD.to_string()).unwrap();
+        assert!(verdict(&h, &name).is_ok(), "dead pid in cc marker");
+    }
+
+    #[test]
+    fn non_own_dir_with_unreadable_marker_still_refuses() {
+        for name in [
+            format!("term-{DEAD}"),
+            "interactive-capture-1-2".to_string(),
+        ] {
+            for (live, cc, want) in [
+                (Some("garbage"), None, ".live-pid"),
+                (Some(&*DEAD.to_string()), Some("garbage"), ".live-cc-pid"),
+            ] {
+                let t = TempDir::new().unwrap();
+                let h = leftover(t.path(), &name, live, cc);
+                match verdict(&h, &name) {
+                    Err(CredentialError::HandleDirBusy {
+                        marker, live_pid, ..
+                    }) => assert_eq!((marker, live_pid), (want, None), "{name}"),
+                    other => panic!("{name}: expected refusal, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_own_dir_naming_own_pid_in_marker_refuses() {
+        // A daemon-owned capture dir whose marker names OUR pid is held by us: refuse.
+        let t = TempDir::new().unwrap();
+        let name = "interactive-capture-9-9";
+        let h = leftover(t.path(), name, Some(&OWN.to_string()), None);
+        assert!(matches!(
+            verdict(&h, name),
+            Err(CredentialError::HandleDirBusy {
+                marker: ".live-pid",
+                live_pid: Some(OWN),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn handle_dir_busy_message_names_marker_and_says_retry() {
+        let m = crate::error::handle_dir_busy_message("term-7", ".live-cc-pid", None);
+        assert!(
+            m.contains("term-7") && m.contains(".live-cc-pid") && m.contains("Retry"),
+            "{m}"
+        );
+        assert!(!m.contains('/'), "dir name only, never a path: {m}");
+        let m = crate::error::handle_dir_busy_message("term-7", ".live-pid", Some(55));
+        assert!(m.contains("PID 55") && m.contains("Retry"), "{m}");
+    }
+
+    /// End to end through the public entry: a leftover `term-<real own pid>` carrying an
+    /// unreadable `.live-pid` is removed and recreated (the daemon-free launch path).
+    #[test]
+    fn create_handle_dir_codex_recreates_leftover_own_pid_dir() {
         let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join(".live-cc-pid"), "999999003").unwrap();
-        assert_eq!(cc_child_is_live(dir.path()), None);
-        std::fs::write(dir.path().join(".live-cc-pid"), "not-a-pid").unwrap();
-        assert_eq!(cc_child_is_live(dir.path()), None);
+        let base = dir.path();
+        setup_codex_slot(base, 7);
+        let account = AccountNum::try_from(7u16).unwrap();
+        let me = std::process::id();
+        let handle = base.join(format!("term-{me}"));
+        std::fs::create_dir_all(&handle).unwrap();
+        std::fs::write(handle.join(".live-pid"), "garbage").unwrap();
+        std::fs::write(handle.join("stale-sentinel"), "x").unwrap();
+        let out = create_handle_dir_codex(base, account, me).unwrap();
+        assert!(!out.join("stale-sentinel").exists(), "old dir must be gone");
+        assert_eq!(markers::read_live_pid(&out), Some(me));
+    }
+
+    /// An unreadable marker (a directory; an oversized file) the destructive callers
+    /// must treat as possibly live.
+    fn plant_unreadable(path: &Path, kind: &str) {
+        match kind {
+            "dir" => std::fs::create_dir(path).unwrap(),
+            _ => std::fs::write(path, "9".repeat(4096)).unwrap(),
+        }
+    }
+
+    #[test]
+    fn sweep_skips_handle_dir_with_unreadable_live_cc_pid() {
+        for kind in ["dir", "oversized"] {
+            let base = TempDir::new().unwrap();
+            let pid = 999_999_011u32;
+            let handle = orphan_dir_with(base.path(), pid, "999999012", None);
+            plant_unreadable(&handle.join(".live-cc-pid"), kind);
+            let mut cleared = 0;
+            let removed = sweep_dead_handles_inner(base.path(), None, |_| {
+                cleared += 1;
+                Ok(false)
+            });
+            assert_eq!(removed, 0, "{kind}");
+            assert_eq!(cleared, 0, "{kind}: keychain must not be touched");
+            assert!(handle.join("sentinel").exists(), "{kind}: dir must survive");
+        }
+    }
+
+    #[test]
+    fn sweep_skips_handle_dir_with_unreadable_live_pid() {
+        for kind in ["dir", "oversized"] {
+            let base = TempDir::new().unwrap();
+            let pid = 999_999_013u32;
+            let handle = orphan_dir_with(base.path(), pid, "999999014", None);
+            std::fs::remove_file(handle.join(".live-pid")).unwrap();
+            plant_unreadable(&handle.join(".live-pid"), kind);
+            let removed = sweep_dead_handles_inner(base.path(), None, |_| Ok(false));
+            assert_eq!(removed, 0, "{kind}");
+            assert!(handle.join("sentinel").exists(), "{kind}: dir must survive");
+        }
+    }
+
+    /// Absent markers keep today's behaviour: a dead dir-name pid is still swept.
+    #[test]
+    fn sweep_still_removes_dead_dir_with_absent_markers() {
+        let base = TempDir::new().unwrap();
+        let handle = orphan_dir_with(base.path(), 999_999_015, "999999016", None);
+        std::fs::remove_file(handle.join(".live-pid")).unwrap();
+        let removed = sweep_dead_handles_inner(base.path(), None, |_| Ok(false));
+        assert_eq!(removed, 1);
+        assert!(!handle.exists());
+    }
+
+    #[test]
+    fn create_handle_dir_refuses_and_keeps_dir_on_unreadable_markers() {
+        for (marker, kind) in [
+            (".live-cc-pid", "dir"),
+            (".live-cc-pid", "oversized"),
+            (".live-pid", "dir"),
+            (".live-pid", "oversized"),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let base = dir.path();
+            setup_codex_slot(base, 7);
+            let account = AccountNum::try_from(7u16).unwrap();
+            let pid = 999_999_017u32;
+            let handle = orphan_dir_with(base, pid, "999999018", None);
+            if marker == ".live-pid" {
+                std::fs::remove_file(handle.join(".live-pid")).unwrap();
+            }
+            plant_unreadable(&handle.join(marker), kind);
+            let result = create_handle_dir_codex(base, account, pid);
+            assert!(
+                matches!(result, Err(CredentialError::HandleDirBusy { .. })),
+                "{marker} {kind}: {result:?}"
+            );
+            assert!(handle.join("sentinel").exists(), "{marker} {kind}");
+        }
+    }
+
+    #[test]
+    fn create_handle_dir_anthropic_refuses_on_unreadable_live_cc_pid() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        setup_config_dir(base, 7);
+        let account = AccountNum::try_from(7u16).unwrap();
+        let pid = 999_999_019u32;
+        let handle = orphan_dir_with(base, pid, "999999020", None);
+        plant_unreadable(&handle.join(".live-cc-pid"), "dir");
+        let claude_home = dir.path().join("claude-home");
+        let result = create_handle_dir(base, &claude_home, account, pid);
+        assert!(
+            matches!(result, Err(CredentialError::HandleDirBusy { .. })),
+            "{result:?}"
+        );
+        assert!(handle.join("sentinel").exists());
+    }
+
+    /// Run `f` on a thread; fail if it does not return within 20 s (a FIFO read blocks).
+    #[cfg(unix)]
+    fn within_20s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(20))
+            .expect("call blocked on a FIFO .live-pid")
+    }
+
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_live_pid_does_not_block_or_reap_capture_exec_and_create() {
+        let base = TempDir::new().unwrap();
+        let b = base.path().to_path_buf();
+        let cap = b.join(format!("{CAPTURE_DIR_PREFIX}fifo-0"));
+        std::fs::create_dir_all(&cap).unwrap();
+        make_fifo(&cap.join(".live-pid"));
+        let exe = b.join(format!("{EXEC_CODEX_DIR_PREFIX}999999021"));
+        std::fs::create_dir_all(&exe).unwrap();
+        make_fifo(&exe.join(".live-pid"));
+        let (b2, cap2, exe2) = (b.clone(), cap.clone(), exe.clone());
+        let removed = within_20s(move || {
+            let n = sweep_stale_capture_dirs(&b2) + sweep_stale_exec_dirs(&b2);
+            assert!(cap2.exists() && exe2.exists());
+            n
+        });
+        assert_eq!(removed, 0);
+
+        setup_codex_slot(&b, 7);
+        let account = AccountNum::try_from(7u16).unwrap();
+        let handle = b.join("term-999999022");
+        std::fs::create_dir_all(&handle).unwrap();
+        make_fifo(&handle.join(".live-pid"));
+        let b3 = b.clone();
+        let result = within_20s(move || create_handle_dir_codex(&b3, account, 999_999_022));
+        assert!(
+            matches!(result, Err(CredentialError::HandleDirBusy { .. })),
+            "{result:?}"
+        );
+        assert!(handle.exists());
+    }
+
+    /// An unreadable marker must NOT fall back to reaping by directory age.
+    // Unix only: setting a DIRECTORY's mtime needs `File::open(dir)`, which fails on Windows.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_capture_unreadable_marker_does_not_age_reap() {
+        let base = TempDir::new().unwrap();
+        let dir = make_capture_dir_unreadable(base.path());
+        let f = std::fs::File::open(&dir).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+        assert!(
+            dir_age_exceeds(&dir, CAPTURE_REAP_GRACE),
+            "fixture must be old"
+        );
+        assert_eq!(sweep_stale_capture_dirs(base.path()), 0);
+        assert!(dir.exists());
+    }
+
+    #[cfg(unix)]
+    fn make_capture_dir_unreadable(base: &Path) -> PathBuf {
+        let dir = base.join(format!("{CAPTURE_DIR_PREFIX}oversized-0"));
+        std::fs::create_dir_all(&dir).unwrap();
+        plant_unreadable(&dir.join(".live-pid"), "oversized");
+        dir
     }
 
     #[test]
@@ -8930,6 +15445,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn repoint_handle_dir_refuses_codex_shape_handle_dir() {
+        let _env_guard = crate::platform::test_env::lock();
         use crate::credentials::{CodexCredentialFile, CodexTokensFile, CredentialFile};
         use crate::types::AccountNum;
 
@@ -8971,6 +15487,7 @@ mod tests {
         markers::write_csq_account_legacy(&target_config, target_account).unwrap();
 
         // Create a Codex handle dir.
+        stage_verified_repoint_slots(base, &[1, 2, 3]);
         let handle = create_handle_dir_codex(base, codex_account, 70001).unwrap();
 
         // Precondition: handle dir has Codex-shape symlinks.
@@ -8984,7 +15501,7 @@ mod tests {
         );
 
         // Act: attempt to repoint to target slot 1.
-        let result = repoint_handle_dir(base, claude_home.path(), &handle, target_account);
+        let result = repoint_verified_fixture(base, claude_home.path(), &handle, target_account);
 
         // Assert: refused with a clear error.
         assert!(
@@ -9514,6 +16031,231 @@ mod tests {
         }
     }
 
+    /// Materialize `global` (user settings.json text, if any) over a fresh handle dir and
+    /// return the merged `settings.json`.
+    fn materialize_with_global(global: Option<&str>) -> Value {
+        let dir = TempDir::new().unwrap();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        if let Some(g) = global {
+            std::fs::write(claude_home.join("settings.json"), g).unwrap();
+        }
+        let config_dir = dir.path().join("config-1");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let handle_dir = dir.path().join("term-99002");
+        std::fs::create_dir_all(&handle_dir).unwrap();
+        materialize_handle_settings(&handle_dir, &claude_home, &config_dir).unwrap();
+        // A second materialization is the swap / auto-rotate re-merge path.
+        materialize_handle_settings(&handle_dir, &claude_home, &config_dir).unwrap();
+        serde_json::from_str(&std::fs::read_to_string(handle_dir.join("settings.json")).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn fresh_handle_settings_disable_connectors_and_never_invent_a_cache_ttl() {
+        let merged = materialize_with_global(None);
+        assert!(
+            merged.get("subagentPromptCacheTtl").is_none(),
+            "absent stays absent"
+        );
+        assert_eq!(merged["disableClaudeAiConnectors"], true);
+    }
+
+    #[test]
+    fn a_user_cache_ttl_passes_through_unchanged() {
+        for user in [r#""5m""#, r#""1h""#, r#""bogus""#, "5"] {
+            let merged =
+                materialize_with_global(Some(&format!(r#"{{"subagentPromptCacheTtl":{user}}}"#)));
+            let want: Value = serde_json::from_str(user).unwrap();
+            assert_eq!(merged["subagentPromptCacheTtl"], want, "user value {user}");
+        }
+    }
+
+    #[test]
+    fn connectors_default_true_only_when_absent_and_an_explicit_false_passes_through() {
+        let merged = materialize_with_global(Some(r#"{"disableClaudeAiConnectors":false}"#));
+        assert_eq!(merged["disableClaudeAiConnectors"], false);
+        let merged = materialize_with_global(Some(r#"{"disableClaudeAiConnectors":true}"#));
+        assert_eq!(merged["disableClaudeAiConnectors"], true);
+        assert_eq!(
+            materialize_with_global(None)["disableClaudeAiConnectors"],
+            true
+        );
+    }
+
+    #[test]
+    fn previous_handle_preferences_survive_a_remerge_but_env_and_routing_never_do() {
+        let dir = TempDir::new().unwrap();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        let config_dir = dir.path().join("config-1");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let handle_dir = dir.path().join("term-99003");
+        std::fs::create_dir_all(&handle_dir).unwrap();
+        // A first materialization writes the layer record; the file is then edited in-session.
+        materialize_handle_settings(&handle_dir, &claude_home, &config_dir).unwrap();
+        std::fs::write(
+            handle_dir.join("settings.json"),
+            r#"{"subagentPromptCacheTtl":"5m","env":{"ANTHROPIC_AUTH_TOKEN":"old"},"apiKeyHelper":"x","model":"m"}"#,
+        )
+        .unwrap();
+        materialize_handle_settings(&handle_dir, &claude_home, &config_dir).unwrap();
+        let merged: Value = serde_json::from_str(
+            &std::fs::read_to_string(handle_dir.join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(merged["subagentPromptCacheTtl"], "5m");
+        for k in ["env", "apiKeyHelper", "model"] {
+            assert!(merged.get(k).is_none(), "{k} must not be carried: {merged}");
+        }
+        // An explicit global value is newer than the stale handle copy.
+        std::fs::write(
+            claude_home.join("settings.json"),
+            r#"{"subagentPromptCacheTtl":"1h"}"#,
+        )
+        .unwrap();
+        materialize_handle_settings(&handle_dir, &claude_home, &config_dir).unwrap();
+        let merged: Value = serde_json::from_str(
+            &std::fs::read_to_string(handle_dir.join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(merged["subagentPromptCacheTtl"], "1h");
+    }
+
+    /// Fixture for the carry-over tests: a claude home, two slot config dirs and a handle dir.
+    fn carry_fixture() -> (TempDir, PathBuf, PathBuf, PathBuf, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let claude_home = dir.path().join(".claude");
+        let a = dir.path().join("config-1");
+        let b = dir.path().join("config-2");
+        let handle = dir.path().join("term-99004");
+        for d in [&claude_home, &a, &b, &handle] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        (dir, claude_home, a, b, handle)
+    }
+
+    fn handle_ttl(handle: &Path) -> Option<Value> {
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(handle.join("settings.json")).unwrap())
+                .unwrap();
+        v.get("subagentPromptCacheTtl").cloned()
+    }
+
+    #[test]
+    fn a_pre_sidecar_handle_file_carries_nothing_so_slot_a_never_reaches_slot_b() {
+        let (_d, home, a, b, handle) = carry_fixture();
+        // A handle file from before the layer record existed: it holds slot A's overlay value
+        // and there is NO `.csq-layer-prefs.json`, so nothing is attributable to Claude Code.
+        std::fs::write(
+            a.join("settings.json"),
+            r#"{"subagentPromptCacheTtl":"5m"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            handle.join("settings.json"),
+            r#"{"subagentPromptCacheTtl":"5m","disableClaudeAiConnectors":false}"#,
+        )
+        .unwrap();
+        assert!(!handle.join(LAYER_RECORD_FILE).exists());
+        materialize_handle_settings(&handle, &home, &b).unwrap();
+        assert_eq!(
+            handle_ttl(&handle),
+            None,
+            "no record: nothing crosses to slot B"
+        );
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(handle.join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            v["disableClaudeAiConnectors"], true,
+            "reset once to csq's default"
+        );
+    }
+
+    #[test]
+    fn a_preference_removed_from_global_does_not_persist_in_the_handle() {
+        let (_d, home, a, _b, handle) = carry_fixture();
+        std::fs::write(
+            home.join("settings.json"),
+            r#"{"subagentPromptCacheTtl":"1h"}"#,
+        )
+        .unwrap();
+        materialize_handle_settings(&handle, &home, &a).unwrap();
+        assert_eq!(handle_ttl(&handle), Some(Value::from("1h")));
+        std::fs::write(home.join("settings.json"), "{}").unwrap();
+        materialize_handle_settings(&handle, &home, &a).unwrap();
+        assert_eq!(
+            handle_ttl(&handle),
+            None,
+            "a layer-supplied value follows its layer"
+        );
+    }
+
+    #[test]
+    fn slot_a_overlay_preference_does_not_reach_slot_b_after_a_swap() {
+        let (_d, home, a, b, handle) = carry_fixture();
+        std::fs::write(
+            a.join("settings.json"),
+            r#"{"subagentPromptCacheTtl":"5m"}"#,
+        )
+        .unwrap();
+        materialize_handle_settings(&handle, &home, &a).unwrap();
+        assert_eq!(handle_ttl(&handle), Some(Value::from("5m")));
+        materialize_handle_settings(&handle, &home, &b).unwrap();
+        assert_eq!(
+            handle_ttl(&handle),
+            None,
+            "slot A's value must not cross to slot B"
+        );
+    }
+
+    #[test]
+    fn a_claude_code_written_preference_survives_repeated_remerges_and_swaps() {
+        let (_d, home, a, b, handle) = carry_fixture();
+        materialize_handle_settings(&handle, &home, &a).unwrap();
+        // Claude Code (`/config`) writes the key into the handle file mid-session.
+        let mut v: Value =
+            serde_json::from_str(&std::fs::read_to_string(handle.join("settings.json")).unwrap())
+                .unwrap();
+        v["subagentPromptCacheTtl"] = Value::from("1h");
+        std::fs::write(handle.join("settings.json"), v.to_string()).unwrap();
+        materialize_handle_settings(&handle, &home, &a).unwrap();
+        assert_eq!(handle_ttl(&handle), Some(Value::from("1h")));
+        materialize_handle_settings(&handle, &home, &b).unwrap();
+        assert_eq!(
+            handle_ttl(&handle),
+            Some(Value::from("1h")),
+            "still CC's after a swap"
+        );
+    }
+
+    #[test]
+    fn a_claude_code_connectors_choice_survives_a_remerge_and_the_record_is_private() {
+        let (_d, home, a, _b, handle) = carry_fixture();
+        materialize_handle_settings(&handle, &home, &a).unwrap();
+        let mut v: Value =
+            serde_json::from_str(&std::fs::read_to_string(handle.join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(v["disableClaudeAiConnectors"], true);
+        v["disableClaudeAiConnectors"] = Value::Bool(false);
+        std::fs::write(handle.join("settings.json"), v.to_string()).unwrap();
+        materialize_handle_settings(&handle, &home, &a).unwrap();
+        let after: Value =
+            serde_json::from_str(&std::fs::read_to_string(handle.join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(after["disableClaudeAiConnectors"], false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(handle.join(LAYER_RECORD_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
     /// §5a regression — site 4 (security.md MUST Rule 5a, an internal journal entry B2,
     /// /redteam round 3 2026-05-09): when `materialize_handle_settings`
     /// fails after the tmp file would have been created (handle dir
@@ -9551,6 +16293,93 @@ mod tests {
         assert_no_tmp_leak_on_readonly_parent(&handle_dir, || {
             materialize_handle_settings(&handle_dir, &claude_home, &config_dir)
         });
+    }
+
+    /// Spec 32 §6 / INV-32-07: a re-materialization (the swap path) keeps a terminal's
+    /// messaging registration when its previous settings carried one, adds none when it did
+    /// not, and never writes the user-global settings.
+    #[test]
+    fn rematerialization_carries_the_messaging_registration_only_when_present() {
+        use crate::messaging::register;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = base.join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        let user = claude_home.join("settings.json");
+        std::fs::write(
+            &user,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"user-stop"}]}]}}"#,
+        )
+        .unwrap();
+        let user_before = std::fs::read(&user).unwrap();
+        let config_dir = base.join("config-1");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        // Registered terminal: swap re-merge keeps csq's hooks beside the user's own.
+        let reg = base.join("term-1");
+        std::fs::create_dir_all(&reg).unwrap();
+        materialize_handle_settings(&reg, &claude_home, &config_dir).unwrap();
+        register::register_handle_settings(&reg, "/bin/csq").unwrap();
+        materialize_handle_settings(&reg, &claude_home, &config_dir).unwrap();
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(reg.join("settings.json")).unwrap())
+                .unwrap();
+        assert!(register::has_registration(&v), "{v}");
+        assert_eq!(
+            v["hooks"]["Stop"].as_array().unwrap().len(),
+            2,
+            "user hook + csq hook: {v}"
+        );
+        assert_eq!(
+            v["permissions"]["allow"].as_array().unwrap().len(),
+            register::ALLOW_ENTRIES.len()
+        );
+
+        // Unregistered terminal (messaging off): the re-merge adds nothing.
+        let plain = base.join("term-2");
+        std::fs::create_dir_all(&plain).unwrap();
+        materialize_handle_settings(&plain, &claude_home, &config_dir).unwrap();
+        materialize_handle_settings(&plain, &claude_home, &config_dir).unwrap();
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(plain.join("settings.json")).unwrap())
+                .unwrap();
+        assert!(!register::has_registration(&v), "{v}");
+        assert!(v.get("permissions").is_none());
+
+        assert_eq!(
+            std::fs::read(&user).unwrap(),
+            user_before,
+            "user-global settings untouched"
+        );
+    }
+
+    /// M1: a terminal launched with messaging OFF stays off through the Claude to Claude
+    /// re-materialization, even when its previous settings carry csq hooks. Falsifier: the old
+    /// registration-only test registered such a terminal on the next swap.
+    #[test]
+    fn rematerialization_obeys_the_launch_decision_marker() {
+        use crate::messaging::register;
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = base.join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        std::fs::write(claude_home.join("settings.json"), "{}").unwrap();
+        let config_dir = base.join("config-1");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let hd = base.join("term-3");
+        std::fs::create_dir_all(&hd).unwrap();
+        materialize_handle_settings(&hd, &claude_home, &config_dir).unwrap();
+        register::register_handle_settings(&hd, "/bin/csq").unwrap();
+        register::record_decision(&hd, false).unwrap();
+        materialize_handle_settings(&hd, &claude_home, &config_dir).unwrap();
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(hd.join("settings.json")).unwrap())
+                .unwrap();
+        assert!(
+            !register::has_registration(&v),
+            "off at launch, off after swap: {v}"
+        );
     }
 
     /// §5a regression — site 5 (security.md MUST Rule 5a, an internal journal entry B2,
@@ -10464,6 +17293,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn repoint_handle_dir_targets_identity_uuid_path_when_present() {
+        let _env_guard = crate::platform::test_env::lock();
         use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
 
         // Arrange: fixture with slots 1..3 in coexisting layout.
@@ -10492,16 +17322,17 @@ mod tests {
         let claude_home = tempfile::TempDir::new().unwrap();
         let account2 = AccountNum::try_from(2u16).unwrap();
         let account3 = AccountNum::try_from(3u16).unwrap();
+        stage_verified_repoint_slots(base, &[1, 2, 3]);
         let handle = create_handle_dir(base, claude_home.path(), account2, 21001).unwrap();
 
         // Act: repoint from slot 2 → slot 3.
-        repoint_handle_dir(base, claude_home.path(), &handle, account3).unwrap();
+        repoint_verified_fixture(base, claude_home.path(), &handle, account3).unwrap();
 
         // Assert: symlink resolves to identities/<UUID-for-slot-3>/credentials.json
         let link = handle.join(".credentials.json");
         let target = std::fs::read_link(&link).unwrap();
         let target_str = target.to_string_lossy();
-        let uuid3 = fixture_uuid_for_slot(3);
+        let uuid3 = profiles::resolve_slot_to_uuid(base, 3).unwrap();
         assert!(
             target_str.contains("identities"),
             "AC1: .credentials.json must target identities/, got: {target_str}"
@@ -10527,6 +17358,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn repoint_reconciles_oauth_email_to_identity_anchor() {
+        let _env_guard = crate::platform::test_env::lock();
         use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
 
         let dir = coexisting_fixture(3);
@@ -10560,6 +17392,7 @@ mod tests {
         let claude_home = tempfile::TempDir::new().unwrap();
         let account2 = AccountNum::try_from(2u16).unwrap();
         let account3 = AccountNum::try_from(3u16).unwrap();
+        stage_verified_repoint_slots(base, &[1, 2, 3]);
         let handle = create_handle_dir(base, claude_home.path(), account2, 21051).unwrap();
         // Precondition: the handle inherited slot-2's email (the pre-swap value).
         assert_eq!(
@@ -10567,7 +17400,7 @@ mod tests {
             Some("fixture-slot-2@test.invalid")
         );
 
-        repoint_handle_dir(base, claude_home.path(), &handle, account3).unwrap();
+        repoint_verified_fixture(base, claude_home.path(), &handle, account3).unwrap();
 
         // The handle's oauthAccount.emailAddress is now the slot-3 IDENTITY anchor —
         // the gate matches; no wait for CC to rewrite.
@@ -10652,6 +17485,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn repoint_handle_dir_preserves_mtime_bump_against_identity_credentials_json() {
+        let _env_guard = crate::platform::test_env::lock();
         use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
         use std::time::{Duration, SystemTime};
 
@@ -10678,6 +17512,8 @@ mod tests {
         }
 
         // Pin identity credentials.json for slot 3 to a known past mtime.
+        stage_verified_repoint_slots(base, &[1, 2, 3]);
+        let identity_creds = verified_fixture_credentials(base, 3);
         let collision_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let f = std::fs::OpenOptions::new()
             .write(true)
@@ -10692,7 +17528,7 @@ mod tests {
         let handle = create_handle_dir(base, claude_home.path(), account2, 21003).unwrap();
 
         // Act: repoint from slot 2 → slot 3.
-        repoint_handle_dir(base, claude_home.path(), &handle, account3).unwrap();
+        repoint_verified_fixture(base, claude_home.path(), &handle, account3).unwrap();
 
         // Assert: reading mtime through the symlink is strictly above collision_time.
         let post_mtime = std::fs::metadata(handle.join(".credentials.json"))
@@ -10787,12 +17623,13 @@ mod tests {
         );
     }
 
-    /// M3-4 AC5: `repoint_handle_dir` falls back to `config-N/.credentials.json`
-    /// when no UUID is present in profiles.json (legacy-only layout).
+    /// Retired M3-4 AC5: an unverified legacy-only Anthropic target must
+    /// refuse with exact custody preservation; raw fallback is not authority.
     #[cfg(any(test, feature = "test-utils"))]
     #[cfg(unix)]
     #[test]
-    fn repoint_handle_dir_falls_back_to_config_n_when_uuid_missing() {
+    fn repoint_handle_dir_refuses_legacy_config_n_when_uuid_missing() {
+        let _env_guard = crate::platform::test_env::lock();
         use crate::testing::identity_fixtures::legacy_only_fixture;
 
         // Arrange: legacy_only_fixture — no profiles.json UUIDs.
@@ -10810,22 +17647,14 @@ mod tests {
         let account2 = AccountNum::try_from(2u16).unwrap();
         let account3 = AccountNum::try_from(3u16).unwrap();
         let handle = create_handle_dir(base, claude_home.path(), account2, 21005).unwrap();
+        let before = repoint_fixture_snapshot(base);
 
-        // Act: repoint from slot 2 → slot 3 (legacy layout).
-        repoint_handle_dir(base, claude_home.path(), &handle, account3).unwrap();
-
-        // Assert: symlink targets config-3/.credentials.json (not identities/).
-        let link = handle.join(".credentials.json");
-        let target = std::fs::read_link(&link).unwrap();
-        let target_str = target.to_string_lossy();
+        // Retired unverified Anthropic fallback must refuse without ANY mutation.
+        let result = repoint_handle_dir(base, claude_home.path(), &handle, account3);
         assert!(
-            target_str.contains("config-3"),
-            "AC5: legacy fallback must target config-3/, got: {target_str}"
+            matches!(result, Err(CredentialError::Corrupt { reason, .. }) if reason == "identity_authority_refused")
         );
-        assert!(
-            !target_str.contains("identities"),
-            "AC5: legacy fallback must NOT target identities/, got: {target_str}"
-        );
+        assert_eq!(before, repoint_fixture_snapshot(base));
     }
 
     // M3-7: test `repoint_handle_dir_falls_back_to_config_n_when_uuid_present_but_identity_credentials_missing`
@@ -10849,6 +17678,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn repoint_handle_dir_serializes_concurrent_writers_under_identity_targets() {
+        let _env_guard = crate::platform::test_env::lock();
         use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
         use std::sync::Arc;
 
@@ -10880,6 +17710,22 @@ mod tests {
         let claude_home = tempfile::TempDir::new().unwrap();
         let claude_home_path = claude_home.path().to_path_buf();
         let account1 = AccountNum::try_from(1u16).unwrap();
+        std::fs::write(
+            base.join("config-1/settings.json"),
+            serde_json::json!({"fixtureWinner":1}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("config-2/settings.json"),
+            serde_json::json!({"fixtureWinner":2}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("config-3/settings.json"),
+            serde_json::json!({"fixtureWinner":3}).to_string(),
+        )
+        .unwrap();
+        stage_verified_repoint_slots(&base, &[1, 2, 3]);
         let handle = create_handle_dir(&base, &claude_home_path, account1, 21009).unwrap();
 
         let base_arc = Arc::new(base.clone());
@@ -10893,15 +17739,27 @@ mod tests {
         let account2 = AccountNum::try_from(2u16).unwrap();
         let account3 = AccountNum::try_from(3u16).unwrap();
 
-        // Spawn two threads: one repoints to slot 2, the other to slot 3.
+        let binding_a =
+            crate::accounts::anthropic_identity::capture_anthropic_binding(&base, account2)
+                .unwrap();
+        let binding_b =
+            crate::accounts::anthropic_identity::capture_anthropic_binding(&base, account3)
+                .unwrap();
+        let native_a = capture_native_swap(&base, &handle).unwrap();
+        let native_b = capture_native_swap(&base, &handle).unwrap();
+        // Both pre-captured snapshots race through the real guarded route.
         let t1 = std::thread::spawn(move || {
-            let _ = repoint_handle_dir(&base_arc, &ch_arc, &handle_arc, account2);
+            let result =
+                repoint_handle_dir_guarded(&base_arc, &ch_arc, &handle_arc, &binding_a, &native_a);
+            (result, binding_a, native_a)
         });
         let t2 = std::thread::spawn(move || {
-            let _ = repoint_handle_dir(&base2, &ch2, &handle2, account3);
+            let result = repoint_handle_dir_guarded(&base2, &ch2, &handle2, &binding_b, &native_b);
+            (result, binding_b, native_b)
         });
-        t1.join().unwrap();
-        t2.join().unwrap();
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+        assert_verified_repoint_race(&base, &claude_home_path, &handle, r1, r2);
 
         // Assert: symlinks are self-consistent — both point to the SAME slot.
         let creds_target = std::fs::read_link(handle.join(".credentials.json")).unwrap();
@@ -10910,8 +17768,9 @@ mod tests {
         let marker_str = marker_target.to_string_lossy();
 
         // Determine which slot won by reading the marker file.
-        let marker_content = std::fs::read_to_string(handle.join(".csq-account")).unwrap();
-        let winner_slot = marker_content.trim().parse::<u16>().unwrap();
+        let winner_slot = markers::resolve_marker_to_slot(&base, &handle)
+            .unwrap()
+            .get();
         assert!(
             winner_slot == 2 || winner_slot == 3,
             "AC9: winner slot must be 2 or 3, got {winner_slot}"
@@ -10990,5 +17849,132 @@ mod tests {
             mode, 0o600,
             "must be owner-only from creation, got {mode:o}"
         );
+    }
+    #[test]
+    fn native_swap_org_identity_regression_full_context_null_and_foreign_are_distinct() {
+        use crate::accounts::anthropic_identity as ai;
+        let target = ai::AnthropicContext::new(
+            "same@example.test",
+            uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
+            uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
+        )
+        .unwrap();
+        let old = ai::AnthropicContext::new(
+            "same@example.test",
+            target.account_uuid(),
+            uuid::Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap(),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config-2");
+        let handle = dir.path().join("term-999999");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&handle).unwrap();
+        let path = handle.join(".claude.json");
+        for oauth in [
+            serde_json::Value::Null,
+            serde_json::json!({
+                "emailAddress":old.email(),"accountUuid":old.account_uuid(),"organizationUuid":old.organization_uuid(),"organizationRole":"source-only-role"
+            }),
+        ] {
+            let raw = serde_json::to_string(
+                &serde_json::json!({"oauthAccount":oauth,"projects":{"preserve":true},"cachedGrowthBookFeatures":{"foreign-org":true},"overageCreditGrantCache":{"foreign-org":true}}),
+            )
+            .unwrap();
+            std::fs::write(&path, &raw).unwrap();
+            crate::platform::fs::secure_file(&path).unwrap();
+            assert!(native_context_can_rewrite(Some(&raw), &target, Some(&old)));
+            rebuild_claude_json_for_swap_context(&config, &handle, &target, Some(&old), Some(&raw))
+                .unwrap();
+            let result: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                ai::parse_native_expectation(&result).unwrap().context(),
+                &target
+            );
+            assert_eq!(result["projects"]["preserve"], true);
+            assert!(result.get("cachedGrowthBookFeatures").is_none());
+            assert!(result.get("overageCreditGrantCache").is_none());
+            assert!(result["oauthAccount"].get("organizationRole").is_none());
+        }
+        let foreign = serde_json::to_string(&serde_json::json!({"oauthAccount":{
+            "emailAddress":old.email(),"accountUuid":old.account_uuid(),"organizationUuid":old.organization_uuid()
+        }})).unwrap();
+        assert!(!native_context_can_rewrite(Some(&foreign), &target, None));
+        assert!(!native_context_can_rewrite(
+            Some(r#"{"oauthAccount":{"emailAddress":"same@example.test"}}"#),
+            &target,
+            Some(&old)
+        ));
+        std::fs::write(&path, &foreign).unwrap();
+        assert_eq!(
+            rebuild_claude_json_for_swap_context(&config, &handle, &target, None, Some(&foreign)),
+            Err(NativeMetadataReconcileFailure::UntrustedContext)
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), foreign);
+    }
+
+    #[test]
+    fn native_swap_org_identity_regression_interleaved_native_login_preserves_foreign_bytes() {
+        use crate::accounts::anthropic_identity as ai;
+        let target = ai::AnthropicContext::new(
+            "same@example.test",
+            uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
+            uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config-2");
+        let handle = dir.path().join("term-999999");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&handle).unwrap();
+        let path = handle.join(".claude.json");
+        let captured = r#"{"oauthAccount":null,"projects":{"retain":1}}"#;
+        std::fs::write(&path, captured).unwrap();
+        crate::platform::fs::secure_file(&path).unwrap();
+        let receipt = capture_native_swap(dir.path(), &handle).unwrap();
+        assert_eq!(receipt.raw.as_deref(), Some(captured));
+        assert_eq!(receipt.handle, std::fs::canonicalize(&handle).unwrap());
+        let foreign = r#"{"oauthAccount":{"emailAddress":"foreign@example.test","accountUuid":"33333333-3333-4333-8333-333333333333","organizationUuid":"44444444-4444-4444-8444-444444444444"},"projects":{"retain":2}}"#;
+        std::fs::write(&path, foreign).unwrap();
+        assert_eq!(
+            rebuild_claude_json_for_swap_context(
+                &config,
+                &handle,
+                &target,
+                None,
+                receipt.raw.as_deref(),
+            ),
+            Err(NativeMetadataReconcileFailure::ContextChanged)
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), foreign);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn native_swap_org_identity_regression_fifo_and_symlink_refuse_without_touching_target() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let handle = dir.path().join("term-999999");
+        std::fs::create_dir(&handle).unwrap();
+        let path = handle.join(".claude.json");
+        assert_eq!(read_native_swap_raw(&handle).unwrap(), None);
+        let target = dir.path().join("unrelated.json");
+        crate::platform::fs::write_new_private(&target, br#"{"preserve":"fake-fixture"}"#).unwrap();
+        let before = std::fs::read(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(read_native_swap_raw(&handle).is_err());
+        assert!(capture_native_swap(dir.path(), &handle).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), before);
+        assert!(path.symlink_metadata().unwrap().file_type().is_symlink());
+        std::fs::remove_file(&path).unwrap();
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        // No writer is opened: a blocking FIFO reader would hang here. The
+        // production reader rejects irregular metadata before opening and also
+        // uses O_NONBLOCK if a replacement races that metadata check.
+        assert!(read_native_swap_raw(&handle).is_err());
+        assert!(capture_native_swap(dir.path(), &handle).is_err());
+        assert!(!path.symlink_metadata().unwrap().is_file());
+        assert_eq!(std::fs::read(target).unwrap(), before);
     }
 }

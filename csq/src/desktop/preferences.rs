@@ -518,11 +518,11 @@ where
         serde_json::to_string_pretty(prefs).map_err(|e| format!("desktop_prefs_serialize: {e}"))?;
 
     if let Some(parent) = path.parent() {
-        // Best-effort: parent should already exist (it's the csq
-        // base dir, created by the daemon / first login). If it
-        // doesn't, the write below will fail with a clearer error
-        // than mkdir's would.
-        std::fs::create_dir_all(parent).ok();
+        // SEC-2.15 (unified, R1 M1): desktop-prefs.json is a direct child
+        // of the accounts root — create AND secure it fail-closed via the
+        // shared helper (was a silent `.ok()` best-effort).
+        csq_core::platform::fs::ensure_private_dir_root(parent)
+            .map_err(|e| format!("desktop_prefs_parent_refused: {e}"))?;
     }
 
     let tmp = unique_tmp_path(&path);

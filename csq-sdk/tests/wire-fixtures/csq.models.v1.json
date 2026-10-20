@@ -2,7 +2,9 @@
   "id": "corr-id-4",
   "models": [
     {
-      "aliases": ["alias"],
+      "aliases": [
+        "alias"
+      ],
       "context_window": 1048576,
       "is_default": false,
       "model_id": "model",

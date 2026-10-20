@@ -77,7 +77,13 @@ pub fn set_broker_failed(
 ) -> Result<(), CredentialError> {
     let path = broker_failed_path(base_dir, account);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
+        // SEC-2.15 (unified, R1 M1): the flag file lives in credentials/ —
+        // create AND secure that dir fail-closed via the shared helper
+        // (was a silent `.ok()` best-effort).
+        crate::platform::fs::ensure_private_dir(parent).map_err(|e| CredentialError::Io {
+            path: parent.to_path_buf(),
+            source: std::io::Error::other(format!("credentials_dir_refused: {e}")),
+        })?;
     }
     // Cap at 256 bytes so a stray bug that shoves a full error
     // string in here can never bloat the flag file.

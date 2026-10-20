@@ -174,17 +174,15 @@ fn screen_inner(value: &Value) -> Result<(), String> {
                 screen_inner(item)?;
             }
         }
-        Value::String(s) => {
+        Value::String(s) if has_live_token_prefix(s) => {
             // Value-side: reject strings that start with a known live-token prefix.
             // We do NOT use `redact_tokens` here because it also redacts bare hex
             // strings (sha256 hashes) which are legitimate in v1 payload fields
             // like `command_sha256`. Instead we check only the known-prefix patterns
             // that have zero false-positive rate for normal payload values.
-            if has_live_token_prefix(s) {
-                return Err("__value__".to_string());
-            }
+            return Err("__value__".to_string());
         }
-        // Null / Bool / Number — no credentials possible.
+        // Other strings / Null / Bool / Number — no credentials possible.
         _ => {}
     }
     Ok(())

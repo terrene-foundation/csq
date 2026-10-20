@@ -336,7 +336,57 @@ async fn run_loop(
         _ = tokio::time::sleep(startup_delay) => {}
     }
 
+    // F5/L3: one audit of every bound identity's saved refresh token. A pair that shares
+    // a grant would have each refresher rotate it out from under the other; the audit
+    // persists a suppression the tick consults below. Blocking file reads, so off the
+    // async thread. A panicked audit is logged, never silent.
+    {
+        let audit_base = base_dir.clone();
+        if let Err(join_err) = tokio::task::spawn_blocking(move || {
+            crate::accounts::refresh_token_audit::run_startup_audit(&audit_base)
+        })
+        .await
+        {
+            warn!(
+                error_kind = "refresh_audit_task_failed",
+                panicked = join_err.is_panic(),
+                "duplicate-grant startup audit task failed"
+            );
+        }
+    }
+
+    let mut mirror_retry = MirrorRetrySchedule::new();
+    // The negative cache survives successive daemon passes. Legacy verification
+    // is background-only and never runs from a statusline or diagnostic read.
+    //
+    // The pass runs on its OWN interval task, never inline: it awaits up to two
+    // blocking profile requests and the identity repair locks, so inline it
+    // would delay shutdown and an expiring refresh behind a slow verifier. The
+    // guard aborts the task whenever this loop returns.
+    let legacy_verifier = Arc::new(Mutex::new(
+        crate::daemon::legacy_identity::LegacyVerifier::default(),
+    ));
+    let _legacy_task = AbortOnDrop(tokio::spawn(run_legacy_identity_loop_with(
+        base_dir.clone(),
+        legacy_verifier,
+        shutdown.clone(),
+        interval,
+        Arc::new(|verifier, base, budget| {
+            // A profile-endpoint throttle gates only verifier HTTP. Local
+            // Known-metadata index repair remains eligible with budget zero.
+            let budget = if crate::daemon::server::harvest_gate_is_rate_limited() {
+                0
+            } else {
+                budget
+            };
+            verifier.tick(base, budget)
+        }),
+    )));
     loop {
+        if shutdown.is_cancelled() {
+            return;
+        }
+        let tick_started_ms = crate::credentials::keychain::now_ms();
         // Run one tick, isolated in its own task (round 9, S-C-1 / D-F1): a
         // bug anywhere on the tick's call graph (the `harvest_gate`
         // `blocking_lock`-on-a-worker panic fixed alongside this change is
@@ -364,6 +414,24 @@ async fn run_loop(
             Arc::clone(&backoffs),
         )
         .await;
+
+        let observation_base = base_dir.clone();
+        match tokio::task::spawn_blocking(move || {
+            let requested =
+                crate::credentials::keychain::mirror_sync_retry_requested(&observation_base);
+            let status = crate::credentials::keychain::read_mirror_sync_status(&observation_base);
+            mirror_backoff_reset_due(requested, status.as_ref(), tick_started_ms)
+        })
+        .await
+        {
+            Ok(true) => mirror_retry.delay = WAKE_PROBE_INTERVAL,
+            Ok(false) => (),
+            Err(error) => warn!(
+                error_kind = "cc_keychain_sync_observation_panicked",
+                panicked = error.is_panic(),
+                "mirror retry observation failed (non-fatal)"
+            ),
+        }
 
         // M20 (F-SEAM-09): sweep timed-out held provenance events. The seam's
         // intra-source counter-gap hold links a held event past an unfilled gap
@@ -419,22 +487,365 @@ async fn run_loop(
         //     paused), so the loop ticks within one probe granularity of wake.
         // Origin: an internal journal entry Q2.
         let started = Instant::now();
-        let deadline = std::time::SystemTime::now() + interval;
-        let probe = WAKE_PROBE_INTERVAL.min(interval);
-        while let Some(chunk) = wait_chunk_or_done(
-            started.elapsed(),
+        if !wait_for_refresh_with_mirror_retry(
+            &mut mirror_retry,
+            &shutdown,
             interval,
-            std::time::SystemTime::now(),
-            deadline,
-            probe,
-        ) {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    info!("refresher cancelled, exiting loop");
-                    return;
-                }
-                _ = tokio::time::sleep(chunk) => {}
+            WAKE_PROBE_INTERVAL.min(interval),
+            &|| started.elapsed(),
+            &std::time::SystemTime::now,
+            &|chunk| tokio::time::sleep(chunk),
+            &|| run_pending_mirror_retry(base_dir.clone(), shutdown.clone()),
+        )
+        .await
+        {
+            info!("refresher cancelled, exiting loop");
+            return;
+        }
+    }
+}
+
+/// Keep the fixed two-candidate verifier budget and all blocking I/O off the
+/// async worker. The private callback is also the fixture seam; production
+/// supplies only the verifier's pinned transport entrypoint above.
+/// Aborts its task when dropped, so the legacy pass cannot outlive `run_loop`.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+type LegacyVerifyFn = Arc<
+    dyn Fn(
+            &mut crate::daemon::legacy_identity::LegacyVerifier,
+            &std::path::Path,
+            usize,
+        ) -> crate::daemon::legacy_identity::LegacyVerificationSummary
+        + Send
+        + Sync,
+>;
+
+/// The legacy verification pass on its own interval. Shutdown is observed both
+/// while a pass is in flight and while waiting for the next one, so a slow
+/// verifier can never hold the refresher (or the daemon's drain) hostage.
+async fn run_legacy_identity_loop_with(
+    base: PathBuf,
+    verifier: Arc<Mutex<crate::daemon::legacy_identity::LegacyVerifier>>,
+    shutdown: CancellationToken,
+    interval: Duration,
+    verify: LegacyVerifyFn,
+) {
+    loop {
+        let verify_once = Arc::clone(&verify);
+        let pass = run_legacy_identity_tick_with(
+            base.clone(),
+            Arc::clone(&verifier),
+            move |verifier, base, budget| verify_once(verifier, base, budget),
+        );
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = pass => {}
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(interval) => {}
+        }
+    }
+}
+
+async fn run_legacy_identity_tick_with<F>(
+    base: PathBuf,
+    verifier: Arc<Mutex<crate::daemon::legacy_identity::LegacyVerifier>>,
+    verify: F,
+) -> Option<crate::daemon::legacy_identity::LegacyVerificationSummary>
+where
+    F: FnOnce(
+            &mut crate::daemon::legacy_identity::LegacyVerifier,
+            &std::path::Path,
+            usize,
+        ) -> crate::daemon::legacy_identity::LegacyVerificationSummary
+        + Send
+        + 'static,
+{
+    match tokio::task::spawn_blocking(move || {
+        let mut verifier = verifier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        verify(&mut verifier, &base, 2)
+    })
+    .await
+    {
+        Ok(summary) => {
+            debug!(
+                attempted = summary.attempted,
+                upgraded = summary.upgraded,
+                repaired = summary.repaired,
+                deferred = summary.deferred,
+                refused = summary.refused,
+                "legacy identity verification pass completed"
+            );
+            if summary.refused > 0 {
+                warn!(
+                    error_kind = "legacy_identity_verification_refused",
+                    refused = summary.refused,
+                    "legacy identity verification retained existing custody"
+                );
             }
+            Some(summary)
+        }
+        Err(error) => {
+            warn!(
+                error_kind = "legacy_identity_verifier_panicked",
+                panicked = error.is_panic(),
+                "legacy identity verification task failed; refresh loop continues"
+            );
+            None
+        }
+    }
+}
+
+// Mirror attempts ride the existing wait; they never run a provider tick or
+// reset its deadline. Awaiting an in-flight blocking sweep drains cooperative
+// shutdown; the process-lifetime sweep gate also covers supervisor drain timeouts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MirrorRetryOutcome {
+    Idle,
+    Progress,
+    Unavailable,
+}
+
+struct MirrorRetrySchedule {
+    next: Duration,
+    delay: Duration,
+}
+
+impl MirrorRetrySchedule {
+    fn new() -> Self {
+        Self {
+            next: WAKE_PROBE_INTERVAL,
+            delay: WAKE_PROBE_INTERVAL,
+        }
+    }
+
+    fn completed(&mut self, now: Duration, outcome: MirrorRetryOutcome) {
+        self.delay = match outcome {
+            MirrorRetryOutcome::Unavailable => self.delay.saturating_mul(2).min(REFRESH_INTERVAL),
+            MirrorRetryOutcome::Idle | MirrorRetryOutcome::Progress => WAKE_PROBE_INTERVAL,
+        };
+        self.next = now.saturating_add(self.delay);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_refresh_with_mirror_retry<Wait, WaitFuture, Mirror, MirrorFuture>(
+    retry: &mut MirrorRetrySchedule,
+    shutdown: &CancellationToken,
+    interval: Duration,
+    probe: Duration,
+    elapsed: &impl Fn() -> Duration,
+    wall_now: &impl Fn() -> std::time::SystemTime,
+    wait: &Wait,
+    mirror: &Mirror,
+) -> bool
+where
+    Wait: Fn(Duration) -> WaitFuture,
+    WaitFuture: std::future::Future<Output = ()>,
+    Mirror: Fn() -> MirrorFuture,
+    MirrorFuture: std::future::Future<Output = MirrorRetryOutcome>,
+{
+    let deadline = wall_now() + interval;
+    // The delay survives provider waits; each wait has its own elapsed origin.
+    retry.next = elapsed().saturating_add(retry.delay);
+    loop {
+        if shutdown.is_cancelled() {
+            return false;
+        }
+        let Some(chunk) = wait_chunk_or_done(elapsed(), interval, wall_now(), deadline, probe)
+        else {
+            return true;
+        };
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return false,
+            _ = wait(chunk) => {}
+        }
+        if shutdown.is_cancelled() {
+            return false;
+        }
+        // The provider tick takes precedence at its deadline, even at the final
+        // wait chunk or after host wake. Work already in flight may overrun it.
+        if wait_chunk_or_done(elapsed(), interval, wall_now(), deadline, probe).is_none() {
+            return true;
+        }
+        if elapsed() >= retry.next {
+            let outcome = mirror().await;
+            retry.completed(elapsed(), outcome);
+        }
+    }
+}
+
+fn mirror_backoff_reset_due(
+    requested: bool,
+    status: Option<&crate::credentials::keychain::MirrorSyncStatus>,
+    tick_started_ms: u64,
+) -> bool {
+    !requested
+        || status
+            .is_some_and(|status| status.updated_at_unix_ms >= tick_started_ms && status.synced > 0)
+}
+
+fn pending_mirror_retry_with(
+    requested: impl FnOnce() -> bool,
+    due: impl FnOnce() -> bool,
+    sweep: impl FnOnce() -> crate::credentials::keychain::MirrorSyncStatus,
+) -> MirrorRetryOutcome {
+    if !requested() {
+        return MirrorRetryOutcome::Idle;
+    }
+    if !due() {
+        return MirrorRetryOutcome::Unavailable;
+    }
+    let status = sweep();
+    if status.pending == 0 {
+        MirrorRetryOutcome::Idle
+    } else if status.synced > 0 {
+        MirrorRetryOutcome::Progress
+    } else {
+        MirrorRetryOutcome::Unavailable
+    }
+}
+
+#[cfg(test)]
+fn pending_mirror_retry_observed_with(
+    requested: impl Fn() -> bool,
+    due: impl FnOnce() -> bool,
+    sweep: impl FnOnce() -> crate::credentials::keychain::MirrorSyncStatus,
+) -> MirrorRetryOutcome {
+    pending_mirror_retry_observed_admitted_with(requested, due, || true, sweep)
+}
+
+fn pending_mirror_retry_observed_admitted_with(
+    requested: impl Fn() -> bool,
+    due: impl FnOnce() -> bool,
+    admit: impl FnOnce() -> bool,
+    sweep: impl FnOnce() -> crate::credentials::keychain::MirrorSyncStatus,
+) -> MirrorRetryOutcome {
+    let admitted = || due() && admit();
+    let outcome = pending_mirror_retry_with(&requested, admitted, || {
+        let started = std::time::Instant::now();
+        let status = sweep();
+        // Only an admitted, returned sweep emits completion. Zero pending
+        // is not a drain proof when publication left a retry requested.
+        let retry_requested = requested();
+        tracing::debug!(
+            event_kind = "cc_keychain_mirror_retry_completed",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            pending = status.pending,
+            synced = status.synced,
+            skipped = status.skipped,
+            failed = status.failed,
+            deferred = status.deferred,
+            lock_timed_out = status.lock_timed_out,
+            lock_failed = status.lock_failed,
+            malformed = status.malformed,
+            sessions_undetermined = status.sessions_undetermined,
+            retry_requested,
+            "pending CC keychain mirror retry sweep completed"
+        );
+        status
+    });
+    // A zero-count sweep can still fail to persist. Keep that unavailable
+    // work on backoff rather than turning an old green row into success.
+    if outcome == MirrorRetryOutcome::Idle && requested() {
+        MirrorRetryOutcome::Unavailable
+    } else {
+        outcome
+    }
+}
+
+/// The sweep the pending-mirror retry runs once admitted. A named fn (not an
+/// inline closure) because the delivery fixture drives the same sweep through
+/// [`pending_mirror_retry_locked`] under its held gate.
+fn pending_mirror_retry_sweep(
+    base: &std::path::Path,
+) -> crate::credentials::keychain::MirrorSyncStatus {
+    #[cfg(test)]
+    {
+        *SYNC_REFRESHED_KEYCHAINS_CALLS
+            .lock()
+            .unwrap()
+            .entry(base.to_path_buf())
+            .or_insert(0) += 1;
+    }
+    crate::credentials::keychain::sync_pending_login_handle_dirs_status(base)
+}
+
+async fn run_pending_mirror_retry(
+    base_dir: PathBuf,
+    shutdown: CancellationToken,
+) -> MirrorRetryOutcome {
+    run_pending_mirror_retry_with(base_dir, shutdown, pending_mirror_retry_sweep).await
+}
+
+/// Retry admission under an ALREADY-HELD [`MIRROR_SWEEP_GATE`].
+///
+/// Production reaches this through [`run_pending_mirror_retry_with`], which
+/// takes the gate NON-blockingly: a busy gate must defer the retry to its next
+/// wake (`Unavailable`) rather than stall the wait behind an in-flight sweep.
+/// The gate cannot be re-entered here, so callers own the hold. The delivery
+/// fixture holds the gate across its timed wait — a legitimate "another
+/// session's sweep is in flight" state — and drives this body, so its
+/// admitted-once assertion exercises the same admission and sweep without
+/// depending on which parallel test happens to hold the process-wide gate.
+fn pending_mirror_retry_locked(
+    base_dir: &std::path::Path,
+    shutdown: &CancellationToken,
+    sweep: impl FnOnce(&std::path::Path) -> crate::credentials::keychain::MirrorSyncStatus,
+) -> MirrorRetryOutcome {
+    if shutdown.is_cancelled() {
+        return MirrorRetryOutcome::Idle;
+    }
+    pending_mirror_retry_observed_admitted_with(
+        || crate::credentials::keychain::mirror_sync_retry_requested(base_dir),
+        || crate::credentials::keychain::mirror_sync_retry_due(base_dir),
+        || !shutdown.is_cancelled(),
+        || sweep(base_dir),
+    )
+}
+
+pub(super) async fn run_pending_mirror_retry_with(
+    base_dir: PathBuf,
+    shutdown: CancellationToken,
+    sweep: impl FnOnce(&std::path::Path) -> crate::credentials::keychain::MirrorSyncStatus
+        + Send
+        + 'static,
+) -> MirrorRetryOutcome {
+    match tokio::task::spawn_blocking(move || {
+        if shutdown.is_cancelled() {
+            return MirrorRetryOutcome::Idle;
+        }
+        let _guard = match MIRROR_SWEEP_GATE.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return MirrorRetryOutcome::Unavailable,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                MIRROR_SWEEP_GATE.clear_poison();
+                poisoned.into_inner()
+            }
+        };
+        pending_mirror_retry_locked(&base_dir, &shutdown, sweep)
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            warn!(
+                error_kind = "cc_keychain_sync_task_panicked",
+                panicked = error.is_panic(),
+                "pending CC keychain sweep task panicked (non-fatal)"
+            );
+            MirrorRetryOutcome::Unavailable
         }
     }
 }
@@ -638,8 +1049,8 @@ pub(crate) fn run_held_sweep_tick(base_dir: &std::path::Path) {
 /// no-op — so only the dirs whose token actually rotated this tick write. This
 /// deliberately avoids per-account handle-dir attribution, whose marker reader is
 /// numeric-only and blind to the UUID `.csq-account` markers modern `csq run`
-/// writes (which would make the fan-out silently do nothing). Called only when a
-/// refresh occurred this tick, so idle ticks pay nothing.
+/// writes (which would make the fan-out silently do nothing). Pending work also
+/// runs between provider ticks; healthy idle wakeups do not sweep.
 ///
 /// Best-effort + test-safe: a base dir with no `term-<pid>/` dirs (every
 /// refresher unit test) sweeps nothing, so no keychain syscall fires under
@@ -676,13 +1087,36 @@ pub(crate) fn sync_refreshed_keychains_call_count_for_test(base_dir: &std::path:
         .unwrap_or(0)
 }
 
+// A supervisor drain timeout drops its JoinHandle and detaches the old task.
+// Keep this gate at process lifetime, rather than inside one refresher session:
+// normal ticks, panic recovery and pending retries must not overlap old sweeps.
+// One gate also bounds storage across base dirs. Per-handle RMW locks remain the
+// cross-process/write-policy boundary; this gate only serializes our sweeps.
+static MIRROR_SWEEP_GATE: Mutex<()> = Mutex::new(());
+
+fn with_mirror_sweep_gate<T>(sweep: impl FnOnce() -> T) -> T {
+    let _guard = MIRROR_SWEEP_GATE.lock().unwrap_or_else(|poisoned| {
+        // The mutex protects execution lifetime, not mutable credential state.
+        // Unwinding ended the prior sweep and released its per-handle guards;
+        // the next sweep re-reads canonical/owner evidence under those guards.
+        warn!(
+            error_kind = "cc_keychain_sweep_gate_poisoned",
+            "recovering mirror sweep gate after prior sweep panic"
+        );
+        let guard = poisoned.into_inner();
+        MIRROR_SWEEP_GATE.clear_poison();
+        guard
+    });
+    sweep()
+}
+
 fn sync_refreshed_keychains(
     base_dir: &std::path::Path,
     refreshed: &std::collections::HashMap<
         AccountNum,
         crate::credentials::token_history::Fingerprint,
     >,
-) {
+) -> crate::credentials::keychain::MirrorSyncStatus {
     #[cfg(test)]
     {
         *SYNC_REFRESHED_KEYCHAINS_CALLS
@@ -691,15 +1125,23 @@ fn sync_refreshed_keychains(
             .entry(base_dir.to_path_buf())
             .or_insert(0) += 1;
     }
-    let (_synced, _skipped, failed) =
-        crate::credentials::keychain::sync_all_handle_dirs(base_dir, refreshed);
-    if failed > 0 {
-        tracing::warn!(
-            error_kind = "cc_keychain_sync_failed",
-            failed,
-            "post-refresh CC keychain mirror failed for one or more handle dirs (non-fatal)"
-        );
-    }
+    with_mirror_sweep_gate(|| {
+        let status = crate::credentials::keychain::sync_all_handle_dirs_status(base_dir, refreshed);
+        if status.pending > 0 {
+            tracing::warn!(
+                error_kind = "cc_keychain_sync_pending",
+                pending = status.pending,
+                failed = status.failed,
+                deferred = status.deferred,
+                lock_timed_out = status.lock_timed_out,
+                lock_failed = status.lock_failed,
+                synced = status.synced,
+                skipped = status.skipped,
+                "post-refresh CC keychain mirror has pending handle dirs (non-fatal)"
+            );
+        }
+        status
+    })
 }
 
 // `keychain-fix-r10.md` C-I1/C-T-a: test-only panic hook, thread-local
@@ -774,6 +1216,9 @@ impl Drop for TickTestPanicHookGuard {
 fn refresh_should_be_skipped(refresh_rate_limited_this_tick: bool, needs_refresh: bool) -> bool {
     refresh_rate_limited_this_tick && needs_refresh
 }
+
+/// Cache label for a slot whose refresh the duplicate-grant audit suppressed.
+const REFRESH_SUPPRESSED_LABEL: &str = "refresh_suppressed";
 
 /// Runs a single refresher tick — discover accounts, check each
 /// one, update cache, manage cooldowns.
@@ -891,6 +1336,13 @@ async fn tick_impl(
         );
         accounts.truncate(MAX_ACCOUNTS_PER_TICK);
     }
+
+    // Slots the duplicate-grant audit suppressed (`refresh_token_audit`). Read once per
+    // tick; a missing file is empty, an unreadable one falls back to a live audit.
+    // An unpersisted first detection is retried here every tick (and stays engaged in memory
+    // until it lands).
+    let _ = crate::accounts::refresh_token_audit::persist_pending(base_dir);
+    let suppressed_refresh = crate::accounts::refresh_token_audit::suppressed_slots(base_dir);
 
     let mut processed = 0usize;
     let mut skipped_cooldown = 0usize;
@@ -1300,7 +1752,7 @@ async fn tick_impl(
         // duration of a network round-trip for no reason; computing the
         // fingerprint up front and letting the `String` drop here shortens
         // that window to the read itself.
-        let pre_refresh_fp = std::fs::read_to_string(&canonical)
+        let pre_refresh_fp = crate::credentials::keychain::read_zeroizing_utf8(&canonical)
             .ok()
             .and_then(|raw| crate::credentials::token_history::fingerprint_from_raw_json(&raw));
 
@@ -1340,7 +1792,7 @@ async fn tick_impl(
                 let uuid_s = uuid.to_string();
                 let http_get_c = Arc::clone(&http_get);
                 let outcome = tokio::task::spawn_blocking(move || {
-                    crate::daemon::custodian::reconcile_account(
+                    crate::daemon::custodian::reconcile_account_periodic(
                         &base_for_custodian,
                         account,
                         &uuid_s,
@@ -1438,6 +1890,26 @@ async fn tick_impl(
         // freshest local token; it just never asks Anthropic for a new one.
         if posture.is_follower() {
             record_follower_skip(cache, info.id, "anthropic", expires_at_ms, needs_refresh);
+            processed += 1;
+            continue;
+        }
+
+        // Duplicate-grant suppression: another slot holds this slot's refresh token and
+        // keeps refreshing it; presenting it here would rotate it out from under that
+        // slot. Held until `csq login` re-binds this slot (`clear_on_login`).
+        if let Some(holder) = suppressed_refresh.get(&info.id) {
+            crate::accounts::refresh_token_audit::warn_suppressed_throttled(
+                base_dir, info.id, *holder,
+            );
+            cache.set(
+                info.id,
+                RefreshStatus {
+                    account: info.id,
+                    last_result: REFRESH_SUPPRESSED_LABEL.to_string(),
+                    expires_at_ms,
+                    checked_at_secs: now_secs(),
+                },
+            );
             processed += 1;
             continue;
         }
@@ -1602,36 +2074,22 @@ async fn tick_impl(
         }
     }
 
-    // If any Anthropic token rotated this tick, mirror the fresh tokens into the
-    // keychain items CC reads (CC is keychain-first). Account-agnostic sweep; the
-    // newer-than-keychain guard no-ops unchanged dirs. Runs on a real
-    // refresh, or once after the keychain stops reading as locked; an idle
-    // tick pays one bounded lock-state probe and no `security` calls.
-    //
-    // Runs in `spawn_blocking`: the sweep shells one or more `security`
-    // subprocesses per live handle dir, synchronous but NOT unbounded — every
-    // `security` call it can issue is bounded at `KEYCHAIN_OP_TIMEOUT +
-    // MIN_POST_EXIT_GRACE` = 5.25s (see `write_raw`'s doc for the derivation),
-    // and each dir's own per-handle-dir lock wait is separately bounded at
-    // ~20.25s (`HANDLE_LOCK_BOUND_ATTEMPTS`'s doc) — so a single dir's worst
-    // case is bounded (lock wait + up to 3 bounded calls), but the SWEEP AS A
-    // WHOLE is unbounded in the number of live handle dirs it walks
-    // sequentially, so its total wall-clock scales with handle-dir count. The
-    // daemon runtime has only 2 worker threads — a direct call would tie up
-    // half the runtime and delay socket IPC (mirrors `run_held_sweep_tick`'s
-    // wrapper), which is why this still runs off the async runtime even
-    // though no individual step blocks forever.
-    // Also re-run the sweep once after a period in which keychain calls were
-    // skipped because the keychain was locked (see `run_security_bounded`):
-    // otherwise a mirror skipped while the screen was locked would wait for
-    // the account's next refresh, leaving CC on the previous token.
-    // The lock probe is a blocking OS call, so it runs inside the same
-    // spawn_blocking as the sweep (once per tick), never on a runtime worker.
+    // Mirror after refresh, unlock, restart catch-up or pending work. Healthy
+    // idle ticks only probe lock state; pending ticks can perform security calls.
+    // A ten-second scheduling budget forbids starting another operation after
+    // expiry. In-flight work is not cancelled: one lock can add up to 20.25s,
+    // or one RMW up to eight 5.25s security calls (42s), plus filesystem work
+    // whose latency is not bounded here. This is not a hard wall-clock limit.
+    // True lock/security timeouts are pending for a later tick, never doubled
+    // by an immediate retry. Blocking work stays off Tokio's runtime workers.
     {
         let sweep_base = base_dir.to_path_buf();
         let sweep_refreshed = refreshed;
         if let Err(e) = tokio::task::spawn_blocking(move || {
-            if any_anthropic_refreshed || crate::credentials::keychain::keychain_catch_up_due() {
+            if any_anthropic_refreshed
+                || crate::credentials::keychain::keychain_catch_up_due()
+                || crate::credentials::keychain::mirror_sync_retry_due(&sweep_base)
+            {
                 sync_refreshed_keychains(&sweep_base, &sweep_refreshed);
             }
         })
@@ -1780,11 +2238,747 @@ fn clear_cooldown(cooldowns: &Arc<Mutex<HashMap<u16, Instant>>>, account: u16) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn legacy_identity_loop_observes_shutdown_while_a_pass_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let stop = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(super::run_legacy_identity_loop_with(
+            dir.path().to_path_buf(),
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::daemon::legacy_identity::LegacyVerifier::default(),
+            )),
+            stop.clone(),
+            std::time::Duration::from_secs(3600),
+            std::sync::Arc::new(move |_, _, _| {
+                let _ = entered_tx.send(());
+                // Blocks like a slow profile request until the test releases it.
+                let _ = release_rx.lock().unwrap().recv();
+                crate::daemon::legacy_identity::LegacyVerificationSummary::default()
+            }),
+        ));
+        tokio::task::spawn_blocking(move || {
+            entered_rx.recv_timeout(std::time::Duration::from_secs(10))
+        })
+        .await
+        .unwrap()
+        .expect("the pass must start");
+        stop.cancel();
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+        let _ = release_tx.send(());
+        assert!(
+            joined.is_ok(),
+            "shutdown must not wait for a blocked legacy verification pass"
+        );
+    }
+
+    #[test]
+    fn pending_login_retry_cancellation_after_due_prevents_admission() {
+        let stop = CancellationToken::new();
+        let outcome = pending_mirror_retry_observed_admitted_with(
+            || true,
+            || {
+                stop.cancel();
+                true
+            },
+            || !stop.is_cancelled(),
+            || panic!("cancelled request must not admit actual mirror work"),
+        );
+        assert_eq!(outcome, MirrorRetryOutcome::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn pending_login_retry_shutdown_prevents_worker_admission() {
+        let stop = CancellationToken::new();
+        stop.cancel();
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = run_pending_mirror_retry_with(dir.path().to_path_buf(), stop, |_| {
+            panic!("shutdown must prevent worker sweep admission")
+        })
+        .await;
+        assert_eq!(result, MirrorRetryOutcome::Idle);
+    }
+
     use super::*;
     use crate::credentials::{AnthropicCredentialFile, CredentialFile, OAuthPayload};
     use crate::types::{AccessToken, RefreshToken};
     use std::sync::atomic::{AtomicU32, Ordering};
     use tempfile::TempDir;
+
+    #[derive(Clone, Debug, Default)]
+    struct MirrorRetryEvent(std::collections::BTreeMap<String, String>);
+
+    impl tracing::field::Visit for MirrorRetryEvent {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    struct MirrorRetryCapture(Arc<Mutex<Vec<MirrorRetryEvent>>>);
+
+    impl tracing::Subscriber for MirrorRetryCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::DEBUG
+        }
+        fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+            Some(tracing::metadata::LevelFilter::DEBUG)
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            assert_eq!(*event.metadata().level(), tracing::Level::DEBUG);
+            let mut captured = MirrorRetryEvent::default();
+            event.record(&mut captured);
+            self.0.lock().unwrap().push(captured);
+        }
+    }
+
+    fn capture_mirror_retry(run: impl FnOnce()) -> Vec<MirrorRetryEvent> {
+        // Keep the shared callsite/filter lock through scoped dispatcher drop.
+        let _capture_guard = crate::testing::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(MirrorRetryCapture(events.clone()), run);
+        Arc::try_unwrap(events).unwrap().into_inner().unwrap()
+    }
+
+    fn assert_mirror_retry_completion(event: &MirrorRetryEvent) {
+        assert_eq!(
+            event.0.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "deferred",
+                "elapsed_ms",
+                "event_kind",
+                "failed",
+                "lock_failed",
+                "lock_timed_out",
+                "malformed",
+                "message",
+                "pending",
+                "retry_requested",
+                "sessions_undetermined",
+                "skipped",
+                "synced",
+            ],
+            "completion logs fixed safe fields only"
+        );
+        assert_eq!(event.0["event_kind"], "cc_keychain_mirror_retry_completed");
+        assert_eq!(
+            event.0["message"],
+            "pending CC keychain mirror retry sweep completed"
+        );
+    }
+
+    #[test]
+    fn mirror_delivery_completion_warn_reports_admitted_backlog_drain() {
+        let pending = std::cell::Cell::new(28);
+        let events = capture_mirror_retry(|| {
+            let outcome = pending_mirror_retry_observed_with(
+                || pending.get() > 0,
+                || true,
+                || {
+                    assert_eq!(pending.replace(0), 28);
+                    crate::credentials::keychain::MirrorSyncStatus {
+                        synced: 28,
+                        ..Default::default()
+                    }
+                },
+            );
+            assert_eq!(outcome, MirrorRetryOutcome::Idle);
+        });
+        eprintln!("RETRY_COMPLETION_ASSERTION reached");
+        assert_eq!(
+            events.len(),
+            1,
+            "admitted drained retry must emit WARN completion"
+        );
+        assert_mirror_retry_completion(&events[0]);
+        assert_eq!(events[0].0["pending"], "0");
+        assert_eq!(events[0].0["synced"], "28");
+        assert_eq!(events[0].0["retry_requested"], "false");
+        assert_eq!(events[0].0["sessions_undetermined"], "false");
+    }
+
+    #[test]
+    fn mirror_delivery_completion_warn_reports_nonzero_backlog_and_safe_counts() {
+        let events = capture_mirror_retry(|| {
+            assert_eq!(
+                pending_mirror_retry_observed_with(
+                    || true,
+                    || true,
+                    || {
+                        crate::credentials::keychain::MirrorSyncStatus {
+                            pending: 28,
+                            synced: 1,
+                            skipped: 2,
+                            failed: 3,
+                            deferred: 4,
+                            lock_timed_out: 5,
+                            lock_failed: 6,
+                            malformed: 7,
+                            sessions_undetermined: true,
+                            ..Default::default()
+                        }
+                    }
+                ),
+                MirrorRetryOutcome::Progress
+            );
+        });
+        assert_eq!(events.len(), 1);
+        assert_mirror_retry_completion(&events[0]);
+        for (field, value) in [
+            ("pending", "28"),
+            ("synced", "1"),
+            ("skipped", "2"),
+            ("failed", "3"),
+            ("deferred", "4"),
+            ("lock_timed_out", "5"),
+            ("lock_failed", "6"),
+            ("malformed", "7"),
+            ("sessions_undetermined", "true"),
+            ("retry_requested", "true"),
+        ] {
+            assert_eq!(events[0].0[field], value, "field {field}");
+        }
+    }
+
+    #[test]
+    fn mirror_delivery_completion_warn_zero_with_retry_still_requested_is_unavailable() {
+        let events = capture_mirror_retry(|| {
+            assert_eq!(
+                pending_mirror_retry_observed_with(
+                    || true,
+                    || true,
+                    crate::credentials::keychain::MirrorSyncStatus::default
+                ),
+                MirrorRetryOutcome::Unavailable,
+                "zero counts with failed publication retain unavailable backoff"
+            );
+        });
+        assert_eq!(events.len(), 1);
+        assert_mirror_retry_completion(&events[0]);
+        assert_eq!(events[0].0["pending"], "0");
+        assert_eq!(events[0].0["retry_requested"], "true");
+    }
+
+    #[test]
+    fn mirror_delivery_completion_warn_absent_when_idle_or_not_due() {
+        let events = capture_mirror_retry(|| {
+            assert_eq!(
+                pending_mirror_retry_observed_with(
+                    || false,
+                    || panic!("idle must not check due"),
+                    || panic!("idle must not sweep")
+                ),
+                MirrorRetryOutcome::Idle
+            );
+            assert_eq!(
+                pending_mirror_retry_observed_with(
+                    || true,
+                    || false,
+                    || panic!("not due must not sweep")
+                ),
+                MirrorRetryOutcome::Unavailable
+            );
+        });
+        assert!(
+            events.is_empty(),
+            "no admitted sweep means no completion event"
+        );
+    }
+
+    #[test]
+    fn mirror_delivery_completion_warn_preserves_unknown_sessions() {
+        let requested = std::cell::Cell::new(true);
+        let events = capture_mirror_retry(|| {
+            assert_eq!(
+                pending_mirror_retry_observed_with(
+                    || requested.get(),
+                    || true,
+                    || {
+                        requested.set(false);
+                        crate::credentials::keychain::MirrorSyncStatus {
+                            sessions_undetermined: true,
+                            ..Default::default()
+                        }
+                    }
+                ),
+                MirrorRetryOutcome::Idle
+            );
+        });
+        assert_eq!(events.len(), 1);
+        assert_mirror_retry_completion(&events[0]);
+        assert_eq!(events[0].0["pending"], "0");
+        assert_eq!(events[0].0["retry_requested"], "false");
+        assert_eq!(events[0].0["sessions_undetermined"], "true");
+    }
+
+    #[tokio::test]
+    async fn mirror_delivery_wait_retries_with_backoff_without_resetting_provider_deadline() {
+        let clock = std::cell::Cell::new(Duration::ZERO);
+        let calls = std::cell::RefCell::new(Vec::new());
+        let shutdown = CancellationToken::new();
+        assert!(
+            wait_for_refresh_with_mirror_retry(
+                &mut MirrorRetrySchedule::new(),
+                &shutdown,
+                REFRESH_INTERVAL,
+                WAKE_PROBE_INTERVAL,
+                &|| clock.get(),
+                &|| std::time::UNIX_EPOCH + clock.get(),
+                &|chunk| {
+                    clock.set(clock.get() + chunk);
+                    std::future::ready(())
+                },
+                &|| async {
+                    calls.borrow_mut().push(clock.get());
+                    MirrorRetryOutcome::Unavailable
+                },
+            )
+            .await
+        );
+        assert_eq!(
+            *calls.borrow(),
+            vec![
+                Duration::from_secs(30),
+                Duration::from_secs(90),
+                Duration::from_secs(210)
+            ]
+        );
+        assert_eq!(clock.get(), REFRESH_INTERVAL);
+        // No extra attempt at the provider deadline, including a sleep/wake jump.
+        calls.borrow_mut().clear();
+        clock.set(Duration::ZERO);
+        assert!(
+            wait_for_refresh_with_mirror_retry(
+                &mut MirrorRetrySchedule::new(),
+                &shutdown,
+                REFRESH_INTERVAL,
+                WAKE_PROBE_INTERVAL,
+                &|| clock.get(),
+                &|| std::time::UNIX_EPOCH + clock.get(),
+                &|_| async {
+                    clock.set(REFRESH_INTERVAL);
+                },
+                &|| async {
+                    panic!("provider deadline already due");
+                },
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn mirror_delivery_backoff_survives_multiple_provider_waits() {
+        let clock = std::cell::Cell::new(Duration::ZERO);
+        let calls = std::cell::RefCell::new(Vec::new());
+        let shutdown = CancellationToken::new();
+        let mut retry = MirrorRetrySchedule::new();
+        for expected in [vec![30, 90, 210], vec![240], vec![]] {
+            clock.set(Duration::ZERO);
+            calls.borrow_mut().clear();
+            assert!(
+                wait_for_refresh_with_mirror_retry(
+                    &mut retry,
+                    &shutdown,
+                    REFRESH_INTERVAL,
+                    WAKE_PROBE_INTERVAL,
+                    &|| clock.get(),
+                    &|| std::time::UNIX_EPOCH + clock.get(),
+                    &|chunk| {
+                        clock.set(clock.get() + chunk);
+                        std::future::ready(())
+                    },
+                    &|| async {
+                        calls.borrow_mut().push(clock.get().as_secs());
+                        MirrorRetryOutcome::Unavailable
+                    },
+                )
+                .await
+            );
+            assert_eq!(*calls.borrow(), expected);
+        }
+        let status = crate::credentials::keychain::MirrorSyncStatus {
+            pending: 1,
+            synced: 1,
+            updated_at_unix_ms: 20,
+            ..Default::default()
+        };
+        assert!(!mirror_backoff_reset_due(true, Some(&status), 21));
+        assert!(mirror_backoff_reset_due(true, Some(&status), 20));
+        assert!(mirror_backoff_reset_due(false, None, 21));
+        assert!(!mirror_backoff_reset_due(true, None, 21));
+    }
+
+    #[tokio::test]
+    async fn mirror_delivery_progress_serializes_without_moving_provider_deadline() {
+        let clock = std::cell::Cell::new(Duration::ZERO);
+        let active = std::cell::Cell::new(false);
+        let calls = std::cell::RefCell::new(Vec::new());
+        assert!(
+            wait_for_refresh_with_mirror_retry(
+                &mut MirrorRetrySchedule::new(),
+                &CancellationToken::new(),
+                Duration::from_secs(110),
+                WAKE_PROBE_INTERVAL,
+                &|| clock.get(),
+                &|| std::time::UNIX_EPOCH + clock.get(),
+                &|chunk| {
+                    clock.set(clock.get() + chunk);
+                    std::future::ready(())
+                },
+                &|| async {
+                    assert!(!active.replace(true), "overlapping mirror attempts");
+                    calls.borrow_mut().push(clock.get().as_secs());
+                    tokio::task::yield_now().await;
+                    clock.set(clock.get() + Duration::from_secs(12));
+                    active.set(false);
+                    MirrorRetryOutcome::Progress
+                },
+            )
+            .await
+        );
+        assert_eq!(*calls.borrow(), vec![30, 72]);
+        assert_eq!(clock.get(), Duration::from_secs(110));
+        assert!(!active.get(), "normal tick must see no mirror in flight");
+    }
+
+    #[test]
+    fn mirror_delivery_backoff_caps_and_progress_resets() {
+        let mut retry = MirrorRetrySchedule::new();
+        let mut clock = Duration::ZERO;
+        for seconds in [60, 120, 240, 300, 300] {
+            retry.completed(clock, MirrorRetryOutcome::Unavailable);
+            assert_eq!(retry.delay, Duration::from_secs(seconds));
+            clock = retry.next;
+        }
+        retry.completed(clock, MirrorRetryOutcome::Progress);
+        assert_eq!(retry.next - clock, WAKE_PROBE_INTERVAL);
+        retry.completed(clock, MirrorRetryOutcome::Idle);
+        assert_eq!(retry.delay, WAKE_PROBE_INTERVAL);
+    }
+
+    #[test]
+    fn mirror_delivery_idle_and_locked_do_not_sweep() {
+        assert_eq!(
+            pending_mirror_retry_with(
+                || false,
+                || panic!("idle must not probe lock state"),
+                || panic!("idle must not sweep")
+            ),
+            MirrorRetryOutcome::Idle
+        );
+        assert_eq!(
+            pending_mirror_retry_with(|| true, || false, || panic!("locked must not sweep")),
+            MirrorRetryOutcome::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn mirror_delivery_wait_serializes_attempts_and_drains_on_shutdown() {
+        let clock = std::cell::Cell::new(Duration::ZERO);
+        let active = Arc::new(AtomicU32::new(0));
+        let completed = Arc::new(AtomicU32::new(0));
+        let shutdown = CancellationToken::new();
+        let outcome = wait_for_refresh_with_mirror_retry(
+            &mut MirrorRetrySchedule::new(),
+            &shutdown,
+            REFRESH_INTERVAL,
+            WAKE_PROBE_INTERVAL,
+            &|| clock.get(),
+            &|| std::time::UNIX_EPOCH + clock.get(),
+            &|chunk| {
+                clock.set(clock.get() + chunk);
+                std::future::ready(())
+            },
+            &|| async {
+                assert_eq!(
+                    active.fetch_add(1, Ordering::SeqCst),
+                    0,
+                    "overlapping sweep"
+                );
+                let active_c = Arc::clone(&active);
+                let completed_c = Arc::clone(&completed);
+                let shutdown_c = shutdown.clone();
+                tokio::task::spawn_blocking(move || {
+                    shutdown_c.cancel();
+                    assert_eq!(active_c.load(Ordering::SeqCst), 1);
+                    completed_c.fetch_add(1, Ordering::SeqCst);
+                    active_c.fetch_sub(1, Ordering::SeqCst);
+                })
+                .await
+                .unwrap();
+                MirrorRetryOutcome::Progress
+            },
+        )
+        .await;
+        assert!(!outcome);
+        assert_eq!(
+            active.load(Ordering::SeqCst),
+            0,
+            "blocking sweep detached on shutdown"
+        );
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        assert!(
+            !wait_for_refresh_with_mirror_retry(
+                &mut MirrorRetrySchedule::new(),
+                &shutdown,
+                REFRESH_INTERVAL,
+                WAKE_PROBE_INTERVAL,
+                &|| Duration::ZERO,
+                &|| std::time::UNIX_EPOCH,
+                &|_| async {
+                    panic!("shutdown must not wait");
+                },
+                &|| async {
+                    panic!("shutdown must not start a sweep");
+                },
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn mirror_delivery_supervisor_timeout_preserves_cross_session_sweep_gate() {
+        use tokio::sync::oneshot;
+
+        // Release the admitted operation on assertion failure too: Tokio cannot
+        // abort spawn_blocking, and runtime teardown waits for blocking workers.
+        struct ReleaseOnDrop(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_old = ReleaseOnDrop(Some(release_tx));
+        let (old_entered_tx, old_entered_rx) = oneshot::channel();
+        let (old_done_tx, old_done_rx) = oneshot::channel();
+        let old_refresher = tokio::spawn(async move {
+            let outcome = tokio::task::spawn_blocking(move || {
+                // Same helper as the extra pending path, with private native I/O.
+                pending_mirror_retry_with(
+                    || true,
+                    || true,
+                    || {
+                        with_mirror_sweep_gate(|| {
+                            old_entered_tx.send(()).unwrap();
+                            release_rx.recv().unwrap();
+                            crate::credentials::keychain::MirrorSyncStatus::default()
+                        })
+                    },
+                )
+            })
+            .await
+            .unwrap();
+            assert_eq!(outcome, MirrorRetryOutcome::Idle);
+            old_done_tx.send(()).unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(5), old_entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        // Execute the actual production teardown route with a short fixture
+        // deadline. The old subsystem cannot finish while its operation is held.
+        crate::daemon::supervise::drain_subsystems(
+            vec![("refresher", old_refresher)],
+            Duration::from_millis(1),
+        )
+        .await;
+
+        let (contended_tx, contended_rx) = oneshot::channel();
+        let (new_entered_tx, mut new_entered_rx) = oneshot::channel();
+        let new_refresher = tokio::task::spawn_blocking(move || {
+            // Establish real lock contention before observing non-entry; no
+            // scheduler sleep is used to guess whether this worker started.
+            let contended = matches!(
+                MIRROR_SWEEP_GATE.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            contended_tx.send(contended).unwrap();
+            // Normal-tick and panic-recovery sweeps use this same gate.
+            with_mirror_sweep_gate(|| new_entered_tx.send(()).unwrap());
+        });
+        let contended = tokio::time::timeout(Duration::from_secs(5), contended_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        eprintln!("S-M2 causal marker: supervisor detached old worker; contention={contended}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut new_entered_rx)
+                .await
+                .is_err(),
+            "new session entered native mirror operation before detached old sweep completed"
+        );
+        assert!(contended, "fixture must establish actual gate contention");
+        drop(release_old);
+        tokio::time::timeout(Duration::from_secs(5), new_entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        new_refresher.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), old_done_rx)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn mirror_delivery_sweep_gate_recovers_after_panic() {
+        assert!(std::panic::catch_unwind(|| {
+            with_mirror_sweep_gate(|| panic!("private sweep panic fixture"));
+        })
+        .is_err());
+        // Another parallel fixture may already have recovered the poison. The
+        // relevant contract is that subsequent work enters and completes.
+        assert_eq!(with_mirror_sweep_gate(|| 42), 42);
+        assert!(!MIRROR_SWEEP_GATE.is_poisoned());
+    }
+
+    #[test]
+    fn mirror_delivery_missing_corrupt_follower_posture_keeps_provider_http_cadence() {
+        let _env = crate::platform::test_env::lock();
+        // Env precedes tracing. The awaited blocking sweep never takes this
+        // lock: this parent scope protects its uncaptured first callsite hit.
+        let _capture_guard = crate::testing::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for posture in ["missing", "corrupt", "follower"] {
+                    let base = TempDir::new().unwrap();
+                    install_account(base.path(), 1, 0);
+                    match posture {
+                        "follower" => crate::daemon::posture::save(
+                            base.path(),
+                            crate::daemon::posture::DaemonPosture::Follower,
+                        )
+                        .unwrap(),
+                        "corrupt" => std::fs::write(
+                            crate::daemon::posture::posture_path(base.path()),
+                            "not-json",
+                        )
+                        .unwrap(),
+                        _ => (),
+                    }
+                    let requests = Arc::new(AtomicU32::new(0));
+                    let codex_requests = Arc::new(AtomicU32::new(0));
+                    let http = counting_success(Arc::clone(&requests));
+                    let codex = noop_codex_http(Arc::clone(&codex_requests));
+                    tick_impl(
+                        base.path(),
+                        &http,
+                        &codex,
+                        &Arc::new(TtlCache::with_default_age()),
+                        &Arc::new(Mutex::new(HashMap::new())),
+                        &Arc::new(Mutex::new(HashMap::new())),
+                        false,
+                    )
+                    .await;
+                    let expected = u32::from(posture == "missing");
+                    assert_eq!(requests.load(Ordering::SeqCst), expected);
+                    // Existing policy gates provider refreshes, not mirror sweeps. Seed
+                    // pending AFTER the normal tick to exercise the production wakeup.
+                    let handle = base.path().join(format!("term-{}", std::process::id()));
+                    std::fs::create_dir(&handle).unwrap();
+                    let pending = crate::credentials::keychain::MirrorSyncStatus {
+                        failed: 1,
+                        pending: 1,
+                        sessions_undetermined: true,
+                        updated_at_unix_ms: crate::credentials::keychain::now_ms(),
+                        ..Default::default()
+                    };
+                    std::fs::write(
+                        base.path().join(".keychain-mirror-sync.json"),
+                        serde_json::to_vec(&pending).unwrap(),
+                    )
+                    .unwrap();
+                    let before = sync_refreshed_keychains_call_count_for_test(base.path());
+                    let clock = std::cell::Cell::new(Duration::ZERO);
+                    let mut schedule = MirrorRetrySchedule::new();
+                    // Hold the process-wide sweep gate across the timed wait: a
+                    // legitimate production state (a parallel session's sweep is
+                    // in flight), and exactly what full-parallel CI supplies. With
+                    // the gate held, the production NON-blocking admission returns
+                    // `Unavailable` and backs off (correct: the sweeps are
+                    // serialized), so asserting the admitted-once contract from
+                    // that entry would depend on which parallel test happens to be
+                    // sweeping when the fake clock runs. Driving the same
+                    // admission body under this held gate exercises the
+                    // pending-wake contract deterministically; the contended
+                    // non-blocking entry itself is covered by
+                    // `mirror_delivery_sweep_gate_recovers_after_panic` and the
+                    // supervisor-timeout gate fixture.
+                    let (held_tx, held_rx) = std::sync::mpsc::channel();
+                    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+                    let holder = std::thread::spawn(move || {
+                        let _guard = MIRROR_SWEEP_GATE
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        held_tx.send(()).unwrap();
+                        let _ = release_rx.recv();
+                    });
+                    held_rx.recv().unwrap();
+                    assert!(
+                        wait_for_refresh_with_mirror_retry(
+                            &mut schedule,
+                            &CancellationToken::new(),
+                            REFRESH_INTERVAL,
+                            WAKE_PROBE_INTERVAL,
+                            &|| clock.get(),
+                            &|| std::time::UNIX_EPOCH + clock.get(),
+                            &|chunk| {
+                                clock.set(clock.get() + chunk);
+                                std::future::ready(())
+                            },
+                            &|| {
+                                std::future::ready(pending_mirror_retry_locked(
+                                    base.path(),
+                                    &CancellationToken::new(),
+                                    pending_mirror_retry_sweep,
+                                ))
+                            },
+                        )
+                        .await
+                    );
+                    drop(release_tx);
+                    holder.join().unwrap();
+                    assert_eq!(
+                        sync_refreshed_keychains_call_count_for_test(base.path()),
+                        before + 1,
+                        "pending wakes once, then idle stops sweeping"
+                    );
+                    assert_eq!(
+                        requests.load(Ordering::SeqCst),
+                        expected,
+                        "mirror retry must never make provider HTTP calls"
+                    );
+                    assert_eq!(codex_requests.load(Ordering::SeqCst), 0);
+                    assert_eq!(
+                        crate::credentials::keychain::read_mirror_sync_status(base.path())
+                            .unwrap()
+                            .pending,
+                        0
+                    );
+                }
+            });
+    }
 
     #[test]
     fn sync_refreshed_keychains_is_noop_without_handle_dirs() {
@@ -1795,6 +2989,70 @@ mod tests {
         let dir = TempDir::new().unwrap();
         sync_refreshed_keychains(dir.path(), &std::collections::HashMap::new());
         // must not panic / touch keychain
+    }
+
+    #[tokio::test]
+    async fn mirror_retry_pending_is_swept_on_idle_tick_then_stops() {
+        let base = TempDir::new().unwrap();
+        let handle = base.path().join(format!("term-{}", std::process::id()));
+        std::fs::create_dir(&handle).unwrap();
+        std::fs::write(handle.join(".live-pid"), std::process::id().to_string()).unwrap();
+        let pending = crate::credentials::keychain::MirrorSyncStatus {
+            lock_timed_out: 1,
+            pending: 1,
+            updated_at_unix_ms: crate::credentials::keychain::now_ms(),
+            ..Default::default()
+        };
+        std::fs::write(
+            base.path().join(".keychain-mirror-sync.json"),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        let cache = Arc::new(TtlCache::with_default_age());
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+        install_account(base.path(), 1, 9_999_999_999_999);
+        let requests = Arc::new(AtomicU32::new(0));
+        let http = counting_success(Arc::clone(&requests));
+        let codex = noop_codex_http(Arc::new(AtomicU32::new(0)));
+        tick_impl(
+            base.path(),
+            &http,
+            &codex,
+            &cache,
+            &cooldowns,
+            &backoffs,
+            false,
+        )
+        .await;
+        assert_eq!(sync_refreshed_keychains_call_count_for_test(base.path()), 1);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "valid idle slot must not refresh"
+        );
+        assert_eq!(
+            crate::credentials::keychain::read_mirror_sync_status(base.path())
+                .unwrap()
+                .pending,
+            0
+        );
+        tick_impl(
+            base.path(),
+            &http,
+            &codex,
+            &cache,
+            &cooldowns,
+            &backoffs,
+            false,
+        )
+        .await;
+        assert_eq!(sync_refreshed_keychains_call_count_for_test(base.path()), 1);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "valid idle slot must not refresh"
+        );
     }
 
     /// `next_wait_chunk` caps the sub-sleep at `probe`, returns the short tail
@@ -1906,7 +3164,9 @@ mod tests {
             claude_ai_oauth: OAuthPayload {
                 access_token: AccessToken::new(access.into()),
                 refresh_token: RefreshToken::new(refresh.into()),
-                expires_at: expires_at_ms,
+                // An expired, authority-bearing pair still has a real timestamp;
+                // zero is the missing-expiry representation, not an expired grant.
+                expires_at: expires_at_ms.max(1),
                 scopes: vec![],
                 subscription_type: None,
                 rate_limit_tier: None,
@@ -1914,6 +3174,141 @@ mod tests {
             },
             extra: Default::default(),
         })
+    }
+
+    #[tokio::test]
+    async fn org_identity_regression_daemon_legacy_pass_upgrades_same_uuid_and_retains_backoff() {
+        use crate::accounts::{anthropic_identity as ai, identity_store, profiles};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        for different_email in [false, true] {
+            let base = TempDir::new().unwrap();
+            let config = base.path().join("config-1");
+            std::fs::create_dir(&config).unwrap();
+            std::fs::write(config.join(".csq-account"), "1").unwrap();
+            let account = AccountNum::try_from(1u16).unwrap();
+            let credential = make_creds("legacy-pass-at", "legacy-pass-rt", 4102444800000);
+            credentials::save(
+                &cred_file::canonical_path(base.path(), account),
+                &credential,
+            )
+            .unwrap();
+            // Pass 0 discovers the OAuth email from native login output, not
+            // the retired display-only profiles accounts map.
+            let mut native_login = serde_json::to_value(&credential).unwrap();
+            native_login["oauthAccount"] = serde_json::json!({
+                "emailAddress": "legacy-pass@test.invalid"
+            });
+            std::fs::write(
+                config.join(".credentials.json"),
+                serde_json::to_vec(&native_login).unwrap(),
+            )
+            .unwrap();
+            let path = profiles::profiles_path(base.path());
+            let mut profile = profiles::ProfilesFile::empty();
+            profile.set_profile(
+                1,
+                profiles::AccountProfile {
+                    email: "legacy-pass@test.invalid".into(),
+                    method: "oauth".into(),
+                    extra: Default::default(),
+                },
+            );
+            profiles::save(&path, &profile).unwrap();
+            // Actual Pass-0 writes the legacy metadata, without a Known commit
+            // or a context-index row. Stage its ordinary canonical file next.
+            let minted = crate::daemon::identity_mint::run_if_unsentineled(base.path()).unwrap();
+            assert_eq!(minted.slots_fresh, 1);
+            let identity = profiles::resolve_slot_to_uuid(base.path(), 1).unwrap();
+            let canonical = identity_store::credentials_path_for(base.path(), identity);
+            credentials::save(&canonical, &credential).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                for dir in [
+                    base.path().join("identities"),
+                    canonical.parent().unwrap().to_path_buf(),
+                ] {
+                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+                }
+            }
+            assert!(matches!(
+                ai::read_stored_anthropic_context(base.path(), identity).unwrap(),
+                ai::StoredAnthropicContext::LegacyUnknown
+            ));
+            assert!(profiles::load(&path).unwrap().anthropic_contexts.is_empty());
+            let canonical_before = std::fs::read(&canonical).unwrap();
+            let metadata = identity_store::identity_json_path_for(base.path(), identity);
+            let metadata_before = std::fs::read(&metadata).unwrap();
+            let profiles_before = std::fs::read(&path).unwrap();
+            let calls = Arc::new(AtomicU32::new(0));
+            let calls_http = Arc::clone(&calls);
+            let http: crate::daemon::usage_poller::HttpGetFn = Arc::new(
+                move |url, token, headers| {
+                    assert_eq!(url, "https://api.anthropic.com/api/oauth/profile");
+                    assert_eq!(token, "legacy-pass-at");
+                    assert_eq!(headers, &[("anthropic-beta", "oauth-2025-04-20")]);
+                    calls_http.fetch_add(1, Ordering::SeqCst);
+                    Ok((200, serde_json::to_vec(&serde_json::json!({
+                    "account": {"uuid": "11111111-1111-4111-8111-111111111111",
+                        "email": if different_email {"foreign@test.invalid"} else {"legacy-pass@test.invalid"}},
+                    "organization": {"uuid": "22222222-2222-4222-8222-222222222222"}
+                })).unwrap()))
+                },
+            );
+            let verifier = Arc::new(Mutex::new(
+                crate::daemon::legacy_identity::LegacyVerifier::default(),
+            ));
+            let now = Instant::now();
+            let source = base.path().to_path_buf();
+            let first_http = Arc::clone(&http);
+            let first = run_legacy_identity_tick_with(
+                source.clone(),
+                Arc::clone(&verifier),
+                move |v, base, budget| {
+                    assert_eq!(budget, 2);
+                    v.tick_with(base, budget, now, &first_http)
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(first.attempted, 1);
+            assert_eq!(first.upgraded, usize::from(!different_email));
+            assert_eq!(first.refused, usize::from(different_email));
+            assert_eq!(std::fs::read(&canonical).unwrap(), canonical_before);
+            assert_eq!(
+                profiles::resolve_slot_to_uuid(base.path(), 1),
+                Some(identity)
+            );
+            if different_email {
+                assert_eq!(std::fs::read(&metadata).unwrap(), metadata_before);
+                assert_eq!(std::fs::read(&path).unwrap(), profiles_before);
+            } else {
+                let ai::StoredAnthropicContext::Known(context) =
+                    ai::read_stored_anthropic_context(base.path(), identity).unwrap()
+                else {
+                    panic!("daemon must upgrade the existing UUID's context");
+                };
+                assert_eq!(context.email(), "legacy-pass@test.invalid");
+                assert_eq!(
+                    profiles::load(&path).unwrap().anthropic_contexts[0].identity_uuid,
+                    identity
+                );
+            }
+            let second = run_legacy_identity_tick_with(
+                source,
+                Arc::clone(&verifier),
+                move |v, base, budget| v.tick_with(base, budget, now, &http),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                second.attempted, 0,
+                "Known skips; rejected grant remains in negative cache"
+            );
+            assert_eq!(second.deferred, usize::from(different_email));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(std::fs::read(&canonical).unwrap(), canonical_before);
+        }
     }
 
     fn install_account(base: &std::path::Path, account: u16, expires_at_ms: u64) {
@@ -1936,6 +3331,36 @@ mod tests {
         let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(account);
         let uuid_path = crate::accounts::identity_store::credentials_path_for(base, uuid);
         std::fs::create_dir_all(uuid_path.parent().unwrap()).unwrap();
+        crate::platform::fs::secure_dir(&base.join("identities")).unwrap();
+        crate::platform::fs::secure_dir(uuid_path.parent().unwrap()).unwrap();
+        let email = format!("refresh-{account}@example.test");
+        let account_uuid = uuid::Uuid::from_u128(0x1000 + u128::from(account));
+        let organization_uuid = uuid::Uuid::from_u128(0x2000 + u128::from(account));
+        let metadata = uuid_path.parent().unwrap().join("identity.json");
+        std::fs::write(
+            &metadata,
+            serde_json::to_vec(&serde_json::json!({
+                "provider": "anthropic", "email": email,
+                "account_uuid": account_uuid, "organization_uuid": organization_uuid,
+                "created_at": "fixture", "key_id": null,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        crate::platform::fs::secure_file(&metadata).unwrap();
+        let path = crate::accounts::profiles::profiles_path(base);
+        let mut pf = crate::accounts::profiles::load(&path).unwrap();
+        pf.anthropic_contexts
+            .retain(|entry| entry.identity_uuid != uuid);
+        pf.anthropic_contexts
+            .push(crate::accounts::anthropic_identity::AnthropicContextEntry {
+                email,
+                account_uuid,
+                organization_uuid,
+                identity_uuid: uuid,
+                extra: Default::default(),
+            });
+        crate::accounts::profiles::save(&path, &pf).unwrap();
         credentials::save(&uuid_path, &creds).unwrap();
     }
 
@@ -1987,6 +3412,10 @@ mod tests {
         let uuid_codex_path =
             crate::accounts::identity_store::credentials_codex_path_for(base, uuid);
         std::fs::create_dir_all(uuid_codex_path.parent().unwrap()).unwrap();
+        crate::platform::fs::secure_dir(&base.join("identities")).unwrap();
+        crate::platform::fs::secure_dir(uuid_codex_path.parent().unwrap()).unwrap();
+        crate::platform::fs::write_new_private(&uuid_codex_path.parent().unwrap().join("identity.json"),
+            &serde_json::to_vec(&serde_json::json!({"provider":"codex", "email":format!("codex-{account}@example.test"), "created_at":"fixture", "key_id":null})).unwrap()).unwrap();
         credentials::save(&uuid_codex_path, &creds).unwrap();
     }
 
@@ -2001,11 +3430,18 @@ mod tests {
         })
     }
 
-    /// Mock HTTP closure that always fails.
+    /// Mock HTTP closure that always fails with a PROVIDER rejection, in the
+    /// shape production actually sees it: `post_json_node` returns the
+    /// response body on any HTTP status ("the caller classifies the
+    /// response"), so a 401 arrives as `Ok(body)`, never as a transport
+    /// `Err`. The `Err` channel is reserved for LOCAL transport failures,
+    /// which `broker_check` classifies as an unknown provider outcome
+    /// (D237 ruling F) rather than a re-login condition. Mirrored by
+    /// `refresh::check::tests::mock_refresh_failure`.
     fn counting_failure(counter: Arc<AtomicU32>) -> HttpPostFn {
         Arc::new(move |_url: &str, _body: &str| {
             counter.fetch_add(1, Ordering::SeqCst);
-            Err("401 Unauthorized".to_string())
+            Ok(br#"{"error":{"type":"invalid_grant"}}"#.to_vec())
         })
     }
 
@@ -3649,5 +5085,202 @@ mod tests {
             crate::audit::outbox_paths::read_outbox_drain_stamp(base).is_some(),
             "tick stamps the drain cycle"
         );
+    }
+
+    /// F5/L3: `install_account` gives every slot the same refresh token, so slots 1 and 2
+    /// share one grant. After the startup audit, the tick presents it for slot 1 only.
+    #[tokio::test]
+    async fn tick_refreshes_only_the_holder_of_a_shared_refresh_grant_until_login_clears() {
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1, 0);
+        install_account(dir.path(), 2, 0);
+        crate::accounts::refresh_token_audit::run_startup_audit(dir.path());
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = counting_success(Arc::clone(&counter));
+        let cache = Arc::new(TtlCache::with_default_age());
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+        let codex = noop_codex_http(Arc::new(AtomicU32::new(0)));
+
+        tick(dir.path(), &http, &codex, &cache, &cooldowns, &backoffs).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "exactly one holder of the shared grant may refresh"
+        );
+        assert_eq!(cache.get(&1).unwrap().last_result, "refreshed");
+        assert_eq!(cache.get(&2).unwrap().last_result, REFRESH_SUPPRESSED_LABEL);
+
+        // The successful login of slot 2 lifts its suppression.
+        crate::accounts::refresh_token_audit::clear_on_login(dir.path(), 2);
+        tick(dir.path(), &http, &codex, &cache, &cooldowns, &backoffs).await;
+        assert_eq!(cache.get(&2).unwrap().last_result, "refreshed");
+    }
+
+    /// r6 L-2: the per-tick suppression warning is per slot and per window, not per tick.
+    /// Slot 1 holds; slots 2 and 3 are suppressed. Four ticks warn once for each.
+    #[test]
+    fn tick_warns_once_per_suppressed_slot_per_window() {
+        #[derive(Clone, Default)]
+        struct Kinds(Arc<Mutex<Vec<String>>>);
+        struct V<'a>(&'a mut String);
+        impl tracing::field::Visit for V<'_> {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!("{}={v:?} ", f.name()));
+            }
+        }
+        impl tracing::Subscriber for Kinds {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut line = String::new();
+                event.record(&mut V(&mut line));
+                self.0.lock().unwrap().push(line);
+            }
+        }
+        let _capture_guard = crate::testing::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new().unwrap();
+        for s in [1, 2, 3] {
+            install_account(dir.path(), s, 0);
+        }
+        crate::accounts::refresh_token_audit::run_startup_audit(dir.path());
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = counting_success(Arc::clone(&counter));
+        let cache = Arc::new(TtlCache::with_default_age());
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+        let codex = noop_codex_http(Arc::new(AtomicU32::new(0)));
+        let sink = Kinds::default();
+        let guard = tracing::subscriber::set_default(sink.clone());
+        // Other refresher and broker tests reach the SAME warning callsite without taking
+        // the capture lock. If one of them makes its first hit on a thread with no
+        // dispatcher while this capture is the only live one, tracing caches the callsite as
+        // disabled and every event below is dropped (the suite-only flake: zero lines for a
+        // slot). Register the callsite from this thread and rebuild any interest another
+        // thread cached, then discard what the priming call captured.
+        crate::testing::settle_capture_interest(|| {
+            crate::accounts::refresh_token_audit::warn_suppressed_throttled(dir.path(), 99, 1);
+        });
+        sink.0.lock().unwrap().clear();
+        // The capture lock is held for the whole body, so the awaits run on a private
+        // current-thread runtime inside a sync test (no guard crosses an await point).
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for _ in 0..4 {
+                    tick(dir.path(), &http, &codex, &cache, &cooldowns, &backoffs).await;
+                }
+            });
+        drop(guard);
+        let lines = sink.0.lock().unwrap().clone();
+        for slot in ["2", "3"] {
+            let n = lines
+                .iter()
+                .filter(|l| {
+                    l.contains("refresh_suppressed_duplicate_grant")
+                        && l.contains(&format!("account={slot} "))
+                })
+                .count();
+            assert_eq!(n, 1, "slot {slot}: {lines:?}");
+        }
+    }
+
+    /// r7 item 1 (sec M2a): a move lands between the tick's suppression snapshot and a later
+    /// account's `broker_check`. The suppressed identity now sits at a number the snapshot
+    /// does not list; the check where the token is presented still refuses it.
+    #[tokio::test]
+    async fn tick_never_presents_a_suppressed_identity_that_moved_after_the_snapshot() {
+        let dir = TempDir::new().unwrap();
+        for s in [1u16, 2, 3] {
+            install_account(dir.path(), s, 0);
+        }
+        // Slot 3 gets its own grant: slots 1 and 2 share one, 3 is clean.
+        let id3 = crate::testing::identity_fixtures::fixture_uuid_for_slot(3);
+        credentials::save(
+            &crate::accounts::identity_store::credentials_path_for(dir.path(), id3),
+            &make_creds("at3", "rt3", 0),
+        )
+        .unwrap();
+        crate::accounts::refresh_token_audit::run_startup_audit(dir.path());
+        assert!(crate::accounts::refresh_token_audit::is_refresh_suppressed(
+            dir.path(),
+            2
+        ));
+        assert!(!crate::accounts::refresh_token_audit::is_refresh_suppressed(dir.path(), 3));
+
+        // Slot 1's refresh call (the only POST that may happen) swaps the bindings of slots 2
+        // and 3 under the profiles lock, as a `csq move` does, AFTER the tick's snapshot.
+        let counter = Arc::new(AtomicU32::new(0));
+        let swap_base = dir.path().to_path_buf();
+        let seen = Arc::clone(&counter);
+        let http: HttpPostFn = Arc::new(move |_url: &str, _body: &str| {
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                let lock =
+                    crate::accounts::profiles_lock::ProfilesFileLock::acquire(&swap_base).unwrap();
+                crate::accounts::profiles::swap_slot_mapping(&lock, &swap_base, 2, 3).unwrap();
+            }
+            Ok(
+                br#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":18000}"#
+                    .to_vec(),
+            )
+        });
+        let cache = Arc::new(TtlCache::with_default_age());
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+        let codex = noop_codex_http(Arc::new(AtomicU32::new(0)));
+        tick(dir.path(), &http, &codex, &cache, &cooldowns, &backoffs).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "only slot 1's holder grant is presented; the moved suppressed identity is not"
+        );
+    }
+
+    /// r7 item 3 (corr L-2): a failed startup persist leaves the brake engaged for every tick
+    /// and the persist is retried until it succeeds.
+    #[tokio::test]
+    async fn tick_keeps_a_failed_startup_persist_engaged_and_retries_it() {
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1, 0);
+        install_account(dir.path(), 2, 0);
+        crate::accounts::refresh_token_audit::fail_state_writes_for_test(dir.path(), true);
+        crate::accounts::refresh_token_audit::run_startup_audit(dir.path());
+        let state = dir.path().join("refresh-suppressed.json");
+        assert!(!state.exists(), "the injected write failure left no file");
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = counting_success(Arc::clone(&counter));
+        let cache = Arc::new(TtlCache::with_default_age());
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+        let codex = noop_codex_http(Arc::new(AtomicU32::new(0)));
+        tick(dir.path(), &http, &codex, &cache, &cooldowns, &backoffs).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "the unpersisted first detection still suppresses slot 2"
+        );
+        assert!(!state.exists(), "the persist is still failing");
+
+        crate::accounts::refresh_token_audit::fail_state_writes_for_test(dir.path(), false);
+        tick(dir.path(), &http, &codex, &cache, &cooldowns, &backoffs).await;
+        assert!(state.exists(), "the next tick retried the persist");
+        assert!(crate::accounts::refresh_token_audit::is_refresh_suppressed(
+            dir.path(),
+            2
+        ));
     }
 }

@@ -12,8 +12,8 @@
 
 #![cfg(unix)]
 
-#[path = "../src/daemon/test_socket_fixture.rs"]
-mod test_socket_fixture;
+#[path = "../src/testing/socket_fixture.rs"]
+mod socket_fixture;
 
 use csq_core::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
 use csq_core::daemon::{
@@ -28,12 +28,12 @@ use csq_core::providers::gemini::capture::{
 use csq_core::providers::gemini::provisioning::{write_binding, AuthMode, GeminiBinding};
 use csq_core::quota::state as quota_state;
 use csq_core::types::{AccessToken, AccountNum, RefreshToken};
+use socket_fixture::{UnixSocketFixture, UnixSocketPath};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
-use test_socket_fixture::{UnixSocketFixture, UnixSocketPath};
 
 /// PR-G4a: every live-IPC happy-path test now must provision the
 /// slot before posting events — the H2 gate refuses unprovisioned
@@ -56,6 +56,7 @@ fn make_router_state(base: &Path) -> RouterState {
         audit_health: csq_core::audit::new_shared(csq_core::audit::AuditHealth::Verified),
         audit_records_unverified: 0,
         anchor_sink: None,
+        usage_poller_wake: std::sync::Arc::new(csq_core::daemon::usage_poller::WakeChannel::new()),
         #[cfg(feature = "enterprise")]
         interactive: Arc::new(csq_core::daemon::InteractiveSessionRegistry::empty()),
     }
@@ -352,6 +353,7 @@ async fn gemini_event_live_ipc_then_ndjson_drain_does_not_double_count() {
         audit_health: csq_core::audit::new_shared(csq_core::audit::AuditHealth::Verified),
         audit_records_unverified: 0,
         anchor_sink: None,
+        usage_poller_wake: std::sync::Arc::new(csq_core::daemon::usage_poller::WakeChannel::new()),
         #[cfg(feature = "enterprise")]
         interactive: Arc::new(csq_core::daemon::InteractiveSessionRegistry::empty()),
     };

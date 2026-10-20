@@ -60,16 +60,28 @@ use crate::usage::ledger::{UsageEvent, UsageSource};
 use crate::usage::request::{NormalizedRequest, RequestCollector, SnapshotUsage, UsageSnapshot};
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
-use std::collections::HashSet;
-use std::io::{BufRead, BufReader};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use super::launch_log::LaunchEvent;
 
+#[cfg(any(test, feature = "test-utils"))]
+#[path = "transcript_test_support.rs"]
+pub mod transcript_test_support;
+#[cfg(any(test, feature = "test-utils"))]
+use transcript_test_support::TranscriptFile;
+#[cfg(not(any(test, feature = "test-utils")))]
+type TranscriptFile = std::fs::File;
+
 /// Directory name CC uses for a session's nested subagent transcripts. The ONLY
 /// child directory this scanner descends into.
-const SUBAGENTS_DIR: &str = "subagents";
+/// The directory under `<encoded-cwd>/<session-id>/` that holds subagent transcripts. Shared
+/// with `usage::session_cost`, so the ledger and the statusline agree on where a session's
+/// subagent spend lives.
+pub(crate) const SUBAGENTS_DIR: &str = "subagents";
 
 /// Skip transcript files whose mtime is older than this many days. The widest
 /// ledger window is 30 days ([`super::ledger::summarize`]); the extra day is
@@ -81,7 +93,7 @@ const SCAN_MAX_AGE_DAYS: i64 = 31;
 /// and [`TranscriptMessage`] / [`TranscriptUsage`] are the privacy gate — they
 /// contain NO content fields (`content`, `text`, `first_prompt`, tool payloads
 /// are absent, so serde drops them). Never add a content field here.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct TranscriptLine {
     #[serde(default)]
     cwd: Option<String>,
@@ -103,7 +115,7 @@ struct TranscriptLine {
 /// The `message` object on assistant/user lines. METADATA ONLY — carries the
 /// model name, the message id and usage counts; `content` is deliberately
 /// absent.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct TranscriptMessage {
     /// The assistant message id. Observed 1:1 with `requestId` on every record
     /// carrying both (see [`super::request`]); used as the identity when
@@ -117,7 +129,7 @@ struct TranscriptMessage {
 }
 
 /// The per-turn token counts inside `message.usage`. All numeric.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct TranscriptUsage {
     #[serde(default)]
     input_tokens: u64,
@@ -247,6 +259,20 @@ fn admit_file(path: &Path) -> Result<(), SkipReason> {
     }
 }
 
+/// Wrap an opened file as the transcript handle type. With `test-utils` (or under test)
+/// `TranscriptFile` is a wrapper that needs the conversion; otherwise it is an alias of
+/// `File` and the wrapper is the identity, so no `From` call (clippy `useless_conversion`)
+/// appears in either `open_readonly` arm.
+#[cfg(any(test, feature = "test-utils"))]
+fn wrap_transcript(f: std::fs::File) -> TranscriptFile {
+    TranscriptFile::from(f)
+}
+
+#[cfg(not(any(test, feature = "test-utils")))]
+fn wrap_transcript(f: std::fs::File) -> TranscriptFile {
+    f
+}
+
 /// Opens `path` for reading WITHOUT following a symlink in the final component.
 ///
 /// ## Why the flag, and what it does NOT close
@@ -270,17 +296,18 @@ fn admit_file(path: &Path) -> Result<(), SkipReason> {
 /// Non-unix has no `O_NOFOLLOW`, so the plain open is used and the callers'
 /// `admit_*` checks remain the only refusal, exactly as before.
 #[cfg(unix)]
-fn open_readonly(path: &Path) -> std::io::Result<std::fs::File> {
+fn open_readonly(path: &Path) -> std::io::Result<TranscriptFile> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
+        .map(wrap_transcript)
 }
 
 #[cfg(not(unix))]
-fn open_readonly(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::File::open(path)
+fn open_readonly(path: &Path) -> std::io::Result<TranscriptFile> {
+    std::fs::File::open(path).map(wrap_transcript)
 }
 
 /// Skip counts for one tier, in the [`SkipReason`] vocabulary.
@@ -567,6 +594,14 @@ fn scan_project_transcripts_counting(
     projects_dir: &Path,
     now: DateTime<Utc>,
 ) -> (Vec<ScannedSession>, ScanSkips) {
+    scan_project_transcripts_cached(projects_dir, now, None)
+}
+
+fn scan_project_transcripts_cached(
+    projects_dir: &Path,
+    now: DateTime<Utc>,
+    mut cache: Option<&mut IncrementalScanner>,
+) -> (Vec<ScannedSession>, ScanSkips) {
     let cutoff = now - Duration::days(SCAN_MAX_AGE_DAYS);
     let mut skips = ScanSkips::default();
     let project_entries = match std::fs::read_dir(projects_dir) {
@@ -605,7 +640,11 @@ fn scan_project_transcripts_counting(
         for entry in entries.flatten() {
             let path = entry.path();
             if admits_transcript(&path, cutoff) {
-                if let Some(session) = scan_one_transcript(&path, false, None, &mut skips) {
+                let session = match cache.as_deref_mut() {
+                    Some(c) => c.scan(&path, false, None, &mut skips),
+                    None => scan_one_transcript(&path, false, None, &mut skips),
+                };
+                if let Some(session) = session {
                     out.push(session);
                 }
             } else if let Err(reason) = admit_dir(&path) {
@@ -655,9 +694,16 @@ fn scan_project_transcripts_counting(
                     continue;
                 }
                 let parent_attr = parent
-                    .get_or_insert_with(|| read_attribution_header(&parent_transcript, &mut skips))
+                    .get_or_insert_with(|| match cache.as_deref_mut() {
+                        Some(c) => c.header(&parent_transcript, &mut skips),
+                        None => read_attribution_header(&parent_transcript, &mut skips),
+                    })
                     .as_ref();
-                if let Some(session) = scan_one_transcript(&path, true, parent_attr, &mut skips) {
+                let session = match cache.as_deref_mut() {
+                    Some(c) => c.scan(&path, true, parent_attr, &mut skips),
+                    None => scan_one_transcript(&path, true, parent_attr, &mut skips),
+                };
+                if let Some(session) = session {
                     // A child attributes as its PARENT did (an internal ticket finding 4).
                     // Only when the parent's instant is unavailable does the
                     // child fall back to its own, which is no worse than the
@@ -670,6 +716,9 @@ fn scan_project_transcripts_counting(
                 }
             }
         }
+    }
+    if let Some(c) = cache {
+        c.prune();
     }
     (out, skips)
 }
@@ -729,6 +778,8 @@ fn read_attribution_header(path: &Path, skips: &mut ScanSkips) -> Option<ParentA
         if line.is_empty() {
             continue;
         }
+        #[cfg(any(test, feature = "test-utils"))]
+        transcript_test_support::note_parse();
         let Ok(rec) = serde_json::from_str::<TranscriptLine>(&line) else {
             continue;
         };
@@ -838,6 +889,8 @@ fn scan_one_transcript(
         if header_complete && !line.contains("\"usage\"") {
             continue;
         }
+        #[cfg(any(test, feature = "test-utils"))]
+        transcript_test_support::note_parse();
         let rec: TranscriptLine = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(_) => continue, // tolerate non-conforming lines
@@ -902,6 +955,134 @@ fn scan_one_transcript(
                     },
                     &file_key,
                     line_ordinal,
+                    from_subagent,
+                );
+            }
+        }
+    }
+
+    // Require usage; otherwise there is nothing to bill.
+    if requests.is_empty() {
+        return None;
+    }
+    // Fall back to the file stem for session_id (CC names files by session id).
+    let session_id = session_id.clone().or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+    })?;
+
+    // Attribution. A file with its own `cwd` stands alone and is attributed by
+    // the same cwd + time + provider gate as any parent transcript — nesting
+    // grants it nothing. Only a file with NO `cwd` may borrow its parent's, and
+    // only when it does not name a different session: a subagent transcript
+    // claiming another session id is evidence against, not for, the parent's
+    // ownership of its usage.
+    let project_path = match project_path {
+        Some(own) => own,
+        None => {
+            let parent = parent?;
+            let names_other_session = session_id != *parent.session_id.as_ref()?;
+            if names_other_session {
+                return None;
+            }
+            parent.project_path.clone()
+        }
+    };
+    let requests = requests.finish();
+    // Every request's own timestamp is a candidate start; the earliest wins so
+    // a file whose header line carried no timestamp still attributes.
+    let start_time = start_time.or_else(|| earliest_request_timestamp(&requests))?;
+
+    Some(ScannedSession::from_parts(
+        session_id,
+        project_path,
+        start_time,
+        model,
+        requests,
+    ))
+}
+
+fn scan_records<'a>(
+    path: &Path,
+    from_subagent: bool,
+    parent: Option<&ParentAttribution>,
+    records: impl Iterator<Item = &'a (u64, TranscriptLine)>,
+) -> Option<ScannedSession> {
+    // Identity namespace for the last-resort per-record key. The full path is
+    // unique per file within one scan, so two files' uuid-less records can
+    // never merge.
+    let file_key = path.to_string_lossy().into_owned();
+
+    let mut project_path: Option<String> = None;
+    let mut start_time: Option<String> = None;
+    let mut start_ts: Option<DateTime<chrono::FixedOffset>> = None;
+    let mut session_id: Option<String> = None;
+    let mut model: Option<String> = None;
+    let mut requests = RequestCollector::new();
+
+    for (line_ordinal, rec) in records {
+        let rec = rec.clone();
+        if project_path.is_none() {
+            if let Some(cwd) = rec.cwd {
+                project_path = Some(cwd);
+            }
+        }
+        if session_id.is_none() {
+            session_id = rec.session_id;
+        }
+        // Earliest timestamp seen. The perf prefilter above skips non-`usage`
+        // tail lines once the header is complete, so this is the minimum across
+        // header lines and usage lines rather than across every line in the
+        // file. CC writes transcripts by appending, and in the transcripts
+        // observed for an internal ticket timestamps were non-decreasing down the file, so
+        // the earliest one is typically on an early line that the prefilter
+        // does not skip. That is an observation, NOT a guarantee about the
+        // format: a genuinely earlier timestamp on a skipped non-usage tail
+        // line would leave `start_time` late.
+        //
+        // What that costs, precisely: `start_time` is used for attribution (a
+        // launch event must be at or before it) and — before an internal ticket — for
+        // pricing the entire session. Pricing no longer depends on it at all,
+        // because each request is priced at its own timestamp
+        // (`attributed_session_to_events_with_manifest`), so a late
+        // `start_time` can now only shift which launch event wins attribution,
+        // never what a token costs and never which rolling window it lands in.
+        if let Some(ts) = rec.timestamp.as_deref() {
+            if let Ok(parsed) = DateTime::parse_from_rfc3339(ts) {
+                match start_ts {
+                    Some(prev) if parsed >= prev => {}
+                    _ => {
+                        start_ts = Some(parsed);
+                        start_time = Some(ts.to_string());
+                    }
+                }
+            }
+        }
+        if let Some(msg) = rec.message {
+            // Treat an empty model string as absent so the caller's slot
+            // fallback applies instead of passing "" to the rate table.
+            let line_model = msg.model.filter(|m| !m.is_empty());
+            if model.is_none() {
+                model.clone_from(&line_model);
+            }
+            if let Some(u) = msg.usage {
+                requests.push(
+                    UsageSnapshot {
+                        request_id: rec.request_id,
+                        message_id: msg.id,
+                        record_uuid: rec.uuid,
+                        timestamp: rec.timestamp.clone(),
+                        model: line_model,
+                        usage: SnapshotUsage {
+                            input_tokens: u.input_tokens,
+                            output_tokens: u.output_tokens,
+                            cache_creation_tokens: u.cache_creation_input_tokens,
+                            cache_read_tokens: u.cache_read_input_tokens,
+                        },
+                    },
+                    &file_key,
+                    *line_ordinal,
                     from_subagent,
                 );
             }
@@ -1438,13 +1619,25 @@ fn aggregate_with_manifest<F>(
     claude_home: &Path,
     base_dir: &Path,
     now: DateTime<Utc>,
-    mut model_for_slot: F,
+    model_for_slot: F,
     manifest: &crate::providers::model_manifest::ModelManifest,
 ) -> Vec<(AccountNum, UsageEvent)>
 where
     F: FnMut(AccountNum) -> String,
 {
     let sessions = scan_project_transcripts(&projects_dir(claude_home), now);
+    aggregate_sessions(sessions, base_dir, model_for_slot, manifest)
+}
+
+fn aggregate_sessions<F>(
+    sessions: Vec<ScannedSession>,
+    base_dir: &Path,
+    mut model_for_slot: F,
+    manifest: &crate::providers::model_manifest::ModelManifest,
+) -> Vec<(AccountNum, UsageEvent)>
+where
+    F: FnMut(AccountNum) -> String,
+{
     let launch = match super::launch_log::read_all(base_dir) {
         Ok(r) => r.events,
         Err(_) => Vec::new(),
@@ -1481,12 +1674,22 @@ where
         }
     }
     let mut out = Vec::with_capacity(sessions.len());
+    // Resolve each slot's fallback model ONCE per pass. The callback reads the
+    // slot's `settings.json` from disk, and it used to fire once per attributed
+    // session — a measured hot spot (open/read_to_string) on the desktop's
+    // refresh thread. The map lives only for this pass, so a settings edit is
+    // observed by the next pass exactly as before.
+    let mut fallback_by_slot: std::collections::HashMap<AccountNum, String> =
+        std::collections::HashMap::new();
     for session in sessions {
         let attributed = attribute_session(&session, &launch, |slot| {
             source_family_by_slot.get(&slot).copied()
         });
         if let Some(attributed) = attributed {
-            let fallback = model_for_slot(attributed.slot);
+            let fallback = fallback_by_slot
+                .entry(attributed.slot)
+                .or_insert_with_key(|slot| model_for_slot(*slot))
+                .clone();
             for event in
                 attributed_session_to_events_with_manifest(&attributed, &fallback, manifest)
             {
@@ -1497,10 +1700,1778 @@ where
     out
 }
 
+// Metadata-only per-file watermarks. Unchanged passes deserialize no records.
+// Growth validates the last 4KiB before the prior watermark. Earlier prefix
+// rewrites are outside this fast-path guarantee until the 24-hour cold scan.
+// Identity changes, shrink and same-size metadata changes always rescan.
+const INCREMENTAL_FILE_CAP: usize = 4096;
+// Desktop fallback retains more small projections; record/payload budgets stay equal.
+const DESKTOP_INCREMENTAL_FILE_CAP: usize = 32_768;
+// Conservative retained-cache defaults. These bound admitted record count and
+// allocated record payload, NOT allocator overhead, map/path storage, a current
+// input line/record, the bounded candidate, or full normalized/output vectors.
+const INCREMENTAL_RECORD_CAP: usize = 65_536;
+const INCREMENTAL_PAYLOAD_BYTE_CAP: usize = 32 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CacheFootprint {
+    records: usize,
+    bytes: usize,
+}
+impl CacheFootprint {
+    fn fits(self, budget: Self) -> bool {
+        self.records <= budget.records && self.bytes <= budget.bytes
+    }
+    fn add(self, other: Self) -> Self {
+        Self {
+            records: self.records.saturating_add(other.records),
+            bytes: self.bytes.saturating_add(other.bytes),
+        }
+    }
+    fn subtract(self, other: Self) -> Self {
+        Self {
+            records: self.records.saturating_sub(other.records),
+            bytes: self.bytes.saturating_sub(other.bytes),
+        }
+    }
+}
+
+impl TranscriptLine {
+    fn allocated_strings(&self) -> usize {
+        let strings = [
+            self.cwd.as_ref(),
+            self.timestamp.as_ref(),
+            self.session_id.as_ref(),
+            self.request_id.as_ref(),
+            self.uuid.as_ref(),
+            self.message.as_ref().and_then(|m| m.id.as_ref()),
+            self.message.as_ref().and_then(|m| m.model.as_ref()),
+        ];
+        strings
+            .into_iter()
+            .flatten()
+            .fold(0usize, |sum, s| sum.saturating_add(s.capacity()))
+    }
+}
+const WATERMARK_BYTES: u64 = 4096;
+const COLD_VALIDATION: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+#[derive(Default)]
+struct ParsedTranscript {
+    records: Vec<(u64, TranscriptLine)>,
+    string_bytes: usize,
+    tail: Option<(u64, TranscriptLine)>,
+    offset: u64,
+    ordinal: u64,
+    cwd: bool,
+    session: bool,
+    timestamp: bool,
+}
+
+impl ParsedTranscript {
+    fn footprint(&self) -> CacheFootprint {
+        let record_size = std::mem::size_of::<(u64, TranscriptLine)>();
+        CacheFootprint {
+            records: self
+                .records
+                .len()
+                .saturating_add(usize::from(self.tail.is_some())),
+            bytes: self
+                .records
+                .capacity()
+                .saturating_mul(record_size)
+                .saturating_add(usize::from(self.tail.is_some()).saturating_mul(record_size))
+                .saturating_add(self.string_bytes),
+        }
+    }
+    fn admit_record(
+        &mut self,
+        ordinal: u64,
+        record: TranscriptLine,
+        tail: bool,
+        budget: CacheFootprint,
+    ) -> std::io::Result<bool> {
+        let strings = record.allocated_strings();
+        let capacity = if !tail && self.records.len() == self.records.capacity() {
+            self.records.capacity().saturating_mul(2).max(4)
+        } else {
+            self.records.capacity()
+        };
+        let projected = CacheFootprint {
+            records: self.footprint().records.saturating_add(1),
+            bytes: capacity
+                .saturating_add(usize::from(tail))
+                .saturating_mul(std::mem::size_of::<(u64, TranscriptLine)>())
+                .saturating_add(self.string_bytes)
+                .saturating_add(strings),
+        };
+        // Check BEFORE growing the Vec or retaining the parsed record. An
+        // oversized candidate is abandoned immediately, never filled then pruned.
+        if !projected.fits(budget) {
+            return Ok(false);
+        }
+        if !tail && capacity > self.records.capacity() {
+            self.records
+                .try_reserve_exact(capacity - self.records.len())
+                .map_err(std::io::Error::other)?;
+        }
+        // Allocators may grant more capacity than requested. Account the actual
+        // capacity before admission as well; unused Vec slots are payload bytes.
+        let actual = CacheFootprint {
+            records: projected.records,
+            bytes: self
+                .records
+                .capacity()
+                .saturating_add(usize::from(tail))
+                .saturating_mul(std::mem::size_of::<(u64, TranscriptLine)>())
+                .saturating_add(self.string_bytes)
+                .saturating_add(strings),
+        };
+        if !actual.fits(budget) {
+            return Ok(false);
+        }
+        self.string_bytes = self.string_bytes.saturating_add(strings);
+        if tail {
+            self.tail = Some((ordinal, record));
+        } else {
+            self.records.push((ordinal, record));
+        }
+        Ok(true)
+    }
+    fn read(
+        &mut self,
+        mut reader: impl BufRead,
+        parses: &mut usize,
+        budget: CacheFootprint,
+    ) -> std::io::Result<bool> {
+        if let Some((_, tail)) = self.tail.take() {
+            self.string_bytes = self.string_bytes.saturating_sub(tail.allocated_strings());
+        }
+        let mut bytes = Vec::new();
+        loop {
+            bytes.clear();
+            let n = reader.read_until(b'\n', &mut bytes)?;
+            if n == 0 {
+                break;
+            }
+            let complete = bytes.last() == Some(&b'\n');
+            let ordinal = self.ordinal + 1;
+            let line = match std::str::from_utf8(&bytes) {
+                Ok(line) => line.trim_end_matches(['\n', '\r']),
+                Err(_) => break, // same stop-at-invalid-UTF8 policy as lines()
+            };
+            let rec = if !line.is_empty()
+                && (!(self.cwd && self.session && self.timestamp) || line.contains("\"usage\""))
+            {
+                *parses += 1;
+                #[cfg(any(test, feature = "test-utils"))]
+                transcript_test_support::note_parse();
+                serde_json::from_str::<TranscriptLine>(line).ok()
+            } else {
+                None
+            };
+            if !complete {
+                if let Some(r) = rec {
+                    if !self.admit_record(ordinal, r, true, budget)? {
+                        return Ok(false);
+                    }
+                }
+                break; // speculative EOF record; retry from prior newline
+            }
+            self.offset += n as u64;
+            self.ordinal = ordinal;
+            if let Some(r) = rec {
+                self.cwd |= r.cwd.is_some();
+                self.session |= r.session_id.is_some();
+                self.timestamp |= r
+                    .timestamp
+                    .as_deref()
+                    .is_some_and(|ts| DateTime::parse_from_rfc3339(ts).is_ok());
+                if !self.admit_record(ordinal, r, false, budget)? {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct FileStamp {
+    identity: Option<(u64, u64)>,
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+impl FileStamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            identity: stat_identity(meta),
+            size: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            changed: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+}
+struct CachedTranscript {
+    stamp: FileStamp,
+    digest: [u8; 32],
+    validated: std::time::Instant,
+    parsed: ParsedTranscript,
+}
+
+/// Persistent daemon/desktop scanner; pricing, attribution and rolling windows are
+/// recomputed every pass from current inputs, only transcript parsing is cached.
+/// Unix identity enables the fast path; platforms without identity rescan safely.
+/// Cache admission is bounded across all files by record count and allocated
+/// Vec/String payload bytes. Over-budget files use the complete uncached parser.
+/// Map/path overhead is separately bounded by file count, not byte-accounted;
+/// full scan outputs and transient parser allocations remain workload-sized.
+pub struct IncrementalScanner {
+    files: HashMap<PathBuf, CachedTranscript>,
+    seen: HashSet<PathBuf>,
+    retained: CacheFootprint,
+    budget: CacheFootprint,
+    file_cap: usize,
+    #[cfg(test)]
+    parses: usize,
+}
+impl Default for IncrementalScanner {
+    fn default() -> Self {
+        Self {
+            files: HashMap::new(),
+            seen: HashSet::new(),
+            retained: CacheFootprint::default(),
+            budget: CacheFootprint {
+                records: INCREMENTAL_RECORD_CAP,
+                bytes: INCREMENTAL_PAYLOAD_BYTE_CAP,
+            },
+            file_cap: INCREMENTAL_FILE_CAP,
+            #[cfg(test)]
+            parses: 0,
+        }
+    }
+}
+impl IncrementalScanner {
+    /// Desktop-only retained-file profile; daemon Default stays at 4096 files.
+    /// Metadata records and allocated payload retain the same global budgets.
+    pub fn for_desktop() -> Self {
+        Self {
+            file_cap: DESKTOP_INCREMENTAL_FILE_CAP,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn test_cache_observation(&self) -> transcript_test_support::CacheObservation {
+        transcript_test_support::CacheObservation {
+            files: self.files.len(),
+            seen: self.seen.len(),
+            records: self.retained.records,
+            payload_bytes: self.retained.bytes,
+            file_limit: self.file_cap,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn test_expire_validation(&mut self) {
+        for cached in self.files.values_mut() {
+            cached.validated = std::time::Instant::now() - COLD_VALIDATION;
+        }
+    }
+
+    pub fn aggregate<F>(
+        &mut self,
+        home: &Path,
+        base: &Path,
+        now: DateTime<Utc>,
+        model: F,
+    ) -> anyhow::Result<Vec<(AccountNum, UsageEvent)>>
+    where
+        F: FnMut(AccountNum) -> String,
+    {
+        let manifest = crate::providers::model_manifest::ModelManifest::load(base)?;
+        self.seen.clear();
+        let (sessions, skips) =
+            scan_project_transcripts_cached(&projects_dir(home), now, Some(self));
+        skips.report();
+        self.prune();
+        Ok(aggregate_sessions(sessions, base, model, &manifest))
+    }
+    fn prune(&mut self) {
+        self.files.retain(|path, _| self.seen.contains(path));
+        self.retained = self
+            .files
+            .values()
+            .fold(CacheFootprint::default(), |total, c| {
+                total.add(c.parsed.footprint())
+            });
+    }
+    fn remove_cached(&mut self, path: &Path) -> Option<CachedTranscript> {
+        let removed = self.files.remove(path)?;
+        self.seen.remove(path);
+        self.retained = self.retained.subtract(removed.parsed.footprint());
+        Some(removed)
+    }
+    // Some(false) is cache bypass, never a skipped accounting input.
+    fn load(&mut self, path: &Path, skips: &mut ScanSkips) -> Option<bool> {
+        let result = self.load_inner(path);
+        if let Err(e) = result {
+            self.remove_cached(path);
+            let reason = reason_for_open_error(&e);
+            skips.transcript_file.record(reason);
+            alert_once(path, reason);
+            return None;
+        }
+        // Only admitted paths need pruning metadata. Bypassed paths cannot
+        // make this per-pass set grow with the number of uncached files.
+        if result.as_ref().is_ok_and(|cached| *cached) {
+            self.seen.insert(path.to_path_buf());
+        }
+        result.ok()
+    }
+    fn load_inner(&mut self, path: &Path) -> std::io::Result<bool> {
+        // Always OPEN first: cached data cannot bypass unreadability/nofollow.
+        let mut file = open_readonly(path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(std::io::Error::other("not a regular transcript"));
+        }
+        let stamp = FileStamp::of(&meta);
+        if self.files.get(path).is_some_and(|c| {
+            c.stamp == stamp
+                && stamp.modified.is_some()
+                && stamp.identity.is_some()
+                && c.validated.elapsed() < COLD_VALIDATION
+        }) {
+            return Ok(true);
+        }
+        let prior = self.remove_cached(path);
+        if self.files.len() >= self.file_cap {
+            return Ok(false);
+        }
+        let budget = self.budget.subtract(self.retained);
+        let mut parsed = ParsedTranscript::default();
+        let mut validated = std::time::Instant::now();
+        if let Some(c) = prior {
+            if stamp.identity.is_some()
+                && stamp.identity == c.stamp.identity
+                && stamp.size > c.stamp.size
+                && c.validated.elapsed() < COLD_VALIDATION
+                && hash_watermark(&mut file, c.stamp.size)? == c.digest
+            {
+                validated = c.validated;
+                parsed = c.parsed;
+            }
+        }
+        file.seek(SeekFrom::Start(parsed.offset))?;
+        let mut parses = 0;
+        // Read only bytes present at the initial stat. A concurrent append is
+        // retried next pass; an unstable read is never admitted to the cache.
+        let admitted = parsed.read(
+            BufReader::new((&mut file).take(stamp.size - parsed.offset)),
+            &mut parses,
+            budget,
+        )?;
+        #[cfg(test)]
+        {
+            self.parses += parses;
+        }
+        if !admitted {
+            // Drop even an append candidate (and its prior cached prefix).
+            // scan/header then reread the entire input through the uncached path.
+            return Ok(false);
+        }
+        let digest = hash_watermark(&mut file, stamp.size)?;
+        if FileStamp::of(&file.metadata()?) != stamp {
+            return Err(std::io::Error::other("transcript changed during scan"));
+        }
+        self.retained = self.retained.add(parsed.footprint());
+        self.files.insert(
+            path.to_path_buf(),
+            CachedTranscript {
+                stamp,
+                digest,
+                validated,
+                parsed,
+            },
+        );
+        Ok(true)
+    }
+    fn scan(
+        &mut self,
+        path: &Path,
+        sub: bool,
+        parent: Option<&ParentAttribution>,
+        skips: &mut ScanSkips,
+    ) -> Option<ScannedSession> {
+        if !self.load(path, skips)? {
+            return scan_one_transcript(path, sub, parent, skips);
+        }
+        let p = &self.files.get(path)?.parsed;
+        scan_records(path, sub, parent, p.records.iter().chain(p.tail.iter()))
+    }
+    fn header(&mut self, path: &Path, skips: &mut ScanSkips) -> Option<ParentAttribution> {
+        if let Err(reason) = admit_file(path) {
+            skips.transcript_file.record(reason);
+            alert_once(path, reason);
+            return None;
+        }
+        if !self.load(path, skips)? {
+            return read_attribution_header(path, skips);
+        }
+        let p = &self.files.get(path)?.parsed;
+        let mut attr = ParentAttribution {
+            project_path: String::new(),
+            session_id: None,
+            start_time: None,
+        };
+        let mut cwd = None;
+        for (_, rec) in p.records.iter().chain(p.tail.iter()) {
+            if cwd.is_none() {
+                cwd = rec.cwd.clone();
+            }
+            if attr.session_id.is_none() {
+                attr.session_id = rec.session_id.clone();
+            }
+            if attr.start_time.is_none() {
+                attr.start_time = rec
+                    .timestamp
+                    .as_ref()
+                    .filter(|ts| DateTime::parse_from_rfc3339(ts).is_ok())
+                    .cloned();
+            }
+            if cwd.is_some() && attr.start_time.is_some() {
+                break;
+            }
+        }
+        attr.project_path = cwd?;
+        Some(attr)
+    }
+}
+fn hash_watermark(file: &mut TranscriptFile, length: u64) -> std::io::Result<[u8; 32]> {
+    let start = length.saturating_sub(WATERMARK_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut hash = Sha256::new();
+    let mut remaining = length - start;
+    let mut bytes = [0; 65536];
+    while remaining > 0 {
+        let n = file.read(&mut bytes[..remaining.min(65536) as usize])?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        hash.update(&bytes[..n]);
+        remaining -= n as u64;
+    }
+    Ok(hash.finalize().into())
+}
+
+// ── Change detection for repeated passes (desktop cold-start fallback) ────
+//
+// A full pass re-reads and re-parses every in-window transcript. The desktop's
+// fallback path repeats that every `USAGE_CACHE_TTL` even when nothing on disk
+// changed. [`PassCache`] skips the pass when a cheap `stat`-only snapshot of
+// every input is identical to the previous pass's, returning the SAME result
+// the full pass produced. The clock and the listing are both parameters so a
+// test (or a bench) injects them.
+
+/// One `stat`-level observation of a file the aggregation depends on.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InputStat {
+    pub path: PathBuf,
+    pub len: u64,
+    /// Nanoseconds since the Unix epoch; `None` when the mtime is unreadable.
+    pub mtime_ns: Option<i128>,
+    /// `(dev, ino)` of the statted target on unix; `None` where std exposes no
+    /// stable file identity. A rename-based replacement that preserves length
+    /// and mtime still changes the inode, so it is seen where
+    /// `(len, mtime_ns)` alone would miss it.
+    pub identity: Option<(u64, u64)>,
+    /// The entry exists (`symlink_metadata` succeeds) but its target could not
+    /// be statted — a dangling or unreadable link. Such a snapshot can never
+    /// prove "unchanged": [`PassCache::refresh`] never reuses on it.
+    pub unreadable: bool,
+}
+
+/// A sorted, comparable listing of every input of one aggregation pass.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InputSnapshot(Vec<InputStat>);
+
+impl InputSnapshot {
+    /// Builds a snapshot from an arbitrary listing (the injection point).
+    pub fn from_stats(mut stats: Vec<InputStat>) -> Self {
+        stats.sort();
+        Self(stats)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// True when any input exists but could not be statted.
+    pub fn has_unreadable(&self) -> bool {
+        self.0.iter().any(|s| s.unreadable)
+    }
+}
+
+/// Stats the TARGET of `path` (follows symlinks: a `config-*/settings.json` or
+/// `profiles.json` that is a link changes when its target does). `None` only
+/// when the entry does not exist at all; an entry that exists but whose target
+/// cannot be statted is kept, flagged `unreadable`, so it can never read as
+/// "unchanged".
+fn stat_of(path: &Path) -> Option<InputStat> {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => {
+            std::fs::symlink_metadata(path).ok()?;
+            return Some(InputStat {
+                path: path.to_path_buf(),
+                len: 0,
+                mtime_ns: None,
+                identity: None,
+                unreadable: true,
+            });
+        }
+    };
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .map(|m| match m.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_nanos() as i128,
+            Err(e) => -(e.duration().as_nanos() as i128),
+        });
+    Some(InputStat {
+        path: path.to_path_buf(),
+        len: meta.len(),
+        mtime_ns,
+        identity: stat_identity(&meta),
+        unreadable: false,
+    })
+}
+
+#[cfg(unix)]
+fn stat_identity(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn stat_identity(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+/// Upper bound on the entries listed from any one directory the snapshot
+/// walks (`credentials/`, `identities/`, `config-*`). Slots are 1..=999, so a
+/// legitimate store is far below it; a directory above it is listed no
+/// further and the snapshot is flagged `unreadable`, which forces a full pass
+/// every time instead of an unbounded stat storm on the refresh thread.
+pub const MAX_LISTED_ENTRIES: usize = 4096;
+
+/// Per-identity files `discover_*` / `is_codex_only_slot` read: the provider
+/// binding and the credential-presence/validity probes.
+const IDENTITY_INPUT_FILES: [&str; 3] = [
+    "identity.json",
+    "credentials.json",
+    "credentials-codex.json",
+];
+
+/// Lists, with `stat` only (no file is opened), every input the aggregation of
+/// `(claude_home, base_dir, now)` reads: in-window transcripts (parents and
+/// subagent children — the same `admits_transcript` predicate as the scan, so a
+/// file ageing out of the window changes the snapshot), the launch log, the
+/// runtime manifest, `profiles.json`, `dashboard-accounts.json`, the global 3P
+/// `settings-{zai,mm}.json`, each `config-*/{settings,.credentials}.json`, the
+/// identity store (`identities/*/{identity,credentials,credentials-codex}.json`
+/// — the provider binding) and the legacy `credentials/*` mirrors: every file
+/// `discover_all` / `discover_per_slot_third_party` read. Each directory walk
+/// is capped at [`MAX_LISTED_ENTRIES`]; above it the snapshot is `unreadable`
+/// (never reused). Inputs still unseen: `.csq-account` markers and the
+/// keychain.
+pub fn snapshot_inputs(claude_home: &Path, base_dir: &Path, now: DateTime<Utc>) -> InputSnapshot {
+    let cutoff = now - Duration::days(SCAN_MAX_AGE_DAYS);
+    let mut stats = Vec::new();
+    let mut push = |p: &Path| {
+        if let Some(st) = stat_of(p) {
+            stats.push(st);
+        }
+    };
+    if let Ok(projects) = std::fs::read_dir(projects_dir(claude_home)) {
+        for project in projects.flatten() {
+            let Ok(entries) = std::fs::read_dir(project.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if admits_transcript(&path, cutoff) {
+                    push(&path);
+                } else if path.is_dir() {
+                    if let Ok(children) = std::fs::read_dir(path.join(SUBAGENTS_DIR)) {
+                        for child in children.flatten() {
+                            let cp = child.path();
+                            if admits_transcript(&cp, cutoff) {
+                                push(&cp);
+                            }
+                        }
+                    }
+                    // The parent transcript supplies attribution for children
+                    // even when outside the window.
+                    push(&path.with_extension("jsonl"));
+                }
+            }
+        }
+    }
+    push(&super::launch_log::launch_log_path(base_dir));
+    push(&crate::providers::model_manifest::manifest_path(base_dir));
+    push(&base_dir.join("profiles.json"));
+    push(&base_dir.join("dashboard-accounts.json"));
+    push(&base_dir.join("settings-zai.json"));
+    push(&base_dir.join("settings-mm.json"));
+    let mut overflow = false;
+    if let Ok(rd) = std::fs::read_dir(base_dir) {
+        for (n, entry) in rd.flatten().enumerate() {
+            if n >= MAX_LISTED_ENTRIES {
+                overflow = true;
+                break;
+            }
+            if entry.file_name().to_string_lossy().starts_with("config-") {
+                push(&entry.path().join("settings.json"));
+                push(&entry.path().join(".credentials.json"));
+            }
+        }
+    }
+    // Identity store: the provider binding (`identity.json`) and credential
+    // presence feed `discover_all`'s provider-family map and so attribution.
+    if let Ok(rd) = std::fs::read_dir(base_dir.join("identities")) {
+        for (n, entry) in rd.flatten().enumerate() {
+            if n >= MAX_LISTED_ENTRIES {
+                overflow = true;
+                break;
+            }
+            for f in IDENTITY_INPUT_FILES {
+                push(&entry.path().join(f));
+            }
+        }
+    }
+    // Legacy flat credential mirrors (`credentials/<N>.json`, `codex-<N>.json`,
+    // `gemini-<N>.json`, native markers).
+    if let Ok(rd) = std::fs::read_dir(base_dir.join("credentials")) {
+        for (n, entry) in rd.flatten().enumerate() {
+            if n >= MAX_LISTED_ENTRIES {
+                overflow = true;
+                break;
+            }
+            push(&entry.path());
+        }
+    }
+    if overflow {
+        stats.push(InputStat {
+            path: base_dir.to_path_buf(),
+            len: 0,
+            mtime_ns: None,
+            identity: None,
+            unreadable: true,
+        });
+    }
+    InputSnapshot::from_stats(stats)
+}
+
+/// How a [`PassCache::refresh`] produced its result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassKind {
+    /// Full aggregation ran.
+    Full,
+    /// Inputs were unchanged; the previous pass's result was returned.
+    Reused,
+}
+
+/// Result of an aggregation pass: shared so a reuse costs no copy.
+pub type PassPairs = std::sync::Arc<SlimLedger>;
+
+/// The fields of a [`UsageEvent`] that `ledger::summarize` reads, and nothing
+/// else — no `session_id`, `model`, `project_path` or `source`, which own four
+/// heap allocations per event. 72 bytes inline, no heap.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SlimEvent {
+    /// Parsed `ts` seconds since the epoch; meaningful only when `ts_ok`.
+    ts_secs: i64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_tokens: u64,
+    cache_read_tokens: u64,
+    cost_usd_estimate: Option<f64>,
+    snapshots_collapsed: u64,
+    ts_nanos: u32,
+    /// `false` when `ts` did not parse: `summarize` then counts the event in
+    /// the totals only, exactly as for the original string.
+    ts_ok: bool,
+    finalization_divergent: bool,
+    from_subagent: bool,
+    unidentified: bool,
+}
+
+impl SlimEvent {
+    fn from_event(e: &UsageEvent) -> Self {
+        let parsed = DateTime::parse_from_rfc3339(&e.ts)
+            .ok()
+            .map(|t| t.with_timezone(&Utc));
+        SlimEvent {
+            ts_secs: parsed.map_or(0, |t| t.timestamp()),
+            ts_nanos: parsed.map_or(0, |t| t.timestamp_subsec_nanos()),
+            ts_ok: parsed.is_some(),
+            input_tokens: e.input_tokens,
+            output_tokens: e.output_tokens,
+            cache_creation_tokens: e.cache_creation_tokens,
+            cache_read_tokens: e.cache_read_tokens,
+            cost_usd_estimate: e.cost_usd_estimate,
+            snapshots_collapsed: e.snapshots_collapsed,
+            finalization_divergent: e.finalization_divergent,
+            from_subagent: e.from_subagent,
+            unidentified: e.unidentified,
+        }
+    }
+
+    /// A transient event that summarizes identically to the original: every
+    /// field `summarize` reads is restored exactly (the timestamp via a
+    /// nanosecond-precision RFC 3339 round trip); the rest are empty.
+    fn to_event(self) -> UsageEvent {
+        let ts = if self.ts_ok {
+            DateTime::<Utc>::from_timestamp(self.ts_secs, self.ts_nanos)
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        UsageEvent {
+            ts,
+            session_id: String::new(),
+            model: String::new(),
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            cost_usd_estimate: self.cost_usd_estimate,
+            source: UsageSource::ProjectsJsonl,
+            project_path: None,
+            snapshots_collapsed: self.snapshots_collapsed,
+            finalization_divergent: self.finalization_divergent,
+            from_subagent: self.from_subagent,
+            unidentified: self.unidentified,
+        }
+    }
+}
+
+/// Per-slot retained form of an aggregation pass. Order within a slot is the
+/// pass's order, so floating-point sums match a summary of the full events.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SlimLedger {
+    by_slot: std::collections::BTreeMap<AccountNum, Vec<SlimEvent>>,
+}
+
+impl SlimLedger {
+    pub fn from_pairs(pairs: &[(AccountNum, UsageEvent)]) -> Self {
+        let mut by_slot: std::collections::BTreeMap<AccountNum, Vec<SlimEvent>> =
+            std::collections::BTreeMap::new();
+        for (slot, e) in pairs {
+            by_slot
+                .entry(*slot)
+                .or_default()
+                .push(SlimEvent::from_event(e));
+        }
+        for v in by_slot.values_mut() {
+            v.shrink_to_fit();
+        }
+        SlimLedger { by_slot }
+    }
+
+    /// Total retained events across all slots.
+    pub fn len(&self) -> usize {
+        self.by_slot.values().map(Vec::len).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_slot.is_empty()
+    }
+
+    /// Retained bytes (inline events; the map overhead is negligible).
+    pub fn retained_bytes(&self) -> usize {
+        self.by_slot
+            .values()
+            .map(|v| v.capacity() * std::mem::size_of::<SlimEvent>())
+            .sum()
+    }
+
+    /// One slot's summary at `now`; identical to
+    /// `ledger::summarize(<that slot's full events>, now)`. Only that slot's
+    /// transient events are materialised, and dropped on return.
+    pub fn summarize_slot(
+        &self,
+        slot: AccountNum,
+        now: DateTime<Utc>,
+    ) -> crate::usage::ledger::UsageSummary {
+        let events: Vec<UsageEvent> = self
+            .by_slot
+            .get(&slot)
+            .map(|v| v.iter().map(|e| e.to_event()).collect())
+            .unwrap_or_default();
+        crate::usage::ledger::summarize(&events, now)
+    }
+}
+
+/// Remembers the last pass's input snapshot and result.
+#[derive(Debug, Default)]
+pub struct PassCache {
+    snapshot: Option<InputSnapshot>,
+    pairs: Option<PassPairs>,
+    reused_since_full: u32,
+}
+
+impl PassCache {
+    /// Consecutive reuses allowed before a full pass is forced. The snapshot
+    /// cannot see every input (the `.csq-account` markers and the keychain are
+    /// not listed), so unchanged-by-snapshot is bounded, not eternal: the
+    /// worst-case staleness for an unseen input is
+    /// `MAX_REUSE_STREAK + 1` refresh intervals (13 × 300 s = 65 min at the
+    /// desktop's `USAGE_CACHE_TTL`).
+    pub const MAX_REUSE_STREAK: u32 = 12;
+
+    /// Returns the pass result for `snapshot`, running `aggregate` only when the
+    /// snapshot differs from the last successful pass, there is none, or the
+    /// reuse streak is exhausted. A failed `aggregate` clears the cache and
+    /// returns the error — never an empty success.
+    pub fn refresh<E>(
+        &mut self,
+        snapshot: InputSnapshot,
+        aggregate: impl FnOnce() -> Result<Vec<(AccountNum, UsageEvent)>, E>,
+    ) -> Result<(PassPairs, PassKind), E> {
+        if let (Some(prev), Some(pairs)) = (&self.snapshot, &self.pairs) {
+            if *prev == snapshot
+                && !snapshot.has_unreadable()
+                && self.reused_since_full < Self::MAX_REUSE_STREAK
+            {
+                self.reused_since_full += 1;
+                return Ok((pairs.clone(), PassKind::Reused));
+            }
+        }
+        // Release the previous result BEFORE building the next so the two never
+        // coexist in the cache (the caller may still hold its own Arc).
+        self.snapshot = None;
+        self.pairs = None;
+        // The full events live only inside this call: they are reduced to the
+        // slim retained form and dropped before the result is cached.
+        let pairs = std::sync::Arc::new(SlimLedger::from_pairs(&aggregate()?));
+        self.snapshot = Some(snapshot);
+        self.pairs = Some(pairs.clone());
+        self.reused_since_full = 0;
+        Ok((pairs, PassKind::Full))
+    }
+}
+
+#[cfg(test)]
+#[path = "incremental_desktop_tests.rs"]
+mod incremental_desktop_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn perf_line(id: &str, output: u64) -> String {
+        serde_json::json!({"cwd":"/work/perf", "sessionId":"perf", "timestamp":"2026-05-06T10:00:00Z",
+            "requestId":id, "message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":output,
+            "cache_creation_input_tokens":3,"cache_read_input_tokens":7}}}).to_string()
+    }
+    #[cfg(unix)]
+    fn perf_compare(
+        c: &mut IncrementalScanner,
+        home: &Path,
+        base: &Path,
+    ) -> Vec<(AccountNum, UsageEvent)> {
+        let cached = c
+            .aggregate(home, base, fixed_now(), |_| "claude-sonnet-4-6".into())
+            .unwrap();
+        let full = aggregate(home, base, fixed_now(), |_| "claude-sonnet-4-6".into()).unwrap();
+        assert_eq!(
+            cached, full,
+            "events, requests, pricing and attribution must match the full reference"
+        );
+        assert_eq!(
+            super::super::ledger::summarize(
+                &cached.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>(),
+                fixed_now()
+            ),
+            super::super::ledger::summarize(
+                &full.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>(),
+                fixed_now()
+            )
+        );
+        cached
+    }
+    fn assert_cache_budget(scanner: &IncrementalScanner) {
+        let actual = scanner
+            .files
+            .values()
+            .fold(CacheFootprint::default(), |sum, c| {
+                sum.add(c.parsed.footprint())
+            });
+        assert_eq!(
+            scanner.retained, actual,
+            "cache debit/credit must track replacement and pruning"
+        );
+        assert!(
+            actual.records <= scanner.budget.records,
+            "retained records exceed budget: {actual:?}"
+        );
+        assert!(
+            actual.bytes <= scanner.budget.bytes,
+            "retained payload exceeds budget: {actual:?}"
+        );
+        assert!(scanner.files.len() <= scanner.file_cap);
+        assert!(scanner.seen.len() <= scanner.file_cap);
+    }
+    fn budget_compare_scan(
+        scanner: &mut IncrementalScanner,
+        path: &Path,
+    ) -> Option<ScannedSession> {
+        let mut skips = ScanSkips::default();
+        let cached = scanner.scan(path, false, None, &mut skips);
+        let mut full_skips = ScanSkips::default();
+        let full = scan_one_transcript(path, false, None, &mut full_skips);
+        assert_eq!(
+            cached, full,
+            "complete requests, models, timestamps and collapse diagnostics"
+        );
+        assert_eq!(
+            skips, full_skips,
+            "cache bypass must not report skipped input"
+        );
+        assert_cache_budget(scanner);
+        cached
+    }
+    fn budget_lines(count: usize) -> String {
+        (0..count)
+            .map(|i| format!("{}\n", perf_line(&format!("request-{i}"), i as u64 + 1)))
+            .collect()
+    }
+
+    #[test]
+    fn cache_budget_admission_margins_count_vec_capacity_strings_and_tail() {
+        let mut record: TranscriptLine = serde_json::from_str(&perf_line("one", 1)).unwrap();
+        record.cwd.as_mut().unwrap().reserve_exact(4096);
+        let tail_record = record.clone();
+        let tail_strings = tail_record.allocated_strings();
+        let strings = record.allocated_strings();
+        assert!(
+            strings >= 4096,
+            "String spare capacity, not just length, must count"
+        );
+        let inline = std::mem::size_of::<(u64, TranscriptLine)>();
+        let mut parsed = ParsedTranscript::default();
+        let generous = CacheFootprint {
+            records: 10,
+            bytes: usize::MAX,
+        };
+        assert!(parsed.admit_record(1, record, false, generous).unwrap());
+        assert_eq!(
+            parsed.footprint().bytes,
+            parsed.records.capacity() * inline + strings
+        );
+        assert!(
+            parsed.records.capacity() >= 4,
+            "spare capacity must be accounted"
+        );
+        let exact = parsed.footprint().bytes + inline + tail_strings;
+        assert!(!parsed
+            .admit_record(
+                2,
+                tail_record.clone(),
+                true,
+                CacheFootprint {
+                    records: 2,
+                    bytes: exact - 1
+                }
+            )
+            .unwrap());
+        assert_eq!(parsed.footprint().records, 1);
+        assert!(parsed
+            .admit_record(
+                2,
+                tail_record,
+                true,
+                CacheFootprint {
+                    records: 2,
+                    bytes: exact
+                }
+            )
+            .unwrap());
+        assert_eq!(
+            parsed.footprint(),
+            CacheFootprint {
+                records: 2,
+                bytes: exact
+            }
+        );
+        let overflow = CacheFootprint {
+            records: usize::MAX,
+            bytes: usize::MAX,
+        }
+        .add(CacheFootprint {
+            records: 1,
+            bytes: 1,
+        });
+        assert_eq!(overflow.records, usize::MAX);
+        assert_eq!(overflow.bytes, usize::MAX);
+        assert!(!overflow.fits(generous));
+    }
+
+    #[test]
+    fn cache_budget_oversized_records_and_strings_use_complete_uncached_output() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("large.jsonl");
+        // Two hundred independent requests, then a duplicate finalization.
+        let text = format!("{}{}\n", budget_lines(200), perf_line("request-0", 999));
+        std::fs::write(&path, &text).unwrap();
+        let mut records = IncrementalScanner {
+            budget: CacheFootprint {
+                records: 8,
+                bytes: usize::MAX,
+            },
+            ..IncrementalScanner::default()
+        };
+        let output = budget_compare_scan(&mut records, &path).unwrap();
+        assert_eq!(
+            output.requests.len(),
+            200,
+            "all requests must survive cache bypass"
+        );
+        assert_eq!(output.requests[0].snapshots_collapsed, 1);
+        assert_eq!(output.requests[0].usage.output_tokens, 999);
+        assert_eq!(
+            records.parses, 9,
+            "cache candidate stops at first inadmissible record"
+        );
+        assert!(records.files.is_empty());
+
+        let mut big: serde_json::Value =
+            serde_json::from_str(&perf_line("large-metadata", 5)).unwrap();
+        // Each metadata string independently defeats a small byte budget.
+        for field in ["cwd", "timestamp", "sessionId", "requestId", "uuid"] {
+            let mut rec = big.clone();
+            rec[field] = serde_json::Value::String("x".repeat(16 * 1024));
+            std::fs::write(&path, format!("{}\n{}", rec, text)).unwrap();
+            let mut bytes = IncrementalScanner {
+                budget: CacheFootprint {
+                    records: 1000,
+                    bytes: 4096,
+                },
+                ..IncrementalScanner::default()
+            };
+            assert!(budget_compare_scan(&mut bytes, &path).is_some());
+            assert_eq!(bytes.parses, 1, "oversized initial record is not retained");
+            assert!(bytes.files.is_empty());
+        }
+        for field in ["id", "model"] {
+            big["message"][field] = serde_json::Value::String("x".repeat(16 * 1024));
+        }
+        std::fs::write(&path, format!("{}\n{}", big, text)).unwrap();
+        let mut bytes = IncrementalScanner {
+            budget: CacheFootprint {
+                records: 1000,
+                bytes: 4096,
+            },
+            ..IncrementalScanner::default()
+        };
+        assert_eq!(
+            budget_compare_scan(&mut bytes, &path)
+                .unwrap()
+                .requests
+                .len(),
+            201
+        );
+        assert_eq!(bytes.parses, 1);
+        assert!(bytes.files.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_budget_global_many_files_eviction_reload_and_aggregation_equivalence() {
+        let _env = crate::platform::test_env::lock();
+        let home = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        super::super::launch_log::append(
+            base.path(),
+            &launch_ev("2026-05-06T09:00:00Z", 1, "/work/perf"),
+        )
+        .unwrap();
+        let mut scanner = IncrementalScanner {
+            budget: CacheFootprint {
+                records: 12,
+                bytes: 8192,
+            },
+            ..IncrementalScanner::default()
+        };
+        let mut paths = Vec::new();
+        for n in 0..20 {
+            let path = write_transcript(
+                &projects_dir(home.path()),
+                "-perf",
+                &format!("file-{n}.jsonl"),
+                &[&budget_lines(4)],
+            );
+            assert_eq!(
+                budget_compare_scan(&mut scanner, &path)
+                    .unwrap()
+                    .requests
+                    .len(),
+                4
+            );
+            paths.push(path);
+        }
+        assert!(scanner.files.len() < paths.len());
+        assert!(!scanner.files.contains_key(&paths[19]));
+        // Exercise the BYTE axis globally with a generous record limit: one
+        // file fits, but two identical allocations exceed the remaining bytes.
+        let single_bytes = scanner
+            .files
+            .values()
+            .next()
+            .unwrap()
+            .parsed
+            .footprint()
+            .bytes;
+        let mut bytes = IncrementalScanner {
+            budget: CacheFootprint {
+                records: 1000,
+                bytes: single_bytes * 2 - 1,
+            },
+            ..IncrementalScanner::default()
+        };
+        for path in &paths {
+            assert_eq!(
+                budget_compare_scan(&mut bytes, path)
+                    .unwrap()
+                    .requests
+                    .len(),
+                4
+            );
+        }
+        assert_eq!(bytes.files.len(), 1);
+        assert_eq!(bytes.retained.records, 4);
+        assert_eq!(perf_compare(&mut bytes, home.path(), base.path()).len(), 80);
+        assert_cache_budget(&bytes);
+        let events = perf_compare(&mut scanner, home.path(), base.path());
+        assert_eq!(
+            events.len(),
+            80,
+            "global budget must never drop cross-file usage"
+        );
+        assert_cache_budget(&scanner);
+        scanner.seen.clear();
+        let (cached, cached_skips) = scan_project_transcripts_cached(
+            &projects_dir(home.path()),
+            fixed_now(),
+            Some(&mut scanner),
+        );
+        let (full, full_skips) =
+            scan_project_transcripts_cached(&projects_dir(home.path()), fixed_now(), None);
+        assert_eq!(cached, full);
+        assert_eq!(cached_skips, full_skips);
+        assert_cache_budget(&scanner);
+
+        // Invalidation credits precisely the removed allocation; a formerly
+        // bypassed file can then be admitted without evicting accounting output.
+        let admitted = scanner.files.keys().next().unwrap().clone();
+        std::fs::remove_file(&admitted).unwrap();
+        assert!(budget_compare_scan(&mut scanner, &admitted).is_none());
+        assert!(budget_compare_scan(&mut scanner, &paths[19]).is_some());
+        assert!(scanner.files.contains_key(&paths[19]));
+        assert_eq!(
+            perf_compare(&mut scanner, home.path(), base.path()).len(),
+            76
+        );
+        assert_cache_budget(&scanner);
+        scanner.seen.clear();
+        scanner.prune();
+        assert_eq!(scanner.retained, CacheFootprint::default());
+        assert!(scanner.files.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_budget_parent_header_bypass_preserves_subagent_attribution() {
+        let _env = crate::platform::test_env::lock();
+        let home = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        super::super::launch_log::append(
+            base.path(),
+            &launch_ev("2026-05-06T09:00:00Z", 1, "/work/perf"),
+        )
+        .unwrap();
+        let parent = write_transcript(
+            &projects_dir(home.path()),
+            "-perf",
+            "perf.jsonl",
+            &[&budget_lines(4)],
+        );
+        let children = parent.with_extension("").join(SUBAGENTS_DIR);
+        std::fs::create_dir_all(&children).unwrap();
+        let mut child: serde_json::Value = serde_json::from_str(&perf_line("child", 2)).unwrap();
+        child.as_object_mut().unwrap().remove("cwd");
+        std::fs::write(children.join("child.jsonl"), format!("{}\n", child)).unwrap();
+        let mut scanner = IncrementalScanner {
+            budget: CacheFootprint {
+                records: 1,
+                bytes: 4096,
+            },
+            ..IncrementalScanner::default()
+        };
+        assert_eq!(
+            perf_compare(&mut scanner, home.path(), base.path()).len(),
+            5
+        );
+        assert!(!scanner.files.contains_key(&parent));
+        assert_cache_budget(&scanner);
+    }
+
+    #[test]
+    fn cache_budget_file_cap_bypasses_without_dropping_extra_file_output() {
+        let dir = TempDir::new().unwrap();
+        let mut scanner = IncrementalScanner::default();
+        assert_eq!(scanner.budget.records, INCREMENTAL_RECORD_CAP);
+        assert_eq!(scanner.budget.bytes, INCREMENTAL_PAYLOAD_BYTE_CAP);
+        let mut skips = ScanSkips::default();
+        for n in 0..INCREMENTAL_FILE_CAP {
+            let path = dir.path().join(format!("empty-{n}.jsonl"));
+            std::fs::write(&path, "").unwrap();
+            assert!(scanner.scan(&path, false, None, &mut skips).is_none());
+            assert_cache_budget(&scanner);
+        }
+        let extra = dir.path().join("extra.jsonl");
+        std::fs::write(&extra, budget_lines(3)).unwrap();
+        assert_eq!(
+            budget_compare_scan(&mut scanner, &extra)
+                .unwrap()
+                .requests
+                .len(),
+            3
+        );
+        assert_eq!(scanner.files.len(), INCREMENTAL_FILE_CAP);
+        assert!(!scanner.files.contains_key(&extra));
+    }
+
+    #[test]
+    fn cache_budget_growth_partial_utf8_truncation_rewrite_and_reload() {
+        use std::io::Write;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("growing.jsonl");
+        let mut scanner = IncrementalScanner {
+            budget: CacheFootprint {
+                records: 2,
+                bytes: 4096,
+            },
+            ..IncrementalScanner::default()
+        };
+        std::fs::write(
+            &path,
+            format!("{}\n{}", perf_line("a", 1), perf_line("b", 2)),
+        )
+        .unwrap();
+        assert_eq!(
+            budget_compare_scan(&mut scanner, &path)
+                .unwrap()
+                .requests
+                .len(),
+            2
+        );
+        assert!(scanner.files.get(&path).unwrap().parsed.tail.is_some());
+        // Retry a split UTF-8 code point at EOF, keeping full-parser semantics.
+        let mut third: serde_json::Value = serde_json::from_str(&perf_line("c", 3)).unwrap();
+        third["uuid"] = serde_json::Value::String("é".into());
+        let third = third.to_string().into_bytes();
+        let split = third.iter().position(|b| *b == 0xc3).unwrap() + 1;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"\nnot-json\n").unwrap();
+        file.write_all(&third[..split]).unwrap();
+        assert_eq!(
+            budget_compare_scan(&mut scanner, &path)
+                .unwrap()
+                .requests
+                .len(),
+            2
+        );
+        file.write_all(&third[split..]).unwrap();
+        file.write_all(b"\n").unwrap();
+        assert_eq!(
+            budget_compare_scan(&mut scanner, &path)
+                .unwrap()
+                .requests
+                .len(),
+            3
+        );
+        assert!(
+            !scanner.files.contains_key(&path),
+            "append crossing the budget removes prior prefix"
+        );
+        for count in 4..10 {
+            writeln!(file, "{}", perf_line(&format!("new-{count}"), count as u64)).unwrap();
+            assert_eq!(
+                budget_compare_scan(&mut scanner, &path)
+                    .unwrap()
+                    .requests
+                    .len(),
+                count
+            );
+            assert!(!scanner.files.contains_key(&path));
+        }
+        drop(file);
+        // Truncation reloads the now-small file; same-size rewrite replaces its
+        // contents, without accumulating stale byte or record credits.
+        std::fs::write(&path, format!("{}\n", perf_line("z", 9))).unwrap();
+        assert_eq!(
+            budget_compare_scan(&mut scanner, &path)
+                .unwrap()
+                .requests
+                .len(),
+            1
+        );
+        assert!(scanner.files.contains_key(&path));
+        std::fs::write(&path, format!("{}\n", perf_line("z", 5))).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            budget_compare_scan(&mut scanner, &path)
+                .unwrap()
+                .output_tokens,
+            5
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn perf_incremental_unchanged_and_append_parse_only_delta_with_request_collapse() {
+        let _env = crate::platform::test_env::lock();
+        let home = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        super::super::launch_log::append(
+            base.path(),
+            &launch_ev("2026-05-06T09:00:00Z", 1, "/work/perf"),
+        )
+        .unwrap();
+        let path = write_transcript(
+            &projects_dir(home.path()),
+            "-perf",
+            "perf.jsonl",
+            &[&format!("{}\n", perf_line("r1", 1))],
+        );
+        let mut c = IncrementalScanner::default();
+        let initial = perf_compare(&mut c, home.path(), base.path());
+        assert_eq!(initial.len(), 1);
+        assert_eq!(c.parses, 1);
+        c.parses = 0;
+        perf_compare(&mut c, home.path(), base.path());
+        assert_eq!(c.parses, 0, "unchanged pass must never parse");
+        use std::io::Write;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            "{}",
+            perf_line("r1", 9)
+        )
+        .unwrap();
+        let final_events = perf_compare(&mut c, home.path(), base.path());
+        assert_eq!(c.parses, 1, "append deserializes only the delta");
+        assert_eq!(final_events.len(), 1);
+        assert_eq!(final_events[0].1.output_tokens, 9);
+        assert_eq!(final_events[0].1.input_tokens, 10);
+    }
+    #[test]
+    fn perf_incremental_growing_rewrite_replacement_and_shrink_rescan() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("x.jsonl");
+        std::fs::write(&path, format!("{}\n", perf_line("a", 1))).unwrap();
+        let mut c = IncrementalScanner::default();
+        let mut skips = ScanSkips::default();
+        c.scan(&path, false, None, &mut skips).unwrap();
+        c.parses = 0;
+        std::fs::write(
+            &path,
+            format!("{}\n{}\n", perf_line("a", 5), perf_line("b", 2)),
+        )
+        .unwrap();
+        let s = c.scan(&path, false, None, &mut skips).unwrap();
+        assert_eq!(
+            c.parses, 2,
+            "growth with a changed prefix requires a full parse"
+        );
+        assert_eq!(s.output_tokens, 7);
+        assert_eq!(s.requests.len(), 2);
+        let replacement = dir.path().join("new");
+        std::fs::write(&replacement, format!("{}\n", perf_line("c", 8))).unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        c.parses = 0;
+        let cached = c.scan(&path, false, None, &mut skips).unwrap();
+        assert_eq!(
+            Some(cached),
+            scan_one_transcript(&path, false, None, &mut skips)
+        );
+        assert_eq!(c.parses, 1);
+        std::fs::write(&path, perf_line("d", 4)).unwrap();
+        c.parses = 0;
+        assert_eq!(
+            c.scan(&path, false, None, &mut skips),
+            scan_one_transcript(&path, false, None, &mut skips)
+        );
+        assert_eq!(c.parses, 1);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn perf_incremental_partial_eof_completion_preserves_absolute_fallback_ordinals() {
+        use crate::usage::request::IdentitySource;
+        use std::io::Write;
+        let anonymous = |output| {
+            let mut record: serde_json::Value =
+                serde_json::from_str(&perf_line("removed", output)).unwrap();
+            record.as_object_mut().unwrap().remove("requestId");
+            assert!(record.get("uuid").is_none());
+            assert!(record["message"].get("id").is_none());
+            record.to_string()
+        };
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("x.jsonl");
+        let second = anonymous(7);
+        // Physical line 1 has no usage; identifierless billable records begin
+        // at line 2, so absolute ordinals must include the preceding header.
+        let header =
+            r#"{"cwd":"/work/perf","sessionId":"perf","timestamp":"2026-05-06T10:00:00Z"}"#;
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}",
+                header,
+                anonymous(1),
+                &second[..second.len() / 2]
+            ),
+        )
+        .unwrap();
+        let mut c = IncrementalScanner::default();
+        let mut skips = ScanSkips::default();
+        let initial = c.scan(&path, false, None, &mut skips).unwrap();
+        assert_eq!(
+            Some(initial.clone()),
+            scan_one_transcript(&path, false, None, &mut skips)
+        );
+        assert_eq!(initial.requests.len(), 1);
+        assert_eq!(initial.requests[0].identity, IdentitySource::RecordFallback);
+        c.parses = 0;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            "{}",
+            &second[second.len() / 2..]
+        )
+        .unwrap();
+        let completed = c.scan(&path, false, None, &mut skips).unwrap();
+        assert_eq!(
+            Some(completed.clone()),
+            scan_one_transcript(&path, false, None, &mut skips)
+        );
+        assert_eq!(completed.requests.len(), 2);
+        assert_eq!(c.parses, 1, "completed EOF rereads only that one line");
+        // A third valid identifierless record at EOF must remain a distinct
+        // billable request. Resetting append ordinals aliases earlier keys.
+        write!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            "{}",
+            anonymous(3)
+        )
+        .unwrap();
+        c.parses = 0;
+        let valid_tail = c.scan(&path, false, None, &mut skips).unwrap();
+        assert_eq!(
+            Some(valid_tail.clone()),
+            scan_one_transcript(&path, false, None, &mut skips)
+        );
+        assert_eq!(
+            valid_tail.requests.len(),
+            3,
+            "identifierless append must never collide with a prior ordinal"
+        );
+        assert_eq!(valid_tail.output_tokens, 11);
+        assert_eq!(c.parses, 1);
+        assert!(valid_tail
+            .requests
+            .iter()
+            .all(|r| r.identity == IdentitySource::RecordFallback && r.snapshots_collapsed == 0));
+        // Its newline completion must preserve every normalized identity,
+        // request order and count, rather than duplicate or shift that record.
+        writeln!(std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap())
+        .unwrap();
+        c.parses = 0;
+        let newline_completed = c.scan(&path, false, None, &mut skips).unwrap();
+        assert_eq!(newline_completed, valid_tail);
+        assert_eq!(
+            Some(newline_completed),
+            scan_one_transcript(&path, false, None, &mut skips)
+        );
+        assert_eq!(c.parses, 1);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn perf_incremental_subagent_attribution_deletion_and_cache_pruning() {
+        let _env = crate::platform::test_env::lock();
+        let home = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        super::super::launch_log::append(
+            base.path(),
+            &launch_ev("2026-05-06T09:00:00Z", 1, "/work/perf"),
+        )
+        .unwrap();
+        let parent = write_transcript(
+            &projects_dir(home.path()),
+            "-p",
+            "perf.jsonl",
+            &[&format!("{}\n", perf_line("a", 1))],
+        );
+        let children = parent.with_extension("").join("subagents");
+        std::fs::create_dir_all(&children).unwrap();
+        let child = children.join("child.jsonl");
+        let mut rec: serde_json::Value = serde_json::from_str(&perf_line("b", 2)).unwrap();
+        rec.as_object_mut().unwrap().remove("cwd");
+        std::fs::write(&child, format!("{}\n", rec)).unwrap();
+        let mut c = IncrementalScanner::default();
+        assert_eq!(perf_compare(&mut c, home.path(), base.path()).len(), 2);
+        c.parses = 0;
+        perf_compare(&mut c, home.path(), base.path());
+        assert_eq!(c.parses, 0, "parent-header reuse must not reparse either");
+        std::fs::remove_file(&child).unwrap();
+        assert_eq!(perf_compare(&mut c, home.path(), base.path()).len(), 1);
+        assert!(!c.files.contains_key(&child));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&parent, &child).unwrap();
+            assert_eq!(perf_compare(&mut c, home.path(), base.path()).len(), 1);
+            assert!(!c.files.contains_key(&child));
+        }
+        std::fs::remove_file(&parent).unwrap();
+        assert!(perf_compare(&mut c, home.path(), base.path()).is_empty());
+        assert!(c.files.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn perf_incremental_cold_validation_bounds_early_prefix_rewrite() {
+        use std::io::Write;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("x.jsonl");
+        let first = format!("{}\n", perf_line("a", 1));
+        std::fs::write(&path, format!("{}{}\n", first, " ".repeat(8192))).unwrap();
+        let mut c = IncrementalScanner::default();
+        let mut skips = ScanSkips::default();
+        c.scan(&path, false, None, &mut skips).unwrap();
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.write_all(format!("{}\n", perf_line("a", 9)).as_bytes())
+            .unwrap();
+        f.seek(SeekFrom::End(0)).unwrap();
+        writeln!(f, "{}", perf_line("b", 2)).unwrap();
+        c.parses = 0;
+        // The rewritten earlier prefix is outside the bounded append check.
+        assert_eq!(
+            c.scan(&path, false, None, &mut skips)
+                .unwrap()
+                .output_tokens,
+            3
+        );
+        assert_eq!(c.parses, 1);
+        c.files.get_mut(&path).unwrap().validated = std::time::Instant::now() - COLD_VALIDATION;
+        c.parses = 0;
+        assert_eq!(
+            c.scan(&path, false, None, &mut skips),
+            scan_one_transcript(&path, false, None, &mut skips)
+        );
+        assert_eq!(
+            c.parses, 2,
+            "daily cold scan reparses the previously changed prefix"
+        );
+        assert_eq!(
+            c.scan(&path, false, None, &mut skips)
+                .unwrap()
+                .output_tokens,
+            11
+        );
+    }
+
+    #[test]
+    fn perf_incremental_same_size_mtime_change_and_unreadable_recheck() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("x.jsonl");
+        std::fs::write(&path, format!("{}\n", perf_line("a", 1))).unwrap();
+        let mut c = IncrementalScanner::default();
+        let mut skips = ScanSkips::default();
+        c.scan(&path, false, None, &mut skips).unwrap();
+        std::fs::write(&path, format!("{}\n", perf_line("a", 9))).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(1))
+            .unwrap();
+        c.parses = 0;
+        assert_eq!(
+            c.scan(&path, false, None, &mut skips)
+                .unwrap()
+                .output_tokens,
+            9
+        );
+        assert_eq!(c.parses, 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // open_readonly must still run: access cannot be bypassed by cache.
+            // Root can read mode-000; both scanners must agree in either case.
+            assert_eq!(
+                c.scan(&path, false, None, &mut skips),
+                scan_one_transcript(&path, false, None, &mut skips)
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert!(c.scan(&path, false, None, &mut skips).is_none());
+        assert!(!c.files.contains_key(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn perf_incremental_recomputes_window_and_launch_attribution_without_parse() {
+        let _env = crate::platform::test_env::lock();
+        let home = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        let mut ev = launch_ev("2026-05-06T09:00:00Z", 1, "/work/perf");
+        super::super::launch_log::append(base.path(), &ev).unwrap();
+        write_transcript(
+            &projects_dir(home.path()),
+            "-perf",
+            "perf.jsonl",
+            &[&format!("{}\n", perf_line("a", 1))],
+        );
+        let mut c = IncrementalScanner::default();
+        assert_eq!(perf_compare(&mut c, home.path(), base.path())[0].0, slot(1));
+        ev.slot = 2;
+        ev.ts = "2026-05-06T09:30:00Z".into();
+        super::super::launch_log::append(base.path(), &ev).unwrap();
+        c.parses = 0;
+        assert_eq!(perf_compare(&mut c, home.path(), base.path())[0].0, slot(2));
+        assert_eq!(c.parses, 0);
+        let previous_cost = perf_compare(&mut c, home.path(), base.path())[0]
+            .1
+            .cost_usd_estimate;
+        assert!(previous_cost.is_some());
+        let mut manifest = crate::providers::model_manifest::ModelManifest::bundled();
+        for rule in &mut manifest.rates {
+            for epoch in &mut rule.epochs {
+                epoch.rate.input_per_1m_usd *= 2.0;
+                epoch.rate.output_per_1m_usd *= 2.0;
+            }
+        }
+        std::fs::write(
+            crate::providers::model_manifest::manifest_path(base.path()),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let repriced = perf_compare(&mut c, home.path(), base.path());
+        assert_ne!(repriced[0].1.cost_usd_estimate, previous_cost);
+        assert_eq!(
+            c.parses, 0,
+            "manifest reload reprices metadata without transcript parsing"
+        );
+        let now = chrono::DateTime::<Utc>::from(std::time::SystemTime::now()) + Duration::days(40);
+        assert_eq!(
+            c.aggregate(home.path(), base.path(), now, |_| "claude-sonnet-4-6"
+                .into())
+                .unwrap(),
+            aggregate(home.path(), base.path(), now, |_| "claude-sonnet-4-6"
+                .into())
+            .unwrap()
+        );
+        assert!(c.files.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn perf_incremental_synthetic_256mib_cold_warm_append_measurement() {
+        use std::io::Write;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("corpus.jsonl");
+        let mut rec: serde_json::Value =
+            serde_json::from_str(&perf_line("same-request", 1)).unwrap();
+        rec["message"]["content"] = serde_json::Value::String("x".repeat(65536));
+        let line = format!("{}\n", rec);
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        for _ in 0..4096 {
+            out.write_all(line.as_bytes()).unwrap();
+        }
+        out.flush().unwrap();
+        drop(out);
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        assert!(bytes >= 256 * 1024 * 1024);
+        let mut c = IncrementalScanner::default();
+        let mut skips = ScanSkips::default();
+        let start = std::time::Instant::now();
+        let cold = c.scan(&path, false, None, &mut skips).unwrap();
+        let cold_us = start.elapsed().as_micros();
+        let cold_parses = c.parses;
+        assert_eq!(cold_parses, 4096);
+        assert_eq!(cold.requests.len(), 1);
+        c.parses = 0;
+        let start = std::time::Instant::now();
+        assert_eq!(Some(cold), c.scan(&path, false, None, &mut skips));
+        let warm_us = start.elapsed().as_micros();
+        let warm_parses = c.parses;
+        assert_eq!(warm_parses, 0);
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            "{}",
+            perf_line("same-request", 9)
+        )
+        .unwrap();
+        c.parses = 0;
+        let start = std::time::Instant::now();
+        let appended = c.scan(&path, false, None, &mut skips).unwrap();
+        let append_us = start.elapsed().as_micros();
+        assert_eq!(c.parses, 1);
+        assert_eq!(appended.output_tokens, 9);
+        assert_eq!(
+            Some(appended),
+            scan_one_transcript(&path, false, None, &mut skips)
+        );
+        eprintln!("PERF_CORPUS bytes={bytes} cold_parses={cold_parses} warm_parses={warm_parses} append_parses={} cold_us={cold_us} warm_us={warm_us} append_us={append_us}", c.parses);
+    }
 
     fn slot(n: u16) -> AccountNum {
         AccountNum::try_from(n).unwrap()
@@ -3929,6 +5900,486 @@ mod tests {
                 "cache_creation_input_tokens",
                 "cache_read_input_tokens",
             ],
+        );
+    }
+    // ── per-pass fallback memo + PassCache ─────────────────────────────────
+
+    fn line_for(i: usize, ts: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","cwd":"/repo/a","timestamp":"{ts}","sessionId":"s{i}","requestId":"r{i}","message":{{"id":"m{i}","model":"claude-opus-4-8","usage":{{"input_tokens":{n},"output_tokens":7}}}}}}"#,
+            n = 100 + i
+        )
+    }
+
+    /// Plants `files` transcripts x `per_file` requests in one cwd launched by
+    /// slot 4; returns nothing — callers re-aggregate.
+    fn plant_many(claude_home: &Path, base: &Path, files: usize, per_file: usize) {
+        for f in 0..files {
+            let lines: Vec<String> = (0..per_file)
+                .map(|r| {
+                    let id = f * per_file + r;
+                    let ts = format!("2026-05-06T11:{:02}:{:02}Z", (id / 60) % 60, id % 60);
+                    line_for(id, &ts)
+                })
+                .collect();
+            let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+            write_transcript(
+                &claude_home.join("projects"),
+                "-repo-a",
+                &format!("t{f}.jsonl"),
+                &refs,
+            );
+        }
+        super::super::launch_log::append(base, &launch_ev("2026-05-06T10:00:00Z", 4, "/repo/a"))
+            .unwrap();
+    }
+
+    /// RED without the memo: the callback ran once per attributed SESSION (here
+    /// 5), reading settings.json each time. GREEN: once per slot per pass.
+    #[test]
+    fn aggregate_resolves_fallback_model_once_per_slot_per_pass() {
+        let ch = TempDir::new().unwrap();
+        let bd = TempDir::new().unwrap();
+        plant_many(ch.path(), bd.path(), 5, 2);
+        let calls = std::cell::Cell::new(0u32);
+        let out = aggregate(ch.path(), bd.path(), fixed_now(), |_| {
+            calls.set(calls.get() + 1);
+            "claude-sonnet-5".to_string()
+        })
+        .unwrap();
+        assert_eq!(out.len(), 10, "all requests attributed");
+        assert_eq!(calls.get(), 1, "one resolution for the one slot");
+        // A second pass resolves afresh (the memo is per pass, not global).
+        let _ = aggregate(ch.path(), bd.path(), fixed_now(), |_| {
+            calls.set(calls.get() + 1);
+            "claude-sonnet-5".to_string()
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+    }
+
+    /// The slim retained form summarizes IDENTICALLY (`UsageSummary` is
+    /// `PartialEq`, floats included) to the full events, for every slot, and
+    /// holds the same number of events.
+    fn assert_equivalent(slim: &SlimLedger, full: &[(AccountNum, UsageEvent)], now: DateTime<Utc>) {
+        assert_eq!(slim.len(), full.len());
+        let slots: std::collections::BTreeSet<AccountNum> = full.iter().map(|(s, _)| *s).collect();
+        for s in slots {
+            let evs: Vec<UsageEvent> = full
+                .iter()
+                .filter(|(x, _)| *x == s)
+                .map(|(_, e)| e.clone())
+                .collect();
+            assert_eq!(
+                slim.summarize_slot(s, now),
+                crate::usage::ledger::summarize(&evs, now),
+                "slot {s}"
+            );
+        }
+    }
+
+    /// Exactness of the slim round trip on awkward timestamps: sub-second,
+    /// offset-bearing, and unparseable (which must stay total-only).
+    #[test]
+    fn slim_event_summarizes_identically_for_awkward_timestamps() {
+        let now = fixed_now();
+        let mk = |ts: &str, i: u64| {
+            let mut e = attributed_session_to_events(
+                &AttributedSession {
+                    slot: slot(4),
+                    session: ScannedSession::from_parts(
+                        "s".into(),
+                        "/p".into(),
+                        "2026-05-06T11:00:00Z".into(),
+                        None,
+                        vec![request_at("2026-05-06T11:00:00Z", None, i, 2 * i, 3, 4)],
+                    ),
+                },
+                "claude-sonnet-5",
+            )
+            .remove(0);
+            e.ts = ts.to_string();
+            e.snapshots_collapsed = i;
+            e.from_subagent = i.is_multiple_of(2);
+            (slot(4), e)
+        };
+        let full: Vec<_> = [
+            "2026-05-06T11:59:59.123456789Z",
+            "2026-05-06T19:30:00+08:00",
+            "2026-05-06T00:00:00Z",
+            "2026-05-05T23:59:59.999999999Z",
+            "2026-04-01T00:00:00Z",
+            "garbage",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, ts)| mk(ts, i as u64 + 1))
+        .collect();
+        assert_equivalent(&SlimLedger::from_pairs(&full), &full, now);
+    }
+
+    fn stat(path: &str, len: u64, m: i128) -> InputStat {
+        InputStat {
+            path: PathBuf::from(path),
+            len,
+            mtime_ns: Some(m),
+            identity: None,
+            unreadable: false,
+        }
+    }
+
+    /// A symlinked `settings.json` whose TARGET changes must change the
+    /// snapshot (`symlink_metadata` would stat the link itself and miss it).
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_sees_through_symlinked_settings() {
+        let ch = TempDir::new().unwrap();
+        let bd = TempDir::new().unwrap();
+        let now = fixed_now();
+        let cfg = bd.path().join("config-1");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let target = bd.path().join("real-settings.json");
+        std::fs::write(&target, "{\"a\":1}").unwrap();
+        std::os::unix::fs::symlink(&target, cfg.join("settings.json")).unwrap();
+        let before = snapshot_inputs(ch.path(), bd.path(), now);
+        assert!(!before.is_empty(), "fixture: the link is listed");
+        std::fs::write(&target, "{\"a\":12345}").unwrap();
+        let after_len = snapshot_inputs(ch.path(), bd.path(), now);
+        assert_ne!(before, after_len, "target length change must differ");
+        // Same length, explicit different mtime.
+        std::fs::write(&target, "{\"a\":54321}").unwrap();
+        let set = |secs: u64| {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&target)
+                .unwrap();
+            f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .unwrap();
+        };
+        set(1_700_000_000);
+        let a = snapshot_inputs(ch.path(), bd.path(), now);
+        set(1_700_000_100);
+        let b = snapshot_inputs(ch.path(), bd.path(), now);
+        assert_ne!(a, b, "target mtime change must differ");
+    }
+
+    /// A link whose target cannot be statted is a snapshot that never reuses.
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlinked_input_never_reads_as_unchanged() {
+        let ch = TempDir::new().unwrap();
+        let bd = TempDir::new().unwrap();
+        let now = fixed_now();
+        let cfg = bd.path().join("config-1");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::os::unix::fs::symlink(bd.path().join("gone.json"), cfg.join("settings.json")).unwrap();
+        let snap = snapshot_inputs(ch.path(), bd.path(), now);
+        assert!(snap.has_unreadable());
+        let mut pc = PassCache::default();
+        let mut runs = 0;
+        for _ in 0..2 {
+            let snap = snapshot_inputs(ch.path(), bd.path(), now);
+            let (_, k) = pc
+                .refresh(snap, || {
+                    runs += 1;
+                    Ok::<_, ()>(Vec::new())
+                })
+                .unwrap();
+            assert_eq!(k, PassKind::Full);
+        }
+        assert_eq!(runs, 2);
+    }
+
+    fn set_mtime(path: &Path, secs: u64) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    /// An identity-store file (the provider binding) is an input: changing it
+    /// (same length, explicit different mtime) or adding one changes the
+    /// snapshot, so `PassCache` runs a full pass instead of reusing.
+    #[test]
+    fn identity_store_change_invalidates_reuse() {
+        let ch = TempDir::new().unwrap();
+        let bd = TempDir::new().unwrap();
+        let now = fixed_now();
+        let dir = bd
+            .path()
+            .join("identities")
+            .join("11111111-2222-3333-4444-555555555555");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ident = dir.join("identity.json");
+        std::fs::write(&ident, "{\"provider\":\"a\"}").unwrap();
+        set_mtime(&ident, 1_700_000_000);
+        let mut pc = PassCache::default();
+        let mut runs = 0;
+        let mut go = |pc: &mut PassCache| {
+            let snap = snapshot_inputs(ch.path(), bd.path(), now);
+            pc.refresh(snap, || {
+                runs += 1;
+                Ok::<_, ()>(Vec::new())
+            })
+            .unwrap()
+            .1
+        };
+        assert_eq!(go(&mut pc), PassKind::Full);
+        assert_eq!(go(&mut pc), PassKind::Reused, "nothing changed");
+        std::fs::write(&ident, "{\"provider\":\"b\"}").unwrap();
+        set_mtime(&ident, 1_700_000_100);
+        assert_eq!(go(&mut pc), PassKind::Full, "identity.json edit");
+        assert_eq!(go(&mut pc), PassKind::Reused);
+        std::fs::write(dir.join("credentials-codex.json"), "{}").unwrap();
+        assert_eq!(go(&mut pc), PassKind::Full, "codex credential appeared");
+        let legacy = bd.path().join("credentials");
+        std::fs::create_dir_all(&legacy).unwrap();
+        assert_eq!(go(&mut pc), PassKind::Reused);
+        std::fs::write(legacy.join("codex-3.json"), "{}").unwrap();
+        assert_eq!(go(&mut pc), PassKind::Full, "legacy mirror appeared");
+    }
+
+    /// A replacement by rename with the SAME length and a preserved mtime is
+    /// seen through the inode.
+    #[cfg(unix)]
+    #[test]
+    fn same_len_same_mtime_rename_replacement_changes_snapshot() {
+        let ch = TempDir::new().unwrap();
+        let bd = TempDir::new().unwrap();
+        let now = fixed_now();
+        let manifest = crate::providers::model_manifest::manifest_path(bd.path());
+        std::fs::write(&manifest, "{\"a\":1}").unwrap();
+        set_mtime(&manifest, 1_700_000_000);
+        let before = snapshot_inputs(ch.path(), bd.path(), now);
+        let staged = bd.path().join("staged.json");
+        std::fs::write(&staged, "{\"a\":2}").unwrap();
+        set_mtime(&staged, 1_700_000_000);
+        std::fs::rename(&staged, &manifest).unwrap();
+        let after = snapshot_inputs(ch.path(), bd.path(), now);
+        assert_ne!(before, after, "inode change must be visible");
+    }
+
+    /// A directory above the listing cap makes the snapshot unreadable (never
+    /// reused) rather than an unbounded stat walk.
+    #[test]
+    fn oversized_listing_is_bounded_and_never_reused() {
+        let ch = TempDir::new().unwrap();
+        let bd = TempDir::new().unwrap();
+        let creds = bd.path().join("credentials");
+        std::fs::create_dir_all(&creds).unwrap();
+        for i in 0..(MAX_LISTED_ENTRIES + 5) {
+            std::fs::write(creds.join(format!("x{i}.json")), "").unwrap();
+        }
+        let snap = snapshot_inputs(ch.path(), bd.path(), fixed_now());
+        assert!(snap.has_unreadable());
+        assert!(snap.len() <= MAX_LISTED_ENTRIES + 1, "len={}", snap.len());
+    }
+
+    fn one_pair() -> Vec<(AccountNum, UsageEvent)> {
+        let ev = attributed_session_to_events(
+            &AttributedSession {
+                slot: slot(4),
+                session: ScannedSession::from_parts(
+                    "s".into(),
+                    "/p".into(),
+                    "2026-05-06T11:00:00Z".into(),
+                    None,
+                    vec![request_at("2026-05-06T11:00:00Z", None, 1, 2, 0, 0)],
+                ),
+            },
+            "claude-sonnet-5",
+        );
+        ev.into_iter().map(|e| (slot(4), e)).collect()
+    }
+
+    /// Injected listings: identical snapshot reuses (aggregate NOT called);
+    /// a changed length or mtime, or a removed file, forces a full pass.
+    #[test]
+    fn pass_cache_reuses_only_when_snapshot_identical() {
+        let mut pc = PassCache::default();
+        let calls = std::cell::Cell::new(0u32);
+        let run = |pc: &mut PassCache, snap: InputSnapshot| {
+            pc.refresh::<()>(snap, || {
+                calls.set(calls.get() + 1);
+                Ok(one_pair())
+            })
+            .unwrap()
+            .1
+        };
+        let base = vec![stat("/a", 10, 1), stat("/b", 20, 2)];
+        // Listing order must not matter.
+        let rev = vec![stat("/b", 20, 2), stat("/a", 10, 1)];
+        assert_eq!(
+            run(&mut pc, InputSnapshot::from_stats(base.clone())),
+            PassKind::Full
+        );
+        assert_eq!(
+            run(&mut pc, InputSnapshot::from_stats(rev)),
+            PassKind::Reused
+        );
+        assert_eq!(calls.get(), 1);
+        for changed in [
+            vec![stat("/a", 11, 1), stat("/b", 20, 2)],
+            vec![stat("/a", 10, 9), stat("/b", 20, 2)],
+            vec![stat("/a", 10, 1)],
+            vec![stat("/a", 10, 1), stat("/b", 20, 2), stat("/c", 1, 1)],
+        ] {
+            let before = calls.get();
+            assert_eq!(
+                run(&mut pc, InputSnapshot::from_stats(changed)),
+                PassKind::Full
+            );
+            assert_eq!(calls.get(), before + 1);
+        }
+    }
+
+    /// The reuse streak is bounded: after MAX_REUSE_STREAK reuses a full pass
+    /// is forced even with an identical snapshot.
+    #[test]
+    fn pass_cache_forces_full_pass_after_streak() {
+        let mut pc = PassCache::default();
+        let snap = InputSnapshot::from_stats(vec![stat("/a", 1, 1)]);
+        let kinds: Vec<PassKind> = (0..PassCache::MAX_REUSE_STREAK + 2)
+            .map(|_| pc.refresh::<()>(snap.clone(), || Ok(one_pair())).unwrap().1)
+            .collect();
+        assert_eq!(kinds[0], PassKind::Full);
+        assert!(kinds[1..=PassCache::MAX_REUSE_STREAK as usize]
+            .iter()
+            .all(|k| *k == PassKind::Reused));
+        assert_eq!(
+            kinds[PassCache::MAX_REUSE_STREAK as usize + 1],
+            PassKind::Full
+        );
+    }
+
+    /// A failed pass is an error, never a cached/empty success, and it clears
+    /// the cache so the next call runs in full.
+    #[test]
+    fn pass_cache_error_is_surfaced_and_clears_cache() {
+        let mut pc = PassCache::default();
+        let snap = InputSnapshot::from_stats(vec![stat("/a", 1, 1)]);
+        pc.refresh::<&str>(snap.clone(), || Ok(one_pair())).unwrap();
+        // Force a full pass by changing the snapshot; the aggregate fails.
+        let other = InputSnapshot::from_stats(vec![stat("/a", 2, 1)]);
+        assert_eq!(
+            pc.refresh::<&str>(other, || Err("boom")).unwrap_err(),
+            "boom"
+        );
+        let kind = pc.refresh::<&str>(snap, || Ok(one_pair())).unwrap().1;
+        assert_eq!(kind, PassKind::Full);
+    }
+
+    /// Equivalence on real fixture transcripts: the cached path returns exactly
+    /// what a fresh full aggregation returns — on the first pass, on a reuse,
+    /// after an append (mtime/len change), and after the clock moves the files
+    /// out of the scan window.
+    #[test]
+    fn pass_cache_matches_full_aggregation_on_fixture_transcripts() {
+        let ch = TempDir::new().unwrap();
+        let bd = TempDir::new().unwrap();
+        plant_many(ch.path(), bd.path(), 6, 4);
+        let full =
+            |now| aggregate(ch.path(), bd.path(), now, |_| "claude-sonnet-5".to_string()).unwrap();
+        let mut pc = PassCache::default();
+        let mut cached = |now: DateTime<Utc>| {
+            let snap = snapshot_inputs(ch.path(), bd.path(), now);
+            pc.refresh(snap, || {
+                aggregate(ch.path(), bd.path(), now, |_| "claude-sonnet-5".to_string())
+            })
+            .unwrap()
+        };
+        let now = fixed_now();
+        let (p1, k1) = cached(now);
+        assert_eq!(k1, PassKind::Full);
+        assert_equivalent(&p1, &full(now), now);
+        assert_eq!(p1.len(), 24);
+        let (p2, k2) = cached(now);
+        assert_eq!(k2, PassKind::Reused);
+        assert_equivalent(&p2, &full(now), now);
+        // Append a request to one transcript: len changes -> must re-aggregate.
+        let t0 = ch.path().join("projects/-repo-a/t0.jsonl");
+        let mut body = std::fs::read_to_string(&t0).unwrap();
+        body.push('\n');
+        body.push_str(&line_for(9999, "2026-05-06T11:59:00Z"));
+        std::fs::write(&t0, body).unwrap();
+        let (p3, k3) = cached(now);
+        assert_eq!(k3, PassKind::Full);
+        assert_eq!(p3.len(), 25);
+        assert_equivalent(&p3, &full(now), now);
+        // Injected clock far in the future: every transcript ages out.
+        let later = now + Duration::days(SCAN_MAX_AGE_DAYS + 400);
+        let (p4, k4) = cached(later);
+        assert_eq!(k4, PassKind::Full);
+        assert_equivalent(&p4, &full(later), later);
+        assert!(p4.is_empty());
+    }
+
+    /// Measurement (not a gate): 200 transcripts x 500 events. Run with
+    /// `-- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
+    fn bench_full_pass_vs_reused_pass_200x500() {
+        let ch = TempDir::new().unwrap();
+        let bd = TempDir::new().unwrap();
+        plant_many(ch.path(), bd.path(), 200, 500);
+        let now = fixed_now();
+        let mut pc = PassCache::default();
+        let t = std::time::Instant::now();
+        let snap = snapshot_inputs(ch.path(), bd.path(), now);
+        let (p, k) = pc
+            .refresh(snap, || {
+                aggregate(ch.path(), bd.path(), now, |_| "claude-sonnet-5".to_string())
+            })
+            .unwrap();
+        let full_ms = t.elapsed().as_secs_f64() * 1e3;
+        let t = std::time::Instant::now();
+        let snap = snapshot_inputs(ch.path(), bd.path(), now);
+        let (p2, k2) = pc
+            .refresh(snap, || {
+                aggregate(ch.path(), bd.path(), now, |_| "claude-sonnet-5".to_string())
+            })
+            .unwrap();
+        let reuse_ms = t.elapsed().as_secs_f64() * 1e3;
+        println!(
+            "BENCH events={} first={k:?} {full_ms:.1}ms second={k2:?} {reuse_ms:.1}ms",
+            p.len()
+        );
+        assert_eq!(k, PassKind::Full);
+        assert_eq!(k2, PassKind::Reused);
+        assert_eq!(p.len(), p2.len());
+    }
+    /// Measurement (not a gate): retained bytes of the cached pass for the
+    /// 200 x 500 fixture, full events vs slim. Heap = String capacities (a lower
+    /// bound; the allocator rounds up). Run with `-- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement; run explicitly with --ignored --nocapture"]
+    fn measure_retained_bytes_of_cached_pairs_200x500() {
+        let ch = TempDir::new().unwrap();
+        let bd = TempDir::new().unwrap();
+        plant_many(ch.path(), bd.path(), 200, 500);
+        let out = aggregate(ch.path(), bd.path(), fixed_now(), |_| {
+            "claude-sonnet-5".to_string()
+        })
+        .unwrap();
+        let inline = std::mem::size_of::<(AccountNum, UsageEvent)>();
+        let heap: usize = out
+            .iter()
+            .map(|(_, e)| {
+                e.ts.capacity()
+                    + e.session_id.capacity()
+                    + e.model.capacity()
+                    + e.project_path.as_ref().map_or(0, |p| p.capacity())
+            })
+            .sum();
+        let n = out.len();
+        let full = heap + out.capacity() * inline;
+        let slim = SlimLedger::from_pairs(&out);
+        println!(
+            "MEM events={n} before: inline_per_event={inline} heap_per_event={:.1} total_per_event={:.1} total_bytes={full} | after: size_of_SlimEvent={} total_per_event={:.1} total_bytes={}",
+            heap as f64 / n as f64,
+            full as f64 / n as f64,
+            std::mem::size_of::<SlimEvent>(),
+            slim.retained_bytes() as f64 / n as f64,
+            slim.retained_bytes()
         );
     }
 }

@@ -3,14 +3,14 @@ resolver = "2"
 members = [
   "csq-core",
   "csq",                      # Single-binary csq (an internal ticket).
-  "csq-merkle",              # an internal ticket RFC 6962 Merkle verifier leaf (dep of BOTH csq-ledger AND csq-core; breaks the csq-core↔csq-ledger cycle).
+  "csq-merkle",              # an internal ticket RFC 6962 Merkle verifier leaf (dep of csq-ledger; csq-core does not use it).
   "csq-redact",              # W1 community leaf: token redaction + RedactedString (dep of csq-sdk).
   "csq-sdk",                 # W2 public wire contract: SDK envelope/error/adapter + payload DTOs.
   "csq-ledger",              # M10 Foundation-owned transparency-log server.
 ]
 
 [workspace.package]
-version = "2.20.2"
+version = "2.21.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/terrene-foundation/csq"
@@ -27,19 +27,20 @@ repository = "https://github.com/terrene-foundation/csq"
 # NOT these dep literals (nor the enterprise SDK crate's `=X.Y.Z` pin), so the
 # `version_pins_match_workspace` test in the enterprise SDK crate fails closed on drift
 # until W5 automates the bump — do NOT trust the /release flow to keep these in sync.
-csq-redact = { path = "csq-redact", version = "2.20.2" }
+csq-redact = { path = "csq-redact", version = "2.21.0" }
 # csq-sdk — public (Apache-2.0) SDK wire contract (W2): envelope/error/adapter +
 # payload DTOs. csq-core depends on it and re-exports it (crate::sdk::*); the
 # builders (EDITION + audit->DTO mapping) live app-side in csq-core. `version`
 # alongside `path` for the same publishability reason as csq-redact above; the same
 # `version_pins_match_workspace` guard covers this literal.
-csq-sdk = { path = "csq-sdk", version = "2.20.2" }
-# csq-merkle — an internal ticket RFC 6962 Merkle verifier leaf crate (publish=false). Both
-# csq-ledger AND csq-core depend on it; no `version` alongside `path` is needed
-# because it is not published and no publishable (OPEN) crate depends on it — it
-# is PROPRIETARY (publish=false) reached only by PROPRIETARY crates, the allowed
-# edition-boundary direction. Zero enterprise deps, so csq-core → csq-merkle is
-# not a moat edge; ships to community (COMMUNITY_SHIPPED_PROPRIETARY).
+csq-sdk = { path = "csq-sdk", version = "2.21.0" }
+# csq-merkle — an internal ticket RFC 6962 Merkle verifier leaf crate (publish=false). csq-ledger
+# depends on it; csq-core does NOT (nothing there calls it, so the dependency was
+# dropped — rustc nightly's `unused_dependencies` lint). No `version` alongside `path`
+# is needed because it is not published and no publishable (OPEN) crate depends on it —
+# it is PROPRIETARY (publish=false) reached only by PROPRIETARY crates, the allowed
+# edition-boundary direction. Zero enterprise deps; ships to community
+# (COMMUNITY_SHIPPED_PROPRIETARY). A future csq-core caller re-adds the edge.
 csq-merkle = { path = "csq-merkle" }
 serde = { version = "1", features = ["derive"] }
 # `raw_value` enables `serde_json::value::RawValue` — verbatim JSON capture used
@@ -84,6 +85,7 @@ sha2 = "0.10"
 # to a direct workspace dep gives a stable public API surface and one version pin.
 hkdf = "0.12"
 unicode-normalization = "0.1"
+unicode-general-category = "1.1"
 secrecy = { version = "0.10", features = ["serde"] }
 libc = "0.2"
 tempfile = "3"
@@ -148,6 +150,11 @@ aes-gcm = { version = "0.10", features = ["zeroize"] }
 # SEPARATE crate instance in the graph and the feature no longer unifies with
 # aes-gcm's copy — verify with `cargo tree -i aes` after any aes-gcm bump.
 aes = { version = "0.8", features = ["zeroize"] }
+# Linux Secret Service 5 uses separate AES/CBC versions. These direct anchors
+# scrub the owning AES schedule and CBC IV; they do not scrub Session/DH
+# buffers, VAES temporaries, registers, or every copy of secret material.
+secret-service-aes = { package = "aes", version = "0.9", default-features = false, features = ["zeroize"] }
+secret-service-cbc = { package = "cbc", version = "0.2", default-features = false, features = ["zeroize"] }
 argon2 = "0.5"
 zeroize = { version = "1", features = ["derive"] }
 # `subtle` provides constant-time equality (`ConstantTimeEq`) for
@@ -174,7 +181,7 @@ subtle = { version = "2", default-features = false, features = ["core_hint_black
 # `rt-tokio-crypto-rust` feature picks tokio for the async runtime and
 # RustCrypto for session-key crypto so we keep the no-OpenSSL-FFI posture.
 # Linux-only — the crate itself does not compile on macOS / Windows.
-secret-service = { version = "4", default-features = false, features = ["rt-tokio-crypto-rust"] }
+secret-service = { version = "5", default-features = false, features = ["rt-tokio-crypto-rust"] }
 # PR-CA9b T18 originally used bincode 1.3.3 for the parse-cache wire format,
 # but bincode 1.x AND 2.x are both flagged unmaintained (RUSTSEC-2024-0419,
 # RUSTSEC-2025-0141). The use case is trivial — length-prefix + bytes for a

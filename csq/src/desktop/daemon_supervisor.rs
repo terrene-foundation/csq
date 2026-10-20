@@ -178,7 +178,8 @@ async fn supervisor_loop(base_dir: PathBuf, cancel: CancellationToken) {
 /// real signal cannot be raised against a `#[cfg(windows)]` shutdown
 /// event, but it CAN be raised against this function directly — see the
 /// `unix_sigterm_bridge_cancels_the_token` test below, which sends a
-/// genuine `SIGTERM` to the current process and asserts `cancel` fires.
+/// genuine `SIGTERM` in an owned subprocess and asserts `cancel` fires
+/// without contaminating the parent test process's signal state.
 ///
 /// Returns immediately after spawning the listener task; never blocks,
 /// never panics. A registration failure (an exceptional kernel
@@ -209,69 +210,352 @@ fn install_unix_sigterm_bridge(cancel: CancellationToken) {
 #[cfg(all(test, unix))]
 mod sigterm_bridge_tests {
     use super::install_unix_sigterm_bridge;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
     use tokio_util::sync::CancellationToken;
 
-    /// Non-vacuity + correctness proof for an internal ticket's Unix half: a
-    /// REAL `SIGTERM` raised against the current process reaches the
-    /// bridged token, exercising the exact signal `csq daemon stop`
-    /// sends (`csq-core/src/daemon/lifecycle.rs::stop_daemon` →
-    /// `kill(pid, SIGTERM)`) when this app's PID is the PidFile owner.
-    ///
-    /// # Why raising a real SIGTERM at the whole test-binary process is
-    /// safe here
-    ///
-    /// `tokio::signal::unix::signal` registers with the process-wide
-    /// `signal-hook-registry`, which OVERRIDES the OS default
-    /// disposition (process termination) for `SIGTERM` for the
-    /// remainder of the process once ANY listener has been registered.
-    /// So once `install_unix_sigterm_bridge` returns `Ok`, self-raising
-    /// `SIGTERM` cannot terminate the test binary — it can only reach
-    /// registered listeners, which is exactly the behavior under test.
-    /// `yield_now` gives the listener's registration (synchronous,
-    /// inside `signal()` itself, before any task runs) a scheduling
-    /// point to complete before the raise — a scheduling nicety, not a
-    /// correctness requirement, since the syscall itself is synchronous.
-    /// Item 4 (D-F3): this bridge registers via `tokio`'s
-    /// `signal-hook-registry`, while `cli_deps::auto_update`'s
-    /// `InterruptSignalGuard` and `codex_supervise::drive_child` both
-    /// install raw `libc::signal(SIGTERM, ..)` handlers — a mechanism that
-    /// silently OVERWRITES whatever `signal-hook-registry` installed for
-    /// the remainder of the process. All three touch the SAME process-wide
-    /// `SIGTERM` disposition, and this crate's default feature set
-    /// compiles `desktop` alongside `cli`/`enterprise` into one test
-    /// binary, so `cargo test`'s default parallel runner can genuinely
-    /// interleave this test with either of the other two. Held across the
-    /// awaits below deliberately: the race window this guards is exactly
-    /// "another test mutates SIGTERM disposition between this test's
-    /// install and its own raise+await", which spans both await points.
-    ///
-    /// `await_holding_lock`: this `std::sync::Mutex` guard IS intentionally
-    /// held across the awaits below — see the doc above for why the race
-    /// window it closes spans both of them. Nothing else in THIS test's
-    /// own async context contends for the SAME lock while it is held (the
-    /// two-worker-thread runtime is sized for the one other task this test
-    /// spawns, not for a second lock acquirer), so the usual deadlock risk
-    /// the lint warns about does not apply here; the risk this lock
-    /// defends against is cross-TEST signal-disposition interleaving, not
-    /// an in-test lock-ordering hazard.
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unix_sigterm_bridge_cancels_the_token() {
-        let _signal_guard = csq_core::platform::test_env::signal_lock();
+    const SIGNAL_CHILD_ENV: &str = "CSQ_TEST_SIGTERM_BRIDGE_CHILD";
+    #[cfg(target_os = "linux")]
+    const SIGNAL_PARENT_ENV: &str = "CSQ_TEST_SIGTERM_BRIDGE_PARENT";
 
-        let cancel = CancellationToken::new();
-        install_unix_sigterm_bridge(cancel.clone());
-        tokio::task::yield_now().await;
+    struct OwnedSignalChild(Option<Child>);
 
-        // SAFETY: raises SIGTERM against our OWN pid only. See the
-        // doc comment above for why this cannot terminate the process.
-        unsafe {
-            libc::kill(std::process::id() as libc::pid_t, libc::SIGTERM);
+    impl OwnedSignalChild {
+        fn kill_group_if_owned(&self) -> std::io::Result<()> {
+            let child = self.0.as_ref().expect("wait-owned signal child");
+            // SAFETY: initialized C output; WNOWAIT never consumes child ownership.
+            let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+            loop {
+                // Refuse a recycled group ID if another reaper consumed our child.
+                // SAFETY: the pointer is valid and only our child PID is queried.
+                if unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        child.id() as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                } == 0
+                {
+                    // SAFETY: the fresh ownership probe reserves our group's leader.
+                    if unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) } == 0 {
+                        return Ok(());
+                    }
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::ESRCH) {
+                        return Ok(());
+                    }
+                    // Darwin may refuse a signal to an exited, wait-owned zombie
+                    // group with EPERM. Accept only that measured exited case,
+                    // never EPERM against a live child or another signal error.
+                    #[cfg(target_os = "macos")]
+                    if error.raw_os_error() == Some(libc::EPERM)
+                        && info.si_pid == child.id() as libc::pid_t
+                    {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
         }
+    }
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), cancel.cancelled())
-            .await
-            .expect("a real SIGTERM must cancel the bridged token within 5s");
+    impl Drop for OwnedSignalChild {
+        fn drop(&mut self) {
+            if self.0.is_some() {
+                if let Err(error) = self.kill_group_if_owned() {
+                    eprintln!("signal helper cleanup refused an unowned child: {error}");
+                }
+            }
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.wait();
+            }
+        }
+    }
+
+    fn run_signal_child(
+        exact_test: &str,
+        witness: &str,
+        deadline: std::time::Duration,
+        expected_code: i32,
+    ) {
+        let sandbox = tempfile::TempDir::new_in("/tmp").expect("signal child sandbox");
+        let home = sandbox.path().join("home");
+        let base = sandbox.path().join("base");
+        let tmp = sandbox.path().join("tmp");
+        for path in [&home, &base, &tmp] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let stdout = sandbox.path().join("stdout");
+        let stderr = sandbox.path().join("stderr");
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.env_clear();
+        for key in ["PATH", "LANG", "LC_ALL", "TERM", "USER"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let parent = std::process::id() as libc::pid_t;
+            command.env(SIGNAL_PARENT_ENV, parent.to_string());
+            // SAFETY: only async-signal-safe syscalls run between fork and exec.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::getppid() != parent {
+                        return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let child = command
+            .env("HOME", &home)
+            .env("CSQ_BASE_DIR", &base)
+            .env("CLAUDE_CONFIG_DIR", &home)
+            .env("TMPDIR", &tmp)
+            .env(SIGNAL_CHILD_ENV, exact_test)
+            .current_dir(sandbox.path())
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create(&stdout).unwrap())
+            .stderr(std::fs::File::create(&stderr).unwrap())
+            .args(["--exact", exact_test, "--ignored", "--nocapture"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn owned signal helper");
+        let mut child = OwnedSignalChild(Some(child));
+        let pid = child.0.as_ref().unwrap().id();
+        let (done, ready) = std::sync::mpsc::sync_channel(1);
+        let waiter = std::thread::spawn(move || {
+            // SAFETY: waitid initializes this plain C output structure before use.
+            let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+            let result = loop {
+                // SAFETY: this is our child; WNOWAIT reserves its PID for cleanup.
+                if unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                } == 0
+                {
+                    break Ok(());
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    break Err(error.kind());
+                }
+            };
+            let _ = done.send(result);
+        });
+        let observed = ready.recv_timeout(deadline);
+        child
+            .kill_group_if_owned()
+            .expect("owned signal helper cleanup");
+        let status = child
+            .0
+            .as_mut()
+            .unwrap()
+            .wait()
+            .expect("reap signal helper");
+        // The child is now reaped; disarm Drop so a recycled PID is never signalled.
+        child.0.take();
+        waiter.join().expect("signal helper waiter");
+        let capture = |path: &std::path::Path| {
+            assert!(std::fs::metadata(path).unwrap().len() <= 64 * 1024);
+            std::fs::read_to_string(path).unwrap()
+        };
+        let log = format!("{}{}", capture(&stdout), capture(&stderr));
+        assert!(
+            matches!(observed, Ok(Ok(()))),
+            "signal helper did not finish: {observed:?}; {log}"
+        );
+        assert_eq!(
+            status.code(),
+            Some(expected_code),
+            "signal helper exited {status:?}; {log}"
+        );
+        if expected_code == 0 {
+            assert!(
+                log.contains("test result: ok. 1 passed; 0 failed; 0 ignored"),
+                "wrong helper selection: {log}"
+            );
+            assert!(
+                log.contains(witness),
+                "missing body witness {witness}: {log}"
+            );
+        } else {
+            assert_eq!(expected_code, 128 + libc::SIGTERM);
+            assert!(
+                log.contains("bridge-child:real-sigterm-cancelled-token"),
+                "real bridge did not run: {log}"
+            );
+            assert!(
+                log.contains("a termination signal arrived before the codex relaunch"),
+                "real supervisor guard did not exit: {log}"
+            );
+            assert!(
+                !log.contains(witness),
+                "contaminated supervisor unexpectedly survived: {log}"
+            );
+        }
+        println!(
+            "signal-child-evidence: selector={exact_test} code={expected_code} survivor={} real-cancellation={}",
+            log.contains("bridge-ordering:supervisor-pre-spawn-survived"),
+            log.contains("bridge-child:real-sigterm-cancelled-token")
+        );
+    }
+
+    fn assert_signal_child_context(exact_test: &str) {
+        assert_eq!(std::env::var(SIGNAL_CHILD_ENV).as_deref(), Ok(exact_test));
+        // SAFETY: read-only identity calls on this explicitly selected helper.
+        assert_eq!(
+            unsafe { libc::getpgrp() },
+            std::process::id() as libc::pid_t
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let parent: libc::pid_t = std::env::var(SIGNAL_PARENT_ENV).unwrap().parse().unwrap();
+            assert!(parent > 1);
+            // libtest runs the body on another thread. Arm that thread as well
+            // as the exec thread already protected by pre_exec, then close the
+            // parent-exited-before-registration race before doing any work.
+            // SAFETY: these syscalls affect only this owned helper thread.
+            assert_eq!(
+                unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) },
+                0
+            );
+            assert_eq!(unsafe { libc::getppid() }, parent);
+            let mut death_signal: libc::c_int = 0;
+            // SAFETY: prctl writes one valid c_int; no process is signalled.
+            assert_eq!(
+                unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &mut death_signal) },
+                0
+            );
+            assert_eq!(death_signal, libc::SIGKILL);
+        }
+    }
+
+    #[test]
+    fn signal_child_cleanup_refuses_a_reaped_identity() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .env_clear()
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = OwnedSignalChild(Some(command.spawn().unwrap()));
+        assert!(child.0.as_mut().unwrap().wait().unwrap().success());
+        assert_eq!(
+            child.kill_group_if_owned().unwrap_err().raw_os_error(),
+            Some(libc::ECHILD),
+            "a reaped PID cannot authorize a process-group signal"
+        );
+        child.0.take();
+    }
+
+    #[test]
+    fn unix_sigterm_bridge_preserves_subsequent_supervisor_pre_spawn() {
+        run_signal_child(
+            "desktop::daemon_supervisor::sigterm_bridge_tests::supervisor_bridge_ordering_helper",
+            "bridge-ordering:supervisor-pre-spawn-survived",
+            // The nested bridge child has a 10s ceiling, leaving teardown margin.
+            std::time::Duration::from_secs(30),
+            0,
+        );
+    }
+
+    #[test]
+    #[ignore = "only run explicitly in the owned signal regression subprocess"]
+    fn supervisor_bridge_ordering_helper() {
+        // SAFETY: bound this explicitly selected helper even if its parent dies.
+        unsafe { libc::alarm(20) };
+        assert_signal_child_context(
+            "desktop::daemon_supervisor::sigterm_bridge_tests::supervisor_bridge_ordering_helper",
+        );
+        crate::cli::commands::codex_supervise::bridge_signal_ordering_probe(
+            unix_sigterm_bridge_cancels_the_token,
+        );
+    }
+
+    #[test]
+    fn in_process_bridge_signal_reaches_the_real_supervisor_exit_guard() {
+        run_signal_child(
+            "desktop::daemon_supervisor::sigterm_bridge_tests::in_process_bridge_ordering_helper",
+            "bridge-ordering:supervisor-pre-spawn-survived",
+            std::time::Duration::from_secs(10),
+            128 + libc::SIGTERM,
+        );
+    }
+
+    #[test]
+    #[ignore = "only run explicitly by the owned positive-control subprocess"]
+    fn in_process_bridge_ordering_helper() {
+        // SAFETY: self-bound before registration, lock acquisition, or runtime startup.
+        unsafe { libc::alarm(8) };
+        assert_signal_child_context(
+            "desktop::daemon_supervisor::sigterm_bridge_tests::in_process_bridge_ordering_helper",
+        );
+        crate::cli::commands::codex_supervise::bridge_signal_ordering_probe(
+            assert_real_sigterm_bridge,
+        );
+    }
+
+    /// A shared mutex cannot isolate persistent signal handlers or pending flags.
+    /// Keep the real signal-to-token assertion in its own process instead.
+    #[test]
+    fn unix_sigterm_bridge_cancels_the_token() {
+        run_signal_child(
+            "desktop::daemon_supervisor::sigterm_bridge_tests::unix_sigterm_bridge_child",
+            "bridge-child:real-sigterm-cancelled-token",
+            // Above the real assertion's 5s bound, below the ordering parent's 30s.
+            std::time::Duration::from_secs(10),
+            0,
+        );
+    }
+
+    #[ignore = "only run explicitly in the owned signal subprocess"]
+    #[test]
+    fn unix_sigterm_bridge_child() {
+        // SAFETY: self-bound before registration, lock acquisition, or runtime startup.
+        unsafe { libc::alarm(8) };
+        assert_signal_child_context(
+            "desktop::daemon_supervisor::sigterm_bridge_tests::unix_sigterm_bridge_child",
+        );
+        assert_real_sigterm_bridge();
+    }
+
+    fn assert_real_sigterm_bridge() {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cancel = CancellationToken::new();
+                install_unix_sigterm_bridge(cancel.clone());
+                tokio::task::yield_now().await;
+                // SAFETY: signal only this explicitly selected helper process.
+                assert_eq!(
+                    unsafe { libc::kill(std::process::id() as libc::pid_t, libc::SIGTERM) },
+                    0
+                );
+                tokio::time::timeout(std::time::Duration::from_secs(5), cancel.cancelled())
+                    .await
+                    .expect("a real SIGTERM must cancel the bridged token within 5s");
+                assert!(cancel.is_cancelled());
+                println!("bridge-child:real-sigterm-cancelled-token");
+            });
     }
 }
 
@@ -363,9 +647,7 @@ async fn run_daemon(
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map(|v| v.max(1))
-            .unwrap_or_else(|| {
-                crate::cli::commands::daemon::derive_audit_verify_timeout_secs(record_limit)
-            });
+            .unwrap_or_else(|| crate::daemon_host::derive_audit_verify_timeout_secs(record_limit));
         let verify_cfg = csq_core::audit::VerifyConfig {
             record_limit,
             keychain_service: csq_core::audit::AUDIT_SIGNING_SERVICE_NAME.to_string(),
@@ -543,6 +825,11 @@ Run `csq audit verify --full` for diagnosis."
         csq_core::audit::AuditSinkConfig::load(base_dir).unwrap_or_default();
     let anchor_sink_desktop: Option<std::sync::Arc<dyn csq_core::audit::LedgerSink>> =
         resolve_anchor_sink_desktop(&anchor_sink_cfg_desktop);
+    // login-followup: ONE rebind wake channel, shared by the usage poller
+    // (spawned below) and `POST /api/slot-rebind` (RouterState twin of the
+    // CLI daemon). Created before the state so the route can never arrive
+    // at a poller that is not waiting on the same Notify.
+    let usage_poller_wake = Arc::new(csq_core::daemon::usage_poller::WakeChannel::new());
     let router_state = daemon_server::RouterState {
         cache: Arc::clone(&refresh_cache),
         discovery_cache: Arc::clone(&discovery_cache),
@@ -559,6 +846,7 @@ Run `csq audit verify --full` for diagnosis."
         audit_health: csq_core::audit::new_shared(audit_health),
         audit_records_unverified,
         anchor_sink: anchor_sink_desktop.clone(),
+        usage_poller_wake: Arc::clone(&usage_poller_wake),
         // an internal ticket — seed the interactive enforcement registry from the fail-closed
         // §10.5 activation gate (absent → empty/503).
         // an internal ticket follow-up — inject the cross-SDK kailash projector (the csq crate
@@ -595,7 +883,22 @@ Run `csq audit verify --full` for diagnosis."
     // PR-C4: reconciler clamps Codex invariants (canonical 0o400 +
     // config.toml `cli_auth_credentials_store = "file"`) before any
     // subsystem touches them. Mutex-coordinated with the refresher.
-    let _reconcile_summary = daemon::run_reconciler(base_dir);
+    //
+    // Blocking filesystem work (it walks the accounts tree), so it runs on the
+    // blocking pool, never on a runtime worker (twin of the CLI daemon path). A
+    // daemon stop also stops the label sweep's background continuation.
+    // Held until this function returns by ANY path: the guard aborts the task on an
+    // early return, and on a normal end the cancelled token has finished it.
+    let _label_stop_watcher =
+        csq_core::platform::label_upgrade::spawn_stop_watcher(shutdown.clone());
+    {
+        let reconcile_base = base_dir.to_path_buf();
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || daemon::run_reconciler(&reconcile_base)).await
+        {
+            return Err(daemon::reconciler_join_failure(&e));
+        }
+    }
 
     // M3-7 + M4-5: Phase 4 fail-closed gate (an internal journal entry Delta F / OQ #7;
     // strengthened in M4-5). Refuse to start if the on-disk store predates
@@ -667,6 +970,8 @@ Run `csq audit verify --full` for diagnosis."
         http_post_probe,
         gemini_consumer.clone(),
         shutdown.clone(),
+        // Same Arc as RouterState::usage_poller_wake (see above).
+        Arc::clone(&usage_poller_wake),
     );
     // Gemini midnight-LA reset task (PR-G3, ADR-G05).
     let gemini_midnight = tokio::spawn(csq_core::daemon::usage_poller::gemini::run_midnight_reset(
@@ -679,7 +984,7 @@ Run `csq audit verify --full` for diagnosis."
     // the CLI twin (`$CLAUDE_HOME` override, else `~/.claude`) — a bare
     // `dirs::home_dir().join(".claude")` here silently ignored the operator's
     // `$CLAUDE_HOME` and pointed the rotator at the wrong tree. None → no-op.
-    let claude_home_for_rotate = crate::cli::commands::claude_home().ok();
+    let claude_home_for_rotate = crate::daemon_host::claude_home().ok();
     let auto_rotator = daemon::spawn_auto_rotate(
         base_dir.to_path_buf(),
         claude_home_for_rotate,
@@ -692,7 +997,7 @@ Run `csq audit verify --full` for diagnosis."
     // better to lose images than route them into a fallback path
     // like base_dir/image-cache/ that CC will never find. Same `$CLAUDE_HOME`-
     // aware resolver as the CLI twin.
-    let claude_home_for_sweep = crate::cli::commands::claude_home().ok();
+    let claude_home_for_sweep = crate::daemon_host::claude_home().ok();
     let sweep = csq_core::session::spawn_sweep(
         base_dir.to_path_buf(),
         claude_home_for_sweep,
@@ -706,7 +1011,7 @@ Run `csq audit verify --full` for diagnosis."
     // render path. Daemon is the SOLE producer; terminals only read
     // (account-terminal-separation.md Rule 1, extended for billing telemetry).
     // Same `$CLAUDE_HOME`-aware resolver as the CLI twin; None → writer no-op.
-    let claude_home_for_ledger = crate::cli::commands::claude_home().ok();
+    let claude_home_for_ledger = crate::daemon_host::claude_home().ok();
     let usage_ledger_writer = daemon::spawn_usage_ledger_writer(
         base_dir.to_path_buf(),
         claude_home_for_ledger,

@@ -21,7 +21,7 @@ set -euo pipefail
 # operator's PATH resolves to, and a stub that exits 0 without running the
 # program would let those assertions "pass" over input they never read.
 # shellcheck source=/dev/null
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/resolve-python.sh" || {
+. "$(cd "${BASH_SOURCE[0]%/*}" && pwd)/lib/resolve-python.sh" || {
   echo "FATAL: cannot source scripts/lib/resolve-python.sh (next to this script)." >&2
   echo "       The interpreter probe is unavailable, so no verified python3 can be" >&2
   echo "       resolved. A missing tool lib is NOT a clean run." >&2

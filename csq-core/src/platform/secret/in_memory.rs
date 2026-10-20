@@ -19,7 +19,7 @@
 //! function of the secret), `get` returns a fresh
 //! [`SecretString`].
 
-use super::{SecretError, SlotKey, Vault};
+use super::{NamedKey, SecretError, SlotKey, Vault};
 use crate::types::AccountNum;
 use secrecy::{ExposeSecret, SecretString};
 use std::collections::HashMap;
@@ -31,12 +31,14 @@ use std::sync::Mutex;
 /// this backend; explicit-test-isolation is.
 pub struct InMemoryVault {
     store: Mutex<HashMap<(String, u16), SecretString>>,
+    named: Mutex<HashMap<NamedKey, SecretString>>,
 }
 
 impl InMemoryVault {
     pub fn new() -> Self {
         Self {
             store: Mutex::new(HashMap::new()),
+            named: Mutex::new(HashMap::new()),
         }
     }
 
@@ -56,6 +58,34 @@ impl Default for InMemoryVault {
 }
 
 impl Vault for InMemoryVault {
+    fn set_named(&self, key: &NamedKey, secret: &SecretString) -> Result<(), SecretError> {
+        if secret.expose_secret().is_empty() {
+            return Err(SecretError::InvalidKey {
+                reason: "secret must not be empty".into(),
+            });
+        }
+        self.named.lock().unwrap().insert(
+            key.clone(),
+            SecretString::new(secret.expose_secret().to_owned().into()),
+        );
+        Ok(())
+    }
+    fn get_named(&self, key: &NamedKey) -> Result<SecretString, SecretError> {
+        self.named
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|s| SecretString::new(s.expose_secret().to_owned().into()))
+            .ok_or(SecretError::NamedNotFound)
+    }
+    fn delete_named(&self, key: &NamedKey) -> Result<(), SecretError> {
+        self.named.lock().unwrap().remove(key);
+        Ok(())
+    }
+    fn contains_named(&self, key: &NamedKey) -> Result<bool, SecretError> {
+        Ok(self.named.lock().unwrap().contains_key(key))
+    }
+
     fn set(&self, slot: SlotKey, secret: &SecretString) -> Result<(), SecretError> {
         if secret.expose_secret().is_empty() {
             return Err(SecretError::InvalidKey {

@@ -98,6 +98,28 @@ pub(crate) fn download_and_apply_to<F>(
 where
     F: Fn(&str, &[(&str, &str)]) -> Result<Vec<u8>, String>,
 {
+    download_and_apply_to_with_lock(
+        info,
+        binary_path,
+        http_get,
+        crate::cli_deps::cli_shim::REPLACE_LOCK_ATTEMPTS,
+        crate::cli_deps::cli_shim::REPLACE_LOCK_DELAY,
+        &mut || {},
+    )
+}
+
+/// Private retry/observability seam; production retains the shared lock defaults.
+fn download_and_apply_to_with_lock<F>(
+    info: &UpdateInfo,
+    binary_path: &std::path::Path,
+    http_get: F,
+    lock_attempts: u32,
+    lock_delay: std::time::Duration,
+    on_wait: &mut dyn FnMut(),
+) -> Result<()>
+where
+    F: Fn(&str, &[(&str, &str)]) -> Result<Vec<u8>, String>,
+{
     // Step 1: download the binary into a temp file.
     eprintln!("Downloading csq v{}...", info.version);
     let binary_bytes = http_get(&info.download_url, &[("User-Agent", user_agent().as_str())])
@@ -128,15 +150,45 @@ where
 
     // Step 6: write verified binary to a temp file.
     let tmp_path = unique_tmp_path(binary_path);
-    write_binary(&tmp_path, &binary_bytes)
-        .with_context(|| format!("failed to write temp binary to {}", tmp_path.display()))?;
+    if let Err(e) = write_binary(&tmp_path, &binary_bytes) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e)
+            .with_context(|| format!("failed to write temp binary to {}", tmp_path.display()));
+    }
 
     // Step 7: set executable permissions on the temp file.
-    set_executable(&tmp_path)
-        .with_context(|| format!("failed to set permissions on {}", tmp_path.display()))?;
+    if let Err(e) = set_executable(&tmp_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e)
+            .with_context(|| format!("failed to set permissions on {}", tmp_path.display()));
+    }
 
     // Step 8: atomic replace.
     eprintln!("Replacing {} with new version...", binary_path.display());
+    // Serialize with the desktop's CLI-shim refresh (`cli_deps::cli_shim`), which
+    // re-checks the target and renames under this same lock.
+    let _replace_lock = match crate::cli_deps::cli_shim::acquire_replace_lock(
+        binary_path,
+        lock_attempts,
+        lock_delay,
+        on_wait,
+    ) {
+        Ok(Some(g)) => g,
+        Ok(None) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            anyhow::bail!(
+                "The csq desktop app is updating this CLI right now — run `csq update` again in a few seconds. (replace lock: {})",
+                crate::cli_deps::cli_shim::replace_lock_path(binary_path).display()
+            )
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            anyhow::bail!(
+                "failed to take the binary replace lock {}: {e}",
+                crate::cli_deps::cli_shim::replace_lock_path(binary_path).display()
+            )
+        }
+    };
     atomic_replace(&tmp_path, binary_path).with_context(|| {
         // Clean up the temp file on failure to avoid leaving a stale binary.
         let _ = std::fs::remove_file(&tmp_path);
@@ -449,6 +501,78 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o755, "target must be 0o755 after replace");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_and_apply_to_waits_for_the_shared_replace_lock() {
+        // The apply rename is serialized with the desktop CLI-shim refresh through
+        // `replace_lock_path`: while another replacer holds it, the target stays
+        // untouched. The wait callback proves apply encountered the held lock,
+        // then a channel releases the worker after the guard is dropped.
+        let dir = TempDir::new().unwrap();
+        let target_path = dir.path().join("csq");
+        std::fs::write(&target_path, b"old binary content").unwrap();
+        let new_content = b"new binary content v2.1.0";
+        let filename = "csq-linux-x86_64";
+        let bundle = build_bundle(new_content, filename);
+        let info = UpdateInfo {
+            version: "2.1.0".into(),
+            download_url: format!("https://example.com/{filename}"),
+            signature_url: format!("https://example.com/{filename}.sig"),
+            checksum_url: "https://example.com/SHA256SUMS".into(),
+            html_url: "https://example.com/releases/v2.1.0".into(),
+        };
+        let mut responses: HashMap<&'static str, Vec<u8>> = HashMap::new();
+        responses.insert("https://example.com/csq-linux-x86_64", bundle.binary);
+        responses.insert("https://example.com/csq-linux-x86_64.sig", bundle.sig);
+        responses.insert(
+            "https://example.com/SHA256SUMS",
+            bundle.sha256sums.as_bytes().to_vec(),
+        );
+        let transport = make_transport(responses);
+
+        let guard = crate::cli_deps::cli_shim::acquire_replace_lock(
+            &target_path,
+            1,
+            std::time::Duration::ZERO,
+            &mut || {},
+        )
+        .unwrap()
+        .unwrap();
+        let (wait_tx, wait_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (t2, i2) = (target_path.clone(), info);
+        let h = std::thread::spawn(move || {
+            download_and_apply_to_with_lock(
+                &i2,
+                &t2,
+                transport,
+                2,
+                std::time::Duration::ZERO,
+                &mut || {
+                    wait_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .expect("test must release apply after observing lock contention");
+                },
+            )
+        });
+        // A timeout is only a deadlock watchdog; scheduling cannot consume the
+        // retry budget because the callback blocks until the test releases it.
+        wait_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("apply must report contention on the shared replace lock");
+        assert!(!h.is_finished(), "apply finished while the lock was held");
+        assert_eq!(
+            std::fs::read(&target_path).unwrap(),
+            b"old binary content",
+            "target must be untouched while the replace lock is held"
+        );
+        drop(guard);
+        resume_tx.send(()).unwrap();
+        h.join().unwrap().unwrap();
+        assert_eq!(std::fs::read(&target_path).unwrap(), new_content);
     }
 
     #[test]

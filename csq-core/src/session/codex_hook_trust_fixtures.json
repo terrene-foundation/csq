@@ -1,0 +1,188 @@
+[
+ {
+  "name": "v01_true_compact",
+  "hooks_json_bytes_b64": "eyJob29rcyI6eyJTdG9wIjpbeyJob29rcyI6W3sidHlwZSI6ImNvbW1hbmQiLCJjb21tYW5kIjoidHJ1ZSJ9XX1dfX0=",
+  "key_suffix": ":stop:0:0",
+  "current_hash": "sha256:2ba34c7a02841fada06b868a093d041fd3d9de81883c789a321916b0aa118851"
+ },
+ {
+  "name": "v02_true_pretty",
+  "hooks_json_bytes_b64": "ewogICAgImhvb2tzIjogewogICAgICAgICJTdG9wIjogWwogICAgICAgICAgICB7CiAgICAgICAgICAgICAgICAiaG9va3MiOiBbCiAgICAgICAgICAgICAgICAgICAgewogICAgICAgICAgICAgICAgICAgICAgICAiY29tbWFuZCI6ICJ0cnVlIiwKICAgICAgICAgICAgICAgICAgICAgICAgInR5cGUiOiAiY29tbWFuZCIKICAgICAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgICAgICBdCiAgICAgICAgICAgIH0KICAgICAgICBdCiAgICB9Cn0K",
+  "key_suffix": ":stop:0:0",
+  "current_hash": "sha256:2ba34c7a02841fada06b868a093d041fd3d9de81883c789a321916b0aa118851"
+ },
+ {
+  "name": "v03_echo",
+  "hooks_json_bytes_b64": "eyJob29rcyI6eyJTdG9wIjpbeyJob29rcyI6W3sidHlwZSI6ImNvbW1hbmQiLCJjb21tYW5kIjoiZWNobyBoaSJ9XX1dfX0=",
+  "key_suffix": ":stop:0:0",
+  "current_hash": "sha256:f2aa169c7a1cf9b7cc9b61ce5ecec0315e0f7d13ac35935b1aa74440f9a839f8"
+ },
+ {
+  "name": "v04_echo_ws",
+  "hooks_json_bytes_b64": "eyJob29rcyI6eyJTdG9wIjpbeyJob29rcyI6W3sidHlwZSI6ImNvbW1hbmQiLCJjb21tYW5kIjoiZWNobyAgIGhpIn1dfV19fQ==",
+  "key_suffix": ":stop:0:0",
+  "current_hash": "sha256:8ee4de87fa5dbef15db201e0fef2731535fc057face32c512e2bf991cb0d1833"
+ },
+ {
+  "name": "v05_timeout",
+  "hooks_json_bytes_b64": "eyJob29rcyI6eyJTdG9wIjpbeyJob29rcyI6W3sidHlwZSI6ImNvbW1hbmQiLCJjb21tYW5kIjoidHJ1ZSIsInRpbWVvdXQiOjMwfV19XX19",
+  "key_suffix": ":stop:0:0",
+  "current_hash": "sha256:4e5beff43739d7a9608ce6244a0344b28c0e8530edf28ff1e021f4507e51f5fc"
+ },
+ {
+  "name": "v06_pre_matcher",
+  "hooks_json_bytes_b64": "eyJob29rcyI6eyJQcmVUb29sVXNlIjpbeyJtYXRjaGVyIjoiQmFzaCIsImhvb2tzIjpbeyJ0eXBlIjoiY29tbWFuZCIsImNvbW1hbmQiOiJ0cnVlIn1dfV19fQ==",
+  "key_suffix": ":pre_tool_use:0:0",
+  "current_hash": "sha256:39057ebd30cc98418da09c661f1ff844e076ba83820ea7f8a14b085993f1a440"
+ },
+ {
+  "name": "v07_pre_nomatcher",
+  "hooks_json_bytes_b64": "eyJob29rcyI6eyJQcmVUb29sVXNlIjpbeyJob29rcyI6W3sidHlwZSI6ImNvbW1hbmQiLCJjb21tYW5kIjoidHJ1ZSJ9XX1dfX0=",
+  "key_suffix": ":pre_tool_use:0:0",
+  "current_hash": "sha256:a7de97b60e1412f8e936f33ad7e97c04dfe69190d43e61d14c46265643383835"
+ },
+ {
+  "name": "v08_two_handlers:stop:0:0",
+  "hooks_json_bytes_b64": "eyJob29rcyI6eyJTdG9wIjpbeyJob29rcyI6W3sidHlwZSI6ImNvbW1hbmQiLCJjb21tYW5kIjoidHJ1ZSJ9LHsidHlwZSI6ImNvbW1hbmQiLCJjb21tYW5kIjoiZWNobyB0d28ifV19XX19",
+  "key_suffix": ":stop:0:0",
+  "current_hash": "sha256:2ba34c7a02841fada06b868a093d041fd3d9de81883c789a321916b0aa118851"
+ },
+ {
+  "name": "v08_two_handlers:stop:0:1",
+  "hooks_json_bytes_b64": "eyJob29rcyI6eyJTdG9wIjpbeyJob29rcyI6W3sidHlwZSI6ImNvbW1hbmQiLCJjb21tYW5kIjoidHJ1ZSJ9LHsidHlwZSI6ImNvbW1hbmQiLCJjb21tYW5kIjoiZWNobyB0d28ifV19XX19",
+  "key_suffix": ":stop:0:1",
+  "current_hash": "sha256:2dca0e87ac3670e9fe795624588c8944512bf53bdb123ceb110cadaee80911ae"
+ },
+ {
+  "name": "v09_two_groups:stop:0:0",
+  "hooks_json_bytes_b64": "eyJob29rcyI6eyJTdG9wIjpbeyJob29rcyI6W3sidHlwZSI6ImNvbW1hbmQiLCJjb21tYW5kIjoidHJ1ZSJ9XX0seyJob29rcyI6W3sidHlwZSI6ImNvbW1hbmQiLCJjb21tYW5kIjoiZWNobyBnMiJ9XX1dfX0=",
+  "key_suffix": ":stop:0:0",
+  "current_hash": "sha256:2ba34c7a02841fada06b868a093d041fd3d9de81883c789a321916b0aa118851"
+ },
+ {
+  "name": "v09_two_groups:stop:1:0",
+  "hooks_json_bytes_b64": "eyJob29rcyI6eyJTdG9wIjpbeyJob29rcyI6W3sidHlwZSI6ImNvbW1hbmQiLCJjb21tYW5kIjoidHJ1ZSJ9XX0seyJob29rcyI6W3sidHlwZSI6ImNvbW1hbmQiLCJjb21tYW5kIjoiZWNobyBnMiJ9XX1dfX0=",
+  "key_suffix": ":stop:1:0",
+  "current_hash": "sha256:3803491983b1c01dbad9456ff14b40ae9c21700234342d9f8dd67c0f6d97a6b4"
+ },
+ {
+  "name": "v10_sessionstart",
+  "hooks_json_bytes_b64": "eyJob29rcyI6eyJTZXNzaW9uU3RhcnQiOlt7Imhvb2tzIjpbeyJ0eXBlIjoiY29tbWFuZCIsImNvbW1hbmQiOiJ0cnVlIn1dfV19fQ==",
+  "key_suffix": ":session_start:0:0",
+  "current_hash": "sha256:696abd07fc74736ff2d809abef82925e1ea697cd2e547d73317c677b0d407441"
+ },
+ {
+  "name": "v11_userprompt",
+  "hooks_json_bytes_b64": "eyJob29rcyI6eyJVc2VyUHJvbXB0U3VibWl0IjpbeyJob29rcyI6W3sidHlwZSI6ImNvbW1hbmQiLCJjb21tYW5kIjoidHJ1ZSJ9XX1dfX0=",
+  "key_suffix": ":user_prompt_submit:0:0",
+  "current_hash": "sha256:0c5faf9b4c95d27d454f681f22931c6d071e6b0ab11bcbf2e461c464355de34d"
+ },
+ {
+  "name": "v12_true_trailing_space",
+  "hooks_json_bytes_b64": "eyJob29rcyI6eyJTdG9wIjpbeyJob29rcyI6W3sidHlwZSI6ImNvbW1hbmQiLCJjb21tYW5kIjoidHJ1ZSAifV19XX19",
+  "key_suffix": ":stop:0:0",
+  "current_hash": "sha256:b609b20342a6355db137b669b1f576d44ecfa0ef9956324cacd4f576d9913d57"
+ },
+ {
+  "name": "v13_pre_matcher_regex",
+  "hooks_json_bytes_b64": "eyJob29rcyI6eyJQcmVUb29sVXNlIjpbeyJtYXRjaGVyIjoiQmFzaHxFZGl0IiwiaG9va3MiOlt7InR5cGUiOiJjb21tYW5kIiwiY29tbWFuZCI6InRydWUiLCJ0aW1lb3V0Ijo1fV19XX19",
+  "key_suffix": ":pre_tool_use:0:0",
+  "current_hash": "sha256:26ee25824760852afdde0bfb3943d8db0773eaa89be154143bfe4a138ec5eb3b"
+ },
+ {
+  "name": "v14_multi_event:pre_tool_use:0:0",
+  "hooks_json_bytes_b64": "eyJob29rcyI6eyJQcmVUb29sVXNlIjpbeyJtYXRjaGVyIjoiQmFzaCIsImhvb2tzIjpbeyJ0eXBlIjoiY29tbWFuZCIsImNvbW1hbmQiOiJ0cnVlIn1dfV0sIlN0b3AiOlt7Imhvb2tzIjpbeyJ0eXBlIjoiY29tbWFuZCIsImNvbW1hbmQiOiJ0cnVlIn1dfV19fQ==",
+  "key_suffix": ":pre_tool_use:0:0",
+  "current_hash": "sha256:39057ebd30cc98418da09c661f1ff844e076ba83820ea7f8a14b085993f1a440"
+ },
+ {
+  "name": "v14_multi_event:stop:0:0",
+  "hooks_json_bytes_b64": "eyJob29rcyI6eyJQcmVUb29sVXNlIjpbeyJtYXRjaGVyIjoiQmFzaCIsImhvb2tzIjpbeyJ0eXBlIjoiY29tbWFuZCIsImNvbW1hbmQiOiJ0cnVlIn1dfV0sIlN0b3AiOlt7Imhvb2tzIjpbeyJ0eXBlIjoiY29tbWFuZCIsImNvbW1hbmQiOiJ0cnVlIn1dfV19fQ==",
+  "key_suffix": ":stop:0:0",
+  "current_hash": "sha256:2ba34c7a02841fada06b868a093d041fd3d9de81883c789a321916b0aa118851"
+ },
+ {
+  "name": "h01_timeout600",
+  "hooks_json_bytes_b64": "eyJob29rcyI6IHsiU3RvcCI6IFt7Imhvb2tzIjogW3sidHlwZSI6ICJjb21tYW5kIiwgImNvbW1hbmQiOiAidHJ1ZSIsICJ0aW1lb3V0IjogNjAwfV19XX19",
+  "key_suffix": ":stop:0:0",
+  "current_hash": "sha256:2ba34c7a02841fada06b868a093d041fd3d9de81883c789a321916b0aa118851"
+ },
+ {
+  "name": "h02_status",
+  "hooks_json_bytes_b64": "eyJob29rcyI6IHsiU3RvcCI6IFt7Imhvb2tzIjogW3sidHlwZSI6ICJjb21tYW5kIiwgImNvbW1hbmQiOiAidHJ1ZSIsICJzdGF0dXNNZXNzYWdlIjogImNoZWNraW5nIn1dfV19fQ==",
+  "key_suffix": ":stop:0:0",
+  "current_hash": "sha256:8c48511ee6c2b5cdea7748b22a0de15fede5ad6cfffc7ffb77fb0cf42aaebd5b"
+ },
+ {
+  "name": "h03_async",
+  "hooks_json_bytes_b64": "eyJob29rcyI6IHsiU3RvcCI6IFt7Imhvb2tzIjogW3sidHlwZSI6ICJjb21tYW5kIiwgImNvbW1hbmQiOiAidHJ1ZSIsICJhc3luYyI6IHRydWV9XX1dfX0=",
+  "key_suffix": ":stop:0:0",
+  "current_hash": "sha256:fbc96d5753340a4590d23f35ed0cb94e8a483cbb94657362cbf3c934ad57886b"
+ },
+ {
+  "name": "h04_stop_matcher",
+  "hooks_json_bytes_b64": "eyJob29rcyI6IHsiU3RvcCI6IFt7Im1hdGNoZXIiOiAiQmFzaCIsICJob29rcyI6IFt7InR5cGUiOiAiY29tbWFuZCIsICJjb21tYW5kIjogInRydWUifV19XX19",
+  "key_suffix": ":stop:0:0",
+  "current_hash": "sha256:2ba34c7a02841fada06b868a093d041fd3d9de81883c789a321916b0aa118851"
+ },
+ {
+  "name": "h05_pre_star",
+  "hooks_json_bytes_b64": "eyJob29rcyI6IHsiUHJlVG9vbFVzZSI6IFt7Im1hdGNoZXIiOiAiKiIsICJob29rcyI6IFt7InR5cGUiOiAiY29tbWFuZCIsICJjb21tYW5kIjogInRydWUifV19XX19",
+  "key_suffix": ":pre_tool_use:0:0",
+  "current_hash": "sha256:b30d8c3c10d15e07c1f6479619d2e81059794466921c11b395b2bc917ddb4e15"
+ },
+ {
+  "name": "h06_pre_empty",
+  "hooks_json_bytes_b64": "eyJob29rcyI6IHsiUHJlVG9vbFVzZSI6IFt7Im1hdGNoZXIiOiAiIiwgImhvb2tzIjogW3sidHlwZSI6ICJjb21tYW5kIiwgImNvbW1hbmQiOiAidHJ1ZSJ9XX1dfX0=",
+  "key_suffix": ":pre_tool_use:0:0",
+  "current_hash": "sha256:189a2dab8752eb65ee6809aee40155c040acb4f3337fadc048710db013ee4436"
+ },
+ {
+  "name": "h07_unicode",
+  "hooks_json_bytes_b64": "eyJob29rcyI6IHsiU3RvcCI6IFt7Imhvb2tzIjogW3sidHlwZSI6ICJjb21tYW5kIiwgImNvbW1hbmQiOiAiZWNobyDDqSDinJMgPC90YWc+In1dfV19fQ==",
+  "key_suffix": ":stop:0:0",
+  "current_hash": "sha256:35cda3ad1a8ef0290227566323543276294fe132cb7c33ab950eee95474f2f23"
+ },
+ {
+  "name": "h08_escapes",
+  "hooks_json_bytes_b64": "eyJob29rcyI6IHsiU3RvcCI6IFt7Imhvb2tzIjogW3sidHlwZSI6ICJjb21tYW5kIiwgImNvbW1hbmQiOiAicHJpbnRmIFwiYVxcdGJcIlxueFx1MDAwMS95In1dfV19fQ==",
+  "key_suffix": ":stop:0:0",
+  "current_hash": "sha256:6cb1be5426ed9ca96408f1a674071d05b5210fc416cbb722c3bedfac90d33ae8"
+ },
+ {
+  "name": "h09_timeout_huge",
+  "hooks_json_bytes_b64": "eyJob29rcyI6IHsiU3RvcCI6IFt7Imhvb2tzIjogW3sidHlwZSI6ICJjb21tYW5kIiwgImNvbW1hbmQiOiAidHJ1ZSIsICJ0aW1lb3V0IjogMTAwMDAwfV19XX19",
+  "key_suffix": ":stop:0:0",
+  "current_hash": "sha256:3289043f657ad68976e9a80216bf2ccc5bd58aaac29b097d052758f624d7e598"
+ },
+ {
+  "name": "h10_timeout_zero",
+  "hooks_json_bytes_b64": "eyJob29rcyI6IHsiU3RvcCI6IFt7Imhvb2tzIjogW3sidHlwZSI6ICJjb21tYW5kIiwgImNvbW1hbmQiOiAidHJ1ZSIsICJ0aW1lb3V0IjogMH1dfV19fQ==",
+  "key_suffix": ":stop:0:0",
+  "current_hash": "sha256:b25508d2c190c60ce60f933b540274aadef543edd8e326efe697b0db5f893408"
+ },
+ {
+  "name": "h11_post_matcher",
+  "hooks_json_bytes_b64": "eyJob29rcyI6IHsiUG9zdFRvb2xVc2UiOiBbeyJtYXRjaGVyIjogIkVkaXR8V3JpdGUiLCAiaG9va3MiOiBbeyJ0eXBlIjogImNvbW1hbmQiLCAiY29tbWFuZCI6ICJ0cnVlIn1dfV19fQ==",
+  "key_suffix": ":post_tool_use:0:0",
+  "current_hash": "sha256:abc1e94b88f960daf0de9b8cc0760912034857a7eb84819e9df143b114bde804"
+ },
+ {
+  "name": "h12_unknown_field",
+  "hooks_json_bytes_b64": "eyJob29rcyI6IHsiU3RvcCI6IFt7Imhvb2tzIjogW3sidHlwZSI6ICJjb21tYW5kIiwgImNvbW1hbmQiOiAidHJ1ZSIsICJmb28iOiAxfV19XX19",
+  "key_suffix": ":stop:0:0",
+  "current_hash": "sha256:2ba34c7a02841fada06b868a093d041fd3d9de81883c789a321916b0aa118851"
+ },
+ {
+  "name": "h13_ctxlimit",
+  "hooks_json_bytes_b64": "eyJob29rcyI6IHsiU3RvcCI6IFt7Imhvb2tzIjogW3sidHlwZSI6ICJjb21tYW5kIiwgImNvbW1hbmQiOiAidHJ1ZSIsICJhZGRpdGlvbmFsQ29udGV4dExpbWl0IjogMTAwMH1dfV19fQ==",
+  "key_suffix": ":stop:0:0",
+  "current_hash": "sha256:2ba34c7a02841fada06b868a093d041fd3d9de81883c789a321916b0aa118851"
+ },
+ {
+  "name": "h14_combo",
+  "hooks_json_bytes_b64": "eyJob29rcyI6IHsiUHJlVG9vbFVzZSI6IFt7Im1hdGNoZXIiOiAiQmFzaCIsICJob29rcyI6IFt7InR5cGUiOiAiY29tbWFuZCIsICJjb21tYW5kIjogInRydWUiLCAidGltZW91dCI6IDcsICJzdGF0dXNNZXNzYWdlIjogInMiLCAiYWRkaXRpb25hbENvbnRleHRMaW1pdCI6IDUwfV19XX19",
+  "key_suffix": ":pre_tool_use:0:0",
+  "current_hash": "sha256:229c6e07a226218fb4b788a3556b0d5edcffde05f8eab5b6618dc5af19c4ebc9"
+ }
+]

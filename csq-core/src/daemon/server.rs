@@ -68,9 +68,7 @@ use crate::credentials;
 #[cfg(unix)]
 use crate::error::DaemonError;
 use crate::error::OAuthError;
-use crate::oauth::{
-    exchange_code, start_login, LoginRequest, OAuthStateStore, PASTE_CODE_REDIRECT_URI,
-};
+use crate::oauth::{exchange_code, LoginRequest, OAuthStateStore, PASTE_CODE_REDIRECT_URI};
 use crate::types::AccountNum;
 #[cfg(feature = "enterprise")]
 use axum::http::HeaderMap;
@@ -194,6 +192,19 @@ pub struct RouterState {
     /// the operative protection when the chain is not operational is the anchor
     /// handler's own 503 gate, not the absence of a resolved sink (an internal ticket redteam).
     pub anchor_sink: Option<Arc<dyn crate::audit::LedgerSink>>,
+    /// Rebind wake channel — the SAME `Arc<tokio::sync::Notify>` the
+    /// usage poller's run loop waits on (`usage_poller::spawn`'s `wake`
+    /// parameter; see `RunLoopConfig::wake`). `POST /api/slot-rebind`
+    /// calls `notify_one()` here after a successful Anthropic
+    /// login/rebind so the just-bound slot's quota row is refreshed on
+    /// an immediate tick instead of up to `POLL_INTERVAL` later.
+    ///
+    /// Shared, not per-request: both the CLI daemon
+    /// (`csq/src/cli/commands/daemon.rs`) and the desktop in-process
+    /// daemon (`csq/src/desktop/daemon_supervisor.rs`) create ONE
+    /// `Arc<Notify>` before constructing this state and hand the same
+    /// `Arc` to `spawn_usage_poller`. Cloned cheaply per request.
+    pub usage_poller_wake: Arc<crate::daemon::usage_poller::WakeChannel>,
 }
 
 /// Maximum staleness for the discovery cache: 5 seconds.
@@ -277,6 +288,7 @@ pub fn router(state: RouterState) -> Router {
         .route("/api/oauth/exchange", post(oauth_exchange_handler))
         .route("/api/invalidate-cache", post(invalidate_cache_handler))
         .route("/api/slot-swap", post(slot_swap_handler))
+        .route("/api/slot-rebind", post(slot_rebind_handler))
         .route("/api/harvest-account", post(harvest_account_handler))
         .route("/api/gemini/event", post(gemini_event_handler))
         .route("/api/audit/record", post(audit_record_handler))
@@ -830,7 +842,23 @@ async fn login_handler(
         ));
     };
 
-    start_login(store, account).map(Json).map_err(|e| {
+    let base = Arc::clone(&state.base_dir);
+    let store = Arc::clone(store);
+    let request = tokio::task::spawn_blocking(move || {
+        let base = std::fs::canonicalize(&*base).map_err(|_| "identity base refused")?;
+        let prior = crate::accounts::anthropic_identity::capture_login_prior(&base, account)
+            .map_err(|_| "identity capture failed")?;
+        crate::oauth::login::start_login_with_prior(&store, account, base, prior)
+            .map_err(|_| "login initiation failed")
+    })
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "login initiation failed".to_string(),
+        )
+    })?;
+    request.map(Json).map_err(|e| {
         // start_login is effectively infallible for valid
         // AccountNum on supported platforms; if it ever errors we
         // map to 500 without echoing internal details.
@@ -861,6 +889,94 @@ pub struct OAuthExchangeResponse {
     pub account: u16,
 }
 
+// Synchronous producer boundary used by oauth_exchange_handler's blocking save task.
+fn save_oauth_login_credentials(
+    base: &Path,
+    account: AccountNum,
+    credential: &credentials::CredentialFile,
+    prior: crate::accounts::anthropic_identity::LoginPrior,
+) -> Result<(), String> {
+    finish_oauth_login_credentials(
+        base,
+        account,
+        crate::accounts::anthropic_identity::commit_anthropic_login(
+            base, account, credential, None, prior,
+        ),
+    )
+}
+
+#[cfg(all(test, unix))]
+fn save_oauth_login_credentials_with(
+    base: &Path,
+    account: AccountNum,
+    credential: &credentials::CredentialFile,
+    profile: &crate::daemon::usage_poller::HttpGetFn,
+    prior: crate::accounts::anthropic_identity::LoginPrior,
+) -> Result<(), String> {
+    finish_oauth_login_credentials(
+        base,
+        account,
+        crate::accounts::anthropic_identity::commit_anthropic_login_with(
+            base, account, credential, profile, None, prior,
+        ),
+    )
+}
+
+fn finish_oauth_login_credentials(
+    base: &Path,
+    account: AccountNum,
+    committed: Result<
+        crate::accounts::anthropic_identity::CommittedAnthropicLogin,
+        crate::accounts::anthropic_identity::IdentityError,
+    >,
+) -> Result<(), String> {
+    let committed = committed.map_err(|e| {
+        // corr LOW-1: the daemon's reply is a fixed error_kind vocabulary, so
+        // the operator line goes to its log (same fixed text, no payload).
+        if let Some(notice) = crate::credentials::rescue::take_refusal_not_durable_notice() {
+            tracing::warn!(error_kind = "login_refusal_not_durable", "{notice}");
+        }
+        crate::accounts::login::LoginCommitOutcome::from_identity_error(&e)
+            .error_kind()
+            .to_string()
+    })?;
+    crate::accounts::login::finalize_verified_login(base, account, committed).map_err(|error| {
+        match error {
+            crate::error::ConfigError::InvalidJson { reason, .. }
+                if reason == "anthropic_identity_finalization_refused" =>
+            {
+                crate::accounts::login::LoginCommitOutcome::FinalizationRefused
+                    .error_kind()
+                    .to_string()
+            }
+            _ => crate::accounts::login::LoginCommitOutcome::PublicationFailed
+                .error_kind()
+                .to_string(),
+        }
+    })?;
+    Ok(())
+}
+
+/// HTTP status for a failed verified-login commit. The error_kind and message
+/// come from the shared [`crate::accounts::login::LoginCommitOutcome`] so the
+/// daemon, CLI and desktop report one vocabulary. A busy profiles store is a
+/// 409 retry; a refused organization identity is a 400; a publication failure
+/// (including one after the target's canonical credentials advanced) is a 500.
+fn login_outcome_response(
+    reason: &str,
+) -> (StatusCode, crate::accounts::login::LoginCommitOutcome) {
+    use crate::accounts::login::LoginCommitOutcome as O;
+    let outcome = O::from_error_kind(reason);
+    let status = match outcome {
+        O::IdentityChanged | O::Busy | O::FinalizationRefused => StatusCode::CONFLICT,
+        O::Refused | O::IndexDamaged => StatusCode::BAD_REQUEST,
+        O::PublicationFailed | O::TargetAdvancedPublicationFailed => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    (status, outcome)
+}
+
 /// POST /api/oauth/exchange — submits the paste-code from the
 /// browser and exchanges it for a credential file.
 ///
@@ -872,8 +988,8 @@ pub struct OAuthExchangeResponse {
 /// 2. Calls [`exchange_code`] against the Anthropic token endpoint
 ///    with the recovered verifier and the paste-code redirect URI
 ///    (must be byte-identical to what the authorize URL advertised).
-/// 3. Writes the resulting credential file to `credentials/N.json`
-///    with `0o600` via [`credentials::save_canonical`].
+/// 3. Verifies the exact grant's complete account/organization profile, stages
+///    its UUID-keyed credentials, then publishes the verified slot binding.
 /// 4. Returns the validated account number.
 ///
 /// # Errors
@@ -890,8 +1006,48 @@ pub struct OAuthExchangeResponse {
 /// before surfacing — the upstream response body (which may echo
 /// the submitted code) is never included.
 async fn oauth_exchange_handler(
+    state: State<RouterState>,
+    body: Json<OAuthExchangeRequest>,
+) -> Result<Json<OAuthExchangeResponse>, (StatusCode, String)> {
+    oauth_exchange_handler_using(
+        state,
+        body,
+        crate::http::post_json_node,
+        save_oauth_login_credentials,
+    )
+    .await
+}
+
+#[cfg(all(test, unix))]
+async fn oauth_exchange_handler_with_transport(
+    state: State<RouterState>,
+    body: Json<OAuthExchangeRequest>,
+    exchange: impl Fn(&str, &str) -> Result<Vec<u8>, String> + Send + 'static,
+    profile: crate::daemon::usage_poller::HttpGetFn,
+) -> Result<Json<OAuthExchangeResponse>, (StatusCode, String)> {
+    oauth_exchange_handler_using(
+        state,
+        body,
+        exchange,
+        move |base, account, credential, prior| {
+            save_oauth_login_credentials_with(base, account, credential, &profile, prior)
+        },
+    )
+    .await
+}
+
+async fn oauth_exchange_handler_using(
     State(state): State<RouterState>,
     Json(body): Json<OAuthExchangeRequest>,
+    exchange: impl Fn(&str, &str) -> Result<Vec<u8>, String> + Send + 'static,
+    save: impl FnOnce(
+            &Path,
+            AccountNum,
+            &credentials::CredentialFile,
+            crate::accounts::anthropic_identity::LoginPrior,
+        ) -> Result<(), String>
+        + Send
+        + 'static,
 ) -> Result<Json<OAuthExchangeResponse>, (StatusCode, String)> {
     let Some(store) = state.oauth_store.as_ref() else {
         return Err((
@@ -925,18 +1081,41 @@ async fn oauth_exchange_handler(
         ),
     })?;
 
-    // The exchange is a synchronous HTTP round-trip via blocking
-    // reqwest. Run it on a spawn_blocking worker so we don't stall
+    let pending_login = pending.verified_login.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "identity authority missing".to_string(),
+        )
+    })?;
+    let prior_base = Arc::clone(&state.base_dir);
+    let prior = tokio::task::spawn_blocking(move || {
+        let base = std::fs::canonicalize(&*prior_base).map_err(|_| "identity base refused")?;
+        if base != pending_login.base {
+            return Err("identity base changed");
+        }
+        Ok::<_, &str>(pending_login.prior)
+    })
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "identity authority failed".to_string(),
+        )
+    })?
+    .map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "identity authority refused".to_string(),
+        )
+    })?;
+
+    // The injected exchange is a synchronous HTTP round-trip. Production uses
+    // the Node transport; run it on a blocking worker so we don't stall
     // the tokio runtime.
     let verifier = pending.code_verifier.clone();
     let account = pending.account;
     let exchange_result = tokio::task::spawn_blocking(move || {
-        exchange_code(
-            &code,
-            &verifier,
-            PASTE_CODE_REDIRECT_URI,
-            crate::http::post_json_node,
-        )
+        exchange_code(&code, &verifier, PASTE_CODE_REDIRECT_URI, exchange)
     })
     .await;
 
@@ -974,22 +1153,11 @@ async fn oauth_exchange_handler(
         }
     };
 
-    // Persist credentials via UUID-keyed path (M4-12: numeric
-    // credentials/<N>.json retired; fail-closed if UUID absent).
-    //
-    // an internal ticket (legacy/daemon-exchange sibling): this exchange-based path
-    // has NO `config-N/.claude.json` (it never spawns `claude auth login`), so
-    // `accounts::login::ensure_login_identity_minted` — which sources the email
-    // from that file — is structurally inapplicable here. This handler relies on
-    // daemon Pass-0 having already minted `by_slot[N]`. If this route is ever
-    // made the live first-login path for fresh installs, mint the UUID from the
-    // exchanged `credential`'s `oauthAccount.emailAddress` BEFORE this save, or
-    // it reintroduces the an internal ticket "no credentials configured" fail-closed.
+    // Verify the exact exchanged grant independently of native metadata, then
+    // stage and publish its organization-bound identity before finalizing.
     let base_dir = Arc::clone(&state.base_dir);
-    let save_result = tokio::task::spawn_blocking(move || {
-        credentials::save_canonical_for(&base_dir, account, &credential)
-    })
-    .await;
+    let save_result =
+        tokio::task::spawn_blocking(move || save(&base_dir, account, &credential, prior)).await;
 
     match save_result {
         Ok(Ok(())) => {
@@ -997,21 +1165,31 @@ async fn oauth_exchange_handler(
             // shows the new row without waiting for the TTL.
             state.discovery_cache.clear();
             state.cache.clear();
+            // login-followup: this path IS the daemon's own login
+            // completion, so wake the usage poller in-process (the twin of
+            // the CLI/desktop clients' POST /api/slot-rebind; `notify_one`
+            // coalesces with any such request that also arrives).
+            state.usage_poller_wake.wake_slot(account.get());
+            tracing::debug!(
+                error_kind = "usage_poller_wake_rebind",
+                slot = account.get(),
+                "oauth login complete — usage poller woken for an immediate tick"
+            );
             tracing::info!(account = account.get(), "oauth login complete");
             Ok(Json(OAuthExchangeResponse {
                 account: account.get(),
             }))
         }
-        Ok(Err(_)) => {
+        Ok(Err(reason)) => {
+            let (status, outcome) = login_outcome_response(reason.as_str());
+            let error_kind = outcome.error_kind();
+            let message = outcome.message();
             tracing::warn!(
                 account = account.get(),
-                error_kind = "credential_save",
-                "credential write failed after oauth exchange"
+                error_kind,
+                "verified oauth login refused"
             );
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "credential write failed".to_string(),
-            ))
+            Err((status, message.to_string()))
         }
         Err(_join_err) => {
             tracing::warn!(
@@ -1140,6 +1318,56 @@ async fn slot_swap_handler(
         "slot-swap cache invalidation applied"
     );
     Json(SlotSwapResponse { invalidated: true })
+}
+
+/// Request body for `POST /api/slot-rebind`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SlotRebindRequest {
+    pub slot: u16,
+}
+
+/// Response body for `POST /api/slot-rebind`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SlotRebindResponse {
+    pub woken: bool,
+}
+
+/// POST /api/slot-rebind — immediate usage-poller wake after a successful
+/// Anthropic login / re-auth of that slot (login-followup).
+///
+/// Called best-effort by `csq login`/the desktop Add-Account and Re-auth
+/// flows AND by the daemon's own `/api/oauth/exchange` success path, once
+/// the on-disk commit + finalize have SUCCEEDED, so the slot's quota row
+/// refreshes within milliseconds of the binding landing instead of up to
+/// `POLL_INTERVAL` (5 min) later. It also fires directly in-process from
+/// [`oauth_exchange_handler_using`]'s success arm — this route is the
+/// channel for clients that commit outside the daemon.
+///
+/// The slot is validated at THIS boundary via `AccountNum::try_from`
+/// (`account-terminal-separation.md` MUST-1 channel (b): the daemon
+/// validates what the client sends and derives nothing from
+/// terminal/env/CLI context). An out-of-range slot → 400 and the wake is
+/// NOT sent.
+///
+/// `WakeChannel::wake_slot` records the slot in a pending SET and stores a
+/// notify permit: a wake that races an in-flight poll is consumed by the
+/// loop's next `select!` instead of being dropped, and N wakes for one slot
+/// coalesce into ONE targeted re-poll of that slot (never a full sweep, and
+/// never over an active cooldown).
+async fn slot_rebind_handler(
+    State(state): State<RouterState>,
+    Json(req): Json<SlotRebindRequest>,
+) -> Result<Json<SlotRebindResponse>, (StatusCode, String)> {
+    use crate::types::AccountNum;
+    let slot = AccountNum::try_from(req.slot)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid account id: {e}")))?;
+    state.usage_poller_wake.wake_slot(slot.get());
+    tracing::debug!(
+        error_kind = "usage_poller_wake_rebind",
+        slot = slot.get(),
+        "slot rebind — usage poller woken for an immediate tick"
+    );
+    Ok(Json(SlotRebindResponse { woken: true }))
 }
 
 /// Request body for `POST /api/harvest-account`.
@@ -1504,7 +1732,9 @@ pub(crate) mod harvest_gate {
     /// (`user-path-verification.md`-style: least surface, not "make it all
     /// public").
     pub(super) fn real_reconcile() -> ReconcileFn {
-        std::sync::Arc::new(crate::daemon::custodian::reconcile_account)
+        // On-demand harvest: shared Mismatch, call-local Dead (see
+        // `custodian::NegativeCache::on_demand_view`).
+        std::sync::Arc::new(crate::daemon::custodian::reconcile_account_on_demand)
     }
 
     /// Runs `custodian::reconcile_account` for `account`, coordinated
@@ -2314,8 +2544,8 @@ async fn gemini_event_handler(
             return Ok::<bool, String>(false);
         }
         drop(applied);
-        let mut quota =
-            crate::quota::state::load_state(&base_dir).map_err(|e| format!("quota load: {e}"))?;
+        let mut quota = crate::quota::state::load_state_or_skip(&base_dir)
+            .map_err(|e| format!("quota load: {e}"))?;
         // PR-G3 redteam H2: structured-log when IPC creates a quota
         // row for a previously-unseen slot. Same-UID caller can still
         // do this (and we accept it — the live IPC path needs to work
@@ -3433,6 +3663,8 @@ pub async fn serve(
         shutdown: shutdown.clone(),
     };
 
+    // One noninteractive prior-boot custody check; never block server readiness.
+    tokio::spawn(recover_pool_after_startup((*state.base_dir).clone()));
     let app = Arc::new(router(state));
     let sock_for_cleanup = socket_path.to_path_buf();
     let join = tokio::spawn(async move {
@@ -3440,6 +3672,44 @@ pub async fn serve(
     });
 
     Ok((handle, join))
+}
+
+/// One restart-only pool custody check for a product startup channel.
+/// Callers spawn this future exactly once and never wait for it during startup.
+/// The deadline bounds observation, not cancellation of a native blocking call;
+/// custody and prior-boot admission remain enforced by the Pool API.
+pub async fn recover_pool_after_startup(base_dir: PathBuf) {
+    let outcome = recover_pool_after_startup_with(std::time::Duration::from_secs(5), move || {
+        pool_startup_recovery_checked(crate::pool::Pool::new(&base_dir).recover_after_restart())
+    })
+    .await;
+    if outcome != "pool_restart_recovery_checked" {
+        tracing::warn!(
+            error_kind = outcome,
+            "pool restart recovery check incomplete"
+        );
+    }
+}
+
+fn pool_startup_recovery_checked(
+    outcome: std::result::Result<crate::pool::RestartRecovery, crate::pool::PoolError>,
+) -> bool {
+    matches!(
+        outcome,
+        Ok(crate::pool::RestartRecovery::NotNeeded | crate::pool::RestartRecovery::Recovered)
+    )
+}
+
+async fn recover_pool_after_startup_with(
+    budget: std::time::Duration,
+    recover: impl FnOnce() -> bool + Send + 'static,
+) -> &'static str {
+    match tokio::time::timeout(budget, tokio::task::spawn_blocking(recover)).await {
+        Ok(Ok(true)) => "pool_restart_recovery_checked",
+        Ok(Ok(false)) => "pool_restart_recovery_refused",
+        Ok(Err(_)) => "pool_restart_recovery_worker_failed",
+        Err(_) => "pool_restart_recovery_timed_out",
+    }
 }
 
 /// The accept loop. Exits when the shutdown token is cancelled.
@@ -3620,7 +3890,39 @@ fn verify_peer_uid(_stream: &tokio::net::UnixStream) -> std::io::Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::daemon::test_socket_fixture::UnixSocketFixture;
+    use crate::testing::socket_fixture::UnixSocketFixture;
+
+    #[test]
+    fn oauth_login_outcomes_map_busy_to_409_retry_and_target_advance_to_explicit_500() {
+        use crate::accounts::anthropic_identity::IdentityError as E;
+        let dir = tempfile::TempDir::new().unwrap();
+        let account = AccountNum::try_from(1).unwrap();
+        let busy =
+            finish_oauth_login_credentials(dir.path(), account, Err(E::BindingBusy)).unwrap_err();
+        assert_eq!(busy, "oauth_identity_busy");
+        let (status, outcome) = login_outcome_response(&busy);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(outcome.message().contains("retry"), "{}", outcome.message());
+        let advanced = finish_oauth_login_credentials(
+            dir.path(),
+            account,
+            Err(E::TargetAdvancedPublicationFailed),
+        )
+        .unwrap_err();
+        assert_eq!(advanced, "oauth_login_target_advanced_publication_failed");
+        let (status, outcome) = login_outcome_response(&advanced);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            outcome
+                .message()
+                .contains("existing credentials were advanced"),
+            "{}",
+            outcome.message()
+        );
+        let refused = finish_oauth_login_credentials(dir.path(), account, Err(E::ProfileRefused))
+            .unwrap_err();
+        assert_eq!(login_outcome_response(&refused).0, StatusCode::BAD_REQUEST);
+    }
 
     /// Builds a minimal RouterState for tests. Both caches start
     /// empty; base_dir points at the provided temp directory. The
@@ -3633,6 +3935,18 @@ mod tests {
     ///
     /// `audit_health` defaults to `AuditHealth::Verified` so tests
     /// that don't care about audit gating get the clean path.
+    /// Acquires the shared env lock and awaits `fut` with it held: serve()
+    /// flips the process umask around bind(2) outside any lock, and the flip
+    /// window is entirely inside the served future, so the guard MUST span
+    /// this await. Allowed deliberately — a test-only serialization mutex on
+    /// a current_thread runtime (same disposition as daemon/detect.rs and
+    /// usage_poller/kimi.rs); the guard drops when the future returns.
+    #[allow(clippy::await_holding_lock)]
+    async fn with_serve_env_lock<T>(fut: impl std::future::Future<Output = T>) -> T {
+        let _env = crate::platform::test_env::lock();
+        fut.await
+    }
+
     fn test_state(base: &Path) -> RouterState {
         RouterState {
             cache: Arc::new(TtlCache::with_default_age()),
@@ -3643,6 +3957,7 @@ mod tests {
             audit_health: crate::audit::new_shared(crate::audit::AuditHealth::Verified),
             audit_records_unverified: 0,
             anchor_sink: None,
+            usage_poller_wake: Arc::new(crate::daemon::usage_poller::WakeChannel::new()),
             #[cfg(feature = "enterprise")]
             interactive: Arc::new(InteractiveSessionRegistry::empty()),
         }
@@ -3660,6 +3975,7 @@ mod tests {
             audit_health: crate::audit::new_shared(crate::audit::AuditHealth::Verified),
             audit_records_unverified: 0,
             anchor_sink: None,
+            usage_poller_wake: Arc::new(crate::daemon::usage_poller::WakeChannel::new()),
             #[cfg(feature = "enterprise")]
             interactive: Arc::new(InteractiveSessionRegistry::empty()),
         }
@@ -3681,6 +3997,7 @@ mod tests {
             audit_health: crate::audit::new_shared(crate::audit::AuditHealth::Verified),
             audit_records_unverified: 0,
             anchor_sink: None,
+            usage_poller_wake: Arc::new(crate::daemon::usage_poller::WakeChannel::new()),
             #[cfg(feature = "enterprise")]
             interactive: Arc::new(InteractiveSessionRegistry::empty()),
         }
@@ -3691,7 +4008,9 @@ mod tests {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
 
-        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
         assert!(sock.exists(), "socket file should be created");
 
         // Verify 0o600 permissions.
@@ -3718,7 +4037,9 @@ mod tests {
         std::fs::write(&sock, "stale").unwrap();
         assert!(sock.exists());
 
-        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
         assert!(sock.exists());
 
         handle.shutdown();
@@ -3736,7 +4057,9 @@ mod tests {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
 
-        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
 
         // Connect and send a minimal HTTP/1.1 GET.
         let mut stream = UnixStream::connect(&sock).await.unwrap();
@@ -3785,7 +4108,9 @@ mod tests {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
 
-        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
 
         let mut stream = UnixStream::connect(&sock).await.unwrap();
         stream
@@ -4009,7 +4334,7 @@ mod tests {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
         let (state, key) = seeded_interactive_state(dir.path(), factory);
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
         let key_str = key.as_str().to_owned();
 
         let (status, body) = http_post_json_with_key(
@@ -4057,7 +4382,9 @@ mod tests {
         // NOT a panic.
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
-        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
 
         let (status, body) = http_post_json(&sock, "/api/interactive/open", "{}").await;
         assert!(
@@ -4080,7 +4407,9 @@ mod tests {
         // pre-open query is fail-closed identically to the keyed routes (an internal ticket).
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
-        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
 
         let (status, body) = http_post_json(&sock, "/api/interactive/options", "").await;
         assert!(
@@ -4144,7 +4473,7 @@ mod tests {
             ..test_state(dir.path())
         };
         let sock = dir.socket_path();
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let (status, body) = http_post_json(&sock, "/api/interactive/options", "").await;
         assert!(
@@ -4179,7 +4508,7 @@ mod tests {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
         let (state, key) = seeded_interactive_state(dir.path(), factory);
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
         let key_str = key.as_str().to_owned();
 
         let (_s1, b1) = http_post_json_with_key(
@@ -4220,7 +4549,7 @@ mod tests {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
         let (state, key) = seeded_interactive_state(dir.path(), factory);
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
         let key_str = key.as_str().to_owned();
 
         let (status, body) =
@@ -4255,7 +4584,7 @@ mod tests {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
         let (state, _key) = seeded_interactive_state(dir.path(), factory);
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         // Send submit with no header — extract_session_key must reject it.
         let (status, body) =
@@ -4277,7 +4606,9 @@ mod tests {
     async fn accounts_route_returns_empty_list_on_empty_base() {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
-        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
 
         let (status, body) = http_get(&sock, "/api/accounts").await;
         assert!(status.contains("200"), "status: {status}");
@@ -4318,7 +4649,9 @@ mod tests {
         .unwrap();
 
         let sock = dir.socket_path();
-        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
 
         let (status, body) = http_get(&sock, "/api/accounts").await;
         assert!(status.contains("200"), "status: {status}");
@@ -4333,7 +4666,9 @@ mod tests {
     async fn refresh_status_one_returns_404_when_absent() {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
-        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
 
         let (status, body) = http_get(&sock, "/api/refresh-status/1").await;
         assert!(status.contains("404"), "status: {status}");
@@ -4347,7 +4682,9 @@ mod tests {
     async fn refresh_status_one_rejects_out_of_range_id() {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
-        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
 
         // 0 is out of the 1..=999 range so AccountNum::try_from rejects it.
         let (status, body) = http_get(&sock, "/api/refresh-status/0").await;
@@ -4377,7 +4714,7 @@ mod tests {
         );
 
         let sock = dir.socket_path();
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let (status, body) = http_get(&sock, "/api/refresh-status/1").await;
         assert!(status.contains("200"), "status: {status}");
@@ -4434,7 +4771,7 @@ mod tests {
         );
 
         let sock = dir.socket_path();
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let (status, body) = http_get(&sock, "/api/refresh-status").await;
         assert!(status.contains("200"), "status: {status}");
@@ -4453,7 +4790,7 @@ mod tests {
         let state = test_state(dir.path());
         // Remember the store so we can verify the pending entry.
         let store = Arc::clone(state.oauth_store.as_ref().unwrap());
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let (status, body) = http_get(&sock, "/api/login/3").await;
         assert!(status.contains("200"), "status: {status}");
@@ -4481,7 +4818,7 @@ mod tests {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
         let state = test_state_no_oauth(dir.path());
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let (status, body) = http_get(&sock, "/api/login/1").await;
         assert!(status.contains("503"), "status: {status}");
@@ -4491,11 +4828,616 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
     }
 
+    fn exchanged_grant_fixture(token: &str) -> credentials::CredentialFile {
+        // A year-2100 expiry isolates identity validation from expiration.
+        serde_json::from_value(serde_json::json!({"claudeAiOauth": {
+            "accessToken": token, "refreshToken": "fixture-server-refresh",
+            "expiresAt": 4102444800000_u64, "scopes": ["user:profile", "user:inference"],
+        }}))
+        .unwrap()
+    }
+
+    #[test]
+    fn oauth_browser_wait_rebind_refuses_original_handler_authority() {
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let state = test_state(dir.path());
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let account = AccountNum::try_from(1).unwrap();
+                let Json(initial) = login_handler(State(state.clone()), AxumPath(account.get())).await.unwrap();
+                let Json(winner) = login_handler(State(state.clone()), AxumPath(account.get())).await.unwrap();
+                let Json(committed_winner) = oauth_exchange_handler_with_transport(State(state.clone()), Json(OAuthExchangeRequest {
+                    state: winner.state, code: "fixture-winner-code".into(),
+                }), |_, _| Ok(br#"{"access_token":"fixture-browser-winning-token","refresh_token":"fixture-browser-refresh","expires_in":3153600000}"#.to_vec()),
+                    oauth_profile_fixture("fixture-browser-winning-token")).await.unwrap();
+                assert_eq!(committed_winner.account, account.get(), "winner completion must report the verified slot");
+                let identity = crate::accounts::profiles::resolve_slot_to_uuid(dir.path(), account.get()).unwrap();
+                let path = crate::accounts::identity_store::credentials_path_for(dir.path(), identity);
+                let before = std::fs::read(&path).unwrap();
+                let err = oauth_exchange_handler_with_transport(State(state), Json(OAuthExchangeRequest {
+                    state: initial.state, code: "fixture-stale-code".into(),
+                }), |_, _| Ok(br#"{"access_token":"fixture-browser-stale-token","refresh_token":"fixture-browser-stale-refresh","expires_in":3153600000}"#.to_vec()),
+                    oauth_profile_fixture("fixture-browser-stale-token")).await.unwrap_err();
+                assert_eq!(err.0, StatusCode::CONFLICT,
+                    "browser-wait winner must invalidate original pending authority");
+                assert_eq!(crate::accounts::profiles::resolve_slot_to_uuid(dir.path(), account.get()), Some(identity));
+                assert_eq!(std::fs::read(&path).unwrap(), before, "winner grant must survive stale browser completion");
+            });
+        });
+    }
+
+    #[test]
+    fn oauth_exchange_unknown_profile_refuses_without_publishing() {
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let account = AccountNum::try_from(1).unwrap();
+            let prior =
+                crate::accounts::anthropic_identity::capture_login_prior(dir.path(), account)
+                    .unwrap();
+            let credential = exchanged_grant_fixture("fixture-server-unknown-token");
+            let profile: crate::daemon::usage_poller::HttpGetFn = Arc::new(|url, token, _| {
+                assert_eq!(url, "https://api.anthropic.com/api/oauth/profile");
+                assert_eq!(token, "fixture-server-unknown-token");
+                Ok((
+                    200,
+                    br#"{"account":{"email":"fixture-slot-1@test.invalid"}}"#.to_vec(),
+                ))
+            });
+            assert!(save_oauth_login_credentials_with(
+                dir.path(),
+                account,
+                &credential,
+                &profile,
+                prior
+            )
+            .is_err());
+            assert!(
+                crate::accounts::profiles::resolve_slot_to_uuid(dir.path(), account.get())
+                    .is_none()
+            );
+            assert!(!dir.path().join("config-1/.csq-account").exists());
+        });
+    }
+
+    #[test]
+    fn oauth_exchange_profile_transport_error_does_not_leak_grant_or_body() {
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let account = AccountNum::try_from(1).unwrap();
+            let credential = exchanged_grant_fixture("fixture-server-private-token");
+            let profile: crate::daemon::usage_poller::HttpGetFn =
+                Arc::new(|_, token, _| Err(format!("{token}: fixture-private-profile-body")));
+            let err = save_oauth_login_credentials_with(
+                dir.path(),
+                account,
+                &credential,
+                &profile,
+                crate::accounts::anthropic_identity::capture_login_prior(dir.path(), account)
+                    .unwrap(),
+            )
+            .unwrap_err();
+            assert!(!err.contains("fixture-server-private-token"));
+            assert!(!err.contains("fixture-private-profile-body"));
+            assert!(
+                crate::accounts::profiles::resolve_slot_to_uuid(dir.path(), account.get())
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn oauth_exchange_profile_context_does_not_inherit_ambient_native_metadata() {
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let account = AccountNum::try_from(1).unwrap();
+            let config = dir.path().join("config-1");
+            std::fs::create_dir(&config).unwrap();
+            std::fs::write(
+                config.join(".claude.json"),
+                serde_json::json!({"oauthAccount": {
+                    "emailAddress": "stale-personal@test.invalid",
+                    "accountUuid": "33333333-3333-4333-8333-333333333333",
+                    "organizationUuid": "44444444-4444-4444-8444-444444444444",
+                }})
+                .to_string(),
+            )
+            .unwrap();
+            let prior =
+                crate::accounts::anthropic_identity::capture_login_prior(dir.path(), account)
+                    .unwrap();
+            let credential = exchanged_grant_fixture("fixture-server-exact-token");
+            save_oauth_login_credentials_with(
+                dir.path(),
+                account,
+                &credential,
+                &oauth_profile_fixture("fixture-server-exact-token"),
+                prior,
+            )
+            .unwrap();
+            let identity =
+                crate::accounts::profiles::resolve_slot_to_uuid(dir.path(), account.get()).unwrap();
+            let stored = crate::accounts::anthropic_identity::read_stored_anthropic_context(
+                dir.path(),
+                identity,
+            )
+            .unwrap();
+            match stored {
+                crate::accounts::anthropic_identity::StoredAnthropicContext::Known(context) => {
+                    assert_eq!(context.email(), "fixture-slot-1@test.invalid");
+                    assert_eq!(
+                        context.organization_uuid().to_string(),
+                        "22222222-2222-4222-8222-222222222222"
+                    );
+                }
+                _ => panic!("exchanged grant must publish a known verified context"),
+            }
+        });
+    }
+
+    #[test]
+    fn oauth_exchange_prior_unbound_refuses_an_interleaved_winning_login() {
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let account = AccountNum::try_from(1).unwrap();
+            let stale_prior =
+                crate::accounts::anthropic_identity::capture_login_prior(dir.path(), account)
+                    .unwrap();
+            let winner = exchanged_grant_fixture("fixture-server-winning-token");
+            let winner_prior =
+                crate::accounts::anthropic_identity::capture_login_prior(dir.path(), account)
+                    .unwrap();
+            save_oauth_login_credentials_with(
+                dir.path(),
+                account,
+                &winner,
+                &oauth_profile_fixture("fixture-server-winning-token"),
+                winner_prior,
+            )
+            .unwrap();
+            let identity =
+                crate::accounts::profiles::resolve_slot_to_uuid(dir.path(), account.get()).unwrap();
+            let path = crate::accounts::identity_store::credentials_path_for(dir.path(), identity);
+            let before = std::fs::read(&path).unwrap();
+            let stale = exchanged_grant_fixture("fixture-server-stale-token");
+            assert!(save_oauth_login_credentials_with(dir.path(), account, &stale,
+                &oauth_profile_fixture("fixture-server-stale-token"), stale_prior).is_err(),
+                "an initially unbound ingress must not overwrite a winner published during exchange");
+            assert_eq!(
+                crate::accounts::profiles::resolve_slot_to_uuid(dir.path(), account.get()),
+                Some(identity)
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "winner credential bytes must survive"
+            );
+        });
+    }
+
+    fn oauth_profile_fixture(
+        expected_token: &'static str,
+    ) -> crate::daemon::usage_poller::HttpGetFn {
+        Arc::new(move |url, token, _| {
+            assert_eq!(url, "https://api.anthropic.com/api/oauth/profile");
+            assert_eq!(
+                token, expected_token,
+                "profile must verify the exact exchanged grant"
+            );
+            Ok((200, serde_json::json!({
+                "account": {"uuid": "11111111-1111-4111-8111-111111111111", "email": "fixture-slot-1@test.invalid"},
+                "organization": {"uuid": "22222222-2222-4222-8222-222222222222"},
+            }).to_string().into_bytes()))
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn seed_verified_oauth_profile(
+        base: &Path,
+        identity: crate::accounts::identity_store::IdentityId,
+    ) {
+        // The Known writer and its pre-login mirror witness require private
+        // identity directories; coexisting_fixture predates that boundary.
+        for directory in [
+            base.join("identities"),
+            crate::accounts::identity_store::identity_path(base, identity),
+        ] {
+            crate::platform::fs::secure_dir(&directory).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "verified OAuth fixture identity directories must be private"
+            );
+        }
+        let account_uuid = uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let organization_uuid =
+            uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+        let path = crate::accounts::profiles::profiles_path(base);
+        let mut pf = crate::accounts::profiles::load(&path).unwrap();
+        pf.anthropic_contexts
+            .push(crate::accounts::anthropic_identity::AnthropicContextEntry {
+                email: "fixture-slot-1@test.invalid".into(),
+                account_uuid,
+                organization_uuid,
+                identity_uuid: identity,
+                extra: Default::default(),
+            });
+        crate::accounts::profiles::save(&path, &pf).unwrap();
+        let path = crate::accounts::identity_store::identity_json_path_for(base, identity);
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        metadata["account_uuid"] = serde_json::json!(account_uuid);
+        metadata["organization_uuid"] = serde_json::json!(organization_uuid);
+        std::fs::write(&path, metadata.to_string()).unwrap();
+        crate::platform::fs::secure_file(&path).unwrap();
+        assert!(matches!(
+            crate::accounts::anthropic_identity::read_stored_anthropic_context(base, identity)
+                .unwrap(),
+            crate::accounts::anthropic_identity::StoredAnthropicContext::Known(context)
+                if context.account_uuid() == account_uuid
+                    && context.organization_uuid() == organization_uuid
+                    && context.email() == "fixture-slot-1@test.invalid"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn oauth_exchange_response_is_prompt_while_mirror_is_blocked() {
+        oauth_background_http_case(false);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn oauth_exchange_background_mirrors_after_client_history_reset() {
+        oauth_background_http_case(true);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn oauth_background_http_case(reset_first: bool) {
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            use crate::credentials::keychain::{
+                clear_test_keychain_executor, set_test_keychain_executor, KeychainExecutor,
+                RawContentClassification, ScriptedKeychainExecutor,
+            };
+            use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+            use std::os::unix::fs::symlink;
+            use std::rc::Rc;
+            struct Clear;
+            impl Drop for Clear {
+                fn drop(&mut self) {
+                    clear_test_keychain_executor();
+                }
+            }
+            struct Blocked {
+                entered: std::sync::mpsc::Sender<()>,
+                release: std::cell::RefCell<Option<std::sync::mpsc::Receiver<()>>>,
+                old: String,
+                mutation_attempted: Arc<std::sync::atomic::AtomicBool>,
+            }
+            impl KeychainExecutor for Blocked {
+                fn find(&self, _: &str, _: &str) -> RawContentClassification {
+                    if let Some(release) = self.release.borrow_mut().take() {
+                        self.entered.send(()).unwrap();
+                        release
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .unwrap();
+                    }
+                    RawContentClassification::Content(self.old.clone().into())
+                }
+                fn add(
+                    &self,
+                    _: &str,
+                    _: &str,
+                    _: &str,
+                ) -> Result<(), crate::error::PlatformError> {
+                    self.mutation_attempted
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    panic!("the old admitted target must not publish after a new login");
+                }
+                fn delete(&self, _: &str, _: &str) -> bool {
+                    self.mutation_attempted
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    panic!("no delete admitted");
+                }
+            }
+            let dir = coexisting_fixture(1);
+            let base = dir.path();
+            let account = AccountNum::try_from(1u16).unwrap();
+            let uuid = fixture_uuid_for_slot(1);
+            seed_verified_oauth_profile(base, uuid);
+            let config = base.join("config-1");
+            std::fs::write(
+                config.join(".claude.json"),
+                r#"{"oauthAccount":{"emailAddress":"fixture-slot-1@test.invalid"}}"#,
+            )
+            .unwrap();
+            // Year 2100 keeps the original grant live at the actual policy decision.
+            let old_raw = r#"{"claudeAiOauth":{"accessToken":"fixture-http-old-at","refreshToken":"fixture-http-old-rt","expiresAt":4102444800000,"scopes":["user:inference"],"subscriptionType":"max"}}"#;
+            std::fs::write(config.join(".credentials.json"), old_raw).unwrap();
+            let old = credentials::load(&config.join(".credentials.json")).unwrap();
+            credentials::file::save(
+                &crate::accounts::identity_store::credentials_path_for(base, uuid),
+                &old,
+            )
+            .unwrap();
+            let old_fp =
+                crate::credentials::token_history::fingerprint_from_raw_json(old_raw).unwrap();
+            let handle = base.join(format!("term-{}", std::process::id()));
+            std::fs::create_dir(&handle).unwrap();
+            crate::accounts::markers::write_csq_account(&config, uuid).unwrap();
+            symlink(
+                crate::accounts::identity_store::credentials_path_for(base, uuid),
+                handle.join(".credentials.json"),
+            )
+            .unwrap();
+            symlink(config.join(".csq-account"), handle.join(".csq-account")).unwrap();
+            std::fs::write(handle.join(".live-pid"), std::process::id().to_string()).unwrap();
+            assert!(crate::session::handle_dir::handle_dir_symlinks_are_consistent(base, &handle));
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let socket = UnixSocketFixture::new().unwrap();
+                let sock = socket.socket_path();
+                let state = test_state(base);
+                let login = crate::oauth::login::start_login_with_prior(
+                    state.oauth_store.as_ref().unwrap(), account, std::fs::canonicalize(base).unwrap(),
+                    crate::accounts::anthropic_identity::capture_login_prior(base, account).unwrap()).unwrap();
+                let app = Router::new().route("/api/oauth/exchange", post(
+                    |state: State<RouterState>, body: Json<OAuthExchangeRequest>| async move {
+                        oauth_exchange_handler_with_transport(state, body, |_, _| {
+                            // A century of fixture lifetime avoids real-time expiry races.
+                            Ok(br#"{"access_token":"fixture-http-new-at","refresh_token":"fixture-http-new-rt","expires_in":3153600000}"#.to_vec())
+                        }, oauth_profile_fixture("fixture-http-new-at")).await
+                    })).with_state(state);
+                let listener = UnixListener::bind(&sock).unwrap();
+                std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
+                let stop = CancellationToken::new();
+                let server = tokio::spawn(accept_loop(listener, Arc::new(app), stop.clone(), sock.clone()));
+                crate::credentials::keychain::queue_login_mirror(base, account, None);
+                let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let prior_base = base.to_path_buf();
+                let release = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+                let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let mutation_attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let worker_completed = completed.clone();
+                let worker_mutation = mutation_attempted.clone();
+                let blocked = tokio::spawn(async move {
+                    loop {
+                        let release = release.clone();
+                        let entered = entered_tx.clone();
+                        let completed = worker_completed.clone();
+                        let mutation = worker_mutation.clone();
+                        let outcome = crate::daemon::refresher::run_pending_mirror_retry_with(
+                            prior_base.clone(), CancellationToken::new(), move |base| {
+                                set_test_keychain_executor(Rc::new(Blocked {
+                                    entered, release: std::cell::RefCell::new(release.lock().unwrap().take()),
+                                    old: old_raw.to_string(), mutation_attempted: mutation,
+                                }));
+                                let _clear = Clear;
+                                let status = crate::credentials::keychain::sync_pending_login_handle_dirs_status(base);
+                                completed.store(true, std::sync::atomic::Ordering::SeqCst);
+                                status
+                            }).await;
+                        if worker_completed.load(std::sync::atomic::Ordering::SeqCst)
+                            || worker_mutation.load(std::sync::atomic::Ordering::SeqCst) {
+                            break outcome;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                });
+                tokio::task::spawn_blocking(move || entered_rx.recv_timeout(std::time::Duration::from_secs(30))).await.unwrap().unwrap();
+                let concurrent_admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let admitted = concurrent_admitted.clone();
+                let concurrent = crate::daemon::refresher::run_pending_mirror_retry_with(
+                    base.to_path_buf(), CancellationToken::new(), move |_| {
+                        admitted.store(true, std::sync::atomic::Ordering::SeqCst);
+                        panic!("second background sweep must not be admitted while gate is held")
+                    }
+                ).await;
+                assert_eq!(concurrent, crate::daemon::refresher::MirrorRetryOutcome::Unavailable);
+                assert!(!concurrent_admitted.load(std::sync::atomic::Ordering::SeqCst), "gate refusal must precede actual sweep callback");
+                let body = serde_json::json!({"state": login.state, "code":"fixture-code"}).to_string();
+                let request_sock = sock.clone();
+                let started = std::time::Instant::now();
+                let response = tokio::task::spawn_blocking(move || {
+                    crate::daemon::client::http_post_unix_json(&request_sock, "/api/oauth/exchange", &body)
+                }).await.unwrap().expect("unchanged 2s client timeout must receive saved response");
+                assert!(started.elapsed() < crate::daemon::client::DEFAULT_TIMEOUT);
+                assert_eq!(response.status, 200);
+                assert_eq!(serde_json::from_str::<serde_json::Value>(&response.body).unwrap(), serde_json::json!({"account":1}));
+                assert!(!blocked.is_finished(), "response must return while mirror remains blocked");
+                let fresh = std::fs::read_to_string(crate::accounts::identity_store::credentials_path_for(base, uuid)).unwrap();
+                std::fs::write(config.join(".credentials.json"), &fresh).unwrap();
+                let finalizer_mutated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let finalizer = if reset_first {
+                    let finalizer_base = base.to_path_buf();
+                    let attempted = finalizer_mutated.clone();
+                    let task = tokio::task::spawn_blocking(move || {
+                        let exec = Rc::new(ScriptedKeychainExecutor::scripted(
+                            RawContentClassification::Content(old_raw.to_string().into())));
+                        set_test_keychain_executor(exec.clone());
+                        let _clear = Clear;
+                        let incoming = credentials::load(&crate::accounts::identity_store::credentials_path_for(&finalizer_base, uuid)).unwrap();
+                        let prior = crate::accounts::anthropic_identity::capture_login_prior(&finalizer_base, account).unwrap();
+                        save_oauth_login_credentials_with(&finalizer_base, account, &incoming,
+                            &oauth_profile_fixture("fixture-http-new-at"), prior).unwrap();
+                        attempted.store(exec.last_add_payload().is_some(), std::sync::atomic::Ordering::SeqCst);
+                    });
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        let fresh_fp = crate::credentials::token_history::fingerprint_from_raw_json(&fresh).unwrap();
+                        loop {
+                            let history = crate::credentials::token_history::read_history(base, uuid);
+                            if history.contains(&fresh_fp) && !history.contains(&old_fp) { break; }
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
+                    }).await.expect("client history reset must occur before delayed mirror resumes");
+                    assert!(!blocked.is_finished());
+                    Some(task)
+                } else { None };
+                release_tx.send(()).unwrap();
+                blocked.await.unwrap();
+                assert!(completed.load(std::sync::atomic::Ordering::SeqCst), "blocked sweep must finish normally rather than hide a caught panic");
+                assert!(!mutation_attempted.load(std::sync::atomic::Ordering::SeqCst));
+                if let Some(task) = finalizer { task.await.unwrap(); }
+                assert!(!finalizer_mutated.load(std::sync::atomic::Ordering::SeqCst), "ordinary client finalizer must not consume retained daemon ancestry");
+                assert!(crate::credentials::keychain::mirror_sync_retry_requested(base));
+                let payload = Arc::new(std::sync::Mutex::new(None));
+                let captured = payload.clone();
+                crate::daemon::refresher::run_pending_mirror_retry_with(base.to_path_buf(), CancellationToken::new(), move |base| {
+                    let exec = Rc::new(ScriptedKeychainExecutor::scripted(RawContentClassification::Content(old_raw.to_string().into())));
+                    set_test_keychain_executor(exec.clone());
+                    let _clear = Clear;
+                    let status = crate::credentials::keychain::sync_pending_login_handle_dirs_status(base);
+                    *captured.lock().unwrap() = exec.last_add_payload();
+                    status
+                }).await;
+                let written = payload.lock().unwrap().take().expect("retained pre-save witness must deliver fresh grant after blocked work");
+                assert_eq!(crate::credentials::token_history::fingerprint_from_raw_json(&written), crate::credentials::token_history::fingerprint_from_raw_json(&fresh));
+                stop.cancel();
+                tokio::time::timeout(std::time::Duration::from_secs(1), server).await.unwrap().unwrap();
+            });
+        });
+    }
+
+    // Exercise the actual save task boundary with fixture credentials, never OAuth HTTP.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn oauth_exchange_save_queues_bound_mirror_for_existing_retry() {
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            use crate::credentials::keychain::{
+                clear_test_keychain_executor, set_test_keychain_executor, RawContentClassification,
+                ScriptedKeychainExecutor,
+            };
+            use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+            use std::os::unix::fs::symlink;
+            use std::rc::Rc;
+            struct ResetExecutor;
+            impl Drop for ResetExecutor {
+                fn drop(&mut self) {
+                    clear_test_keychain_executor();
+                }
+            }
+            let dir = coexisting_fixture(1);
+            let base = dir.path();
+            let account = AccountNum::try_from(1u16).unwrap();
+            let uuid = fixture_uuid_for_slot(1);
+            seed_verified_oauth_profile(base, uuid);
+            let config = base.join("config-1");
+            std::fs::write(
+                config.join(".claude.json"),
+                r#"{"oauthAccount":{"emailAddress":"fixture-slot-1@test.invalid"}}"#,
+            )
+            .unwrap();
+            // Year 2100 keeps both fixture grants valid for real mirror policy.
+            let old_raw = r#"{"claudeAiOauth":{"accessToken":"fixture-daemon-old-at","refreshToken":"fixture-daemon-old-rt","expiresAt":4102444800000,"scopes":["user:inference"],"subscriptionType":"max"}}"#;
+            std::fs::write(config.join(".credentials.json"), old_raw).unwrap();
+            let old = credentials::load(&config.join(".credentials.json")).unwrap();
+            credentials::file::save(
+                &crate::accounts::identity_store::credentials_path_for(base, uuid),
+                &old,
+            )
+            .unwrap();
+            let old_fp =
+                crate::credentials::token_history::fingerprint_from_raw_json(old_raw).unwrap();
+            let handle = base.join(format!("term-{}", std::process::id()));
+            std::fs::create_dir(&handle).unwrap();
+            crate::accounts::markers::write_csq_account(&config, uuid).unwrap();
+            symlink(
+                crate::accounts::identity_store::credentials_path_for(base, uuid),
+                handle.join(".credentials.json"),
+            )
+            .unwrap();
+            symlink(config.join(".csq-account"), handle.join(".csq-account")).unwrap();
+            std::fs::write(handle.join(".live-pid"), std::process::id().to_string()).unwrap();
+            assert!(crate::session::handle_dir::handle_dir_symlinks_are_consistent(base, &handle));
+            let exec = Rc::new(ScriptedKeychainExecutor::scripted(
+                RawContentClassification::Content(old_raw.to_string().into()),
+            ));
+            set_test_keychain_executor(exec.clone());
+            let _reset = ResetExecutor;
+            let new_raw = old_raw
+                .replace("fixture-daemon-old-at", "fixture-daemon-new-at")
+                .replace("fixture-daemon-old-rt", "fixture-daemon-new-rt")
+                .replace("4102444800000", "4102444800001");
+            std::fs::write(config.join(".credentials.json"), &new_raw).unwrap();
+            let new = credentials::load(&config.join(".credentials.json")).unwrap();
+            let prior =
+                crate::accounts::anthropic_identity::capture_login_prior(base, account).unwrap();
+            save_oauth_login_credentials_with(
+                base,
+                account,
+                &new,
+                &oauth_profile_fixture("fixture-daemon-new-at"),
+                prior,
+            )
+            .unwrap();
+            assert!(
+                exec.last_add_payload().is_none(),
+                "producer must enqueue without mirror work"
+            );
+            crate::credentials::keychain::sync_pending_login_handle_dirs_status(base);
+            assert!(
+                !crate::credentials::token_history::read_history(base, uuid).contains(&old_fp),
+                "verified daemon finalization must reset history without consuming mirror ancestry"
+            );
+            let written = exec
+                .last_add_payload()
+                .expect("daemon save must mirror the fresh grant");
+            assert_eq!(
+                crate::credentials::token_history::fingerprint_from_raw_json(&written),
+                crate::credentials::token_history::fingerprint_from_raw_json(&new_raw)
+            );
+            assert!(exec.calls().iter().any(|(verb, _, _)| *verb == "find"));
+            let adds = exec
+                .calls()
+                .iter()
+                .filter(|(verb, _, _)| *verb == "add")
+                .count();
+            let prior =
+                crate::accounts::anthropic_identity::capture_login_prior(base, account).unwrap();
+            save_oauth_login_credentials_with(
+                base,
+                account,
+                &new,
+                &oauth_profile_fixture("fixture-daemon-new-at"),
+                prior,
+            )
+            .unwrap();
+            crate::credentials::keychain::sync_pending_login_handle_dirs_status(base);
+            assert!(!crate::credentials::token_history::read_history(base, uuid).contains(&old_fp));
+            assert_eq!(
+                exec.calls()
+                    .iter()
+                    .filter(|(verb, _, _)| *verb == "add")
+                    .count(),
+                adds,
+                "client finalization must not write the already mirrored grant again"
+            );
+            assert_eq!(
+                serde_json::to_value(OAuthExchangeResponse {
+                    account: account.get()
+                })
+                .unwrap(),
+                serde_json::json!({"account": 1})
+            );
+        });
+    }
+
     #[tokio::test]
     async fn oauth_exchange_rejects_empty_code() {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
-        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
 
         let req_body = r#"{"state":"anything","code":"   "}"#;
         let (status, body) = http_post_json(&sock, "/api/oauth/exchange", req_body).await;
@@ -4510,7 +5452,9 @@ mod tests {
     async fn oauth_exchange_rejects_unknown_state() {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
-        let (handle, join) = serve(&sock, test_state(dir.path())).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
 
         // Send a state token that was never issued — the consume
         // step must reject it as state_mismatch and return 400.
@@ -4528,7 +5472,7 @@ mod tests {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
         let state = test_state_no_oauth(dir.path());
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let req_body = r#"{"state":"any","code":"any"}"#;
         let (status, body) = http_post_json(&sock, "/api/oauth/exchange", req_body).await;
@@ -4550,7 +5494,7 @@ mod tests {
         let sock = dir.socket_path();
         let state = test_state(dir.path());
         let store = Arc::clone(state.oauth_store.as_ref().unwrap());
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         // Seed one pending entry so we have a valid state token.
         let account = AccountNum::try_from(1u16).unwrap();
@@ -4648,7 +5592,7 @@ mod tests {
 
         let sock = dir.socket_path();
         let state = test_state(dir.path());
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         // First call: runs discovery, finds account 1, caches.
         let (status1, body1) = http_get(&sock, "/api/accounts").await;
@@ -4697,7 +5641,7 @@ mod tests {
         // Very short TTL so the test doesn't wait 5 seconds.
         let sock = dir.socket_path();
         let state = test_state_with_discovery_ttl(dir.path(), std::time::Duration::from_millis(50));
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         // Populate the cache.
         let (status1, _) = http_get(&sock, "/api/accounts").await;
@@ -4761,7 +5705,7 @@ mod tests {
                 checked_at_secs: 0,
             },
         );
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let (status1, body1) = http_get(&sock, "/api/refresh-status").await;
         assert!(status1.contains("200"), "status1: {status1}");
@@ -4788,7 +5732,7 @@ mod tests {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
         let state = test_state(dir.path());
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         // 0 is out of range (AccountNum requires >=1)
         let (status, body) = http_get(&sock, "/api/login/0").await;
@@ -4808,7 +5752,7 @@ mod tests {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
         let state = test_state(dir.path());
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         // Act: POST /api/slot-swap with from == to (request anomaly).
         let (status, body) = http_post_json(&sock, "/api/slot-swap", r#"{"from":3,"to":3}"#).await;
@@ -4822,6 +5766,240 @@ mod tests {
 
         handle.shutdown();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // ── login-followup — POST /api/slot-rebind ────────────────────────────
+
+    /// A `POST /api/slot-rebind` with an in-range slot MUST reach the SAME
+    /// `Notify` the usage poller blocks on. The test holds the other end of
+    /// that `Arc`, so the wake is observed directly: `notify_one` stores a
+    /// permit, making a `notified()` awaited AFTER the POST complete
+    /// immediately. Dropping the handler's `notify_one()` makes this test
+    /// time out.
+    #[tokio::test]
+    async fn slot_rebind_route_wakes_the_shared_poller_notify() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let wake = Arc::new(crate::daemon::usage_poller::WakeChannel::new());
+        let mut state = test_state(dir.path());
+        state.usage_poller_wake = Arc::clone(&wake);
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let (status, body) = http_post_json(&sock, "/api/slot-rebind", r#"{"slot":3}"#).await;
+        assert!(status.contains("200"), "expected 200, got: {status}");
+        assert!(
+            body.contains("\"woken\":true"),
+            "expected woken=true, got: {body}"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+            .await
+            .expect("POST /api/slot-rebind must notify_one() the shared poller Notify");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// Negative control for the test above: an out-of-range slot is
+    /// rejected 400 AND no wake is sent — without this, a handler that
+    /// notified unconditionally before validating would still pass the
+    /// positive test.
+    #[tokio::test]
+    async fn slot_rebind_route_rejects_out_of_range_slot_without_waking() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let wake = Arc::new(crate::daemon::usage_poller::WakeChannel::new());
+        let mut state = test_state(dir.path());
+        state.usage_poller_wake = Arc::clone(&wake);
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        // 0 is out of range (AccountNum requires >= 1).
+        let (status, body) = http_post_json(&sock, "/api/slot-rebind", r#"{"slot":0}"#).await;
+        assert!(status.contains("400"), "status: {status} body: {body}");
+        assert!(body.contains("invalid account id"), "body: {body}");
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), wake.notified())
+                .await
+                .is_err(),
+            "a rejected slot must NOT wake the poller"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// Writes `credentials/<N>.json` so the poller's discovery finds slot
+    /// `account` and `anthropic::tick` polls it (mirrors
+    /// `usage_poller::wake_channel_tests::install_account`).
+    fn install_anthropic_slot_for_wake_test(base: &Path, account: u16) {
+        use crate::credentials::{
+            self, file as cred_file, AnthropicCredentialFile, CredentialFile, OAuthPayload,
+        };
+        use crate::types::{AccessToken, AccountNum, RefreshToken};
+        let num = AccountNum::try_from(account).unwrap();
+        let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("sk-ant-oat01-test-token".into()),
+                refresh_token: RefreshToken::new("sk-ant-ort01-test-refresh".into()),
+                expires_at: 9_999_999_999_999,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        credentials::save(&cred_file::canonical_path(base, num), &creds).unwrap();
+    }
+
+    /// Bounded wait for an atomic counter to reach `target`; the panic names
+    /// the count actually observed.
+    async fn wait_for_wake_count(
+        counter: &Arc<std::sync::atomic::AtomicU32>,
+        target: u32,
+        bound: std::time::Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + bound;
+        loop {
+            if counter.load(std::sync::atomic::Ordering::SeqCst) >= target {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "waited past {bound:?} for the poller's tick count to reach {target}; saw {}",
+                counter.load(std::sync::atomic::Ordering::SeqCst)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// login-followup R1 LOW-7(b): the ROUTE and the POLLER must share ONE
+    /// `Arc<Notify>` — the single wiring both daemon entry points perform
+    /// (`cli/commands/daemon.rs`, `desktop/daemon_supervisor.rs`): one Arc,
+    /// cloned into `RouterState::usage_poller_wake` and into
+    /// `usage_poller::spawn`. This test constructs that pair exactly, serves
+    /// the real router, POSTs `/api/slot-rebind`, and asserts the REAL poller
+    /// run loop ticks a second time. A fresh `Notify::new()` handed to either
+    /// side reds this test (the route's wake would reach nothing, or the
+    /// poller would wait on an Arc nobody notifies).
+    ///
+    /// The first tick is the startup tick (`startup_delay = ZERO`); the tick
+    /// count comes from the Anthropic transport mock, which
+    /// `anthropic::tick` calls exactly once per eligible account per tick —
+    /// one seeded slot, so the count IS the tick count. The wake floor
+    /// (`WAKE_FLOOR`, 5 s) may defer the wake-triggered tick; the bound below
+    /// covers it.
+    #[tokio::test]
+    async fn rebind_route_and_real_poller_share_one_notify() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let base = dir.path();
+        install_anthropic_slot_for_wake_test(base, 3);
+
+        let tick_counter = Arc::new(AtomicU32::new(0));
+        let wake = Arc::new(crate::daemon::usage_poller::WakeChannel::new());
+        let mut state = test_state(base);
+        state.usage_poller_wake = Arc::clone(&wake);
+
+        let shutdown = CancellationToken::new();
+        let counting: crate::daemon::usage_poller::HttpGetWithRetryAfterFn = {
+            let counter = Arc::clone(&tick_counter);
+            Arc::new(move |_url, _token, _headers| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok((
+                    200,
+                    None,
+                    br#"{"five_hour":{"utilization":42.0,"resets_at":"2099-01-01T00:00:00Z"}}"#
+                        .to_vec(),
+                ))
+            })
+        };
+        let http_get: crate::daemon::usage_poller::HttpGetFn =
+            Arc::new(|_url, _token, _headers| Ok((200, Vec::new())));
+        let http_post_probe: crate::daemon::usage_poller::HttpPostProbeFn =
+            Arc::new(|_url, _headers, _body| {
+                Ok((200, std::collections::HashMap::new(), String::new()))
+            });
+        let poller = crate::daemon::usage_poller::spawn_with_config(
+            base.to_path_buf(),
+            http_get,
+            counting,
+            http_post_probe,
+            crate::daemon::usage_poller::gemini::GeminiConsumerState::default(),
+            shutdown.clone(),
+            // The SAME Arc the RouterState holds — the wiring under test.
+            Arc::clone(&wake),
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::ZERO,
+            // The PRODUCTION wake floor — a first wake for a slot is never deferred.
+            crate::daemon::usage_poller::WAKE_FLOOR,
+        );
+
+        // Startup tick (startup_delay = ZERO), so the next tick can only be
+        // the wake's.
+        wait_for_wake_count(&tick_counter, 1, std::time::Duration::from_secs(10)).await;
+
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+        let (status, body) = http_post_json(&sock, "/api/slot-rebind", r#"{"slot":3}"#).await;
+        assert!(status.contains("200"), "status: {status} body: {body}");
+
+        // The route's notify_one must reach the poller's run loop through
+        // the shared Arc and buy one more tick (targeted re-poll of slot 3 (first wake for the slot: not deferred).        // floor).
+        wait_for_wake_count(&tick_counter, 2, std::time::Duration::from_secs(15)).await;
+
+        handle.shutdown();
+        shutdown.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+        poller.join.abort();
+    }
+
+    /// login-followup R1 LOW-7(c): the daemon's OWN `/api/oauth/exchange`
+    /// success arm wakes the shared poller Notify in-process (the twin of the
+    /// clients' `POST /api/slot-rebind`). Drives the REAL handler with a stub
+    /// exchange + stub save, so the arm that runs after a committed paste-code
+    /// login is what notifies.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oauth_exchange_success_arm_wakes_the_shared_poller_notify() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let mut state = test_state(&base);
+        let wake = Arc::new(crate::daemon::usage_poller::WakeChannel::new());
+        state.usage_poller_wake = Arc::clone(&wake);
+        let store = Arc::clone(state.oauth_store.as_ref().unwrap());
+
+        let account = crate::types::AccountNum::try_from(1u16).unwrap();
+        let prior =
+            crate::accounts::anthropic_identity::capture_login_prior(&base, account).unwrap();
+        let login =
+            crate::oauth::login::start_login_with_prior(&store, account, base.clone(), prior)
+                .unwrap();
+
+        let req = Json(
+            serde_json::from_value::<OAuthExchangeRequest>(
+                serde_json::json!({"state": login.state, "code": "fixture-code"}),
+            )
+            .unwrap(),
+        );
+        let resp = oauth_exchange_handler_using(
+            State(state),
+            req,
+            |_code, _verifier| {
+                Ok(br#"{"access_token":"fixture-exchange-at","refresh_token":"fixture-exchange-rt","expires_in":3153600000}"#.to_vec())
+            },
+            |_base, _account, _credential, _prior| Ok(()),
+        )
+        .await
+        .expect("stub exchange + stub save must reach the success arm");
+        assert_eq!(resp.0.account, 1);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+            .await
+            .expect("the exchange success arm must notify_one() the shared poller Notify");
     }
 
     // ── round 7c D3 — POST /api/harvest-account ───────────────────────────
@@ -4856,7 +6034,7 @@ mod tests {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
         let state = test_state(dir.path());
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         // account 0 is out of AccountNum's 1..=999 range.
         let (status, body) =
@@ -4879,7 +6057,7 @@ mod tests {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
         let state = test_state(dir.path());
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let (status, body) =
             http_post_json(&sock, "/api/harvest-account", r#"{"account":5}"#).await;
@@ -5082,7 +6260,7 @@ mod tests {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
         let state = test_state(dir.path()); // Verified by default
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         // Minimal valid v1 audit record body.
         let body = r#"{"run_id":"r1","ts":"2026-06-05T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
@@ -5111,7 +6289,7 @@ mod tests {
             error_kind: "audit_chain_broken_at_seq_0".to_string(),
             reason: "test broken chain".to_string(),
         };
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let body = r#"{"run_id":"r2","ts":"2026-06-05T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
         let (status, resp_body) = http_post_json(&sock, "/api/audit/record", body).await;
@@ -5140,7 +6318,7 @@ mod tests {
             .expect("audit health lock poisoned") = crate::audit::AuditHealth::Unknown {
             reason: "audit_verify_timeout".to_string(),
         };
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let body = r#"{"run_id":"r3","ts":"2026-06-05T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
         let (status, resp_body) = http_post_json(&sock, "/api/audit/record", body).await;
@@ -5174,7 +6352,7 @@ mod tests {
                 count: 6,
             }],
         };
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let body = r#"{"run_id":"r4","ts":"2026-06-05T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
         let (status, _resp) = http_post_json(&sock, "/api/audit/record", body).await;
@@ -5199,7 +6377,7 @@ mod tests {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
         let state = test_state(dir.path()); // Verified by default
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let body = r#"{"session_nonce":"mcp-proxy-1-ab","record_seq":0,"cli":"codex","tool":"mcp__shell__exec","verdict":"block"}"#;
         let (status, _resp) = http_post_json(&sock, "/api/audit/mcp-gate", body).await;
@@ -5226,7 +6404,7 @@ mod tests {
         crate::audit::outbox_paths::set_attestation_intent(dir.path()).unwrap();
         let sock = dir.socket_path();
         let state = test_state(dir.path()); // Verified health, chain uninitialised.
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let body = r#"{"session_nonce":"mcp-proxy-9-cd","record_seq":0,"cli":"codex","tool":"mcp__shell__exec","verdict":"block"}"#;
         let (status, resp) = http_post_json(&sock, "/api/audit/mcp-gate", body).await;
@@ -5257,7 +6435,7 @@ mod tests {
         );
         let sock = dir.socket_path();
         let state = test_state(dir.path());
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let body = r#"{"session_nonce":"mcp-proxy-9-ef","record_seq":0,"cli":"codex","tool":"mcp__shell__exec","verdict":"block"}"#;
         let (status, _resp) = http_post_json(&sock, "/api/audit/mcp-gate", body).await;
@@ -5321,7 +6499,7 @@ mod tests {
 
         let sock = dir.socket_path();
         let state = test_state(dir.path()); // Verified
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let body = r#"{"session_nonce":"mcp-proxy-9-cafe","record_seq":1,"cli":"codex","tool":"mcp__fs__read","verdict":"pass"}"#;
         let (status, _resp) = http_post_json(&sock, "/api/audit/mcp-gate", body).await;
@@ -5359,7 +6537,7 @@ mod tests {
             error_kind: "audit_chain_broken_at_seq_0".to_string(),
             reason: "test broken chain".to_string(),
         };
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let body = r#"{"session_nonce":"mcp-proxy-1-ab","record_seq":0,"cli":"codex","tool":"t","verdict":"block"}"#;
         let (status, resp_body) = http_post_json(&sock, "/api/audit/mcp-gate", body).await;
@@ -5384,7 +6562,7 @@ mod tests {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
         let state = test_state(dir.path());
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         // verdict "allow" is NOT in the fixed vocabulary {pass,block,escalate}.
         let body = r#"{"session_nonce":"mcp-proxy-1-ab","record_seq":0,"cli":"codex","tool":"t","verdict":"allow"}"#;
@@ -5410,7 +6588,7 @@ mod tests {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
         let state = test_state(dir.path());
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let body = r#"{"session_nonce":"mcp-proxy-1-ab","record_seq":0,"cli":"claude","tool":"t","verdict":"block"}"#;
         let (status, resp_body) = http_post_json(&sock, "/api/audit/mcp-gate", body).await;
@@ -5443,7 +6621,7 @@ mod tests {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
         let state = test_state(dir.path());
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         // A body that passes frontier validation (well-formed UUID, ts within skew,
         // registered surface "cc") but has an unknown schema version.
@@ -5482,7 +6660,7 @@ mod tests {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
         let state = test_state(dir.path());
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         // Completely malformed body — not valid JSON.
         let (status, _resp) = http_post_json(&sock, "/api/provenance/anchor", "not-json").await;
@@ -5530,7 +6708,7 @@ mod tests {
         let sock = dir.socket_path();
         init_signed_chain(dir.path());
         let state = test_state(dir.path());
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let body = r#"{"run_id":"anchor-t1","ts":"2026-07-12T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
         let (status, resp_body) = http_post_json(&sock, "/api/audit/anchor", body).await;
@@ -5613,7 +6791,7 @@ mod tests {
         init_signed_chain(dir.path());
         let mut state = test_state(dir.path());
         state.anchor_sink = Some(std::sync::Arc::new(StructuredProofSink));
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let body = r#"{"run_id":"anchor-proof-t1b"}"#;
         let (status, resp_body) = http_post_json(&sock, "/api/audit/anchor", body).await;
@@ -5689,7 +6867,7 @@ mod tests {
         init_signed_chain(dir.path());
         let mut state = test_state(dir.path());
         state.anchor_sink = Some(std::sync::Arc::new(FailingSink));
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let body = r#"{"run_id":"anchor-failopen"}"#;
         let (status, resp_body) = http_post_json(&sock, "/api/audit/anchor", body).await;
@@ -5750,7 +6928,7 @@ mod tests {
         init_signed_chain(dir.path());
         let mut state = test_state(dir.path());
         state.anchor_sink = Some(std::sync::Arc::new(UnsoundProofSink));
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let (status, resp_body) =
             http_post_json(&sock, "/api/audit/anchor", r#"{"run_id":"anchor-unsound"}"#).await;
@@ -5851,7 +7029,7 @@ mod tests {
         let dir = UnixSocketFixture::new().unwrap();
         let sock = dir.socket_path();
         let state = test_state(dir.path()); // Verified by default
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let (status, resp_body) =
             http_post_json(&sock, "/api/audit/anchor", "not-json-at-all").await;
@@ -5881,7 +7059,7 @@ mod tests {
             error_kind: "anchor_chain_broken_test".to_string(),
             reason: "injected broken health for T3".to_string(),
         };
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let body = r#"{"run_id":"anchor-t3","ts":"2026-07-12T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
         let (status, resp_body) = http_post_json(&sock, "/api/audit/anchor", body).await;
@@ -5913,7 +7091,7 @@ mod tests {
             write_record_v2(genesis, Some(dir.path())).expect("seed genesis");
         }
         let state = test_state(dir.path());
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let body = r#"{"run_id":"anchor-t4","ts":"2026-07-12T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
         let (status, resp_body) = http_post_json(&sock, "/api/audit/anchor", body).await;
@@ -5938,7 +7116,7 @@ mod tests {
         let sock = dir.socket_path();
         init_signed_chain(dir.path());
         let state = test_state(dir.path());
-        let (handle, join) = serve(&sock, state).await.unwrap();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
 
         let body = r#"{"run_id":"anchor-t5","ts":"2026-07-12T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
         let (status, resp_body) = http_post_json(&sock, "/api/audit/anchor", body).await;
@@ -5963,5 +7141,101 @@ mod tests {
 
         handle.shutdown();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+}
+
+#[cfg(test)]
+mod pool_startup_tests {
+    #[tokio::test]
+    async fn both_product_startups_schedule_one_bounded_restart_check() {
+        // Source wiring binds the exercised helper to all actual startup paths,
+        // without opening sockets, a WebView, or any native credential backend.
+        let unix_source = include_str!("server.rs");
+        let unix_start = unix_source
+            .split("pub async fn serve(")
+            .nth(1)
+            .unwrap()
+            .split("/// The accept loop.")
+            .next()
+            .unwrap();
+        assert_eq!(
+            unix_start
+                .matches("tokio::spawn(recover_pool_after_startup(")
+                .count(),
+            1
+        );
+        let windows_source = include_str!("server_windows.rs");
+        let windows_start = windows_source
+            .split("pub async fn serve(")
+            .nth(1)
+            .unwrap()
+            .split("Ok((handle, join))")
+            .next()
+            .unwrap();
+        assert_eq!(
+            windows_start
+                .matches("super::server::recover_pool_after_startup(")
+                .count(),
+            1
+        );
+        let desktop_source = include_str!("../../../csq/src/desktop/mod.rs");
+        let desktop_start = desktop_source
+            .split(".setup(|app| {")
+            .nth(1)
+            .unwrap()
+            .split("let log_level")
+            .next()
+            .unwrap();
+        assert_eq!(
+            desktop_start
+                .matches("csq_core::daemon::server::recover_pool_after_startup(")
+                .count(),
+            1
+        );
+
+        assert!(super::pool_startup_recovery_checked(Ok(
+            crate::pool::RestartRecovery::NotNeeded
+        )));
+        assert!(super::pool_startup_recovery_checked(Ok(
+            crate::pool::RestartRecovery::Recovered
+        )));
+        assert!(
+            !super::pool_startup_recovery_checked(Ok(crate::pool::RestartRecovery::Deferred)),
+            "deferred cleanup must not be reported checked"
+        );
+        for _product_start in ["daemon", "desktop"] {
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = calls.clone();
+            assert_eq!(
+                super::recover_pool_after_startup_with(
+                    std::time::Duration::from_secs(1),
+                    move || {
+                        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        true
+                    },
+                )
+                .await,
+                "pool_restart_recovery_checked"
+            );
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+        assert_eq!(
+            super::recover_pool_after_startup_with(std::time::Duration::from_secs(1), || false,)
+                .await,
+            "pool_restart_recovery_refused"
+        );
+        let (release, blocked) = std::sync::mpsc::channel();
+        let result = super::recover_pool_after_startup_with(
+            std::time::Duration::from_millis(10),
+            move || {
+                let _ = blocked.recv_timeout(std::time::Duration::from_secs(2));
+                true
+            },
+        )
+        .await;
+        // Free even a queued worker before dropping the runtime. Timeout does
+        // not certify cancellation of an already-running blocking operation.
+        let _ = release.send(());
+        assert_eq!(result, "pool_restart_recovery_timed_out");
     }
 }

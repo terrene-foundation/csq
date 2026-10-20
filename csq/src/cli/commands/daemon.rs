@@ -63,6 +63,12 @@ pub fn handle_start(base_dir: &Path) -> Result<()> {
         eprint!("{warning}");
     }
 
+    // SEC-2.15 (unified, R1 M1): secure the accounts root fail-closed
+    // before the pid file (whose parent is this root on macOS) is
+    // acquired — on a virgin machine PidFile::acquire's own create_dir_all
+    // would otherwise make the root at the process umask.
+    csq_core::platform::fs::ensure_private_dir_root(base_dir)
+        .with_context(|| "accounts_root_refused")?;
     let pid_path = daemon::pid_file_path(base_dir);
 
     // Acquire PID file; errors if another daemon is already running.
@@ -170,58 +176,6 @@ fn build_daemon_runtime() -> Result<tokio::runtime::Runtime> {
         .context("failed to build tokio runtime for daemon")
 }
 
-/// The `csq audit verify` startup step's per-record duration floor (ms),
-/// measured on an UNLOADED host: `csq audit verify --full` verified an
-/// 11,449-record chain in 2462ms (2026-09, exit 0, clean — "11449 v2
-/// records verified, 0 v1 skipped"). 2462/11449 ≈ 0.215 ms/record. This is
-/// a FLOOR standing in for typical throughput — NOT a bound
-/// (`doc-property-claims.md` MUST-2) — and it EXCLUDES the EATP-chain
-/// reconciliation the daemon startup path runs inside the SAME
-/// `spawn_blocking` (`csq audit verify --full` does not touch the EATP
-/// chain), so the daemon's real per-record cost is this number plus an
-/// unmeasured EATP margin.
-const AUDIT_VERIFY_MS_PER_RECORD_FLOOR: f64 = 0.215;
-
-/// Margin applied to [`AUDIT_VERIFY_MS_PER_RECORD_FLOOR`] to size the
-/// DEFAULT verify timeout. ~7x the measured unloaded floor.
-///
-/// The margin is INFERENCE, not a direct measurement of the loaded case
-/// (`evidence-first-claims.md` MUST-4): the only two loaded data points on
-/// THIS code path are "5s (the old fixed default) was insufficient under
-/// host load ~100-190" and "30s (an operator override of
-/// `CSQ_AUDIT_VERIFY_TIMEOUT_SECS`) was sufficient" — a coarse bracket,
-/// not the tight healthy/dead pair `HEALTH_TIMEOUT` had. Absent a tight
-/// bracket for this code path, the corroborating evidence is
-/// `HEALTH_TIMEOUT`'s independently measured ~20x slowdown for a
-/// near-zero-cost health read under a comparable load
-/// (`csq-core/src/daemon/detect.rs`); 7x is deliberately SMALLER than
-/// that because audit verify is CPU-bound crypto work, whose throughput
-/// degrades under scheduling contention differently than an IO-wait
-/// latency spike does — the two are not the same mechanism, so
-/// borrowing the multiplier directly would overstate the case.
-const AUDIT_VERIFY_LOAD_MARGIN: f64 = 7.0;
-
-/// Absolute floor for the derived timeout — covers fixed per-run overhead
-/// (process/tokio-task spin-up, the EATP-chain check) on a chain too
-/// small for the per-record term to dominate. Equal to the ORIGINAL fixed
-/// default, which was adequate for small/fresh chains; only a LARGE chain
-/// under load exposed the insufficiency this constant no longer has to
-/// cover alone.
-const AUDIT_VERIFY_TIMEOUT_MIN_SECS: u64 = 5;
-
-/// Absolute ceiling for the derived timeout, independent of how large an
-/// operator sets `CSQ_AUDIT_VERIFY_LIMIT`. `csq daemon start` blocks on
-/// this step before binding its IPC socket — spec 12 §12.13.5's "never
-/// blocks daemon startup" governs the OUTCOME (every result maps to an
-/// `AuditHealth` and startup proceeds), not how long the outcome takes to
-/// arrive. An unbounded formula would let a large record-limit override
-/// turn a genuinely broken chain into a multi-minute "is the daemon even
-/// starting?" hang. An operator who needs longer than this for a real
-/// (not-hung) verify at their configured limit can still set
-/// `CSQ_AUDIT_VERIFY_TIMEOUT_SECS` explicitly — the explicit override
-/// always takes full precedence over this formula.
-const AUDIT_VERIFY_TIMEOUT_MAX_SECS: u64 = 60;
-
 /// Bounded attempt count for [`spawn_audit_verify_retry`]'s background
 /// retry after a startup `AuditHealth::Unknown` verdict.
 ///
@@ -326,9 +280,7 @@ fn audit_verify_retry_backoff_secs(attempt: u32, verify_timeout_secs: u64) -> u6
 /// this function's derived value with margin, in the direction that
 /// matters (above the known-insufficient 5s).
 pub(crate) fn derive_audit_verify_timeout_secs(record_limit: usize) -> u64 {
-    let ms = record_limit as f64 * AUDIT_VERIFY_MS_PER_RECORD_FLOOR * AUDIT_VERIFY_LOAD_MARGIN;
-    let secs = (ms / 1000.0).ceil() as u64;
-    secs.clamp(AUDIT_VERIFY_TIMEOUT_MIN_SECS, AUDIT_VERIFY_TIMEOUT_MAX_SECS)
+    crate::daemon_host::derive_audit_verify_timeout_secs(record_limit)
 }
 
 /// One full run of the standalone csq daemon: license gate, bind the IPC
@@ -859,7 +811,22 @@ async fn run_daemon_session(
         // (INV-P03). Both passes are surface-scoped to Codex and
         // mutex-coordinated with the refresher (INV-P09), so they're
         // safe to run before `spawn_refresher`.
-        let _reconcile_summary = daemon::run_reconciler(&base_dir_for_runtime);
+        //
+        // Blocking filesystem work (it walks the accounts tree), so it runs on the
+        // blocking pool, never on a runtime worker (twin of the desktop path). A
+        // daemon stop also stops the label sweep's background continuation.
+        // Held until this function returns by ANY path: the guard aborts the task on
+        // an early return, and on a normal end the cancelled token has finished it.
+        let _label_stop_watcher =
+            csq_core::platform::label_upgrade::spawn_stop_watcher(shutdown.clone());
+        {
+            let reconcile_base = base_dir_for_runtime.clone();
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || daemon::run_reconciler(&reconcile_base)).await
+            {
+                return Err(daemon::reconciler_join_failure(&e));
+            }
+        }
 
         // M3-7 + M4-5: Phase 4 fail-closed gate (an internal journal entry Delta F /
         // OQ #7; strengthened in M4-5). Refuse to start if the on-disk
@@ -931,6 +898,13 @@ async fn run_daemon_session(
         let anchor_sink: Option<std::sync::Arc<dyn csq_core::audit::LedgerSink>> =
             resolve_anchor_sink(&anchor_sink_cfg);
 
+        // login-followup: ONE rebind wake channel, shared by the usage
+        // poller (spawned below) and the `POST /api/slot-rebind` route
+        // (RouterState::usage_poller_wake). Created BEFORE both consumers
+        // so a rebind POST can never arrive at a state whose poller is
+        // not yet waiting on the same Notify.
+        let usage_poller_wake = Arc::new(csq_core::daemon::usage_poller::WakeChannel::new());
+
         let router_state = daemon::server::RouterState {
             cache: Arc::clone(&refresh_cache),
             discovery_cache: Arc::clone(&discovery_cache),
@@ -940,6 +914,7 @@ async fn run_daemon_session(
             audit_health: Arc::clone(&audit_health_shared),
             audit_records_unverified,
             anchor_sink: anchor_sink.clone(),
+            usage_poller_wake: Arc::clone(&usage_poller_wake),
             // an internal ticket — seed the interactive enforcement registry from the
             // fail-closed §10.5 activation gate (absent → empty/503).
             // an internal ticket follow-up — inject the cross-SDK kailash projector (the
@@ -1060,6 +1035,10 @@ async fn run_daemon_session(
                     http_post_probe,
                     gemini_consumer.clone(),
                     shutdown.clone(),
+                    // Same Arc as RouterState::usage_poller_wake — a
+                    // successful login/rebind POSTs /api/slot-rebind and
+                    // the poller ticks immediately.
+                    Arc::clone(&usage_poller_wake),
                 );
 
                 // Gemini midnight-LA reset task — zeroes the
@@ -1693,7 +1672,7 @@ pub fn handle_status(base_dir: &Path) -> Result<()> {
 /// reading a log the running daemon is not writing, which is the failure
 /// this whole path exists to prevent.
 pub fn daemon_log_path(base_dir: &Path) -> PathBuf {
-    base_dir.join("csq-daemon.log")
+    crate::daemon_host::daemon_log_path(base_dir)
 }
 
 /// Opens the daemon log for APPEND, creating it 0600.
@@ -1704,8 +1683,10 @@ pub fn daemon_log_path(base_dir: &Path) -> PathBuf {
 /// surface, not world-readable chat).
 fn open_daemon_log_for_append(base_dir: &Path) -> Result<std::fs::File> {
     if let Some(parent) = daemon_log_path(base_dir).parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("could not create {}", parent.display()))?;
+        // SEC-2.15 (unified, R1 M1): the daemon log lives directly in the
+        // accounts root — create AND secure it fail-closed.
+        csq_core::platform::fs::ensure_private_dir_root(parent)
+            .with_context(|| "accounts_root_refused")?;
     }
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).append(true);
@@ -1829,34 +1810,31 @@ pub fn handle_uninstall(_base_dir: &Path) -> Result<()> {
     platform_uninstall()
 }
 
-// ── macOS launchd ─────────────────────────────────────────────────────────────
-
-/// The managed launchd job's label. The plist builder emits this same literal;
-/// `launchd_label_matches_plist` pins the two together so this probe can never
-/// drift into confidently answering about a job that does not exist.
+// Explicit shared entrypoints/probes; mutable lifecycle seams stay module-private.
+#[cfg(all(target_os = "macos", test))]
+use crate::daemon_host::launchd::build_launchd_plist;
+#[cfg(all(target_os = "macos", test, feature = "test-utils"))]
+use crate::daemon_host::launchd::managed_launchd_probe_label;
 #[cfg(any(target_os = "macos", test))]
-pub(crate) const LAUNCHD_LABEL: &str = csq_core::daemon::recovery::LAUNCHD_LABEL;
+pub(crate) use crate::daemon_host::launchd::ManagedJobState;
+#[cfg(test)]
+use crate::daemon_host::launchd::LAUNCHD_LABEL;
+#[cfg(target_os = "macos")]
+use crate::daemon_host::launchd::{
+    ensure_managed_daemon_plist, launchd_plist_path, managed_uninstall_output,
+    uninstall_managed_daemon_plist, ManagedPlistOutcome,
+};
+#[cfg(target_os = "macos")]
+pub(crate) use crate::daemon_host::launchd::{
+    managed_daemon_dormant, managed_daemon_plist_exists, managed_launchd_job_state,
+};
 
-/// True when a MANAGED launchd job is currently LOADED for this user.
-///
-/// `launchctl list <label>` exits 0 when the job is loaded and non-zero when it
-/// is not (measured 2026-09-12 on macOS 25.6: 0 loaded, 113 for an unknown
-/// label), so the probe discriminates — it is not a check that answers the same
-/// way under both hypotheses (`instrument-discipline.md` MUST-1).
-///
-/// A probe that cannot RUN at all (no `launchctl`, spawn refused) answers
-/// `false`. That is the conservative direction: csq stays silent rather than
-/// printing recovery advice naming a supervisor that may not exist.
+/// True only when the shared bounded native launchd probe confirms a loaded job.
+/// Definite absence, timeout, other nonzero statuses and unavailable execution all
+/// return false, so uncertain probes do not print supervisor recovery advice.
 #[cfg(target_os = "macos")]
 fn launchd_job_is_loaded() -> bool {
-    std::process::Command::new("launchctl")
-        .arg("list")
-        .arg(LAUNCHD_LABEL)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|st| st.success())
-        .unwrap_or(false)
+    managed_launchd_job_state() == ManagedJobState::Loaded
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1927,223 +1905,11 @@ fn unsupervised_start_advisory(managed: bool) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn launchd_plist_path() -> Result<std::path::PathBuf> {
-    let home =
-        csq_core::platform::home::home_dir().context("could not determine home directory")?;
-    Ok(home
-        .join("Library")
-        .join("LaunchAgents")
-        .join("foundation.terrene.csq.plist"))
-}
-
-/// Build the launchd plist XML for the given binary path and log path.
-/// Exported for unit-testing the generated XML.
-///
-/// The MANAGED form (daemon-auth-resilience Wave B):
-/// - `ProgramArguments` runs `<exe> daemon start --supervised` — the
-///   crash-restart supervisor loop, NOT the foreground daemon.
-/// - `KeepAlive={SuccessfulExit:false}` restarts the process ONLY on a
-///   non-zero/crash exit; a clean `csq daemon stop` (SIGTERM → exit 0)
-///   stays stopped.
-/// - `ThrottleInterval=10` bounds launchd's respawn rate under a crash
-///   loop (its own floor is 10s; stated explicitly for clarity).
-///
-/// `exe` MUST be a real file OUTSIDE the app bundle (see
-/// [`resolve_managed_daemon_exe`]) — a bundle path is misdetected as
-/// Desktop mode by `mode::detect()` and would launch the whole app.
-#[cfg(target_os = "macos")]
-pub fn build_launchd_plist(exe: &Path, log_path: &Path) -> String {
-    // XML-escape: launchd plists are XML 1.0. An unescaped `&`/`<`/`>` in a
-    // path (relocated $HOME, unusual install dir) yields a malformed plist
-    // that `launchctl load` rejects — which, via the best-effort desktop
-    // caller, silently skips the managed-daemon install. Escaping keeps the
-    // plist well-formed for ANY path and closes a same-UID injection vector
-    // now that the exe can originate from a PATH walk.
-    let exe_str = xml_escape(&exe.display().to_string());
-    let log_str = xml_escape(&log_path.display().to_string());
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>Label</key>
-	<string>foundation.terrene.csq</string>
-	<key>ProgramArguments</key>
-	<array>
-		<string>{exe_str}</string>
-		<string>daemon</string>
-		<string>start</string>
-		<string>--supervised</string>
-	</array>
-	<key>RunAtLoad</key>
-	<true/>
-	<key>KeepAlive</key>
-	<dict>
-		<key>SuccessfulExit</key>
-		<false/>
-	</dict>
-	<key>ThrottleInterval</key>
-	<integer>10</integer>
-	<key>ProcessType</key>
-	<string>Adaptive</string>
-	<key>StandardOutPath</key>
-	<string>{log_str}</string>
-	<key>StandardErrorPath</key>
-	<string>{log_str}</string>
-</dict>
-</plist>
-"#
-    )
-}
-
-/// Minimal XML text escaper for plist `<string>` values (XML 1.0).
-#[cfg(target_os = "macos")]
-fn xml_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// Resolve the binary path to bake into the managed plist's
-/// `ProgramArguments[0]`.
-///
-/// MUST be a real file OUTSIDE the app bundle so `mode::detect()`
-/// resolves it to CLI mode: a bundle path (`.../Contents/MacOS/csq`) is
-/// misdetected as Desktop mode by [`crate::mode::detect`] and would
-/// launch the whole desktop app instead of the daemon (an internal journal entry).
-///
-/// Prefers the current exe when it is itself a standalone CLI binary
-/// (the `csq daemon install` case, run from a terminal `csq`); falls
-/// back to the persistent shim (`~/.local/bin/csq`) for the desktop
-/// bundle case where `current_exe()` is the misdetected bundle binary.
-#[cfg(target_os = "macos")]
-fn resolve_managed_daemon_exe() -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        let s = exe.to_string_lossy();
-        let in_bundle =
-            s.contains("/Contents/MacOS/") || s.contains(".app/") || s.contains(".AppImage");
-        if !in_bundle && exe.is_file() {
-            return Some(exe);
-        }
-    }
-    csq_core::cli_deps::cli_shim::resolve_shim_target()
-}
-
-/// Outcome of an idempotent managed-plist install/repair.
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ManagedPlistOutcome {
-    /// Plist was absent and has been written + loaded.
-    Installed,
-    /// Plist existed but drifted from the expected content; rewritten + reloaded.
-    Repaired,
-    /// Plist already matched the expected content; nothing changed.
-    AlreadyCurrent,
-}
-
-/// Idempotently installs or repairs the launchd-managed daemon plist
-/// (daemon-auth-resilience Wave B). Safe to call on every desktop launch:
-/// - Absent → write + `launchctl load` → [`ManagedPlistOutcome::Installed`].
-/// - Present but drifted → unload + rewrite + reload → [`ManagedPlistOutcome::Repaired`].
-/// - Present + byte-identical → no-op → [`ManagedPlistOutcome::AlreadyCurrent`].
-///
-/// The managed plist runs `<shim> daemon start --supervised` under
-/// `KeepAlive={SuccessfulExit:false}`, so the token refresher survives
-/// the desktop app quitting or crashing — the structural fix for the
-/// mass-token-expiry incident (an internal journal entry).
-///
-/// Best-effort by contract: the desktop caller MUST treat any `Err` as
-/// non-fatal (a launchctl hiccup must never block app launch).
-#[cfg(target_os = "macos")]
-pub fn ensure_managed_daemon_plist() -> Result<ManagedPlistOutcome> {
-    let plist_path = launchd_plist_path()?;
-    let exe = resolve_managed_daemon_exe()
-        .context("could not resolve a managed-daemon binary path (no CLI shim available)")?;
-    let home =
-        csq_core::platform::home::home_dir().context("could not determine home directory")?;
-    // Same helper the detached mode uses, so the two cannot drift onto
-    // different files and leave an operator reading a log nothing writes.
-    let log_path = daemon_log_path(&home.join(".claude").join("accounts"));
-    let expected = build_launchd_plist(&exe, &log_path);
-
-    // Idempotent: if the on-disk content already matches, do nothing —
-    // and (critically) skip the `launchctl load`, which returns non-zero
-    // for an already-loaded agent.
-    if let Ok(existing) = std::fs::read_to_string(&plist_path) {
-        if existing == expected {
-            return Ok(ManagedPlistOutcome::AlreadyCurrent);
-        }
-    }
-    let drifted = plist_path.exists();
-
-    if let Some(parent) = plist_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "could not create LaunchAgents directory at {}",
-                parent.display()
-            )
-        })?;
-    }
-
-    // A drifted plist must be unloaded before the rewrite so launchd picks
-    // up the new ProgramArguments on the reload (best-effort; the agent may
-    // not currently be loaded).
-    if drifted {
-        let _ = std::process::Command::new("launchctl")
-            .args(["unload", &plist_path.to_string_lossy()])
-            .status();
-    }
-
-    if let Err(e) = std::fs::write(&plist_path, &expected) {
-        let _ = std::fs::remove_file(&plist_path);
-        return Err(e)
-            .with_context(|| format!("could not write plist to {}", plist_path.display()));
-    }
-
-    // On ANY `launchctl load` failure (spawn error or non-zero exit), remove
-    // the freshly-written plist. Otherwise the content-match fast-path at the
-    // top of this function would report `AlreadyCurrent` on the next call —
-    // permanently skipping the load retry and leaving the managed daemon
-    // UNLOADED while reporting success, which silently defeats Wave B's
-    // after-app-quit coverage (redteam R2 finding 6; restores the pre-Wave-B
-    // `platform_install` cleanup that this extraction dropped).
-    match std::process::Command::new("launchctl")
-        .args(["load", &plist_path.to_string_lossy()])
-        .status()
-    {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            let _ = std::fs::remove_file(&plist_path);
-            anyhow::bail!("launchctl load failed with exit code {:?}", status.code());
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&plist_path);
-            return Err(e).context("could not run launchctl load");
-        }
-    }
-
-    Ok(if drifted {
-        ManagedPlistOutcome::Repaired
-    } else {
-        ManagedPlistOutcome::Installed
-    })
-}
-
-#[cfg(target_os = "macos")]
 fn platform_install() -> Result<()> {
     // Idempotent drift-repair (Wave B): re-running `csq daemon install`
     // refreshes a drifted plist instead of the old "already installed, do
-    // nothing". The desktop app calls the same `ensure_managed_daemon_plist`
-    // on launch, so the two converge on one managed plist.
+    // nothing". Desktop refresh uses its own admitted repair entrypoint;
+    // both paths converge on the shared managed-plist writer.
     let outcome = ensure_managed_daemon_plist()?;
     let plist_path = launchd_plist_path()?;
     match outcome {
@@ -2165,23 +1931,8 @@ fn platform_install() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn platform_uninstall() -> Result<()> {
-    let plist_path = launchd_plist_path()?;
-
-    if !plist_path.exists() {
-        eprintln!("csq daemon service is not installed (no plist found).");
-        return Ok(());
-    }
-
-    // Unload first; ignore exit code — the agent may already be stopped.
-    let _ = std::process::Command::new("launchctl")
-        .args(["unload", &plist_path.to_string_lossy()])
-        .status();
-
-    std::fs::remove_file(&plist_path)
-        .with_context(|| format!("could not remove plist at {}", plist_path.display()))?;
-
-    eprintln!("csq daemon service uninstalled.");
-    eprintln!("  Removed: {}", plist_path.display());
+    let (outcome, plist_path) = uninstall_managed_daemon_plist()?;
+    eprintln!("{}", managed_uninstall_output(outcome, &plist_path));
     Ok(())
 }
 
@@ -2505,6 +2256,246 @@ pub fn handle_posture(base_dir: &Path, role: Option<&str>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::daemon_host::{AUDIT_VERIFY_TIMEOUT_MAX_SECS, AUDIT_VERIFY_TIMEOUT_MIN_SECS};
+
+    /// R2 H1 regression on the daemon start path: a symlinked accounts root
+    /// (the documented external-drive setup) is accepted — the start stops
+    /// at the already-held PID file, AFTER the root was secured — and the
+    /// resolved target is 0o700 with the operator's symlink intact. RED on
+    /// the pre-R3 bytes, where the root ensure refused the symlink first.
+    #[cfg(unix)]
+    #[test]
+    fn handle_start_accepts_symlinked_accounts_root_and_stops_at_held_pid_file() {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // On Linux `pid_file_path` prefers $XDG_RUNTIME_DIR, a path shared by
+        // every process of the user: pin it to a private dir so a concurrent
+        // test binary or a real daemon cannot already hold the pid file.
+        let _env = csq_core::platform::test_env::lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let runtime = dir.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        struct XdgRestore(Option<std::ffi::OsString>);
+        impl Drop for XdgRestore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                    None => std::env::remove_var("XDG_RUNTIME_DIR"),
+                }
+            }
+        }
+        let _xdg = XdgRestore(std::env::var_os("XDG_RUNTIME_DIR"));
+        std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+        let target = dir.path().join("external");
+        std::fs::create_dir(&target).unwrap();
+        let link = dir.path().join("accounts");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let pid_path = daemon::pid_file_path(&link);
+        // Discriminates the XDG pin: without it the pid file resolves under the
+        // user-shared runtime dir and a real daemon can already hold it.
+        #[cfg(target_os = "linux")]
+        assert!(
+            pid_path.starts_with(&runtime),
+            "pid file must resolve under the test's private runtime dir, got {}",
+            pid_path.display()
+        );
+        let _held = PidFile::acquire(&pid_path).expect("the test holds the pid file");
+
+        let err = handle_start(&link).expect_err("a held pid file must stop the start");
+        // R3 LOW 8: discriminate on the VARIANT, not a substring — the
+        // pre-fix accounts_root_refused text also contains "refused", so the
+        // loose check could not tell the two failure classes apart.
+        assert!(
+            err.chain().any(|c| matches!(
+                c.downcast_ref::<csq_core::error::DaemonError>(),
+                Some(csq_core::error::DaemonError::AlreadyRunning { .. })
+            )),
+            "held-pid refusal (DaemonError::AlreadyRunning) expected, got: {err:#}"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&target)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "the resolved accounts root must be secured by the start path"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the operator's symlink must be intact"
+        );
+    }
+    #[cfg(all(target_os = "macos", feature = "test-utils"))]
+    #[test]
+    fn n2_probe_label_absent_uses_canonical() {
+        assert_eq!(
+            super::managed_launchd_probe_label(None),
+            super::LAUNCHD_LABEL
+        );
+    }
+
+    #[cfg(all(target_os = "macos", feature = "test-utils"))]
+    #[test]
+    fn n2_probe_label_preserves_valid_fixture() {
+        for label in ["csq.fixture.doctor.n2.123-456", "csq.fixture.doctor.AZ09"] {
+            assert_eq!(
+                super::managed_launchd_probe_label(Some(label.into())),
+                label
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "test-utils"))]
+    #[test]
+    fn n2_probe_label_rejects_invalid_instead_of_canonical_fallback() {
+        for label in [
+            "",
+            super::LAUNCHD_LABEL,
+            "csq.fixture.other.123",
+            "csq.fixture.doctor.bad/label",
+            "csq.fixture.doctor.bad label",
+            "csq.fixture.doctor.bad_label",
+            "csq.fixture.doctor.bad\0label",
+            "csq.fixture.doctor.é",
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| super::managed_launchd_probe_label(Some(label.into())))
+                    .is_err(),
+                "invalid override must fail before selecting any native job"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "test-utils"))]
+    #[test]
+    fn n2_probe_label_rejects_non_unicode_instead_of_canonical_fallback() {
+        use std::os::unix::ffi::OsStringExt;
+        let label = std::ffi::OsString::from_vec(b"csq.fixture.doctor.\xff".to_vec());
+        assert!(
+            std::panic::catch_unwind(|| super::managed_launchd_probe_label(Some(label))).is_err(),
+            "present non-Unicode override must never select the canonical job"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", feature = "test-utils"))]
+    #[test]
+    fn n2_observer_rejects_invalid_env_override_before_native_probe() {
+        let _env = csq_core::platform::test_env::lock();
+        struct RestoreLabel(Option<std::ffi::OsString>);
+        impl Drop for RestoreLabel {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("CSQ_TEST_LAUNCHD_LABEL", value),
+                    None => std::env::remove_var("CSQ_TEST_LAUNCHD_LABEL"),
+                }
+            }
+        }
+        let _restore = RestoreLabel(std::env::var_os("CSQ_TEST_LAUNCHD_LABEL"));
+        std::env::set_var("CSQ_TEST_LAUNCHD_LABEL", "invalid-fixture-label");
+        assert!(
+            std::panic::catch_unwind(super::managed_launchd_job_state).is_err(),
+            "observer must validate the override before any native launchctl probe"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", feature = "test-utils"))]
+    #[test]
+    fn l1_loaded_advisory_uses_actual_native_probe_without_path_override() {
+        use super::{launchd_job_is_loaded, managed_launchd_job_state, ManagedJobState};
+        use std::os::unix::fs::PermissionsExt;
+        let _env = csq_core::platform::test_env::lock();
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let fixture = tempfile::TempDir::new().unwrap();
+        let _restore = RestoreEnv(
+            ["PATH", "CSQ_TEST_LAUNCHD_LABEL", "CSQ_L1_CANARY"]
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        );
+        let canary = fixture.path().join("path-command-ran");
+        let impostor = fixture.path().join("launchctl");
+        std::fs::write(
+            &impostor,
+            "#!/bin/sh\nprintf reached > \"$CSQ_L1_CANARY\"\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&impostor, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::env::set_var("PATH", fixture.path());
+        std::env::set_var("CSQ_L1_CANARY", &canary);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::set_var(
+            "CSQ_TEST_LAUNCHD_LABEL",
+            format!("csq.fixture.doctor.l1.{}.{nonce}", std::process::id()),
+        );
+        assert_eq!(
+            managed_launchd_job_state(),
+            ManagedJobState::Unloaded,
+            "actual /bin/launchctl must establish unique-label absence"
+        );
+        assert!(
+            !launchd_job_is_loaded(),
+            "absent native job must not produce loaded advice"
+        );
+        assert!(
+            !canary.exists(),
+            "native advisory must not execute PATH launchctl"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn l1_shared_exit_probe_times_out_actual_owned_hang() {
+        use csq_core::cli_deps::cli_shim::{
+            probe_command_exit_code, ProbeOutcome, SHIM_PROBE_TIMEOUT,
+        };
+        let fixture = tempfile::TempDir::new().unwrap();
+        let mut command = std::process::Command::new("/bin/sleep");
+        command
+            .arg("30")
+            .env_clear()
+            .env("HOME", fixture.path())
+            .env("CSQ_BASE_DIR", fixture.path().join("base"))
+            .env("PATH", "/usr/bin:/bin");
+        let started = std::time::Instant::now();
+        let result = probe_command_exit_code(command);
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(result, ProbeOutcome::TimedOut),
+            "owned sleep must reach the real probe deadline: {result:?}"
+        );
+        assert!(
+            elapsed >= SHIM_PROBE_TIMEOUT,
+            "timeout must be genuine, not a fake early outcome"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "probe did not finish within fixture allowance: {elapsed:?}"
+        );
+        eprintln!(
+            "l1 genuine-hang elapsed_seconds={:.3}",
+            elapsed.as_secs_f64()
+        );
+    }
+
     /// Structural guard: BOTH daemon twins MUST map an audit-verify summary to
     /// an `AuditHealth` through the shared producer
     /// `AuditHealth::from_verify_result`, never by constructing a clean verdict
@@ -2554,7 +2545,7 @@ mod tests {
             "AuditHealth::Degraded",
         ];
 
-        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let manifest_dir = csq_core::testing::manifest_dir(env!("CARGO_MANIFEST_DIR"));
         let mut violations: Vec<String> = Vec::new();
 
         for twin in TWINS {

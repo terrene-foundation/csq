@@ -175,6 +175,21 @@ pub const DEEPSEEK_TIERED_PRICING_START_UNIX: i64 = 1_786_896_000;
 /// DeepSeek V4.1 Flash cutover, 2026-09-10T04:00:00Z.
 pub const DEEPSEEK_V41_PRICING_START_UNIX: i64 = 1_789_012_800;
 
+/// Price lookup against the RUNTIME manifest at `base_dir` (bundled data only
+/// when `<base_dir>/model-rates.json` is absent). Production readers use this so
+/// an installed manifest's rates apply. A present but invalid file is an error,
+/// never a silent switch to different prices (spec 07 §7.11).
+pub fn rate_for_model_in(
+    base_dir: &std::path::Path,
+    model: &str,
+    at: Option<DateTime<Utc>>,
+) -> anyhow::Result<Option<CostRate>> {
+    Ok(
+        crate::providers::model_manifest::ModelManifest::load(base_dir)?
+            .rate_for_model_at(model, at),
+    )
+}
+
 /// Pure bundled-price lookup retained for library compatibility. Runtime usage
 /// aggregation loads one `ModelManifest` snapshot from its explicit base dir
 /// instead. Unknown names or missing timestamps for dated rates return `None`.
@@ -915,5 +930,32 @@ mod tests {
             read_only < write_only,
             "cache read (${read_only}) must be cheaper than cache write (${write_only})"
         );
+    }
+
+    #[test]
+    fn rate_for_model_in_reads_the_runtime_manifest() {
+        use crate::providers::model_manifest::ModelManifest;
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut v = serde_json::to_value(ModelManifest::bundled()).unwrap();
+        for rule in v["rates"].as_array_mut().unwrap() {
+            for ep in rule["epochs"].as_array_mut().unwrap() {
+                ep["rate"]["input_per_1m_usd"] = serde_json::json!(777.0);
+            }
+        }
+        let src = dir.path().join("m.json");
+        std::fs::write(&src, v.to_string()).unwrap();
+        ModelManifest::install(dir.path(), &src).unwrap();
+        let r = rate_for_model_in(dir.path(), "claude-sonnet-4-6", any_instant())
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.input_per_1m_usd, 777.0);
+        assert_ne!(
+            rate_for_model_at("claude-sonnet-4-6", any_instant())
+                .unwrap()
+                .input_per_1m_usd,
+            777.0
+        );
+        std::fs::write(dir.path().join("model-rates.json"), "{").unwrap();
+        assert!(rate_for_model_in(dir.path(), "claude-sonnet-4-6", any_instant()).is_err());
     }
 }

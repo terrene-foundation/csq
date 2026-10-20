@@ -67,7 +67,12 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 ///   `reconcile_account` either adopts one or gives up — the freshest
 ///   candidate, then (on a 401) the next-freshest. Since D-F7, this cap
 ///   is ENFORCED BY CODE (`reconcile_candidates_inner` stops and returns
-///   `SkippedUnknown` once reached), not merely assumed here.
+///   `SkippedUnknown` once reached), not merely assumed here. The
+///   older-login path (`custodian::record_superseded_owner_verified`)
+///   spends from the SAME budget (`validations_performed` carries over)
+///   and also returns `SkippedUnknown` on budget exhaustion or an
+///   `Unknown` verdict; expired, store-own, recorded or negatively-cached
+///   candidates there cost no call at all.
 ///
 /// `4*5.25 + 2*15 = 21 + 30 = 51s`, plus a margin of 10s for scheduling
 /// jitter and the server-side per-account gate's own bookkeeping
@@ -114,6 +119,13 @@ pub enum DaemonClientError {
     MalformedResponse(String),
     /// Response body exceeded [`MAX_RESPONSE_BYTES`].
     ResponseTooLarge,
+    /// The daemon answered, but with a non-2xx status: the route is absent
+    /// on a version-skewed daemon (404) or refused the request (400/500).
+    /// For the fire-and-forget notify callers this means the notification
+    /// did NOT take effect — they still complete (the daemon picks the
+    /// change up at its next periodic tick), but they log the status so it
+    /// is never mistaken for success (login-followup R1 MED-1).
+    HttpStatus(u16),
 }
 
 impl std::fmt::Display for DaemonClientError {
@@ -123,6 +135,7 @@ impl std::fmt::Display for DaemonClientError {
             Self::Io(e) => write!(f, "daemon IO error: {e}"),
             Self::MalformedResponse(s) => write!(f, "malformed daemon response: {s}"),
             Self::ResponseTooLarge => write!(f, "daemon response exceeded 64 KiB cap"),
+            Self::HttpStatus(status) => write!(f, "daemon returned HTTP status {status}"),
         }
     }
 }
@@ -265,10 +278,16 @@ pub fn http_post_unix_json_with_headers(
 /// drops `RefreshStatus` cache entries for both slot numbers (SEC-2.11).
 /// The discovery cache is also cleared by the route handler.
 ///
-/// Returns `Ok(())` if the request succeeded (HTTP 200) or if the socket
-/// is absent/unreachable (fire-and-forget: connect failure is not an
-/// error from the caller's perspective). Returns `Err` only when the path
-/// contains CRLF characters (security guard, an internal journal entry H3).
+/// Returns `Ok(())` when the daemon answered 2xx, or when the socket is
+/// absent/unreachable (fire-and-forget: no daemon is the common case and a
+/// connect failure is not an error from the caller's perspective). Returns
+/// `Err` — after logging a fixed-vocabulary `tracing::warn!` — when the
+/// daemon answered with a non-2xx status (404: a version-skewed daemon with
+/// no such route; 400/500: the route refused), when the path contains CRLF
+/// characters (security guard, an internal journal entry H3), or on any other transport
+/// error. Callers stay best-effort: the daemon picks the change up at its
+/// next periodic tick, so they ignore the error — but a non-2xx is no
+/// longer silently counted as success (login-followup R1 MED-1).
 ///
 /// **This is the single production chokepoint for slot-swap IPC.**
 /// Both the CLI (`csq move`) and the desktop Tauri command
@@ -280,7 +299,58 @@ pub fn notify_slot_swap(sock_path: &Path, from: u16, to: u16) -> Result<(), Daem
     }
     let body = format!(r#"{{"from":{},"to":{}}}"#, from, to);
     match http_post_unix_json(sock_path, "/api/slot-swap", &body) {
-        Ok(_) | Err(DaemonClientError::Connect(_)) => Ok(()),
+        Ok(resp) if (200..300).contains(&resp.status) => Ok(()),
+        Ok(resp) => {
+            tracing::warn!(
+                error_kind = "daemon_cache_invalidate_failed",
+                route = "/api/slot-swap",
+                status = resp.status,
+                "daemon refused the slot-swap notify; both slots will be \
+                 refreshed at its next periodic tick"
+            );
+            Err(DaemonClientError::HttpStatus(resp.status))
+        }
+        Err(DaemonClientError::Connect(_)) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Fire-and-forget wake of the daemon's usage poller after a successful
+/// Anthropic login / re-auth of that slot (login-followup).
+///
+/// Sends `POST /api/slot-rebind {"slot": N}` so the daemon ticks its
+/// usage poller IMMEDIATELY — the just-bound slot's quota row appears on
+/// the next tick instead of up to `POLL_INTERVAL` (5 min) later.
+///
+/// Same contract as [`notify_slot_swap`]: `Ok(())` when the daemon answered
+/// 2xx or when the socket is absent/unreachable (fire-and-forget: no daemon
+/// is the common case). `Err` — after logging a fixed-vocabulary
+/// `tracing::warn!` — on a non-2xx status (404: an older daemon with no
+/// `/api/slot-rebind` route, so the wake would silently never happen;
+/// 400/500: the route refused), on CRLF in the path (security guard,
+/// an internal journal entry H3), or on any other transport error. Callers ignore the
+/// error; they never fail a completed login on it.
+///
+/// Cross-platform callers should use [`super::notify::slot_rebind`],
+/// which wraps this on Unix and the named pipe on Windows.
+pub fn notify_slot_rebind(sock_path: &Path, slot: u16) -> Result<(), DaemonClientError> {
+    if !sock_path.exists() {
+        return Ok(());
+    }
+    let body = format!(r#"{{"slot":{slot}}}"#);
+    match http_post_unix_json(sock_path, "/api/slot-rebind", &body) {
+        Ok(resp) if (200..300).contains(&resp.status) => Ok(()),
+        Ok(resp) => {
+            tracing::warn!(
+                error_kind = "daemon_slot_rebind_notify_failed",
+                route = "/api/slot-rebind",
+                status = resp.status,
+                "daemon refused the usage-poller wake; the slot's quota row \
+                 will appear at its next periodic tick"
+            );
+            Err(DaemonClientError::HttpStatus(resp.status))
+        }
+        Err(DaemonClientError::Connect(_)) => Ok(()),
         Err(e) => Err(e),
     }
 }
@@ -501,7 +571,7 @@ pub(crate) fn parse_response(buf: &[u8]) -> Result<DaemonResponse, DaemonClientE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::test_socket_fixture::UnixSocketFixture;
+    use crate::testing::socket_fixture::{short_root, UnixSocketFixture};
 
     /// C-F5 (`keychain-fix-r8.md`), D-F7 (`keychain-fix-r9.md`): the timeout
     /// arithmetic named in `HARVEST_TIMEOUT`'s doc — `4*5.25 + 2*15 = 51s`
@@ -720,13 +790,133 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// Serves EXACTLY one request with `status_line` (e.g. `"404 Not Found"`)
+    /// over a throwaway Unix socket, then exits. The caller joins the
+    /// returned handle after the client call returns.
+    fn serve_one_status(path: &Path, status_line: &'static str) -> std::thread::JoinHandle<()> {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        let listener = UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut req = [0u8; 512];
+                let _ = conn.read(&mut req);
+                let resp = format!("HTTP/1.1 {status_line}\r\nContent-Length: 0\r\n\r\n");
+                let _ = conn.write_all(resp.as_bytes());
+            }
+        })
+    }
+
+    /// login-followup R1 MED-1: a non-2xx daemon response is NOT success.
+    /// Pre-fix both notify fns matched `Ok(_) => Ok(())`, so a
+    /// version-skewed daemon (404 — no `/api/slot-rebind` route) silently
+    /// never woke the poller, and a 400/500 logged nothing at all. Each
+    /// case below is EXECUTED against a real socket answering that status.
+    #[test]
+    fn notify_routes_reject_non_2xx_statuses() {
+        for (status_line, code) in [
+            ("404 Not Found", 404u16),
+            ("500 Internal Server Error", 500),
+            ("400 Bad Request", 400),
+        ] {
+            let dir = UnixSocketFixture::new().unwrap();
+            let path = dir.socket_path();
+            let server = serve_one_status(&path, status_line);
+            match notify_slot_rebind(&path, 3) {
+                Err(DaemonClientError::HttpStatus(c)) => assert_eq!(c, code, "{status_line}"),
+                other => {
+                    panic!("slot-rebind {status_line}: expected HttpStatus({code}), got {other:?}")
+                }
+            }
+            server.join().unwrap();
+
+            let dir = UnixSocketFixture::new().unwrap();
+            let path = dir.socket_path();
+            let server = serve_one_status(&path, status_line);
+            match notify_slot_swap(&path, 1, 2) {
+                Err(DaemonClientError::HttpStatus(c)) => assert_eq!(c, code, "{status_line}"),
+                other => {
+                    panic!("slot-swap {status_line}: expected HttpStatus({code}), got {other:?}")
+                }
+            }
+            server.join().unwrap();
+        }
+    }
+
+    /// Positive control for [`notify_routes_reject_non_2xx_statuses`] (and
+    /// the non-vacuity guard for both): a notify fn that returned `Err`
+    /// unconditionally would pass the non-2xx test above, so a real 200
+    /// response must still resolve `Ok(())` — and must actually reach the
+    /// listener (the connect is observed by the server thread).
+    #[test]
+    fn notify_routes_accept_2xx() {
+        for line in ["200 OK", "201 Created"] {
+            let dir = UnixSocketFixture::new().unwrap();
+            let path = dir.socket_path();
+            let server = serve_one_status(&path, line);
+            assert!(
+                notify_slot_rebind(&path, 3).is_ok(),
+                "slot-rebind {line} must resolve Ok"
+            );
+            server.join().unwrap();
+
+            let dir = UnixSocketFixture::new().unwrap();
+            let path = dir.socket_path();
+            let server = serve_one_status(&path, line);
+            assert!(
+                notify_slot_swap(&path, 1, 2).is_ok(),
+                "slot-swap {line} must resolve Ok"
+            );
+            server.join().unwrap();
+        }
+    }
+
+    /// The absent-socket early return still resolves `Ok(())` — the
+    /// common case (no daemon running) must stay silent and error-free for
+    /// both fns, unchanged by the MED-1 status check.
+    #[test]
+    fn notify_routes_no_op_when_socket_absent() {
+        let dir = short_root("csq-missing-").unwrap();
+        let missing = dir.path().join("nope.sock");
+        // A representable pathname, so the `Ok` below is produced by an
+        // absent socket and not by a path-length error the kernel reports
+        // before any lookup happens.
+        assert!(
+            missing.as_os_str().len() < 104,
+            "fixture path must fit sun_path: {} bytes",
+            missing.as_os_str().len()
+        );
+        assert!(notify_slot_rebind(&missing, 3).is_ok());
+        assert!(notify_slot_swap(&missing, 1, 2).is_ok());
+        // Pin the reason the fire-and-forget wrappers suppress: a genuine
+        // NotFound, not ENAMETOOLONG (the deep-TMPDIR failure this fixture
+        // would otherwise mistake for absence).
+        match http_post_unix_json(&missing, "/api/slot-rebind", r#"{"slot":3}"#).unwrap_err() {
+            DaemonClientError::Connect(e) => assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::NotFound,
+                "a missing socket must fail with NotFound, not a path-length error: {e}"
+            ),
+            other => panic!("expected Connect error, got {other:?}"),
+        }
+    }
+
     #[test]
     fn http_get_unix_connect_failure_when_socket_missing() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = short_root("csq-missing-").unwrap();
         let missing = dir.path().join("nope.sock");
+        assert!(
+            missing.as_os_str().len() < 104,
+            "fixture path must fit sun_path: {} bytes",
+            missing.as_os_str().len()
+        );
         let err = http_get_unix(&missing, "/api/health").unwrap_err();
         match err {
-            DaemonClientError::Connect(_) => {}
+            DaemonClientError::Connect(e) => assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::NotFound,
+                "a missing socket must fail with NotFound, not a path-length error: {e}"
+            ),
             other => panic!("expected Connect error, got {other:?}"),
         }
     }

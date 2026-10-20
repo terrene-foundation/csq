@@ -784,197 +784,107 @@ pub(crate) fn community_auto_update_enabled() -> bool {
     crate::BUILD_EDITION != "enterprise"
 }
 
-/// Production probe budget for [`installed_cli_is_enterprise`]. Deliberately
-/// short: the probe gates a CLI-shim refresh at desktop launch and must
-/// never block it behind a wedged/hung binary. Tests MUST NOT depend on
-/// this constant's wall-clock value — they call
-/// [`installed_cli_is_enterprise_within`] with a budget generous enough to
-/// survive host contention (see that function's doc comment).
-const CLI_ENTERPRISE_PROBE_TIMEOUT_SECS: u64 = 3;
-
-/// Best-effort: does the CLI already installed at `cli_path` report the
-/// ENTERPRISE edition? Runs `<cli> --version` with a short timeout — the CLI
-/// prints its edition-suffixed version line (`X.Y.Z (enterprise)`) and exits
-/// immediately (a real file at `~/.local/bin/csq` resolves to CLI mode, so this
-/// does NOT launch the desktop app). Returns `false` on ANY ambiguity — missing
-/// binary, spawn error, timeout, non-zero exit, or an unparseable line — so the
-/// shim refresh proceeds by default; only the unambiguous enterprise case is
-/// protected from a community downgrade. The probe thread is detached so a hung
-/// binary can never block launch.
+/// Is the CLI installed at `cli_path` a VERIFIED enterprise CLI? Its signature is
+/// checked (community accepts any intact signature) BEFORE it is executed, and
+/// only a verified target's `--version` claim counts: an unsigned or planted file
+/// claiming `(enterprise)` is "not enterprise", so it cannot suppress the
+/// managed-daemon plist. Symlinks and non-regular files are never verified.
+#[cfg(all(test, unix))]
 fn installed_cli_is_enterprise(cli_path: &std::path::Path) -> bool {
-    installed_cli_is_enterprise_within(
+    csq_core::cli_deps::cli_shim::installed_verified_version_line(
         cli_path,
-        std::time::Duration::from_secs(CLI_ENTERPRISE_PROBE_TIMEOUT_SECS),
+        &csq_core::cli_deps::cli_shim::SignerPolicy::AnySignature,
     )
-}
-
-/// [`installed_cli_is_enterprise`], parameterized on the probe's
-/// `recv_timeout` budget. The production entry point above always passes
-/// [`CLI_ENTERPRISE_PROBE_TIMEOUT_SECS`] — that value is a deliberate
-/// launch-latency UX choice and MUST NOT be raised to accommodate tests.
-/// Tests call this function directly with a budget generous enough that
-/// host contention (csq's macOS CI runner is self-hosted and shares the
-/// box with concurrent cargo builds/other agents — see
-/// `discovery_macos_ci_runner_is_self_hosted_local`) cannot produce a false
-/// negative, while still bounding a genuine hang so the suite cannot wedge
-/// forever. Same defect class as an internal ticket: a test must not assert a
-/// wall-clock deadline it never actually exercises.
-fn installed_cli_is_enterprise_within(
-    cli_path: &std::path::Path,
-    timeout: std::time::Duration,
-) -> bool {
-    probe_cli_version_output_within(cli_path, timeout)
-        .is_some_and(|stdout| version_output_is_enterprise(&stdout))
-}
-
-/// Run `<cli_path> --version` under `timeout` and return its stdout, or `None`
-/// on ANY ambiguity — missing binary, symlink, spawn error, timeout, or
-/// non-zero exit.
-///
-/// Extracted from [`installed_cli_is_enterprise_within`] so the EDITION guard
-/// and the VERSION-downgrade guard ([`installed_cli_is_newer_within`]) share a
-/// single spawn shape rather than each growing their own copy — the two guards
-/// read the same one line of output for different properties. Each caller
-/// decides for itself what `None` means; this function takes no position.
-fn probe_cli_version_output_within(
-    cli_path: &std::path::Path,
-    timeout: std::time::Duration,
-) -> Option<String> {
-    use std::process::{Command, Stdio};
-    // Reject a SYMLINK target without spawning: `mode::detect` canonicalizes
-    // `current_exe()`, so a symlink at the CLI path pointing into
-    // `…/Contents/MacOS/csq` would resolve back into the bundle and run in
-    // Desktop mode (spawning a GUI subprocess) rather than printing a version
-    // (memory `discovery_csq_symlink_breaks_mode_detect`). A symlink is never a
-    // legitimate standalone enterprise CLI; fail-open so `ensure_cli_shim`
-    // replaces it with a real file.
-    let is_regular_file = cli_path
-        .symlink_metadata()
-        .map(|m| m.file_type().is_file())
-        .unwrap_or(false);
-    if !is_regular_file {
-        return None;
-    }
-    let cli = cli_path.to_path_buf();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let out = Command::new(&cli)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output();
-        let _ = tx.send(out);
-    });
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(output)) if output.status.success() => {
-            Some(String::from_utf8_lossy(&output.stdout).into_owned())
-        }
-        _ => None,
-    }
+    .is_some_and(|l| version_output_is_enterprise(&l))
 }
 
 /// Decides whether a `csq --version` stdout names the enterprise edition.
 ///
-/// Split out of [`installed_cli_is_enterprise_within`] so the DECISION is
+/// Split out of [`installed_cli_is_enterprise`] so the DECISION is
 /// testable without spawning a subprocess or racing any wall-clock budget —
 /// see `version_output_is_enterprise_accepts_and_rejects` below. Ported from
 /// commit `6e646188` (originally landed on the sibling PR fixing this same
 /// flake by a different mechanism; that commit was dropped from its branch
 /// after a cross-PR collision in this file, but this extraction was judged
 /// the one genuinely-good thing to keep and port here).
+#[cfg(test)]
 fn version_output_is_enterprise(stdout: &str) -> bool {
     stdout.contains("(enterprise)")
 }
 
-/// Parse `MAJOR.MINOR.PATCH` out of a `csq --version` stdout line.
-///
-/// Accepts the shipped shape `csq 2.19.0 (enterprise)` (built as
-/// `VERSION_LINE` in `csq/src/main.rs`) and a bare `2.19.0`.
-///
-/// A pre-release / build suffix is truncated at the first `-` or `+`, so
-/// `2.19.0-rc1` compares EQUAL to `2.19.0`. That is a deliberate deviation from
-/// semver, where `2.19.0-rc1 < 2.19.0`: it means an rc-installed host facing a
-/// same-version final bundle is refreshed rather than refused. That is the safe
-/// direction here — the caller is a downgrade guard, and refusing would strand
-/// the host on a pre-release.
-///
-/// Returns `None` for anything it cannot read as three integers — the caller
-/// decides what ambiguity means.
-fn parse_version_triple(stdout: &str) -> Option<(u64, u64, u64)> {
-    for token in stdout.split_whitespace() {
-        let core = token
-            .split(['-', '+'])
-            .next()
-            .unwrap_or(token)
-            .trim_start_matches(['v', 'V']);
-        let mut parts = core.split('.');
-        let (Some(a), Some(b), Some(c), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            continue;
-        };
-        if let (Ok(a), Ok(b), Ok(c)) = (a.parse::<u64>(), b.parse::<u64>(), c.parse::<u64>()) {
-            return Some((a, b, c));
-        }
-    }
-    None
-}
-
-/// Decides whether an installed CLI's `--version` stdout names a STRICTLY
-/// NEWER version than this bundle.
-///
-/// Split out of [`installed_cli_is_newer_within`] for the same reason
-/// [`version_output_is_enterprise`] was: the DECISION is then testable without
-/// spawning a subprocess or racing a wall-clock budget.
-///
-/// Returns `false` on ambiguity (either side unparseable). That direction is
-/// deliberate and is NOT a fail-open on the destructive branch: this predicate
-/// is only ever consulted for a target that already exists, and a target whose
-/// `--version` cannot be parsed is not a working csq — there is no version to
-/// downgrade FROM, and the refresh is the thing that repairs it. The branch
-/// where a real downgrade is possible (both sides parse, installed is newer)
-/// fails closed, per `guard-reader-writer-parity.md` MUST-2.
-fn version_output_is_newer_than(stdout: &str, bundle_version: &str) -> bool {
-    match (
-        parse_version_triple(stdout),
-        parse_version_triple(bundle_version),
-    ) {
-        (Some(installed), Some(bundle)) => installed > bundle,
-        _ => false,
-    }
-}
-
-/// Best-effort: does the CLI already installed at `cli_path` report a STRICTLY
-/// NEWER version than this bundle? When it does, the shim refresh MUST be
-/// skipped — copying the bundle over it is a silent DOWNGRADE of the binary the
-/// operator actually runs.
-///
-/// The sibling [`installed_cli_is_enterprise`] guards the EDITION axis of the
-/// same copy. Neither implies the other: a stale ENTERPRISE `.app` downgrading
-/// a newer ENTERPRISE CLI passes the edition guard cleanly. Measured on the
-/// maintainer host 2026-09-12 — `.app` 2.18.0, `~/.local/bin/csq` 2.19.0, both
-/// enterprise.
-fn installed_cli_is_newer(cli_path: &std::path::Path) -> bool {
-    installed_cli_is_newer_within(
-        cli_path,
-        std::time::Duration::from_secs(CLI_ENTERPRISE_PROBE_TIMEOUT_SECS),
-        env!("CARGO_PKG_VERSION"),
+/// F3: may the launchd-managed daemon plist be installed? The CLI it points at
+/// must exist, and after a FAILED refresh it must still verify (a rejected
+/// refresh over a missing/broken target would leave `ProgramArguments[0]`
+/// pointing at nothing runnable).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(test)]
+fn managed_plist_allowed(target_exists: bool, refresh_failed: bool, target_verifies: bool) -> bool {
+    csq_core::cli_deps::cli_shim_refresh::managed_plist_allowed(
+        target_exists,
+        refresh_failed,
+        target_verifies,
     )
 }
 
-/// [`installed_cli_is_newer`], parameterized on the probe budget and the
-/// bundle version so tests need neither a wall-clock assertion nor a rebuild at
-/// a synthetic version. The production entry point always passes
-/// [`CLI_ENTERPRISE_PROBE_TIMEOUT_SECS`] and `CARGO_PKG_VERSION`.
-fn installed_cli_is_newer_within(
-    cli_path: &std::path::Path,
-    timeout: std::time::Duration,
-    bundle_version: &str,
-) -> bool {
-    match probe_cli_version_output_within(cli_path, timeout) {
-        Some(stdout) => version_output_is_newer_than(&stdout, bundle_version),
-        None => false,
+/// Run off the Tauri setup thread; publish a receipt even when refresh or plist
+/// repair fails. Only the final live verification is shared by the gates.
+fn refresh_cli_shim_and_managed_plist() {
+    use csq_core::cli_deps::cli_shim::{self, SignerPolicy};
+    use csq_core::cli_deps::cli_shim_refresh::{refresh_cli_and_record_with, RefreshContext};
+    let policy = if crate::BUILD_EDITION == "enterprise" {
+        SignerPolicy::PinTrustedTeam
+    } else {
+        SignerPolicy::AnySignature
+    };
+    let source = std::env::current_exe()
+        .ok()
+        .map(|e| cli_shim::resolve_shim_source(&e));
+    let target = cli_shim::resolve_shim_target();
+    let Some(accounts) = base_dir() else {
+        tracing::warn!(
+            tag = "shim_receipt_base_unavailable",
+            "CLI refresh accounts directory unavailable"
+        );
+        return;
+    };
+    let result = refresh_cli_and_record_with(
+        RefreshContext {
+            base_dir: &accounts,
+            source: source.as_deref(),
+            target: target.as_deref(),
+            expected_version_line: crate::VERSION_LINE,
+        },
+        |source, target| cli_shim::ensure_cli_shim(source, target, crate::VERSION_LINE, &policy),
+        |target| cli_shim::installed_cli_verification(target, &policy),
+        |target, verified, refresh_failed| {
+            #[cfg(target_os = "macos")]
+            {
+                crate::daemon_host::launchd::repair_managed_daemon_plist_after_refresh(
+                    target,
+                    verified,
+                    refresh_failed,
+                    crate::VERSION_LINE,
+                    &policy,
+                )
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (target, verified, refresh_failed);
+                ("unsupported".into(), "unsupported".into())
+            }
+        },
+    );
+    match result {
+        Ok(receipt) => tracing::info!(
+            outcome = receipt.outcome,
+            plist_decision = receipt.plist_decision,
+            stale_plist_decision = receipt.stale_plist_decision,
+            "CLI shim refresh completed"
+        ),
+        Err(_) => tracing::warn!(
+            tag = "shim_receipt_write_failed",
+            "CLI shim refresh receipt could not be published"
+        ),
     }
 }
 
@@ -1538,12 +1448,20 @@ pub fn run() {
         // `:default` which would also bundle save / message / ask.
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            commands::pool::pool_list,
+            commands::pool::pool_add,
+            commands::pool::pool_remove,
+            commands::pool::pool_set_reset,
             commands::get_build_edition,
             commands::get_accounts,
+            commands::get_pending_rescues,
             commands::rename_account,
             commands::provider_cli_installed,
             commands::remove_account,
             commands::move_account,
+            commands::get_codex_slot_write_status,
+            commands::get_claude_autocompact_status,
+            commands::ack_codex_slot_raced,
             commands::get_account_usage,
             commands::get_rotation_config,
             commands::set_rotation_enabled,
@@ -1674,6 +1592,19 @@ pub fn run() {
             // `log_gc` task GCs.
             init_logging_subscriber(&resolved_base_dir_for_logging());
 
+            // Once per app launch, including login autostart. The shared check
+            // mutates custody only when a previous boot is proven by Pool.
+            if let Some(base) = base_dir() {
+                tauri::async_runtime::spawn(csq_core::daemon::server::recover_pool_after_startup(
+                    base,
+                ));
+            } else {
+                tracing::warn!(
+                    error_kind = "pool_restart_recovery_base_unavailable",
+                    "pool restart recovery check unavailable"
+                );
+            }
+
             // ── CLI shim refresh (#1) ──────────────────────────
             //
             // The desktop `.app` and the terminal CLI are the same single
@@ -1686,6 +1617,12 @@ pub fn run() {
             // Real-file copy (NOT cp → Gatekeeper SIGKILL; NOT a symlink →
             // mode::detect canonicalize trap). See csq_core cli_shim.
             //
+            // Invariant: the refresh never MAKES `~/.local/bin/csq` unrunnable.
+            // `ensure_cli_shim` skips when the installed CLI already matches
+            // (version + edition + verifying signature), and otherwise verifies a
+            // temp copy (`codesign --verify` + `--version` exec probe) BEFORE the
+            // atomic replace, rolling back with a fixed reason tag on failure.
+            //
             // Source resolution (an internal ticket): on the enterprise Developer-ID
             // build the running binary is the bundle's `--deep`-signed MAIN
             // executable, whose signature is bundle-bound and INVALID when copied
@@ -1693,136 +1630,11 @@ pub fn run() {
             // standalone-signed `Contents/Helpers/csq-cli` helper when present,
             // falling back to the running exe otherwise.
             //
-            // Runs on a DETACHED thread so the `installed_cli_is_enterprise`
-            // probe (a `<cli> --version` subprocess bounded by a 3s timeout)
-            // never blocks the synchronous Tauri setup closure / event-loop
-            // start — otherwise a slow/hung CLI would beachball launch (redteam
-            // an internal ticket M1). The refresh is already best-effort + non-fatal, so
-            // racing the rest of setup is safe.
-            std::thread::spawn(|| {
-            match (
-                std::env::current_exe()
-                    .map(|exe| csq_core::cli_deps::cli_shim::resolve_shim_source(&exe)),
-                csq_core::cli_deps::cli_shim::resolve_shim_target(),
-            ) {
-                // Edition-downgrade guard (edition independence): a COMMUNITY
-                // desktop must never silently overwrite an installed ENTERPRISE
-                // CLI. The shim refresh is unconditional, so without this a
-                // community `.app` launch would replace `~/.local/bin/csq`
-                // (enterprise) with the community binary — the user silently
-                // loses the Phase-2b moat. Enterprise-over-anything and
-                // community-over-community are fine; only community-over-
-                // enterprise is blocked (see `installed_cli_is_enterprise`).
-                (Ok(_), Some(target))
-                    if crate::BUILD_EDITION == "community"
-                        && installed_cli_is_enterprise(&target) =>
-                {
-                    tracing::warn!(
-                        target = %target.display(),
-                        "cli shim refresh SKIPPED: refusing to downgrade an enterprise CLI \
-                         to community. Run the enterprise desktop build, or reinstall the \
-                         enterprise CLI, to keep editions consistent."
-                    );
-                }
-                // Version-downgrade guard: a STALE `.app` must never copy an
-                // OLDER binary over a NEWER installed CLI. The edition guard
-                // above does not cover this — an enterprise 2.18.0 bundle
-                // downgrading an enterprise 2.19.0 CLI passes it cleanly. Doing
-                // so silently reverts the binary the operator runs in the
-                // terminal, and (because the managed-daemon plist below points
-                // at this same target) the launchd daemon with it — resurfacing
-                // the very version-skew warning this whole block exists to
-                // prevent. Observed on the maintainer host 2026-09-12.
-                //
-                // COVERAGE NOTE: the two predicates below are unit-tested, but
-                // this `match` — the decision that consults them, and the arm
-                // ORDER that makes the edition guard short-circuit the version
-                // probe — is NOT. `run()` is a Tauri setup closure and is not
-                // unit-testable, so deleting either guard arm leaves every test
-                // green. Reviewed and accepted 2026-09-12 rather than extracting
-                // the decision; if a third guard is ever added here, extract
-                // them into one testable predicate instead of growing this match.
-                (Ok(_), Some(target)) if installed_cli_is_newer(&target) => {
-                    tracing::warn!(
-                        target = %target.display(),
-                        bundle_version = %env!("CARGO_PKG_VERSION"),
-                        "cli shim refresh SKIPPED: the installed CLI is NEWER than this \
-                         bundle; refusing to downgrade it. Update the desktop app (or \
-                         reinstall the CLI from this bundle) to bring the two back in step."
-                    );
-                }
-                (Ok(src), Some(target)) => {
-                    match csq_core::cli_deps::cli_shim::ensure_cli_shim(&src, &target) {
-                        Ok(outcome) => tracing::info!(
-                            ?outcome,
-                            target = %target.display(),
-                            "cli shim refresh"
-                        ),
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            "cli shim refresh failed (non-fatal)"
-                        ),
-                    }
-                }
-                _ => tracing::warn!(
-                    "cli shim refresh skipped: could not resolve current exe or target"
-                ),
-            }
-
-            // ── Managed background daemon plist (Wave B) ────────
-            //
-            // Install / repair the launchd-managed daemon plist AFTER the
-            // shim refresh, so its `ProgramArguments[0]` (the shim,
-            // resolved by `resolve_managed_daemon_exe`) points at a
-            // freshly-copied real-file `~/.local/bin/csq`. The managed
-            // daemon (`csq daemon start --supervised` under
-            // `KeepAlive={SuccessfulExit:false}`) keeps the token refresher
-            // alive whether or not this desktop app is open — the
-            // structural fix for the mass-token-expiry incident
-            // (daemon-auth-resilience an internal journal entry). Best-effort +
-            // NON-FATAL: a launchctl hiccup must never block launch. The
-            // in-process supervisor above is the cohabiting backup; the
-            // PidFile guard ensures exactly one owner.
-            //
-            // macOS only — Linux's systemd unit already auto-restarts
-            // (`Restart=on-failure`) and has no bundle-misdetection issue.
-            //
-            // Edition coherence: NEVER launchd-manage a daemon of a
-            // different edition than this app. The shim-refresh above
-            // refuses to downgrade an enterprise CLI to community, so a
-            // COMMUNITY app on a box with an enterprise `~/.local/bin/csq`
-            // leaves the shim enterprise — and a plist pointing at it would
-            // run the enterprise daemon whose license gate refuses → no
-            // refresh → Wave B silently defeated on exactly that
-            // mixed-edition (maintainer dev-box) machine. Skip the install
-            // in that case, mirroring the shim-refresh downgrade guard.
-            #[cfg(target_os = "macos")]
-            {
-                let target = csq_core::cli_deps::cli_shim::resolve_shim_target();
-                let edition_incoherent = crate::BUILD_EDITION == "community"
-                    && target
-                        .as_ref()
-                        .is_some_and(|t| installed_cli_is_enterprise(t));
-                if edition_incoherent {
-                    tracing::warn!(
-                        "managed daemon plist SKIPPED: installed CLI is enterprise \
-                         but this is a community app; refusing to launchd-manage a \
-                         mismatched-edition daemon. Reinstall a coherent edition to \
-                         enable the always-on managed daemon."
-                    );
-                } else {
-                    match crate::cli::commands::daemon::ensure_managed_daemon_plist() {
-                        Ok(outcome) => {
-                            tracing::info!(?outcome, "managed daemon plist ensured")
-                        }
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            "managed daemon plist install/repair failed (non-fatal)"
-                        ),
-                    }
-                }
-            }
-            });
+            // Runs on a DETACHED thread: the refresh execs bounded subprocesses
+            // (`codesign`, `--version`; worst case in spec 04 section 4.1.2) and must
+            // never block the synchronous Tauri setup closure / event-loop start.
+            // It is best-effort + non-fatal, so racing the rest of setup is safe.
+            std::thread::spawn(refresh_cli_shim_and_managed_plist);
 
             let log_level = if cfg!(debug_assertions) {
                 log::LevelFilter::Debug
@@ -1843,8 +1655,14 @@ pub fn run() {
             // community bundle over the enterprise one. Gate it off for
             // enterprise until an enterprise updater channel exists (W5).
             if community_auto_update_enabled() {
-                app.handle()
-                    .plugin(tauri_plugin_updater::Builder::new().build())?;
+                // sec-M2: a stable install must never take a prerelease. The
+                // default comparator is `release.version > current`, and
+                // semver ranks `2.22.0-beta.1` above `2.21.0`, so a prerelease
+                // published on the channel would be installed by a stable
+                // client. The policy lives in `updater_builder`; the test
+                // `updater_builder_is_wired_to_the_comparator` is the tripwire
+                // that the comparator is part of it.
+                app.handle().plugin(updater_builder().build())?;
             }
 
             // ── OAuth state store ────────────────────────────
@@ -1930,10 +1748,9 @@ pub fn run() {
                 // `false` (opted into by the user or migrated from a legacy
                 // dock-hide=true file) leaves the dashboard hidden until the
                 // user clicks the tray icon to reveal it.
-                if let Err(e) = commands::apply_dashboard_visibility(
-                    app.handle(),
-                    prefs.dashboard_at_launch,
-                ) {
+                if let Err(e) =
+                    commands::apply_dashboard_visibility(app.handle(), prefs.dashboard_at_launch)
+                {
                     log::warn!(
                         "startup dashboard-visibility apply failed \
                          (visible={}, err={e}); window state may not match pref",
@@ -1955,11 +1772,7 @@ pub fn run() {
                 if let preferences::LoadOutcome::RecoveredFromCorrupt(reason) = outcome {
                     let occurred_at = chrono::Utc::now().to_rfc3339();
                     // Cache for late-subscribing renderer (HIGH-1 fix).
-                    if let Ok(mut guard) = app
-                        .state::<AppState>()
-                        .prefs_recovery
-                        .lock()
-                    {
+                    if let Ok(mut guard) = app.state::<AppState>().prefs_recovery.lock() {
                         *guard = Some(PrefsRecoveryRecord {
                             reason,
                             occurred_at: occurred_at.clone(),
@@ -2134,9 +1947,31 @@ pub fn run() {
         });
 }
 
+/// The updater's acceptance rule (installed as `default_version_comparator`):
+/// take an update only when it is strictly newer AND a stable (non-prerelease)
+/// install never takes a prerelease. A prerelease install may move to a newer
+/// prerelease or to stable. Ordering is `semver::Version`, under which
+/// `2.22.0-beta.1 > 2.21.0` — without the prerelease clause a stable client
+/// would install it.
+fn update_is_acceptable(current: &semver::Version, release: &semver::Version) -> bool {
+    release > current && (release.pre.is_empty() || !current.pre.is_empty())
+}
+
+/// The updater plugin as this shell configures it. The comparator is part of
+/// the construction (not a separate registration), so `run()` installs the
+/// whole policy with this one call. Kept as a named function so
+/// `updater_builder_is_wired_to_the_comparator` can pin the wire-up — a
+/// TauriPlugin's internals are opaque once built.
+fn updater_builder() -> tauri_plugin_updater::Builder {
+    tauri_plugin_updater::Builder::new().default_version_comparator(|current, release| {
+        update_is_acceptable(&current, &release.version)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use csq_core::cli_deps::cli_shim::{parse_version_triple, version_output_is_newer_than};
     use std::fs;
     use tempfile::TempDir;
 
@@ -2239,15 +2074,137 @@ mod tests {
         assert_eq!(crate::BUILD_EDITION, "community");
     }
 
-    #[cfg(unix)]
-    fn write_fake_cli(dir: &std::path::Path, name: &str, version_line: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join(name);
-        fs::write(&path, format!("#!/bin/sh\necho '{version_line}'\n")).unwrap();
-        let mut perms = fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).unwrap();
-        path
+    /// The updater endpoint response is unsigned and the minisign signature
+    /// covers only the downloaded installer, so without
+    /// `requireSignedVersion` an endpoint controller can pair an inflated
+    /// `version` with an older csq-signed installer and roll users back.
+    /// `tauri-plugin-updater` (>= 2.12) reads the flag from this exact config
+    /// key at runtime; a deleted or misspelled key is silently `false`.
+    /// Enabling it obliges every release pipeline to emit version-bound
+    /// signatures — `scripts/verify/latest-json-signed-version.sh` is the gate.
+    #[test]
+    fn updater_config_requires_a_signed_version() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../../tauri.conf.json")).expect("tauri.conf.json");
+        assert_eq!(
+            conf["plugins"]["updater"]["requireSignedVersion"],
+            serde_json::Value::Bool(true),
+            "plugins.updater.requireSignedVersion must be exactly `true`"
+        );
+    }
+
+    /// sec-L1: with `allowDowngrades: true` the plugin's fallback comparator
+    /// accepts any version that merely DIFFERS from the installed one, so an
+    /// endpoint could install an OLDER advertised version. It is consulted
+    /// only when the application installs no comparator of its own
+    /// (tauri-plugin-updater 2.12.0 `lib.rs:99-103`: a comparator set by the
+    /// application takes precedence), and this shell always installs one —
+    /// absent and `false` remain the only acceptable values because a single
+    /// dropped wire-up would otherwise silently enable downgrades.
+    /// `scripts/verify/latest-json-signed-version.sh config` asserts the same
+    /// pair on the shipped file.
+    #[test]
+    fn updater_config_does_not_allow_downgrades() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../../tauri.conf.json")).expect("tauri.conf.json");
+        let value = &conf["plugins"]["updater"]["allowDowngrades"];
+        assert!(
+            value.is_null() || *value == serde_json::Value::Bool(false),
+            "plugins.updater.allowDowngrades must be absent or `false`, got {value}"
+        );
+    }
+
+    /// sec-M2/H: the comparator on REAL `semver::Version` values. A boolean
+    /// table cannot catch a swapped argument order, a sign error, or a wrong
+    /// prerelease parse — this table exercises the actual comparisons the
+    /// closure performs.
+    #[test]
+    fn updater_comparator_refuses_prereleases_for_stable_clients() {
+        let v = |s: &str| semver::Version::parse(s).expect("test version");
+        // The ordering facts the rule leans on.
+        assert!(
+            v("2.22.0-beta.1") > v("2.21.0"),
+            "semver ranks a prerelease above an older stable"
+        );
+        assert!(
+            v("2.21.0-rc.10") > v("2.21.0-rc.9"),
+            "numeric prerelease identifiers compare numerically"
+        );
+        // Accepted moves.
+        assert!(
+            update_is_acceptable(&v("2.21.0"), &v("2.22.0")),
+            "stable -> newer stable"
+        );
+        assert!(
+            update_is_acceptable(&v("2.22.0-beta.1"), &v("2.22.0-beta.2")),
+            "prerelease -> newer prerelease"
+        );
+        assert!(
+            update_is_acceptable(&v("2.22.0-beta.2"), &v("2.22.0")),
+            "prerelease -> stable"
+        );
+        // Refused moves.
+        assert!(
+            !update_is_acceptable(&v("2.21.0"), &v("2.22.0-beta.1")),
+            "stable -> any prerelease"
+        );
+        assert!(
+            !update_is_acceptable(&v("2.21.0"), &v("2.21.0")),
+            "equal version is not newer"
+        );
+        assert!(
+            !update_is_acceptable(&v("2.22.0"), &v("2.21.0")),
+            "downgrade refused (also catches swapped arguments)"
+        );
+    }
+
+    /// G-tripwire (structural): a built TauriPlugin is opaque, so the only
+    /// checkable fact is the SOURCE wire-up — the comparator must be
+    /// registered exactly once, inside `updater_builder`, and `run()` must
+    /// install that builder. The needles are assembled from split literals so
+    /// this test's own text cannot satisfy them; dropping the comparator line
+    /// (the mutation this exists for) reds the first assertion.
+    #[test]
+    fn updater_builder_is_wired_to_the_comparator() {
+        let src = include_str!("mod.rs");
+        let comparator_call = format!(".{}", "default_version_comparator(");
+        let helper_call = format!(
+            "update_is_acceptable(&{}, &{}.version)",
+            "current", "release"
+        );
+        let install = format!("app.handle().plugin({}(){})", "updater_builder", ".build()");
+        assert_eq!(
+            src.matches(&comparator_call).count(),
+            1,
+            "the comparator must be registered exactly once, in updater_builder"
+        );
+        assert!(
+            src.contains(&helper_call),
+            "updater_builder must route through update_is_acceptable"
+        );
+        assert!(
+            src.contains(&install),
+            "run() must install the builder from updater_builder()"
+        );
+    }
+
+    #[test]
+    fn managed_plist_requires_an_existing_vetted_target() {
+        // F3.
+        assert!(
+            !managed_plist_allowed(false, false, false),
+            "missing target"
+        );
+        assert!(!managed_plist_allowed(false, true, true), "missing target");
+        assert!(
+            !managed_plist_allowed(true, true, false),
+            "rejected + unverified"
+        );
+        assert!(
+            managed_plist_allowed(true, true, true),
+            "rejected but still verifies"
+        );
+        assert!(managed_plist_allowed(true, false, false), "refresh fine");
     }
 
     /// Deterministic coverage of the actual decision — no subprocess, no
@@ -2270,38 +2227,6 @@ mod tests {
         assert!(!version_output_is_enterprise("csq 2.18.0 enterprise"));
         assert!(!version_output_is_enterprise("csq 2.18.0 (Enterprise)"));
     }
-
-    /// Test-only probe budget for [`installed_cli_is_enterprise_within`].
-    /// csq's macOS CI runner is self-hosted and shares the host with
-    /// concurrent cargo builds / other agents, so the production 3s budget
-    /// ([`CLI_ENTERPRISE_PROBE_TIMEOUT_SECS`]) is NOT safe to assert against
-    /// under test — a fork/exec of `/bin/sh` can transiently take >3s under
-    /// contention with no defect in the code under test. Reproduced directly:
-    /// `installed_cli_is_enterprise_detects_enterprise_suffix` failed with
-    /// `finished in 3.08s` (the exact production timeout) while its two
-    /// sibling tests in the same run passed — the assertion is timeout-bound,
-    /// not code-bound. 60s is generous enough to absorb that contention while
-    /// still bounding a genuine hang so the suite cannot wedge forever.
-    #[cfg(unix)]
-    const TEST_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-    // Workspace-local serial mutex, same pattern as
-    // `csq/tests/cli_deps_doctor_integration.rs::SERIAL` (an internal ticket, journal
-    // `internal-design-docs`).
-    // That integration-test binary's static is NOT reachable here — `csq/tests/*.rs`
-    // integration tests compile as separate binaries from `csq/src/**`'s own
-    // `#[cfg(test)]` unittest harness — so this is a second, local instance of the
-    // same pattern, not a shared import. Two independent defenses stack:
-    // (1) this mutex removes INTRA-BINARY contention (no two of the three tests
-    // below spawn `/bin/sh` at the same instant); (2) the generous
-    // `TEST_PROBE_TIMEOUT` above absorbs CROSS-PROCESS contention the mutex
-    // cannot touch (csq's macOS CI runner is self-hosted and shares the box
-    // with concurrent cargo builds / other agents' sessions, per
-    // `discovery_macos_ci_runner_is_self_hosted_local` — serializing this
-    // binary's own three tests does nothing about a sibling process eating
-    // every core). Neither layer alone is sufficient.
-    #[cfg(unix)]
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // ── version-downgrade guard ───────────────────────────────────────
     #[test]
@@ -2390,124 +2315,20 @@ mod tests {
         );
     }
 
-    /// End-to-end through the real subprocess probe: a fake `csq` that prints a
-    /// newer version is refused. Exercises `probe_cli_version_output_within`
-    /// (spawn + parse), not just the pure decision. Uses the same
-    /// `SERIAL` + `TEST_PROBE_TIMEOUT` discipline as the sibling edition-probe
-    /// tests — see `TEST_PROBE_TIMEOUT`'s doc comment for why the production
-    /// budget is not safe to assert against on the self-hosted runner.
+    /// A symlink or a missing path is never "a verified enterprise CLI" (the
+    /// verify-then-claim rule itself is tested in `cli_shim` with a fake probe;
+    /// here no codesign is involved on any platform).
     #[cfg(unix)]
     #[test]
-    fn installed_cli_is_newer_within_refuses_a_newer_fake_cli() {
-        let _serial_guard = SERIAL.lock().unwrap_or_else(|p| {
-            SERIAL.clear_poison();
-            p.into_inner()
-        });
+    fn installed_cli_is_enterprise_false_for_symlink_and_missing() {
         let dir = TempDir::new().unwrap();
-        let cli = write_fake_cli(dir.path(), "csq-new", "csq 2.19.0 (enterprise)");
-
-        assert!(
-            installed_cli_is_newer_within(&cli, TEST_PROBE_TIMEOUT, "2.18.0"),
-            "a 2.19.0 CLI against a 2.18.0 bundle is a downgrade and must be refused"
-        );
-        assert!(
-            !installed_cli_is_newer_within(&cli, TEST_PROBE_TIMEOUT, "2.19.0"),
-            "same version is not a downgrade"
-        );
-        assert!(
-            !installed_cli_is_newer_within(&cli, TEST_PROBE_TIMEOUT, "2.20.0"),
-            "a newer bundle is an UPGRADE and must proceed"
-        );
-    }
-
-    /// A missing target is not a downgrade — otherwise the guard would break
-    /// FIRST INSTALL, where nothing sits at the target at all.
-    #[cfg(unix)]
-    #[test]
-    fn installed_cli_is_newer_within_is_false_for_a_missing_target() {
-        let _serial_guard = SERIAL.lock().unwrap_or_else(|p| {
-            SERIAL.clear_poison();
-            p.into_inner()
-        });
-        let dir = TempDir::new().unwrap();
-        let missing = dir.path().join("nope/csq");
-        assert!(!installed_cli_is_newer_within(
-            &missing,
-            TEST_PROBE_TIMEOUT,
-            "2.18.0"
-        ));
-    }
-
-    /// A target that exists but cannot print a parseable version is NOT treated
-    /// as a downgrade: it is not a working csq, so there is nothing to protect
-    /// and the refresh is what repairs it. This is the one ambiguity branch
-    /// that deliberately proceeds — see `version_output_is_newer_than`.
-    #[cfg(unix)]
-    #[test]
-    fn installed_cli_is_newer_within_is_false_for_an_unparseable_version() {
-        let _serial_guard = SERIAL.lock().unwrap_or_else(|p| {
-            SERIAL.clear_poison();
-            p.into_inner()
-        });
-        let dir = TempDir::new().unwrap();
-        let cli = write_fake_cli(dir.path(), "csq-broken", "not a version at all");
-        assert!(!installed_cli_is_newer_within(
-            &cli,
-            TEST_PROBE_TIMEOUT,
-            "2.18.0"
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn installed_cli_is_enterprise_detects_enterprise_suffix() {
-        let _serial_guard = SERIAL.lock().unwrap_or_else(|p| {
-            SERIAL.clear_poison();
-            p.into_inner()
-        });
-        let dir = TempDir::new().unwrap();
-        let cli = write_fake_cli(dir.path(), "csq-ent", "csq 2.17.0 (enterprise)");
-        assert!(installed_cli_is_enterprise_within(&cli, TEST_PROBE_TIMEOUT));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn installed_cli_is_enterprise_rejects_symlink() {
-        let _serial_guard = SERIAL.lock().unwrap_or_else(|p| {
-            SERIAL.clear_poison();
-            p.into_inner()
-        });
-        // sec-M1: a symlink target (even one pointing at a real enterprise CLI)
-        // must be rejected without spawning — `mode::detect` would canonicalize
-        // it into the .app and launch Desktop mode. Fail-open (false) so
-        // ensure_cli_shim replaces it with a real file.
-        let dir = TempDir::new().unwrap();
-        let real = write_fake_cli(dir.path(), "csq-real", "csq 2.17.0 (enterprise)");
+        let real = dir.path().join("csq-real");
+        std::fs::write(&real, b"#!/bin/sh\necho 'csq 2.17.0 (enterprise)'\n").unwrap();
         let link = dir.path().join("csq-link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        assert!(
-            !installed_cli_is_enterprise_within(&link, TEST_PROBE_TIMEOUT),
-            "a symlink target must be rejected (never probed)"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn installed_cli_is_enterprise_false_for_community_and_missing() {
-        let _serial_guard = SERIAL.lock().unwrap_or_else(|p| {
-            SERIAL.clear_poison();
-            p.into_inner()
-        });
-        let dir = TempDir::new().unwrap();
-        let community = write_fake_cli(dir.path(), "csq-comm", "csq 2.17.0 (community)");
-        assert!(
-            !installed_cli_is_enterprise_within(&community, TEST_PROBE_TIMEOUT),
-            "community CLI must not be flagged enterprise"
-        );
-        // Missing binary → false (shim refresh proceeds).
-        assert!(!installed_cli_is_enterprise_within(
-            &dir.path().join("does-not-exist"),
-            TEST_PROBE_TIMEOUT
+        assert!(!installed_cli_is_enterprise(&link));
+        assert!(!installed_cli_is_enterprise(
+            &dir.path().join("does-not-exist")
         ));
     }
 

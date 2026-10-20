@@ -1887,15 +1887,20 @@ mod tests {
     /// one process reproduces real contention), while the Windows impl is a
     /// named mutex whose same-process semantics do not reliably contend —
     /// per testing.md's platform-gating rationale. Do NOT remove the gate.
+    /// The env lock is deliberately NOT taken here: this test mutates and
+    /// reads NO process-global env. `handle_roster_install_inner` reaches
+    /// `acquire_chain_lock` (roster.rs:236) before its first env read
+    /// (`resolve_org_root_pubkey` / `CSQ_AUDIT_EDITION`), so the timeout path
+    /// this test drives is env-independent. Holding the shared env lock across
+    /// the 5 s chain-lock deadline + 5 s holder handshake below only starved
+    /// sibling tests that need the env lock (it delayed the desktop
+    /// `BaseDirEnvGuard` serialization proof by the full window under the
+    /// full set); narrow the scope, never widen the hold.
     #[cfg(unix)]
     #[test]
     fn roster_install_chain_lock_timeout_aborts_before_any_write() {
         use csq_core::platform::lock::lock_file;
         use std::time::Duration;
-
-        let _g = csq_core::platform::test_env::lock();
-        std::env::remove_var("CSQ_AUDIT_EDITION");
-        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
 
         let dir = tmp();
         let base = dir.path();
@@ -1906,7 +1911,6 @@ mod tests {
         let signed = minimal_signed_roster(&root_sk, root_pk, 1);
         let roster_file = dir.path().join("test-roster.json");
         std::fs::write(&roster_file, serde_json::to_string_pretty(&signed).unwrap()).unwrap();
-        setup_env_root_pk(root_pk);
 
         // Arrange — record pre-state bytes so we can assert nothing changed.
         let roster_on_disk = csq_core::audit::authority::roster_path(base);
@@ -1944,8 +1948,6 @@ mod tests {
 
         // Release background lock regardless of outcome.
         let _ = tx_release.send(());
-
-        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
 
         // Assert — install must fail with a lock-timeout error.
         assert!(

@@ -13,7 +13,7 @@
 //! Rule 1 to billing telemetry that the ledger module was designed for (see
 //! `crate::usage::ledger` header).
 //!
-//! Runs as a `tokio::spawn`-ed background task (never on the daemon main loop),
+//! A Tokio task schedules a dedicated background OS thread (never the main loop),
 //! mirroring [`crate::daemon::coc_cache_sweeper`]. The FIRST tick fires
 //! immediately at startup so a freshly-launched daemon populates the ledger
 //! before the user opens the dashboard; subsequent ticks run on cadence. Each
@@ -78,7 +78,21 @@ pub fn run_once(
     base_dir: &Path,
     now: chrono::DateTime<chrono::Utc>,
 ) -> WriteReport {
-    let pairs = match aggregator::aggregate(claude_home, base_dir, now, |slot: AccountNum| {
+    run_once_with_scanner(
+        claude_home,
+        base_dir,
+        now,
+        &mut aggregator::IncrementalScanner::default(),
+    )
+}
+
+fn run_once_with_scanner(
+    claude_home: &Path,
+    base_dir: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+    scanner: &mut aggregator::IncrementalScanner,
+) -> WriteReport {
+    let pairs = match scanner.aggregate(claude_home, base_dir, now, |slot: AccountNum| {
         crate::providers::settings::model_id_for_slot(base_dir, slot.get())
             .unwrap_or_else(|| DEFAULT_FALLBACK_MODEL.to_string())
     }) {
@@ -278,6 +292,27 @@ where
             shutdown.cancelled().await;
             return;
         };
+        let (requests, responses) = std::sync::mpsc::channel::<(
+            chrono::DateTime<chrono::Utc>,
+            tokio::sync::oneshot::Sender<WriteReport>,
+        )>();
+        // This OS thread is owned solely by the ledger aggregator. Do not set
+        // QoS on Tokio's reusable blocking pool: later credential work could
+        // otherwise inherit this thread's background priority.
+        let worker = spawn_aggregation_thread(move || {
+            let mut scanner = aggregator::IncrementalScanner::default();
+            while let Ok((now, reply)) = responses.recv() {
+                let report = run_once_with_scanner(&claude_home, &base_dir, now, &mut scanner);
+                let _ = reply.send(report);
+            }
+        });
+        if let Err(error) = worker {
+            warn!(
+                error_kind = "usage_ledger_worker_spawn",
+                "usage-ledger thread failed: {error}"
+            );
+            return; // supervisor detects an unexpected subsystem exit
+        }
         let mut ticker = tokio::time::interval(interval);
         // First tick fires immediately (tokio interval default), populating the
         // ledger at daemon startup. Delay (not Burst) on a missed tick so a
@@ -290,20 +325,11 @@ where
                     return;
                 }
                 _ = ticker.tick() => {
-                    let base = base_dir.clone();
-                    let home = claude_home.clone();
-                    let now = now_fn();
-                    // The scan is filesystem-heavy (~20s on a large host); keep
-                    // it off the async runtime's worker threads.
-                    let scan = tokio::task::spawn_blocking(move || {
-                        run_once(&home, &base, now)
-                    });
-                    // Race the scan against shutdown so cancellation is observed
-                    // MID-scan, not only at the top of the loop. spawn_blocking
-                    // runs to completion regardless (a blocking task cannot be
-                    // cancelled), so the detached task finishes its atomic write
-                    // harmlessly — we just stop waiting on it. No ledger is torn
-                    // (atomic_replace). (an internal ticket redteam R1 MEDIUM-3.)
+                    let (reply, scan) = tokio::sync::oneshot::channel();
+                    if requests.send((now_fn(), reply)).is_err() {
+                        warn!(error_kind = "usage_ledger_worker_stopped", "usage-ledger worker stopped");
+                        return;
+                    }
                     let report = tokio::select! {
                         _ = shutdown.cancelled() => {
                             debug!("usage-ledger-writer: shutdown during scan, exiting");
@@ -332,10 +358,92 @@ where
     WriterHandle { join }
 }
 
+fn spawn_aggregation_thread<F, R>(work: F) -> std::io::Result<std::thread::JoinHandle<R>>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    std::thread::Builder::new()
+        .name("csq-usage-ledger".into())
+        .spawn(move || {
+            aggregator_background_qos();
+            work()
+        })
+}
+
+/// Applies only to the current, dedicated aggregator thread, never pollers.
+fn aggregator_background_qos() {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn pthread_set_qos_class_self_np(class: u32, relative_priority: i32) -> i32;
+        }
+        // SAFETY: applies a documented QoS constant to the calling owned
+        // thread; no pointers or shared runtime scheduling state are changed.
+        let status = unsafe { pthread_set_qos_class_self_np(0x09, 0) }; // QOS_CLASS_BACKGROUND
+        if status != 0 {
+            warn!(
+                error_kind = "usage_ledger_qos",
+                status, "background aggregator QoS unavailable"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn perf_dedicated_aggregator_thread_background_qos_does_not_change_caller() {
+        unsafe extern "C" {
+            fn qos_class_self() -> u32;
+        }
+        // SAFETY: reads only the calling thread's documented Darwin QoS class.
+        let before = unsafe { qos_class_self() };
+        let parent = std::thread::current().id();
+        let (child, class, name) = spawn_aggregation_thread(|| {
+            (
+                std::thread::current().id(),
+                unsafe { qos_class_self() },
+                std::thread::current().name().map(str::to_owned),
+            )
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+        assert_ne!(child, parent);
+        assert_eq!(name.as_deref(), Some("csq-usage-ledger"));
+        assert_eq!(
+            class, 0x09,
+            "native owned worker must actually have QOS_CLASS_BACKGROUND"
+        );
+        assert_eq!(
+            unsafe { qos_class_self() },
+            before,
+            "caller/poller priority stays unchanged"
+        );
+        eprintln!("PERF_QOS worker_class={class} caller_class={before} separate_thread=true");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn perf_dedicated_owned_thread_adopts_native_background_qos() {
+        unsafe extern "C" {
+            fn qos_class_self() -> u32;
+        }
+        // New owned thread only; the test harness and Tokio workers stay normal.
+        let class = std::thread::spawn(|| {
+            aggregator_background_qos();
+            // SAFETY: read-only QoS query for the calling owned thread.
+            unsafe { qos_class_self() }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(class, 0x09, "native thread must actually adopt BACKGROUND");
+    }
 
     /// Builds a `~/.claude` + `~/.claude/accounts` pair under a tempdir and
     /// writes a CC transcript + a matching launch-log entry so the aggregator
@@ -509,7 +617,10 @@ mod tests {
             "ignored-transcript-has-model".to_string()
         })
         .unwrap();
-        assert_eq!(calls, 2);
+        // Both sessions attribute to ONE slot, and the fallback model is
+        // resolved once per slot per pass (`aggregate_resolves_fallback_model_
+        // once_per_slot_per_pass`), so the callback fires once for two events.
+        assert_eq!(calls, 1);
         assert_eq!(events.len(), 2);
         assert!(events
             .iter()

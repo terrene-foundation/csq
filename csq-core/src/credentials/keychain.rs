@@ -21,6 +21,8 @@
 //! On non-macOS platforms both read and write are no-op stubs: CC stores
 //! credentials in `<CLAUDE_CONFIG_DIR>/.credentials.json` directly there.
 
+pub mod orphans;
+
 use super::CredentialFile;
 use crate::error::PlatformError;
 use crate::types::AccountNum;
@@ -30,6 +32,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use tracing::warn;
 use unicode_normalization::UnicodeNormalization;
+use zeroize::{Zeroize, Zeroizing};
 
 /// True when the macOS keychain mirror MUST NOT shell `security` — every keychain
 /// read/write/delete becomes a no-op (absent item / pretend-success). Two triggers:
@@ -401,6 +404,7 @@ fn read_impl(service: &str, config_dir: &Path) -> Result<CredentialFile, Platfor
         PlatformError::Keychain("security unavailable (spawn failure or timeout)".to_string())
     })?;
 
+    let mut bo = SecretOutput::new(bo);
     if !bo.output.status.success() {
         return Err(read_impl_error_for_exit(bo.output.status.code()));
     }
@@ -425,22 +429,22 @@ fn read_impl(service: &str, config_dir: &Path) -> Result<CredentialFile, Platfor
     // includes), and the bytes it describes are the credential payload
     // itself. The `utf8` prefix is preserved so `keychain_error_kind`'s
     // `msg.starts_with("utf8")` classification is unaffected.
-    let raw = String::from_utf8(bo.output.stdout)
+    let raw = zeroizing_utf8(Zeroizing::new(std::mem::take(&mut bo.output.stdout)))
         .map_err(|_| PlatformError::Keychain("utf8 decode failed".to_string()))?;
     let raw = raw.trim();
 
     // CC writes raw JSON; older csq versions wrote hex-encoded JSON.
     // Try raw JSON first, fall back to hex-decode for legacy entries.
     let json = if raw.starts_with('{') {
-        raw.to_string()
+        Zeroizing::new(raw.to_owned())
     } else {
         // L-2: `FromHexError`'s `Display` can echo a character FROM THE
         // PAYLOAD (e.g. "invalid character 'x' at position N") — the
         // payload here is credential-adjacent, so no part of `e` may reach
         // an error string. Fixed vocabulary only (security.md MUST-2).
-        let bytes = hex::decode(raw)
+        let bytes = zeroizing_hex(raw)
             .map_err(|_| PlatformError::Keychain("hex decode failed".to_string()))?;
-        String::from_utf8(bytes)
+        zeroizing_utf8(bytes)
             .map_err(|_| PlatformError::Keychain("utf8 decode failed".to_string()))?
     };
 
@@ -797,11 +801,71 @@ fn sweep_sync_handle_dir(
     base: &Path,
     handle_dir: &Path,
     refreshed: &HashMap<AccountNum, crate::credentials::token_history::Fingerprint>,
-) -> Result<bool, PlatformError> {
-    if keychain_mirror_disabled_now() {
-        return Ok(false);
+) -> MirrorHandleObservation {
+    sweep_sync_handle_dir_context(base, handle_dir, refreshed, None, None)
+}
+
+#[cfg(target_os = "macos")]
+fn sweep_sync_handle_dir_context(
+    base: &Path,
+    handle_dir: &Path,
+    refreshed: &HashMap<AccountNum, crate::credentials::token_history::Fingerprint>,
+    login: Option<&crate::accounts::login::LoginMirrorContext>,
+    stamp: Option<&std::sync::Arc<()>>,
+) -> MirrorHandleObservation {
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(exec) = test_keychain_executor_override() {
+        return sweep_sync_handle_dir_observed_context(
+            &*exec, base, handle_dir, refreshed, login, stamp,
+        );
     }
-    sweep_sync_handle_dir_with_executor(&SecurityCliExecutor, base, handle_dir, refreshed)
+    if keychain_mirror_disabled_now() {
+        return MirrorHandleObservation {
+            result: Ok(false),
+            session: mirror_unknown_row(
+                handle_dir,
+                crate::credentials::session_login::LoginReason::KeychainDisabled,
+            ),
+            malformed: false,
+        };
+    }
+    sweep_sync_handle_dir_observed_context(
+        &SecurityCliExecutor,
+        base,
+        handle_dir,
+        refreshed,
+        login,
+        stamp,
+    )
+}
+
+struct MirrorHandleObservation {
+    result: Result<bool, PlatformError>,
+    session: crate::credentials::session_login::SessionLogin,
+    malformed: bool,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    static MIRROR_OBSERVATION_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn mirror_unknown_row(
+    handle: &Path,
+    reason: crate::credentials::session_login::LoginReason,
+) -> crate::credentials::session_login::SessionLogin {
+    let pid = crate::accounts::markers::read_live_pid(handle)
+        .or_else(|| {
+            handle
+                .file_name()?
+                .to_str()?
+                .strip_prefix("term-")?
+                .parse()
+                .ok()
+        })
+        .unwrap_or(0);
+    // Without the handle lock, never attribute this process to an account.
+    crate::credentials::session_login::SessionLogin::undetermined(pid, None, reason)
 }
 
 /// Executor-injected core of [`sweep_sync_handle_dir`] — no
@@ -810,111 +874,307 @@ fn sweep_sync_handle_dir(
 /// [`reconcile_keychain_to_marker_with_executor`]'s identical split, so a
 /// test can drive the real decision against a `RecordingExecutor` instead of
 /// every call being hermetically no-op'd under `cfg!(test)`.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 fn sweep_sync_handle_dir_with_executor(
     exec: &impl KeychainExecutor,
     base: &Path,
     handle_dir: &Path,
     refreshed: &HashMap<AccountNum, crate::credentials::token_history::Fingerprint>,
 ) -> Result<bool, PlatformError> {
-    if !crate::session::handle_dir::handle_dir_symlinks_are_consistent(base, handle_dir) {
-        return Ok(false);
-    }
-    let Some(account) = crate::accounts::markers::resolve_marker_to_slot(base, handle_dir) else {
-        warn!(
-            error_kind = "keychain_sweep_marker_unreadable",
-            "post-refresh keychain sweep: handle dir's marker could not be resolved; skipped"
+    sweep_sync_handle_dir_observed(exec, base, handle_dir, refreshed).result
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn sweep_sync_handle_dir_observed(
+    exec: &(impl KeychainExecutor + ?Sized),
+    base: &Path,
+    handle_dir: &Path,
+    refreshed: &HashMap<AccountNum, crate::credentials::token_history::Fingerprint>,
+) -> MirrorHandleObservation {
+    sweep_sync_handle_dir_observed_context(exec, base, handle_dir, refreshed, None, None)
+}
+
+#[cfg(target_os = "macos")]
+fn sweep_sync_handle_dir_observed_context(
+    exec: &(impl KeychainExecutor + ?Sized),
+    base: &Path,
+    handle_dir: &Path,
+    refreshed: &HashMap<AccountNum, crate::credentials::token_history::Fingerprint>,
+    login: Option<&crate::accounts::login::LoginMirrorContext>,
+    stamp: Option<&std::sync::Arc<()>>,
+) -> MirrorHandleObservation {
+    use crate::credentials::session_login::{LoginReason, SessionLogin};
+    let mut session = mirror_unknown_row(handle_dir, LoginReason::HandleInconsistent);
+    let mut malformed = false;
+    let result = (|| {
+        if crate::credentials::session_login::mirror_applicability(base, handle_dir)
+            != crate::credentials::session_login::MirrorApplicability::ClaudeOAuth
+        {
+            session.evidence.reason = LoginReason::MarkerUnresolved;
+            return Ok(false);
+        }
+        if !crate::session::handle_dir::handle_dir_symlinks_are_consistent(base, handle_dir) {
+            return Ok(false);
+        }
+        session.evidence.reason = LoginReason::MarkerUnresolved;
+        let Some(account) = crate::accounts::markers::resolve_marker_to_slot(base, handle_dir)
+        else {
+            tracing::debug!(
+                error_kind = "keychain_sweep_marker_unreadable",
+                "post-refresh keychain sweep: handle dir's marker could not be resolved; skipped"
+            );
+            return Ok(false);
+        };
+        let Some(binding) = capture_known_slot(base, account) else {
+            session.evidence.reason = LoginReason::OwnerChanged;
+            return Ok(false);
+        };
+        // No valid token to mirror (3P/Codex slot, unreadable, or expired) —
+        // leave whatever X holds; matches the pre-D2 `file_expiry: None` ->
+        // `SyncAction::Skip` behaviour exactly (this sweep never strips).
+        let target = crate::accounts::identity_store::target_token_for_forced_write(base, account);
+        session.account = Some(account);
+        session.evidence.reason = LoginReason::CanonicalUnavailable;
+        let Some(raw) = target.as_valid_str() else {
+            return Ok(false);
+        };
+        let svc = service_name(handle_dir);
+        let ours = keychain_account_for(handle_dir);
+        let x = exec.find(&svc, &ours);
+        // C-F1: widen recognition to the marker account's own token history —
+        // this is precisely what stops the sweep refusing forever against a
+        // terminal that missed one refresh (see this function's own doc + the
+        // module-level directive on `token_history`).
+        let history = crate::credentials::token_history::read_history_for_slot(base, account);
+        let owner_verified =
+            crate::credentials::token_history::read_owner_verified_for_slot(base, account);
+        // The witness whose retry-claim supplied `sweep_pre_refresh`, if any.
+        // The recognition below is lock-free bounded reads only (`prior_for`:
+        // custody snapshot + fresh grant digests), so the write arm
+        // RE-VALIDATES this witness's ORIGINAL custody under the ACTUAL held
+        // authority lock (`prior_for_locked`) before its prior may authorize
+        // the mutation.
+        let mut retained_prior_witness: Option<&crate::accounts::login::LoginMirrorContext> = None;
+        let sweep_pre_refresh = refreshed.get(&account).copied().or_else(|| {
+            login.and_then(|context| {
+                if !claim_login_mirror_attempt(base, account, context, stamp) {
+                    return None;
+                }
+                let prior = context.prior_for(base, account, raw)?;
+                retained_prior_witness = Some(context);
+                Some(prior)
+            })
+        });
+        let known = KnownTokens {
+            marker_account_canonical: Some(raw),
+            sweep_pre_refresh,
+            marker_account_history: &history,
+            marker_account_owner_verified: &owner_verified,
+            ..KnownTokens::default()
+        };
+        session = SessionLogin::from_evidence(
+            session.handle_pid,
+            Some(account),
+            crate::credentials::session_login::classify_login(&x, raw, &history, &owner_verified),
         );
-        return Ok(false);
-    };
-    // No valid token to mirror (3P/Codex slot, unreadable, or expired) —
-    // leave whatever X holds; matches the pre-D2 `file_expiry: None` ->
-    // `SyncAction::Skip` behaviour exactly (this sweep never strips).
-    let target = crate::accounts::identity_store::target_token_for_forced_write(base, account);
-    let Some(raw) = target.as_valid_str() else {
-        return Ok(false);
-    };
-    let svc = service_name(handle_dir);
-    let ours = keychain_account_for(handle_dir);
-    let x = exec.find(&svc, &ours);
-    // C-F1: widen recognition to the marker account's own token history —
-    // this is precisely what stops the sweep refusing forever against a
-    // terminal that missed one refresh (see this function's own doc + the
-    // module-level directive on `token_history`).
-    let history = crate::credentials::token_history::read_history_for_slot(base, account);
-    let known = KnownTokens {
-        marker_account_canonical: Some(raw),
-        sweep_pre_refresh: refreshed.get(&account).copied(),
-        marker_account_history: &history,
-        ..KnownTokens::default()
-    };
-    match decide_cc_keychain_write(&x, &known, Intended::Token(raw)) {
-        WriteDecision::NoWrite => Ok(false),
-        // Rule 3: the sweep does NOT harvest — that is the custodian tick's
-        // job. Skip and warn (fixed vocabulary; no path, no token bytes).
-        WriteDecision::RefuseUnharvested => {
-            warn!(
-                error_kind = "keychain_sweep_foreign_login_unharvested",
-                "post-refresh keychain sweep: item holds a login that matches no known \
+        let decision = decide_cc_keychain_write(&x, &known, Intended::Token(raw));
+        malformed = matches!(
+            decision,
+            WriteDecision::Unknown(WriteUnknownReason::MalformedOauth)
+        );
+        let result = match decision {
+            WriteDecision::NoWrite => Ok(false),
+            // Rule 3: the sweep does NOT harvest — that is the custodian tick's
+            // job. Skip and warn (fixed vocabulary; no path, no token bytes).
+            WriteDecision::RefuseUnharvested => {
+                // `svc_hash` is the non-secret 8-hex suffix of this session's
+                // keychain service name (a hash of the handle-dir path) — it lets
+                // an operator match the stuck terminal without a path, email or
+                // token ever being logged.
+                tracing::debug!(
+                    error_kind = "keychain_sweep_foreign_login_unharvested",
+                    svc_hash = quarantine_svc_hash(&svc),
+                    "post-refresh keychain sweep: item holds a login that matches no known \
                  account; skipped (harvesting happens on the custodian's own tick, not here)"
-            );
-            Ok(false)
-        }
-        // `keychain-fix-r11.md` S-M-3 residual: `raw` was already confirmed
-        // Valid by `target_token_for_forced_write` before this call — this
-        // backstop firing here would mean the token expired in the
-        // (sub-tick) window between that read and this decision. Genuine
-        // bug/race, not the ordinary "unharvested" case; skip and warn under
-        // its own tag rather than conflating the two.
-        WriteDecision::RefuseIntendedExpired => {
-            warn!(
-                error_kind = "keychain_sweep_intended_expired",
-                "post-refresh keychain sweep: the token this tick intended to mirror was \
+                );
+                Ok(false)
+            }
+            // `keychain-fix-r11.md` S-M-3 residual: `raw` was already confirmed
+            // Valid by `target_token_for_forced_write` before this call — this
+            // backstop firing here would mean the token expired in the
+            // (sub-tick) window between that read and this decision. Genuine
+            // bug/race, not the ordinary "unharvested" case; skip and warn under
+            // its own tag rather than conflating the two.
+            WriteDecision::RefuseIntendedExpired => {
+                tracing::debug!(
+                    error_kind = "keychain_sweep_intended_expired",
+                    "post-refresh keychain sweep: the token this tick intended to mirror was \
                  already expired at decision time; skipped"
-            );
-            Ok(false)
-        }
-        WriteDecision::Unknown(_) => {
-            warn!(
-                error_kind = "keychain_sweep_unclassified",
-                "post-refresh keychain sweep: item could not be classified; skipped"
-            );
-            Ok(false)
-        }
-        decision @ WriteDecision::Write(_) => {
-            match apply_cc_keychain_write(
-                exec, &svc, &ours, &x, decision, /* backfill_allowed */ true,
-            ) {
-                ApplyOutcome::Applied { .. } => Ok(true),
-                ApplyOutcome::AbsentWriteFailed | ApplyOutcome::WriteFailed => Err(
-                    PlatformError::Keychain("post-refresh keychain sweep write failed".to_string()),
-                ),
-                ApplyOutcome::NoOp => {
-                    unreachable!("apply_cc_keychain_write never no-ops a Write decision")
+                );
+                Ok(false)
+            }
+            WriteDecision::Unknown(WriteUnknownReason::MalformedOauth) => {
+                tracing::debug!(
+                    error_kind = "keychain_sweep_malformed_oauth",
+                    "keychain item is malformed; not retried"
+                );
+                Ok(false)
+            }
+            WriteDecision::Unknown(WriteUnknownReason::KeychainUnreadable) => {
+                tracing::debug!(
+                    error_kind = "keychain_sweep_unclassified",
+                    "post-refresh keychain sweep: item could not be classified; skipped"
+                );
+                Err(PlatformError::Keychain(
+                    "post-refresh keychain classification unavailable".to_string(),
+                ))
+            }
+            decision @ WriteDecision::Write(_) => {
+                let authority_guard = match lock_keychain_authority(base, &[&binding]) {
+                    Ok(guard) => guard,
+                    Err(refusal) => {
+                        session.evidence.reason = refusal.login_reason(LoginReason::OwnerChanged);
+                        warn!(
+                            error_kind = refusal.error_kind(),
+                            "keychain sweep refused because profile custody could not be held"
+                        );
+                        return Ok(false);
+                    }
+                };
+                // A prior recognized from the retained witness (lock-free at
+                // decision time) is re-checked under the ACTUAL held
+                // authority — original context/generation must still match
+                // (`prior_for_locked`; no nested acquisition — this IS the
+                // lock). A custody that moved between decision and apply is
+                // an owner-clause change: nothing is written.
+                if retained_prior_witness.is_some_and(|witness| {
+                    witness
+                        .prior_for_locked(&authority_guard, base, account, raw)
+                        .is_none()
+                }) {
+                    session.evidence.reason = LoginReason::OwnerChanged;
+                    warn!(
+                        error_kind = "keychain_sweep_retained_prior_custody_moved",
+                        "keychain sweep refused: the retained login witness's original \
+                         custody no longer matches under the apply authority"
+                    );
+                    return Ok(false);
+                }
+                match apply_cc_keychain_write(
+                    exec, &svc, &ours, &x, decision, /* backfill_allowed */ true,
+                ) {
+                    ApplyOutcome::Applied { .. } => {
+                        // No readback or claim about CC's cached adoption.
+                        session = SessionLogin::undetermined(
+                            session.handle_pid,
+                            Some(account),
+                            LoginReason::SnapshotUnavailable,
+                        );
+                        Ok(true)
+                    }
+                    ApplyOutcome::AbsentWriteFailed | ApplyOutcome::WriteFailed => {
+                        Err(PlatformError::Keychain(
+                            "post-refresh keychain sweep write failed".to_string(),
+                        ))
+                    }
+                    ApplyOutcome::NoOp => {
+                        unreachable!("apply_cc_keychain_write never no-ops a Write decision")
+                    }
                 }
             }
+            WriteDecision::StripAllowed => {
+                unreachable!("the sweep always passes Intended::Token, never Intended::Strip")
+            }
+        };
+        #[cfg(test)]
+        MIRROR_OBSERVATION_TEST_HOOK.with(|hook| {
+            if let Some(mut hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        let reason = if !std::fs::symlink_metadata(handle_dir).is_ok_and(|m| m.is_dir())
+            || !mirror_handle_is_live(handle_dir)
+            || crate::accounts::markers::resolve_marker_to_slot(base, handle_dir) != Some(account)
+            || !crate::session::handle_dir::handle_dir_symlinks_are_consistent(base, handle_dir)
+        {
+            Some(LoginReason::OwnerChanged)
+        } else if let Err(refusal) = binding_clause_check(base, &binding, true) {
+            // The identity-bearing clause moved (marker -> different slot, or
+            // the slot's identity/generation/context changed) — a true owner
+            // change. A busy/refused profiles lock is NOT a move: it reads as
+            // its own reason (`refusal.login_reason`).
+            Some(refusal.login_reason(LoginReason::OwnerChanged))
+        } else if crate::accounts::identity_store::target_token_for_forced_write(base, account)
+            .as_valid_str()
+            != Some(raw)
+        {
+            Some(LoginReason::CanonicalChanged)
+        } else if let Err(refusal) = binding_clause_check(base, &binding, false) {
+            // Identity clause still current AND the token byte-identical, but
+            // the whole binding moved: only the CREDENTIAL VERSION changed
+            // (e.g. a refresh rotating only the refresh token). The canonical
+            // credential moved — clause-specific CanonicalChanged, NOT
+            // OwnerChanged (v5 Darwin
+            // `mirror_retry_snapshot_rejects_each_changed_authority_clause`).
+            // Exact for `Known` AND validated `LegacyUnknown` bindings: a
+            // `Known`-gated predicate here was vacuously FALSE for legacy
+            // bindings, so this arm fired on every untouched legacy tick.
+            Some(refusal.login_reason(LoginReason::CanonicalChanged))
+        } else if crate::credentials::token_history::read_history_for_slot(base, account) != history
+        {
+            Some(LoginReason::HistoryChanged)
+        } else if crate::credentials::token_history::read_owner_verified_for_slot(base, account)
+            != owner_verified
+        {
+            Some(LoginReason::OwnerVerifiedChanged)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            session = SessionLogin::undetermined(session.handle_pid, None, reason);
         }
-        WriteDecision::StripAllowed => {
-            unreachable!("the sweep always passes Intended::Token, never Intended::Strip")
-        }
+        result
+    })();
+    MirrorHandleObservation {
+        result,
+        session,
+        malformed,
     }
 }
 
 /// Non-macOS: no OS keychain item exists to sync — matches the pre-D2 stub
 /// shape (the write side of this module is a no-op there entirely).
 #[cfg(not(target_os = "macos"))]
+fn sweep_sync_handle_dir_context(
+    base: &Path,
+    handle: &Path,
+    refreshed: &HashMap<AccountNum, crate::credentials::token_history::Fingerprint>,
+    _login: Option<&crate::accounts::login::LoginMirrorContext>,
+    _stamp: Option<&std::sync::Arc<()>>,
+) -> MirrorHandleObservation {
+    sweep_sync_handle_dir(base, handle, refreshed)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn sweep_sync_handle_dir(
     _base: &Path,
-    _handle_dir: &Path,
+    handle_dir: &Path,
     _refreshed: &HashMap<AccountNum, crate::credentials::token_history::Fingerprint>,
-) -> Result<bool, PlatformError> {
-    Ok(false)
+) -> MirrorHandleObservation {
+    MirrorHandleObservation {
+        result: Ok(false),
+        session: mirror_unknown_row(
+            handle_dir,
+            crate::credentials::session_login::LoginReason::KeychainDisabled,
+        ),
+        malformed: false,
+    }
 }
 
 /// Sync every `term-*` handle dir under `base_dir` (the accounts dir) — the
 /// shared sweep used by `csq keychain-sync`, `finalize_login`'s post-login
 /// mirror, and the daemon refresher's post-refresh pass. Returns `(synced,
-/// skipped, failed)`.
+/// safely_skipped, pending)`; operational lock/read/write misses are pending.
 ///
 /// `refreshed` (round 7c D2): this tick's pre-refresh identity per account —
 /// see `sweep_sync_handle_dir`'s doc. Callers with no refresh-tick context
@@ -930,88 +1190,1119 @@ pub fn sync_all_handle_dirs(
     base_dir: &Path,
     refreshed: &HashMap<AccountNum, crate::credentials::token_history::Fingerprint>,
 ) -> (usize, usize, usize) {
-    sync_all_handle_dirs_with(base_dir, &|d| sweep_sync_handle_dir(base_dir, d, refreshed))
+    let status = sync_all_handle_dirs_status(base_dir, refreshed);
+    (status.synced, status.skipped, status.pending)
 }
 
-/// [`sync_all_handle_dirs`] with the per-dir sync injected, so a test can
-/// observe which dir each visited call is synced with (round-10 mutation M8:
-/// the loop body was otherwise unreachable from tests).
+/// The same sweep with its actual outcome counters, without another snapshot read.
+pub(crate) fn sync_all_handle_dirs_status(
+    base_dir: &Path,
+    refreshed: &HashMap<AccountNum, crate::credentials::token_history::Fingerprint>,
+) -> MirrorSyncStatus {
+    sync_all_handle_dirs_context(base_dir, refreshed, None)
+}
+
+pub(crate) fn sync_all_handle_dirs_context(
+    base_dir: &Path,
+    refreshed: &HashMap<AccountNum, crate::credentials::token_history::Fingerprint>,
+    login: Option<&crate::accounts::login::LoginMirrorContext>,
+) -> MirrorSyncStatus {
+    sync_all_handle_dirs_owned(base_dir, refreshed, login, false)
+}
+
+/// Only the refresher's admitted pending sweep consumes retained producer witnesses.
+pub(crate) fn sync_pending_login_handle_dirs_status(base: &Path) -> MirrorSyncStatus {
+    sync_all_handle_dirs_owned(base, &HashMap::new(), None, true)
+}
+
+fn sync_all_handle_dirs_owned(
+    base_dir: &Path,
+    refreshed: &HashMap<AccountNum, crate::credentials::token_history::Fingerprint>,
+    login: Option<&crate::accounts::login::LoginMirrorContext>,
+    pending_login: bool,
+) -> MirrorSyncStatus {
+    let start = std::time::Instant::now();
+    let stamp = std::sync::Arc::new(());
+    let retained = if pending_login {
+        login_mirror_snapshot(base_dir)
+    } else {
+        HashMap::new()
+    };
+    let status = sync_all_handle_dirs_with_observations(
+        base_dir,
+        &|d| {
+            let queued = crate::accounts::markers::resolve_marker_to_slot(base_dir, d)
+                .and_then(|account| retained.get(&account));
+            let context = login.or(queued.map(|context| context.as_ref()));
+            if context.is_some() {
+                sweep_sync_handle_dir_context(
+                    base_dir,
+                    d,
+                    refreshed,
+                    context,
+                    pending_login.then_some(&stamp),
+                )
+            } else {
+                sweep_sync_handle_dir(base_dir, d, refreshed)
+            }
+        },
+        &lock_handle_dir_for_swap_bounded,
+        &mirror_handle_is_live,
+        &std::thread::sleep,
+        &save_mirror_sync_status,
+        &|| start.elapsed(),
+    );
+    finish_login_mirror_snapshot(base_dir, &retained, &status);
+    status
+}
+
+/// Last persisted sweep, not proof that CC adopted a token or that a refused
+/// foreign login agrees with the canonical account. Counts contain no secrets.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MirrorSyncStatus {
+    pub synced: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub lock_timed_out: usize,
+    pub lock_failed: usize,
+    pub deferred: usize,
+    pub malformed: usize,
+    pub sessions: Vec<crate::credentials::session_login::SessionLogin>,
+    pub sessions_undetermined: bool,
+    pub pending: usize,
+    pub updated_at_unix_ms: u64,
+    /// Scheduling hint only, never account/login evidence. Survives observation
+    /// truncation so an unrepresented suffix receives the next admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_admitted_pid: Option<u32>,
+}
+
+const MIRROR_STATUS_MAX_BYTES: usize = 131_072;
+const MIRROR_STATUS_MAX_SESSIONS: usize = 256;
+const MIRROR_SYNC_STATUS_FILE: &str = ".keychain-mirror-sync.json";
+// Refresher retry-state freshness only. Healthy idle ticks write no new
+// snapshot; operator diagnostics validate observed metadata instead of age.
+pub const MIRROR_SYNC_MAX_AGE_MS: u64 = 600_000;
+const MIRROR_SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+const MIRROR_SYNC_ATTEMPTS: usize = 2;
+const MIRROR_SYNC_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+// Fixed-size retry/scheduling hints per existing base entry; no handle queue,
+// account, credential, or diagnostic/login snapshot is retained here.
+#[derive(Clone, Copy)]
+struct MirrorRetryState {
+    login_pending_reason: Option<&'static str>,
+    pending: bool,
+    last_admitted_pid: Option<u32>,
+    updated_at_unix_ms: u64,
+    sweep_started_at: std::time::Instant,
+}
+
+static MIRROR_RETRY_PENDING: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, MirrorRetryState>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(target_os = "macos")]
+struct PendingLoginMirror {
+    context: std::sync::Arc<crate::accounts::login::LoginMirrorContext>,
+    attempts: u8,
+    last_sweep: Option<std::sync::Arc<()>>,
+}
+
+#[cfg(target_os = "macos")]
+static PENDING_LOGIN_MIRRORS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<(PathBuf, AccountNum), PendingLoginMirror>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(target_os = "macos")]
+fn request_login_mirror_retry(base: &Path, reason: &'static str) {
+    let generic = !matches!(reason, "login_saved" | "context_retained");
+    let mut pending = MIRROR_RETRY_PENDING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let entry = pending
+        .entry(base.to_path_buf())
+        .or_insert(MirrorRetryState {
+            login_pending_reason: None,
+            pending: true,
+            last_admitted_pid: None,
+            updated_at_unix_ms: now_ms(),
+            sweep_started_at: std::time::Instant::now(),
+        });
+    entry.pending = true;
+    entry.sweep_started_at = std::time::Instant::now();
+    if generic && entry.login_pending_reason != Some(reason) {
+        entry.login_pending_reason = Some(reason);
+        tracing::warn!(
+            event_kind = "cc_login_mirror_pending",
+            reason,
+            "login mirror authority unavailable; generic retry pending"
+        );
+    }
+}
+
+/// Enqueue no credential bytes or keychain work; the existing refresher owns admission.
+#[cfg(target_os = "macos")]
+pub(crate) fn queue_login_mirror(
+    base: &Path,
+    account: AccountNum,
+    context: Option<crate::accounts::login::LoginMirrorContext>,
+) {
+    let witnessed = context.is_some();
+    let mut pending = PENDING_LOGIN_MIRRORS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let key = (base.to_path_buf(), account);
+    if let Some(context) = context {
+        // Preserve the OLDEST VALID same-incoming witness. A repeated
+        // same-grant commit/finalize (e.g. a background exchange delivered
+        // twice) must NOT overwrite a retained (priorOLD, incomingFRESH)
+        // witness with (priorFRESH, incomingFRESH): after a client
+        // token-history reset the OLD native token is recognizable ONLY
+        // through the oldest witness's prior, so replacing it strands the
+        // client with a token the policy must refuse
+        // (v5 `oauth_exchange_background_mirrors_after_client_history_reset`).
+        // `current_for` is the exact continuity predicate the context
+        // exposes — same namespace, slot→UUID identity, the ORIGINAL custody
+        // generation/context the witness was built under, not expired, and
+        // the LIVE canonical still carrying THIS witness's incoming version.
+        // Anything failing it (different incoming grant, foreign namespace,
+        // expired, or an A→B→A custody move at the same UUID) is
+        // stale/foreign and IS replaced below — a same-UUID restoration must
+        // not retain an era-A prior (causal test:
+        // `queue_login_mirror_replaces_witness_after_slot_generation_move`;
+        // the witness-side binding is `bind_committed_custody` in
+        // accounts/login.rs).
+        // Its reads are openat/profiles file reads, never locks — safe while
+        // this queue mutex is held.
+        if pending
+            .get(&key)
+            .is_some_and(|existing| existing.context.current_for(base, account))
+        {
+            drop(pending);
+            request_login_mirror_retry(base, "login_saved");
+            return;
+        }
+        if pending.contains_key(&key) || pending.len() < 999 {
+            pending.insert(
+                key,
+                PendingLoginMirror {
+                    context: std::sync::Arc::new(context),
+                    attempts: 0,
+                    last_sweep: None,
+                },
+            );
+        } else {
+            drop(pending);
+            request_login_mirror_retry(base, "context_capacity");
+            return;
+        }
+    } else {
+        pending.remove(&key);
+    }
+    drop(pending);
+    request_login_mirror_retry(
+        base,
+        if witnessed {
+            "login_saved"
+        } else {
+            "context_absent"
+        },
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn queue_login_mirror(
+    _base: &Path,
+    _account: AccountNum,
+    _context: Option<crate::accounts::login::LoginMirrorContext>,
+) {
+}
+
+#[cfg(target_os = "macos")]
+fn claim_login_mirror_attempt(
+    base: &Path,
+    account: AccountNum,
+    context: &crate::accounts::login::LoginMirrorContext,
+    stamp: Option<&std::sync::Arc<()>>,
+) -> bool {
+    let Some(stamp) = stamp else {
+        return true;
+    };
+    let mut pending = PENDING_LOGIN_MIRRORS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let Some(entry) = pending
+        .get_mut(&(base.to_path_buf(), account))
+        .filter(|entry| std::ptr::eq(entry.context.as_ref(), context))
+    else {
+        return false;
+    };
+    if entry
+        .last_sweep
+        .as_ref()
+        .is_some_and(|old| std::sync::Arc::ptr_eq(old, stamp))
+    {
+        return true;
+    }
+    if entry.attempts >= 4 {
+        return false;
+    }
+    entry.attempts += 1;
+    entry.last_sweep = Some(stamp.clone());
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn login_mirror_snapshot(
+    base: &Path,
+) -> HashMap<AccountNum, std::sync::Arc<crate::accounts::login::LoginMirrorContext>> {
+    let snapshot = PENDING_LOGIN_MIRRORS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|((root, _), _)| root == base)
+        .map(|((_, account), pending)| (*account, pending.context.clone()))
+        .collect::<Vec<_>>();
+    let mut ready = HashMap::new();
+    for (account, context) in snapshot {
+        let valid = context.current_for(base, account);
+        let mut pending = PENDING_LOGIN_MIRRORS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let key = (base.to_path_buf(), account);
+        let Some(entry) = pending
+            .get_mut(&key)
+            .filter(|entry| std::sync::Arc::ptr_eq(&entry.context, &context))
+        else {
+            continue;
+        };
+        if valid && entry.attempts < 4 {
+            ready.insert(account, context);
+        } else {
+            pending.remove(&key);
+            drop(pending);
+            request_login_mirror_retry(
+                base,
+                if valid {
+                    "context_attempts_exhausted"
+                } else {
+                    "context_expired_or_changed"
+                },
+            );
+        }
+    }
+    ready
+}
+
+#[cfg(not(target_os = "macos"))]
+fn login_mirror_snapshot(
+    _base: &Path,
+) -> HashMap<AccountNum, std::sync::Arc<crate::accounts::login::LoginMirrorContext>> {
+    HashMap::new()
+}
+
+fn finish_login_mirror_snapshot(
+    base: &Path,
+    snapshot: &HashMap<AccountNum, std::sync::Arc<crate::accounts::login::LoginMirrorContext>>,
+    status: &MirrorSyncStatus,
+) {
+    #[cfg(target_os = "macos")]
+    {
+        use crate::credentials::session_login::LoginState;
+        let mut pending = PENDING_LOGIN_MIRRORS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if status.pending == 0 && !status.sessions_undetermined {
+            for (account, context) in snapshot {
+                let rows = status
+                    .sessions
+                    .iter()
+                    .filter(|row| row.account == Some(*account))
+                    .collect::<Vec<_>>();
+                if !rows.is_empty()
+                    && rows
+                        .iter()
+                        .all(|row| row.evidence.state == LoginState::Current)
+                {
+                    let key = (base.to_path_buf(), *account);
+                    if pending
+                        .get(&key)
+                        .is_some_and(|entry| std::sync::Arc::ptr_eq(&entry.context, context))
+                    {
+                        pending.remove(&key);
+                    }
+                }
+            }
+        }
+        let retained = pending.keys().any(|(root, _)| root == base);
+        drop(pending);
+        if retained {
+            request_login_mirror_retry(base, "context_retained");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (base, snapshot, status);
+}
+
+/// Read-only, bounded observation. Missing, malformed or unpersisted state is
+/// UNKNOWN; this never probes the OS keychain or starts a repair.
+pub fn read_mirror_sync_status(base_dir: &Path) -> Option<MirrorSyncStatus> {
+    let status = read_mirror_sync_observation(base_dir)?;
+    (now_ms().checked_sub(status.updated_at_unix_ms)? <= MIRROR_SYNC_MAX_AGE_MS).then_some(status)
+}
+
+/// Validated historical, token-free observation. Operator diagnostics show age
+/// and invalidate changed metadata; refresher retry-state freshness is separate.
+pub fn read_mirror_sync_observation(base_dir: &Path) -> Option<MirrorSyncStatus> {
+    let status = read_mirror_status_validated(base_dir)?;
+    if status.pending == 0
+        && MIRROR_RETRY_PENDING
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(base_dir)
+            .is_some_and(|state| state.pending)
+    {
+        return None;
+    }
+    Some(status)
+}
+
+fn read_mirror_status_validated(base_dir: &Path) -> Option<MirrorSyncStatus> {
+    let raw = read_bounded_sentinel(
+        &base_dir.join(MIRROR_SYNC_STATUS_FILE),
+        (MIRROR_STATUS_MAX_BYTES + 1) as u64,
+    )?;
+    if raw.len() > MIRROR_STATUS_MAX_BYTES {
+        return None;
+    }
+    let status: MirrorSyncStatus = serde_json::from_str(&raw).ok()?;
+    if status.last_admitted_pid == Some(0)
+        || status.sessions.len() > MIRROR_STATUS_MAX_SESSIONS
+        || !status
+            .sessions
+            .iter()
+            .all(crate::credentials::session_login::SessionLogin::is_valid)
+        || (!status.sessions_undetermined
+            && status.sessions.iter().any(|row| {
+                row.evidence.state == crate::credentials::session_login::LoginState::Undetermined
+            }))
+        || status.updated_at_unix_ms == 0
+        || status.updated_at_unix_ms > now_ms()
+        || status
+            .failed
+            .checked_add(status.lock_timed_out)?
+            .checked_add(status.lock_failed)?
+            .checked_add(status.deferred)?
+            != status.pending
+    {
+        return None;
+    }
+    Some(status)
+}
+
+/// Pending work only: no OS lock probe or restart catch-up on the short wakeup.
+pub(crate) fn mirror_sync_retry_requested(base_dir: &Path) -> bool {
+    MIRROR_RETRY_PENDING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(base_dir)
+        .is_some_and(|state| state.pending)
+        || read_mirror_sync_status(base_dir).is_some_and(|status| status.pending > 0)
+}
+
+pub(crate) fn mirror_sync_retry_due(base_dir: &Path) -> bool {
+    #[cfg(all(target_os = "macos", not(any(test, feature = "test-utils"))))]
+    if keychain_lock_state(bounded_default_keychain_lock_probe) == KeychainLockState::Locked {
+        note_keychain_deferral();
+        return false;
+    }
+    let process_state = MIRROR_RETRY_PENDING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(base_dir)
+        .copied();
+    if process_state.is_some_and(|state| state.pending) {
+        return true;
+    }
+    match read_mirror_sync_status(base_dir) {
+        Some(status) if process_state.is_some() => status.pending > 0,
+        // One catch-up in this process even if disk holds an older green row:
+        // the previous process may have failed to persist its last miss. An
+        // empty base must not start an idle keychain sweep.
+        None if process_state.is_some_and(|state| !state.pending) => false,
+        _ => std::fs::read_dir(base_dir).ok().is_some_and(|rd| {
+            rd.flatten().any(|e| {
+                e.file_name().to_string_lossy().starts_with("term-")
+                    && e.file_type().is_ok_and(|t| t.is_dir())
+            })
+        }),
+    }
+}
+
+fn mirror_handle_is_live(handle_dir: &Path) -> bool {
+    crate::accounts::markers::read_live_pid(handle_dir)
+        .or_else(|| {
+            handle_dir
+                .file_name()?
+                .to_str()?
+                .strip_prefix("term-")?
+                .parse()
+                .ok()
+        })
+        .filter(|pid| *pid > 0)
+        .is_some_and(crate::platform::process::is_pid_alive)
+}
+
+/// Fixed-vocabulary diagnostic for a failed status write: WHICH step failed and
+/// its errno, never a path and never an error's `Display` (which can carry one;
+/// `security.md` MUST-2). Emitted at DEBUG: the sweep's single default-WARN
+/// summary (`cc_keychain_mirror_sweep_completed`, `publication_ok=false`) is the
+/// one warn a failed publication may emit — pinned by
+/// `mirror_sweep_telemetry_tests::actual_publication_failure_has_only_one_default_warn_summary`
+/// — and this event carries the detail beneath it.
+fn note_mirror_status_write_failure(step: &'static str, contended: bool, errno: Option<i32>) {
+    tracing::debug!(
+        error_kind = "keychain_mirror_status_write_failed",
+        step,
+        contended,
+        errno,
+        "keychain mirror status could not be persisted; retry remains pending"
+    );
+}
+
+/// The errno of a [`PlatformError`]'s I/O cause, for the fixed-vocabulary
+/// diagnostic above. The error's own `Display` is never logged.
+fn note_platform_errno(err: &crate::error::PlatformError) -> Option<i32> {
+    match err {
+        crate::error::PlatformError::Io(io) => io.raw_os_error(),
+        _ => None,
+    }
+}
+
+fn save_mirror_sync_status(base_dir: &Path, status: &MirrorSyncStatus) -> bool {
+    let target = base_dir.join(MIRROR_SYNC_STATUS_FILE);
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let writer_lock = match options.open(base_dir.join(".keychain-mirror-status.lock")) {
+        Ok(file) => file,
+        Err(err) => {
+            note_mirror_status_write_failure("open_lock", false, err.raw_os_error());
+            return false;
+        }
+    };
+    match writer_lock.metadata() {
+        Ok(md) if md.is_file() => {}
+        Ok(_) => {
+            note_mirror_status_write_failure("lock_not_a_file", false, None);
+            return false;
+        }
+        Err(err) => {
+            note_mirror_status_write_failure("lock_metadata", false, err.raw_os_error());
+            return false;
+        }
+    }
+    if let Err(err) = writer_lock.try_lock() {
+        let (contended, io) = match &err {
+            std::fs::TryLockError::WouldBlock => (true, None),
+            std::fs::TryLockError::Error(io) => (false, Some(io)),
+        };
+        note_mirror_status_write_failure(
+            "lock_flock",
+            contended,
+            io.and_then(std::io::Error::raw_os_error),
+        );
+        return false;
+    }
+    // An older-started sweep cannot replace a newer completed observation.
+    if read_mirror_status_validated(base_dir)
+        .is_some_and(|old| old.updated_at_unix_ms > status.updated_at_unix_ms)
+    {
+        return true;
+    }
+    let tmp = crate::platform::fs::unique_tmp_path(&target);
+    let Ok(json) = serde_json::to_vec(status) else {
+        note_mirror_status_write_failure("serialize", false, None);
+        return false;
+    };
+    if json.len() > MIRROR_STATUS_MAX_BYTES {
+        note_mirror_status_write_failure("oversize", false, None);
+        return false;
+    }
+    let failure = match std::fs::write(&tmp, json) {
+        Err(err) => {
+            note_mirror_status_write_failure("write_tmp", false, err.raw_os_error());
+            true
+        }
+        Ok(()) => match crate::platform::fs::secure_file(&tmp) {
+            Err(err) => {
+                note_mirror_status_write_failure("secure_tmp", false, note_platform_errno(&err));
+                true
+            }
+            Ok(()) => match crate::platform::fs::atomic_replace(&tmp, &target) {
+                Err(err) => {
+                    note_mirror_status_write_failure(
+                        "rename_status",
+                        false,
+                        note_platform_errno(&err),
+                    );
+                    true
+                }
+                Ok(()) => false,
+            },
+        },
+    };
+    if failure {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    !failure
+}
+
+/// The lock and sync are acquired afresh for each attempt; sync re-resolves
+/// the marker and current canonical under that lock through the SAME policy.
+#[cfg(test)]
 fn sync_all_handle_dirs_with(
     base_dir: &Path,
     sync: &dyn Fn(&Path) -> Result<bool, PlatformError>,
-) -> (usize, usize, usize) {
-    let (mut synced, mut skipped, mut failed) = (0usize, 0usize, 0usize);
-    let rd = match std::fs::read_dir(base_dir) {
-        Ok(rd) => rd,
-        Err(_) => return (0, 0, 0),
+    lock: &dyn Fn(&Path) -> BoundedLockOutcome,
+    is_live: &dyn Fn(&Path) -> bool,
+    wait: &dyn Fn(std::time::Duration),
+) -> MirrorSyncStatus {
+    sync_all_handle_dirs_with_persistence(
+        base_dir,
+        sync,
+        lock,
+        is_live,
+        wait,
+        &save_mirror_sync_status,
+    )
+}
+
+#[cfg(test)]
+fn sync_all_handle_dirs_with_persistence(
+    base_dir: &Path,
+    sync: &dyn Fn(&Path) -> Result<bool, PlatformError>,
+    lock: &dyn Fn(&Path) -> BoundedLockOutcome,
+    is_live: &dyn Fn(&Path) -> bool,
+    wait: &dyn Fn(std::time::Duration),
+    persist: &dyn Fn(&Path, &MirrorSyncStatus) -> bool,
+) -> MirrorSyncStatus {
+    let start = std::time::Instant::now();
+    sync_all_handle_dirs_with_budget(base_dir, sync, lock, is_live, wait, persist, &|| {
+        start.elapsed()
+    })
+}
+
+#[cfg(test)]
+fn sync_all_handle_dirs_with_budget(
+    base_dir: &Path,
+    sync: &dyn Fn(&Path) -> Result<bool, PlatformError>,
+    lock: &dyn Fn(&Path) -> BoundedLockOutcome,
+    is_live: &dyn Fn(&Path) -> bool,
+    wait: &dyn Fn(std::time::Duration),
+    persist: &dyn Fn(&Path, &MirrorSyncStatus) -> bool,
+    elapsed: &dyn Fn() -> std::time::Duration,
+) -> MirrorSyncStatus {
+    sync_all_handle_dirs_with_observations(
+        base_dir,
+        &|handle| MirrorHandleObservation {
+            result: sync(handle),
+            session: mirror_unknown_row(
+                handle,
+                crate::credentials::session_login::LoginReason::SnapshotUnavailable,
+            ),
+            malformed: false,
+        },
+        lock,
+        is_live,
+        wait,
+        persist,
+        elapsed,
+    )
+}
+
+// Cursor identity comes from the stable directory name, not mutable live-PID
+// or account markers. All policy metadata is still re-resolved under the lock.
+fn mirror_sweep_pid(handle: &Path) -> Option<u32> {
+    handle
+        .file_name()?
+        .to_str()?
+        .strip_prefix("term-")?
+        .parse()
+        .ok()
+        .filter(|pid| *pid > 0)
+}
+
+fn mirror_sweep_order_key(
+    handle: &Path,
+    previous: Option<&MirrorSyncStatus>,
+) -> (bool, bool, u32, std::ffi::OsString) {
+    use crate::credentials::session_login::LoginReason;
+    let pid = mirror_sweep_pid(handle);
+    let cursor = previous.and_then(|old| old.last_admitted_pid);
+    // Legacy snapshots lack a cursor: retain their first-next deferred priority.
+    // Once present, the cursor includes unrepresented suffixes in that priority
+    // instead of repeatedly admitting only the bounded diagnostic prefix.
+    let legacy_deferred = cursor.is_none()
+        && previous.is_some_and(|old| {
+            old.sessions.iter().any(|row| {
+                Some(row.handle_pid) == pid && row.evidence.reason == LoginReason::SweepBudget
+            })
+        });
+    (
+        !legacy_deferred,
+        pid.is_none() || cursor.is_some_and(|last| pid.is_some_and(|pid| pid <= last)),
+        pid.unwrap_or(u32::MAX),
+        handle.file_name().unwrap_or_default().to_os_string(),
+    )
+}
+
+static MIRROR_RUN_EPOCH: std::sync::LazyLock<u64> = std::sync::LazyLock::new(now_ms);
+static MIRROR_SWEEP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+enum MirrorUncertainty {
+    ScanUnknown,
+    CoverageLimit,
+    OwnerUnknown,
+    ObservationUnknown,
+}
+
+fn sync_all_handle_dirs_with_observations(
+    base_dir: &Path,
+    sync: &dyn Fn(&Path) -> MirrorHandleObservation,
+    lock: &dyn Fn(&Path) -> BoundedLockOutcome,
+    is_live: &dyn Fn(&Path) -> bool,
+    wait: &dyn Fn(std::time::Duration),
+    persist: &dyn Fn(&Path, &MirrorSyncStatus) -> bool,
+    elapsed: &dyn Fn() -> std::time::Duration,
+) -> MirrorSyncStatus {
+    use crate::credentials::session_login::LoginReason;
+    let sweep_started_at = std::time::Instant::now();
+    let mut status = MirrorSyncStatus {
+        updated_at_unix_ms: now_ms(),
+        ..Default::default()
     };
-    for entry in rd.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
+    let mut previous = read_mirror_status_validated(base_dir);
+    let process_state = MIRROR_RETRY_PENDING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(base_dir)
+        .copied();
+    // This synthetic predecessor is used ONLY to order admissions. A failed
+    // publication still leaves diagnostic observations UNKNOWN. Prefer newer
+    // disk progress; equal-ms process progress is the last completed hint here.
+    if let Some(state) = process_state.filter(|state| {
+        previous
+            .as_ref()
+            .is_none_or(|old| state.updated_at_unix_ms >= old.updated_at_unix_ms)
+    }) {
+        if state.last_admitted_pid.is_some() {
+            previous
+                .get_or_insert_with(MirrorSyncStatus::default)
+                .last_admitted_pid = state.last_admitted_pid;
         }
-        if !entry.file_name().to_string_lossy().starts_with("term-") {
-            continue;
+    }
+    status.last_admitted_pid = previous.as_ref().and_then(|old| old.last_admitted_pid);
+    let sweep_sequence = MIRROR_SWEEP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let reasons = std::cell::Cell::new([0usize; 4]);
+    let uncertain = |reason: MirrorUncertainty| {
+        let mut counts = reasons.get();
+        counts[reason as usize] += 1;
+        reasons.set(counts);
+    };
+    let mut admitted_position = 0;
+    match std::fs::read_dir(base_dir) {
+        Err(_) => {
+            status.failed += 1;
+            status.sessions_undetermined = true;
+            uncertain(MirrorUncertainty::ScanUnknown);
         }
-        // CC hashes the canonicalized CLAUDE_CONFIG_DIR path (the value `csq run`
-        // exports); canonicalize so the service name matches. On canonicalize
-        // failure the non-canonical path would hash differently and write a stray
-        // item CC never reads — count it as skipped rather than a false "synced".
-        let abs = match std::fs::canonicalize(&path) {
-            Ok(p) => p,
-            Err(_) => {
-                skipped += 1;
-                continue;
-            }
-        };
-        // S3/bounded-lock (kc-simplify-brief): hold the per-handle-dir swap
-        // lock across this dir's whole read (X's classification) -> write
-        // (X updated in place), same as `csq run`/`csq exec`/`csq
-        // swap`/auto_rotate — so this periodic sweep cannot interleave its
-        // RMW with a concurrent `csq swap` or auto-rotation repointing
-        // this SAME dir.
-        //
-        // BOUNDED (round 2): a sweep iterates EVERY live handle dir in one
-        // call — blocking indefinitely on ONE stuck lock would starve
-        // every OTHER dir behind it. Same ~20.25s ceiling as the
-        // interactive callers; on timeout this dir's mirror is SKIPPED
-        // (counted, never silently dropped) with a fixed-tag warn and the
-        // sweep moves on to the next dir.
-        match lock_handle_dir_for_swap_bounded(&abs) {
-            BoundedLockOutcome::Acquired(_keychain_guard) => match sync(&abs) {
-                Ok(true) => synced += 1,
-                Ok(false) => skipped += 1,
-                Err(_) => failed += 1,
-            },
-            // R7-4: non-macOS never reaches here in practice (this fn's
-            // production caller is macOS-gated), but proceeds exactly as
-            // pre-v3 with no warn if it ever does.
-            BoundedLockOutcome::NotNeeded => match sync(&abs) {
-                Ok(true) => synced += 1,
-                Ok(false) => skipped += 1,
-                Err(_) => failed += 1,
-            },
-            BoundedLockOutcome::TimedOut => {
-                skipped += 1;
-                warn!(
-                    error_kind = "keychain_sync_lock_timed_out",
-                    "sync_all_handle_dirs: could not acquire the per-handle-dir keychain \
-                     lock within the bound for one dir; skipped this tick (non-fatal — \
-                     retried on the next sweep)"
-                );
-            }
-            BoundedLockOutcome::Failed => {
-                skipped += 1;
-                warn!(
-                    error_kind = "keychain_sync_lock_failed",
-                    "sync_all_handle_dirs: the per-handle-dir keychain lock file itself \
-                     could not be opened/locked for one dir (not ordinary contention); \
-                     skipped this tick"
-                );
+        Ok(rd) => {
+            let mut entries = rd.collect::<Vec<_>>();
+            entries.sort_by_key(|entry| {
+                entry
+                    .as_ref()
+                    .ok()
+                    .map(|entry| mirror_sweep_order_key(&entry.path(), previous.as_ref()))
+            });
+            for (position, entry) in entries.into_iter().enumerate() {
+                let Ok(entry) = entry else {
+                    status.failed += 1;
+                    status.sessions_undetermined = true;
+                    uncertain(MirrorUncertainty::ScanUnknown);
+                    continue;
+                };
+                if !entry.file_name().to_string_lossy().starts_with("term-")
+                    || !entry.file_type().is_ok_and(|t| t.is_dir())
+                {
+                    continue;
+                }
+                let path = entry.path();
+                if crate::credentials::session_login::mirror_applicability(base_dir, &path)
+                    == crate::credentials::session_login::MirrorApplicability::NotApplicable
+                {
+                    continue;
+                }
+                let mut session = mirror_unknown_row(&path, LoginReason::SnapshotUnavailable);
+                for attempt in 0..MIRROR_SYNC_ATTEMPTS {
+                    if elapsed() >= MIRROR_SWEEP_BUDGET {
+                        status.deferred += 1;
+                        session.evidence.reason = LoginReason::SweepBudget;
+                        break;
+                    }
+                    let attempt_started = elapsed();
+                    let Ok(abs) = std::fs::canonicalize(&path) else {
+                        status.skipped += 1;
+                        break;
+                    };
+                    if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) || !is_live(&abs)
+                    {
+                        status.skipped += 1;
+                        break;
+                    }
+                    if attempt == 0 {
+                        if let Some(pid) = mirror_sweep_pid(&path) {
+                            status.last_admitted_pid = Some(pid);
+                            admitted_position = position + 1;
+                        }
+                    }
+                    // Keep the RAII lock alive until the current marker/policy/write
+                    // completes, including a second liveness check after lock wait.
+                    let guard = lock(&abs);
+                    let result = match &guard {
+                        BoundedLockOutcome::Acquired(_) | BoundedLockOutcome::NotNeeded => {
+                            if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir())
+                                || !is_live(&abs)
+                            {
+                                status.skipped += 1;
+                                break;
+                            }
+                            if elapsed() >= MIRROR_SWEEP_BUDGET {
+                                status.deferred += 1;
+                                session.evidence.reason = LoginReason::SweepBudget;
+                                break;
+                            }
+                            let observation = sync(&abs);
+                            session = observation.session;
+                            status.malformed += usize::from(observation.malformed);
+                            match observation.result {
+                                Ok(true) => {
+                                    status.synced += 1;
+                                    break;
+                                }
+                                Ok(false) => {
+                                    status.skipped += 1;
+                                    break;
+                                }
+                                Err(_) => 0,
+                            }
+                        }
+                        BoundedLockOutcome::TimedOut => 1,
+                        BoundedLockOutcome::Failed => 2,
+                    };
+                    drop(guard);
+                    let fast = elapsed().saturating_sub(attempt_started) < KEYCHAIN_OP_TIMEOUT / 2;
+                    if result != 1
+                        && (result == 2 || fast)
+                        && attempt + 1 < MIRROR_SYNC_ATTEMPTS
+                        && elapsed().saturating_add(MIRROR_SYNC_RETRY_DELAY) < MIRROR_SWEEP_BUDGET
+                    {
+                        wait(MIRROR_SYNC_RETRY_DELAY);
+                    } else {
+                        match result {
+                            1 => {
+                                status.lock_timed_out += 1;
+                                session.evidence.reason = LoginReason::LockTimeout;
+                                tracing::debug!(
+                                    error_kind = "keychain_sync_lock_timed_out",
+                                    "keychain mirror lock timed out; pending for next tick"
+                                );
+                            }
+                            2 => {
+                                status.lock_failed += 1;
+                                session.evidence.reason = LoginReason::LockFailed;
+                                tracing::debug!(
+                                    error_kind = "keychain_sync_lock_failed",
+                                    "keychain mirror lock failed; pending for next tick"
+                                );
+                            }
+                            _ => status.failed += 1,
+                        }
+                        break;
+                    }
+                }
+                if status.sessions.len() >= MIRROR_STATUS_MAX_SESSIONS {
+                    // Observation retention is bounded; execution eligibility is
+                    // independent. Counts and the cursor still cover this handle.
+                    status.sessions_undetermined = true;
+                    uncertain(MirrorUncertainty::CoverageLimit);
+                } else if session.handle_pid > 0 && is_live(&path) {
+                    status.sessions_undetermined |= session.evidence.state
+                        == crate::credentials::session_login::LoginState::Undetermined;
+                    if session.evidence.state
+                        == crate::credentials::session_login::LoginState::Undetermined
+                    {
+                        uncertain(MirrorUncertainty::ObservationUnknown);
+                    }
+                    status.sessions.push(session);
+                } else {
+                    status.sessions_undetermined = true;
+                    uncertain(MirrorUncertainty::OwnerUnknown);
+                }
             }
         }
     }
-    (synced, skipped, failed)
+    status.pending = status.failed + status.lock_timed_out + status.lock_failed + status.deferred;
+    let persisted = persist(base_dir, &status);
+    if !persisted {
+        // Best effort invalidation is cross-process: no old green observation
+        // is deliberately retained. Permissions/filesystem failures can still
+        // prevent deletion; freshness rejection remains an independent bound.
+        if !read_mirror_status_validated(base_dir)
+            .is_some_and(|old| old.updated_at_unix_ms > status.updated_at_unix_ms)
+        {
+            let _ = std::fs::remove_file(base_dir.join(MIRROR_SYNC_STATUS_FILE));
+        }
+    }
+    // A stale completing sweep must not replace newer disk/process progress.
+    let newer = read_mirror_status_validated(base_dir)
+        .filter(|old| old.updated_at_unix_ms > status.updated_at_unix_ms);
+    let progress = newer.as_ref().unwrap_or(&status);
+    let reasons = reasons.get();
+    if status.pending > 0 || status.sessions_undetermined || !persisted {
+        tracing::warn!(
+            event_kind = "cc_keychain_mirror_sweep_completed",
+            run_epoch_ms = *MIRROR_RUN_EPOCH,
+            process_id = std::process::id(),
+            sweep_sequence,
+            elapsed_ms = sweep_started_at.elapsed().as_millis() as u64,
+            budget_ms = MIRROR_SWEEP_BUDGET.as_millis() as u64,
+            admitted_position,
+            cursor_present = status.last_admitted_pid.is_some(),
+            sessions_undetermined = status.sessions_undetermined,
+            pending = status.pending,
+            synced = status.synced,
+            skipped = status.skipped,
+            failed = status.failed,
+            deferred = status.deferred,
+            lock_timed_out = status.lock_timed_out,
+            lock_failed = status.lock_failed,
+            malformed = status.malformed,
+            publication_ok = persisted,
+            scan_unknown = reasons[MirrorUncertainty::ScanUnknown as usize],
+            coverage_unknown = reasons[MirrorUncertainty::CoverageLimit as usize],
+            owner_unknown = reasons[MirrorUncertainty::OwnerUnknown as usize],
+            observation_unknown = reasons[MirrorUncertainty::ObservationUnknown as usize],
+            sync_failed = status.failed - reasons[MirrorUncertainty::ScanUnknown as usize],
+        );
+    }
+    let login_pending_reason = if !status.sessions_undetermined
+        && !status.sessions.is_empty()
+        && status
+            .sessions
+            .iter()
+            .all(|row| row.evidence.state == crate::credentials::session_login::LoginState::Current)
+    {
+        None
+    } else {
+        process_state.and_then(|state| state.login_pending_reason)
+    };
+    retain_mirror_retry_state(
+        base_dir,
+        MirrorRetryState {
+            login_pending_reason,
+            pending: status.pending > 0 || !persisted || login_pending_reason.is_some(),
+            last_admitted_pid: progress.last_admitted_pid,
+            updated_at_unix_ms: progress.updated_at_unix_ms,
+            sweep_started_at,
+        },
+    );
+    status
+}
+
+fn retain_mirror_retry_state(base_dir: &Path, state: MirrorRetryState) {
+    let mut pending = MIRROR_RETRY_PENDING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let entry = pending.entry(base_dir.to_path_buf()).or_insert(state);
+    // Wall time orders validated disk observations only. Monotonic starts
+    // keep current process progress moving across backward clock corrections
+    // while preventing an older completing sweep from replacing newer work.
+    if state.sweep_started_at >= entry.sweep_started_at {
+        *entry = state;
+    }
+}
+
+/// Reads directly into a guarded buffer, including partial I/O and UTF-8 failures.
+pub(crate) fn read_zeroizing_utf8(path: &Path) -> std::io::Result<Zeroizing<String>> {
+    read_zeroizing_utf8_from(std::fs::File::open(path)?)
+}
+
+fn read_zeroizing_utf8_from(mut reader: impl std::io::Read) -> std::io::Result<Zeroizing<String>> {
+    let mut bytes = Zeroizing::new(Vec::new());
+    reader.read_to_end(&mut bytes)?;
+    zeroizing_utf8(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )
+    })
+}
+
+/// The inspection result is independent of the borrowed tree's lifetime.
+/// Owned/partial parsed trees remain guarded; fingerprint callers return a digest only.
+pub(crate) fn inspect_secret_json<T>(
+    raw: &str,
+    inspect: impl FnOnce(&serde_json::Value) -> T,
+) -> Option<T> {
+    let value = serde_json::from_str::<SecretJson>(raw).ok()?;
+    Some(inspect(&value.0))
+}
+
+/// Owns UTF-8 conversion buffers on both success and invalid-byte paths.
+pub(crate) fn zeroizing_utf8(mut bytes: Zeroizing<Vec<u8>>) -> Result<Zeroizing<String>, ()> {
+    match String::from_utf8(std::mem::take(&mut *bytes)) {
+        Ok(raw) => Ok(Zeroizing::new(raw)),
+        Err(error) => {
+            let _bytes = Zeroizing::new(error.into_bytes());
+            Err(())
+        }
+    }
+}
+
+fn zeroizing_hex(raw: &str) -> Result<Zeroizing<Vec<u8>>, ()> {
+    let mut bytes = Zeroizing::new(vec![0; raw.len() / 2]);
+    hex::decode_to_slice(raw, &mut bytes).map_err(|_| ())?;
+    Ok(bytes)
+}
+
+fn zeroizing_json(value: &serde_json::Value) -> Result<Zeroizing<String>, serde_json::Error> {
+    let mut bytes = Zeroizing::new(Vec::new());
+    serde_json::to_writer(&mut *bytes, value)?;
+    zeroizing_utf8(bytes)
+        .map_err(|_| <serde_json::Error as serde::ser::Error>::custom("JSON encoding failed"))
+}
+
+// JSON subtrees are guarded during parsing as well as merging, so rejecting a
+// malformed suffix does not drop already-parsed credential strings unwiped.
+#[derive(Default)]
+struct SecretJson(serde_json::Value);
+impl SecretJson {
+    fn is_empty(&self) -> bool {
+        self.as_object().is_none_or(|object| object.is_empty())
+    }
+    #[cfg(all(test, target_os = "macos"))]
+    fn contains_key(&self, key: &str) -> bool {
+        self.as_object()
+            .is_some_and(|object| object.contains_key(key))
+    }
+}
+impl std::ops::Deref for SecretJson {
+    type Target = serde_json::Value;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for SecretJson {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+fn wipe_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => s.zeroize(),
+        serde_json::Value::Array(values) => values.iter_mut().for_each(wipe_json),
+        serde_json::Value::Object(values) => {
+            for (mut key, mut value) in std::mem::take(values) {
+                key.zeroize();
+                wipe_json(&mut value);
+            }
+        }
+        _ => {}
+    }
+}
+impl Drop for SecretJson {
+    fn drop(&mut self) {
+        wipe_json(&mut self.0);
+    }
+}
+impl<'de> serde::Deserialize<'de> for SecretJson {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = SecretJson;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("JSON value")
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<SecretJson, E> {
+                Ok(SecretJson(v.into()))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<SecretJson, E> {
+                Ok(SecretJson(v.into()))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<SecretJson, E> {
+                Ok(SecretJson(v.into()))
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<SecretJson, E> {
+                Ok(SecretJson(v.into()))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<SecretJson, E> {
+                Ok(SecretJson(serde_json::Value::Null))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<SecretJson, E> {
+                Ok(SecretJson(v.into()))
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<SecretJson, E> {
+                Ok(SecretJson(v.into()))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<SecretJson, A::Error> {
+                let mut result = SecretJson(serde_json::Value::Array(Vec::new()));
+                while let Some(mut value) = a.next_element::<SecretJson>()? {
+                    if let serde_json::Value::Array(values) = &mut result.0 {
+                        values.push(std::mem::take(&mut value.0));
+                    }
+                }
+                Ok(result)
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<SecretJson, A::Error> {
+                let mut result = SecretJson(serde_json::Value::Object(serde_json::Map::new()));
+                while let Some(key) = a.next_key::<String>()? {
+                    let mut key = Zeroizing::new(key);
+                    let mut value = a.next_value::<SecretJson>()?;
+                    if let serde_json::Value::Object(values) = &mut result.0 {
+                        // Keep the original key's position, including when
+                        // serde_json's preserve_order feature is enabled.
+                        if let Some(old) = values.get_mut(&*key) {
+                            wipe_json(old);
+                            *old = std::mem::take(&mut value.0);
+                        } else {
+                            values.insert(std::mem::take(&mut *key), std::mem::take(&mut value.0));
+                        }
+                    }
+                }
+                Ok(result)
+            }
+        }
+        d.deserialize_any(Visitor)
+    }
 }
 
 /// Extract `claudeAiOauth.expiresAt` (Unix millis) from an Anthropic credential
@@ -1024,7 +2315,7 @@ fn sync_all_handle_dirs_with(
 /// cannot silently disagree on what counts as a live Anthropic token
 /// (`guard-reader-writer-parity.md` MUST-1).
 pub(crate) fn anthropic_expiry_ms(raw: &str) -> Option<u64> {
-    serde_json::from_str::<serde_json::Value>(raw)
+    serde_json::from_str::<SecretJson>(raw)
         .ok()?
         .get("claudeAiOauth")?
         .get("expiresAt")?
@@ -1072,7 +2363,7 @@ pub(crate) fn now_ms() -> u64 {
 pub struct HarvestCandidate {
     /// Raw JSON as read from the keychain (verbatim, for A2 write-back).
     /// MUST NOT appear in any log statement.
-    pub raw_json: String,
+    pub raw_json: Zeroizing<String>,
     /// `claudeAiOauth.expiresAt` in Unix milliseconds.
     pub expiry_ms: u64,
     /// Short identifier for logging — contains NO token bytes.
@@ -1147,14 +2438,17 @@ pub fn swap_lock_path(config_dir: &Path) -> PathBuf {
     config_dir.join(".swap-lock")
 }
 
-/// Acquire the swap lock for `config_dir`, blocking until available (the daemon
-/// only ever holds it briefly via try-lock during a keychain read). The caller
-/// holds the returned guard across the whole swap transition so the custodian's
-/// harvest skips this dir until it settles. `None` if the lock cannot be taken —
-/// best-effort: the clear-before-repoint ordering still gives crash-safety.
+/// Acquire the swap lock for `config_dir` within the bounded credential-lock
+/// budget (the daemon only ever holds it briefly via try-lock during a keychain
+/// read). The caller holds the returned guard across the whole swap transition
+/// so the custodian's harvest skips this dir until it settles. `None` if the
+/// lock cannot be taken within the budget — best-effort: the clear-before-
+/// repoint ordering still gives crash-safety.
 #[cfg(target_os = "macos")]
 pub fn lock_handle_dir_for_swap(config_dir: &Path) -> Option<crate::platform::lock::FileLockGuard> {
-    crate::platform::lock::lock_file(&swap_lock_path(config_dir)).ok()
+    crate::platform::lock::lock_credential_file(&swap_lock_path(config_dir))
+        .ok()
+        .flatten()
 }
 
 /// Non-macOS: no keychain, so no swap race; lock is a no-op (`None`).
@@ -1473,19 +2767,19 @@ pub(crate) const SECURITY_ERR_INTERACTION_NOT_ALLOWED: i32 = 36;
 /// timeout takes ~`KEYCHAIN_OP_TIMEOUT`, and the `/ 2` threshold sits with
 /// ample margin on both sides of that gap.
 #[cfg(target_os = "macos")]
-fn delete_service_retrying(svc: &str) -> Option<std::process::Output> {
+fn delete_service_retrying(svc: &str) -> Option<SecretOutput> {
     // Only `output.status` matters here (BUG-R3-1's completeness flags govern
     // parsed-content callers; a delete confirmation never parses stdout).
     let start = std::time::Instant::now();
     let first =
-        run_security_bounded(&["delete-generic-password", "-s", svc], None).map(|bo| bo.output);
+        run_security_bounded(&["delete-generic-password", "-s", svc], None).map(SecretOutput::new);
     if let Some(out) = &first {
-        if security_delete_call_resolved(out) {
+        if security_delete_call_resolved(&out.output) {
             return first;
         }
     }
     if start.elapsed() < KEYCHAIN_OP_TIMEOUT / 2 {
-        run_security_bounded(&["delete-generic-password", "-s", svc], None).map(|bo| bo.output)
+        run_security_bounded(&["delete-generic-password", "-s", svc], None).map(SecretOutput::new)
     } else {
         first // a genuine timeout — do not retry, return the (unconfirmed) result as-is
     }
@@ -1561,7 +2855,7 @@ pub(crate) const MAX_DUPLICATE_DELETE_ITERATIONS: u32 = 5;
 #[cfg(target_os = "macos")]
 fn drain_service(svc: &str) -> Result<bool, KeychainClearUnconfirmed> {
     drain_service_inner(svc, &mut |s| {
-        delete_service_retrying(s).and_then(|o| o.status.code())
+        delete_service_retrying(s).and_then(|o| o.output.status.code())
     })
 }
 
@@ -1682,25 +2976,45 @@ fn decide_and_clear_dead_handle_with_executor(
 ) -> Result<bool, KeychainClearUnconfirmed> {
     let svc = service_name(config_dir);
     let ours = keychain_account_for(config_dir);
-    let x = exec.find(&svc, &ours);
-
     let marker_account = crate::accounts::markers::resolve_marker_to_slot(base_dir, config_dir);
-    let marker_raw: Option<String> = marker_account.and_then(|acct| {
+    let binding = marker_account.and_then(|slot| capture_known_slot(base_dir, slot));
+    let x = exec.find(&svc, &ours);
+    if !holds_no_login(&x) && !holds_emptied_login(&x) && binding.is_none() {
+        return Err(KeychainClearUnconfirmed);
+    }
+
+    let marker_raw: Option<Zeroizing<String>> = marker_account.and_then(|acct| {
         crate::accounts::identity_store::target_token_for_forced_write(base_dir, acct)
             .as_valid_str()
-            .map(str::to_string)
+            .map(|raw| Zeroizing::new(raw.to_owned()))
     });
     let history = marker_account
         .map(|acct| crate::credentials::token_history::read_history_for_slot(base_dir, acct))
         .unwrap_or_default();
+    let owner_verified = marker_account
+        .map(|acct| crate::credentials::token_history::read_owner_verified_for_slot(base_dir, acct))
+        .unwrap_or_default();
+    let retired = marker_account
+        .map(|acct| crate::credentials::token_history::retired_bindings_for_slot(base_dir, acct))
+        .unwrap_or_default();
     let known = KnownTokens {
-        marker_account_canonical: marker_raw.as_deref(),
+        marker_account_canonical: marker_raw.as_ref().map(|raw| raw.as_str()),
         marker_account_history: &history,
+        marker_account_owner_verified: &owner_verified,
+        retired_bindings: &retired,
         ..KnownTokens::default()
     };
 
     match decide_cc_keychain_write(&x, &known, Intended::Strip) {
-        WriteDecision::StripAllowed => apply_dead_handle_strip(exec, &svc, &ours, &x),
+        WriteDecision::StripAllowed => apply_dead_handle_strip_guarded(
+            exec,
+            base_dir,
+            &svc,
+            &ours,
+            &x,
+            binding.as_ref(),
+            false,
+        ),
         WriteDecision::RefuseUnharvested => {
             if let (Some(acct), RawContentClassification::Content(raw)) = (marker_account, &x) {
                 if let Some(expiry_ms) = anthropic_expiry_ms(raw) {
@@ -1731,7 +3045,15 @@ fn decide_and_clear_dead_handle_with_executor(
                         if let WriteDecision::StripAllowed =
                             decide_cc_keychain_write(&x, &self_known, Intended::Strip)
                         {
-                            return apply_dead_handle_strip(exec, &svc, &ours, &x);
+                            return apply_dead_handle_strip_guarded(
+                                exec,
+                                base_dir,
+                                &svc,
+                                &ours,
+                                &x,
+                                binding.as_ref(),
+                                true,
+                            );
                         }
                     }
                 }
@@ -1768,24 +3090,73 @@ fn decide_and_clear_dead_handle_with_executor(
     }
 }
 
-/// Apply a confirmed [`WriteDecision::StripAllowed`] and map
-/// [`ApplyOutcome`] onto this module's `Result<bool, KeychainClearUnconfirmed>`
-/// shape — shared by [`decide_and_clear_dead_handle_with_executor`]'s two
-/// call sites (the direct rule-2 match and the post-adopt re-decide).
-///
-/// **`keychain-fix-r9.md` D-F5.** The pre-decide legacy path
-/// ([`drain_service`]/[`drain_service_inner`]) drained EVERY duplicate item
-/// resident under a service (security review 1386 N1: `security
-/// delete-generic-password` removes exactly ONE matching item per call, so
-/// a single-shot delete against a service with a resident duplicate reports
-/// success while a sibling survives). The decide-gated strip path here used
-/// to call [`apply_cc_keychain_write`] exactly once — a single delete —
-/// which reintroduced the N1 gap for this path alone. This wrapper now
-/// drains any lingering duplicate the SAME way, bounded and scoped to CC's
-/// own `svc`/`account` (never a bare by-service-only match like the legacy
-/// path), but ONLY when the first strip fully DELETED X (no sibling object
-/// to preserve) — see [`drain_duplicate_cc_items`]'s own doc for why a
-/// sibling-preserving strip must never be drained.
+/// Recheck captured Known identity custody and exact canonical pair before a
+/// confirmed strip. Hold nonblocking profiles authority through the bounded
+/// executor; finish adoption/profile/history reads before acquiring it.
+/// A subsequent native duplicate is only observed: remaining Content is
+/// retained and reported unconfirmed, never deleted using the first proof.
+#[cfg(target_os = "macos")]
+fn apply_dead_handle_strip_guarded(
+    exec: &(impl KeychainExecutor + ?Sized),
+    base: &Path,
+    svc: &str,
+    ours: &str,
+    x: &RawContentClassification,
+    binding: Option<&crate::accounts::anthropic_identity::CapturedBinding>,
+    adopted: bool,
+) -> Result<bool, KeychainClearUnconfirmed> {
+    use crate::accounts::anthropic_identity as ai;
+    let Some(binding) = binding else {
+        // An empty/non-OAuth item has no Anthropic grant to destroy. Unknown
+        // or unbound actual grants remain retained, never upgraded by history.
+        return if holds_no_login(x) || holds_emptied_login(x) {
+            apply_dead_handle_strip(exec, svc, ours, x)
+        } else {
+            Err(KeychainClearUnconfirmed)
+        };
+    };
+    let Ok(Some(profiles)) = crate::accounts::profiles_lock::ProfilesFileLock::try_acquire(base)
+    else {
+        return Err(KeychainClearUnconfirmed);
+    };
+    let current = if adopted {
+        ai::binding_custody_matches_locked(&profiles, base, binding)
+    } else {
+        ai::binding_matches_locked(&profiles, base, binding)
+    };
+    if !current.unwrap_or(false) {
+        return Err(KeychainClearUnconfirmed);
+    }
+    if !holds_no_login(x) && !holds_emptied_login(x) {
+        // Canonical pair equality is mandatory even for a historical match:
+        // a bare history fingerprint does not prove the item's full grant.
+        // After adoption original UUID/context/generation must still hold and
+        // the item must equal the pair actually committed at that UUID.
+        let RawContentClassification::Content(raw) = x else {
+            return Err(KeychainClearUnconfirmed);
+        };
+        let candidate = serde_json::from_str::<crate::credentials::CredentialFile>(raw)
+            .ok()
+            .and_then(|c| {
+                c.anthropic()
+                    .and_then(|a| ai::CredentialVersion::for_credentials(a).ok())
+            });
+        let canonical = ai::load_anthropic_canonical(
+            &crate::accounts::identity_store::credentials_path_for(base, binding.identity()),
+        )
+        .ok()
+        .and_then(|c| {
+            c.anthropic()
+                .and_then(|a| ai::CredentialVersion::for_credentials(a).ok())
+        });
+        if candidate.is_none() || candidate != canonical {
+            return Err(KeychainClearUnconfirmed);
+        }
+    }
+    // No profile/proof helper executes inside the bounded native executor.
+    apply_dead_handle_strip(exec, svc, ours, x)
+}
+
 #[cfg(target_os = "macos")]
 fn apply_dead_handle_strip(
     exec: &(impl KeychainExecutor + ?Sized),
@@ -1817,54 +3188,25 @@ fn apply_dead_handle_strip(
     }
 }
 
-/// `keychain-fix-r9.md` D-F5. Bounded drain for a duplicate item lingering
-/// under the SAME `svc`+`account` [`apply_dead_handle_strip`] just
-/// confirmed-deleted. `security delete-generic-password` removes exactly
-/// ONE matching item per call (security review 1386 N1); two never-
-/// consolidated items under one service both survive a single call.
-///
-/// Called ONLY when the first strip fully DELETED X — never on a
-/// sibling-preserving strip, which just wrote a REMAINDER back to this
-/// exact `svc`+`account` and must not be re-found-and-deleted here.
-///
-/// Bounded at [`MAX_DUPLICATE_DELETE_ITERATIONS`], mirroring
-/// [`drain_service_inner`]'s shape — but built from this module's injected
-/// [`KeychainExecutor`] rather than raw `security` exit codes: this
-/// trait's `delete` confirms BOTH "just deleted one" and "already absent"
-/// as `true` ([`security_delete_call_resolved`] resolves both `0` and
-/// [`SECURITY_ITEM_NOT_FOUND`] to `true`), so the delete call's own return
-/// value cannot distinguish "a sibling remains" from "confirmed drained" —
-/// `find` is what does, exactly as `drain_service_inner`'s exit-code
-/// inspection did for the legacy path. Every iteration re-`find`s and
-/// re-deletes the SAME `svc`+`account` this call was scoped to (never a
-/// bare by-service-only match), stopping at the first confirmed `Absent`
-/// (mirrors the old path's "stop on 44"). An unconfirmed result — a
-/// failed delete, or a re-`find` that itself cannot classify X — stops the
-/// loop with `Err` rather than guessing further; the FIRST item is already
-/// confirmed gone by the time this runs, so `Err` here only means the
-/// caller cannot be told the drain is FULLY clean, not that the original
-/// clear failed.
+/// Observe whether the exact service/account is absent after the first proved
+/// item was deleted. A subsequent duplicate has independent ownership: retain
+/// any Content or unreadable result and report an unconfirmed queued retry.
+/// This supersedes the historical blind duplicate drain from keychain-fix-r9.
+/// Sibling-preserving strips never call this observer.
 #[cfg(target_os = "macos")]
 fn drain_duplicate_cc_items(
     exec: &(impl KeychainExecutor + ?Sized),
     svc: &str,
     account: &str,
 ) -> Result<(), KeychainClearUnconfirmed> {
-    for _ in 0..MAX_DUPLICATE_DELETE_ITERATIONS {
-        match exec.find(svc, account) {
-            RawContentClassification::Absent => return Ok(()),
-            RawContentClassification::Unreadable(_) => return Err(KeychainClearUnconfirmed),
-            RawContentClassification::Content(_) => {
-                if !exec.delete(svc, account) {
-                    return Err(KeychainClearUnconfirmed);
-                }
-                // A duplicate may have just been removed — re-check.
-            }
+    // Proof of the first item does not establish ownership of a subsequent
+    // native duplicate. Keep remaining content for a fresh classified retry.
+    match exec.find(svc, account) {
+        RawContentClassification::Absent => Ok(()),
+        RawContentClassification::Unreadable(_) | RawContentClassification::Content(_) => {
+            Err(KeychainClearUnconfirmed)
         }
     }
-    // Iteration budget exhausted without a confirmed `Absent` — fail toward
-    // "might still have a duplicate", never toward success.
-    Err(KeychainClearUnconfirmed)
 }
 
 /// Non-macOS: no keychain item exists to mutate — structural no-op,
@@ -1945,6 +3287,38 @@ fn decide_and_clear_queued_service(
     )
 }
 
+/// [`decide_and_clear_queued_service`] for the pending-clears RETRY: every write
+/// it makes goes through the mint-lock gate ([`MintGatedExecutor`]), AFTER the
+/// decision read and the adopt HTTP call (made inside the decision, holding no
+/// lock), so the lock covers only the final check, the re-read and the write.
+/// The creation-time caller ([`resolve_pending_clear_at_creation`]) uses the
+/// ungated form on purpose: the dir it would be checked against is its own,
+/// just-minted one.
+#[cfg(target_os = "macos")]
+fn decide_and_clear_queued_service_under_mint(
+    base_dir: &Path,
+    svc: &str,
+    account: Option<AccountNum>,
+    candidate_email: Option<&str>,
+    keychain_account_hint: Option<&str>,
+    try_adopt: &dyn Fn(AccountNum, &HarvestCandidate) -> bool,
+    queued_identity: Option<(u64, i64)>,
+) -> Result<bool, KeychainClearUnconfirmed> {
+    if keychain_mirror_disabled() {
+        return Ok(false);
+    }
+    let gated = MintGatedExecutor::new(&SecurityCliExecutor, base_dir, svc, queued_identity);
+    decide_and_clear_queued_service_with_executor(
+        &gated,
+        base_dir,
+        svc,
+        account,
+        candidate_email,
+        keychain_account_hint,
+        try_adopt,
+    )
+}
+
 /// Executor-injected core of [`decide_and_clear_queued_service`] — no
 /// `keychain_mirror_disabled()` short-circuit here, so a test can drive
 /// this directly against a scripted executor.
@@ -1976,21 +3350,32 @@ fn decide_and_clear_queued_service_with_executor(
     let ours = keychain_account_hint
         .map(str::to_string)
         .unwrap_or_else(keychain_account);
+    let binding = capture_known_slot(base_dir, acct);
     let x = exec.find(svc, &ours);
+    if !holds_no_login(&x) && !holds_emptied_login(&x) && binding.is_none() {
+        return Err(KeychainClearUnconfirmed);
+    }
 
-    let marker_raw: Option<String> =
+    let marker_raw: Option<Zeroizing<String>> =
         crate::accounts::identity_store::target_token_for_forced_write(base_dir, acct)
             .as_valid_str()
-            .map(str::to_string);
+            .map(|raw| Zeroizing::new(raw.to_owned()));
     let history = crate::credentials::token_history::read_history_for_slot(base_dir, acct);
+    let owner_verified =
+        crate::credentials::token_history::read_owner_verified_for_slot(base_dir, acct);
+    let retired = crate::credentials::token_history::retired_bindings_for_slot(base_dir, acct);
     let known = KnownTokens {
-        marker_account_canonical: marker_raw.as_deref(),
+        marker_account_canonical: marker_raw.as_ref().map(|raw| raw.as_str()),
         marker_account_history: &history,
+        marker_account_owner_verified: &owner_verified,
+        retired_bindings: &retired,
         ..KnownTokens::default()
     };
 
     match decide_cc_keychain_write(&x, &known, Intended::Strip) {
-        WriteDecision::StripAllowed => apply_dead_handle_strip(exec, svc, &ours, &x),
+        WriteDecision::StripAllowed => {
+            apply_dead_handle_strip_guarded(exec, base_dir, svc, &ours, &x, binding.as_ref(), false)
+        }
         WriteDecision::RefuseUnharvested => {
             if let RawContentClassification::Content(raw) = &x {
                 if let Some(expiry_ms) = anthropic_expiry_ms(raw) {
@@ -2020,64 +3405,22 @@ fn decide_and_clear_queued_service_with_executor(
                         if let WriteDecision::StripAllowed =
                             decide_cc_keychain_write(&x, &self_known, Intended::Strip)
                         {
-                            return apply_dead_handle_strip(exec, svc, &ours, &x);
+                            return apply_dead_handle_strip_guarded(
+                                exec,
+                                base_dir,
+                                svc,
+                                &ours,
+                                &x,
+                                binding.as_ref(),
+                                true,
+                            );
                         }
                     }
                 }
             }
-            // The entry exists because its handle dir is GONE, so an item
-            // that stays unidentified belongs to a dead terminal and would
-            // collide with a recycled PID. Save it, then delete it. Only when
-            // no directory that hashes to this service exists (a re-created
-            // dir may have a live owner), and only if the save succeeded;
-            // otherwise keep it as before.
-            if let RawContentClassification::Content(raw) = &x {
-                if !handle_dir_exists_for_service(base_dir, svc)
-                    && quarantine_foreign_item(base_dir, svc, raw).is_ok()
-                {
-                    // Re-check immediately before the delete: a dir created
-                    // since the first check may have a live owner.
-                    if handle_dir_exists_for_service(base_dir, svc) {
-                        warn!(
-                            error_kind = "keychain_pending_clear_quarantined_dir_reappeared",
-                            svc_hash = quarantine_svc_hash(svc),
-                            "pending-clear retry: an unidentified login was saved to the \
-                             quarantine folder, but its handle dir reappeared before the \
-                             delete; kept and stays queued"
-                        );
-                        return Err(KeychainClearUnconfirmed);
-                    }
-                    // Absent view: delete the whole item, merge nothing.
-                    let outcome = apply_dead_handle_strip(
-                        exec,
-                        svc,
-                        &ours,
-                        &RawContentClassification::Absent,
-                    );
-                    return match outcome {
-                        Ok(true) => {
-                            warn!(
-                                error_kind = "keychain_pending_clear_quarantined_foreign_item",
-                                svc_hash = quarantine_svc_hash(svc),
-                                "pending-clear retry: an unidentified login for a dead \
-                                 handle dir was saved to the quarantine folder and removed"
-                            );
-                            Ok(true)
-                        }
-                        Ok(false) | Err(_) => {
-                            warn!(
-                                error_kind =
-                                    "keychain_pending_clear_quarantined_removal_unconfirmed",
-                                svc_hash = quarantine_svc_hash(svc),
-                                "pending-clear retry: an unidentified login for a dead \
-                                 handle dir was saved to the quarantine folder but its \
-                                 removal is unconfirmed; stays queued"
-                            );
-                            Err(KeychainClearUnconfirmed)
-                        }
-                    };
-                }
-            }
+            // A vanished directory or a quarantined copy cannot prove that
+            // this grant belongs to the captured identity. Failed adoption
+            // leaves the native item intact and the queue retry unconfirmed.
             if warn_due(svc) {
                 warn!(
                     error_kind = "keychain_pending_clear_unmatched_kept",
@@ -2181,6 +3524,63 @@ const PENDING_CLEARS_LOCK_FILENAME: &str = "keychain-pending-clears.lock";
 /// operator well before it silently degrades further.
 #[cfg(target_os = "macos")]
 const PENDING_CLEARS_MAX: usize = 200;
+
+/// Directory (under `base_dir`) of the durable FALLBACK spool for
+/// pending-clear records that could not be merged into
+/// [`PENDING_CLEARS_FILENAME`] because its lock could not be taken within
+/// [`crate::platform::lock::DURABLE_RECORD_LOCK_BUDGET`].
+///
+/// One file per record, each written by [`spool_pending_clear`] via
+/// `secure_file` + `atomic_replace` (§5a cleanup on every branch). A spool
+/// DIRECTORY rather than one appended file: an appended file would need the
+/// same lock this path exists because it could not take, and a
+/// last-writer-wins read-modify-write of a fallback file is a lost update —
+/// exactly the silent drop this fallback exists to prevent. Unique names
+/// need no lock; the sweep merges every file under the queue lock
+/// ([`pending_clears_drain_spool_locked`]) and removes it only after the
+/// merged queue is durably saved.
+#[cfg(target_os = "macos")]
+const PENDING_CLEARS_SPOOL_DIRNAME: &str = "keychain-pending-clears.spool";
+
+/// Bound on one spool entry's on-disk size. A `PendingClearEntry` is under
+/// 100 bytes serialized (see [`PENDING_CLEARS_MAX`]'s doc); 4 KiB is
+/// generous headroom and makes every merge read a bounded read.
+#[cfg(target_os = "macos")]
+const PENDING_CLEARS_SPOOL_MAX_BYTES: u64 = 4096;
+
+/// How many spool files ONE locked section merges. Bounds the section's work
+/// (this many bounded reads plus the queue save) so the lock table in
+/// `platform::lock::DURABLE_RECORD_LOCK_HOLDER_SECTIONS_AHEAD` stays true;
+/// any remainder is merged by the next tick. A spool file is never removed
+/// until its contents are in the durably saved queue. The cap applies to
+/// the FILTERED set: a junk file is quarantined first and never consumes a
+/// merge slot (D237 round-2 correctness N5 / security R2-M2).
+#[cfg(target_os = "macos")]
+const PENDING_CLEARS_SPOOL_DRAIN_MAX: usize = 32;
+
+/// Hard cap on the TOTAL number of pending-clear spool files (D237 round-2
+/// correctness N5: the fallback spool had no count bound). At the cap a new
+/// record is REFUSED with a fixed-vocabulary ERROR naming that state — loud,
+/// never a silent drop — while the queued entries keep draining.
+///
+/// Derivation from ENFORCED limits: the queue itself is capped at
+/// [`PENDING_CLEARS_MAX`] (200) entries, so the fallback spool must be able
+/// to absorb at least one full queue's worth of records arriving while the
+/// queue lock is unavailable. Each drain merges up to
+/// [`PENDING_CLEARS_SPOOL_DRAIN_MAX`] (32), so 200 records take 7 drains;
+/// 512 is `16 * 32` — more than twice the queue cap and sixteen complete
+/// drain windows of headroom, so only a pathological lock storm can reach
+/// the refusal.
+#[cfg(target_os = "macos")]
+const PENDING_CLEARS_SPOOL_MAX_FILES: usize = 512;
+
+/// Subdirectory of the spool that bad entries are MOVED into (D237 round-2
+/// correctness N5 / security R2-M2). Kept on disk for the operator to
+/// inspect, never deleted, and — because it has no `.json` extension — never
+/// re-enumerated as a drain candidate, so a head of junk can no longer
+/// starve the valid entries behind it.
+#[cfg(target_os = "macos")]
+const PENDING_CLEARS_SPOOL_QUARANTINE_DIRNAME: &str = "quarantine";
 
 /// How many DUE entries the DAEMON's periodic sweep
 /// ([`sweep_pending_clears`]) attempts per tick. This budget is for the
@@ -2439,6 +3839,18 @@ fn pending_clears_lock_path(base_dir: &Path) -> PathBuf {
     base_dir.join(PENDING_CLEARS_LOCK_FILENAME)
 }
 
+#[cfg(target_os = "macos")]
+fn pending_clears_spool_dir(base_dir: &Path) -> PathBuf {
+    base_dir.join(PENDING_CLEARS_SPOOL_DIRNAME)
+}
+
+/// Subdirectory of [`pending_clears_spool_dir`] holding quarantined spool
+/// files (see [`PENDING_CLEARS_SPOOL_QUARANTINE_DIRNAME`]).
+#[cfg(target_os = "macos")]
+fn pending_clears_spool_quarantine_dir(base_dir: &Path) -> PathBuf {
+    pending_clears_spool_dir(base_dir).join(PENDING_CLEARS_SPOOL_QUARANTINE_DIRNAME)
+}
+
 /// Security review 1386 LOW: a corrupt/unparseable queue file previously
 /// degraded to an empty queue with no signal — every entry silently
 /// discarded, on the one file whose job is to not forget. `Err` from
@@ -2574,6 +3986,11 @@ fn is_well_formed_service_name(s: &str) -> bool {
 /// dropped, `zero-tolerance.md` Rule 3) but MUST NOT fail the caller — the
 /// caller is itself a best-effort compensating step, not the primary path.
 ///
+/// Returns `true` only when the queue reached disk. Callers that merged
+/// spool files use it as the gate for removing them: a spool file is removed
+/// only after its contents are durably in [`PENDING_CLEARS_FILENAME`], so a
+/// failed save re-merges rather than loses.
+///
 /// `context` names WHAT was being persisted when the write failed —
 /// security review 1386 F9: a single fixed message ("this logout's
 /// unconfirmed item will not be auto-retried") was wrong on the sweep path,
@@ -2581,12 +3998,12 @@ fn is_well_formed_service_name(s: &str) -> bool {
 /// (already-queued entries simply keep their stale on-disk state and get
 /// re-attempted next sweep — benign, but not what the old message said).
 #[cfg(target_os = "macos")]
-fn save_pending_clears(base_dir: &Path, clears: &PendingClears, context: &str) {
+fn save_pending_clears(base_dir: &Path, clears: &PendingClears, context: &str) -> bool {
     let path = pending_clears_path(base_dir);
     let tmp = crate::platform::fs::unique_tmp_path(&path);
     let json = match serde_json::to_string(clears) {
         Ok(j) => j,
-        Err(_) => return, // unreachable for this shape; nothing to persist
+        Err(_) => return false, // unreachable for this shape; nothing to persist
     };
     if std::fs::write(&tmp, json.as_bytes()).is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -2594,7 +4011,7 @@ fn save_pending_clears(base_dir: &Path, clears: &PendingClears, context: &str) {
             error_kind = "keychain_pending_clears_write_failed",
             context, "failed to persist the keychain pending-clear queue (non-fatal)"
         );
-        return;
+        return false;
     }
     // `keychain-fix-r10.md` S-L-3, security.md §5a: `std::fs::write` creates
     // `tmp` at umask-default permissions (typically 0o644) with the queue
@@ -2607,7 +4024,7 @@ fn save_pending_clears(base_dir: &Path, clears: &PendingClears, context: &str) {
             error_kind = "keychain_pending_clears_write_failed",
             context, "failed to persist the keychain pending-clear queue (non-fatal)"
         );
-        return;
+        return false;
     }
     if crate::platform::fs::atomic_replace(&tmp, &path).is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -2615,99 +4032,22 @@ fn save_pending_clears(base_dir: &Path, clears: &PendingClears, context: &str) {
             error_kind = "keychain_pending_clears_write_failed",
             context, "failed to persist the keychain pending-clear queue (non-fatal)"
         );
+        return false;
     }
+    true
 }
 
-/// Record `service` as needing a retried clear. No duplicate entries — a
-/// SECOND record for a service already queued does NOT insert again, it
-/// RESETS that entry's backoff to due-now (security review 1386 N3), since
-/// a fresh logout recording the same service is new evidence the item
-/// still matters. Best-effort (a failure to persist, or to acquire the
-/// lock, is logged, never silently dropped, and never propagated — see
-/// `save_pending_clears`).
-///
-/// Serialized under `pending_clears_lock_path` (security review 1386
-/// HIGH — round 2) against both a concurrent `record_pending_clear` and the
-/// removal half of `sweep_pending_clears`, so an insert can never be lost
-/// to a racing sweep's blind overwrite. Load+dedupe+push+save is fast (one
-/// small file), so this lock is held only briefly — never across a
-/// `security` subprocess call.
-///
-/// Pure file I/O against `base_dir` — no `security` subprocess, so unlike
-/// every OTHER writer in this module this is NOT gated on
-/// `keychain_mirror_disabled()`. That guard exists to keep unit tests off
-/// the operator's REAL login keychain; `base_dir` here is always the
-/// caller's own (a `TempDir` in every test), so there is nothing to guard
-/// and gating it would make the queue itself untestable.
-///
-/// `account` (`keychain-fix-r8d.md` item 1): the marker account `service`'s
-/// dir was bound to AT QUEUE TIME — the caller resolves it (e.g.
-/// `accounts::markers::resolve_marker_to_slot`) before this call, since by
-/// retry time (`sweep_pending_clears`) the dir is gone and there is nothing
-/// left to resolve it from. `None` for a caller that genuinely has no
-/// marker to resolve (e.g. the dir never carried one) — the retry path
-/// treats that identically to a legacy pre-fix entry: fail closed, keep,
-/// never delete blind.
+/// Applies ONE clear record to an in-memory queue, with the same
+/// dedupe/reset/evict policy for both entry points: a live record
+/// ([`record_pending_clear_with_identity`]) and a spool file merged by the
+/// sweep ([`pending_clears_drain_spool_locked`]). No I/O.
 #[cfg(target_os = "macos")]
-pub(crate) fn record_pending_clear(
-    base_dir: &Path,
-    service: &str,
-    account: Option<AccountNum>,
-    origin: PendingClearOrigin,
-    candidate_email: Option<String>,
-    keychain_account_hint: Option<String>,
-) {
-    record_pending_clear_with_identity(
-        base_dir,
-        service,
-        account,
-        origin,
-        candidate_email,
-        keychain_account_hint,
-        None,
-    )
-}
-
-/// `keychain-fix-r11.md` S-LOW-1/D-4b: identical to [`record_pending_clear`]
-/// except for the trailing `queued_identity` — `(inode, ctime)` of the
-/// handle dir THIS entry is being queued for, captured by the caller from
-/// the dir's own `std::fs::metadata` BEFORE it is removed (by retry time
-/// there is nothing left to re-derive it from). `record_pending_clear`
-/// itself is kept as a thin wrapper passing `None` — every test call site
-/// and any caller with no dir left to stat (a bare service-name re-record)
-/// keeps working unchanged; only [`live_handle_dir_maps_to_service`] reads
-/// this field, and it treats `None` the same conservative way it always has
-/// (see that field's own doc on [`PendingClearEntry`]).
-#[cfg(target_os = "macos")]
-pub(crate) fn record_pending_clear_with_identity(
-    base_dir: &Path,
-    service: &str,
-    account: Option<AccountNum>,
-    origin: PendingClearOrigin,
-    candidate_email: Option<String>,
-    keychain_account_hint: Option<String>,
-    queued_identity: Option<(u64, i64)>,
-) {
-    let _guard = match crate::platform::lock::lock_file(&pending_clears_lock_path(base_dir)) {
-        Ok(g) => g,
-        Err(_) => {
-            warn!(
-                error_kind = "keychain_pending_clears_lock_failed",
-                "could not lock the keychain pending-clear queue — this logout's \
-                 unconfirmed item was NOT queued for auto-retry (non-fatal)"
-            );
-            return;
-        }
-    };
-    debug_assert!(
-        is_well_formed_service_name(service),
-        "record_pending_clear called with a malformed service name: {service:?} — \
-         every production caller derives this from keychain::service_name() \
-         (security review 1386 N4)"
-    );
-
-    let mut clears = load_pending_clears(base_dir);
-    if let Some(existing) = clears.services.iter_mut().find(|e| e.service == service) {
+fn apply_pending_clear_record(clears: &mut PendingClears, record: PendingClearEntry) {
+    if let Some(existing) = clears
+        .services
+        .iter_mut()
+        .find(|e| e.service == record.service)
+    {
         // Security review 1386 N3 + the generation fix: a fresh logout
         // recording the SAME service (reachable via PID recycling hashing
         // back to the same keychain service name) is new evidence the item
@@ -2726,17 +4066,16 @@ pub(crate) fn record_pending_clear_with_identity(
         // account it belongs to as well — overwrite, don't keep whatever
         // (possibly stale, possibly absent) account an earlier record for
         // this same service carried.
-        existing.account = account.map(|a| a.get());
+        existing.account = record.account;
         // `keychain-fix-r9.md` S-M-1/D-F2: a fresh record also overwrites
         // origin and candidate email — same rationale as `account` above:
         // this is new evidence about the CURRENT reason the entry is
         // queued, not a reason to keep whatever a prior record carried.
-        existing.origin = origin;
-        existing.candidate_email = candidate_email;
-        existing.keychain_account_hint = keychain_account_hint;
-        existing.queued_inode = queued_identity.map(|(ino, _)| ino);
-        existing.queued_ctime = queued_identity.map(|(_, ctime)| ctime);
-        save_pending_clears(base_dir, &clears, "record_pending_clear");
+        existing.origin = record.origin;
+        existing.candidate_email = record.candidate_email;
+        existing.keychain_account_hint = record.keychain_account_hint;
+        existing.queued_inode = record.queued_inode;
+        existing.queued_ctime = record.queued_ctime;
         return;
     }
     if clears.services.len() >= PENDING_CLEARS_MAX {
@@ -2772,9 +4111,398 @@ pub(crate) fn record_pending_clear_with_identity(
                  clear will NOT be auto-retried and may remain an orphan"
             );
         }
-        let _ = evicted; // service name only — nothing further to log (no secret)
     }
-    clears.services.push(PendingClearEntry {
+    clears.services.push(record);
+}
+
+/// Persists ONE clear record to the durable fallback spool, for a caller
+/// that could not take [`pending_clears_lock_path`] within
+/// [`crate::platform::lock::DURABLE_RECORD_LOCK_BUDGET`]. NEVER drops the
+/// record: the spool file is removed only by
+/// [`pending_clears_drain_spool_locked`] after the queue save that merged it
+/// succeeded.
+///
+/// Write shape (`security.md` §5a): tmp write, `secure_file` → 0600, then
+/// `atomic_replace`, with `remove_file(&tmp)` before returning on EVERY
+/// failure branch. Returns `false` (and logs a fixed-vocabulary ERROR — the
+/// only outcome in this module where a clear record cannot be made durable
+/// anywhere) when the spool write itself fails.
+#[cfg(target_os = "macos")]
+fn spool_pending_clear(base_dir: &Path, record: &PendingClearEntry) -> bool {
+    static SPOOL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = pending_clears_spool_dir(base_dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        tracing::error!(
+            error_kind = "keychain_pending_clears_spool_failed",
+            "could not create the pending-clear spool directory — this clear \
+             record could NOT be made durable (the queue lock was busy and the \
+             fallback spool is unwritable)"
+        );
+        return false;
+    }
+    let _ = crate::platform::fs::secure_dir(&dir);
+    // D237 round-2 correctness N5: the fallback spool is bounded. At the
+    // cap this record is REFUSED with a loud fixed-vocabulary ERROR naming
+    // the state — never a silent drop, never unbounded growth.
+    //
+    // The count is of DRAIN CANDIDATES only, never every directory entry: a
+    // non-`.json` file, a directory named `*.json`, or a symlink is junk that
+    // the drain will never merge (it quarantines the latter two), so it MUST
+    // NOT consume cap headroom and force a refusal while the real records
+    // still have room. Counting junk here would also let a head of junk
+    // refuse new records during exactly the lock storm this spool exists for
+    // — the drain that would clear it cannot run on this path at all.
+    if pending_clears_spool_file_count(base_dir) >= PENDING_CLEARS_SPOOL_MAX_FILES {
+        tracing::error!(
+            error_kind = "keychain_pending_clears_spool_full",
+            cap = PENDING_CLEARS_SPOOL_MAX_FILES,
+            "the pending-clear spool is AT ITS TOTAL FILE CAP — this clear \
+             record is REFUSED loudly rather than growing the spool without \
+             bound; the records already spooled still merge on the next sweep"
+        );
+        return false;
+    }
+    let seq = SPOOL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = dir.join(format!("{nanos:030}-{}-{seq}.json", std::process::id()));
+    let Ok(json) = serde_json::to_string(record) else {
+        tracing::error!(
+            error_kind = "keychain_pending_clears_spool_failed",
+            "could not serialize a pending-clear record for the fallback spool"
+        );
+        return false;
+    };
+    let tmp = crate::platform::fs::unique_tmp_path(&path);
+    if std::fs::write(&tmp, json.as_bytes()).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::error!(
+            error_kind = "keychain_pending_clears_spool_failed",
+            "could not write a pending-clear spool file — this clear record \
+             could NOT be made durable"
+        );
+        return false;
+    }
+    if crate::platform::fs::secure_file(&tmp).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::error!(
+            error_kind = "keychain_pending_clears_spool_failed",
+            "could not secure a pending-clear spool file — this clear record \
+             could NOT be made durable"
+        );
+        return false;
+    }
+    if crate::platform::fs::atomic_replace(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::error!(
+            error_kind = "keychain_pending_clears_spool_failed",
+            "could not publish a pending-clear spool file — this clear record \
+             could NOT be made durable"
+        );
+        return false;
+    }
+    warn!(
+        error_kind = "keychain_pending_clears_spooled",
+        "the keychain pending-clear queue lock was busy past the durable-record \
+         budget — the clear was spooled and WILL be merged by the next sweep \
+         (never dropped)"
+    );
+    true
+}
+
+/// Every spool file, name-sorted (oldest first; names begin with a
+/// zero-padded timestamp). Used for presence checks and by the drain,
+/// which applies its own [`PENDING_CLEARS_SPOOL_DRAIN_MAX`] cap AFTER
+/// filtering (D237 round-2 correctness N5 / security R2-M2). Junk entries
+/// whose names end in `.json` are INCLUDED here so the drain can quarantine
+/// them; the cap uses [`pending_clears_spool_file_count`], which is narrower.
+#[cfg(target_os = "macos")]
+fn pending_clears_spool_paths(base_dir: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(pending_clears_spool_dir(base_dir)) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// Number of spool entries that can actually become drain candidates: a
+/// `.json` name whose entry is a REGULAR FILE. Used only to enforce
+/// [`PENDING_CLEARS_SPOOL_MAX_FILES`].
+///
+/// Deliberately narrower than [`pending_clears_spool_paths`]: the cap is a
+/// bound on records that will be merged, so a junk directory or symlink
+/// named `*.json` (quarantined by the drain, never merged) and any
+/// non-`.json` file MUST NOT consume headroom. A `file_type()` error is
+/// treated as "not a regular file" — a vanished entry holds no slot.
+#[cfg(target_os = "macos")]
+fn pending_clears_spool_file_count(base_dir: &Path) -> usize {
+    let Ok(rd) = std::fs::read_dir(pending_clears_spool_dir(base_dir)) else {
+        return 0;
+    };
+    rd.flatten()
+        .filter(|e| {
+            e.path().extension().is_some_and(|x| x == "json")
+                && e.file_type().is_ok_and(|t| t.is_file())
+        })
+        .count()
+}
+
+/// Moves `path` out of the drain window into
+/// [`PENDING_CLEARS_SPOOL_QUARANTINE_DIRNAME`], keeping it on disk for the
+/// operator (D237 round-2 correctness N5 / security R2-M2). Never deletes.
+/// A failed move logs a fixed-vocabulary WARN and leaves the file where it
+/// is; the drain's cap applies to the FILTERED set, so a file that cannot be
+/// moved still consumes no merge slot and cannot starve progress.
+#[cfg(target_os = "macos")]
+fn quarantine_pending_clear_spool_file(base_dir: &Path, path: &Path, reason: &'static str) {
+    let qdir = pending_clears_spool_quarantine_dir(base_dir);
+    let dir_ready =
+        std::fs::create_dir_all(&qdir).is_ok() && crate::platform::fs::secure_dir(&qdir).is_ok();
+    if !dir_ready {
+        warn!(
+            error_kind = "keychain_pending_clears_spool_quarantine_failed",
+            reason,
+            "a pending-clear spool entry could not be quarantined (the \
+             quarantine directory is unwritable); leaving it in place — it is \
+             excluded from the merge window, never merged, never deleted"
+        );
+        return;
+    }
+    let Some(name) = path.file_name() else {
+        return;
+    };
+    match std::fs::rename(path, qdir.join(name)) {
+        Ok(()) => warn!(
+            error_kind = "keychain_pending_clears_spool_quarantined",
+            reason,
+            "a pending-clear spool entry could not make progress; MOVED to the \
+             quarantine subdirectory (kept on disk for inspection, never \
+             deleted) so it can no longer starve the entries behind it"
+        ),
+        Err(_) => {
+            // A concurrent drain may have quarantined it first; only warn
+            // when it is still present.
+            if path.exists() {
+                warn!(
+                    error_kind = "keychain_pending_clears_spool_quarantine_failed",
+                    reason,
+                    "a pending-clear spool entry could not be quarantined; \
+                     leaving it in place — it is excluded from the merge window, \
+                     never merged, never deleted"
+                );
+            }
+        }
+    }
+}
+
+/// Merges spool files into `clears` (no I/O on the queue itself) and returns
+/// the files whose contents were applied. The caller saves the queue and
+/// removes the returned files ONLY when that save succeeded.
+///
+/// FILTER BEFORE CAPPING (D237 round-2 correctness N5 / security R2-M2). A
+/// spool file is bounded-read and never followed through a symlink
+/// (`symlink_metadata` + `is_file`). An irregular, oversized, unparseable, or
+/// malformed-service file is QUARANTINED — moved to
+/// [`PENDING_CLEARS_SPOOL_QUARANTINE_DIRNAME`], kept on disk for the
+/// operator, never deleted, never re-scanned — and does not consume one of
+/// the [`PENDING_CLEARS_SPOOL_DRAIN_MAX`] merge slots, so a head of junk
+/// files cannot permanently starve every valid entry behind it.
+///
+/// QUARANTINE ONLY DETERMINISTIC FAILURES. A read error is quarantined only
+/// when it is `InvalidData` (the bytes are not UTF-8 — retrying can never
+/// succeed). Every other read error is TRANSIENT — `PermissionDenied` mid
+/// ACL change, `Interrupted`, `WouldBlock`, `TimedOut`, `EAGAIN`/`EMFILE`
+/// under fd pressure, `EIO` on a flaky volume — and the file is LEFT IN
+/// PLACE for the next drain. Quarantine is terminal (the subdirectory is
+/// never re-scanned), so quarantining a transient error would move a valid
+/// clear record out of the retry path forever: the silent drop this spool
+/// exists to prevent. `NotFound` means a concurrent drain already took it;
+/// nothing to report. A file left in place cannot starve progress — the
+/// drain cap counts only APPLIED entries.
+#[cfg(target_os = "macos")]
+fn pending_clears_drain_spool_locked(base_dir: &Path, clears: &mut PendingClears) -> Vec<PathBuf> {
+    let mut applied = Vec::new();
+    for path in pending_clears_spool_paths(base_dir) {
+        if applied.len() >= PENDING_CLEARS_SPOOL_DRAIN_MAX {
+            break;
+        }
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.file_type().is_file() || meta.len() > PENDING_CLEARS_SPOOL_MAX_BYTES {
+            quarantine_pending_clear_spool_file(base_dir, &path, "irregular_or_oversized");
+            continue;
+        }
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // Non-UTF-8 is the ONE deterministic read failure: the bytes can
+            // never parse on a retry.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                quarantine_pending_clear_spool_file(base_dir, &path, "unreadable");
+                continue;
+            }
+            Err(_) => {
+                warn!(
+                    error_kind = "keychain_pending_clears_spool_read_retry",
+                    "a pending-clear spool entry could not be read right now (a \
+                     transient I/O error); leaving it in place for the next drain \
+                     — never quarantined, never deleted"
+                );
+                continue;
+            }
+        };
+        let Ok(record) = serde_json::from_str::<PendingClearEntry>(&raw) else {
+            quarantine_pending_clear_spool_file(base_dir, &path, "unparseable");
+            continue;
+        };
+        if !is_well_formed_service_name(&record.service) {
+            quarantine_pending_clear_spool_file(base_dir, &path, "malformed_service");
+            continue;
+        }
+        apply_pending_clear_record(clears, record);
+        applied.push(path);
+    }
+    applied
+}
+
+/// Record `service` as needing a retried clear. No duplicate entries — a
+/// SECOND record for a service already queued does NOT insert again, it
+/// RESETS that entry's backoff to due-now (security review 1386 N3), since
+/// a fresh logout recording the same service is new evidence the item
+/// still matters.
+///
+/// Returns `true` when the record reached DURABLE storage (the queue was
+/// saved, or the fallback spool file was written). Every failure remains
+/// non-fatal — nothing here panics or propagates an error — but `false`
+/// (spool at its total cap or unwritable, queue save failed) is returned so a
+/// user-facing caller can say the automatic retry was NOT queued; each
+/// refusal is also logged at a fixed-vocabulary ERROR/WARN at its source.
+///
+/// A caller that renders an operator result (logout) MUST surface `false`.
+/// `clear_bound_keychain_items` does: a refused queue sets
+/// `LogoutSummary::keychain_retry_queue_failed`, which `csq logout` and the
+/// desktop IPC result both render. Deliberately not `#[must_use]`: the
+/// dead-handle reaper only logs, and every refusal is already loud where it
+/// happens.
+///
+/// Serialized under `pending_clears_lock_path` (security review 1386
+/// HIGH — round 2) against both a concurrent `record_pending_clear` and the
+/// removal half of `sweep_pending_clears`, so an insert can never be lost
+/// to a racing sweep's blind overwrite. Load+dedupe+push+save is fast (one
+/// small file), so this lock is held only briefly — never across a
+/// `security` subprocess call.
+///
+/// Pure file I/O against `base_dir` — no `security` subprocess, so unlike
+/// every OTHER writer in this module this is NOT gated on
+/// `keychain_mirror_disabled()`. That guard exists to keep unit tests off
+/// the operator's REAL login keychain; `base_dir` here is always the
+/// caller's own (a `TempDir` in every test), so there is nothing to guard
+/// and gating it would make the queue itself untestable.
+///
+/// `account` (`keychain-fix-r8d.md` item 1): the marker account `service`'s
+/// dir was bound to AT QUEUE TIME — the caller resolves it (e.g.
+/// `accounts::markers::resolve_marker_to_slot`) before this call, since by
+/// retry time (`sweep_pending_clears`) the dir is gone and there is nothing
+/// left to resolve it from. `None` for a caller that genuinely has no
+/// marker to resolve (e.g. the dir never carried one) — the retry path
+/// treats that identically to a legacy pre-fix entry: fail closed, keep,
+/// never delete blind.
+#[cfg(target_os = "macos")]
+pub(crate) fn record_pending_clear(
+    base_dir: &Path,
+    service: &str,
+    account: Option<AccountNum>,
+    origin: PendingClearOrigin,
+    candidate_email: Option<String>,
+    keychain_account_hint: Option<String>,
+) -> bool {
+    record_pending_clear_recorded(
+        base_dir,
+        service,
+        account,
+        origin,
+        candidate_email,
+        keychain_account_hint,
+        None,
+    )
+}
+
+/// Same as [`record_pending_clear`] for the dead-handle reaper's call site,
+/// but discards the outcome: that caller only logs, and every refusal is
+/// already logged at a fixed-vocabulary ERROR/WARN at its source. The
+/// `()` return is what keeps this signature stable for the reaper's
+/// injectable `record_fn` seam; logout renders a user-facing result and uses
+/// [`record_pending_clear`] instead.
+///
+/// `keychain-fix-r11.md` S-LOW-1/D-4b: identical to [`record_pending_clear`]
+/// except for the trailing `queued_identity` — `(inode, ctime)` of the
+/// handle dir THIS entry is being queued for, captured by the caller from
+/// the dir's own `std::fs::metadata` BEFORE it is removed (by retry time
+/// there is nothing left to re-derive it from). `record_pending_clear`
+/// itself is kept as a thin wrapper passing `None` — every test call site
+/// and any caller with no dir left to stat (a bare service-name re-record)
+/// keeps working unchanged; only [`live_handle_dir_maps_to_service`] reads
+/// this field, and it treats `None` the same conservative way it always has
+/// (see that field's own doc on [`PendingClearEntry`]).
+///
+/// D237 round-2 ruling B/H2 + C: this is a DURABLE-RECORD path. The lock is
+/// [`crate::platform::lock::lock_durable_record_file`], and when it cannot be
+/// taken the record is persisted to the fallback spool
+/// ([`spool_pending_clear`]) — whose reader is
+/// [`pending_clears_drain_spool_locked`], called from this function's own
+/// locked section and from [`sweep_pending_clears_inner`] — and NEVER
+/// dropped. The previous behaviour (a 500 ms credential-budget wait followed
+/// by a `return` that lost a logout's clear) is what security finding H2
+/// named.
+#[cfg(target_os = "macos")]
+pub(crate) fn record_pending_clear_with_identity(
+    base_dir: &Path,
+    service: &str,
+    account: Option<AccountNum>,
+    origin: PendingClearOrigin,
+    candidate_email: Option<String>,
+    keychain_account_hint: Option<String>,
+    queued_identity: Option<(u64, i64)>,
+) {
+    let _ = record_pending_clear_recorded(
+        base_dir,
+        service,
+        account,
+        origin,
+        candidate_email,
+        keychain_account_hint,
+        queued_identity,
+    );
+}
+
+/// Full implementation shared by both public entry points: records
+/// `record` durably and reports whether it reached storage.
+#[cfg(target_os = "macos")]
+fn record_pending_clear_recorded(
+    base_dir: &Path,
+    service: &str,
+    account: Option<AccountNum>,
+    origin: PendingClearOrigin,
+    candidate_email: Option<String>,
+    keychain_account_hint: Option<String>,
+    queued_identity: Option<(u64, i64)>,
+) -> bool {
+    debug_assert!(
+        is_well_formed_service_name(service),
+        "record_pending_clear called with a malformed service name: {service:?} — \
+         every production caller derives this from keychain::service_name() \
+         (security review 1386 N4)"
+    );
+    let record = PendingClearEntry {
         service: service.to_string(),
         attempts: 0,
         next_attempt_unix_secs: 0,
@@ -2785,12 +4513,60 @@ pub(crate) fn record_pending_clear_with_identity(
         keychain_account_hint,
         queued_inode: queued_identity.map(|(ino, _)| ino),
         queued_ctime: queued_identity.map(|(_, ctime)| ctime),
-    });
-    save_pending_clears(base_dir, &clears, "record_pending_clear_with_identity");
+    };
+    let lock_path = pending_clears_lock_path(base_dir);
+    let _guard = match crate::platform::lock::lock_durable_record_file(&lock_path) {
+        Ok(Some(g)) => g,
+        Ok(None) => {
+            // D237 round-2 ruling B/H2 + C: the record is NEVER dropped. The
+            // lock's holder sections are local-only after the at-creation
+            // split, so expiry means a genuinely long/wedged queue writer;
+            // the durable spool is merged by the next sweep
+            // (`pending_clears_drain_spool_locked`), and by this function's
+            // own locked section on its next call.
+            warn!(
+                error_kind = "keychain_pending_clears_lock_failed",
+                "could not lock the keychain pending-clear queue within the \
+                 durable-record budget — spooling the clear so it is NEVER \
+                 dropped (the next sweep merges it)"
+            );
+            return spool_pending_clear(base_dir, &record);
+        }
+        Err(_) => {
+            warn!(
+                error_kind = "keychain_pending_clears_lock_failed",
+                "could not lock the keychain pending-clear queue — spooling the \
+                 clear so it is NEVER dropped (the next sweep merges it)"
+            );
+            return spool_pending_clear(base_dir, &record);
+        }
+    };
+
+    let mut clears = load_pending_clears(base_dir);
+    // Merge anything a previous caller had to spool, in the same locked
+    // section, so the queue stays the single source the sweep reads.
+    let drained = pending_clears_drain_spool_locked(base_dir, &mut clears);
+    apply_pending_clear_record(&mut clears, record);
+    if save_pending_clears(base_dir, &clears, "record_pending_clear_with_identity") {
+        // Only after the merged queue is durably saved: a spool file left in
+        // place after a failed save is re-merged (idempotent), never lost.
+        for path in drained {
+            let _ = std::fs::remove_file(path);
+        }
+        true
+    } else {
+        // `save_pending_clears` already logged a fixed-vocabulary ERROR. The
+        // new record is gone with the failed save; report the refusal so the
+        // logout result can say the retry was not queued.
+        false
+    }
 }
 
 /// Non-macOS: no keychain, so no pending-clear queue is ever populated —
-/// structural no-op.
+/// structural no-op. Returns `true` ("durably recorded"): there is nothing
+/// here that could fail to be queued, and returning `false` would make
+/// `csq logout` claim a keychain clear was lost on a platform that has no
+/// keychain clear at all.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn record_pending_clear(
     _base_dir: &Path,
@@ -2799,7 +4575,8 @@ pub(crate) fn record_pending_clear(
     _origin: PendingClearOrigin,
     _candidate_email: Option<String>,
     _keychain_account_hint: Option<String>,
-) {
+) -> bool {
+    true
 }
 
 /// Non-macOS: no keychain, so no pending-clear queue is ever populated —
@@ -2889,6 +4666,13 @@ pub(crate) fn resolve_pending_clear_at_creation(base_dir: &Path, svc: &str) {
 /// identical split for the SAME reason. Production's only caller
 /// ([`resolve_pending_clear_at_creation`] above) always passes the real
 /// [`clear_service_reporting`] / [`decide_and_clear_queued_service`] pair.
+///
+/// LOCK DISCIPLINE (D237 round-2 ruling B/H2): the injected closures run with
+/// [`pending_clears_lock_path`] RELEASED — snapshot (phase 1, locked), act
+/// (phase 2, unlocked), relock-and-remove (phase 3). The real closures shell
+/// a `security` subprocess ([`clear_service_reporting`]) or make a Node HTTP
+/// call ([`adopt_single_candidate_before_delete`]); neither may run under the
+/// queue lock.
 #[cfg(target_os = "macos")]
 fn resolve_pending_clear_at_creation_with(
     base_dir: &Path,
@@ -2901,39 +4685,101 @@ fn resolve_pending_clear_at_creation_with(
         Option<&str>,
     ) -> Result<bool, KeychainClearUnconfirmed>,
 ) {
-    let _guard = match crate::platform::lock::lock_file(&pending_clears_lock_path(base_dir)) {
-        Ok(g) => g,
-        Err(e) => {
-            warn!(
-                error_kind = "keychain_pending_clears_lock_failed",
-                "could not lock the keychain pending-clear queue to resolve a stale \
-                 entry for a freshly created handle dir (non-fatal); entry, if any, \
-                 stays queued for the daemon's own retry: {}",
-                crate::error::redact_tokens(&e.to_string())
-            );
-            return;
+    // PHASE 1 — SNAPSHOT under the lock. Local file I/O only. D237 round-2
+    // ruling B/H2: the clear itself (a `security` subprocess for a Logout
+    // entry, or decide+adopt's Node HTTP call for a DeadHandle entry) MUST
+    // NOT run while this lock is held — it used to, for seconds, which made
+    // a concurrent `record_pending_clear_with_identity` time out and lose a
+    // logout's clear. The shape mirrors `sweep_pending_clears_inner`:
+    // snapshot, release, act, relock, remove.
+    let snapshot = {
+        let _guard = match crate::platform::lock::lock_credential_file(&pending_clears_lock_path(
+            base_dir,
+        )) {
+            Ok(Some(g)) => g,
+            Ok(None) => {
+                warn!(
+                    error_kind = "keychain_pending_clears_lock_failed",
+                    "could not lock the keychain pending-clear queue within the bounded \
+                     wait to resolve a stale entry for a freshly created handle dir \
+                     (non-fatal); entry, if any, stays queued for the daemon's own retry"
+                );
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    error_kind = "keychain_pending_clears_lock_failed",
+                    "could not lock the keychain pending-clear queue to resolve a stale \
+                     entry for a freshly created handle dir (non-fatal); entry, if any, \
+                     stays queued for the daemon's own retry: {}",
+                    crate::error::redact_tokens(&e.to_string())
+                );
+                return;
+            }
+        };
+        let clears = load_pending_clears(base_dir);
+        match clears.services.iter().find(|e| e.service == svc) {
+            Some(e) => e.clone(),
+            None => return,
         }
-    };
-    let mut clears = load_pending_clears(base_dir);
-    let Some(idx) = clears.services.iter().position(|e| e.service == svc) else {
-        return;
-    };
-    let entry = clears.services[idx].clone();
-    let account = entry.account.and_then(|n| AccountNum::try_from(n).ok());
-    let outcome = match entry.origin {
+    }; // ← lock RELEASED here, before any subprocess / network call.
+
+    // PHASE 2 — the clear runs with NO queue lock held.
+    let account = snapshot.account.and_then(|n| AccountNum::try_from(n).ok());
+    let outcome = match snapshot.origin {
         PendingClearOrigin::Logout => logout_clear_fn(svc),
         PendingClearOrigin::DeadHandle => dead_handle_clear_fn(
             svc,
             account,
-            entry.candidate_email.as_deref(),
-            entry.keychain_account_hint.as_deref(),
+            snapshot.candidate_email.as_deref(),
+            snapshot.keychain_account_hint.as_deref(),
         ),
     };
     match outcome {
         // `Ok(true)`: a real clear was confirmed — remove the entry.
         Ok(true) => {
-            clears.services.remove(idx);
-            save_pending_clears(base_dir, &clears, "resolve_pending_clear_at_creation");
+            // PHASE 3 — relock and remove ONLY the entry this call acted on,
+            // by its (service, generation) identity (the same discriminator
+            // `sweep_pending_clears_inner`'s removal uses), so a record
+            // re-recorded during PHASE 2 is not clobbered.
+            let _guard = match crate::platform::lock::lock_durable_record_file(
+                &pending_clears_lock_path(base_dir),
+            ) {
+                Ok(Some(g)) => g,
+                Ok(None) => {
+                    warn!(
+                        error_kind = "keychain_pending_clears_lock_failed",
+                        "the keychain pending-clear item was confirmed cleared, but the \
+                         queue lock stayed busy past the durable-record budget — the \
+                         entry stays queued and the next sweep retries it (non-fatal)"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        error_kind = "keychain_pending_clears_lock_failed",
+                        "the keychain pending-clear item was confirmed cleared, but the \
+                         queue lock could not be taken — the entry stays queued and the \
+                         next sweep retries it (non-fatal): {}",
+                        crate::error::redact_tokens(&e.to_string())
+                    );
+                    return;
+                }
+            };
+            let mut clears = load_pending_clears(base_dir);
+            let drained = pending_clears_drain_spool_locked(base_dir, &mut clears);
+            if let Some(idx) = clears
+                .services
+                .iter()
+                .position(|e| identity_matches(&snapshot, e))
+            {
+                clears.services.remove(idx);
+            }
+            if save_pending_clears(base_dir, &clears, "resolve_pending_clear_at_creation") {
+                for path in drained {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
         }
         // `Ok(false)`: structural no-op (`keychain_mirror_disabled()`) —
         // nothing was attempted, so nothing changed; leave the entry queued
@@ -3114,15 +4960,16 @@ fn clear_queued_entry(
         origin,
         account,
         svc_has_live_handle_dir,
-        &mut |s| clear_service_reporting(s),
+        &mut |s| clear_service_under_mint(base_dir, s, queued_identity),
         &mut |s, a| {
-            decide_and_clear_queued_service(
+            decide_and_clear_queued_service_under_mint(
                 base_dir,
                 s,
                 a,
                 candidate_email,
                 keychain_account_hint,
                 try_adopt,
+                queued_identity,
             )
         },
     )
@@ -3148,33 +4995,87 @@ fn clear_queued_entry(
 ///    since there is nothing to compare against and the destructive branch
 ///    (a blind Logout delete) is the one that must fail closed
 ///    (`guard-reader-writer-parity.md` MUST-2).
-/// 2. **Identity-aware liveness, not bare `kill(pid, 0)`.** The candidate's
-///    owning PID must ALSO independently resolve a start time via
-///    [`crate::sessions::macos::read_start_time`] — a second, differently
-///    sourced signal before treating a bare-alive PID as a genuine
-///    collision, guarding against a THIRD-level PID recycle this predicate
-///    cannot otherwise distinguish from the dir it is actually protecting.
+/// 2. **A second, differently sourced liveness read, not bare `kill(pid, 0)`.** A
+///    bare-alive PID is cross-checked with
+///    [`crate::sessions::macos::probe_start_time`]. That read is NEVER compared with
+///    a recorded start time, so it does NOT detect PID reuse: it only catches a
+///    process that exits between the two reads. Only a definite `ESRCH` from it makes
+///    the holder dead; a read that merely failed counts as LIVE (see
+///    [`holder_is_live`]), never as dead. A REUSED pid reads live, which KEEPS the
+///    queued clear — the safe direction for a destructive operation.
 ///
-/// `false` on any I/O failure (absent `base_dir`, an unreadable entry, a
-/// canonicalize failure) for the SAME fail-closed reason MUST-2 gives above:
-/// this predicate fails toward "no live collision found", which is the safe
-/// direction ONLY because [`clear_queued_entry_inner`] now KEEPS the entry
-/// (does nothing) on a positive collision rather than acting on it — a
-/// `false` here simply proceeds to the entry's OWN origin disposition, never
-/// to an unconditional destructive default.
+/// Doubt answers `true` ("maps to a live dir"), because `true` is the direction in
+/// which [`clear_queued_entry_inner`] KEEPS a `Logout`-origin entry instead of clearing
+/// the item: an unreadable marker, an unreadable entry, or a failure to list or resolve
+/// the accounts directory all answer `true`. Only a missing `base_dir` answers `false`.
+/// See [`live_handle_dir_maps_to_service_with`].
 #[cfg(target_os = "macos")]
 fn live_handle_dir_maps_to_service(
     base_dir: &Path,
     svc: &str,
     queued_identity: Option<(u64, i64)>,
 ) -> bool {
+    live_handle_dir_maps_to_service_with(base_dir, svc, queued_identity, |pid| {
+        holder_is_live(
+            pid,
+            &crate::platform::process::is_pid_alive,
+            &crate::sessions::macos::probe_start_time,
+        )
+    })
+}
+
+/// Whether a handle dir's recorded holder `pid` counts as LIVE for a queued logout clear,
+/// over injected reads. Dead only when `kill(pid, 0)` says no such process, or the
+/// start-time read answers `ESRCH` ([`Probe::Gone`](crate::sessions::macos::Probe)). A
+/// start-time read that FAILED for any other reason (or returned an unpopulated zero) says
+/// nothing about the process, so the holder is LIVE: the clear is destructive, and
+/// "could not read" must not fold into "dead" (`guard-reader-writer-parity.md` MUST-2).
+#[cfg(target_os = "macos")]
+fn holder_is_live(
+    pid: u32,
+    is_alive: &dyn Fn(u32) -> bool,
+    start_of: &dyn Fn(u32) -> crate::sessions::macos::Probe<u64>,
+) -> bool {
+    use crate::sessions::macos::Probe;
+    is_alive(pid) && !matches!(start_of(pid), Probe::Gone)
+}
+
+/// [`live_handle_dir_maps_to_service`] with liveness injected (tests never shell `ps`).
+///
+/// A positive answer makes [`clear_queued_entry_inner`] KEEP a `Logout`-origin entry, so
+/// every doubt resolves to `true` (`guard-reader-writer-parity.md` MUST-2): the dir's
+/// holder is read with [`crate::accounts::markers::handle_dir_in_use`] (BOTH `.live-pid`
+/// and `.live-cc-pid`; an orphan `claude` child outlives a dead csq parent and still holds
+/// the dir's item), and an UNREADABLE marker, an unreadable entry, or a dir that cannot be
+/// stat'd or canonicalized counts as "maps to a live dir". Only a dir that is provably
+/// dead, or whose service name provably differs from `svc`, is skipped. A missing
+/// `base_dir` is `false` (nothing to protect); any other enumeration failure is `true`.
+#[cfg(target_os = "macos")]
+fn live_handle_dir_maps_to_service_with(
+    base_dir: &Path,
+    svc: &str,
+    queued_identity: Option<(u64, i64)>,
+    is_alive: impl Fn(u32) -> bool,
+) -> bool {
     use std::os::unix::fs::MetadataExt;
 
     let entries = match std::fs::read_dir(base_dir) {
         Ok(e) => e,
-        Err(_) => return false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return kept_on_doubt("accounts_dir_unlistable"),
     };
-    for entry in entries.flatten() {
+    // Resolve the accounts directory ONCE and derive each candidate's service from it: the
+    // service CC uses is keyed by the handle dir's path under the resolved accounts dir, so
+    // a per-entry canonicalize is not needed, and an entry that vanishes or dangles between
+    // listing and resolving no longer turns into a blanket "live" for every service.
+    let Ok(base_abs) = std::fs::canonicalize(base_dir) else {
+        return kept_on_doubt("accounts_dir_unresolvable");
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            // A per-entry readdir error may hide a live dir: refuse.
+            return kept_on_doubt("accounts_dir_entry_unreadable");
+        };
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -3183,32 +5084,239 @@ fn live_handle_dir_maps_to_service(
             continue;
         }
         if let Some(queued) = queued_identity {
-            let Ok(meta) = std::fs::metadata(&path) else {
-                continue;
-            };
-            if (meta.ino(), meta.ctime()) == queued {
-                continue; // the SAME dir the entry was queued against
+            // A dir that cannot be stat'd is NOT skipped as "the same dir".
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if (meta.ino(), meta.ctime()) == queued {
+                    continue; // the SAME dir the entry was queued against
+                }
             }
         }
-        let pid = crate::accounts::markers::read_live_pid(&path)
-            .or_else(|| name.strip_prefix("term-").and_then(|s| s.parse().ok()));
-        let Some(pid) = pid else { continue };
-        if !crate::platform::process::is_pid_alive(pid) {
-            continue;
+        let dir_name_pid = name.strip_prefix("term-").and_then(|s| s.parse().ok());
+        if crate::accounts::markers::handle_dir_in_use(&path, dir_name_pid, &is_alive).is_none() {
+            continue; // provably dead (or no holder recorded)
         }
-        // Identity-aware liveness (S-LOW-1/D-4b): a second, independently
-        // sourced confirmation beyond bare `kill(pid, 0)`.
-        if crate::sessions::macos::read_start_time(pid).is_none() {
-            continue;
-        }
-        let Ok(abs) = std::fs::canonicalize(&path) else {
-            continue;
-        };
-        if service_name(&abs) == svc {
+        // Possibly live (live pid, live child, or unreadable marker). Does it map to `svc`?
+        if service_name(&base_abs.join(name)) == svc {
             return true;
         }
     }
     false
+}
+
+/// `true`, logged once per process with a fixed tag: a queued logout clear is being kept
+/// because a check could not be completed, not because a live session was found. Without
+/// the log an operator would see a logged-out account's item linger with no reason.
+#[cfg(target_os = "macos")]
+fn kept_on_doubt(reason: &'static str) -> bool {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            error_kind = "keychain_clear_kept_on_doubt",
+            reason,
+            "a queued keychain clear was kept because a liveness check could not complete"
+        );
+    }
+    true
+}
+
+/// Longest a Logout-origin clear keeps starting NEW deletes after taking the
+/// term mint lock. A delete in [`delete_service_retrying`] is at most
+/// `KEYCHAIN_OP_TIMEOUT / 2` (a fast failure) plus one bounded retry
+/// (`KEYCHAIN_OP_TIMEOUT` + `MIN_POST_EXIT_GRACE`), 7.75s; starting none after 3s
+/// bounds the whole hold at 10.75s, under the creators' 13s wait
+/// (`session::term_mint::MINT_WAIT_ATTEMPTS`). A drain stopped here is
+/// unconfirmed: the entry stays queued and retries.
+#[cfg(target_os = "macos")]
+const MINT_HOLD_NEW_DELETE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The final step of a queued retry that DELETES or REWRITES a `term-<pid>`
+/// item, run under the term mint lock (`session::term_mint`): take the lock
+/// (one try; busy or unavailable means keep), re-check that no live handle dir
+/// maps to `svc` (`live_handle_dir_maps_to_service`, which counts a reused pid's
+/// freshly minted `term-<pid>`), then run `step`. A creator for that pid either
+/// finished before the check (seen) or waits for the step. `keep` produces the
+/// result when the step is not run.
+///
+/// LOCK ORDER (the mint lock is a LEAF, `platform::lock::order`): the retry
+/// loop `sweep_pending_clears_inner` runs every `clear_fn` with NO
+/// pending-clears lock held (it takes that lock only afterwards, to remove
+/// confirmed entries), so the leaf is taken first-and-only here. The adopt HTTP
+/// call happens inside the decision, before the gate, holding no lock. The only
+/// lock that may already be held when the gate runs is the profiles lock
+/// `apply_dead_handle_strip_guarded` holds across the write (class `Other`,
+/// admitted); nothing is acquired while the mint lock is held.
+#[cfg(target_os = "macos")]
+fn under_mint_after_live_check<T>(
+    base_dir: &Path,
+    svc: &str,
+    queued_identity: Option<(u64, i64)>,
+    keep: &dyn Fn() -> T,
+    step: impl FnOnce() -> T,
+) -> T {
+    use crate::session::term_mint::{try_acquire_for_sweep, SweepLock};
+    let _mint = match try_acquire_for_sweep(base_dir) {
+        SweepLock::Held(guard) => guard,
+        SweepLock::Busy | SweepLock::Unavailable => return keep(),
+    };
+    if live_handle_dir_maps_to_service(base_dir, svc, queued_identity) {
+        return keep();
+    }
+    step()
+}
+
+/// A Logout-origin queued retry: the unconditional delete-by-service-name of
+/// [`clear_service_reporting`], run under [`under_mint_after_live_check`]. A
+/// kept retry is `Ok(false)`, the free structural no-op the retry loop already
+/// treats as "try again next tick".
+#[cfg(target_os = "macos")]
+fn clear_service_under_mint(
+    base_dir: &Path,
+    svc: &str,
+    queued_identity: Option<(u64, i64)>,
+) -> Result<bool, KeychainClearUnconfirmed> {
+    if keychain_mirror_disabled() {
+        return Ok(false);
+    }
+    clear_service_under_mint_with(base_dir, svc, queued_identity, |s| {
+        let held_since = std::time::Instant::now();
+        drain_service_inner(s, &mut |svc| {
+            if held_since.elapsed() >= MINT_HOLD_NEW_DELETE_DEADLINE {
+                return None;
+            }
+            delete_service_retrying(svc).and_then(|o| o.output.status.code())
+        })
+    })
+}
+
+/// [`clear_service_under_mint`] with the drain injected, so a test can observe
+/// whether it ran and whether the lock was held while it did.
+#[cfg(target_os = "macos")]
+fn clear_service_under_mint_with(
+    base_dir: &Path,
+    svc: &str,
+    queued_identity: Option<(u64, i64)>,
+    drain: impl FnOnce(&str) -> Result<bool, KeychainClearUnconfirmed>,
+) -> Result<bool, KeychainClearUnconfirmed> {
+    under_mint_after_live_check(base_dir, svc, queued_identity, &|| Ok(false), || drain(svc))
+}
+
+/// The executor a DeadHandle-origin retry decides and writes through. Reads
+/// pass straight through; every write (`delete`, `delete_reporting`, `add`,
+/// `add_restoring`) first takes the term mint lock, re-checks for a live handle
+/// dir, RE-READS the item and requires it to be byte-equal to the FIRST read the
+/// decision was made on, and only then runs. A refused write returns the
+/// executor's own failure value, which the retry reports as unconfirmed (the
+/// entry stays queued, backed off, never dropped).
+///
+/// The first read is the decision's: any adopt HTTP call and profile reads
+/// happened after it and before the gate, so a Claude Code that rotated the
+/// item's login in that time is seen as changed bytes and the item is kept.
+#[cfg(target_os = "macos")]
+struct MintGatedExecutor<'a, E: KeychainExecutor + ?Sized> {
+    inner: &'a E,
+    base_dir: &'a Path,
+    svc: &'a str,
+    queued_identity: Option<(u64, i64)>,
+    first_read: std::cell::RefCell<Option<RawContentClassification>>,
+}
+
+#[cfg(target_os = "macos")]
+impl<'a, E: KeychainExecutor + ?Sized> MintGatedExecutor<'a, E> {
+    fn new(
+        inner: &'a E,
+        base_dir: &'a Path,
+        svc: &'a str,
+        queued_identity: Option<(u64, i64)>,
+    ) -> Self {
+        Self {
+            inner,
+            base_dir,
+            svc,
+            queued_identity,
+            first_read: std::cell::RefCell::new(None),
+        }
+    }
+
+    fn gated<T>(&self, account: &str, keep: &dyn Fn() -> T, op: impl FnOnce() -> T) -> T {
+        under_mint_after_live_check(self.base_dir, self.svc, self.queued_identity, keep, || {
+            if let Some(first) = self.first_read.borrow().as_ref() {
+                let now = self.inner.find(self.svc, account);
+                let unchanged = matches!(
+                    (first, &now),
+                    (
+                        RawContentClassification::Absent,
+                        RawContentClassification::Absent
+                    )
+                ) || orphans::same_item_content(first, &now);
+                if !unchanged {
+                    return keep();
+                }
+            }
+            op()
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl<E: KeychainExecutor + ?Sized> KeychainExecutor for MintGatedExecutor<'_, E> {
+    fn find(&self, svc: &str, account: &str) -> RawContentClassification {
+        let read = self.inner.find(svc, account);
+        if svc == self.svc {
+            let mut first = self.first_read.borrow_mut();
+            if first.is_none() {
+                *first = Some(read.clone());
+            }
+        }
+        read
+    }
+
+    fn add(&self, svc: &str, account: &str, payload: &str) -> Result<(), PlatformError> {
+        self.gated(account, &mint_gate_refused, || {
+            self.inner.add(svc, account, payload)
+        })
+    }
+
+    fn add_create_only(
+        &self,
+        svc: &str,
+        account: &str,
+        payload: &str,
+    ) -> Result<CreateOnlyOutcome, PlatformError> {
+        self.inner.add_create_only(svc, account, payload)
+    }
+
+    fn add_restoring(
+        &self,
+        svc: &str,
+        account: &str,
+        payload: &str,
+        siblings_only: Option<Zeroizing<String>>,
+    ) -> Result<(), PlatformError> {
+        self.gated(account, &mint_gate_refused, || {
+            self.inner
+                .add_restoring(svc, account, payload, siblings_only)
+        })
+    }
+
+    fn delete(&self, svc: &str, account: &str) -> bool {
+        self.gated(account, &|| false, || self.inner.delete(svc, account))
+    }
+
+    fn delete_reporting(&self, svc: &str, account: &str) -> orphans::DeleteOutcome {
+        self.gated(account, &|| orphans::DeleteOutcome::Failed, || {
+            self.inner.delete_reporting(svc, account)
+        })
+    }
+
+    fn list_cc_credential_items(&self) -> Result<orphans::DumpScan, orphans::UndeterminedReason> {
+        self.inner.list_cc_credential_items()
+    }
+}
+
+/// The failure a gated write returns when the gate keeps the item.
+#[cfg(target_os = "macos")]
+fn mint_gate_refused() -> Result<(), PlatformError> {
+    Err(PlatformError::Keychain("keychain_mint_gate_kept".into()))
 }
 
 /// Test seam for [`clear_queued_entry`]'s ORIGIN dispatch. Both real
@@ -3294,7 +5402,13 @@ fn sweep_pending_clears_inner(
     ) -> Result<bool, KeychainClearUnconfirmed>,
 ) -> (usize, usize) {
     let snapshot = load_pending_clears(base_dir);
-    if snapshot.services.is_empty() {
+    // A non-empty SPOOL must not short-circuit as "queue empty": the spool is
+    // exactly the durable path a record takes when the queue lock was busy
+    // (D237 round-2 ruling C), and this sweep is its reader. The drain below
+    // runs under the queue lock and persists the merged queue before any
+    // spool file is removed.
+    let spool_present = !pending_clears_spool_paths(base_dir).is_empty();
+    if snapshot.services.is_empty() && !spool_present {
         return (0, 0);
     }
     // Security review 1386, sec-1386's generation-counter finding: track the
@@ -3376,11 +5490,24 @@ fn sweep_pending_clears_inner(
     let cleared = cleared_entries.len();
 
     let remaining = {
-        let _guard = match crate::platform::lock::lock_file(&pending_clears_lock_path(base_dir)) {
-            Ok(g) => g,
-            Err(_) => return (0, snapshot.services.len()), // couldn't lock — remove NOTHING; retry next tick
+        let _guard = match crate::platform::lock::lock_credential_file(&pending_clears_lock_path(
+            base_dir,
+        )) {
+            Ok(Some(g)) => g,
+            // Bounded expiry and I/O refusal both remove NOTHING; retry next tick.
+            Ok(None) | Err(_) => {
+                return (
+                    0,
+                    snapshot.services.len() + pending_clears_spool_paths(base_dir).len(),
+                )
+            }
         };
         let mut current = load_pending_clears(base_dir);
+        // Merge records that could not take this lock when they were
+        // recorded (D237 round-2 ruling C: a logout clear is NEVER dropped).
+        // The merged entries are persisted by the save below; only then are
+        // their spool files removed.
+        let drained = pending_clears_drain_spool_locked(base_dir, &mut current);
         // Remove exactly the SNAPSHOT entries THIS sweep confirmed cleared —
         // keyed on (service, generation) ONLY, not full entry equality
         // (security review 1386, C1(c) — pendq-r2 + team-lead, independently
@@ -3434,8 +5561,18 @@ fn sweep_pending_clears_inner(
         // unreachable keychain) this whole mechanism targets. Do not add
         // an early-return / no-op skip here without re-establishing that
         // persistence for the zero-removals-nonzero-bumps case.
-        save_pending_clears(base_dir, &current, "sweep_pending_clears");
-        n
+        let saved = save_pending_clears(base_dir, &current, "sweep_pending_clears");
+        if saved {
+            // Only after the merged queue is durably on disk. A file left in
+            // place after a failed save (or left malformed) is re-merged or
+            // reported next tick — never lost.
+            for path in drained {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        // Entries still in the spool (save failed, an entry was malformed, or
+        // more than one drain's cap) are still pending clears.
+        n + pending_clears_spool_paths(base_dir).len()
     };
     // Security review 1386 F4: the compensating mechanism had zero
     // observability — both callers discard the return value. A non-empty
@@ -3612,7 +5749,7 @@ pub fn harvest_account_candidates(base_dir: &Path, account_uuid: &str) -> Vec<Ha
         // claimed to cover without actually calling it).
         let raw = read_raw_keychain(&abs);
         let raw_present = raw.is_some();
-        let expiry = match harvest_candidate_expiry(raw.as_deref(), now) {
+        let expiry = match harvest_candidate_expiry(raw.as_ref().map(|s| s.as_str()), now) {
             Ok(e) => e,
             Err(HarvestSkipReason::ReadAbsentOrFailed) => {
                 debug_assert!(!raw_present, "ReadAbsentOrFailed implies raw was None");
@@ -3658,7 +5795,7 @@ pub fn harvest_account_candidates(base_dir: &Path, account_uuid: &str) -> Vec<Ha
     }
 
     // Freshest first; A0 validates in this order and adopts the first Live one.
-    candidates.sort_by(|a, b| b.expiry_ms.cmp(&a.expiry_ms));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.expiry_ms));
     candidates
 }
 
@@ -3849,7 +5986,7 @@ pub enum RawContentClassification {
     Absent,
     /// A COMPLETE, non-empty, successfully decoded (raw JSON or legacy hex)
     /// payload that parses as a JSON OBJECT. Safe to read and merge with.
-    Content(String),
+    Content(Zeroizing<String>),
     /// Every other case: spawn failure/timeout, an INCOMPLETE stdout
     /// capture (BUG-R3-1/F6), a non-44 failure exit, non-UTF-8 bytes, bad
     /// hex, an empty payload, or content that decodes but is not a JSON
@@ -3896,6 +6033,7 @@ fn classify_raw_content(output: Option<BoundedOutput>) -> RawContentClassificati
         Some(bo) => bo,
         None => return RawContentClassification::Unreadable(UnreadableKind::Transient),
     };
+    let mut bo = SecretOutput::new(bo);
     if !bo.output.status.success() {
         return match bo.output.status.code() {
             Some(SECURITY_ITEM_NOT_FOUND) => RawContentClassification::Absent,
@@ -3917,7 +6055,7 @@ fn classify_raw_content(output: Option<BoundedOutput>) -> RawContentClassificati
     if !bo.stdout_complete {
         return RawContentClassification::Unreadable(UnreadableKind::Transient);
     }
-    let Ok(raw) = String::from_utf8(bo.output.stdout) else {
+    let Ok(raw) = zeroizing_utf8(Zeroizing::new(std::mem::take(&mut bo.output.stdout))) else {
         return RawContentClassification::Unreadable(UnreadableKind::Transient);
     };
     let raw = raw.trim();
@@ -3925,18 +6063,15 @@ fn classify_raw_content(output: Option<BoundedOutput>) -> RawContentClassificati
         return RawContentClassification::Unreadable(UnreadableKind::Transient);
     }
     let json = if raw.starts_with('{') {
-        raw.to_string()
+        Zeroizing::new(raw.to_owned())
     } else {
-        let Ok(bytes) = hex::decode(raw) else {
-            return RawContentClassification::Unreadable(UnreadableKind::Transient);
-        };
-        match String::from_utf8(bytes) {
+        match zeroizing_hex(raw).and_then(zeroizing_utf8) {
             Ok(s) => s,
             Err(_) => return RawContentClassification::Unreadable(UnreadableKind::Transient),
         }
     };
-    match serde_json::from_str::<serde_json::Value>(&json) {
-        Ok(serde_json::Value::Object(_)) => RawContentClassification::Content(json),
+    match serde_json::from_str::<SecretJson>(&json) {
+        Ok(value) if value.is_object() => RawContentClassification::Content(json),
         // Parses as something other than a JSON object, or fails to parse
         // at all — neither is a known "safe to merge with" shape.
         _ => RawContentClassification::Unreadable(UnreadableKind::Transient),
@@ -3953,13 +6088,16 @@ fn classify_raw_content(output: Option<BoundedOutput>) -> RawContentClassificati
 // its tests run on every platform; its only PRODUCTION caller is still
 // macOS-gated, so it is genuinely unused in a non-test, non-macOS build.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn extract_sibling_object(json: &str) -> serde_json::Map<String, serde_json::Value> {
-    match serde_json::from_str::<serde_json::Value>(json) {
-        Ok(serde_json::Value::Object(mut obj)) => {
-            obj.remove("claudeAiOauth");
-            obj
+fn extract_sibling_object(json: &str) -> SecretJson {
+    let mut value = serde_json::from_str::<SecretJson>(json).unwrap_or_default();
+    if let Some(object) = value.as_object_mut() {
+        if let Some((mut key, mut oauth)) = object.remove_entry("claudeAiOauth") {
+            key.zeroize();
+            wipe_json(&mut oauth);
         }
-        _ => serde_json::Map::new(),
+        value
+    } else {
+        SecretJson(serde_json::Value::Object(serde_json::Map::new()))
     }
 }
 
@@ -4025,7 +6163,7 @@ fn raw_content_for(_config_dir: &Path) -> RawContentClassification {
 /// distinguish `Absent` from `Unreadable` to decide whether writing or
 /// deleting is safe — never a second, different account).
 #[cfg(target_os = "macos")]
-fn read_complete_keychain_content(config_dir: &Path) -> Option<String> {
+fn read_complete_keychain_content(config_dir: &Path) -> Option<Zeroizing<String>> {
     match raw_content_for(config_dir) {
         RawContentClassification::Content(s) => Some(s),
         RawContentClassification::Absent | RawContentClassification::Unreadable(_) => None,
@@ -4038,7 +6176,7 @@ fn read_complete_keychain_content(config_dir: &Path) -> Option<String> {
 /// [`read_complete_keychain_content`], which is the shared completeness-safe
 /// primitive (BUG-R3-1).
 #[cfg(target_os = "macos")]
-fn read_raw_keychain(config_dir: &Path) -> Option<String> {
+fn read_raw_keychain(config_dir: &Path) -> Option<Zeroizing<String>> {
     read_complete_keychain_content(config_dir)
 }
 
@@ -4049,7 +6187,6 @@ fn read_raw_keychain(config_dir: &Path) -> Option<String> {
 /// blocks waiting for an unlock that never comes; without this bound a `csq run`
 /// keychain mirror would hang the launch (observed: CI macOS integration tests
 /// timed out at 25 min).
-#[cfg(target_os = "macos")]
 const KEYCHAIN_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Per-call bound when the operator is present to answer a macOS password
@@ -4058,7 +6195,7 @@ const KEYCHAIN_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// type a password, leaving an orphaned dialog and a "could not be read"
 /// result.
 #[cfg(target_os = "macos")]
-#[cfg_attr(feature = "test-utils", allow(dead_code))]
+#[cfg_attr(any(test, feature = "test-utils"), allow(dead_code))]
 const KEYCHAIN_INTERACTIVE_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The per-call `security` bound. The long bound applies ONLY inside the
@@ -4066,7 +6203,7 @@ const KEYCHAIN_INTERACTIVE_OP_TIMEOUT: std::time::Duration = std::time::Duration
 /// process that merely has a terminal on stdin keeps [`KEYCHAIN_OP_TIMEOUT`],
 /// so an unrelated stalled call never holds a lock for a minute.
 #[cfg(target_os = "macos")]
-#[cfg_attr(feature = "test-utils", allow(dead_code))]
+#[cfg_attr(any(test, feature = "test-utils"), allow(dead_code))]
 fn security_op_timeout(in_interactive_scope: bool) -> std::time::Duration {
     if in_interactive_scope {
         KEYCHAIN_INTERACTIVE_OP_TIMEOUT
@@ -4125,6 +6262,44 @@ pub(crate) struct BoundedOutput {
     /// no current caller reads it, since none parses `stderr` as content.
     #[allow(dead_code)]
     pub(crate) stderr_complete: bool,
+}
+
+pub(crate) struct SecretOutput(pub(crate) BoundedOutput);
+impl SecretOutput {
+    pub(crate) fn new(output: BoundedOutput) -> Self {
+        Self(output)
+    }
+    fn wipe(&mut self) {
+        self.output.stdout.zeroize();
+        self.output.stderr.zeroize();
+    }
+}
+impl fmt::Debug for SecretOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretOutput")
+            .field("status", &self.output.status)
+            .field("stdout", &"[REDACTED]")
+            .field("stderr", &"[REDACTED]")
+            .field("stdout_complete", &self.stdout_complete)
+            .field("stderr_complete", &self.stderr_complete)
+            .finish()
+    }
+}
+impl std::ops::Deref for SecretOutput {
+    type Target = BoundedOutput;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for SecretOutput {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl Drop for SecretOutput {
+    fn drop(&mut self) {
+        self.wipe();
+    }
 }
 
 /// Deliberately does NOT derive `Debug` (`credential-type-hygiene.md` Rule 1
@@ -4196,6 +6371,7 @@ impl fmt::Debug for BoundedOutput {
 /// to a completed ask.
 #[cfg(all(target_os = "macos", any(test, feature = "test-utils")))]
 pub(crate) fn run_security_bounded(args: &[&str], stdin: Option<Vec<u8>>) -> Option<BoundedOutput> {
+    let stdin = stdin.map(Zeroizing::new);
     // Test/hermetic guard — never shell `security` against the operator's real
     // login keychain from a test. Reads/deletes degrade to "unavailable" (None);
     // `write_raw` short-circuits to Ok separately so it reports a clean no-op.
@@ -4212,6 +6388,7 @@ pub(crate) fn run_security_bounded(args: &[&str], stdin: Option<Vec<u8>>) -> Opt
 
 #[cfg(all(target_os = "macos", not(any(test, feature = "test-utils"))))]
 pub(crate) fn run_security_bounded(args: &[&str], stdin: Option<Vec<u8>>) -> Option<BoundedOutput> {
+    let mut stdin = stdin.map(Zeroizing::new);
     // Test/hermetic guard — never shell `security` against the operator's real
     // login keychain from a test. Reads/deletes degrade to "unavailable" (None);
     // `write_raw` short-circuits to Ok separately so it reports a clean no-op.
@@ -4253,13 +6430,17 @@ pub(crate) fn run_security_bounded(args: &[&str], stdin: Option<Vec<u8>>) -> Opt
     }
     let mut cmd = std::process::Command::new("security");
     cmd.args(args);
-    run_bounded(cmd, security_op_timeout(in_interactive_scope), stdin)
+    run_bounded(
+        cmd,
+        security_op_timeout(in_interactive_scope),
+        stdin.as_mut().map(|bytes| std::mem::take(&mut **bytes)),
+    )
 }
 
 /// Whether the default (login) keychain is locked, as far as csq can tell
 /// without prompting.
 #[cfg(target_os = "macos")]
-#[cfg_attr(feature = "test-utils", allow(dead_code))]
+#[cfg_attr(any(test, feature = "test-utils"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeychainLockState {
     Locked,
@@ -4272,17 +6453,17 @@ pub(crate) enum KeychainLockState {
 /// `None` when the default keychain or its status could not be obtained.
 /// Injected so the classification is testable without the real keychain.
 #[cfg(target_os = "macos")]
-#[cfg_attr(feature = "test-utils", allow(dead_code))]
+#[cfg_attr(any(test, feature = "test-utils"), allow(dead_code))]
 pub(crate) type KeychainStatusProbe = fn() -> Option<u32>;
 
 /// `kSecUnlockStateStatus` from `SecKeychain.h`: set when the keychain is
 /// unlocked.
 #[cfg(target_os = "macos")]
-#[cfg_attr(feature = "test-utils", allow(dead_code))]
+#[cfg_attr(any(test, feature = "test-utils"), allow(dead_code))]
 const K_SEC_UNLOCK_STATE_STATUS: u32 = 1;
 
 #[cfg(target_os = "macos")]
-#[cfg_attr(feature = "test-utils", allow(dead_code))]
+#[cfg_attr(any(test, feature = "test-utils"), allow(dead_code))]
 pub(crate) fn keychain_lock_state(probe: KeychainStatusProbe) -> KeychainLockState {
     match probe() {
         Some(bits) if bits & K_SEC_UNLOCK_STATE_STATUS != 0 => KeychainLockState::Unlocked,
@@ -4296,7 +6477,7 @@ pub(crate) fn keychain_lock_state(probe: KeychainStatusProbe) -> KeychainLockSta
 /// confirmed locked. The lock state is read lazily, so an interactive process
 /// never pays for the probe.
 #[cfg(target_os = "macos")]
-#[cfg_attr(feature = "test-utils", allow(dead_code))]
+#[cfg_attr(any(test, feature = "test-utils"), allow(dead_code))]
 pub(crate) fn should_defer_for_locked_keychain(
     interactive: bool,
     lock_state: impl FnOnce() -> KeychainLockState,
@@ -4312,7 +6493,7 @@ pub(crate) fn should_defer_for_locked_keychain(
 static KEYCHAIN_DEFERRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(target_os = "macos")]
-#[cfg_attr(feature = "test-utils", allow(dead_code))]
+#[cfg_attr(any(test, feature = "test-utils"), allow(dead_code))]
 fn note_keychain_deferral() {
     // Log once per locked episode at info, not once per call.
     if !KEYCHAIN_DEFERRED.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -4337,7 +6518,7 @@ pub fn declare_background_keychain_process() {
 }
 
 #[cfg_attr(
-    any(not(target_os = "macos"), feature = "test-utils"),
+    any(not(target_os = "macos"), test, feature = "test-utils"),
     allow(dead_code)
 )]
 fn process_declared_background() -> bool {
@@ -4350,11 +6531,11 @@ fn process_declared_background() -> bool {
 /// bound the state is Unknown, which proceeds under the old (itself bounded)
 /// behaviour. A probe thread stranded by a hang is left to finish on its own.
 #[cfg(target_os = "macos")]
-#[cfg_attr(feature = "test-utils", allow(dead_code))]
+#[cfg_attr(any(test, feature = "test-utils"), allow(dead_code))]
 const KEYCHAIN_LOCK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[cfg(target_os = "macos")]
-#[cfg_attr(feature = "test-utils", allow(dead_code))]
+#[cfg_attr(any(test, feature = "test-utils"), allow(dead_code))]
 fn bounded_default_keychain_lock_probe() -> Option<u32> {
     bounded_probe(default_keychain_lock_probe, KEYCHAIN_LOCK_PROBE_TIMEOUT)
 }
@@ -4362,11 +6543,11 @@ fn bounded_default_keychain_lock_probe() -> Option<u32> {
 /// At most one lock probe is in flight per process, so a keychain service
 /// that stops answering strands ONE helper thread, not one per call.
 #[cfg(target_os = "macos")]
-#[cfg_attr(feature = "test-utils", allow(dead_code))]
+#[cfg_attr(any(test, feature = "test-utils"), allow(dead_code))]
 static PROBE_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(target_os = "macos")]
-#[cfg_attr(feature = "test-utils", allow(dead_code))]
+#[cfg_attr(any(test, feature = "test-utils"), allow(dead_code))]
 fn bounded_probe(probe: fn() -> Option<u32>, timeout: std::time::Duration) -> Option<u32> {
     bounded_probe_with(&PROBE_IN_FLIGHT, probe, timeout)
 }
@@ -4428,7 +6609,7 @@ pub fn with_interactive_keychain<T>(f: impl FnOnce() -> T) -> T {
     any(not(target_os = "macos"), feature = "test-utils"),
     allow(dead_code)
 )]
-fn interactive_scope_active() -> bool {
+pub(crate) fn interactive_scope_active() -> bool {
     INTERACTIVE_SCOPE.with(|c| c.get() > 0)
 }
 
@@ -4436,7 +6617,7 @@ fn interactive_scope_active() -> bool {
 /// detect the locked -> unlocked transition regardless of WHICH process
 /// skipped work while it was locked.
 #[cfg(target_os = "macos")]
-#[cfg_attr(feature = "test-utils", allow(dead_code))]
+#[cfg_attr(any(test, feature = "test-utils"), allow(dead_code))]
 static LAST_SEEN_LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// True when the daemon should re-run its keychain sweep now: either this
@@ -4458,7 +6639,7 @@ pub(crate) fn keychain_catch_up_due() -> bool {
 
 /// Pure decision for [`keychain_catch_up_due`], testable without a keychain.
 #[cfg(target_os = "macos")]
-#[cfg_attr(feature = "test-utils", allow(dead_code))]
+#[cfg_attr(any(test, feature = "test-utils"), allow(dead_code))]
 fn catch_up_due_with(
     deferred: &std::sync::atomic::AtomicBool,
     last_locked: &std::sync::atomic::AtomicBool,
@@ -4621,17 +6802,17 @@ fn real_security_spawn_tripwire(args: &[&str]) -> ! {
 /// exactly like an incomplete capture, never as "here is the (possibly
 /// empty) real content". Only `Ok(Ok(buf))` is `(true, buf)`.
 #[cfg(target_os = "macos")]
-#[cfg_attr(feature = "test-utils", allow(dead_code))]
+#[cfg_attr(any(test, feature = "test-utils"), allow(dead_code))]
 fn classify_reader_recv(
-    recv: Result<std::io::Result<Vec<u8>>, std::sync::mpsc::RecvTimeoutError>,
-) -> (bool, Vec<u8>) {
+    recv: Result<std::io::Result<Zeroizing<Vec<u8>>>, std::sync::mpsc::RecvTimeoutError>,
+) -> (bool, Zeroizing<Vec<u8>>) {
     let complete = matches!(recv, Ok(Ok(_)));
     let buf = recv.ok().and_then(|r| r.ok()).unwrap_or_default();
     (complete, buf)
 }
 
 #[cfg(target_os = "macos")]
-#[cfg_attr(feature = "test-utils", allow(dead_code))]
+#[cfg_attr(any(test, feature = "test-utils"), allow(dead_code))]
 fn run_bounded(
     mut cmd: std::process::Command,
     timeout: std::time::Duration,
@@ -4641,6 +6822,7 @@ fn run_bounded(
     use std::process::Stdio;
     use std::sync::mpsc;
 
+    let stdin_data = stdin_data.map(Zeroizing::new);
     let deadline = std::time::Instant::now() + timeout;
 
     let mut child = cmd
@@ -4722,11 +6904,11 @@ fn run_bounded(
     // on the pipe (not merely "still open") looked identical to a completed
     // read: `recv` succeeding was read as "complete" regardless of whether
     // `read_to_end` itself had actually succeeded.
-    let (stdout_tx, stdout_rx) = mpsc::channel::<std::io::Result<Vec<u8>>>();
-    let (stderr_tx, stderr_rx) = mpsc::channel::<std::io::Result<Vec<u8>>>();
+    let (stdout_tx, stdout_rx) = mpsc::channel::<std::io::Result<Zeroizing<Vec<u8>>>>();
+    let (stderr_tx, stderr_rx) = mpsc::channel::<std::io::Result<Zeroizing<Vec<u8>>>>();
 
     let stdout_reader = std::thread::Builder::new().spawn(move || {
-        let mut buf = Vec::new();
+        let mut buf = Zeroizing::new(Vec::new());
         let result = match stdout_pipe {
             Some(mut p) => p.read_to_end(&mut buf).map(|_| buf),
             None => Ok(buf),
@@ -4734,7 +6916,7 @@ fn run_bounded(
         let _ = stdout_tx.send(result);
     });
     let stderr_reader = std::thread::Builder::new().spawn(move || {
-        let mut buf = Vec::new();
+        let mut buf = Zeroizing::new(Vec::new());
         let result = match stderr_pipe {
             Some(mut p) => p.read_to_end(&mut buf).map(|_| buf),
             None => Ok(buf),
@@ -4805,10 +6987,10 @@ fn run_bounded(
     // directly against a synthetic `recv_timeout` result.
     let stdout_wait =
         stdout_rx.recv_timeout(exit_deadline.saturating_duration_since(std::time::Instant::now()));
-    let (stdout_complete, stdout) = classify_reader_recv(stdout_wait);
+    let (stdout_complete, mut stdout) = classify_reader_recv(stdout_wait);
     let stderr_wait =
         stderr_rx.recv_timeout(exit_deadline.saturating_duration_since(std::time::Instant::now()));
-    let (stderr_complete, stderr) = classify_reader_recv(stderr_wait);
+    let (stderr_complete, mut stderr) = classify_reader_recv(stderr_wait);
     // Do not join: a still-blocked reader cannot be safely cancelled (see
     // the fn doc); dropping the handle lets it finish in the background.
     drop(stdout_handle);
@@ -4836,8 +7018,8 @@ fn run_bounded(
     Some(BoundedOutput {
         output: std::process::Output {
             status,
-            stdout,
-            stderr,
+            stdout: std::mem::take(&mut *stdout),
+            stderr: std::mem::take(&mut *stderr),
         },
         stdout_complete,
         stderr_complete,
@@ -4913,7 +7095,7 @@ fn run_bounded(
 /// the credential on its own first API call, and — since CC reads/writes
 /// the keychain directly — that backfill can land in the KEYCHAIN item's
 /// `claudeAiOauth` WITHOUT ever round-tripping through csq's file store
-/// (`refresh/sync.rs`'s backsync guard protects the FILE from losing an
+/// (the custodian's adopt path protects the FILE from losing an
 /// already-known `subscription_type`, but has no visibility into a value
 /// CC wrote straight to the keychain). Re-derived (F8): `write_raw` has
 /// exactly one caller in this crate (`sync_handle_dir_inner`), so this is
@@ -4944,13 +7126,14 @@ fn build_write_payload(
     file_raw_json: &str,
     existing_claude_oauth: Option<&serde_json::Value>,
     backfill_allowed: bool,
-) -> Result<String, PlatformError> {
-    let file_value: serde_json::Value = serde_json::from_str(file_raw_json).map_err(|_| {
+) -> Result<Zeroizing<String>, PlatformError> {
+    let file_value: SecretJson = serde_json::from_str(file_raw_json).map_err(|_| {
         PlatformError::Keychain("credential file payload is not valid JSON".to_string())
     })?;
-    let mut claude_oauth = file_value.get("claudeAiOauth").cloned().ok_or_else(|| {
-        PlatformError::Keychain("credential file payload has no claudeAiOauth".to_string())
-    })?;
+    let mut claude_oauth =
+        SecretJson(file_value.get("claudeAiOauth").cloned().ok_or_else(|| {
+            PlatformError::Keychain("credential file payload has no claudeAiOauth".to_string())
+        })?);
     if backfill_allowed {
         if let (Some(existing), Some(obj)) = (existing_claude_oauth, claude_oauth.as_object_mut()) {
             for field in ["subscriptionType", "rateLimitTier"] {
@@ -4958,16 +7141,27 @@ fn build_write_payload(
                 if file_is_null_or_absent {
                     if let Some(existing_value) = existing.get(field) {
                         if !existing_value.is_null() {
-                            obj.insert(field.to_string(), existing_value.clone());
+                            if let Some(mut old) =
+                                obj.insert(field.to_string(), existing_value.clone())
+                            {
+                                wipe_json(&mut old);
+                            }
                         }
                     }
                 }
             }
         }
     }
-    let mut obj = siblings.clone();
-    obj.insert("claudeAiOauth".to_string(), claude_oauth);
-    serde_json::to_string(&serde_json::Value::Object(obj)).map_err(|_| {
+    let mut obj = SecretJson(serde_json::Value::Object(siblings.clone()));
+    if let Some(map) = obj.as_object_mut() {
+        if let Some(mut old) = map.insert(
+            "claudeAiOauth".to_string(),
+            std::mem::take(&mut claude_oauth.0),
+        ) {
+            wipe_json(&mut old);
+        }
+    }
+    zeroizing_json(&obj.0).map_err(|_| {
         PlatformError::Keychain("failed to serialize merged keychain payload".to_string())
     })
 }
@@ -5006,9 +7200,16 @@ fn build_write_payload(
 // its tests run on every platform; its only PRODUCTION caller is still
 // macOS-gated, so it is genuinely unused in a non-test, non-macOS build.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct MirrorPlan {
-    write_x: String,
+    write_x: Zeroizing<String>,
+}
+impl fmt::Debug for MirrorPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MirrorPlan")
+            .field("write_x", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Why [`plan_mirror_write`] refused to produce a plan. Either way the
@@ -5073,15 +7274,19 @@ fn plan_mirror_write(
 ) -> Result<MirrorPlan, PlanError> {
     let (siblings, existing_claude_oauth) = match x {
         RawContentClassification::Unreadable(_) => return Err(PlanError::Unreadable),
-        RawContentClassification::Absent => (serde_json::Map::new(), None),
+        RawContentClassification::Absent => (
+            SecretJson(serde_json::Value::Object(serde_json::Map::new())),
+            None,
+        ),
         RawContentClassification::Content(json) => {
             let siblings = extract_sibling_object(json);
             // An emptied login carries no identity, so it cannot prove it
             // belongs to the account being written: never backfill plan
             // metadata from it.
-            let existing = serde_json::from_str::<serde_json::Value>(json)
+            let existing = serde_json::from_str::<SecretJson>(json)
                 .ok()
                 .and_then(|v| v.get("claudeAiOauth").cloned())
+                .map(SecretJson)
                 .filter(|o| !oauth_tokens_both_empty(o));
             (siblings, existing)
         }
@@ -5093,9 +7298,9 @@ fn plan_mirror_write(
     // longer needs a standalone `file_claude_oauth` value (S5 dropped the
     // refresh-token-equality proof that used to consume it).
     let write_x = build_write_payload(
-        &siblings,
+        siblings.as_object().ok_or(PlanError::Unreadable)?,
         file_raw_json,
-        existing_claude_oauth.as_ref(),
+        existing_claude_oauth.as_ref().map(|oauth| &oauth.0),
         backfill_allowed,
     )
     .map_err(|e| PlanError::InvalidFilePayload(e.to_string()))?;
@@ -5111,12 +7316,20 @@ fn plan_mirror_write(
 ///
 /// `pub` (not `pub(crate)`): the round 7c D-F7 harness registers a scripted
 /// implementation of this trait from the `csq` binary crate — a different
-/// crate than this one — via [`set_test_keychain_executor`]. Visibility
+/// crate than this one — via `set_test_keychain_executor` (gated, so not linkable from a
+/// production doc build). Visibility
 /// alone does not weaken anything: implementing this trait grants no
 /// capability a caller could not already exercise by shelling `security`
 /// directly, and every setter that can INSTALL an implementation is itself
 /// `#[cfg(any(test, feature = "test-utils"))]`, so none of this compiles
 /// into a production binary.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateOnlyOutcome {
+    Created,
+    AlreadyExists,
+}
+
 #[cfg(target_os = "macos")]
 pub trait KeychainExecutor {
     /// `security find-generic-password -s svc -a account -w`, classified
@@ -5130,9 +7343,21 @@ pub trait KeychainExecutor {
     /// <hex(payload)>` (an internal ticket — the credential travels hex-encoded on
     /// stdin, never as an argv literal). Never `-U`: Apple's `-U` on an
     /// existing item rewrites its access control and raises a password
-    /// dialog, so a write is delete-then-create (see
-    /// [`add_via_delete_create`]).
+    /// dialog, so a write is delete-then-create (see the private
+    /// `add_via_delete_create`).
     fn add(&self, svc: &str, account: &str, payload: &str) -> Result<(), PlatformError>;
+    /// Create without a pre-delete or update. A concurrent item is preserved.
+    /// Unsupported executors refuse rather than fall back to destructive add.
+    fn add_create_only(
+        &self,
+        _svc: &str,
+        _account: &str,
+        _payload: &str,
+    ) -> Result<CreateOnlyOutcome, PlatformError> {
+        Err(PlatformError::Keychain(
+            "keychain_create_only_unsupported".into(),
+        ))
+    }
     /// [`KeychainExecutor::add`], plus: if the create fails after the item was
     /// deleted, ONE best-effort re-add of `siblings_only` (the caller's
     /// already-read previous content with `claudeAiOauth` removed; never the
@@ -5144,7 +7369,7 @@ pub trait KeychainExecutor {
         svc: &str,
         account: &str,
         payload: &str,
-        siblings_only: Option<String>,
+        siblings_only: Option<Zeroizing<String>>,
     ) -> Result<(), PlatformError> {
         let _ = siblings_only;
         self.add(svc, account, payload)
@@ -5154,6 +7379,27 @@ pub trait KeychainExecutor {
     /// production `SecurityCliExecutor` implementation) — never assumed
     /// from a bare attempt (I10).
     fn delete(&self, svc: &str, account: &str) -> bool;
+    /// [`KeychainExecutor::delete`] that tells "this call removed the item" from
+    /// "there was no item" (`security` exit 44). The default cannot tell them
+    /// apart and reports a confirmed delete as [`orphans::DeleteOutcome::Deleted`];
+    /// the production executor overrides it from the exit code. The orphan sweep
+    /// counts only `Deleted` as a delete.
+    fn delete_reporting(&self, svc: &str, account: &str) -> orphans::DeleteOutcome {
+        if self.delete(svc, account) {
+            orphans::DeleteOutcome::Deleted
+        } else {
+            orphans::DeleteOutcome::Failed
+        }
+    }
+    /// Enumerate the `Claude Code-credentials-*` generic-password items in the
+    /// default keychain as `(service, account)` attribute pairs — metadata
+    /// only, never a secret (`security dump-keychain` WITHOUT `-d`). The
+    /// default refuses, so an executor that cannot enumerate makes the orphan
+    /// sweep a no-op rather than guess (`guard-reader-writer-parity.md`
+    /// MUST-2).
+    fn list_cc_credential_items(&self) -> Result<orphans::DumpScan, orphans::UndeterminedReason> {
+        Err(orphans::UndeterminedReason::EnumerationUnsupported)
+    }
 }
 
 // ── round 7c D-F7: cross-crate executor-injection seam ─────────────────
@@ -5291,6 +7537,18 @@ impl ScriptedKeychainExecutor {
 #[cfg(any(test, feature = "test-utils"))]
 #[cfg(target_os = "macos")]
 impl KeychainExecutor for ScriptedKeychainExecutor {
+    fn add_create_only(
+        &self,
+        svc: &str,
+        account: &str,
+        payload: &str,
+    ) -> Result<CreateOnlyOutcome, PlatformError> {
+        if !matches!(*self.current.borrow(), RawContentClassification::Absent) {
+            return Ok(CreateOnlyOutcome::AlreadyExists);
+        }
+        self.add(svc, account, payload)
+            .map(|()| CreateOnlyOutcome::Created)
+    }
     fn find(&self, svc: &str, account: &str) -> RawContentClassification {
         self.calls
             .borrow_mut()
@@ -5304,7 +7562,8 @@ impl KeychainExecutor for ScriptedKeychainExecutor {
             .push(("add", svc.to_string(), account.to_string()));
         self.add_payloads.borrow_mut().push(payload.to_string());
         if self.add_ok.get() {
-            *self.current.borrow_mut() = RawContentClassification::Content(payload.to_string());
+            *self.current.borrow_mut() =
+                RawContentClassification::Content((payload.to_string()).into());
             Ok(())
         } else {
             // A failed `add` leaves `current` UNCHANGED — mirrors the real
@@ -5411,9 +7670,15 @@ fn is_stdin_token_safe(s: &str) -> bool {
 /// does not enforce the limit itself (it is a pure builder); see
 /// [`SECURITY_I_MAX_SAFE_LINE_BYTES`].
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn build_add_stdin_command(svc: &str, account: &str, payload: &str) -> Vec<u8> {
-    let hex_payload = hex::encode(payload.as_bytes());
-    format!("add-generic-password -A -s \"{svc}\" -a \"{account}\" -X {hex_payload}\n").into_bytes()
+fn build_add_stdin_command(svc: &str, account: &str, payload: &str) -> Zeroizing<Vec<u8>> {
+    let hex_payload = Zeroizing::new(hex::encode(payload.as_bytes()));
+    Zeroizing::new(
+        format!(
+            "add-generic-password -A -s \"{svc}\" -a \"{account}\" -X {}\n",
+            hex_payload.as_str()
+        )
+        .into_bytes(),
+    )
 }
 
 /// RETRACTED FINDING, re-derived (2026-09-27) — an earlier version of this
@@ -5483,7 +7748,11 @@ fn build_add_stdin_command(svc: &str, account: &str, payload: &str) -> Vec<u8> {
 /// limit, with a fixed-vocabulary warn naming an internal ticket so the fallback is
 /// diagnosable without any credential or size detail in the log.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn add_stdin_invocation(svc: &str, account: &str, payload: &str) -> Result<Vec<u8>, PlatformError> {
+fn add_stdin_invocation(
+    svc: &str,
+    account: &str,
+    payload: &str,
+) -> Result<Zeroizing<Vec<u8>>, PlatformError> {
     if !is_stdin_token_safe(svc) || !is_stdin_token_safe(account) {
         return Err(PlatformError::Keychain(
             "keychain write refused: service or account name contains a character unsafe \
@@ -5511,15 +7780,24 @@ fn add_stdin_invocation(svc: &str, account: &str, payload: &str) -> Result<Vec<u
 /// and callers must treat it exactly as security-sensitive as any other
 /// argv-bearing `Command`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 enum AddInvocation {
     /// Fits `security -i`'s stdin line — argv is always [`ADD_STDIN_ARGV`].
-    Stdin(Vec<u8>),
+    Stdin(Zeroizing<Vec<u8>>),
     /// an internal ticket — does not fit; the byte-for-byte pre-an internal ticket v2.19 argv shape:
     /// `["add-generic-password", "-A", "-s", svc, "-a", account, "-w", payload]`
     /// (pre-an internal ticket minus `-U`: every write is delete-then-create, see
     /// [`add_via_delete_create`]).
-    ArgvFallback(Vec<String>),
+    ArgvFallback(Zeroizing<Vec<String>>),
+}
+
+impl fmt::Debug for AddInvocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stdin(_) => f.debug_tuple("Stdin").field(&"[REDACTED]").finish(),
+            Self::ArgvFallback(_) => f.debug_tuple("ArgvFallback").field(&"[REDACTED]").finish(),
+        }
+    }
 }
 
 /// an internal ticket (round 4, owner-accepted residual) — PURE selection between the
@@ -5548,7 +7826,7 @@ fn select_add_invocation(
             if !is_stdin_token_safe(svc) || !is_stdin_token_safe(account) {
                 return Err(refusal);
             }
-            Ok(AddInvocation::ArgvFallback(vec![
+            Ok(AddInvocation::ArgvFallback(Zeroizing::new(vec![
                 "add-generic-password".to_string(),
                 "-A".to_string(),
                 "-s".to_string(),
@@ -5557,7 +7835,7 @@ fn select_add_invocation(
                 account.to_string(),
                 "-w".to_string(),
                 payload.to_string(),
-            ]))
+            ])))
         }
     }
 }
@@ -5695,7 +7973,7 @@ fn set_generic_password_native_update(
     let (tx, rx) = mpsc::sync_channel::<Result<(), security_framework::base::Error>>(1);
     let svc = svc.to_string();
     let account = account.to_string();
-    let payload = payload.to_vec();
+    let payload = Zeroizing::new(payload.to_vec());
     let spawn_result = std::thread::Builder::new().spawn(move || {
         let result = security_framework::os::macos::keychain::SecKeychain::default()
             .and_then(|kc| native_update_generic_password(&kc, &svc, &account, &payload));
@@ -5729,6 +8007,14 @@ struct SecurityCliExecutor;
 
 #[cfg(target_os = "macos")]
 impl KeychainExecutor for SecurityCliExecutor {
+    fn add_create_only(
+        &self,
+        svc: &str,
+        account: &str,
+        payload: &str,
+    ) -> Result<CreateOnlyOutcome, PlatformError> {
+        run_create_only_add(svc, account, payload, run_security_bounded)
+    }
     fn find(&self, svc: &str, account: &str) -> RawContentClassification {
         classify_raw_content(run_security_bounded(
             &["find-generic-password", "-s", svc, "-a", account, "-w"],
@@ -5745,7 +8031,7 @@ impl KeychainExecutor for SecurityCliExecutor {
         svc: &str,
         account: &str,
         payload: &str,
-        siblings_only: Option<String>,
+        siblings_only: Option<Zeroizing<String>>,
     ) -> Result<(), PlatformError> {
         // an internal ticket: the credential (previously the literal argument after
         // `-w`, readable in `ps` output for the life of the call) now
@@ -5774,9 +8060,21 @@ impl KeychainExecutor for SecurityCliExecutor {
 
     fn delete(&self, svc: &str, account: &str) -> bool {
         match run_security_bounded(&["delete-generic-password", "-s", svc, "-a", account], None) {
-            Some(bo) => security_delete_call_resolved(&bo.output),
+            Some(bo) => security_delete_call_resolved(&SecretOutput::new(bo).output),
             None => false,
         }
+    }
+
+    fn delete_reporting(&self, svc: &str, account: &str) -> orphans::DeleteOutcome {
+        match run_security_bounded(&["delete-generic-password", "-s", svc, "-a", account], None) {
+            Some(bo) => orphans::delete_outcome_of(&SecretOutput::new(bo).output),
+            None => orphans::DeleteOutcome::Failed,
+        }
+    }
+
+    fn list_cc_credential_items(&self) -> Result<orphans::DumpScan, orphans::UndeterminedReason> {
+        // The standard bounded runner: KEYCHAIN_OP_TIMEOUT (5s), no interactive scope.
+        orphans::dump_keychain(&run_security_bounded)
     }
 }
 
@@ -5811,13 +8109,13 @@ fn add_via_delete_create(
     svc: &str,
     account: &str,
     invocation: AddInvocation,
-    siblings_only: Option<String>,
+    siblings_only: Option<Zeroizing<String>>,
     run: SecurityRunner<'_>,
 ) -> Result<(), PlatformError> {
     let mut confirmed_absent = false;
     for _ in 0..MAX_DUPLICATE_DELETE_ITERATIONS {
         match run(&["delete-generic-password", "-s", svc, "-a", account], None)
-            .map(|bo| bo.output.status.code())
+            .map(|bo| SecretOutput::new(bo).output.status.code())
         {
             Some(Some(0)) => continue,
             Some(Some(SECURITY_ITEM_NOT_FOUND)) => {
@@ -5855,17 +8153,19 @@ fn run_add_invocation(
     run: SecurityRunner<'_>,
 ) -> Result<(), PlatformError> {
     match invocation {
-        AddInvocation::Stdin(stdin_cmd) => {
-            let bo = run(&ADD_STDIN_ARGV, Some(stdin_cmd)).ok_or_else(|| {
-                PlatformError::Keychain(
-                    "keychain write timed out (likely a locked or non-interactive \
+        AddInvocation::Stdin(mut stdin_cmd) => {
+            let bo =
+                run(&ADD_STDIN_ARGV, Some(std::mem::take(&mut *stdin_cmd))).ok_or_else(|| {
+                    PlatformError::Keychain(
+                        "keychain write timed out (likely a locked or non-interactive \
                      keychain — e.g. an SSH/tmux session that cannot answer an \
                      authorization prompt)"
-                        .into(),
-                )
-            })?;
+                            .into(),
+                    )
+                })?;
             let stderr_complete = bo.stderr_complete;
-            let output = bo.output;
+            let bo = SecretOutput::new(bo);
+            let output = &bo.output;
             // an internal ticket — empirically measured on a throwaway keychain
             // (mac-mini, 2026-09-27): `security -i`'s OWN exit code DOES
             // reflect the inner command's outcome — a successful add
@@ -5922,7 +8222,8 @@ fn run_add_invocation(
                         .into(),
                 )
             })?;
-            let output = bo.output;
+            let bo = SecretOutput::new(bo);
+            let output = &bo.output;
             // v2.19 parity: `output.status.success()` alone, no
             // stderr-empty check — that check is specific to `-i`'s own
             // quirks (see the Stdin arm above) and was never part of the
@@ -5938,6 +8239,32 @@ fn run_add_invocation(
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_create_only_add(
+    svc: &str,
+    account: &str,
+    payload: &str,
+    run: impl Fn(&[&str], Option<Vec<u8>>) -> Option<BoundedOutput>,
+) -> Result<CreateOnlyOutcome, PlatformError> {
+    let invocation = select_add_invocation(svc, account, payload)?;
+    let duplicate = std::cell::Cell::new(false);
+    let result = run_add_invocation(invocation, &|args, stdin| {
+        let output = run(args, stdin);
+        if output
+            .as_ref()
+            .is_some_and(|output| output.output.status.code() == Some(45))
+        {
+            duplicate.set(true);
+        }
+        output
+    });
+    match result {
+        Ok(()) => Ok(CreateOnlyOutcome::Created),
+        Err(_) if duplicate.get() => Ok(CreateOnlyOutcome::AlreadyExists),
+        Err(error) => Err(error),
     }
 }
 
@@ -6051,7 +8378,15 @@ fn force_sync_account_changed_with_executor(
     handle_dir: &Path,
     new_credentials_json: Option<&str>,
 ) -> Result<ForcedSyncResult, PlatformError> {
-    force_sync_inner(exec, base, handle_dir, new_credentials_json, false)
+    force_sync_inner_guarded(
+        exec,
+        base,
+        handle_dir,
+        new_credentials_json,
+        false,
+        None,
+        None,
+    )
 }
 
 /// Directory (under the accounts base) holding quarantined foreign logins.
@@ -6085,7 +8420,7 @@ fn warn_due(key: &str) -> bool {
 /// True when some directory directly under `base_dir` hashes to `svc` (the
 /// handle dir this queue entry was recorded for exists again, e.g. a recycled
 /// PID's new session, which may have a live owner).
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 fn handle_dir_exists_for_service(base_dir: &Path, svc: &str) -> bool {
     let Ok(rd) = std::fs::read_dir(base_dir) else {
         // Cannot enumerate: do not claim the dir is gone.
@@ -6101,7 +8436,7 @@ fn handle_dir_exists_for_service(base_dir: &Path, svc: &str) -> bool {
 
 /// A dir whose real path could not be resolved is assumed to own the service
 /// (keep the item); otherwise it owns it iff its service name matches.
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 fn dir_may_own_service(abs: &Path, canonical: bool, svc: &str) -> bool {
     !canonical || service_name(abs) == svc
 }
@@ -6115,20 +8450,14 @@ fn dir_may_own_service(abs: &Path, canonical: bool, svc: &str) -> bool {
 fn quarantine_foreign_item(base: &Path, svc: &str, raw: &str) -> Result<(), PlatformError> {
     use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
     let dir = base.join(QUARANTINE_DIR_NAME);
-    // A symlinked quarantine dir could redirect the saved login elsewhere.
-    if let Ok(meta) = std::fs::symlink_metadata(&dir) {
-        if meta.file_type().is_symlink() {
-            return Err(PlatformError::Keychain(
-                "keychain quarantine directory is a symlink".to_string(),
-            ));
-        }
-    }
-    std::fs::create_dir_all(&dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    }
+    // R2 M3: route through the shared fail-closed helper — a symlinked
+    // quarantine dir is refused (no write through the link), 0o700 is
+    // applied at creation (no create-then-chmod window), and the owning uid
+    // is verified on the fd. The caller maps any failure to
+    // `QuarantineSaveFailed` and MUST NOT discard the item.
+    crate::platform::fs::ensure_private_dir(&dir).map_err(|e| {
+        PlatformError::Keychain(format!("keychain quarantine directory refused: {e}"))
+    })?;
     let hash = quarantine_svc_hash(svc);
     // Already saved (a retry after an unconfirmed delete): do not write a
     // second copy, which would push other services' files out of the
@@ -6218,13 +8547,50 @@ fn prune_quarantine(dir: &Path, keep: usize, max_age: std::time::Duration) {
 /// and then replaced, instead of refusing the launch. Swaps and the daemon
 /// pass false and still refuse.
 #[cfg(target_os = "macos")]
-fn force_sync_inner(
+fn force_sync_inner_guarded(
     exec: &(impl KeychainExecutor + ?Sized),
     base: &Path,
     handle_dir: &Path,
     new_credentials_json: Option<&str>,
     quarantine_foreign: bool,
+    target_binding: Option<&crate::accounts::anthropic_identity::CapturedBinding>,
+    native_capture: Option<&crate::session::handle_dir::NativeSwapCapture>,
 ) -> Result<ForcedSyncResult, PlatformError> {
+    force_sync_inner_with_profiles(
+        exec,
+        base,
+        handle_dir,
+        new_credentials_json,
+        quarantine_foreign,
+        ForceProfileAuthority {
+            profiles: None,
+            target_binding,
+            native_capture,
+        },
+    )
+}
+
+#[cfg(target_os = "macos")]
+struct ForceProfileAuthority<'a> {
+    profiles: Option<&'a crate::accounts::profiles_lock::ProfilesFileLock>,
+    target_binding: Option<&'a crate::accounts::anthropic_identity::CapturedBinding>,
+    native_capture: Option<&'a crate::session::handle_dir::NativeSwapCapture>,
+}
+
+#[cfg(target_os = "macos")]
+fn force_sync_inner_with_profiles(
+    exec: &(impl KeychainExecutor + ?Sized),
+    base: &Path,
+    handle_dir: &Path,
+    new_credentials_json: Option<&str>,
+    quarantine_foreign: bool,
+    authority: ForceProfileAuthority<'_>,
+) -> Result<ForcedSyncResult, PlatformError> {
+    let ForceProfileAuthority {
+        profiles,
+        target_binding,
+        native_capture,
+    } = authority;
     let svc = service_name(handle_dir);
     let ours = keychain_account_for(handle_dir);
     let x = exec.find(&svc, &ours);
@@ -6247,10 +8613,10 @@ fn force_sync_inner(
     // is lost by overwriting; X matching neither is a foreign login the
     // CALLER must harvest (rule 3) before retrying.
     let marker_account = crate::accounts::markers::resolve_marker_to_slot(base, handle_dir);
-    let source_raw: Option<String> = marker_account.and_then(|acct| {
+    let source_raw: Option<Zeroizing<String>> = marker_account.and_then(|acct| {
         crate::accounts::identity_store::target_token_for_forced_write(base, acct)
             .as_valid_str()
-            .map(str::to_string)
+            .map(|raw| Zeroizing::new(raw.to_owned()))
     });
     // C-F1: widen recognition to the marker account's own token history —
     // shared by `csq swap`/`auto_rotate`'s forced write (this function) and,
@@ -6258,9 +8624,20 @@ fn force_sync_inner(
     let history = marker_account
         .map(|acct| crate::credentials::token_history::read_history_for_slot(base, acct))
         .unwrap_or_default();
+    let owner_verified = marker_account
+        .map(|acct| read_owner_verified_with_profiles(profiles, base, acct))
+        .unwrap_or_default();
+    // Owner directive 2026-10-11: the slot's RETIRED bindings — the swap-side
+    // widening that recognises a terminal still holding the token of the
+    // identity this slot ran BEFORE a rebind.
+    let retired = marker_account
+        .map(|acct| read_retired_bindings_with_profiles(profiles, base, acct))
+        .unwrap_or_default();
     let known = KnownTokens {
-        marker_account_canonical: source_raw.as_deref(),
+        marker_account_canonical: source_raw.as_ref().map(|raw| raw.as_str()),
         marker_account_history: &history,
+        marker_account_owner_verified: &owner_verified,
+        retired_bindings: &retired,
         ..KnownTokens::default()
     };
 
@@ -6291,7 +8668,178 @@ fn force_sync_inner(
         },
     };
 
-    match decide_cc_keychain_write(&x, &known, intended) {
+    let decision = decide_cc_keychain_write(&x, &known, intended);
+    if matches!(decision, WriteDecision::NoWrite) {
+        return Ok(ForcedSyncResult::Applied { wrote_token: true });
+    }
+    // Raw token equality/history does not establish an organization. For an
+    // Anthropic target the caller must supply the captured target custody; the
+    // pre-repoint marker deliberately still names the source slot. The custody
+    // may be `Known` OR a validated legacy context — either way it must be
+    // EXACT and current, established locally (no HTTP on this path).
+    if let Intended::Token(raw) = &intended {
+        let Some(binding) = target_binding else {
+            return Ok(ForcedSyncResult::TargetTokenInvalidated);
+        };
+        if !profiles.map_or_else(
+            || binding_full_clause_is_current(base, binding),
+            |lock| {
+                crate::accounts::anthropic_identity::binding_matches_locked(lock, base, binding)
+                    .unwrap_or(false)
+            },
+        ) {
+            return Ok(ForcedSyncResult::TargetTokenInvalidated);
+        }
+        let Ok(credential) = serde_json::from_str::<crate::credentials::CredentialFile>(raw) else {
+            return Ok(ForcedSyncResult::TargetTokenInvalidated);
+        };
+        let Some(anthropic) = credential.anthropic() else {
+            return Ok(ForcedSyncResult::TargetTokenInvalidated);
+        };
+        if crate::accounts::anthropic_identity::CredentialVersion::for_credentials(anthropic).ok()
+            != Some(binding.credential_version())
+        {
+            return Ok(ForcedSyncResult::TargetTokenInvalidated);
+        }
+    }
+    let source_binding = marker_account.and_then(|slot| {
+        profiles.map_or_else(
+            || capture_known_slot(base, slot),
+            |lock| capture_known_slot_locked(lock, base, slot),
+        )
+    });
+    if !holds_no_login(&x) && !holds_emptied_login(&x) && source_binding.is_none() {
+        // Raw/history recognition does not authorize an unknown-org mutation.
+        return Ok(ForcedSyncResult::ForeignLoginUnharvested);
+    }
+    let mut authority = Vec::new();
+    if let Some(target) = target_binding {
+        authority.push(target);
+    }
+    if let Some(source) = source_binding.as_ref() {
+        authority.push(source);
+    }
+    // Native/keychain executors have their own bounded operation budgets. The
+    // cooperative profile binding cannot change between validation and apply.
+    // All recursive profile/proof reads above completed before this witness.
+    let acquired;
+    let _authority_guard = if let Some(lock) = profiles {
+        if authority.iter().any(|binding| {
+            !crate::accounts::anthropic_identity::binding_matches_locked(lock, base, binding)
+                .unwrap_or(false)
+        }) {
+            return Ok(ForcedSyncResult::WriteFailedUnknown);
+        }
+        lock
+    } else {
+        acquired = match lock_keychain_authority(base, &authority) {
+            Ok(guard) => guard,
+            Err(refusal) => {
+                warn!(
+                    error_kind = refusal.error_kind(),
+                    "keychain mutation refused because profile custody could not be held"
+                );
+                return Ok(ForcedSyncResult::WriteFailedUnknown);
+            }
+        };
+        &acquired
+    };
+
+    // Recheck the ORIGINAL preoperation native/source receipt after executor
+    // reads and under the same profiles authority held through mutation. A
+    // newly captured source cannot authorize replacing an interleaved login.
+    if let Some(capture) = native_capture {
+        let Some(target) = target_binding else {
+            return Ok(ForcedSyncResult::TargetTokenInvalidated);
+        };
+        if !crate::session::handle_dir::native_swap_is_current_locked(
+            _authority_guard,
+            base,
+            handle_dir,
+            capture,
+            target,
+        ) {
+            return Ok(ForcedSyncResult::ForeignLoginUnharvested);
+        }
+    }
+
+    // Review R2 L-R2-2: a mutation authorised ONLY by the retired channel
+    // was recognised from a set the no-lock path read before this lock was
+    // held. If a GC reaped that retired identity in between, the item may
+    // now be the LAST copy of its token — re-prove the recognition against
+    // the lock-held reload before destroying it (the same shape as
+    // `apply_dead_handle_strip_guarded`'s canonical re-check).
+    let recognition = recognise_current(&x, &known);
+    if matches!(
+        decision,
+        WriteDecision::Write(_) | WriteDecision::StripAllowed
+    ) && recognition.retired_only()
+        && !retired_recognition_still_current(
+            _authority_guard,
+            base,
+            marker_account,
+            &x,
+            &recognition,
+        )
+    {
+        warn!(
+            error_kind = "keychain_retired_authority_stale",
+            svc_hash = quarantine_svc_hash(&svc),
+            "retired-binding recognition no longer holds under the held profiles \
+             authority — refusing rather than destroying the item's last copy"
+        );
+        return Ok(ForcedSyncResult::ForeignLoginUnharvested);
+    }
+    // Review R2 L-R2-3 + Review R3 L3: a fresh launch (`quarantine_foreign`)
+    // with the item recognised ONLY through the retired channels.
+    // (a) HISTORY-only (L-R2-3): the class that falls to the foreign branch
+    //     when unrecognised, and used to be SAVED before replacement —
+    //     preserve it FIRST: an unrecognised-strongly, superseded but
+    //     still-unexpired token must not be discarded by the overwrite.
+    // (b) BOTH retired classes (L3): write against an ABSENT view, exactly
+    //     as the foreign branch does — a previous tenant's item must not
+    //     have its siblings (e.g. MCP OAuth entries) merged into the new
+    //     account's item. Strips are untouched: `decide` never authorises
+    //     one on the retired-history channel, and a canonical-half
+    //     `StripAllowed` keeps its existing path through the generic arm.
+    if quarantine_foreign
+        && recognition.retired_only()
+        && matches!(decision, WriteDecision::Write(_))
+    {
+        if recognition.retired_history_only() {
+            let RawContentClassification::Content(raw_x) = &x else {
+                return Ok(ForcedSyncResult::WriteFailedUnknown);
+            };
+            if quarantine_foreign_item(base, &svc, raw_x).is_err() {
+                warn!(
+                    error_kind = "keychain_fresh_launch_quarantine_failed",
+                    svc_hash = quarantine_svc_hash(&svc),
+                    "could not save the retired-history-recognised keychain login; \
+                     refusing the launch"
+                );
+                return Ok(ForcedSyncResult::QuarantineSaveFailed);
+            }
+            warn!(
+                error_kind = "keychain_fresh_launch_quarantined_history_item",
+                svc_hash = quarantine_svc_hash(&svc),
+                "a retired-history-recognised keychain login on a fresh launch was saved and replaced"
+            );
+        }
+        // R3 L3: write against an ABSENT view so nothing from the previous
+        // tenant's item (its siblings) is merged into the new account's.
+        let absent = RawContentClassification::Absent;
+        return match apply_cc_keychain_write(exec, &svc, &ours, &absent, decision, false) {
+            ApplyOutcome::Applied { wrote_token } => Ok(ForcedSyncResult::Applied { wrote_token }),
+            // The item is saved (or a canonical copy still lives in the
+            // identity store); a failed replace leaves its state unknown,
+            // so do not launch against it.
+            ApplyOutcome::AbsentWriteFailed | ApplyOutcome::WriteFailed | ApplyOutcome::NoOp => {
+                Ok(ForcedSyncResult::WriteFailedUnknown)
+            }
+        };
+    }
+
+    match decision {
         WriteDecision::RefuseUnharvested if quarantine_foreign => {
             // Fresh-launch path: save the unidentified login, then replace
             // it. If it cannot be saved it is NOT discarded: refuse as before.
@@ -6428,19 +8976,31 @@ fn force_sync_account_changed_for_launch(
     handle_dir: &Path,
     new_credentials_json: Option<&str>,
 ) -> Result<ForcedSyncResult, PlatformError> {
+    let target_binding = crate::accounts::markers::resolve_marker_to_slot(base, handle_dir)
+        .and_then(|slot| capture_known_slot(base, slot));
     #[cfg(any(test, feature = "test-utils"))]
     if let Some(exec) = test_keychain_executor_override() {
-        return force_sync_inner(&*exec, base, handle_dir, new_credentials_json, true);
+        return force_sync_inner_guarded(
+            &*exec,
+            base,
+            handle_dir,
+            new_credentials_json,
+            true,
+            target_binding.as_ref(),
+            None,
+        );
     }
     if keychain_mirror_disabled() {
         return Ok(ForcedSyncResult::Applied { wrote_token: false });
     }
-    force_sync_inner(
+    force_sync_inner_guarded(
         &SecurityCliExecutor,
         base,
         handle_dir,
         new_credentials_json,
         true,
+        target_binding.as_ref(),
+        None,
     )
 }
 
@@ -6497,6 +9057,11 @@ pub enum KeychainUnknownReason {
     /// not write (e.g. CC self-refreshed under an account this call cannot
     /// classify) (rule 6/7).
     ForeignLogin,
+    /// Another holder kept the profiles lock for the whole bounded wait, so
+    /// custody could not be captured. Nothing is wrong with the account and
+    /// nothing was mutated; the keychain may still hold the forced-write
+    /// token, so the operator should simply retry.
+    ProfilesBusy,
 }
 
 /// Outcome of [`reconcile_keychain_to_marker`].
@@ -6595,7 +9160,7 @@ fn oauth_identity(v: &serde_json::Value) -> Option<(&str, &str)> {
 fn holds_no_login(x: &RawContentClassification) -> bool {
     match x {
         RawContentClassification::Absent => true,
-        RawContentClassification::Content(json) => serde_json::from_str::<serde_json::Value>(json)
+        RawContentClassification::Content(json) => serde_json::from_str::<SecretJson>(json)
             .ok()
             .and_then(|v| {
                 v.as_object().map(|o| match o.get("claudeAiOauth") {
@@ -6629,7 +9194,7 @@ fn oauth_tokens_both_empty(oauth: &serde_json::Value) -> bool {
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn holds_emptied_login(x: &RawContentClassification) -> bool {
     match x {
-        RawContentClassification::Content(json) => serde_json::from_str::<serde_json::Value>(json)
+        RawContentClassification::Content(json) => serde_json::from_str::<SecretJson>(json)
             .ok()
             .and_then(|v| v.get("claudeAiOauth").map(oauth_tokens_both_empty))
             .unwrap_or(false),
@@ -6647,10 +9212,10 @@ fn keychain_content_matches_token(x: &RawContentClassification, candidate_raw: &
         RawContentClassification::Content(json) => {
             // S-LOW-2: parse once each, compare BORROWED &str slices — no
             // token String copies made merely to check identity.
-            let Ok(x_val) = serde_json::from_str::<serde_json::Value>(json) else {
+            let Ok(x_val) = serde_json::from_str::<SecretJson>(json) else {
                 return false;
             };
-            let Ok(candidate_val) = serde_json::from_str::<serde_json::Value>(candidate_raw) else {
+            let Ok(candidate_val) = serde_json::from_str::<SecretJson>(candidate_raw) else {
                 return false;
             };
             match (oauth_identity(&x_val), oauth_identity(&candidate_val)) {
@@ -6724,6 +9289,42 @@ pub fn reconcile_keychain_to_marker(
     reconcile_keychain_to_marker_with_executor(&SecurityCliExecutor, base, handle_dir, forced_write)
 }
 
+pub(crate) fn reconcile_keychain_to_marker_locked(
+    profiles: &crate::accounts::profiles_lock::ProfilesFileLock,
+    base: &Path,
+    handle: &Path,
+    forced: Option<ForcedWriteAttempt<'_>>,
+) -> ReconcileOutcome {
+    #[cfg(target_os = "macos")]
+    {
+        let apply = |exec: &dyn KeychainExecutor| {
+            reconcile_keychain_to_marker_with_profiles(
+                exec,
+                base,
+                handle,
+                forced,
+                (
+                    RECONCILE_PROFILES_WAIT_ATTEMPTS,
+                    RECONCILE_PROFILES_WAIT_DELAY,
+                ),
+                Some(profiles),
+            )
+        };
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(exec) = test_keychain_executor_override() {
+            return apply(&*exec);
+        }
+        if !keychain_mirror_disabled() {
+            return apply(&SecurityCliExecutor);
+        }
+    }
+    let _ = (profiles, forced);
+    match crate::accounts::markers::resolve_marker_to_slot(base, handle) {
+        Some(marker_account) => ReconcileOutcome::AlreadyCurrent { marker_account },
+        None => ReconcileOutcome::MarkerUnreadable,
+    }
+}
+
 /// Executor-injected core of [`reconcile_keychain_to_marker`] — no
 /// `keychain_mirror_disabled()` short-circuit here (that guard belongs to
 /// the public entry point), so a test can drive this directly against a
@@ -6754,39 +9355,145 @@ fn reconcile_keychain_to_marker_with_executor(
     handle_dir: &Path,
     forced_write: Option<ForcedWriteAttempt<'_>>,
 ) -> ReconcileOutcome {
+    reconcile_keychain_to_marker_with_wait(
+        exec,
+        base,
+        handle_dir,
+        forced_write,
+        RECONCILE_PROFILES_WAIT_ATTEMPTS,
+        RECONCILE_PROFILES_WAIT_DELAY,
+    )
+}
+
+/// Bounded wait for the profiles lock inside reconcile: `(21 - 1) * 250ms =
+/// 5s`, the same order as `KEYCHAIN_OP_TIMEOUT`. Reconcile is the
+/// compensating step after a forced write whose repoint was refused, so a
+/// momentarily busy lock must not leave the keychain on the target account;
+/// the wait is bounded so a wedged holder never hangs the caller.
+#[cfg(target_os = "macos")]
+const RECONCILE_PROFILES_WAIT_ATTEMPTS: u32 = 21;
+#[cfg(target_os = "macos")]
+const RECONCILE_PROFILES_WAIT_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Capture the marker slot's binding and the native-swap expectation,
+/// waiting (bounded) while the profiles lock is held elsewhere. `None` means
+/// the lock stayed busy for the whole wait.
+#[cfg(target_os = "macos")]
+fn capture_reconcile_custody(
+    base: &Path,
+    handle_dir: &Path,
+    marker_account: AccountNum,
+    attempts: u32,
+    delay: std::time::Duration,
+) -> Option<(
+    Option<crate::accounts::anthropic_identity::CapturedBinding>,
+    Option<crate::session::handle_dir::NativeSwapCapture>,
+)> {
+    for attempt in 0..attempts.max(1) {
+        if attempt > 0 {
+            std::thread::sleep(delay);
+        }
+        let lock = match try_lock_profiles(base) {
+            Err(AuthorityRefusal::Busy) => continue,
+            Err(_) => return Some((None, None)),
+            Ok(lock) => lock,
+        };
+        return Some((
+            capture_known_slot_locked(&lock, base, marker_account),
+            crate::session::handle_dir::capture_native_swap_locked(&lock, base, handle_dir).ok(),
+        ));
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn reconcile_keychain_to_marker_with_wait(
+    exec: &(impl KeychainExecutor + ?Sized),
+    base: &Path,
+    handle_dir: &Path,
+    forced_write: Option<ForcedWriteAttempt<'_>>,
+    wait_attempts: u32,
+    wait_delay: std::time::Duration,
+) -> ReconcileOutcome {
+    reconcile_keychain_to_marker_with_profiles(
+        exec,
+        base,
+        handle_dir,
+        forced_write,
+        (wait_attempts, wait_delay),
+        None,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn reconcile_keychain_to_marker_with_profiles(
+    exec: &(impl KeychainExecutor + ?Sized),
+    base: &Path,
+    handle_dir: &Path,
+    forced_write: Option<ForcedWriteAttempt<'_>>,
+    wait: (u32, std::time::Duration),
+    profiles: Option<&crate::accounts::profiles_lock::ProfilesFileLock>,
+) -> ReconcileOutcome {
+    let (wait_attempts, wait_delay) = wait;
     // Old rule 1: marker unreadable -> no write, fail closed.
     let Some(marker_account) = crate::accounts::markers::resolve_marker_to_slot(base, handle_dir)
     else {
         return ReconcileOutcome::MarkerUnreadable;
     };
 
+    // Capture the original destination and native expectation before the
+    // executor can yield to a concurrent login/rebind. Later reads cannot
+    // substitute a freshly rebound organization for this authority.
+    let custody = profiles.map_or_else(
+        || capture_reconcile_custody(base, handle_dir, marker_account, wait_attempts, wait_delay),
+        |lock| {
+            Some((
+                capture_known_slot_locked(lock, base, marker_account),
+                crate::session::handle_dir::capture_native_swap_locked(lock, base, handle_dir).ok(),
+            ))
+        },
+    );
+    let Some((binding, native_capture)) = custody else {
+        warn!(
+            error_kind = "keychain_reconcile_profiles_busy",
+            "keychain reconcile could not capture profile custody within the bounded wait"
+        );
+        return ReconcileOutcome::KeychainUnknown {
+            marker_account,
+            reason: KeychainUnknownReason::ProfilesBusy,
+        };
+    };
+
+    // The bounded custody wait may have spanned a swap. It must not
+    // turn the pre-wait account into authority over a different marker.
+    if !native_capture
+        .as_ref()
+        .is_some_and(|capture| capture.marker_account() == Some(marker_account))
+        || crate::accounts::markers::resolve_marker_to_slot(base, handle_dir)
+            != Some(marker_account)
+    {
+        return ReconcileOutcome::KeychainUnknown {
+            marker_account,
+            reason: KeychainUnknownReason::ForeignLogin,
+        };
+    }
+
     let svc = service_name(handle_dir);
     let ours = keychain_account_for(handle_dir);
     let x = exec.find(&svc, &ours);
 
-    // H1: the marker account's own canonical token, three-way classified
-    // (Valid / ExpiredOrInvalid / Unreadable) rather than folded into a
-    // bare Option — the untrusted-marker fallback below needs to say "this
-    // file cannot be trusted", not merely "there is nothing to write".
+    // The marker account's canonical token must be valid before applying
+    // a replacement. An untrusted canonical file cannot authorize stripping
+    // native content, even when a previous force-write recorded equal bytes.
     let marker_token =
         crate::accounts::identity_store::target_token_for_forced_write(base, marker_account);
 
-    // decide_cc_keychain_write's `Intended` contract (see its own doc): a
-    // caller with no VALID token to mirror resolves that BEFORE calling the
-    // policy, never inside it — there is no `Intended` variant for "the
-    // target is Anthropic but its own file is untrustworthy". When the
-    // marker account's own canonical file cannot itself be trusted, fall
-    // back directly: old rule 5's `None` arm (nothing to write, nothing
-    // lost, when X already holds no login) or old rule 6/7's
-    // `MarkerTokenUntrusted` reason (X holds something and there is nothing
-    // trustworthy to compare it against) — UNLESS X holds exactly the token
-    // THIS call itself force-wrote (`keychain-fix-r8.md` C-F7): that token
-    // is already recorded, safely, in ITS OWN account's canonical store
-    // (whichever account `forced_write.account` was), so stripping X here
-    // loses nothing. Leaving it in place instead would strand the terminal
-    // silently reading that OTHER account's token while csq reports this
-    // handle dir's own marker account as untrustworthy — the exact
-    // "leaving the terminal on the wrong account" case C-F7 names.
+    if !holds_no_login(&x) && !holds_emptied_login(&x) && binding.is_none() {
+        return ReconcileOutcome::KeychainUnknown {
+            marker_account,
+            reason: KeychainUnknownReason::MarkerTokenUntrusted,
+        };
+    }
     let Some(marker_raw) = marker_token.as_valid_str() else {
         // An emptied login is "no login" for write safety, but it leaves the
         // terminal logged out; with no trusted token to replace it, report it
@@ -6794,44 +9501,15 @@ fn reconcile_keychain_to_marker_with_executor(
         if holds_no_login(&x) && !holds_emptied_login(&x) {
             return ReconcileOutcome::AlreadyCurrent { marker_account };
         }
-        if let Some(csq_written) = forced_write.and_then(|fw| fw.raw_json) {
-            if keychain_content_matches_token(&x, csq_written) {
-                let strip_known = KnownTokens {
-                    csq_written: Some(csq_written),
-                    ..KnownTokens::default()
-                };
-                return match decide_cc_keychain_write(&x, &strip_known, Intended::Strip) {
-                    WriteDecision::StripAllowed => match apply_cc_keychain_write(
-                        exec,
-                        &svc,
-                        &ours,
-                        &x,
-                        WriteDecision::StripAllowed,
-                        false,
-                    ) {
-                        ApplyOutcome::Applied { .. } | ApplyOutcome::AbsentWriteFailed => {
-                            ReconcileOutcome::Reconciled { marker_account }
-                        }
-                        ApplyOutcome::WriteFailed => {
-                            ReconcileOutcome::WriteFailed { marker_account }
-                        }
-                        ApplyOutcome::NoOp => unreachable!(
-                            "apply_cc_keychain_write never no-ops a StripAllowed decision"
-                        ),
-                    },
-                    // `keychain_content_matches_token(&x, csq_written)` just
-                    // confirmed X matches a token in `strip_known.iter_raw()`,
-                    // so rule 2's `matches_known` is true and `Intended::Strip`
-                    // can only resolve to `StripAllowed` (rule 1's `holds_no_login`
-                    // was already ruled out above; rule 4 requires `current`
-                    // itself to be unclassifiable, which a successful content
-                    // match rules out).
-                    other => unreachable!(
-                        "a confirmed csq_written match must decide StripAllowed, got {other:?}"
-                    ),
-                };
-            }
-        }
+        // Raw forced-write equality is not a typed ownership witness. With
+        // no trustworthy canonical destination, retain the native item.
+        return ReconcileOutcome::KeychainUnknown {
+            marker_account,
+            reason: KeychainUnknownReason::MarkerTokenUntrusted,
+        };
+    };
+
+    let Some(binding) = binding else {
         return ReconcileOutcome::KeychainUnknown {
             marker_account,
             reason: KeychainUnknownReason::MarkerTokenUntrusted,
@@ -6847,12 +9525,59 @@ fn reconcile_keychain_to_marker_with_executor(
     // exactly old rule 3's `AlreadyCurrent`.
     // C-F1: widen recognition to the marker account's own token history.
     let history = crate::credentials::token_history::read_history_for_slot(base, marker_account);
+    let owner_verified = read_owner_verified_with_profiles(profiles, base, marker_account);
     let known = KnownTokens {
         marker_account_canonical: Some(marker_raw),
         csq_written: forced_write.and_then(|fw| fw.raw_json),
         marker_account_history: &history,
+        marker_account_owner_verified: &owner_verified,
         ..KnownTokens::default()
     };
+
+    let acquired;
+    let authority = if let Some(lock) = profiles {
+        if !crate::accounts::anthropic_identity::binding_matches_locked(lock, base, &binding)
+            .unwrap_or(false)
+        {
+            return ReconcileOutcome::KeychainUnknown {
+                marker_account,
+                reason: KeychainUnknownReason::MarkerTokenUntrusted,
+            };
+        }
+        lock
+    } else {
+        acquired =
+            match lock_keychain_authority_with_wait(base, &[&binding], wait_attempts, wait_delay) {
+                Ok(guard) => guard,
+                Err(refusal) => {
+                    warn!(
+                        error_kind = refusal.error_kind(),
+                        "keychain reconcile refused because profile custody could not be held"
+                    );
+                    return ReconcileOutcome::KeychainUnknown {
+                        marker_account,
+                        reason: if refusal == AuthorityRefusal::Busy {
+                            KeychainUnknownReason::ProfilesBusy
+                        } else {
+                            KeychainUnknownReason::MarkerTokenUntrusted
+                        },
+                    };
+                }
+            };
+        &acquired
+    };
+    if crate::accounts::markers::resolve_marker_to_slot(base, handle_dir) != Some(marker_account)
+        || !native_capture.as_ref().is_some_and(|capture| {
+            crate::session::handle_dir::native_swap_is_current_locked(
+                authority, base, handle_dir, capture, &binding,
+            )
+        })
+    {
+        return ReconcileOutcome::KeychainUnknown {
+            marker_account,
+            reason: KeychainUnknownReason::ForeignLogin,
+        };
+    }
 
     match decide_cc_keychain_write(&x, &known, Intended::Token(marker_raw)) {
         WriteDecision::NoWrite => ReconcileOutcome::AlreadyCurrent { marker_account },
@@ -6963,6 +9688,522 @@ pub fn reconcile_keychain_to_marker(
 /// Returns `Err` with a fixed operator-facing message (no raw paths) when
 /// X could not be read — A1: the switch must NOT be performed. On `Ok`, the
 /// caller always proceeds to the repoint next, and reconciles afterward.
+pub fn force_swap_write_before_repoint_guarded(
+    base: &Path,
+    handle_dir_abs: &Path,
+    new_credentials_json: Option<&str>,
+    target_binding: &crate::accounts::anthropic_identity::CapturedBinding,
+    native_capture: &crate::session::handle_dir::NativeSwapCapture,
+) -> Result<ForcedSyncResult, String> {
+    // Exact LOCAL custody for the target — `Known` or validated legacy
+    // context, established without HTTP. (Legacy targets additionally meet
+    // the `Known`-target gate inside `native_swap_is_current`; that conjunct
+    // belongs to the native-swap contract, not this file.)
+    if !binding_full_clause_is_current(base, target_binding)
+        || !crate::session::handle_dir::native_swap_is_current(
+            base,
+            handle_dir_abs,
+            native_capture,
+            target_binding,
+        )
+    {
+        return Err("organization_identity_unconfirmed".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(exec) = test_keychain_executor_override() {
+            return decide_swap_disposition(force_sync_inner_guarded(
+                &*exec,
+                base,
+                handle_dir_abs,
+                new_credentials_json,
+                false,
+                Some(target_binding),
+                Some(native_capture),
+            ));
+        }
+        if keychain_mirror_disabled() {
+            return Ok(ForcedSyncResult::Applied { wrote_token: false });
+        }
+        decide_swap_disposition(force_sync_inner_guarded(
+            &SecurityCliExecutor,
+            base,
+            handle_dir_abs,
+            new_credentials_json,
+            false,
+            Some(target_binding),
+            Some(native_capture),
+        ))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        force_swap_write_before_repoint(base, handle_dir_abs, new_credentials_json)
+    }
+}
+
+/// Auto-rotation's forced write reuses custody held through repoint and reconcile.
+pub(crate) fn force_swap_write_before_repoint_locked(
+    profiles: &crate::accounts::profiles_lock::ProfilesFileLock,
+    base: &Path,
+    handle: &Path,
+    raw: Option<&str>,
+    target: &crate::accounts::anthropic_identity::CapturedBinding,
+    native: &crate::session::handle_dir::NativeSwapCapture,
+) -> Result<ForcedSyncResult, &'static str> {
+    if !crate::accounts::anthropic_identity::binding_matches_locked(profiles, base, target)
+        .unwrap_or(false)
+        || !crate::session::handle_dir::native_swap_is_current_locked(
+            profiles, base, handle, native, target,
+        )
+    {
+        return Err("organization_identity_unconfirmed");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let apply = |exec: &dyn KeychainExecutor| {
+            // Compensation needs a live canonical token for the unmoved marker.
+            // Refuse before native reads/writes if restoring that account is impossible.
+            let marker = crate::accounts::markers::resolve_marker_to_slot(base, handle)
+                .ok_or("auto_rotate_marker_token_untrusted")?;
+            if !matches!(
+                crate::accounts::identity_store::target_token_for_forced_write(base, marker),
+                crate::accounts::identity_store::TargetToken::Valid(_)
+            ) {
+                return Err("auto_rotate_marker_token_untrusted");
+            }
+
+            decide_auto_rotate_disposition(force_sync_inner_with_profiles(
+                exec,
+                base,
+                handle,
+                raw,
+                false,
+                ForceProfileAuthority {
+                    profiles: Some(profiles),
+                    target_binding: Some(target),
+                    native_capture: Some(native),
+                },
+            ))
+        };
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(exec) = test_keychain_executor_override() {
+            return apply(&*exec);
+        }
+        if keychain_mirror_disabled() {
+            return Ok(ForcedSyncResult::Applied { wrote_token: false });
+        }
+        apply(&SecurityCliExecutor)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        force_swap_write_before_repoint(base, handle, raw)
+            .map_err(|_| "auto_rotate_keychain_operation_failed")
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn decide_auto_rotate_disposition(
+    result: Result<ForcedSyncResult, PlatformError>,
+) -> Result<ForcedSyncResult, &'static str> {
+    match result {
+        Ok(ForcedSyncResult::Unreadable(_)) => Err("auto_rotate_keychain_unreadable"),
+        Ok(ForcedSyncResult::ForeignLoginUnharvested) => {
+            Err("auto_rotate_foreign_login_unharvested")
+        }
+        Ok(ForcedSyncResult::MalformedOauth) => Err("auto_rotate_keychain_malformed_oauth"),
+        Ok(ForcedSyncResult::TargetTokenInvalidated) => Err("auto_rotate_target_token_invalidated"),
+        Ok(ForcedSyncResult::QuarantineSaveFailed) => Err("auto_rotate_quarantine_save_failed"),
+        Ok(ForcedSyncResult::AbsentWriteFailed) => {
+            warn!(error_kind = "auto_rotate_absent_write_failed_proceeding",
+                "auto-rotation: absent keychain item could not be created; proceeding without a mirror");
+            Ok(ForcedSyncResult::AbsentWriteFailed)
+        }
+        Ok(value @ (ForcedSyncResult::Applied { .. } | ForcedSyncResult::WriteFailedUnknown)) => {
+            Ok(value)
+        }
+        Err(_) => Err("auto_rotate_keychain_operation_failed"),
+    }
+}
+
+/// Remove only the exact grant this rotation attempted when its marker stayed
+/// on a different account and compensation could not confirm. The caller holds
+/// both handle locks and profiles custody; unreadable or unrelated items refuse.
+pub(crate) fn clear_unconfirmed_rotation_write_locked(
+    profiles: &crate::accounts::profiles_lock::ProfilesFileLock,
+    base: &Path,
+    handle: &Path,
+    forced: ForcedWriteAttempt<'_>,
+) -> Result<bool, &'static str> {
+    if !profiles.protects(base) {
+        return Err("auto_rotate_cleanup_custody_refused");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let apply = |exec: &dyn KeychainExecutor| {
+            clear_unconfirmed_rotation_write_with_executor(exec, base, handle, forced)
+        };
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(exec) = test_keychain_executor_override() {
+            return apply(&*exec);
+        }
+        if !keychain_mirror_disabled() {
+            return apply(&SecurityCliExecutor);
+        }
+    }
+    let _ = (handle, forced);
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn clear_unconfirmed_rotation_write_with_executor(
+    exec: &(impl KeychainExecutor + ?Sized),
+    base: &Path,
+    handle: &Path,
+    forced: ForcedWriteAttempt<'_>,
+) -> Result<bool, &'static str> {
+    let marker = crate::accounts::markers::resolve_marker_to_slot(base, handle)
+        .ok_or("auto_rotate_cleanup_marker_unreadable")?;
+    let Some(written) = forced.raw_json else {
+        return Ok(false);
+    };
+    if marker == forced.account {
+        return Ok(false);
+    }
+    let service = service_name(handle);
+    let account = keychain_account_for(handle);
+    let current = exec.find(&service, &account);
+    if matches!(current, RawContentClassification::Unreadable(_)) {
+        return Err("auto_rotate_cleanup_item_unreadable");
+    }
+    if !keychain_content_matches_token(&current, written) {
+        return Ok(false);
+    }
+    // Capture the first verified in-loop snapshot once, including no siblings.
+    // Neither the pre-loop read nor a later duplicate supplies restoration data.
+    let mut siblings = None;
+    let mut deleted = false;
+    let outcome = (|| {
+        for _ in 0..MAX_DUPLICATE_DELETE_ITERATIONS {
+            if crate::accounts::markers::resolve_marker_to_slot(base, handle) != Some(marker) {
+                return Err("auto_rotate_cleanup_marker_changed");
+            }
+            let latest = exec.find(&service, &account);
+            if matches!(latest, RawContentClassification::Unreadable(_)) {
+                return Err("auto_rotate_cleanup_item_unreadable");
+            }
+            if !keychain_content_matches_token(&latest, written) {
+                warn!(
+                    error_kind = "auto_rotate_clear_skipped_rotated",
+                    "auto-rotation: cleanup skipped because the native login changed"
+                );
+                return Ok(false);
+            }
+            siblings.get_or_insert_with(|| siblings_only_payload(&latest));
+            if !exec.delete(&service, &account) {
+                return Err("auto_rotate_cleanup_delete_unconfirmed");
+            }
+            deleted = true;
+            match exec.find(&service, &account) {
+                RawContentClassification::Absent => return Ok(true),
+                remaining if keychain_content_matches_token(&remaining, written) => {}
+                _ => return Err("auto_rotate_cleanup_delete_unconfirmed"),
+            }
+        }
+        Err("auto_rotate_cleanup_delete_unconfirmed")
+    })();
+    if !deleted {
+        return outcome;
+    }
+    // Every exit after a confirmed delete compensates once. A failed delete
+    // later in the loop does not undo the earlier deletion or authorize retry.
+    if outcome.is_err() {
+        warn!(
+            error_kind = "auto_rotate_cleanup_incomplete_after_delete",
+            "auto-rotation: cleanup stopped after a confirmed deletion"
+        );
+    }
+    if let Some(payload) = siblings.as_ref().and_then(|captured| captured.as_deref()) {
+        restore_cleanup_siblings_create_only(exec, &service, &account, payload);
+    }
+    outcome.map(|_| true)
+}
+
+#[cfg(target_os = "macos")]
+fn restore_cleanup_siblings_create_only(
+    exec: &(impl KeychainExecutor + ?Sized),
+    service: &str,
+    account: &str,
+    payload: &str,
+) {
+    if matches!(
+        exec.find(service, account),
+        RawContentClassification::Content(_)
+    ) {
+        warn!(
+            error_kind = "auto_rotate_cleanup_siblings_dropped",
+            "auto-rotation: a native item prevents sibling restoration"
+        );
+        return;
+    }
+    match exec.add_create_only(service, account, payload) {
+        Ok(CreateOnlyOutcome::Created) => {}
+        Ok(CreateOnlyOutcome::AlreadyExists) => warn!(
+            error_kind = "auto_rotate_cleanup_siblings_reappeared",
+            "auto-rotation: a concurrent native item was preserved"
+        ),
+        Err(_) => warn!(
+            error_kind = "auto_rotate_cleanup_siblings_restore_failed",
+            "auto-rotation: sibling restoration failed; not retrying"
+        ),
+    }
+}
+
+/// Capture the slot's binding for the keychain-LOCAL custody paths (sweep,
+/// reconcile, dead-handle/pending clears, forced writes).
+///
+/// Two binding kinds are admitted, and both authorize ONLY local, exact
+/// custody — every mutation downstream re-verifies the captured binding
+/// under `lock_keychain_authority` (whole-struct `binding_matches_locked`)
+/// held across the keychain apply:
+///
+/// - `Known` — typed (email, account UUID, organization UUID) context,
+///   index-validated in the capture itself.
+/// - `LegacyUnknown` — a pre-typed-context identity whose metadata still
+///   records a VALID display email. The email is display/diagnostic
+///   metadata only — it never grants organization ownership (that is
+///   `legacy_own_uuid_proof`'s HTTP-verified write authority, a different
+///   path) — and this local path performs no HTTP at all.
+///
+/// Foreign or invalid metadata never appears as a binding here: the capture
+/// itself fails closed on it (missing/mismatched UUID pair, non-Anthropic
+/// provider, unnormalizable email, unreadable metadata), which `.ok()` turns
+/// into `None` — the same refusal shape as an unreadable or unindexed slot.
+/// The legacy arm below states the valid-email requirement explicitly so
+/// the guard survives any future capture refactor.
+#[cfg(target_os = "macos")]
+fn capture_known_slot(
+    base: &Path,
+    slot: AccountNum,
+) -> Option<crate::accounts::anthropic_identity::CapturedBinding> {
+    let lock = crate::accounts::profiles_lock::ProfilesFileLock::try_acquire(base)
+        .ok()
+        .flatten()?;
+    capture_known_slot_locked(&lock, base, slot)
+}
+
+#[cfg(target_os = "macos")]
+fn capture_known_slot_locked(
+    lock: &crate::accounts::profiles_lock::ProfilesFileLock,
+    base: &Path,
+    slot: AccountNum,
+) -> Option<crate::accounts::anthropic_identity::CapturedBinding> {
+    crate::accounts::anthropic_identity::capture_anthropic_binding_locked(lock, base, slot)
+        .ok()
+        .filter(|binding| match binding.context() {
+            crate::accounts::anthropic_identity::StoredAnthropicContext::Known(_) => true,
+            crate::accounts::anthropic_identity::StoredAnthropicContext::LegacyUnknown => {
+                binding.recorded_legacy_email().is_some()
+            }
+        })
+}
+#[cfg(target_os = "macos")]
+fn read_owner_verified_with_profiles(
+    profiles: Option<&crate::accounts::profiles_lock::ProfilesFileLock>,
+    base: &Path,
+    slot: AccountNum,
+) -> Vec<crate::credentials::token_history::Fingerprint> {
+    match profiles {
+        Some(lock) => {
+            capture_known_slot_locked(lock, base, slot).map_or_else(Vec::new, |binding| {
+                crate::credentials::token_history::read_owner_verified_v2_locked(
+                    lock, base, &binding,
+                )
+            })
+        }
+        None => crate::credentials::token_history::read_owner_verified_for_slot(base, slot),
+    }
+}
+
+/// [`crate::credentials::token_history::retired_bindings_for_slot`] under
+/// the caller's profiles lock when held (review R1 L3) — mirrors
+/// [`read_owner_verified_with_profiles`]: while the caller holds the lock
+/// every channel is read under THAT one lock discipline, so no writer can
+/// interleave between channels. (Precision, review R2 INFO: the Some-arm is
+/// a lock-held RELOAD of `profiles.json` — the retired reader re-reads it
+/// under the lock — not a reuse of an already-parsed snapshot; and the
+/// None-arm uses the reader's own nonblocking acquire, review R2 L-R2-5.)
+#[cfg(target_os = "macos")]
+fn read_retired_bindings_with_profiles(
+    profiles: Option<&crate::accounts::profiles_lock::ProfilesFileLock>,
+    base: &Path,
+    slot: AccountNum,
+) -> Vec<crate::credentials::token_history::RetiredBinding> {
+    match profiles {
+        Some(lock) => {
+            crate::credentials::token_history::retired_bindings_for_slot_locked(lock, base, slot)
+        }
+        None => crate::credentials::token_history::retired_bindings_for_slot(base, slot),
+    }
+}
+
+/// Why profile custody could not be established for a keychain operation.
+/// `Busy` (another holder has the profiles lock) and `LockFailed` (the lock
+/// file itself was refused) are NOT an ownership change: they carry their own
+/// fixed-vocabulary tag and `LoginReason` so a transient contention never
+/// reads as `OwnerChanged` / "custody could not be captured".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthorityRefusal {
+    Busy,
+    LockFailed,
+    Moved,
+}
+
+#[cfg(target_os = "macos")]
+impl AuthorityRefusal {
+    /// `LoginReason` for this refusal; `moved` is the reason an actual
+    /// custody move reads as at the caller's rung of the ladder.
+    fn login_reason(
+        self,
+        moved: crate::credentials::session_login::LoginReason,
+    ) -> crate::credentials::session_login::LoginReason {
+        use crate::credentials::session_login::LoginReason;
+        match self {
+            AuthorityRefusal::Busy => LoginReason::LockTimeout,
+            AuthorityRefusal::LockFailed => LoginReason::LockFailed,
+            AuthorityRefusal::Moved => moved,
+        }
+    }
+
+    fn error_kind(self) -> &'static str {
+        match self {
+            AuthorityRefusal::Busy => "keychain_profile_authority_busy",
+            AuthorityRefusal::LockFailed => "keychain_profile_authority_lock_failed",
+            AuthorityRefusal::Moved => "keychain_profile_authority_unavailable",
+        }
+    }
+}
+
+/// Try-acquire the profiles lock; contention is `Busy`, a refused lock file is
+/// `LockFailed`.
+fn try_lock_profiles(
+    base: &Path,
+) -> Result<crate::accounts::profiles_lock::ProfilesFileLock, AuthorityRefusal> {
+    match crate::accounts::profiles_lock::ProfilesFileLock::try_acquire(base) {
+        Ok(Some(lock)) => Ok(lock),
+        Ok(None) => Err(AuthorityRefusal::Busy),
+        Err(_) => Err(AuthorityRefusal::LockFailed),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn lock_keychain_authority(
+    base: &Path,
+    bindings: &[&crate::accounts::anthropic_identity::CapturedBinding],
+) -> Result<crate::accounts::profiles_lock::ProfilesFileLock, AuthorityRefusal> {
+    let lock = try_lock_profiles(base)?;
+    if bindings.iter().any(|binding| {
+        !crate::accounts::anthropic_identity::binding_matches_locked(&lock, base, binding)
+            .unwrap_or(false)
+    }) {
+        return Err(AuthorityRefusal::Moved);
+    }
+    Ok(lock)
+}
+
+/// The final authority acquisition obeys the same bounded contention budget
+/// as custody capture; a race after capture must not turn it into a one-shot.
+#[cfg(target_os = "macos")]
+fn lock_keychain_authority_with_wait(
+    base: &Path,
+    bindings: &[&crate::accounts::anthropic_identity::CapturedBinding],
+    attempts: u32,
+    delay: std::time::Duration,
+) -> Result<crate::accounts::profiles_lock::ProfilesFileLock, AuthorityRefusal> {
+    for attempt in 0..attempts.max(1) {
+        if attempt > 0 {
+            std::thread::sleep(delay);
+        }
+        match lock_keychain_authority(base, bindings) {
+            Err(AuthorityRefusal::Busy) => continue,
+            result => return result,
+        }
+    }
+    Err(AuthorityRefusal::Busy)
+}
+
+/// Currency of one clause of a captured binding under a try-lock. `Err(Busy)`
+/// / `Err(LockFailed)` mean the question could not be asked (fail-closed:
+/// not current, but NOT a move); `Err(Moved)` means it was asked and the
+/// custody differs.
+fn binding_clause_check(
+    base: &Path,
+    binding: &crate::accounts::anthropic_identity::CapturedBinding,
+    identity_only: bool,
+) -> Result<(), AuthorityRefusal> {
+    let lock = try_lock_profiles(base)?;
+    let current = if identity_only {
+        crate::accounts::anthropic_identity::binding_custody_matches_locked(&lock, base, binding)
+    } else {
+        crate::accounts::anthropic_identity::binding_matches_locked(&lock, base, binding)
+    };
+    if current.unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(AuthorityRefusal::Moved)
+    }
+}
+
+/// Whole-binding currency: EVERY captured clause must still match — the
+/// kind-agnostic exact check the forced-write target gates and the sweep's
+/// last-clause step stand on.
+///
+/// Deliberately NOT gated on `Known`: a validated `LegacyUnknown` binding
+/// authorizes LOCAL custody by exactness alone (namespace, slot, identity,
+/// context, credential_version, generation and recorded legacy email — all
+/// inside `binding_matches_locked`'s whole-struct compare), with no HTTP
+/// anywhere on this path. Foreign or invalid metadata never reaches this
+/// predicate at all — `capture_anthropic_binding_locked` fails closed on it.
+/// Its predecessor `known_binding_is_current` additionally hard-gated on
+/// `Known`, which made this clause vacuously FALSE on every unchanged legacy
+/// binding: the sweep's version-only step would fire `CanonicalChanged` on
+/// every legacy tick (see the ladder in `observe_mirror_handle`). Same
+/// try-lock discipline; lock contention reads as "not current" (fail-closed).
+fn binding_full_clause_is_current(
+    base: &Path,
+    binding: &crate::accounts::anthropic_identity::CapturedBinding,
+) -> bool {
+    binding_clause_check(base, binding, false).is_ok()
+}
+
+/// The identity-bearing clause of a binding: namespace, identity, generation,
+/// context and recorded legacy email — everything EXCEPT `credential_version`,
+/// which moves on EVERY canonical content write (including a plain token
+/// refresh).
+///
+/// `binding_matches_locked` compares the WHOLE `CapturedBinding` (version
+/// included), so it cannot separate "the slot now points at a different
+/// owner" from "the canonical credential content moved". The post-refresh
+/// sweep's clause-specific reason ladder needs that separation: identity-clause
+/// movement is `OwnerChanged`; a version-only movement is `CanonicalChanged`
+/// (v5 Darwin RED `mirror_retry_snapshot_rejects_each_changed_authority_clause`
+/// — with only the whole-struct check, the `CanonicalChanged` branch was
+/// unreachable, because a canonical overwrite necessarily moved the version
+/// too). Delegates to the foundation's `binding_custody_matches_locked` so
+/// the clause partition is identical for `Known` and validated
+/// `LegacyUnknown` bindings — a moved recorded legacy email is an
+/// owner-clause change, not a version-only move. Same try-lock discipline as
+/// `binding_full_clause_is_current`; lock contention reads as "not current"
+/// (fail-closed) and, on the ladder, as a distinct busy reason via
+/// `binding_clause_check` — never `OwnerChanged`.
+#[cfg(all(test, target_os = "macos"))]
+fn binding_identity_clause_is_current(
+    base: &Path,
+    binding: &crate::accounts::anthropic_identity::CapturedBinding,
+) -> bool {
+    binding_clause_check(base, binding, true).is_ok()
+}
+
 pub fn force_swap_write_before_repoint(
     base: &Path,
     handle_dir_abs: &Path,
@@ -7013,13 +10254,18 @@ fn decide_swap_disposition(
         // never "Claude Code just refreshed" stated as fact (that was a
         // guess, and a wrong one whenever the item held a stale-but-known
         // token, which C-F1 now catches earlier). The remedy also no longer
-        // loops on the same failing command: it names the account-scoped fix
-        // (`csq login`) instead of "run the command again", which repeats
-        // the exact refusal against the exact same unidentified item.
+        // loops on the same failing command, and (owner directive
+        // 2026-10-11, the four-terminal refusal) it no longer leads with
+        // "send a message": for a legacy/shared identity the custodian
+        // refuses to recognise (`custodian_binding_unavailable`,
+        // `anthropic_legacy_shared_authority_refused`), a refresh can never
+        // make ANY recognition channel succeed, so the message-refresh
+        // remedy was dead advice. The account-scoped fix — `csq login <n>` —
+        // is the remedy that always works.
         Ok(ForcedSyncResult::ForeignLoginUnharvested) => Err(
-            "the keychain holds a login csq could not identify as this account's own; nothing \
-             was changed — if it belongs to a different account, run `csq login <n>` for that \
-             account to establish ownership, then retry the swap"
+            "this session's keychain holds a login csq has not identified; nothing was changed. Run \
+             `csq login <n>` for this account, then retry; if that login belongs to a different \
+             account, run `csq login <n>` for that account first"
                 .to_string(),
         ),
         // rule 4b: X's `claudeAiOauth` could not be parsed — as unreadable
@@ -7111,6 +10357,10 @@ pub fn reconcile_outcome_operator_line(
                 KeychainUnknownReason::ForeignLogin => format!(
                     "terminal on {n}, keychain holds a login csq did not write — \
                      run `csq swap {n}` in that terminal"
+                ),
+                KeychainUnknownReason::ProfilesBusy => format!(
+                    "terminal on {n}, profile custody was busy so the keychain was not \
+                     reconciled — retry `csq swap {n}` in that terminal"
                 ),
             }
         }
@@ -7325,12 +10575,14 @@ fn decide_launch_disposition(
         // recognizes a stale-but-known token as rule 2, so this arm is
         // genuinely unidentified, never a fact ("just refreshed") csq cannot
         // establish. "Retry the launch" would repeat the exact same refusal
-        // against the exact same unidentified item, so the remedy names the
-        // account-scoped fix instead.
+        // against the exact same unidentified item, and (owner directive
+        // 2026-10-11) the message-refresh remedy is dead advice for a
+        // legacy/shared identity the custodian refuses to recognise — the
+        // remedy names the account-scoped fix.
         Ok(ForcedSyncResult::ForeignLoginUnharvested) => Err(
-            "the keychain holds a login csq could not identify as this account's own; nothing \
-             was changed — if it belongs to a different account, run `csq login <n>` for that \
-             account to establish ownership, then retry the launch"
+            "this session's keychain holds a login csq has not identified; nothing was changed. Run \
+             `csq login <n>` for this account, then retry the launch; if that login belongs to a \
+             different account, run `csq login <n>` for that account first"
                 .to_string(),
         ),
         // rule 4b: X's `claudeAiOauth` could not be parsed — treated the
@@ -7398,15 +10650,18 @@ pub(crate) struct KnownTokens<'a> {
     /// available — optional; omitting entries only makes rule 2's match
     /// narrower, never wrong.
     pub other_accounts_canonical: &'a [&'a str],
-    /// The sweep's pre-refresh identity for the account being refreshed
-    /// (rule 2/D-F4) — `None` outside the post-refresh sweep.
+    /// The sweep's known prior identity for the marker account (rule 2/D-F4).
+    /// The refresher's in-tick `refreshed` fingerprint takes precedence. If
+    /// absent, an admitted local `LoginMirrorContext` may supply its prior
+    /// fingerprint after base/account/identity, incoming-version and expiry
+    /// checks. The background fallback retains the existing four-admitted-sweep
+    /// limit and original context expiry; `None` if neither source qualifies.
     ///
     /// `keychain-fix-r8.md` S-LOW-1: a FINGERPRINT, not the raw credential
-    /// JSON — the refresher's in-tick `refreshed` map (this field's only
-    /// production source) previously held the full pre-refresh
-    /// `.credentials.json` STRING per account for the tick's duration,
-    /// solely to support this identity comparison. A fingerprint carries
-    /// exactly as much matching power (see `decide_cc_keychain_write`'s
+    /// JSON — the refresher's in-tick `refreshed` map previously held the full
+    /// pre-refresh `.credentials.json` STRING per account for the tick's
+    /// duration, solely to support this identity comparison. A fingerprint
+    /// carries exactly as much matching power (see `decide_cc_keychain_write`'s
     /// fingerprint-based check) with zero token bytes retained in memory
     /// beyond the moment `record_write` fingerprints and discards them.
     pub sweep_pre_refresh: Option<crate::credentials::token_history::Fingerprint>,
@@ -7422,6 +10677,46 @@ pub(crate) struct KnownTokens<'a> {
     /// narrows recognition back to current-token-only, never widens it
     /// unsafely.
     pub marker_account_history: &'a [crate::credentials::token_history::Fingerprint],
+    /// Fingerprints of OLDER logins of the marker account that the custodian
+    /// server-verified (`/api/oauth/profile` owner match) as belonging to it
+    /// (`token_history::read_owner_verified`). A STRONG recognition channel,
+    /// equal to a raw match: unlike `marker_account_history` it is not
+    /// position-based, so it carries no relative-expiry guard; only the
+    /// absolute `RefuseIntendedExpired` backstop still applies. Empty by
+    /// default — omitting it only narrows recognition.
+    pub marker_account_owner_verified: &'a [crate::credentials::token_history::Fingerprint],
+    /// The marker slot's RETIRED bindings (owner directive 2026-10-11;
+    /// narrowed to history membership per coordinator ca6022c7). When a
+    /// slot is REBOUND to a new identity -- the Anthropic re-login
+    /// publication, `profiles.rs` `add_identity_mapping`, or `csq move`'s
+    /// swap -- the displaced uuid lands in
+    /// `ProfilesFile::slot_binding_history[N]` in the same locked save as
+    /// the `by_slot` overwrite. Terminals launched under the PREVIOUS
+    /// binding still carry ITS token in their keychain; the marker now
+    /// resolves to the NEW identity, so every other channel misses and the
+    /// swap refuses `ForeignLoginUnharvested` forever. This channel admits
+    /// exactly those tokens, sourced by
+    /// `token_history::retired_bindings_for_slot`: identities in the slot's
+    /// recorded binding history, still unbound everywhere, not removed.
+    /// History membership IS the gate -- the generation counter is not
+    /// consulted (it cannot tell "bound once" from "rebound") and rebinds
+    /// that predate the field fail CLOSED (remedy: `csq login <n>` /
+    /// `csq run <n>`, already in the refusal text).
+    ///
+    /// Evidence strength is SPLIT per binding (review R1 M3): the binding's
+    /// CANONICAL fingerprint is STRONG, equal to raw_match/owner_verified
+    /// (no relative-expiry guard; the absolute `RefuseIntendedExpired`
+    /// backstop still applies). A HISTORY entry is WEAKER -- the
+    /// `marker_account_history` class: `decide_cc_keychain_write` requires
+    /// the position-strictly-before-that-binding's-own-canonical ordering
+    /// AND the relative-expiry guard, and `Intended::Strip` is never
+    /// authorised by history alone.
+    ///
+    /// Empty by default -- omitting it only narrows recognition. Never
+    /// terminal-derived (`account-terminal-separation.md` MUST-1): the slot
+    /// comes from the caller's marker resolution, the identities from
+    /// `profiles.json` + the identity store.
+    pub retired_bindings: &'a [crate::credentials::token_history::RetiredBinding],
 }
 
 impl<'a> KnownTokens<'a> {
@@ -7432,6 +10727,269 @@ impl<'a> KnownTokens<'a> {
             .chain(self.csq_written)
             .chain(self.other_accounts_canonical.iter().copied())
     }
+}
+
+/// Which of [`decide_cc_keychain_write`]'s recognition channels fired
+/// (review R2 L-R2-2/L-R2-3): hoisted out of the decision so the
+/// executor's authority re-check and the fresh-launch quarantine gate
+/// test THE SAME predicate the decision used — a re-derived check could
+/// drift from the decision it is re-proving.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Recognition {
+    pub raw_match: bool,
+    pub history_matches: bool,
+    pub pre_refresh_match: bool,
+    pub owner_verified_match: bool,
+    pub store_fingerprint_match: bool,
+    pub retired_canonical_match: bool,
+    pub retired_history_match: bool,
+}
+
+impl Recognition {
+    /// The union rule 2 consumes (`matches_known`).
+    pub(crate) fn matches_known(&self) -> bool {
+        self.raw_match
+            || self.history_matches
+            || self.pre_refresh_match
+            || self.owner_verified_match
+            || self.store_fingerprint_match
+            || self.retired_canonical_match
+            || self.retired_history_match
+    }
+
+    /// A history-POSITION channel (marker or retired) and no strong one —
+    /// the class `Intended::Token` additionally subjects to the
+    /// relative-expiry guard.
+    pub(crate) fn history_only(&self) -> bool {
+        (self.history_matches || self.retired_history_match)
+            && !self.raw_match
+            && !self.pre_refresh_match
+            && !self.owner_verified_match
+            && !self.store_fingerprint_match
+            && !self.retired_canonical_match
+    }
+
+    /// The retired binding's HISTORY alone, nothing else — the class
+    /// `Intended::Strip` never authorises, and (review R2 L-R2-3) the
+    /// class a fresh launch quarantines before replacement.
+    pub(crate) fn retired_history_only(&self) -> bool {
+        self.retired_history_match
+            && !self.raw_match
+            && !self.pre_refresh_match
+            && !self.owner_verified_match
+            && !self.store_fingerprint_match
+            && !self.retired_canonical_match
+            && !self.history_matches
+    }
+
+    /// Recognised ONLY by the retired channel (canonical or history), with
+    /// no channel that independently pins the item to a token this process
+    /// can name — what `force_sync_inner_with_profiles` re-proves under
+    /// the held profiles authority before mutating (review R2 L-R2-2).
+    /// Only the macOS-gated force-sync path calls this.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn retired_only(&self) -> bool {
+        (self.retired_canonical_match || self.retired_history_match)
+            && !self.raw_match
+            && !self.history_matches
+            && !self.pre_refresh_match
+            && !self.owner_verified_match
+            && !self.store_fingerprint_match
+    }
+}
+
+/// Does any retired binding's CANONICAL equal `fp`? ONE definition, shared
+/// by the decision and the executor's lock-held re-proof (review R2
+/// L-R2-2).
+fn retired_canonical_in(
+    bindings: &[crate::credentials::token_history::RetiredBinding],
+    fp: crate::credentials::token_history::Fingerprint,
+) -> bool {
+    bindings.iter().any(|b| b.canonical == Some(fp))
+}
+
+/// Does `fp` sit STRICTLY BEFORE some retired binding's own canonical in
+/// that binding's bounded history? ONE definition, shared by the decision
+/// and the executor's lock-held re-proof (review R2 L-R2-2).
+fn retired_history_in(
+    bindings: &[crate::credentials::token_history::RetiredBinding],
+    fp: crate::credentials::token_history::Fingerprint,
+) -> bool {
+    bindings.iter().any(|b| {
+        let Some(pos) = b.history.iter().rposition(|h| *h == fp) else {
+            return false;
+        };
+        b.canonical
+            .and_then(|c| b.history.iter().rposition(|h| *h == c))
+            .is_some_and(|canonical_pos| pos < canonical_pos)
+    })
+}
+
+/// Computes [`Recognition`] for `current` against `known` — the channel
+/// block [`decide_cc_keychain_write`] applies after its three early
+/// guards. Pure; `Absent`/`Unreadable` inputs match nothing.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn recognise_current(
+    current: &RawContentClassification,
+    known: &KnownTokens<'_>,
+) -> Recognition {
+    // `keychain-fix-r8.md` C-F1 (PRIMARY DIRECTIVE): a raw-token match against
+    // `known.iter_raw()` is not the only way `current` can be "known, not a
+    // foreign login" — it may also be a token from an EARLIER refresh this
+    // marker account's own canonical store has since superseded. `current`'s
+    // OWN fingerprint is computed at most once (`current`'s bytes never
+    // leave the caller), and checked against the marker account's bounded
+    // history; a hit is "same account, superseded" (rule 2), never rule 3's
+    // unmatched foreign login.
+    // S-LOW-1: `current`'s fingerprint is computed at most once and checked
+    // against BOTH the marker account's bounded on-disk history AND the
+    // sweep's in-tick pre-refresh fingerprint (`sweep_pre_refresh` — the
+    // in-memory equivalent of a not-yet-appended history entry, for the tick
+    // during which the refresh happened but the sweep hasn't caught up on
+    // every dir yet).
+    let current_fingerprint = match current {
+        RawContentClassification::Content(json) => {
+            crate::credentials::token_history::fingerprint_from_raw_json(json)
+        }
+        RawContentClassification::Absent | RawContentClassification::Unreadable(_) => None,
+    };
+    // `keychain-fix-r9.md` S-M-3: a history hit counts as "same account,
+    // superseded" ONLY when `current`'s fingerprint sits STRICTLY BEFORE the
+    // marker account's OWN canonical fingerprint in that same bounded,
+    // oldest-first history — i.e. `current` is a token the canonical store
+    // has demonstrably moved PAST. Without the ordering check, a canonical
+    // store rolled back to an OLDER token (a bug, or a restored backup) would
+    // make its own bounded history contain a NEWER fingerprint too — and a
+    // keychain item still holding that newer, still-live session would read
+    // as "known, safe to overwrite" and get silently replaced by the older
+    // canonical value, discarding a perfectly good session. Requiring
+    // strictly-before means a match is possible only when `current` is
+    // provably behind the canonical position, never merely "somewhere in the
+    // history" — a fingerprint that TIES the canonical position (handled by
+    // `iter_raw`'s raw-string comparison above) or comes AFTER it never
+    // qualifies here.
+    //
+    // Both positions must be independently resolvable in the SAME bounded
+    // array or this is a no-match (fail closed, `guard-reader-writer-
+    // parity.md` MUST-2): if the canonical fingerprint cannot be computed, or
+    // was evicted from (or never entered) the bounded history, there is no
+    // safe position to compare against, so a history hit is NOT trusted.
+    // `keychain-fix-r11.md` S-M-3 residual: BOTH positions below now use
+    // `rposition` (last occurrence), not `position` (first). A bounded
+    // history array can hold the SAME fingerprint at more than one index —
+    // e.g. `[X, C, X]`, when an account's token X was written, superseded by
+    // C, then written again (a rollback/restore) — and a FIRST-occurrence
+    // read can find X's index BEFORE C's even though the fingerprint
+    // `current` actually carries corresponds to the LAST (most recent)
+    // occurrence, which sits AFTER C. Anchoring both sides to their LAST
+    // occurrence keeps "strictly before" meaningful under a rolled-back or
+    // duplicated history instead of matching on a stale earlier index.
+    let history_matches = current_fingerprint.is_some_and(|fp| {
+        let canonical_pos = known
+            .marker_account_canonical
+            .and_then(crate::credentials::token_history::fingerprint_from_raw_json)
+            .and_then(|canonical_fp| {
+                known
+                    .marker_account_history
+                    .iter()
+                    .rposition(|h| *h == canonical_fp)
+            });
+        let Some(canonical_pos) = canonical_pos else {
+            return false;
+        };
+        known
+            .marker_account_history
+            .iter()
+            .rposition(|h| *h == fp)
+            .is_some_and(|fp_pos| fp_pos < canonical_pos)
+    });
+    // `keychain-fix-r11.md` S-M-3 residual (D-1): the recognition channels
+    // are not folded straight into one bool — a history-ONLY match
+    // (recognised via the position channel and NEITHER a raw/csq_written
+    // match NOR the sweep's in-tick pre-refresh fingerprint) is weaker
+    // evidence than the others, which directly confirm `current` IS a
+    // specific already-known token. The relative guard applies only to that
+    // weaker, history-only case ([`Recognition::history_only`]).
+    let raw_match = known
+        .iter_raw()
+        .any(|raw| keychain_content_matches_token(current, raw));
+    let pre_refresh_match =
+        current_fingerprint.is_some_and(|fp| known.sweep_pre_refresh == Some(fp));
+    let owner_verified_match =
+        current_fingerprint.is_some_and(|fp| known.marker_account_owner_verified.contains(&fp));
+    // Owner directive 2026-10-11, two direct-fingerprint channels — both
+    // STRONG (exact identity evidence, same class as `owner_verified_match`):
+    //
+    // (b) `store_fingerprint_match` — parity with the custodian, which already
+    //     treats `fp == store_fp` as known (`guard-reader-writer-parity.md`).
+    //     `raw_match`'s `oauth_identity` comparison requires the WHOLE
+    //     `(accessToken, refreshToken)` pair to be equal, so the ordinary
+    //     same-grant/different-access-token shape (a refresh rotated the
+    //     access token while the grant — and its refresh token — stayed)
+    //     misses it; comparing the REFRESH fingerprint against the stored
+    //     canonical closes exactly that gap and nothing wider.
+    //
+    let store_fingerprint_match = current_fingerprint.is_some_and(|fp| {
+        known
+            .marker_account_canonical
+            .and_then(crate::credentials::token_history::fingerprint_from_raw_json)
+            == Some(fp)
+    });
+    // (a) `retired_canonical_match` / `retired_history_match` — the slot's
+    //     RETIRED bindings (see the field doc). The canonical fingerprint is
+    //     STRONG (exact identity evidence, same class as `owner_verified`);
+    //     a HISTORY entry is WEAKER — it must sit strictly before that same
+    //     binding's own canonical inside the binding's bounded history
+    //     (mirroring `marker_account_history`'s ordering, review R1 M3) and
+    //     never authorises `Intended::Strip`.
+    let retired_canonical_match =
+        current_fingerprint.is_some_and(|fp| retired_canonical_in(known.retired_bindings, fp));
+    let retired_history_match =
+        current_fingerprint.is_some_and(|fp| retired_history_in(known.retired_bindings, fp));
+    Recognition {
+        raw_match,
+        history_matches,
+        pre_refresh_match,
+        owner_verified_match,
+        store_fingerprint_match,
+        retired_canonical_match,
+        retired_history_match,
+    }
+}
+
+/// Review R2 L-R2-2: re-proves a retired-channel-only recognition under the
+/// caller-held profiles authority. The decision's retired channels were
+/// computed from a set the no-lock path read OUTSIDE this lock; if a GC
+/// reaped the retired identity between that read and here, the item may be
+/// the last copy of its token, and a mutation authorised only by the stale
+/// recognition would destroy it. True when the reloaded, lock-held retired
+/// set still recognises `fp` through the SAME predicates the decision used
+/// ([`retired_canonical_in`] / [`retired_history_in`]).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn retired_recognition_still_current(
+    lock: &crate::accounts::profiles_lock::ProfilesFileLock,
+    base: &Path,
+    marker_account: Option<AccountNum>,
+    current: &RawContentClassification,
+    recognition: &Recognition,
+) -> bool {
+    let (Some(slot), RawContentClassification::Content(json)) = (marker_account, current) else {
+        return false;
+    };
+    let Some(fp) = crate::credentials::token_history::fingerprint_from_raw_json(json) else {
+        return false;
+    };
+    let live =
+        crate::credentials::token_history::retired_bindings_for_slot_locked(lock, base, slot);
+    // Review R3 L2: EVERY channel that fired at decision time must still
+    // hold. An OR let a still-live weaker channel re-prove a recognition
+    // whose stronger evidence (a since-GC-reaped canonical) had gone, so
+    // the relative-expiry guard `decide` skipped for the strong class
+    // stayed skipped while the item may have become the token's last copy
+    // — exactly the destruction the re-proof exists to prevent.
+    (!recognition.retired_canonical_match || retired_canonical_in(&live, fp))
+        && (!recognition.retired_history_match || retired_history_in(&live, fp))
 }
 
 /// What this write intends for X. Deliberately only two variants: a caller
@@ -7566,7 +11124,7 @@ impl fmt::Debug for WriteDecision<'_> {
 fn current_oauth_unparseable(current: &RawContentClassification) -> bool {
     match current {
         RawContentClassification::Content(json) => {
-            let Ok(val) = serde_json::from_str::<serde_json::Value>(json) else {
+            let Ok(val) = serde_json::from_str::<SecretJson>(json) else {
                 // Caller already established `Content` only for JSON-object
                 // payloads (`classify_raw_content`); an unparseable `json`
                 // here should not occur, but treat it as malformed rather
@@ -7641,89 +11199,12 @@ pub(crate) fn decide_cc_keychain_write<'a>(
 
     // From here `current` is `Content` with a parseable, real identity.
     //
-    // `keychain-fix-r8.md` C-F1 (PRIMARY DIRECTIVE): a raw-token match against
-    // `known.iter_raw()` is not the only way `current` can be "known, not a
-    // foreign login" — it may also be a token from an EARLIER refresh this
-    // marker account's own canonical store has since superseded. `current`'s
-    // OWN fingerprint is computed at most once (`current`'s bytes never
-    // leave this function), and checked against the marker account's bounded
-    // history; a hit is "same account, superseded" (rule 2), never rule 3's
-    // unmatched foreign login.
-    // S-LOW-1: `current`'s fingerprint is computed at most once and checked
-    // against BOTH the marker account's bounded on-disk history AND the
-    // sweep's in-tick pre-refresh fingerprint (`sweep_pre_refresh` — the
-    // in-memory equivalent of a not-yet-appended history entry, for the tick
-    // during which the refresh happened but the sweep hasn't caught up on
-    // every dir yet).
-    let current_fingerprint = match current {
-        RawContentClassification::Content(json) => {
-            crate::credentials::token_history::fingerprint_from_raw_json(json)
-        }
-        RawContentClassification::Absent | RawContentClassification::Unreadable(_) => None,
-    };
-    // `keychain-fix-r9.md` S-M-3: a history hit counts as "same account,
-    // superseded" ONLY when `current`'s fingerprint sits STRICTLY BEFORE the
-    // marker account's OWN canonical fingerprint in that same bounded,
-    // oldest-first history — i.e. `current` is a token the canonical store
-    // has demonstrably moved PAST. Without the ordering check, a canonical
-    // store rolled back to an OLDER token (a bug, or a restored backup) would
-    // make its own bounded history contain a NEWER fingerprint too — and a
-    // keychain item still holding that newer, still-live session would read
-    // as "known, safe to overwrite" and get silently replaced by the older
-    // canonical value, discarding a perfectly good session. Requiring
-    // strictly-before means a match is possible only when `current` is
-    // provably behind the canonical position, never merely "somewhere in the
-    // history" — a fingerprint that TIES the canonical position (handled by
-    // `iter_raw`'s raw-string comparison above) or comes AFTER it never
-    // qualifies here.
-    //
-    // Both positions must be independently resolvable in the SAME bounded
-    // array or this is a no-match (fail closed, `guard-reader-writer-
-    // parity.md` MUST-2): if the canonical fingerprint cannot be computed, or
-    // was evicted from (or never entered) the bounded history, there is no
-    // safe position to compare against, so a history hit is NOT trusted.
-    // `keychain-fix-r11.md` S-M-3 residual: BOTH positions below now use
-    // `rposition` (last occurrence), not `position` (first). A bounded
-    // history array can hold the SAME fingerprint at more than one index —
-    // e.g. `[X, C, X]`, when an account's token X was written, superseded by
-    // C, then written again (a rollback/restore) — and a FIRST-occurrence
-    // read can find X's index BEFORE C's even though the fingerprint
-    // `current` actually carries corresponds to the LAST (most recent)
-    // occurrence, which sits AFTER C. Anchoring both sides to their LAST
-    // occurrence keeps "strictly before" meaningful under a rolled-back or
-    // duplicated history instead of matching on a stale earlier index.
-    let history_matches = current_fingerprint.is_some_and(|fp| {
-        let canonical_pos = known
-            .marker_account_canonical
-            .and_then(crate::credentials::token_history::fingerprint_from_raw_json)
-            .and_then(|canonical_fp| {
-                known
-                    .marker_account_history
-                    .iter()
-                    .rposition(|h| *h == canonical_fp)
-            });
-        let Some(canonical_pos) = canonical_pos else {
-            return false;
-        };
-        known
-            .marker_account_history
-            .iter()
-            .rposition(|h| *h == fp)
-            .is_some_and(|fp_pos| fp_pos < canonical_pos)
-    });
-    // `keychain-fix-r11.md` S-M-3 residual (D-1): the three recognition
-    // channels are no longer folded straight into `matches_known` — a
-    // history-ONLY match (recognised via the position channel and NEITHER a
-    // raw/csq_written match NOR the sweep's in-tick pre-refresh fingerprint)
-    // is weaker evidence than the other two, which directly confirm
-    // `current` IS a specific already-known token. The relative guard below
-    // applies only to that weaker, history-only case.
-    let raw_match = known
-        .iter_raw()
-        .any(|raw| keychain_content_matches_token(current, raw));
-    let pre_refresh_match =
-        current_fingerprint.is_some_and(|fp| known.sweep_pre_refresh == Some(fp));
-    let matches_known = raw_match || history_matches || pre_refresh_match;
+    // Review R2 L-R2-2/L-R2-3: the channel block lives in
+    // [`recognise_current`], so the executor's lock-held re-proof and the
+    // fresh-launch quarantine gate test the SAME predicate this decision
+    // used — a re-derived check could drift from what was decided here.
+    let recognition = recognise_current(current, known);
+    let matches_known = recognition.matches_known();
 
     match intended {
         Intended::Token(t) => {
@@ -7780,7 +11261,7 @@ pub(crate) fn decide_cc_keychain_write<'a>(
                 // the ordinary "let the caller harvest and re-decide" case,
                 // since a live `current` may genuinely be the account's
                 // true-current session rather than something superseded.
-                let history_only = history_matches && !raw_match && !pre_refresh_match;
+                let history_only = recognition.history_only();
                 if history_only {
                     let current_expiry = match current {
                         RawContentClassification::Content(json) => anthropic_expiry_ms(json),
@@ -7804,7 +11285,14 @@ pub(crate) fn decide_cc_keychain_write<'a>(
             }
         }
         Intended::Strip => {
-            if matches_known {
+            // A history-POSITION match is not a strip authorisation when the
+            // ONLY recognition is a RETIRED binding's history (review R1 M3 /
+            // coordinator ca6022c7 item 4): weaker evidence may overwrite,
+            // never destroy the keychain login. Marker-history-only strips
+            // keep their pre-existing semantics — this change never touched
+            // that channel.
+            let retired_history_only = recognition.retired_history_only();
+            if matches_known && !retired_history_only {
                 WriteDecision::StripAllowed
             } else {
                 WriteDecision::RefuseUnharvested
@@ -7856,22 +11344,28 @@ pub(crate) enum ApplyOutcome {
 /// made. Never the full content: restoring the old token mid-swap would put
 /// a superseded account's login back.
 #[cfg(target_os = "macos")]
-fn siblings_only_payload(current: &RawContentClassification) -> Option<String> {
+fn siblings_only_payload(current: &RawContentClassification) -> Option<Zeroizing<String>> {
     match current {
         RawContentClassification::Content(json) => {
             let siblings = extract_sibling_object(json);
             if siblings.is_empty() {
                 None
             } else {
-                serde_json::to_string(&serde_json::Value::Object(siblings)).ok()
+                zeroizing_json(&siblings.0).ok()
             }
         }
         RawContentClassification::Absent | RawContentClassification::Unreadable(_) => None,
     }
 }
 
-/// The single executor-level entry every production caller of CC-item
-/// add/delete MUST route through (`keychain-fix-r7b.md`). Takes the SAME
+/// Executor-level entry for ordinary production CC-item writes and strips
+/// (`keychain-fix-r7b.md`). The compensation path
+/// `clear_unconfirmed_rotation_write_with_executor` deliberately uses
+/// re-read-then-delete (not atomic; see L1 / an internal ticket) followed by
+/// `restore_cleanup_siblings_create_only`: ordinary
+/// StripAllowed can delete a concurrently appeared item before restoring siblings.
+/// That path never updates or pre-deletes when restoring, and handles duplicate
+/// exit 45 as preservation of the concurrent item. Takes the SAME
 /// `current` [`decide_cc_keychain_write`] decided against, so
 /// [`WriteDecision::Write`]'s sibling-preserving merge and
 /// [`WriteDecision::StripAllowed`]'s strip-to-siblings-or-delete reuse the
@@ -7920,7 +11414,7 @@ fn apply_cc_keychain_write(
             let siblings = match current {
                 RawContentClassification::Content(json) => extract_sibling_object(json),
                 RawContentClassification::Absent | RawContentClassification::Unreadable(_) => {
-                    serde_json::Map::new()
+                    SecretJson(serde_json::Value::Object(serde_json::Map::new()))
                 }
             };
             if siblings.is_empty() {
@@ -7930,7 +11424,7 @@ fn apply_cc_keychain_write(
                     on_write_failure()
                 }
             } else {
-                match serde_json::to_string(&serde_json::Value::Object(siblings)) {
+                match zeroizing_json(&siblings.0) {
                     Ok(remainder) => match exec.add(svc, account, &remainder) {
                         Ok(()) => ApplyOutcome::Applied { wrote_token: false },
                         Err(_) => on_write_failure(),
@@ -7972,6 +11466,707 @@ fn apply_cc_keychain_write(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    fn stage_known_login_fixture(
+        base: &Path,
+        account: AccountNum,
+        credential: &CredentialFile,
+        record_owner: bool,
+    ) {
+        stage_known_fixture(base, account, credential, true, record_owner);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn stage_known_fixture(
+        base: &Path,
+        account: AccountNum,
+        credential: &CredentialFile,
+        record_history: bool,
+        record_owner: bool,
+    ) -> crate::accounts::identity_store::IdentityId {
+        use crate::accounts::{anthropic_identity as ai, identity_store, profiles};
+        let mut pf = profiles::load(&profiles::profiles_path(base)).unwrap();
+        let identity = *pf.by_slot.entry(account.to_string()).or_insert_with(|| {
+            crate::testing::identity_fixtures::fixture_uuid_for_slot(account.get())
+        });
+        let root = identity_store::identities_dir(base);
+        let own = identity_store::identity_json_path_for(base, identity);
+        std::fs::create_dir_all(own.parent().unwrap()).unwrap();
+        crate::platform::fs::secure_dir(&root).unwrap();
+        crate::platform::fs::secure_dir(own.parent().unwrap()).unwrap();
+        let proof = ai::verify_anthropic_context_with(
+            credential.anthropic().unwrap(),
+            &fixture_profile_http_for_slot(credential, account),
+        )
+        .unwrap();
+        let context = proof.context();
+        std::fs::write(&own, serde_json::to_vec(&serde_json::json!({
+            "provider":"anthropic","email":context.email(),"account_uuid":context.account_uuid(),
+            "organization_uuid":context.organization_uuid(),"created_at":"fixture"
+        })).unwrap()).unwrap();
+        crate::platform::fs::secure_file(&own).unwrap();
+        pf.anthropic_contexts
+            .retain(|entry| entry.identity_uuid != identity);
+        pf.anthropic_contexts.push(ai::AnthropicContextEntry {
+            email: context.email().into(),
+            account_uuid: context.account_uuid(),
+            organization_uuid: context.organization_uuid(),
+            identity_uuid: identity,
+            extra: Default::default(),
+        });
+        profiles::save(&profiles::profiles_path(base), &pf).unwrap();
+        crate::credentials::file::save(
+            &identity_store::credentials_path_for(base, identity),
+            credential,
+        )
+        .unwrap();
+        if record_history {
+            crate::credentials::token_history::record_write(base, identity, credential);
+        }
+        let binding = ai::capture_anthropic_binding(base, account).unwrap();
+        assert!(matches!(
+            binding.context(),
+            ai::StoredAnthropicContext::Known(_)
+        ));
+        if record_owner {
+            assert!(matches!(
+                crate::credentials::token_history::record_owner_verified_v2(base, &binding, &proof),
+                crate::credentials::token_history::OwnerVerifiedRecord::Written
+            ));
+        }
+        identity
+    }
+    #[cfg(target_os = "macos")]
+    fn fixture_profile_http(credential: &CredentialFile) -> crate::daemon::usage_poller::HttpGetFn {
+        fixture_profile_http_for_slot(credential, AccountNum::try_from(1u16).unwrap())
+    }
+    #[cfg(target_os = "macos")]
+    fn fixture_profile_http_for_slot(
+        credential: &CredentialFile,
+        slot: AccountNum,
+    ) -> crate::daemon::usage_poller::HttpGetFn {
+        let token = credential
+            .anthropic()
+            .unwrap()
+            .claude_ai_oauth
+            .access_token
+            .clone();
+        std::sync::Arc::new(move |url, bearer, _| {
+            assert_eq!(url, "https://api.anthropic.com/api/oauth/profile");
+            assert_eq!(
+                bearer,
+                token.expose_secret(),
+                "fixture verifies the exact selected grant"
+            );
+            let offset = u128::from(slot.get() - 1);
+            Ok((200, serde_json::to_vec(&serde_json::json!({
+                "account":{"uuid":uuid::Uuid::from_u128(101 + offset),"email":format!("fixture-slot-{}@test.invalid",slot.get())},
+                "organization":{"uuid":uuid::Uuid::from_u128(202 + offset)}
+            })).unwrap()))
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn pending_login_fixture() -> (
+        tempfile::TempDir,
+        AccountNum,
+        String,
+        crate::accounts::login::LoginMirrorContext,
+    ) {
+        use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+        let dir = coexisting_fixture(1);
+        let base = dir.path();
+        let account = AccountNum::try_from(1u16).unwrap();
+        let uuid = fixture_uuid_for_slot(1);
+        let config = base.join("config-1");
+        std::fs::write(
+            config.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"fixture-slot-1@test.invalid"}}"#,
+        )
+        .unwrap();
+        let old = r#"{"claudeAiOauth":{"accessToken":"fixture-pending-old-at","refreshToken":"fixture-pending-old-rt","expiresAt":4102444800000,"scopes":["user:inference"],"subscriptionType":"max"}}"#;
+        std::fs::write(config.join(".credentials.json"), old).unwrap();
+        let prior = crate::credentials::load(&config.join(".credentials.json")).unwrap();
+        stage_known_login_fixture(base, account, &prior, false);
+        let fresh = old
+            .replace("pending-old", "pending-new")
+            .replace("4102444800000", "4102444800001");
+        std::fs::write(config.join(".credentials.json"), &fresh).unwrap();
+        let incoming = crate::credentials::load(&config.join(".credentials.json")).unwrap();
+        let login_prior =
+            crate::accounts::anthropic_identity::capture_login_prior(base, account).unwrap();
+        let committed = crate::accounts::anthropic_identity::commit_anthropic_login_with(
+            base,
+            account,
+            &incoming,
+            &fixture_profile_http(&incoming),
+            None,
+            login_prior,
+        )
+        .unwrap();
+        let (committed_binding, mirror, _) = committed.into_parts();
+        let mut context = mirror.expect("verified commit retains the exact prior grant witness");
+        // The witness authorizes against the ACTUAL committed custody only —
+        // bind the binding the commit itself returned (never a synthesized
+        // epoch; the real finalizer binds the same way under its original
+        // profiles lock).
+        assert!(
+            context.bind_committed_custody(&committed_binding),
+            "fixture witness must bind its committed custody"
+        );
+        let handle = base.join(format!("term-{}", std::process::id()));
+        std::fs::create_dir(&handle).unwrap();
+        crate::accounts::markers::write_csq_account(&config, uuid).unwrap();
+        std::os::unix::fs::symlink(
+            crate::accounts::identity_store::credentials_path_for(base, uuid),
+            handle.join(".credentials.json"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(config.join(".csq-account"), handle.join(".csq-account"))
+            .unwrap();
+        std::fs::write(handle.join(".live-pid"), std::process::id().to_string()).unwrap();
+        assert!(crate::session::handle_dir::handle_dir_symlinks_are_consistent(base, &handle));
+        crate::credentials::token_history::start_new_segment(
+            base,
+            uuid,
+            crate::credentials::token_history::fingerprint_from_raw_json(&fresh).unwrap(),
+        );
+        assert!(!crate::credentials::token_history::read_history(base, uuid)
+            .contains(&crate::credentials::token_history::fingerprint_from_raw_json(old).unwrap()));
+        (dir, account, old.to_string(), context)
+    }
+
+    #[cfg(target_os = "macos")]
+    struct PendingExecutorScope;
+    #[cfg(target_os = "macos")]
+    impl Drop for PendingExecutorScope {
+        fn drop(&mut self) {
+            crate::accounts::login::LoginMirrorContext::clear_clock_for_test();
+            clear_test_keychain_executor();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_login_mirror_failed_attempt_retains_witness_for_later_delivery() {
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            let (dir, account, old, context) = pending_login_fixture();
+            let exec = std::rc::Rc::new(RecordingExecutor::scripted(
+                RawContentClassification::Content(old.into()),
+            ));
+            exec.add_ok.set(false);
+            set_test_keychain_executor(exec.clone());
+            let _clear = PendingExecutorScope;
+            queue_login_mirror(dir.path(), account, Some(context));
+            sync_pending_login_handle_dirs_status(dir.path());
+            assert!(mirror_sync_retry_requested(dir.path()));
+            assert_eq!(
+                PENDING_LOGIN_MIRRORS
+                    .lock()
+                    .unwrap()
+                    .get(&(dir.path().to_path_buf(), account))
+                    .unwrap()
+                    .attempts,
+                1
+            );
+            let before = exec.calls().iter().filter(|call| call.0 == "add").count();
+            assert!(
+                before > 0,
+                "first admitted sweep must reach actual failing writer"
+            );
+            exec.add_ok.set(true);
+            sync_pending_login_handle_dirs_status(dir.path());
+            assert!(
+                exec.calls().iter().filter(|call| call.0 == "add").count() > before,
+                "retained witness must authorize later real delivery"
+            );
+            let payload = exec.last_add_payload().unwrap();
+            assert!(payload.contains("fixture-pending-new-rt"));
+        });
+    }
+
+    /// v5 `oauth_exchange_background_mirrors_after_client_history_reset`:
+    /// a SECOND same-grant commit/finalize queues a (priorFRESH,
+    /// incomingFRESH) witness, but the retained entry must stay the OLDEST
+    /// valid same-incoming ONE — (priorOLD, incomingFRESH) — because after a
+    /// client token-history reset the OLD native token is recognizable only
+    /// through that prior. A stale/expired existing witness, by contrast,
+    /// IS replaced.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn queue_login_mirror_preserves_oldest_same_incoming_witness() {
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            use crate::accounts::identity_store::credentials_path_for;
+            use crate::accounts::login::prepare_verified_login_mirror;
+            let (dir, account, old, first) = pending_login_fixture();
+            let base = dir.path();
+            let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(1);
+            let canonical = crate::credentials::load(&credentials_path_for(base, uuid)).unwrap();
+            // A witness authorizes only against the ACTUAL committed custody
+            // bound at finalize time — never a synthesized epoch. `prepare`
+            // returns unbound; bind the real captured binding here (the real
+            // finalizer does the same under its original profiles lock).
+            let mut second = prepare_verified_login_mirror(base, account, uuid, &canonical)
+                .expect("second same-grant witness");
+            let second_custody =
+                crate::accounts::anthropic_identity::capture_anthropic_binding(base, account)
+                    .expect("second witness committed custody");
+            assert!(
+                second.bind_committed_custody(&second_custody),
+                "second witness must bind its actual committed custody"
+            );
+
+            queue_login_mirror(base, account, Some(first));
+            // A replace resets attempts; seed a non-zero budget so retention
+            // is observable through it.
+            PENDING_LOGIN_MIRRORS
+                .lock()
+                .unwrap()
+                .get_mut(&(base.to_path_buf(), account))
+                .unwrap()
+                .attempts = 2;
+
+            queue_login_mirror(base, account, Some(second));
+
+            let raw = std::fs::read_to_string(credentials_path_for(base, uuid)).unwrap();
+            let old_fp =
+                crate::credentials::token_history::fingerprint_from_raw_json(&old).unwrap();
+            let retained = PENDING_LOGIN_MIRRORS.lock().unwrap();
+            let entry = retained.get(&(base.to_path_buf(), account)).unwrap();
+            assert_eq!(
+                entry.attempts, 2,
+                "second same-grant queue must NOT replace the oldest witness \
+                 (a replace resets attempts)"
+            );
+            assert_eq!(
+                entry.context.prior_for(base, account, &raw),
+                Some(old_fp),
+                "the retained OLDEST witness must positively recognize the OLD native \
+                 token after the history reset — the server positive oracle's path"
+            );
+            drop(retained);
+
+            // ── Stale/expired existing witness IS replaced ─────────────────
+            let (dir2, account2, _old2, mut stale) = pending_login_fixture();
+            let base2 = dir2.path();
+            let uuid2 = crate::testing::identity_fixtures::fixture_uuid_for_slot(1);
+            let canonical2 = crate::credentials::load(&credentials_path_for(base2, uuid2)).unwrap();
+            stale.expire_for_test();
+            queue_login_mirror(base2, account2, Some(stale));
+            PENDING_LOGIN_MIRRORS
+                .lock()
+                .unwrap()
+                .get_mut(&(base2.to_path_buf(), account2))
+                .unwrap()
+                .attempts = 3;
+            let mut fresh2 = prepare_verified_login_mirror(base2, account2, uuid2, &canonical2)
+                .expect("replacement same-incoming witness");
+            let fresh2_custody =
+                crate::accounts::anthropic_identity::capture_anthropic_binding(base2, account2)
+                    .expect("replacement witness committed custody");
+            assert!(
+                fresh2.bind_committed_custody(&fresh2_custody),
+                "replacement witness must bind its actual committed custody"
+            );
+            queue_login_mirror(base2, account2, Some(fresh2));
+            let retained = PENDING_LOGIN_MIRRORS.lock().unwrap();
+            assert_eq!(
+                retained
+                    .get(&(base2.to_path_buf(), account2))
+                    .unwrap()
+                    .attempts,
+                0,
+                "an EXPIRED existing witness is stale and must be replaced"
+            );
+        });
+    }
+
+    /// ABA custody move at the SAME UUID: the slot's binding generation moves
+    /// (an A→B→A restoration that leaves the UUID and the canonical pair
+    /// identical — only the generation records that the custody left and
+    /// returned). UUID+pair+deadline equality alone cannot distinguish the
+    /// restored state from the original, so the retention predicate must
+    /// compare the witness's ORIGINAL custody generation (and context)
+    /// against the live binding: a moved generation makes the stored witness
+    /// not-current, and it MUST be replaced (a replace resets attempts).
+    ///
+    /// This was RED against a UUID-only retention predicate (`current_for`
+    /// returned true, the era-A witness was retained, attempts stayed 2 — the
+    /// old prior kept mirror authority across a custody move). It now pins
+    /// the custody recheck: `prior_for` compares the witness's ORIGINAL
+    /// bound custody against the live profiles/context under bounded reads.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn queue_login_mirror_replaces_witness_after_slot_generation_move() {
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            use crate::accounts::identity_store::credentials_path_for;
+            use crate::accounts::login::prepare_verified_login_mirror;
+            let (dir, account, _old, first) = pending_login_fixture();
+            let base = dir.path();
+            let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(1);
+            let canonical = crate::credentials::load(&credentials_path_for(base, uuid)).unwrap();
+
+            queue_login_mirror(base, account, Some(first));
+            PENDING_LOGIN_MIRRORS
+                .lock()
+                .unwrap()
+                .get_mut(&(base.to_path_buf(), account))
+                .unwrap()
+                .attempts = 2;
+
+            // The custody move: bump the REAL slot binding generation — same
+            // UUID, same canonical pair (the ABA restoration).
+            let profiles_path = crate::accounts::profiles::profiles_path(base);
+            let mut profiles = crate::accounts::profiles::load(&profiles_path).unwrap();
+            *profiles
+                .slot_binding_generations
+                .entry(account.get().to_string())
+                .or_default() += 1;
+            crate::accounts::profiles::save(&profiles_path, &profiles).unwrap();
+
+            let mut restored = prepare_verified_login_mirror(base, account, uuid, &canonical)
+                .expect("same-incoming witness after the custody move");
+            let restored_custody =
+                crate::accounts::anthropic_identity::capture_anthropic_binding(base, account)
+                    .expect("restored witness committed custody");
+            assert!(
+                restored.bind_committed_custody(&restored_custody),
+                "restored witness must bind its actual committed custody"
+            );
+            queue_login_mirror(base, account, Some(restored));
+
+            let retained = PENDING_LOGIN_MIRRORS.lock().unwrap();
+            assert_eq!(
+                retained
+                    .get(&(base.to_path_buf(), account))
+                    .unwrap()
+                    .attempts,
+                0,
+                "a moved slot binding generation must NOT retain the old witness \
+                 (a replace resets attempts) — UUID+pair equality alone is not \
+                 original custody"
+            );
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_login_mirror_expiry_preserves_next_generic_retry() {
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            let (dir, account, old, mut context) = pending_login_fixture();
+            context.expire_for_test();
+            let exec = std::rc::Rc::new(RecordingExecutor::scripted(
+                RawContentClassification::Content(old.into()),
+            ));
+            set_test_keychain_executor(exec.clone());
+            let _clear = PendingExecutorScope;
+            queue_login_mirror(dir.path(), account, Some(context));
+            for _ in 0..2 {
+                sync_pending_login_handle_dirs_status(dir.path());
+                assert!(
+                    mirror_sync_retry_requested(dir.path()),
+                    "retired witness must leave honest generic retry pending on subsequent sweeps"
+                );
+                assert!(
+                    !exec
+                        .calls()
+                        .iter()
+                        .any(|call| matches!(call.0, "add" | "delete")),
+                    "expired context must never authorize the writer"
+                );
+            }
+            assert!(exec.calls().iter().any(|call| call.0 == "find"));
+            assert!(!PENDING_LOGIN_MIRRORS
+                .lock()
+                .unwrap()
+                .contains_key(&(dir.path().to_path_buf(), account)));
+            assert_eq!(
+                MIRROR_RETRY_PENDING
+                    .lock()
+                    .unwrap()
+                    .get(dir.path())
+                    .unwrap()
+                    .login_pending_reason,
+                Some("context_expired_or_changed")
+            );
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_login_mirror_exhausts_only_four_admitted_sweeps() {
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            let (dir, account, old, context) = pending_login_fixture();
+            let exec = std::rc::Rc::new(RecordingExecutor::scripted(
+                RawContentClassification::Content(old.into()),
+            ));
+            exec.add_ok.set(false);
+            set_test_keychain_executor(exec.clone());
+            let _clear = PendingExecutorScope;
+            queue_login_mirror(dir.path(), account, Some(context));
+            // Preflight without a handle admission must not charge an attempt.
+            for _ in 0..5 {
+                assert!(login_mirror_snapshot(dir.path()).contains_key(&account));
+            }
+            assert_eq!(
+                PENDING_LOGIN_MIRRORS
+                    .lock()
+                    .unwrap()
+                    .get(&(dir.path().to_path_buf(), account))
+                    .unwrap()
+                    .attempts,
+                0
+            );
+            for _ in 0..4 {
+                sync_pending_login_handle_dirs_status(dir.path());
+            }
+            let adds = exec.calls().iter().filter(|call| call.0 == "add").count();
+            assert!(adds >= 4);
+            exec.add_ok.set(true);
+            for _ in 0..2 {
+                sync_pending_login_handle_dirs_status(dir.path());
+            }
+            assert_eq!(
+                exec.calls().iter().filter(|call| call.0 == "add").count(),
+                adds,
+                "exhausted context must not reopen authority"
+            );
+            assert!(mirror_sync_retry_requested(dir.path()));
+            assert!(
+                !PENDING_LOGIN_MIRRORS
+                    .lock()
+                    .unwrap()
+                    .contains_key(&(dir.path().to_path_buf(), account)),
+                "exhausted witness must be retired rather than retained indefinitely"
+            );
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_login_request_preserves_multisweep_tail_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        for pid in 1..=4 {
+            std::fs::create_dir(dir.path().join(format!("term-{pid}"))).unwrap();
+        }
+        let mut all = Vec::new();
+        for _ in 0..2 {
+            request_login_mirror_retry(dir.path(), "context_absent");
+            let clock = std::cell::Cell::new(std::time::Duration::ZERO);
+            let seen = std::cell::RefCell::new(Vec::new());
+            sync_all_handle_dirs_with_budget(
+                dir.path(),
+                &|handle| {
+                    seen.borrow_mut().push(mirror_sweep_pid(handle).unwrap());
+                    clock.set(MIRROR_SWEEP_BUDGET);
+                    Ok(true)
+                },
+                &|_| BoundedLockOutcome::NotNeeded,
+                &|_| true,
+                &|_| panic!("no retry"),
+                &|_, _| false,
+                &|| clock.get(),
+            );
+            all.extend(seen.into_inner());
+        }
+        assert_eq!(
+            all,
+            vec![1, 2],
+            "new login request must preserve completed cursor so tail receives next admission"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_login_none_enqueue_survives_older_sweep_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("term-1")).unwrap();
+        retain_mirror_retry_state(
+            dir.path(),
+            MirrorRetryState {
+                login_pending_reason: None,
+                pending: false,
+                last_admitted_pid: None,
+                updated_at_unix_ms: now_ms(),
+                sweep_started_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            },
+        );
+        sync_all_handle_dirs_with_budget(
+            dir.path(),
+            &|_| {
+                queue_login_mirror(dir.path(), AccountNum::try_from(1u16).unwrap(), None);
+                Ok(true)
+            },
+            &|_| BoundedLockOutcome::NotNeeded,
+            &|_| true,
+            &|_| panic!("no retry"),
+            &save_mirror_sync_status,
+            &|| std::time::Duration::ZERO,
+        );
+        assert!(
+            mirror_sync_retry_requested(dir.path()),
+            "older completion must not clear newer unwitnessed login request"
+        );
+        assert_eq!(
+            MIRROR_RETRY_PENDING
+                .lock()
+                .unwrap()
+                .get(dir.path())
+                .unwrap()
+                .login_pending_reason,
+            Some("context_absent")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_login_mirror_multiple_handles_charge_one_admitted_sweep() {
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            let (dir, account, old, context) = pending_login_fixture();
+            let original = dir.path().join(format!("term-{}", std::process::id()));
+            for pid in [1u32, 2, 3] {
+                let handle = dir.path().join(format!("term-{pid}"));
+                std::fs::create_dir(&handle).unwrap();
+                for name in [".credentials.json", ".csq-account"] {
+                    std::os::unix::fs::symlink(
+                        std::fs::read_link(original.join(name)).unwrap(),
+                        handle.join(name),
+                    )
+                    .unwrap();
+                }
+            }
+            let exec = std::rc::Rc::new(RecordingExecutor::scripted(
+                RawContentClassification::Content(old.into()),
+            ));
+            exec.add_ok.set(false);
+            set_test_keychain_executor(exec.clone());
+            let _clear = PendingExecutorScope;
+            queue_login_mirror(dir.path(), account, Some(context));
+            let retained = login_mirror_snapshot(dir.path());
+            let stamp = std::sync::Arc::new(());
+            sync_all_handle_dirs_with_observations(
+                dir.path(),
+                &|handle| {
+                    sweep_sync_handle_dir_context(
+                        dir.path(),
+                        handle,
+                        &HashMap::new(),
+                        Some(retained.get(&account).unwrap().as_ref()),
+                        Some(&stamp),
+                    )
+                },
+                &lock_handle_dir_for_swap_bounded,
+                &|_| true,
+                &|_| {},
+                &save_mirror_sync_status,
+                &|| std::time::Duration::ZERO,
+            );
+            assert!(
+                exec.calls().iter().filter(|call| call.0 == "add").count() >= 4,
+                "multiple native policy admissions must actually reach the failing writer"
+            );
+            assert_eq!(
+                PENDING_LOGIN_MIRRORS
+                    .lock()
+                    .unwrap()
+                    .get(&(dir.path().to_path_buf(), account))
+                    .unwrap()
+                    .attempts,
+                1,
+                "several handles in one sweep must consume one context attempt"
+            );
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_login_mirror_budget_deferred_account_keeps_all_attempts() {
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            let (dir, account, old, context) = pending_login_fixture();
+            let exec = std::rc::Rc::new(RecordingExecutor::scripted(
+                RawContentClassification::Content(old.into()),
+            ));
+            set_test_keychain_executor(exec.clone());
+            let _clear = PendingExecutorScope;
+            queue_login_mirror(dir.path(), account, Some(context));
+            for _ in 0..5 {
+                let retained = login_mirror_snapshot(dir.path());
+                let status = sync_all_handle_dirs_with_observations(
+                    dir.path(),
+                    &|_| panic!("budget deferred handle must not reach native policy"),
+                    &|_| panic!("no lock admission"),
+                    &|_| true,
+                    &|_| {},
+                    &save_mirror_sync_status,
+                    &|| MIRROR_SWEEP_BUDGET,
+                );
+                finish_login_mirror_snapshot(dir.path(), &retained, &status);
+                assert_eq!(status.deferred, 1);
+            }
+            assert_eq!(
+                PENDING_LOGIN_MIRRORS
+                    .lock()
+                    .unwrap()
+                    .get(&(dir.path().to_path_buf(), account))
+                    .unwrap()
+                    .attempts,
+                0,
+                "deferred account must retain all four admission attempts"
+            );
+            sync_pending_login_handle_dirs_status(dir.path());
+            assert!(
+                exec.last_add_payload().is_some(),
+                "first eventual native admission must still deliver using retained witness"
+            );
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_login_mirror_checks_deadline_after_native_read() {
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            struct Crossing {
+                context: std::sync::Arc<crate::accounts::login::LoginMirrorContext>,
+                old: String,
+                found: std::cell::Cell<bool>,
+            }
+            impl KeychainExecutor for Crossing {
+                fn find(&self, _: &str, _: &str) -> RawContentClassification {
+                    self.found.set(true);
+                    self.context.cross_deadline_during_read_for_test();
+                    RawContentClassification::Content(self.old.clone().into())
+                }
+                fn add(&self, _: &str, _: &str, _: &str) -> Result<(), PlatformError> {
+                    panic!("expired background ancestry must not authorize native writer");
+                }
+                fn delete(&self, _: &str, _: &str) -> bool {
+                    panic!("no deletion authority");
+                }
+            }
+            let (dir, account, old, context) = pending_login_fixture();
+            queue_login_mirror(dir.path(), account, Some(context));
+            let context = PENDING_LOGIN_MIRRORS
+                .lock()
+                .unwrap()
+                .get(&(dir.path().to_path_buf(), account))
+                .unwrap()
+                .context
+                .clone();
+            let exec = std::rc::Rc::new(Crossing {
+                context,
+                old,
+                found: std::cell::Cell::new(false),
+            });
+            set_test_keychain_executor(exec.clone());
+            let _clear = PendingExecutorScope;
+            sync_pending_login_handle_dirs_status(dir.path());
+            assert!(
+                exec.found.get(),
+                "real native read must precede the scripted decision crossing"
+            );
+        });
+    }
+
     // ── S10: recording executor — asserts CALL ORDER and TARGETS, not just
     // planner output. `KeychainExecutor`/`SecurityCliExecutor` are
     // macOS-only (so is `keychain_account()`, which `_with_executor` calls),
@@ -7979,11 +12174,11 @@ mod tests {
     // themselves.
 
     #[cfg(target_os = "macos")]
-    struct RecordingExecutor {
+    pub(super) struct RecordingExecutor {
         calls: std::cell::RefCell<Vec<(&'static str, String, String)>>,
         add_payloads: std::cell::RefCell<Vec<String>>,
         find_result: std::cell::RefCell<RawContentClassification>,
-        add_ok: std::cell::Cell<bool>,
+        pub(super) add_ok: std::cell::Cell<bool>,
         delete_ok: std::cell::Cell<bool>,
         // `keychain-fix-r9.md` D-F5: models N or more never-consolidated
         // items resident under one service — `find` reports `find_result`
@@ -7996,7 +12191,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     impl RecordingExecutor {
-        fn scripted(find_result: RawContentClassification) -> Self {
+        pub(super) fn scripted(find_result: RawContentClassification) -> Self {
             Self {
                 calls: std::cell::RefCell::new(Vec::new()),
                 add_payloads: std::cell::RefCell::new(Vec::new()),
@@ -8014,11 +12209,11 @@ mod tests {
             self
         }
 
-        fn calls(&self) -> Vec<(&'static str, String, String)> {
+        pub(super) fn calls(&self) -> Vec<(&'static str, String, String)> {
             self.calls.borrow().clone()
         }
 
-        fn last_add_payload(&self) -> Option<String> {
+        pub(super) fn last_add_payload(&self) -> Option<String> {
             self.add_payloads.borrow().last().cloned()
         }
     }
@@ -8222,7 +12417,7 @@ mod tests {
     #[test]
     fn s2_content_x_merges_siblings_claude_oauth_from_file() {
         let x = RawContentClassification::Content(
-            r#"{"claudeAiOauth":{"accessToken":"old"},"mcp":"keep-me"}"#.to_string(),
+            (r#"{"claudeAiOauth":{"accessToken":"old"},"mcp":"keep-me"}"#.to_string()).into(),
         );
         let file = r#"{"claudeAiOauth":{"accessToken":"file-token","refreshToken":"file-rt","expiresAt":1,"scopes":[]},"bookkeeping":"must-not-leak"}"#;
         let plan = plan_mirror_write(&x, file, true).expect("plan");
@@ -8289,9 +12484,7 @@ mod tests {
     // marker.
     #[test]
     fn s5_backfill_suppressed_when_backfill_disallowed_even_with_matching_refresh_token() {
-        let x = RawContentClassification::Content(
-            r#"{"claudeAiOauth":{"accessToken":"old","refreshToken":"SAME-RT","subscriptionType":"max","rateLimitTier":"tier5"}}"#.to_string(),
-        );
+        let x = RawContentClassification::Content((r#"{"claudeAiOauth":{"accessToken":"old","refreshToken":"SAME-RT","subscriptionType":"max","rateLimitTier":"tier5"}}"#.to_string()).into());
         let file = r#"{"claudeAiOauth":{"accessToken":"new","refreshToken":"SAME-RT","expiresAt":1,"scopes":[],"subscriptionType":null,"rateLimitTier":null}}"#;
         let plan = plan_mirror_write(&x, file, false).expect("plan");
         let v: serde_json::Value = serde_json::from_str(&plan.write_x).unwrap();
@@ -9866,7 +14059,11 @@ mod tests {
         // No `.csq-account` marker (fresh/torn-down handle dir) → Ok(false),
         // no keychain call. Safe in `cargo test` (never touches the keychain).
         let dir = tempfile::tempdir().unwrap();
-        assert!(!sweep_sync_handle_dir(dir.path(), dir.path(), &HashMap::new()).unwrap());
+        assert!(
+            !sweep_sync_handle_dir(dir.path(), dir.path(), &HashMap::new())
+                .result
+                .unwrap()
+        );
     }
 
     // The `.claude.json` `oauthAccount.emailAddress` reader used to capture
@@ -10001,7 +14198,11 @@ mod tests {
             r#"{"openaiAuth":{"token":"x"}}"#,
         )
         .unwrap();
-        assert!(!sweep_sync_handle_dir(dir.path(), dir.path(), &HashMap::new()).unwrap());
+        assert!(
+            !sweep_sync_handle_dir(dir.path(), dir.path(), &HashMap::new())
+                .result
+                .unwrap()
+        );
     }
 
     #[test]
@@ -10018,7 +14219,11 @@ mod tests {
             r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x","expiresAt":1000}}"#,
         )
         .unwrap();
-        assert!(!sweep_sync_handle_dir(dir.path(), dir.path(), &HashMap::new()).unwrap());
+        assert!(
+            !sweep_sync_handle_dir(dir.path(), dir.path(), &HashMap::new())
+                .result
+                .unwrap()
+        );
     }
 
     #[test]
@@ -10031,7 +14236,11 @@ mod tests {
         // No marker/canonical setup needed: the disabled-mirror check now
         // short-circuits before the marker is even resolved.
         let dir = tempfile::tempdir().unwrap();
-        assert!(!sweep_sync_handle_dir(dir.path(), dir.path(), &HashMap::new()).unwrap());
+        assert!(
+            !sweep_sync_handle_dir(dir.path(), dir.path(), &HashMap::new())
+                .result
+                .unwrap()
+        );
     }
 
     #[test]
@@ -10105,7 +14314,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn run_add_scripted(
         invocation: AddInvocation,
-        siblings_only: Option<String>,
+        siblings_only: Option<Zeroizing<String>>,
         delete_codes: Vec<Option<i32>>,
         add_codes: Vec<i32>,
     ) -> (Vec<Vec<String>>, Result<(), PlatformError>) {
@@ -10212,7 +14421,8 @@ mod tests {
     #[test]
     fn add_failure_after_delete_re_adds_siblings_only() {
         let previous = RawContentClassification::Content(
-            r#"{"claudeAiOauth":{"accessToken":"OLDTOKEN"},"mcpOAuth":{"t":"x"}}"#.to_string(),
+            (r#"{"claudeAiOauth":{"accessToken":"OLDTOKEN"},"mcpOAuth":{"t":"x"}}"#.to_string())
+                .into(),
         );
         let inv = select_add_invocation("svc", "acct", "payload").unwrap();
         let (calls, result) =
@@ -10233,7 +14443,7 @@ mod tests {
     #[test]
     fn apply_write_passes_siblings_from_current_without_extra_find() {
         struct Spy {
-            seen: std::cell::RefCell<Option<Option<String>>>,
+            seen: std::cell::RefCell<Option<Option<Zeroizing<String>>>>,
             finds: std::cell::Cell<u32>,
         }
         impl KeychainExecutor for Spy {
@@ -10249,7 +14459,7 @@ mod tests {
                 _: &str,
                 _: &str,
                 _: &str,
-                siblings_only: Option<String>,
+                siblings_only: Option<Zeroizing<String>>,
             ) -> Result<(), PlatformError> {
                 *self.seen.borrow_mut() = Some(siblings_only);
                 Ok(())
@@ -10263,7 +14473,7 @@ mod tests {
             finds: std::cell::Cell::new(0),
         };
         let current = RawContentClassification::Content(
-            r#"{"claudeAiOauth":{"accessToken":"OLD"},"mcpOAuth":{"t":"x"}}"#.to_string(),
+            (r#"{"claudeAiOauth":{"accessToken":"OLD"},"mcpOAuth":{"t":"x"}}"#.to_string()).into(),
         );
         let raw = r#"{"claudeAiOauth":{"accessToken":"NEW","refreshToken":"r","expiresAt":4102444800000}}"#;
         let out = apply_cc_keychain_write(
@@ -10434,7 +14644,7 @@ mod tests {
         let json = r#"{"claudeAiOauth":{"accessToken":"old"},"mcpOAuth":{"token":"x"}}"#;
         assert_eq!(
             classify_raw_content(Some(fake_output_with_stdout(0, json.as_bytes()))),
-            RawContentClassification::Content(json.to_string())
+            RawContentClassification::Content((json.to_string()).into())
         );
     }
 
@@ -10448,7 +14658,7 @@ mod tests {
         let hex = hex::encode(json.as_bytes());
         assert_eq!(
             classify_raw_content(Some(fake_output_with_stdout(0, hex.as_bytes()))),
-            RawContentClassification::Content(json.to_string())
+            RawContentClassification::Content((json.to_string()).into())
         );
     }
 
@@ -10540,10 +14750,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn plan_mirror_write_emptied_login_keeps_siblings_but_never_backfills() {
-        let x = RawContentClassification::Content(
-            r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"subscriptionType":"max","rateLimitTier":"tier4"},"mcpOAuth":{"k":"v"}}"#
-                .to_string(),
-        );
+        let x = RawContentClassification::Content((r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"subscriptionType":"max","rateLimitTier":"tier4"},"mcpOAuth":{"k":"v"}}"#
+                .to_string()).into());
         let file = r#"{"claudeAiOauth":{"accessToken":"new","refreshToken":"new-rt","subscriptionType":null,"rateLimitTier":null}}"#;
         let plan = plan_mirror_write(&x, file, true).unwrap();
         let value: serde_json::Value = serde_json::from_str(&plan.write_x).unwrap();
@@ -10566,7 +14774,7 @@ mod tests {
     fn emptied_logins_never_match_each_other() {
         let emptied = r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}"#;
         assert!(!keychain_content_matches_token(
-            &RawContentClassification::Content(emptied.to_string()),
+            &RawContentClassification::Content((emptied.to_string()).into()),
             emptied
         ));
     }
@@ -10623,11 +14831,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn classify_reader_recv_ok_ok_is_complete_with_buffer() {
-        let recv: Result<std::io::Result<Vec<u8>>, std::sync::mpsc::RecvTimeoutError> =
-            Ok(Ok(b"hello".to_vec()));
+        let recv: Result<std::io::Result<Zeroizing<Vec<u8>>>, std::sync::mpsc::RecvTimeoutError> =
+            Ok(Ok(b"hello".to_vec().into()));
         let (complete, buf) = classify_reader_recv(recv);
         assert!(complete);
-        assert_eq!(buf, b"hello");
+        assert_eq!(buf.as_slice(), b"hello");
     }
 
     #[cfg(target_os = "macos")]
@@ -10636,9 +14844,11 @@ mod tests {
         // F6: the reader thread's own `read_to_end` FAILED — `recv` itself
         // succeeded (the thread sent something), but the payload is not a
         // real, possibly-empty capture. MUST NOT be treated as complete.
-        let recv: Result<std::io::Result<Vec<u8>>, std::sync::mpsc::RecvTimeoutError> = Ok(Err(
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe error"),
-        ));
+        let recv: Result<std::io::Result<Zeroizing<Vec<u8>>>, std::sync::mpsc::RecvTimeoutError> =
+            Ok(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "pipe error",
+            )));
         let (complete, buf) = classify_reader_recv(recv);
         assert!(
             !complete,
@@ -10650,7 +14860,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn classify_reader_recv_timeout_is_not_complete() {
-        let recv: Result<std::io::Result<Vec<u8>>, std::sync::mpsc::RecvTimeoutError> =
+        let recv: Result<std::io::Result<Zeroizing<Vec<u8>>>, std::sync::mpsc::RecvTimeoutError> =
             Err(std::sync::mpsc::RecvTimeoutError::Timeout);
         let (complete, buf) = classify_reader_recv(recv);
         assert!(!complete);
@@ -10726,12 +14936,57 @@ mod tests {
         fn quick() -> Option<u32> {
             Some(0b111)
         }
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Condvar, Mutex};
+        static FLIGHT: AtomicBool = AtomicBool::new(false);
+        // The probe is a `fn()` pointer, so its state is static. START carries the
+        // probe thread's start signal; the gate blocks the hung probe until the
+        // test releases it. Every ordering below is an EVENT, never an elapsed
+        // margin.
+        static START: Mutex<Option<std::sync::mpsc::Sender<()>>> = Mutex::new(None);
+        static INVOCATIONS: AtomicUsize = AtomicUsize::new(0);
+        static RETURNED: AtomicBool = AtomicBool::new(false);
+        static GATE: Condvar = Condvar::new();
+        static RELEASED: Mutex<bool> = Mutex::new(false);
+        const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+        // A WAITING implementation must receive `Some(0)` and red by assertion, so
+        // the hung probe's own safety deadline is finite and derived from the probe
+        // budget it outlives; it is a hang guard, never a product bound.
+        const PROBE_SAFETY: std::time::Duration = PROBE_BUDGET.saturating_mul(10);
         fn hung() -> Option<u32> {
-            std::thread::sleep(std::time::Duration::from_secs(5));
+            INVOCATIONS.fetch_add(1, Ordering::SeqCst);
+            if let Some(start) = START.lock().unwrap().take() {
+                let _ = start.send(());
+            }
+            // Block (no spin) until the test releases the probe, or the safety
+            // deadline expires so an implementation that ignores its budget gets
+            // a result and fails by ASSERT instead of hanging this test.
+            let deadline = std::time::Instant::now() + PROBE_SAFETY;
+            let mut released = RELEASED.lock().unwrap();
+            while !*released {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                released = GATE.wait_timeout(released, deadline - now).unwrap().0;
+            }
+            RETURNED.store(true, Ordering::SeqCst);
             Some(0)
         }
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static FLIGHT: AtomicBool = AtomicBool::new(false);
+        fn counting_quick() -> Option<u32> {
+            INVOCATIONS.fetch_add(1, Ordering::SeqCst);
+            Some(0b111)
+        }
+        // Every exit path (including an earlier assert's panic) releases the probe
+        // thread, so a failed test never leaves it blocked.
+        struct ReleaseProbeOnDrop;
+        impl Drop for ReleaseProbeOnDrop {
+            fn drop(&mut self) {
+                *RELEASED.lock().unwrap() = true;
+                GATE.notify_all();
+            }
+        }
+        let _release_probe = ReleaseProbeOnDrop;
         assert_eq!(
             bounded_probe_with(&FLIGHT, quick, std::time::Duration::from_secs(2)),
             Some(0b111)
@@ -10740,21 +14995,36 @@ mod tests {
             !FLIGHT.load(Ordering::SeqCst),
             "a finished probe clears in-flight"
         );
-        let t0 = std::time::Instant::now();
-        assert_eq!(
-            bounded_probe_with(&FLIGHT, hung, std::time::Duration::from_millis(200)),
-            None
-        );
-        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
-        // The hung probe is still in flight: a second call must not spawn
-        // another thread — it returns Unknown immediately.
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        *START.lock().unwrap() = Some(start_tx);
+        assert_eq!(bounded_probe_with(&FLIGHT, hung, PROBE_BUDGET), None);
+        // Wait for the probe thread to START before reading the count: a read made
+        // before the thread runs would make "no second spawn" vacuous.
+        start_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the hung probe thread must start");
         assert!(FLIGHT.load(Ordering::SeqCst));
-        let t1 = std::time::Instant::now();
+        assert!(
+            !RETURNED.load(Ordering::SeqCst),
+            "the bound must fire while the probe is still running"
+        );
+        assert_eq!(INVOCATIONS.load(Ordering::SeqCst), 1);
+        // The hung probe is still in flight: a second call must not spawn
+        // another thread — it returns Unknown without invoking anything.
         assert_eq!(
-            bounded_probe_with(&FLIGHT, quick, std::time::Duration::from_secs(2)),
+            bounded_probe_with(&FLIGHT, counting_quick, std::time::Duration::from_secs(2)),
             None
         );
-        assert!(t1.elapsed() < std::time::Duration::from_millis(100));
+        assert_eq!(
+            INVOCATIONS.load(Ordering::SeqCst),
+            1,
+            "an in-flight probe must not be replaced by a newly spawned one"
+        );
+        // Release the hung probe so its thread finishes inside the test.
+        drop(_release_probe);
+        while !RETURNED.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
     }
 
     /// The interactive scope is active only inside the closure, nests, and
@@ -10796,19 +15066,74 @@ mod tests {
         assert!(!catch_up_due_with(&d, &l, Unknown));
     }
 
+    /// Stops the backgrounded `sleep` a `run_bounded` pipe-holding test
+    /// starts. Those descendants are deliberately out of `run_bounded`'s
+    /// reach (that is what the tests exercise), so without this every run
+    /// leaves `sleep` processes behind for up to their full duration. The
+    /// shell writes `$!` to `pid_file`; drop sends SIGTERM to that pid, on
+    /// success and on a failed assertion alike.
+    #[cfg(target_os = "macos")]
+    struct BackgroundPidReaper {
+        _dir: tempfile::TempDir,
+        pid_file: std::path::PathBuf,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl BackgroundPidReaper {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pid_file = dir.path().join("bg.pid");
+            Self {
+                _dir: dir,
+                pid_file,
+            }
+        }
+
+        /// The pid file path, single-quoted for `sh -c`.
+        fn shell_path(&self) -> String {
+            format!("'{}'", self.pid_file.display())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for BackgroundPidReaper {
+        fn drop(&mut self) {
+            let Ok(raw) = std::fs::read_to_string(&self.pid_file) else {
+                return;
+            };
+            // Only a real pid: `0` would signal the test runner's process group.
+            if let Some(pid) = raw.trim().parse::<u32>().ok().filter(|&p| p > 1) {
+                let _ = std::process::Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status();
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn run_bounded_timeout_path_bounded_despite_descendant_holding_pipe() {
-        // `sh` itself runs `sleep 30` in the foreground, so `try_wait` never
-        // sees it exit before the deadline; `sleep 5` (backgrounded) holds
-        // the pipes open independently of whether `sh` gets killed.
+        // A bare program name resolves through the process PATH, which sibling tests swap
+        // under the shared env lock; hold it so the spawn cannot see a mid-swap PATH.
+        let _env_lock = crate::platform::test_env::lock();
+        // `sh` `exec`s `sleep 60` in the foreground, so `try_wait` never sees
+        // it exit before the deadline (and the timeout kill reaches it
+        // directly); the backgrounded `sleep 30` holds the pipes open
+        // independently of that kill, and is reaped by `reaper` on drop.
+        let reaper = BackgroundPidReaper::new();
         let mut cmd = std::process::Command::new("sh");
         // Constants (tooling-self-verification Rule 3): the fixed code returns
         // at the 300ms deadline plus kill/reap time (well under a second, a few
         // seconds under heavy host load); the bug blocks until the backgrounded
         // `sleep 30` releases the pipe (~30s). A 15s ceiling leaves >=10s of
         // margin on each side, so host load cannot flip the verdict.
-        cmd.args(["-c", "sleep 30 & sleep 60"]);
+        cmd.args([
+            "-c",
+            &format!(
+                "sleep 30 & echo $! > {}; exec sleep 60",
+                reaper.shell_path()
+            ),
+        ]);
         let start = std::time::Instant::now();
         let out = run_bounded(cmd, std::time::Duration::from_millis(300), None);
         let elapsed = start.elapsed();
@@ -10823,9 +15148,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn run_bounded_normal_exit_path_bounded_despite_descendant_holding_pipe() {
+        // A bare program name resolves through the process PATH, which sibling tests swap
+        // under the shared env lock; hold it so the spawn cannot see a mid-swap PATH.
+        let _env_lock = crate::platform::test_env::lock();
         // `sh` itself exits almost immediately (`exit 0`), well within the
-        // deadline, but the backgrounded `sleep 5` inherits its pipes and
-        // holds them open for ~5s afterward.
+        // deadline, but the backgrounded `sleep 30` inherits its pipes and
+        // holds them open afterward (reaped by `reaper` on drop).
+        let reaper = BackgroundPidReaper::new();
         let mut cmd = std::process::Command::new("sh");
         // Constants (tooling-self-verification Rule 3): the deadline must be
         // long enough for `sh` to START and exit even on a heavily loaded host
@@ -10834,7 +15163,10 @@ mod tests {
         // fixed code returns within deadline + grace (<= ~5.25s); the bug
         // blocks until the backgrounded `sleep 30` releases the pipe (~30s).
         // A 15s ceiling separates them with ~10s of margin on each side.
-        cmd.args(["-c", "sleep 30 & exit 0"]);
+        cmd.args([
+            "-c",
+            &format!("sleep 30 & echo $! > {}; exit 0", reaper.shell_path()),
+        ]);
         let start = std::time::Instant::now();
         let out = run_bounded(cmd, std::time::Duration::from_secs(5), None);
         let elapsed = start.elapsed();
@@ -10850,17 +15182,27 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn run_bounded_normal_exit_flags_incomplete_stdout_when_reader_starved() {
+        // A bare program name resolves through the process PATH, which sibling tests swap
+        // under the shared env lock; hold it so the spawn cannot see a mid-swap PATH.
+        let _env_lock = crate::platform::test_env::lock();
         // BUG-R3-1: `sh` prints then exits almost immediately, but the
-        // backgrounded `sleep 5` inherits the SAME stdout pipe and holds it
+        // backgrounded `sleep 30` inherits the SAME stdout pipe and holds it
         // open well past the process's own exit — the reader thread cannot
         // deliver (`read_to_end` only returns on EOF, which needs every
         // holder of the write end to close it), so `stdout_complete` MUST be
         // `false` even though the exit status itself is a success.
+        let reaper = BackgroundPidReaper::new();
         let mut cmd = std::process::Command::new("sh");
         // Deadline sized so `sh` reliably exits inside it on a loaded host
         // (300ms flaked: the spawn alone exceeded it); the backgrounded
         // `sleep 30` outlives it, so the reader is still starved at return.
-        cmd.args(["-c", "echo hello; sleep 30 & exit 0"]);
+        cmd.args([
+            "-c",
+            &format!(
+                "echo hello; sleep 30 & echo $! > {}; exit 0",
+                reaper.shell_path()
+            ),
+        ]);
         let bo = run_bounded(cmd, std::time::Duration::from_secs(5), None)
             .expect("sh exited successfully within the deadline");
         assert!(bo.output.status.success());
@@ -10877,6 +15219,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn run_bounded_stdin_data_reaches_the_child() {
+        // A bare program name resolves through the process PATH, which sibling tests swap
+        // under the shared env lock; hold it so the spawn cannot see a mid-swap PATH.
+        let _env_lock = crate::platform::test_env::lock();
         let mut cmd = std::process::Command::new("sh");
         cmd.args(["-c", "read l; printf '%s' \"$l\""]);
         let bo = run_bounded(
@@ -10898,6 +15243,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn run_bounded_failed_stdin_write_is_treated_as_failure() {
+        // A bare program name resolves through the process PATH, which sibling tests swap
+        // under the shared env lock; hold it so the spawn cannot see a mid-swap PATH.
+        let _env_lock = crate::platform::test_env::lock();
         // A payload SMALLER than the OS pipe buffer (~64KB on macOS) is a
         // race: `write_all` can complete into the buffer before the child
         // gets around to closing its end, so a fast-exiting child does not
@@ -10922,6 +15270,1302 @@ mod tests {
         // refresher's post-refresh sweep relies on this for test isolation).
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(sync_all_handle_dirs(dir.path(), &HashMap::new()), (0, 0, 0));
+    }
+
+    #[test]
+    fn mirror_fairness_fast_success_and_noop_cover_600_without_diagnostic_admission_cap() {
+        use crate::credentials::session_login::{LoginReason, LoginState};
+        let base = tempfile::tempdir().unwrap();
+        for pid in (1..=600).rev() {
+            std::fs::create_dir(base.path().join(format!("term-{pid}"))).unwrap();
+        }
+        for noop in [false, true] {
+            let attempted = std::cell::RefCell::new(Vec::new());
+            let status = sync_all_handle_dirs_with_budget(
+                base.path(),
+                &|handle| {
+                    attempted
+                        .borrow_mut()
+                        .push(mirror_sweep_pid(handle).unwrap());
+                    Ok(!noop)
+                },
+                &|_| BoundedLockOutcome::NotNeeded,
+                &|_| true,
+                &|_| panic!("completed operation must not retry"),
+                &save_mirror_sync_status,
+                &|| std::time::Duration::ZERO,
+            );
+            assert_eq!(
+                *attempted.borrow(),
+                (1..=600).collect::<Vec<_>>(),
+                "all fast handles must be admitted beyond the diagnostic cap"
+            );
+            assert_eq!(
+                (
+                    status.synced,
+                    status.skipped,
+                    status.deferred,
+                    status.pending
+                ),
+                if noop { (0, 600, 0, 0) } else { (600, 0, 0, 0) }
+            );
+            assert_eq!(status.sessions.len(), MIRROR_STATUS_MAX_SESSIONS);
+            assert!(status.sessions_undetermined);
+            assert!(status
+                .sessions
+                .iter()
+                .all(|row| row.evidence.state == LoginState::Undetermined
+                    && row.evidence.reason == LoginReason::SnapshotUnavailable));
+            assert_eq!(status.last_admitted_pid, Some(600));
+            assert_eq!(read_mirror_sync_observation(base.path()), Some(status));
+            assert!(
+                std::fs::metadata(base.path().join(MIRROR_SYNC_STATUS_FILE))
+                    .unwrap()
+                    .len()
+                    <= MIRROR_STATUS_MAX_BYTES as u64
+            );
+            assert!(!mirror_sync_retry_requested(base.path()));
+        }
+    }
+
+    #[test]
+    fn mirror_fairness_slow_600_complete_across_persisted_cursor_reload_and_churn() {
+        use crate::credentials::session_login::{LoginReason, LoginState};
+        let base = tempfile::tempdir().unwrap();
+        for pid in (1..=600).rev() {
+            std::fs::create_dir(base.path().join(format!("term-{pid}"))).unwrap();
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for round in 0..300 {
+            // Simulate loss of all process-local retry knowledge. Only validated
+            // token-free disk metadata may drive scheduling after this boundary.
+            MIRROR_RETRY_PENDING
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(base.path());
+            let clock = std::cell::Cell::new(std::time::Duration::ZERO);
+            let attempted = std::cell::RefCell::new(Vec::new());
+            let status = sync_all_handle_dirs_with_budget(
+                base.path(),
+                &|handle| {
+                    attempted
+                        .borrow_mut()
+                        .push(mirror_sweep_pid(handle).unwrap());
+                    clock.set(clock.get() + std::time::Duration::from_millis(5250));
+                    Ok(true)
+                },
+                &|_| BoundedLockOutcome::NotNeeded,
+                &|_| true,
+                &|_| panic!("completed slow operation must not retry"),
+                &save_mirror_sync_status,
+                &|| clock.get(),
+            );
+            assert_eq!(
+                *attempted.borrow(),
+                vec![round * 2 + 1, round * 2 + 2],
+                "persisted cyclic cursor must reach every slow handle including PID 513+"
+            );
+            seen.extend(attempted.borrow().iter().copied());
+            assert_eq!(
+                (status.synced, status.deferred, status.pending),
+                (2, 598, 598)
+            );
+            assert_eq!(status.last_admitted_pid, Some(round * 2 + 2));
+            assert_eq!(status.sessions.len(), MIRROR_STATUS_MAX_SESSIONS);
+            assert!(status.sessions_undetermined);
+            assert!(status
+                .sessions
+                .iter()
+                .take(2)
+                .all(|row| row.evidence.state == LoginState::Undetermined
+                    && row.evidence.reason == LoginReason::SnapshotUnavailable));
+            assert!(status
+                .sessions
+                .iter()
+                .skip(2)
+                .all(|row| row.evidence.reason == LoginReason::SweepBudget));
+            assert_eq!(read_mirror_sync_observation(base.path()), Some(status));
+            assert!(
+                std::fs::metadata(base.path().join(MIRROR_SYNC_STATUS_FILE))
+                    .unwrap()
+                    .len()
+                    <= MIRROR_STATUS_MAX_BYTES as u64
+            );
+        }
+        assert_eq!(
+            seen,
+            (1..=600).collect(),
+            "600 slow handles must all complete"
+        );
+        // Removed cursor and additions on each side retain cyclic progress.
+        std::fs::remove_dir(base.path().join("term-600")).unwrap();
+        std::fs::create_dir(base.path().join("term-601")).unwrap();
+        std::fs::create_dir(base.path().join("term-700")).unwrap();
+        let clock = std::cell::Cell::new(std::time::Duration::ZERO);
+        let attempted = std::cell::RefCell::new(Vec::new());
+        let status = sync_all_handle_dirs_with_budget(
+            base.path(),
+            &|handle| {
+                attempted
+                    .borrow_mut()
+                    .push(mirror_sweep_pid(handle).unwrap());
+                clock.set(clock.get() + std::time::Duration::from_millis(5250));
+                Ok(true)
+            },
+            &|_| BoundedLockOutcome::NotNeeded,
+            &|_| true,
+            &|_| panic!("success must not retry"),
+            &save_mirror_sync_status,
+            &|| clock.get(),
+        );
+        assert_eq!(*attempted.borrow(), vec![601, 700]);
+        assert_eq!((status.synced, status.deferred), (2, 599));
+        let blocked = sync_all_handle_dirs_with_budget(
+            base.path(),
+            &|_| panic!("budget must prevent admission"),
+            &|_| panic!("budget must prevent lock"),
+            &|_| true,
+            &|_| panic!("budget must prevent retry"),
+            &save_mirror_sync_status,
+            &|| MIRROR_SWEEP_BUDGET,
+        );
+        assert_eq!(blocked.last_admitted_pid, Some(700));
+        assert_eq!(blocked.deferred, 601);
+    }
+
+    #[test]
+    fn mirror_fairness_failed_persistence_retains_cursor_and_reaches_slow_suffix() {
+        let base = tempfile::tempdir().unwrap();
+        for pid in (1..=600).rev() {
+            std::fs::create_dir(base.path().join(format!("term-{pid}"))).unwrap();
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for round in 0..300 {
+            let clock = std::cell::Cell::new(std::time::Duration::ZERO);
+            let attempted = std::cell::RefCell::new(Vec::new());
+            let status = sync_all_handle_dirs_with_budget(
+                base.path(),
+                &|handle| {
+                    // Injected successful mirror executor: operation duration
+                    // consumes the admission budget without any OS keychain I/O.
+                    attempted
+                        .borrow_mut()
+                        .push(mirror_sweep_pid(handle).unwrap());
+                    clock.set(clock.get() + std::time::Duration::from_millis(5250));
+                    Ok(true)
+                },
+                &|_| BoundedLockOutcome::NotNeeded,
+                &|_| true,
+                &|_| panic!("successful slow writes must not retry"),
+                &|_, _| false,
+                &|| clock.get(),
+            );
+            assert_eq!(
+                *attempted.borrow(),
+                vec![round * 2 + 1, round * 2 + 2],
+                "failed persistence must retain cursor and reach the slow suffix"
+            );
+            seen.extend(attempted.borrow().iter().copied());
+            assert_eq!(
+                (status.synced, status.deferred, status.pending),
+                (2, 598, 598)
+            );
+            assert_eq!(status.last_admitted_pid, Some(round * 2 + 2));
+            assert_eq!(status.sessions.len(), MIRROR_STATUS_MAX_SESSIONS);
+            assert!(status.sessions_undetermined);
+            assert!(mirror_sync_retry_requested(base.path()));
+            assert!(read_mirror_sync_observation(base.path()).is_none());
+            assert!(!base.path().join(MIRROR_SYNC_STATUS_FILE).exists());
+        }
+        assert_eq!(seen, (1..=600).collect());
+        let blocked = sync_all_handle_dirs_with_budget(
+            base.path(),
+            &|_| panic!("no new admission"),
+            &|_| panic!("no new lock"),
+            &|_| true,
+            &|_| panic!("no retry"),
+            &|_, _| false,
+            &|| MIRROR_SWEEP_BUDGET,
+        );
+        assert_eq!(blocked.last_admitted_pid, Some(600));
+        MIRROR_RETRY_PENDING.lock().unwrap().remove(base.path());
+        assert!(
+            mirror_sync_retry_due(base.path()),
+            "restart still requires catch-up"
+        );
+    }
+
+    #[test]
+    fn mirror_fairness_retry_state_preserves_newer_completion() {
+        let base = tempfile::tempdir().unwrap();
+        let newer_start = std::time::Instant::now();
+        let older_start = newer_start - std::time::Duration::from_secs(1);
+        retain_mirror_retry_state(
+            base.path(),
+            MirrorRetryState {
+                login_pending_reason: None,
+                pending: true,
+                last_admitted_pid: Some(4),
+                updated_at_unix_ms: 10,
+                sweep_started_at: newer_start,
+            },
+        );
+        retain_mirror_retry_state(
+            base.path(),
+            MirrorRetryState {
+                login_pending_reason: None,
+                pending: false,
+                last_admitted_pid: Some(2),
+                updated_at_unix_ms: 20,
+                sweep_started_at: older_start,
+            },
+        );
+        let state = MIRROR_RETRY_PENDING
+            .lock()
+            .unwrap()
+            .get(base.path())
+            .copied()
+            .unwrap();
+        assert!(state.pending);
+        assert_eq!(state.last_admitted_pid, Some(4));
+        assert_eq!(state.updated_at_unix_ms, 10);
+        assert_eq!(state.sweep_started_at, newer_start);
+        MIRROR_RETRY_PENDING.lock().unwrap().remove(base.path());
+    }
+
+    #[test]
+    fn mirror_fairness_clock_rollback_retains_current_process_progress() {
+        let base = tempfile::tempdir().unwrap();
+        for pid in 1..=4 {
+            std::fs::create_dir(base.path().join(format!("term-{pid}"))).unwrap();
+        }
+        // A pre-correction completion has a future wall stamp but an older
+        // monotonic start. No real host clock or keychain is modified.
+        let future_wall_stamp = now_ms() + 60_000;
+        retain_mirror_retry_state(
+            base.path(),
+            MirrorRetryState {
+                login_pending_reason: None,
+                pending: true,
+                last_admitted_pid: Some(2),
+                updated_at_unix_ms: future_wall_stamp,
+                sweep_started_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            },
+        );
+        for expected in [vec![3, 4], vec![1, 2], vec![3, 4]] {
+            let clock = std::cell::Cell::new(std::time::Duration::ZERO);
+            let attempted = std::cell::RefCell::new(Vec::new());
+            let status = sync_all_handle_dirs_with_budget(
+                base.path(),
+                &|handle| {
+                    attempted
+                        .borrow_mut()
+                        .push(mirror_sweep_pid(handle).unwrap());
+                    clock.set(clock.get() + std::time::Duration::from_millis(5250));
+                    Ok(true)
+                },
+                &|_| BoundedLockOutcome::NotNeeded,
+                &|_| true,
+                &|_| panic!("successful slow writes must not retry"),
+                &|_, _| false,
+                &|| clock.get(),
+            );
+            eprintln!("ROLLBACK_ADMISSION_ASSERTION reached");
+            assert_eq!(
+                *attempted.borrow(),
+                expected,
+                "wall-clock rollback must advance current process cursor"
+            );
+            assert!(status.updated_at_unix_ms < future_wall_stamp);
+            assert_eq!((status.synced, status.deferred, status.pending), (2, 2, 2));
+            assert!(status.sessions_undetermined);
+            assert!(mirror_sync_retry_requested(base.path()));
+            assert!(read_mirror_sync_observation(base.path()).is_none());
+            assert!(!base.path().join(MIRROR_SYNC_STATUS_FILE).exists());
+        }
+        MIRROR_RETRY_PENDING.lock().unwrap().remove(base.path());
+    }
+
+    #[test]
+    fn mirror_fairness_newer_disk_cursor_wins_over_retained_process_hint() {
+        let base = tempfile::tempdir().unwrap();
+        for pid in 1..=4 {
+            std::fs::create_dir(base.path().join(format!("term-{pid}"))).unwrap();
+        }
+        let stamp = now_ms();
+        retain_mirror_retry_state(
+            base.path(),
+            MirrorRetryState {
+                login_pending_reason: None,
+                pending: true,
+                last_admitted_pid: Some(2),
+                updated_at_unix_ms: stamp - 1,
+                sweep_started_at: std::time::Instant::now(),
+            },
+        );
+        assert!(save_mirror_sync_status(
+            base.path(),
+            &MirrorSyncStatus {
+                last_admitted_pid: Some(3),
+                updated_at_unix_ms: stamp,
+                ..Default::default()
+            }
+        ));
+        let clock = std::cell::Cell::new(std::time::Duration::ZERO);
+        let attempted = std::cell::RefCell::new(Vec::new());
+        let status = sync_all_handle_dirs_with_budget(
+            base.path(),
+            &|handle| {
+                attempted
+                    .borrow_mut()
+                    .push(mirror_sweep_pid(handle).unwrap());
+                clock.set(MIRROR_SWEEP_BUDGET);
+                Ok(true)
+            },
+            &|_| BoundedLockOutcome::NotNeeded,
+            &|_| true,
+            &|_| panic!("successful write must not retry"),
+            &save_mirror_sync_status,
+            &|| clock.get(),
+        );
+        assert_eq!(*attempted.borrow(), vec![4]);
+        assert_eq!(status.last_admitted_pid, Some(4));
+        MIRROR_RETRY_PENDING.lock().unwrap().remove(base.path());
+    }
+
+    #[test]
+    fn mirror_fairness_order_is_stable_cyclic_and_legacy_deferred_first() {
+        use crate::credentials::session_login::{LoginReason, SessionLogin};
+        let mut previous = MirrorSyncStatus {
+            last_admitted_pid: Some(512),
+            ..Default::default()
+        };
+        for reverse in [false, true] {
+            let mut paths: Vec<_> = (1..=600)
+                .map(|pid| PathBuf::from(format!("term-{pid}")))
+                .collect();
+            if reverse {
+                paths.reverse();
+            }
+            paths.sort_by_key(|path| mirror_sweep_order_key(path, Some(&previous)));
+            let actual: Vec<_> = paths
+                .iter()
+                .map(|path| mirror_sweep_pid(path).unwrap())
+                .collect();
+            assert_eq!(
+                actual,
+                (513..=600).chain(1..=512).collect::<Vec<_>>(),
+                "enumeration must not override cyclic fairness"
+            );
+        }
+        previous.last_admitted_pid = None;
+        previous.sessions = vec![SessionLogin::undetermined(
+            3,
+            None,
+            LoginReason::SweepBudget,
+        )];
+        let mut paths: Vec<_> = (1..=4)
+            .map(|pid| PathBuf::from(format!("term-{pid}")))
+            .collect();
+        paths.sort_by_key(|path| mirror_sweep_order_key(path, Some(&previous)));
+        assert_eq!(mirror_sweep_pid(&paths[0]), Some(3));
+    }
+
+    #[test]
+    fn mirror_fairness_cursor_reader_accepts_legacy_and_rejects_unbounded_or_zero_pid() {
+        let base = tempfile::tempdir().unwrap();
+        let path = base.path().join(MIRROR_SYNC_STATUS_FILE);
+        let status = MirrorSyncStatus {
+            updated_at_unix_ms: now_ms(),
+            ..Default::default()
+        };
+        let mut raw = serde_json::to_value(&status).unwrap();
+        assert!(raw.get("last_admitted_pid").is_none());
+        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        assert_eq!(read_mirror_status_validated(base.path()), Some(status));
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(4294967296_u64),
+            serde_json::json!("term-5"),
+        ] {
+            raw["last_admitted_pid"] = bad;
+            std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+            assert!(read_mirror_status_validated(base.path()).is_none());
+        }
+        raw["last_admitted_pid"] = serde_json::json!(u32::MAX);
+        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        assert_eq!(
+            read_mirror_status_validated(base.path())
+                .unwrap()
+                .last_admitted_pid,
+            Some(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn mirror_delivery_multisweep_budget_promotes_deferred_handles_and_timeout_does_not_retry() {
+        use crate::credentials::session_login::LoginReason;
+        let base = tempfile::tempdir().unwrap();
+        for pid in 1..=4 {
+            std::fs::create_dir(base.path().join(format!("term-{pid}"))).unwrap();
+        }
+        let clock = std::cell::Cell::new(std::time::Duration::ZERO);
+        let attempted = std::cell::RefCell::new(Vec::new());
+        let executor = |handle: &Path| {
+            attempted.borrow_mut().push(handle.to_path_buf());
+            clock.set(clock.get() + std::time::Duration::from_millis(5250));
+            Err(PlatformError::Keychain("private scripted timeout".into()))
+        };
+        let sweep = || {
+            sync_all_handle_dirs_with_budget(
+                base.path(),
+                &executor,
+                &|_| BoundedLockOutcome::NotNeeded,
+                &|_| true,
+                &|_| panic!("true timeout must not immediately retry"),
+                &save_mirror_sync_status,
+                &|| clock.get(),
+            )
+        };
+        let first = sweep();
+        assert_eq!((first.failed, first.deferred, first.pending), (2, 2, 4));
+        let first_attempted = attempted.borrow().clone();
+        assert_eq!(first_attempted.len(), 2);
+        let deferred_pids: Vec<_> = first
+            .sessions
+            .iter()
+            .filter(|row| row.evidence.reason == LoginReason::SweepBudget)
+            .map(|row| row.handle_pid)
+            .collect();
+        assert_eq!(deferred_pids.len(), 2);
+        clock.set(std::time::Duration::ZERO);
+        attempted.borrow_mut().clear();
+        let second = sweep();
+        assert_eq!((second.failed, second.deferred, second.pending), (2, 2, 4));
+        let second_attempted = attempted.borrow().clone();
+        assert_eq!(second_attempted.len(), 2);
+        assert!(
+            second_attempted
+                .iter()
+                .all(|path| !first_attempted.contains(path)),
+            "deferred rows must be attempted before the original prefix"
+        );
+        assert!(second_attempted.iter().all(|path| deferred_pids
+            .contains(&mirror_unknown_row(path, LoginReason::SweepBudget).handle_pid)));
+        clock.set(std::time::Duration::ZERO);
+        let done = sync_all_handle_dirs_with_budget(
+            base.path(),
+            &|_| Ok(true),
+            &|_| BoundedLockOutcome::NotNeeded,
+            &|_| true,
+            &|_| panic!("success must not retry"),
+            &save_mirror_sync_status,
+            &|| clock.get(),
+        );
+        assert_eq!((done.synced, done.pending), (4, 0));
+        assert!(!mirror_sync_retry_requested(base.path()));
+    }
+
+    #[test]
+    fn mirror_retry_fast_failure_then_converges_with_bounded_backoff() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir(base.path().join("term-1")).unwrap();
+        let locks = std::cell::Cell::new(0);
+        let waits = std::cell::RefCell::new(Vec::new());
+        let status = sync_all_handle_dirs_with(
+            base.path(),
+            &|_| Ok(true),
+            &|_| {
+                let n = locks.replace(locks.get() + 1);
+                if n == 0 {
+                    BoundedLockOutcome::Failed
+                } else {
+                    BoundedLockOutcome::NotNeeded
+                }
+            },
+            &|_| true,
+            &|d| waits.borrow_mut().push(d),
+        );
+        assert_eq!((status.synced, status.pending, status.skipped), (1, 0, 0));
+        assert_eq!(&*waits.borrow(), &[std::time::Duration::from_millis(100)]);
+        assert_eq!(read_mirror_sync_status(base.path()), Some(status));
+        assert!(!mirror_sync_retry_due(base.path()));
+    }
+
+    #[test]
+    fn mirror_retry_timeouts_wait_until_next_sweep_and_budget_defers() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir(base.path().join("term-1")).unwrap();
+        let locks = std::cell::Cell::new(0);
+        let timeout = sync_all_handle_dirs_with(
+            base.path(),
+            &|_| panic!("timeout must not sync"),
+            &|_| {
+                locks.set(locks.get() + 1);
+                BoundedLockOutcome::TimedOut
+            },
+            &|_| true,
+            &|_| panic!("timeout must not immediately retry"),
+        );
+        assert_eq!(
+            (locks.get(), timeout.lock_timed_out, timeout.pending),
+            (1, 1, 1)
+        );
+        let elapsed = std::cell::Cell::new(std::time::Duration::ZERO);
+        let slow = sync_all_handle_dirs_with_budget(
+            base.path(),
+            &|_| {
+                elapsed.set(KEYCHAIN_OP_TIMEOUT);
+                Err(PlatformError::Keychain("test timeout".into()))
+            },
+            &|_| BoundedLockOutcome::NotNeeded,
+            &|_| true,
+            &|_| panic!("slow security failure must not immediately retry"),
+            &save_mirror_sync_status,
+            &|| elapsed.get(),
+        );
+        assert_eq!((slow.failed, slow.pending), (1, 1));
+        std::fs::create_dir(base.path().join("term-2")).unwrap();
+        let deferred = sync_all_handle_dirs_with_budget(
+            base.path(),
+            &|_| panic!("expired budget"),
+            &|_| panic!("expired budget must not lock"),
+            &|_| true,
+            &|_| {},
+            &save_mirror_sync_status,
+            &|| MIRROR_SWEEP_BUDGET,
+        );
+        assert_eq!((deferred.deferred, deferred.pending), (2, 2));
+        let done = sync_all_handle_dirs_with(
+            base.path(),
+            &|_| Ok(true),
+            &|_| BoundedLockOutcome::NotNeeded,
+            &|_| true,
+            &|_| {},
+        );
+        assert_eq!((done.synced, done.pending), (2, 0));
+    }
+
+    #[test]
+    fn mirror_retry_reader_rejects_stale_future_and_older_writer() {
+        let base = tempfile::tempdir().unwrap();
+        let now = now_ms();
+        let path = base.path().join(MIRROR_SYNC_STATUS_FILE);
+        for stamp in [
+            now - MIRROR_SYNC_MAX_AGE_MS - 1,
+            now + MIRROR_SYNC_MAX_AGE_MS,
+        ] {
+            let old = MirrorSyncStatus {
+                updated_at_unix_ms: stamp,
+                ..Default::default()
+            };
+            std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+            assert!(read_mirror_sync_status(base.path()).is_none());
+        }
+        let newer = MirrorSyncStatus {
+            updated_at_unix_ms: now,
+            ..Default::default()
+        };
+        assert!(save_mirror_sync_status(base.path(), &newer));
+        let old = MirrorSyncStatus {
+            failed: 1,
+            pending: 1,
+            updated_at_unix_ms: now - 1,
+            ..Default::default()
+        };
+        assert!(save_mirror_sync_status(base.path(), &old));
+        assert_eq!(read_mirror_sync_status(base.path()), Some(newer));
+    }
+
+    /// One status-write failure as the production diagnostic reports it: WHICH
+    /// step failed, whether the writer lock was contended, and the errno. No
+    /// path and no error text (the diagnostic carries neither).
+    #[derive(Clone, Debug, Default)]
+    struct StatusWriteFailure {
+        step: Option<String>,
+        contended: bool,
+        errno: Option<i64>,
+    }
+
+    struct StatusWriteCapture(std::sync::Arc<std::sync::Mutex<Vec<StatusWriteFailure>>>);
+
+    struct StatusWriteVisitor<'a>(&'a mut StatusWriteFailure);
+
+    impl tracing::field::Visit for StatusWriteVisitor<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "step" {
+                self.0.step = Some(value.to_owned());
+            }
+        }
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            if field.name() == "contended" {
+                self.0.contended = value;
+            }
+        }
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            if field.name() == "errno" {
+                self.0.errno = Some(value);
+            }
+        }
+        fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+    }
+
+    impl tracing::Subscriber for StatusWriteCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut failure = StatusWriteFailure::default();
+            event.record(&mut StatusWriteVisitor(&mut failure));
+            // Every status-write failure carries `step`; unrelated events do not.
+            if failure.step.is_some() {
+                self.0.lock().unwrap().push(failure);
+            }
+        }
+    }
+
+    /// Run ONE sweep and require its status aggregate to reach the disk. The
+    /// write's failure branches are all explicit (open/metadata/flock/write/
+    /// secure/rename); none is retried here, because a retry would absorb an
+    /// unknown environment failure without evidence. A failed publish instead
+    /// reds with the production diagnostic (step, contended, errno) captured on
+    /// this thread, so the next occurrence names its cause.
+    fn sweep_and_require_published(
+        base: &Path,
+        sweep: impl FnOnce() -> MirrorSyncStatus,
+    ) -> MirrorSyncStatus {
+        let failures = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let status = tracing::subscriber::with_default(
+            StatusWriteCapture(std::sync::Arc::clone(&failures)),
+            sweep,
+        );
+        let published = read_mirror_sync_status(base).is_some_and(|row| {
+            row.pending == status.pending
+                && row.lock_failed == status.lock_failed
+                && row.synced == status.synced
+                && row.skipped == status.skipped
+        });
+        assert!(
+            published,
+            "the sweep's status row must reach the disk: (pending, lock_failed, synced, skipped) \
+             = ({}, {}, {}, {}); captured status-write failures: {:?}",
+            status.pending,
+            status.lock_failed,
+            status.synced,
+            status.skipped,
+            failures.lock().unwrap()
+        );
+        status
+    }
+
+    #[test]
+    fn mirror_retry_persistent_miss_is_durable_and_next_sweep_converges() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir(base.path().join("term-1")).unwrap();
+        let status = sweep_and_require_published(base.path(), || {
+            sync_all_handle_dirs_with(
+                base.path(),
+                &|_| panic!("lock not acquired"),
+                &|_| BoundedLockOutcome::Failed,
+                &|_| true,
+                &|_| {},
+            )
+        });
+        assert_eq!(
+            (status.pending, status.lock_failed, status.skipped),
+            (1, 1, 0)
+        );
+        // Simulate a restart: only the persisted aggregate can trigger catch-up.
+        MIRROR_RETRY_PENDING.lock().unwrap().remove(base.path());
+        assert!(mirror_sync_retry_due(base.path()));
+        let done = sweep_and_require_published(base.path(), || {
+            sync_all_handle_dirs_with(
+                base.path(),
+                &|_| Ok(true),
+                &|_| BoundedLockOutcome::NotNeeded,
+                &|_| true,
+                &|_| {},
+            )
+        });
+        assert_eq!((done.synced, done.pending), (1, 0));
+        assert!(!mirror_sync_retry_due(base.path()));
+    }
+
+    #[cfg(all(target_os = "macos", unix))]
+    #[test]
+    fn mirror_applicability_sweep_minted_surface_rows_and_native_calls() {
+        let _env = crate::platform::test_env::lock();
+        use crate::credentials::session_login::{
+            mirror_applicability_fixture, LoginReason, LoginState,
+        };
+        for kind in [
+            "codex",
+            "codex_broken",
+            "codex_dangling_anthropic",
+            "codex_bad_profiles_legacy",
+            "api_key",
+            "claude",
+            "broken_claude",
+            "wrong_claude",
+            "masquerading_claude",
+        ] {
+            let (base, handle) = mirror_applicability_fixture(kind);
+            let exec = RecordingExecutor::scripted(RawContentClassification::Content(
+                r#"{"claudeAiOauth":{"accessToken":"synthetic-at","refreshToken":"synthetic-rt","expiresAt":4102444800000}}"#.to_owned().into(),
+            ));
+            let status = sync_all_handle_dirs_with_observations(
+                base.path(),
+                &|dir| sweep_sync_handle_dir_observed(&exec, base.path(), dir, &HashMap::new()),
+                &|_| BoundedLockOutcome::NotNeeded,
+                &|_| true,
+                &|_| {},
+                &save_mirror_sync_status,
+                &|| std::time::Duration::ZERO,
+            );
+            if matches!(kind, "codex" | "codex_broken" | "api_key") {
+                assert!(status.sessions.is_empty(), "{kind}: {:?}", status.sessions);
+                assert!(!status.sessions_undetermined, "{kind}");
+                assert!(exec.calls().is_empty());
+            } else if matches!(
+                kind,
+                "codex_dangling_anthropic" | "codex_bad_profiles_legacy"
+            ) {
+                assert_eq!(status.sessions.len(), 1);
+                assert_eq!(
+                    status.sessions[0].evidence.reason,
+                    LoginReason::MarkerUnresolved
+                );
+                assert!(status.sessions_undetermined);
+                assert!(exec.calls().is_empty());
+            } else {
+                assert_eq!(status.sessions.len(), 1, "{handle:?}");
+                assert_eq!(
+                    status.sessions[0].evidence.reason,
+                    if kind == "claude" {
+                        LoginReason::Current
+                    } else {
+                        LoginReason::HandleInconsistent
+                    }
+                );
+                assert_eq!(
+                    status.sessions[0].evidence.state,
+                    if kind == "claude" {
+                        LoginState::Current
+                    } else {
+                        LoginState::Undetermined
+                    }
+                );
+                assert_eq!(exec.calls().len(), usize::from(kind == "claude"));
+            }
+            let report = crate::credentials::session_login::read_diagnostics(base.path());
+            if matches!(
+                kind,
+                "broken_claude" | "wrong_claude" | "masquerading_claude"
+            ) {
+                // The real verified finalizer queued a generic login retry.
+                // An inconsistent handle cannot discharge it: the producer
+                // records that inconsistency, while diagnostics refuses to
+                // present a zero-pending snapshot as settled authority.
+                assert_eq!(status.pending, 0, "{kind}");
+                assert!(status.sessions_undetermined, "{kind}");
+                assert!(
+                    mirror_sync_retry_due(base.path()),
+                    "{kind}: retry must remain pending"
+                );
+                assert_eq!(report.session_logins.len(), 1, "{kind}");
+                let row = &report.session_logins[0];
+                assert_eq!(row.handle_pid, std::process::id(), "{kind}");
+                assert_eq!(row.account, None, "{kind}");
+                assert_eq!(row.evidence.state, LoginState::Undetermined, "{kind}");
+                assert_eq!(row.evidence.reason, LoginReason::NotInSnapshot, "{kind}");
+                assert_eq!(row.evidence.remedy, None, "{kind}");
+                assert!(report.sessions_undetermined, "{kind}");
+                assert!(report.keychain_mirror.is_none(), "{kind}");
+                assert!(exec.calls().is_empty(), "{kind}");
+            } else {
+                // Healthy Claude still requires exact producer/reader equality.
+                assert_eq!(report.session_logins, status.sessions, "{kind}");
+                assert_eq!(
+                    report.sessions_undetermined, status.sessions_undetermined,
+                    "{kind}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mirror_retry_snapshot_uses_one_original_read_and_malformed_is_not_pending() {
+        use crate::credentials::session_login::{LoginReason, LoginState};
+        let base = tempfile::tempdir().unwrap();
+        let handle = seed_sweep_fixture(base.path(), 1, VALID_NEW_JSON);
+        std::fs::write(handle.join(".live-pid"), std::process::id().to_string()).unwrap();
+        let malformed = RecordingExecutor::scripted(RawContentClassification::Content(
+            "{bad".to_owned().into(),
+        ));
+        let status = sync_all_handle_dirs_with_observations(
+            base.path(),
+            &|dir| sweep_sync_handle_dir_observed(&malformed, base.path(), dir, &HashMap::new()),
+            &|_| BoundedLockOutcome::NotNeeded,
+            &|_| true,
+            &|_| panic!("malformed must not retry"),
+            &save_mirror_sync_status,
+            &|| std::time::Duration::ZERO,
+        );
+        assert_eq!(
+            (status.malformed, status.pending, status.sessions.len()),
+            (1, 0, 1)
+        );
+        assert_eq!(
+            status.sessions[0].evidence.reason,
+            LoginReason::MalformedOauth
+        );
+        assert_eq!(
+            malformed.calls().iter().map(|c| c.0).collect::<Vec<_>>(),
+            vec!["find"]
+        );
+        let current = RecordingExecutor::scripted(RawContentClassification::Content(
+            VALID_NEW_JSON.to_owned().into(),
+        ));
+        let status = sync_all_handle_dirs_with_observations(
+            base.path(),
+            &|dir| sweep_sync_handle_dir_observed(&current, base.path(), dir, &HashMap::new()),
+            &|_| BoundedLockOutcome::NotNeeded,
+            &|_| true,
+            &|_| {},
+            &save_mirror_sync_status,
+            &|| std::time::Duration::ZERO,
+        );
+        assert_eq!(status.sessions[0].evidence.state, LoginState::Current);
+        assert_eq!(current.calls().len(), 1);
+        let serialized =
+            std::fs::read_to_string(base.path().join(MIRROR_SYNC_STATUS_FILE)).unwrap();
+        assert!(!serialized.contains("new-at") && !serialized.contains("new-rt"));
+        assert_eq!(read_mirror_sync_status(base.path()), Some(status));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mirror_retry_snapshot_rejects_each_changed_authority_clause() {
+        use crate::credentials::session_login::{LoginReason, LoginState};
+        for expected in [
+            LoginReason::OwnerChanged,
+            LoginReason::CanonicalChanged,
+            LoginReason::HistoryChanged,
+            LoginReason::OwnerVerifiedChanged,
+        ] {
+            let base = crate::testing::identity_fixtures::coexisting_fixture(1);
+            let slot = AccountNum::try_from(1u16).unwrap();
+            let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(1);
+            let canonical =
+                crate::accounts::identity_store::credentials_path_for(base.path(), uuid);
+            std::fs::write(&canonical, VALID_NEW_JSON).unwrap();
+            let handle = seed_sweep_fixture(base.path(), 1, VALID_NEW_JSON);
+            // Identity-backed slots require the identity credential target,
+            // rather than the fallback fixture's legacy config-N target.
+            std::fs::remove_file(handle.join(".credentials.json")).unwrap();
+            std::os::unix::fs::symlink(&canonical, handle.join(".credentials.json")).unwrap();
+            std::fs::write(handle.join(".live-pid"), std::process::id().to_string()).unwrap();
+            assert!(
+                crate::session::handle_dir::handle_dir_symlinks_are_consistent(
+                    base.path(),
+                    &handle
+                )
+            );
+            assert_eq!(
+                crate::accounts::markers::resolve_marker_to_slot(base.path(), &handle),
+                Some(slot)
+            );
+            let owned_base = base.path().to_path_buf();
+            let owned_handle = handle.clone();
+            struct ResetObservationHook;
+            impl Drop for ResetObservationHook {
+                fn drop(&mut self) {
+                    MIRROR_OBSERVATION_TEST_HOOK.with(|hook| *hook.borrow_mut() = None);
+                }
+            }
+            let _reset_hook = ResetObservationHook;
+            MIRROR_OBSERVATION_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    let fp = crate::credentials::token_history::fingerprint_from_raw_json(
+                        VALID_NEW_JSON,
+                    )
+                    .unwrap();
+                    match expected {
+                        LoginReason::OwnerChanged => {
+                            std::fs::remove_file(owned_handle.join(".csq-account")).unwrap();
+                        }
+                        LoginReason::CanonicalChanged => {
+                            std::fs::write(&canonical, r#"{"claudeAiOauth":{"accessToken":"changed-at","refreshToken":"changed-rt","expiresAt":4102444800000}}"#).unwrap();
+                        }
+                        LoginReason::HistoryChanged => {
+                            crate::credentials::token_history::append_history(&owned_base, uuid, fp)
+                        }
+                        LoginReason::OwnerVerifiedChanged => {
+                            {
+                                let credential = crate::credentials::load(&crate::accounts::identity_store::credentials_path_for(&owned_base, uuid)).unwrap();
+                                let proof = crate::accounts::anthropic_identity::verify_anthropic_context_with(credential.anthropic().unwrap(), &fixture_profile_http(&credential)).unwrap();
+                                let binding = crate::accounts::anthropic_identity::capture_anthropic_binding(&owned_base, slot).unwrap();
+                                assert!(matches!(crate::credentials::token_history::record_owner_verified_v2(&owned_base, &binding, &proof), crate::credentials::token_history::OwnerVerifiedRecord::Written));
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }))
+            });
+            let rec = RecordingExecutor::scripted(RawContentClassification::Content(
+                VALID_NEW_JSON.to_owned().into(),
+            ));
+            let observed =
+                sweep_sync_handle_dir_observed(&rec, base.path(), &handle, &HashMap::new());
+            assert!(matches!(observed.result, Ok(false)));
+            assert_eq!(observed.session.evidence.state, LoginState::Undetermined);
+            assert_eq!(observed.session.evidence.reason, expected);
+            assert!(observed.session.account.is_none());
+            assert_eq!(rec.calls().len(), 1);
+        }
+    }
+
+    // ── Legacy-context custody (validated `LegacyUnknown` bindings) ─────────
+    //
+    // A legacy migration identity (email-only metadata, no typed context) must
+    // still reach the keychain-LOCAL custody paths: the exact captured binding
+    // is the authority, no HTTP is involved, and every downstream mutation
+    // re-verifies it under the held profiles lock. Foreign or invalid metadata
+    // stays refused — pinned here at the capture boundary.
+
+    /// Stage slot 1 of a `coexisting_fixture` base as a VALIDATED legacy slot:
+    /// the identity's context-index entry is removed (the capture refuses a
+    /// legacy context that still has one), its metadata is rewritten through
+    /// the real pre-context writer, and its canonical credential is written at
+    /// the identity path.
+    #[cfg(target_os = "macos")]
+    fn seed_validated_legacy_slot(
+        base: &Path,
+        email: &str,
+    ) -> crate::accounts::identity_store::IdentityId {
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(1);
+        let profiles_path = crate::accounts::profiles::profiles_path(base);
+        let mut profiles = crate::accounts::profiles::load(&profiles_path).unwrap();
+        profiles
+            .anthropic_contexts
+            .retain(|entry| entry.identity_uuid != uuid);
+        crate::accounts::profiles::save(&profiles_path, &profiles).unwrap();
+        crate::daemon::identity_mint::write_legacy_anthropic_metadata_fixture(base, uuid, email)
+            .unwrap();
+        let canonical = crate::accounts::identity_store::credentials_path_for(base, uuid);
+        let mut raw: serde_json::Value = serde_json::from_str(VALID_NEW_JSON).unwrap();
+        // Binding versions require the complete grant production stores.
+        raw["claudeAiOauth"]["refreshToken"] = serde_json::json!("fake-legacy-fixture-refresh");
+        crate::credentials::file::save(
+            &canonical,
+            &serde_json::from_value::<crate::credentials::CredentialFile>(raw).unwrap(),
+        )
+        .unwrap();
+        uuid
+    }
+
+    /// Positive arm: a validated legacy binding is captured for keychain
+    /// custody, carrying its recorded email. Under the former `Known`-only
+    /// filter this read was `None` — every legacy slot was silently dropped
+    /// out of the sweep/reconcile/clear paths.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn legacy_custody_capture_admits_validated_legacy_binding() {
+        let base = crate::testing::identity_fixtures::coexisting_fixture(1);
+        let slot = AccountNum::try_from(1u16).unwrap();
+        let _uuid = seed_validated_legacy_slot(base.path(), "fixture-1@example.test");
+        let binding = capture_known_slot(base.path(), slot)
+            .expect("a validated legacy binding must be captured for keychain custody");
+        assert!(matches!(
+            binding.context(),
+            crate::accounts::anthropic_identity::StoredAnthropicContext::LegacyUnknown
+        ));
+        assert_eq!(
+            binding.recorded_legacy_email(),
+            Some("fixture-1@example.test")
+        );
+    }
+
+    /// Guard arm (the `Known` predicate's surviving meaning): a legacy-context
+    /// identity that still has a context-index entry must NOT be admitted —
+    /// the capture refuses it outright (the index entry claims a typed
+    /// context the metadata no longer records), so the custody filter sees
+    /// `None` exactly as before this change.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn legacy_custody_capture_refuses_indexed_legacy_context() {
+        let base = crate::testing::identity_fixtures::coexisting_fixture(1);
+        let slot = AccountNum::try_from(1u16).unwrap();
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(1);
+        // The generic coexisting fixture has no typed context-index row.
+        // Explicitly retain a conflicting row when publishing legacy metadata.
+        let profiles_path = crate::accounts::profiles::profiles_path(base.path());
+        let mut pf = crate::accounts::profiles::load(&profiles_path).unwrap();
+        pf.anthropic_contexts
+            .push(crate::accounts::anthropic_identity::AnthropicContextEntry {
+                email: "fixture-1@example.test".into(),
+                account_uuid: "11111111-1111-4111-8111-111111111111".parse().unwrap(),
+                organization_uuid: "22222222-2222-4222-8222-222222222222".parse().unwrap(),
+                identity_uuid: uuid,
+                extra: Default::default(),
+            });
+        crate::accounts::profiles::save(&profiles_path, &pf).unwrap();
+        crate::daemon::identity_mint::write_legacy_anthropic_metadata_fixture(
+            base.path(),
+            uuid,
+            "fixture-1@example.test",
+        )
+        .unwrap();
+        let canonical = crate::accounts::identity_store::credentials_path_for(base.path(), uuid);
+        let mut raw: serde_json::Value = serde_json::from_str(VALID_NEW_JSON).unwrap();
+        // Binding versions require the complete grant production stores.
+        raw["claudeAiOauth"]["refreshToken"] = serde_json::json!("fake-legacy-fixture-refresh");
+        crate::credentials::file::save(
+            &canonical,
+            &serde_json::from_value::<crate::credentials::CredentialFile>(raw).unwrap(),
+        )
+        .unwrap();
+        let captured =
+            crate::accounts::anthropic_identity::capture_anthropic_binding(base.path(), slot);
+        assert!(
+            matches!(
+                captured,
+                Err(crate::accounts::anthropic_identity::IdentityError::InvalidMetadata)
+            ),
+            "an indexed identity claiming a legacy context must be refused: {captured:?}"
+        );
+        assert!(capture_known_slot(base.path(), slot).is_none());
+    }
+
+    /// Guard arm (foreign/invalid metadata): a non-Anthropic provider, and a
+    /// half UUID pair, are refused at the capture — never admitted as
+    /// bindings. `secure_file` keeps the refusal attributable to the METADATA:
+    /// a 0o644 identity.json fails the private read with the SAME
+    /// `InvalidMetadata` variant, which would make this assertion
+    /// non-discriminating.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn legacy_custody_capture_refuses_foreign_or_invalid_metadata() {
+        let base = crate::testing::identity_fixtures::coexisting_fixture(1);
+        let slot = AccountNum::try_from(1u16).unwrap();
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(1);
+        let path = crate::accounts::identity_store::identity_json_path_for(base.path(), uuid);
+        for json in [
+            r#"{"provider":"codex","email":"fixture-1@example.test"}"#,
+            r#"{"provider":"anthropic","email":"fixture-1@example.test","account_uuid":"11111111-1111-4111-8111-111111111111"}"#,
+        ] {
+            std::fs::write(&path, json).unwrap();
+            crate::platform::fs::secure_file(&path).unwrap();
+            let captured =
+                crate::accounts::anthropic_identity::capture_anthropic_binding(base.path(), slot);
+            assert!(
+                matches!(
+                    captured,
+                    Err(crate::accounts::anthropic_identity::IdentityError::InvalidMetadata)
+                ),
+                "foreign/invalid metadata must stay refused: {captured:?}"
+            );
+            assert!(
+                capture_known_slot(base.path(), slot).is_none(),
+                "no binding may be admitted for foreign/invalid metadata"
+            );
+        }
+    }
+
+    /// The clause predicates partition exactly for a legacy binding:
+    ///
+    /// - unchanged → BOTH current. (Under the predecessor
+    ///   `known_binding_is_current` this read was FALSE unconditionally for a
+    ///   legacy binding, so the sweep's version-only step fired
+    ///   `CanonicalChanged` on every untouched legacy tick — that vacuity is
+    ///   this assertion's falsifier.)
+    /// - refresh-token rotation (the version hashes access+refresh+expiry) →
+    ///   identity clause current, whole binding not: a version-only move.
+    /// - recorded legacy email rewritten → identity clause not current: an
+    ///   OWNER-clause move, read as `OwnerChanged`, never a version-only
+    ///   `CanonicalChanged`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn legacy_binding_clause_predicates_partition_version_from_owner_moves() {
+        let base = crate::testing::identity_fixtures::coexisting_fixture(1);
+        let slot = AccountNum::try_from(1u16).unwrap();
+        let uuid = seed_validated_legacy_slot(base.path(), "fixture-1@example.test");
+        let binding = capture_known_slot(base.path(), slot).unwrap();
+        assert!(
+            binding_identity_clause_is_current(base.path(), &binding),
+            "an unchanged legacy binding must satisfy the identity clause"
+        );
+        assert!(
+            binding_full_clause_is_current(base.path(), &binding),
+            "an unchanged legacy binding must read as FULLY current — a \
+             `Known`-gated predicate returned false here unconditionally"
+        );
+        // Version-only move: same access token, rotated refresh token.
+        let canonical = crate::accounts::identity_store::credentials_path_for(base.path(), uuid);
+        std::fs::write(
+            &canonical,
+            r#"{"claudeAiOauth":{"accessToken":"new-at","refreshToken":"rotated-rt","expiresAt":4102444800000,"scopes":[]}}"#,
+        )
+        .unwrap();
+        assert!(
+            binding_identity_clause_is_current(base.path(), &binding),
+            "a version-only move must leave the identity clause current"
+        );
+        assert!(
+            !binding_full_clause_is_current(base.path(), &binding),
+            "a version-only move must move the whole-binding predicate"
+        );
+        // Owner-clause move: the recorded legacy email is rewritten.
+        crate::daemon::identity_mint::write_legacy_anthropic_metadata_fixture(
+            base.path(),
+            uuid,
+            "other@example.test",
+        )
+        .unwrap();
+        assert!(
+            !binding_identity_clause_is_current(base.path(), &binding),
+            "a moved recorded legacy email is an owner-clause change"
+        );
+    }
+
+    #[test]
+    fn mirror_retry_status_write_failure_keeps_process_pending() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir(base.path().join(MIRROR_SYNC_STATUS_FILE)).unwrap();
+        let status = sync_all_handle_dirs_with(
+            base.path(),
+            &|_| unreachable!(),
+            &|_| BoundedLockOutcome::NotNeeded,
+            &|_| true,
+            &|_| {},
+        );
+        assert_eq!(status.pending, 0);
+        assert!(mirror_sync_retry_due(base.path()));
+        assert!(read_mirror_sync_status(base.path()).is_none());
+        std::fs::remove_dir(base.path().join(MIRROR_SYNC_STATUS_FILE)).unwrap();
+        sync_all_handle_dirs_with(
+            base.path(),
+            &|_| unreachable!(),
+            &|_| BoundedLockOutcome::NotNeeded,
+            &|_| true,
+            &|_| {},
+        );
+        assert!(!mirror_sync_retry_due(base.path()));
+    }
+
+    #[test]
+    fn mirror_retry_last_green_persist_failure_then_restart_catches_up_once() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir(base.path().join("term-1")).unwrap();
+        let initial = sync_all_handle_dirs_with(
+            base.path(),
+            &|_| Ok(true),
+            &|_| BoundedLockOutcome::NotNeeded,
+            &|_| true,
+            &|_| {},
+        );
+        assert_eq!(initial.pending, 0);
+        assert!(!mirror_sync_retry_due(base.path()));
+        assert!(read_mirror_sync_status(base.path()).is_some());
+        // A failed persistence operation leaves exactly the preceding green
+        // bytes, while real mirror lock misses remain pending in this process.
+        let miss = sync_all_handle_dirs_with_persistence(
+            base.path(),
+            &|_| unreachable!(),
+            &|_| BoundedLockOutcome::Failed,
+            &|_| true,
+            &|_| {},
+            &|_, _| false,
+        );
+        assert_eq!(miss.pending, 1);
+        assert!(!base.path().join(MIRROR_SYNC_STATUS_FILE).exists());
+        assert!(read_mirror_sync_status(base.path()).is_none());
+        assert!(mirror_sync_retry_due(base.path()));
+        MIRROR_RETRY_PENDING.lock().unwrap().remove(base.path()); // simulated restart
+        assert!(read_mirror_sync_status(base.path()).is_none());
+        assert!(
+            mirror_sync_retry_due(base.path()),
+            "old green cannot suppress initial catch-up"
+        );
+        sync_all_handle_dirs_with(
+            base.path(),
+            &|_| Ok(true),
+            &|_| BoundedLockOutcome::NotNeeded,
+            &|_| true,
+            &|_| {},
+        );
+        assert!(
+            !mirror_sync_retry_due(base.path()),
+            "healthy idle ticks stay quiet"
+        );
+    }
+
+    #[test]
+    fn mirror_retry_removed_handle_is_not_resurrected() {
+        let base = tempfile::tempdir().unwrap();
+        let handle = base.path().join("term-1");
+        std::fs::create_dir(&handle).unwrap();
+        let status = sync_all_handle_dirs_with(
+            base.path(),
+            &|_| panic!("removed handle was synced"),
+            &|_| BoundedLockOutcome::Failed,
+            &|_| true,
+            &|_| std::fs::remove_dir(&handle).unwrap(),
+        );
+        assert_eq!((status.skipped, status.pending), (1, 0));
+        assert!(!handle.exists());
+    }
+
+    #[test]
+    fn mirror_retry_rereads_swapped_marker_and_does_not_cache_the_account() {
+        let base = tempfile::tempdir().unwrap();
+        let handle = base.path().join("term-1");
+        std::fs::create_dir(&handle).unwrap();
+        std::fs::write(handle.join(".csq-account"), "1").unwrap();
+        let locks = std::cell::Cell::new(0);
+        let status = sync_all_handle_dirs_with(
+            base.path(),
+            &|d| {
+                assert_eq!(
+                    std::fs::read_to_string(d.join(".csq-account")).unwrap(),
+                    "2"
+                );
+                Ok(false)
+            },
+            &|_| {
+                let n = locks.replace(locks.get() + 1);
+                if n == 0 {
+                    BoundedLockOutcome::Failed
+                } else {
+                    BoundedLockOutcome::NotNeeded
+                }
+            },
+            &|_| true,
+            &|_| std::fs::write(handle.join(".csq-account"), "2").unwrap(),
+        );
+        assert_eq!((status.skipped, status.pending), (1, 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mirror_retry_status_reader_refuses_symlinks_and_oversized_data() {
+        let base = tempfile::tempdir().unwrap();
+        let external = base.path().join("external");
+        std::fs::write(&external, "{}").unwrap();
+        let path = base.path().join(MIRROR_SYNC_STATUS_FILE);
+        std::os::unix::fs::symlink(&external, &path).unwrap();
+        assert!(read_mirror_sync_status(base.path()).is_none());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, vec![b' '; MIRROR_STATUS_MAX_BYTES + 1]).unwrap();
+        assert!(read_mirror_sync_status(base.path()).is_none());
     }
 
     #[test]
@@ -11162,8 +16806,8 @@ mod tests {
     // keep since it simply never matches.
     #[test]
     fn no_bare_unbounded_output_call_in_this_file() {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let this_file = std::path::PathBuf::from(manifest_dir).join("src/credentials/keychain.rs");
+        let manifest_dir = crate::testing::manifest_dir(env!("CARGO_MANIFEST_DIR"));
+        let this_file = manifest_dir.join("src/credentials/keychain.rs");
         let content = std::fs::read_to_string(&this_file).expect("read self for tripwire");
 
         // Scope to PRODUCTION code only: stop at the `#[cfg(test)] mod tests`
@@ -11208,7 +16852,7 @@ mod tests {
     // different quoting of the program name, or a different module.
     #[test]
     fn no_bare_security_spawn_outside_shared_bounded_runner() {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let manifest_dir = crate::testing::manifest_dir(env!("CARGO_MANIFEST_DIR"));
         let files = [
             "src/credentials/keychain.rs",
             "src/providers/codex/keychain.rs",
@@ -11216,7 +16860,7 @@ mod tests {
 
         let mut offending: Vec<(&str, usize, String)> = Vec::new();
         for file in files {
-            let path = std::path::PathBuf::from(manifest_dir).join(file);
+            let path = manifest_dir.join(file);
             let content = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("read {file} for tripwire: {e}"));
 
@@ -11588,22 +17232,41 @@ mod tests {";
     #[cfg(target_os = "macos")]
     const VALID_NEW_JSON: &str = r#"{"claudeAiOauth":{"accessToken":"new-at","refreshToken":"new-rt","expiresAt":4102444800000,"scopes":[]}}"#;
 
-    // round 7c D1 test helper: give `dir` (used as both `base` and
-    // `handle_dir` by every T1-T4/S4/F4 fixture below) a legacy numeric
-    // marker plus a `config-1/.credentials.json` whose OAuth identity
-    // matches `old_raw` exactly. `decide_cc_keychain_write` now requires X
-    // to match a KNOWN account before a write/strip proceeds (rule 2) — the
-    // mechanics these tests exercise (sibling preservation, no-backfill,
-    // write-failure classification) are downstream of that check, so the
-    // fixture must clear it first, exactly as a real `csq swap`/`auto_rotate`
-    // pre-repoint call site would (the marker still names the pre-repoint
-    // account, whose own canonical file is what "known" resolves to).
+    // The downstream strip/write mechanics require an exact-grant Known
+    // source, not a legacy numeric marker and email-only metadata.
     #[cfg(target_os = "macos")]
     fn seed_marker_matching(dir: &Path, old_raw: &str) {
-        std::fs::write(dir.join(".csq-account"), "1").expect("write legacy numeric marker");
-        let cfg = dir.join("config-1");
-        std::fs::create_dir_all(&cfg).expect("create config-1");
-        std::fs::write(cfg.join(".credentials.json"), old_raw).expect("write config-1 creds");
+        let credential: CredentialFile = serde_json::from_str(old_raw).unwrap();
+        let identity = stage_known_fixture(
+            dir,
+            AccountNum::try_from(1u16).unwrap(),
+            &credential,
+            false,
+            false,
+        );
+        crate::accounts::markers::write_csq_account(dir, identity).unwrap();
+    }
+
+    // Exercise the guarded mutation seam with an exact-grant Known target.
+    // Strip cases retain the independently captured Known source marker.
+    #[cfg(target_os = "macos")]
+    fn fixture_force_sync(
+        exec: &RecordingExecutor,
+        base: &Path,
+        handle: &Path,
+        raw: Option<&str>,
+        quarantine: bool,
+    ) -> Result<ForcedSyncResult, PlatformError> {
+        let target = raw.map(|raw| {
+            let credential: CredentialFile = serde_json::from_str(raw).unwrap();
+            let slot = AccountNum::try_from(2u16).unwrap();
+            let identity = stage_known_fixture(base, slot, &credential, false, false);
+            if !handle.join(".csq-account").exists() {
+                crate::accounts::markers::write_csq_account(handle, identity).unwrap();
+            }
+            crate::accounts::anthropic_identity::capture_anthropic_binding(base, slot).unwrap()
+        });
+        force_sync_inner_guarded(exec, base, handle, raw, quarantine, target.as_ref(), None)
     }
 
     // T1 — Unreadable X: `force_sync_account_changed` reports `Unreadable`,
@@ -11657,16 +17320,12 @@ mod tests {";
     #[test]
     fn t2_force_sync_readable_valid_token_writes_new_oauth_plus_siblings_no_backfill() {
         let old_raw = r#"{"claudeAiOauth":{"accessToken":"old","refreshToken":"old-rt","expiresAt":9999999999999,"subscriptionType":"max"},"mcp":"keep"}"#;
-        let rec =
-            RecordingExecutor::scripted(RawContentClassification::Content(old_raw.to_string()));
+        let rec = RecordingExecutor::scripted(RawContentClassification::Content(
+            (old_raw.to_string()).into(),
+        ));
         let dir = tempfile::tempdir().unwrap();
         seed_marker_matching(dir.path(), old_raw);
-        let result = force_sync_account_changed_with_executor(
-            &rec,
-            dir.path(),
-            dir.path(),
-            Some(VALID_NEW_JSON),
-        );
+        let result = fixture_force_sync(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), false);
         assert!(
             matches!(
                 result,
@@ -11710,11 +17369,12 @@ mod tests {";
     #[test]
     fn t3_force_sync_invalid_new_token_strips_oauth_keeps_siblings() {
         let old_raw = r#"{"claudeAiOauth":{"accessToken":"old","refreshToken":"old-rt","expiresAt":9999999999999},"mcp":"keep"}"#;
-        let rec =
-            RecordingExecutor::scripted(RawContentClassification::Content(old_raw.to_string()));
+        let rec = RecordingExecutor::scripted(RawContentClassification::Content(
+            (old_raw.to_string()).into(),
+        ));
         let dir = tempfile::tempdir().unwrap();
         seed_marker_matching(dir.path(), old_raw);
-        let result = force_sync_account_changed_with_executor(&rec, dir.path(), dir.path(), None);
+        let result = fixture_force_sync(&rec, dir.path(), dir.path(), None, false);
         assert!(
             matches!(
                 result,
@@ -11745,13 +17405,14 @@ mod tests {";
     #[test]
     fn t3_force_sync_invalid_new_token_deletes_item_when_no_siblings_remain() {
         let old_raw = r#"{"claudeAiOauth":{"accessToken":"old","refreshToken":"old-rt","expiresAt":9999999999999}}"#;
-        let rec =
-            RecordingExecutor::scripted(RawContentClassification::Content(old_raw.to_string()));
+        let rec = RecordingExecutor::scripted(RawContentClassification::Content(
+            (old_raw.to_string()).into(),
+        ));
         let dir = tempfile::tempdir().unwrap();
         seed_marker_matching(dir.path(), old_raw);
         // C-F2: `None`, not an expired-but-Anthropic FILE_JSON — see the
         // sibling test above.
-        let result = force_sync_account_changed_with_executor(&rec, dir.path(), dir.path(), None);
+        let result = fixture_force_sync(&rec, dir.path(), dir.path(), None, false);
         assert!(
             matches!(
                 result,
@@ -11791,17 +17452,13 @@ mod tests {";
         // as for `Applied`, and `reconcile_keychain_to_marker` is the
         // compensating action if that repoint later fails.
         let old_raw = r#"{"claudeAiOauth":{"accessToken":"old","refreshToken":"old-rt","expiresAt":9999999999999}}"#;
-        let rec =
-            RecordingExecutor::scripted(RawContentClassification::Content(old_raw.to_string()));
+        let rec = RecordingExecutor::scripted(RawContentClassification::Content(
+            (old_raw.to_string()).into(),
+        ));
         rec.add_ok.set(false);
         let dir = tempfile::tempdir().unwrap();
         seed_marker_matching(dir.path(), old_raw);
-        let result = force_sync_account_changed_with_executor(
-            &rec,
-            dir.path(),
-            dir.path(),
-            Some(VALID_NEW_JSON),
-        );
+        let result = fixture_force_sync(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), false);
         assert!(
             matches!(result, Ok(ForcedSyncResult::WriteFailedUnknown)),
             "expected Ok(WriteFailedUnknown), got {result:?}"
@@ -11816,10 +17473,11 @@ mod tests {";
     #[cfg(target_os = "macos")]
     #[test]
     fn foreign_item_without_quarantine_still_refuses() {
-        let rec =
-            RecordingExecutor::scripted(RawContentClassification::Content(FOREIGN_RAW.to_string()));
+        let rec = RecordingExecutor::scripted(RawContentClassification::Content(
+            (FOREIGN_RAW.to_string()).into(),
+        ));
         let dir = tempfile::tempdir().unwrap();
-        let result = force_sync_inner(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), false);
+        let result = fixture_force_sync(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), false);
         assert!(
             matches!(result, Ok(ForcedSyncResult::ForeignLoginUnharvested)),
             "{result:?}"
@@ -11838,12 +17496,10 @@ mod tests {";
     #[cfg(target_os = "macos")]
     #[test]
     fn swap_path_replaces_an_emptied_login() {
-        let rec = RecordingExecutor::scripted(RawContentClassification::Content(
-            r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"subscriptionType":"max"}}"#
-                .to_string(),
-        ));
+        let rec = RecordingExecutor::scripted(RawContentClassification::Content((r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"subscriptionType":"max"}}"#
+                .to_string()).into()));
         let dir = tempfile::tempdir().unwrap();
-        let result = force_sync_inner(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), false);
+        let result = fixture_force_sync(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), false);
         assert!(
             matches!(result, Ok(ForcedSyncResult::Applied { wrote_token: true })),
             "{result:?}"
@@ -11859,10 +17515,11 @@ mod tests {";
     fn fresh_launch_quarantines_foreign_item_then_writes() {
         let _trace = quarantine_trace_guard();
         use std::os::unix::fs::PermissionsExt;
-        let rec =
-            RecordingExecutor::scripted(RawContentClassification::Content(FOREIGN_RAW.to_string()));
+        let rec = RecordingExecutor::scripted(RawContentClassification::Content(
+            (FOREIGN_RAW.to_string()).into(),
+        ));
         let dir = tempfile::tempdir().unwrap();
-        let result = force_sync_inner(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), true);
+        let result = fixture_force_sync(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), true);
         assert!(
             matches!(result, Ok(ForcedSyncResult::Applied { wrote_token: true })),
             "{result:?}"
@@ -11894,18 +17551,239 @@ mod tests {";
         );
     }
 
+    /// Review R2 L-R2-3: a fresh launch whose item is recognised ONLY
+    /// through a retired binding's HISTORY channel — the class that took
+    /// the foreign branch (and was saved) before the retired channel
+    /// existed — must still be quarantined before the overwrite. RED
+    /// without the fix: `Applied`, NO file in the quarantine dir, and the
+    /// superseded token gone.
+    ///
+    /// Staging note: the fixture profile context is derived from the SLOT
+    /// number, so two identities cannot both be staged AT slot 2 (their
+    /// contexts would collide and the identity-index validator refuses).
+    /// The earlier identity is therefore staged at slot 1 and MOVED to
+    /// slot 2 through production `swap_slot_mapping` — which is also the
+    /// production shape a moved terminal actually has.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fresh_launch_quarantines_a_retired_history_recognised_item_then_writes() {
+        let _trace = quarantine_trace_guard();
+        use crate::accounts::identity_store::IdentityId;
+        let old_raw = r#"{"claudeAiOauth":{"accessToken":"old-at","refreshToken":"rt-retired-old","expiresAt":3102444800000,"scopes":[]},"mcpOAuth":{"fixture-server":{"accessToken":"old-sib"}}}"#;
+        let prev_canon = r#"{"claudeAiOauth":{"accessToken":"can-at","refreshToken":"rt-retired-canon","expiresAt":4102444800000,"scopes":[]}}"#;
+        let rec = RecordingExecutor::scripted(RawContentClassification::Content(
+            (old_raw.to_string()).into(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        // The slot's earlier identity: canonical `prev_canon`, its own
+        // bounded history holding the OLDER token strictly first, written
+        // through production writers.
+        let prev_id = stage_known_fixture(
+            dir.path(),
+            AccountNum::try_from(1u16).unwrap(),
+            &serde_json::from_str(prev_canon).unwrap(),
+            false,
+            false,
+        );
+        crate::credentials::token_history::append_history(
+            dir.path(),
+            prev_id,
+            crate::credentials::token_history::fingerprint_from_raw_json(old_raw).unwrap(),
+        );
+        crate::credentials::token_history::append_history(
+            dir.path(),
+            prev_id,
+            crate::credentials::token_history::fingerprint_from_raw_json(prev_canon).unwrap(),
+        );
+        // Move slot 1 -> slot 2 (empty target), then rebind slot 2 to the
+        // launched identity — the real writer records the displacement.
+        let lock = crate::accounts::profiles_lock::ProfilesFileLock::acquire(dir.path()).unwrap();
+        assert!(crate::accounts::profiles::swap_slot_mapping(&lock, dir.path(), 1, 2).unwrap());
+        crate::accounts::profiles::add_identity_mapping(
+            &lock,
+            dir.path(),
+            2,
+            "new@example.com",
+            IdentityId::new_v4(),
+        )
+        .unwrap();
+        drop(lock);
+
+        let result = fixture_force_sync(
+            &rec,
+            dir.path(),
+            dir.path(),
+            Some(VALID_NEW_JSON),
+            /* quarantine_foreign */ true,
+        );
+        assert!(
+            matches!(result, Ok(ForcedSyncResult::Applied { wrote_token: true })),
+            "{result:?}"
+        );
+        let qdir = dir.path().join(QUARANTINE_DIR_NAME);
+        let files: Vec<_> = std::fs::read_dir(&qdir)
+            .unwrap_or_else(|e| panic!("quarantine dir must exist (got {e:?})"))
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(
+            files.len(),
+            1,
+            "the retired-history-recognised item must be saved, not discarded: {files:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&files[0]).unwrap(), old_raw);
+        let payload = rec
+            .add_payloads
+            .borrow()
+            .last()
+            .cloned()
+            .expect("an add happened");
+        assert!(payload.contains("new-rt"), "{payload}");
+        assert!(
+            !payload.contains("mcpOAuth") && !payload.contains("old-sib"),
+            "the previous tenant's siblings must not merge into the new item \
+             (review R3 L3): {payload}"
+        );
+    }
+
+    /// Review R3 L3 (canonical half): a fresh launch whose item is
+    /// recognised ONLY through a retired binding's CANONICAL channel must
+    /// also write against an ABSENT view — the previous tenant's item must
+    /// not have its siblings (e.g. MCP OAuth entries) merged into the new
+    /// account's item. No quarantine here: the item's token IS the retired
+    /// identity's canonical, which still lives in the identity store (the
+    /// L-R2-2 re-proof just established that under the held lock).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fresh_launch_retired_canonical_item_writes_without_merging_siblings() {
+        let _trace = quarantine_trace_guard();
+        use crate::accounts::identity_store::IdentityId;
+        let prev_canon = r#"{"claudeAiOauth":{"accessToken":"can-at","refreshToken":"rt-retired-canon","expiresAt":4102444800000,"scopes":[]},"mcpOAuth":{"fixture-server":{"accessToken":"can-sib"}}}"#;
+        let rec = RecordingExecutor::scripted(RawContentClassification::Content(
+            (prev_canon.to_string()).into(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let _ = stage_known_fixture(
+            dir.path(),
+            AccountNum::try_from(1u16).unwrap(),
+            &serde_json::from_str(prev_canon).unwrap(),
+            false,
+            false,
+        );
+        // Move slot 1 -> slot 2, then rebind slot 2 to the launched
+        // identity — the item then matches ONLY the retired canonical.
+        let lock = crate::accounts::profiles_lock::ProfilesFileLock::acquire(dir.path()).unwrap();
+        assert!(crate::accounts::profiles::swap_slot_mapping(&lock, dir.path(), 1, 2).unwrap());
+        crate::accounts::profiles::add_identity_mapping(
+            &lock,
+            dir.path(),
+            2,
+            "new@example.com",
+            IdentityId::new_v4(),
+        )
+        .unwrap();
+        drop(lock);
+
+        let result = fixture_force_sync(
+            &rec,
+            dir.path(),
+            dir.path(),
+            Some(VALID_NEW_JSON),
+            /* quarantine_foreign */ true,
+        );
+        assert!(
+            matches!(result, Ok(ForcedSyncResult::Applied { wrote_token: true })),
+            "{result:?}"
+        );
+        let payload = rec
+            .add_payloads
+            .borrow()
+            .last()
+            .cloned()
+            .expect("an add happened");
+        assert!(payload.contains("new-rt"), "{payload}");
+        assert!(
+            !payload.contains("mcpOAuth") && !payload.contains("can-sib"),
+            "the previous tenant's siblings must not merge into the new item \
+             (review R3 L3, canonical half): {payload}"
+        );
+        assert!(
+            !dir.path().join(QUARANTINE_DIR_NAME).exists(),
+            "a canonical-only recognition needs no quarantine — the canonical \
+             copy lives in the identity store"
+        );
+    }
+
+    /// Review R3 T1: the retired-HISTORY quarantine's failure branch must
+    /// refuse the write — no add and no delete. The foreign branch's twin
+    /// is `fresh_launch_quarantine_failure_refuses_without_mutation`; this
+    /// leg covers the retired-history path specifically.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fresh_launch_retired_history_quarantine_failure_refuses_without_mutation() {
+        let _trace = quarantine_trace_guard();
+        use crate::accounts::identity_store::IdentityId;
+        let old_raw = r#"{"claudeAiOauth":{"accessToken":"old-at","refreshToken":"rt-retired-old","expiresAt":3102444800000,"scopes":[]}}"#;
+        let prev_canon = r#"{"claudeAiOauth":{"accessToken":"can-at","refreshToken":"rt-retired-canon","expiresAt":4102444800000,"scopes":[]}}"#;
+        let rec = RecordingExecutor::scripted(RawContentClassification::Content(
+            (old_raw.to_string()).into(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let prev_id = stage_known_fixture(
+            dir.path(),
+            AccountNum::try_from(1u16).unwrap(),
+            &serde_json::from_str(prev_canon).unwrap(),
+            false,
+            false,
+        );
+        crate::credentials::token_history::append_history(
+            dir.path(),
+            prev_id,
+            crate::credentials::token_history::fingerprint_from_raw_json(old_raw).unwrap(),
+        );
+        crate::credentials::token_history::append_history(
+            dir.path(),
+            prev_id,
+            crate::credentials::token_history::fingerprint_from_raw_json(prev_canon).unwrap(),
+        );
+        let lock = crate::accounts::profiles_lock::ProfilesFileLock::acquire(dir.path()).unwrap();
+        assert!(crate::accounts::profiles::swap_slot_mapping(&lock, dir.path(), 1, 2).unwrap());
+        crate::accounts::profiles::add_identity_mapping(
+            &lock,
+            dir.path(),
+            2,
+            "new@example.com",
+            IdentityId::new_v4(),
+        )
+        .unwrap();
+        drop(lock);
+        // A FILE where the quarantine directory must go: the save fails.
+        std::fs::write(dir.path().join(QUARANTINE_DIR_NAME), b"x").unwrap();
+
+        let result = fixture_force_sync(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), true);
+        assert!(
+            matches!(result, Ok(ForcedSyncResult::QuarantineSaveFailed)),
+            "{result:?}"
+        );
+        assert!(
+            rec.calls().iter().all(|c| c.0 == "find"),
+            "{:?}",
+            rec.calls()
+        );
+    }
+
     /// If the quarantine cannot be written the item is NOT discarded: refuse,
     /// no add and no delete.
     #[cfg(target_os = "macos")]
     #[test]
     fn fresh_launch_quarantine_failure_refuses_without_mutation() {
         let _trace = quarantine_trace_guard();
-        let rec =
-            RecordingExecutor::scripted(RawContentClassification::Content(FOREIGN_RAW.to_string()));
+        let rec = RecordingExecutor::scripted(RawContentClassification::Content(
+            (FOREIGN_RAW.to_string()).into(),
+        ));
         let dir = tempfile::tempdir().unwrap();
         // A FILE where the quarantine directory must go.
         std::fs::write(dir.path().join(QUARANTINE_DIR_NAME), b"x").unwrap();
-        let result = force_sync_inner(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), true);
+        let result = fixture_force_sync(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), true);
         assert!(
             matches!(result, Ok(ForcedSyncResult::QuarantineSaveFailed)),
             "{result:?}"
@@ -11922,12 +17800,13 @@ mod tests {";
     #[test]
     fn fresh_launch_quarantine_refuses_symlinked_dir() {
         let _trace = quarantine_trace_guard();
-        let rec =
-            RecordingExecutor::scripted(RawContentClassification::Content(FOREIGN_RAW.to_string()));
+        let rec = RecordingExecutor::scripted(RawContentClassification::Content(
+            (FOREIGN_RAW.to_string()).into(),
+        ));
         let dir = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(elsewhere.path(), dir.path().join(QUARANTINE_DIR_NAME)).unwrap();
-        let result = force_sync_inner(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), true);
+        let result = fixture_force_sync(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), true);
         assert!(
             matches!(result, Ok(ForcedSyncResult::QuarantineSaveFailed)),
             "{result:?}"
@@ -11942,11 +17821,12 @@ mod tests {";
     #[test]
     fn fresh_launch_quarantine_ok_but_replace_fails_refuses_launch() {
         let _trace = quarantine_trace_guard();
-        let rec =
-            RecordingExecutor::scripted(RawContentClassification::Content(FOREIGN_RAW.to_string()));
+        let rec = RecordingExecutor::scripted(RawContentClassification::Content(
+            (FOREIGN_RAW.to_string()).into(),
+        ));
         rec.add_ok.set(false);
         let dir = tempfile::tempdir().unwrap();
-        let result = force_sync_inner(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), true);
+        let result = fixture_force_sync(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), true);
         assert!(
             matches!(result, Ok(ForcedSyncResult::WriteFailedUnknown)),
             "{result:?}"
@@ -12035,12 +17915,7 @@ mod tests {";
         let dir = tempfile::tempdir().unwrap();
         // No marker seeding needed: `Absent` hits rule 1 (`holds_no_login`)
         // unconditionally — free to write regardless of `known`.
-        let result = force_sync_account_changed_with_executor(
-            &rec,
-            dir.path(),
-            dir.path(),
-            Some(VALID_NEW_JSON),
-        );
+        let result = fixture_force_sync(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), false);
         assert!(
             matches!(result, Ok(ForcedSyncResult::AbsentWriteFailed)),
             "a write failure over a CONFIRMED-absent X must proceed without a mirror, not refuse — got {result:?}"
@@ -12053,14 +17928,15 @@ mod tests {";
         // S4: same reasoning as the `add` case above, for the delete path
         // (T3's "no siblings remain -> delete outright" branch).
         let old_raw = r#"{"claudeAiOauth":{"accessToken":"old","refreshToken":"old-rt","expiresAt":9999999999999}}"#;
-        let rec =
-            RecordingExecutor::scripted(RawContentClassification::Content(old_raw.to_string()));
+        let rec = RecordingExecutor::scripted(RawContentClassification::Content(
+            (old_raw.to_string()).into(),
+        ));
         rec.delete_ok.set(false);
         let dir = tempfile::tempdir().unwrap();
         seed_marker_matching(dir.path(), old_raw);
         // C-F2: `None` (positively non-Anthropic target), not an
         // expired-but-Anthropic FILE_JSON.
-        let result = force_sync_account_changed_with_executor(&rec, dir.path(), dir.path(), None);
+        let result = fixture_force_sync(&rec, dir.path(), dir.path(), None, false);
         assert!(
             matches!(result, Ok(ForcedSyncResult::WriteFailedUnknown)),
             "an unconfirmed delete over known content must be WriteFailedUnknown, not a silent success or a bare Err — got {result:?}"
@@ -12079,8 +17955,9 @@ mod tests {";
     #[test]
     fn c_f2_target_token_invalidated_refuses_not_strip() {
         let old_raw = r#"{"claudeAiOauth":{"accessToken":"old","refreshToken":"old-rt","expiresAt":9999999999999},"mcp":"keep"}"#;
-        let rec =
-            RecordingExecutor::scripted(RawContentClassification::Content(old_raw.to_string()));
+        let rec = RecordingExecutor::scripted(RawContentClassification::Content(
+            (old_raw.to_string()).into(),
+        ));
         let dir = tempfile::tempdir().unwrap();
         seed_marker_matching(dir.path(), old_raw);
         // FILE_JSON IS Anthropic-shaped (`claudeAiOauth` present) but its
@@ -12109,8 +17986,9 @@ mod tests {";
     #[test]
     fn c_f2_target_token_unparseable_expiry_refuses_not_strip() {
         let old_raw = r#"{"claudeAiOauth":{"accessToken":"old","refreshToken":"old-rt","expiresAt":9999999999999},"mcp":"keep"}"#;
-        let rec =
-            RecordingExecutor::scripted(RawContentClassification::Content(old_raw.to_string()));
+        let rec = RecordingExecutor::scripted(RawContentClassification::Content(
+            (old_raw.to_string()).into(),
+        ));
         let dir = tempfile::tempdir().unwrap();
         seed_marker_matching(dir.path(), old_raw);
         let unparseable_expiry = r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"rt"}}"#;
@@ -12138,27 +18016,31 @@ mod tests {";
     // `cfg!(test)`, same reasoning as `reconcile_keychain_to_marker`'s split.
     //
     // Real base/handle-dir topology (SIBLING dirs, real symlinks) —
-    // `handle_dir_symlinks_are_consistent` requires `.csq-account` AND
-    // `.credentials.json` in the handle dir to be SYMLINKS to
-    // `config-<slot>/.csq-account` / `config-<slot>/.credentials.json`
-    // (`seed_marker_matching` above writes plain files at the SAME path used
-    // as both base and handle dir, which this stricter check reports
-    // inconsistent — hence a dedicated fixture builder for the sweep).
+    // A real UUID-backed handle points credentials at the Known identity
+    // canonical and its marker at config-N. History/proof begin empty so
+    // authority-change tests cannot be masked by fixture seeding.
     #[cfg(target_os = "macos")]
     fn seed_sweep_fixture(base: &Path, slot: u16, canonical_raw: &str) -> PathBuf {
         let handle_dir = base.join(format!("term-{slot}00"));
-        std::fs::create_dir_all(&handle_dir).expect("create handle dir");
+        std::fs::create_dir_all(&handle_dir).unwrap();
         let cfg = base.join(format!("config-{slot}"));
-        std::fs::create_dir_all(&cfg).expect("create config dir");
-        std::fs::write(cfg.join(".credentials.json"), canonical_raw).expect("write canonical");
-        std::fs::write(cfg.join(".csq-account"), slot.to_string()).expect("write config marker");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let credential: CredentialFile = serde_json::from_str(canonical_raw).unwrap();
+        let identity = stage_known_fixture(
+            base,
+            AccountNum::try_from(slot).unwrap(),
+            &credential,
+            false,
+            false,
+        );
+        crate::accounts::markers::write_csq_account(&cfg, identity).unwrap();
         std::os::unix::fs::symlink(
-            cfg.join(".credentials.json"),
+            crate::accounts::identity_store::credentials_path_for(base, identity),
             handle_dir.join(".credentials.json"),
         )
-        .expect("symlink credentials");
+        .unwrap();
         std::os::unix::fs::symlink(cfg.join(".csq-account"), handle_dir.join(".csq-account"))
-            .expect("symlink marker");
+            .unwrap();
         handle_dir
     }
 
@@ -12173,7 +18055,7 @@ mod tests {";
         // with the fresh token.
         let pre_refresh_raw = r#"{"claudeAiOauth":{"accessToken":"pre-refresh-at","refreshToken":"pre-refresh-rt","expiresAt":1}}"#;
         let rec = RecordingExecutor::scripted(RawContentClassification::Content(
-            pre_refresh_raw.to_string(),
+            (pre_refresh_raw.to_string()).into(),
         ));
         let base = tempfile::tempdir().unwrap();
         let handle_dir = seed_sweep_fixture(base.path(), 1, VALID_NEW_JSON);
@@ -12204,8 +18086,9 @@ mod tests {";
         // login (e.g. CC self-refreshed it independently). The sweep must
         // NOT harvest (that is the custodian's job) and must NOT write.
         let foreign_raw = r#"{"claudeAiOauth":{"accessToken":"foreign-at","refreshToken":"foreign-rt","expiresAt":9999999999999}}"#;
-        let rec =
-            RecordingExecutor::scripted(RawContentClassification::Content(foreign_raw.to_string()));
+        let rec = RecordingExecutor::scripted(RawContentClassification::Content(
+            (foreign_raw.to_string()).into(),
+        ));
         let base = tempfile::tempdir().unwrap();
         let handle_dir = seed_sweep_fixture(base.path(), 1, VALID_NEW_JSON);
         let result =
@@ -12223,6 +18106,34 @@ mod tests {";
         );
     }
 
+    /// The unharvested-foreign-login WARN names WHICH session is stuck via the
+    /// non-secret `svc_hash` (the same 8-hex suffix `service_name` yields).
+    #[cfg(all(target_os = "macos", unix))]
+    #[test]
+    fn sweep_unharvested_warn_carries_the_session_svc_hash() {
+        let foreign_raw = r#"{"claudeAiOauth":{"accessToken":"foreign-at","refreshToken":"foreign-rt","expiresAt":9999999999999}}"#;
+        let rec = RecordingExecutor::scripted(RawContentClassification::Content(
+            (foreign_raw.to_string()).into(),
+        ));
+        let base = tempfile::tempdir().unwrap();
+        let handle_dir = seed_sweep_fixture(base.path(), 1, VALID_NEW_JSON);
+        let want = service_name(&handle_dir)
+            .rsplit('-')
+            .next()
+            .unwrap()
+            .to_string();
+        let (_, events) = capture_quarantine_events(|| {
+            sweep_sync_handle_dir_with_executor(&rec, base.path(), &handle_dir, &HashMap::new())
+        });
+        assert!(
+            events.contains(&(
+                "keychain_sweep_foreign_login_unharvested".to_string(),
+                want.clone()
+            )),
+            "expected the WARN to carry svc_hash={want}: {events:?}"
+        );
+    }
+
     #[cfg(all(target_os = "macos", unix))]
     #[test]
     fn sweep_skips_inconsistent_dirs() {
@@ -12230,7 +18141,7 @@ mod tests {";
         // report `false` — the sweep must skip before even resolving the
         // marker, let alone touching the keychain.
         let rec = RecordingExecutor::scripted(RawContentClassification::Content(
-            VALID_NEW_JSON.to_string(),
+            (VALID_NEW_JSON.to_string()).into(),
         ));
         let base = tempfile::tempdir().unwrap();
         let handle_dir = seed_sweep_fixture(base.path(), 1, VALID_NEW_JSON);
@@ -12339,6 +18250,38 @@ mod tests {";
             err.contains("earlier session") && err.contains("locked"),
             "expected the fixed stale-item message, got: {err}"
         );
+    }
+
+    // The two rule-3 refusals pin the account-scoped `csq login <n>`
+    // remedy, the ABSENCE of the dead message-refresh remedy (498baa8c +
+    // owner directive 2026-10-11: a message-refresh can never make
+    // recognition succeed for a login the custodian refuses to recognise),
+    // and never promise a timing ("within one refresh cycle" is false under
+    // the Dead TTL / budget).
+    #[test]
+    fn foreign_login_unharvested_swap_refusal_pins_remedies() {
+        let err = decide_swap_disposition(Ok(ForcedSyncResult::ForeignLoginUnharvested))
+            .expect_err("must refuse the swap");
+        assert!(err.contains("has not identified"), "{err}");
+        assert!(err.contains("for this account"), "{err}");
+        assert!(err.contains("`csq login <n>`"), "{err}");
+        assert!(err.contains("then retry;"), "{err}");
+        assert!(err.contains("different account"), "{err}");
+        assert!(!err.contains("send any message"), "{err}");
+        assert!(!err.contains("within one refresh cycle"), "{err}");
+    }
+
+    #[test]
+    fn foreign_login_unharvested_launch_refusal_pins_remedies() {
+        let err = decide_launch_disposition(Ok(ForcedSyncResult::ForeignLoginUnharvested))
+            .expect_err("must refuse the launch");
+        assert!(err.contains("has not identified"), "{err}");
+        assert!(err.contains("for this account"), "{err}");
+        assert!(err.contains("`csq login <n>`"), "{err}");
+        assert!(err.contains("then retry the launch"), "{err}");
+        assert!(err.contains("different account"), "{err}");
+        assert!(!err.contains("send any message"), "{err}");
+        assert!(!err.contains("within one refresh cycle"), "{err}");
     }
 
     // S5 — launch: a genuinely ABSENT item (exit 44) whose write fails
@@ -12524,6 +18467,58 @@ mod tests {";
         );
     }
 
+    #[test]
+    fn r6k_m2_disabled_or_nonmac_mirror_allows_expired_source() {
+        let _env = crate::platform::test_env::lock();
+        #[cfg(target_os = "macos")]
+        clear_test_keychain_executor();
+        let fixture = crate::testing::identity_fixtures::coexisting_fixture(2);
+        let base = fixture.path();
+        for (slot, expiry) in [(1u16, 1u64), (2, 4102444800000)] {
+            let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(slot);
+            let path = crate::accounts::identity_store::credentials_path_for(base, uuid);
+            let raw = format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"fixture-access-{slot}","refreshToken":"fixture-refresh-{slot}","expiresAt":{expiry}}}}}"#
+            );
+            let credential = serde_json::from_str(&raw).unwrap();
+            crate::credentials::file::save(&path, &credential).unwrap();
+        }
+        let handle = base.join("term-r6k-disabled");
+        std::fs::create_dir_all(&handle).unwrap();
+        crate::accounts::markers::write_csq_account(
+            &handle,
+            crate::testing::identity_fixtures::fixture_uuid_for_slot(1),
+        )
+        .unwrap();
+        let profiles = crate::accounts::profiles_lock::ProfilesFileLock::acquire(base).unwrap();
+        let target = crate::accounts::anthropic_identity::capture_anthropic_binding_locked(
+            &profiles,
+            base,
+            acct(2),
+        )
+        .unwrap();
+        let native =
+            crate::session::handle_dir::capture_native_swap_locked(&profiles, base, &handle)
+                .unwrap();
+        assert!(crate::session::handle_dir::native_swap_is_current_locked(
+            &profiles, base, &handle, &native, &target
+        ));
+        assert!(!matches!(
+            crate::accounts::identity_store::target_token_for_forced_write(base, acct(1)),
+            crate::accounts::identity_store::TargetToken::Valid(_)
+        ));
+        assert_eq!(
+            force_swap_write_before_repoint_locked(
+                &profiles, base, &handle, None, &target, &native
+            ),
+            Ok(ForcedSyncResult::Applied { wrote_token: false })
+        );
+        assert_eq!(
+            crate::accounts::markers::resolve_marker_to_slot(base, &handle),
+            Some(acct(1))
+        );
+    }
+
     // K3: the S7 pre-flight refusal's dedicated message — names the
     // blocked item AND folds in the reconcile outcome (D-F2), since the
     // v4 forced write into the keychain already ran before this refusal
@@ -12587,6 +18582,11 @@ mod tests {";
         )
         .expect("write identity credentials");
 
+        // Explicit synthetic known-context setup. The legacy fixture's email
+        // alone cannot authorize any current native mutation.
+        let canonical = crate::credentials::load(&identity_creds_path).unwrap();
+        stage_known_login_fixture(base, slot, &canonical, false);
+
         let handle_dir = base.join("term-reconcile-fixture");
         std::fs::create_dir_all(&handle_dir).unwrap();
         crate::accounts::markers::write_csq_account(&handle_dir, uuid)
@@ -12596,6 +18596,698 @@ mod tests {";
         (fixture, handle_dir, far_future)
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn r6k_m1_cleanup_preserves_mcp_oauth_siblings_after_confirmed_delete() {
+        let _env = crate::platform::test_env::lock();
+        let (fixture, handle, future) = reconcile_fixture();
+        let written = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"fixture-target-access","refreshToken":"fixture-target-refresh","expiresAt":{future}}}}}"#
+        );
+        let mut merged: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let mcp = serde_json::json!({"fixture-server": {"accessToken":"fixture-mcp-access", "refreshToken":"fixture-mcp-refresh"}});
+        merged["mcpOAuth"] = mcp.clone();
+        for add_fails in [false, true] {
+            let exec = ScriptedKeychainExecutor::scripted(RawContentClassification::Content(
+                merged.to_string().into(),
+            ));
+            let exec = if add_fails {
+                exec.with_add_failing()
+            } else {
+                exec
+            };
+            let result = clear_unconfirmed_rotation_write_with_executor(
+                &exec,
+                fixture.path(),
+                &handle,
+                ForcedWriteAttempt {
+                    account: acct(2),
+                    raw_json: Some(&written),
+                },
+            );
+            assert_eq!(
+                result,
+                Ok(true),
+                "a successful delete remains reported after restoration failure"
+            );
+            let calls = exec.calls();
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|(verb, _, _)| *verb == "delete")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                calls.iter().filter(|(verb, _, _)| *verb == "add").count(),
+                1
+            );
+            assert_eq!(
+                calls.iter().map(|(verb, _, _)| *verb).collect::<Vec<_>>(),
+                vec!["find", "find", "delete", "find", "find", "add"]
+            );
+            let restored: serde_json::Value = serde_json::from_str(
+                &exec
+                    .last_add_payload()
+                    .expect("siblings must be restored exactly once"),
+            )
+            .unwrap();
+            assert_eq!(restored["mcpOAuth"], mcp);
+            assert!(restored.get("claudeAiOauth").is_none());
+            if !add_fails {
+                let current = exec.find(&service_name(&handle), &keychain_account_for(&handle));
+                let RawContentClassification::Content(raw) = current else {
+                    panic!("MCP siblings were lost");
+                };
+                let persisted: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                assert_eq!(persisted["mcpOAuth"], mcp);
+                assert!(persisted.get("claudeAiOauth").is_none());
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn r6k_l1_cleanup_refuses_grant_rotated_on_immediate_reread() {
+        let _env = crate::platform::test_env::lock();
+        let (fixture, handle, future) = reconcile_fixture();
+        let written = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"fixture-attempt","refreshToken":"fixture-refresh","expiresAt":{future}}}}}"#
+        );
+        struct RotatesOnRead {
+            reads: std::cell::Cell<usize>,
+            attempted: RawContentClassification,
+            rotated: RawContentClassification,
+        }
+        impl KeychainExecutor for RotatesOnRead {
+            fn find(&self, _service: &str, _account: &str) -> RawContentClassification {
+                let read = self.reads.get();
+                self.reads.set(read + 1);
+                if read == 0 {
+                    self.attempted.clone()
+                } else {
+                    self.rotated.clone()
+                }
+            }
+            fn add(&self, _: &str, _: &str, _: &str) -> Result<(), PlatformError> {
+                panic!("rotated login must not be overwritten")
+            }
+            fn delete(&self, _: &str, _: &str) -> bool {
+                panic!("rotated login must not be deleted")
+            }
+        }
+        let rotated = written.replace("fixture-attempt", "fixture-refreshed");
+        let exec = RotatesOnRead {
+            reads: std::cell::Cell::new(0),
+            attempted: RawContentClassification::Content(written.clone().into()),
+            rotated: RawContentClassification::Content(rotated.into()),
+        };
+        assert_eq!(
+            clear_unconfirmed_rotation_write_with_executor(
+                &exec,
+                fixture.path(),
+                &handle,
+                ForcedWriteAttempt {
+                    account: acct(2),
+                    raw_json: Some(&written)
+                }
+            ),
+            Ok(false)
+        );
+        assert_eq!(
+            exec.reads.get(),
+            2,
+            "must check immediately before deleting"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn r7_cleanup_restores_first_verified_delete_read_siblings() {
+        let _env = crate::platform::test_env::lock();
+        let (fixture, handle, future) = reconcile_fixture();
+        let written = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"fixture-attempt","refreshToken":"fixture-refresh","expiresAt":{future}}}}}"#
+        );
+        let content = |sibling: &str| {
+            let mut value: serde_json::Value = serde_json::from_str(&written).unwrap();
+            value["mcpOAuth"] = serde_json::json!({"fixture-server": {"accessToken": sibling}});
+            RawContentClassification::Content(value.to_string().into())
+        };
+        struct DuplicateItems {
+            reads: std::cell::RefCell<std::collections::VecDeque<RawContentClassification>>,
+            deletes: std::cell::Cell<usize>,
+            adds: std::cell::Cell<usize>,
+            restored: std::cell::RefCell<Option<zeroize::Zeroizing<String>>>,
+        }
+        impl KeychainExecutor for DuplicateItems {
+            fn find(&self, _: &str, _: &str) -> RawContentClassification {
+                self.reads
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("unexpected native read")
+            }
+            fn delete(&self, _: &str, _: &str) -> bool {
+                self.deletes.set(self.deletes.get() + 1);
+                true
+            }
+            fn add(&self, _: &str, _: &str, _: &str) -> Result<(), PlatformError> {
+                panic!("cleanup must use create-only restoration")
+            }
+            fn add_create_only(
+                &self,
+                _: &str,
+                _: &str,
+                payload: &str,
+            ) -> Result<CreateOnlyOutcome, PlatformError> {
+                self.adds.set(self.adds.get() + 1);
+                assert_eq!(
+                    self.deletes.get(),
+                    2,
+                    "restore only after all duplicates are absent"
+                );
+                *self.restored.borrow_mut() = Some(payload.to_owned().into());
+                Ok(CreateOnlyOutcome::Created)
+            }
+        }
+        let exec = DuplicateItems {
+            reads: std::cell::RefCell::new(std::collections::VecDeque::from([
+                content("fixture-old"),
+                content("fixture-first-reread"),
+                content("fixture-exposed-duplicate"),
+                content("fixture-last-reread"),
+                RawContentClassification::Absent,
+                RawContentClassification::Absent,
+            ])),
+            deletes: std::cell::Cell::new(0),
+            adds: std::cell::Cell::new(0),
+            restored: std::cell::RefCell::new(None),
+        };
+        assert_eq!(
+            clear_unconfirmed_rotation_write_with_executor(
+                &exec,
+                fixture.path(),
+                &handle,
+                ForcedWriteAttempt {
+                    account: acct(2),
+                    raw_json: Some(&written)
+                }
+            ),
+            Ok(true)
+        );
+        assert_eq!(exec.deletes.get(), 2);
+        assert_eq!(exec.adds.get(), 1);
+        assert!(exec.reads.borrow().is_empty());
+        let restored = exec.restored.borrow();
+        let value: serde_json::Value = serde_json::from_str(restored.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            value["mcpOAuth"]["fixture-server"]["accessToken"], "fixture-first-reread",
+            "first verified delete read must supply the restored siblings"
+        );
+        assert!(value.get("claudeAiOauth").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn r3_auto_rotate_absent_write_failure_warns_fixed_tag() {
+        let _env = crate::platform::test_env::lock();
+        let _tracing = crate::testing::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        #[derive(Clone)]
+        struct Events(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        impl tracing::Subscriber for Events {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct Fields<'a>(&'a mut Vec<String>);
+                impl tracing::field::Visit for Fields<'_> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "error_kind" {
+                            self.0.push(format!("{value:?}"));
+                        }
+                    }
+                }
+                if *event.metadata().level() == tracing::Level::WARN {
+                    event.record(&mut Fields(&mut self.0.lock().unwrap()));
+                }
+            }
+        }
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(Events(events.clone()), || {
+            assert!(matches!(
+                decide_auto_rotate_disposition(Ok(ForcedSyncResult::AbsentWriteFailed)),
+                Ok(ForcedSyncResult::AbsentWriteFailed)
+            ));
+        });
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|tag| tag.contains("auto_rotate_absent_write_failed_proceeding")),
+            "absent-write failure must emit its fixed warning tag"
+        );
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn r3_cleanup_create_only_transport_preserves_duplicate_exit_45() {
+        let calls = std::cell::Cell::new(0);
+        let result = run_create_only_add("svc", "acct", "{}", |args, input| {
+            use std::os::unix::process::ExitStatusExt;
+            calls.set(calls.get() + 1);
+            assert_eq!(args, ["-i"], "create-only must issue no delete or update");
+            let input = input.expect("small payload must use stdin");
+            let input = String::from_utf8(input).unwrap();
+            assert!(input.starts_with("add-generic-password"));
+            assert!(!input.contains("delete-generic-password") && !input.contains(" -U"));
+            Some(BoundedOutput {
+                output: std::process::Output {
+                    status: std::process::ExitStatus::from_raw(45 << 8),
+                    stdout: vec![],
+                    stderr: b"duplicate".to_vec(),
+                },
+                stdout_complete: true,
+                stderr_complete: true,
+            })
+        });
+        assert_eq!(
+            result.unwrap(),
+            CreateOnlyOutcome::AlreadyExists,
+            "exit 45 must preserve the concurrent item"
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn r7_cleanup_transient_restore_read_still_uses_create_only() {
+        let _env = crate::platform::test_env::lock();
+        let (fixture, handle, future) = reconcile_fixture();
+        let written = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"fixture-target","refreshToken":"fixture-refresh","expiresAt":{future}}},"mcpOAuth":{{"fixture-server":{{"accessToken":"fixture-mcp"}}}}}}"#
+        );
+        struct TransientRestoreRead {
+            inner: ScriptedKeychainExecutor,
+            reads: std::cell::Cell<usize>,
+            deletes: std::cell::Cell<usize>,
+            creates: std::cell::Cell<usize>,
+        }
+        impl KeychainExecutor for TransientRestoreRead {
+            fn find(&self, svc: &str, account: &str) -> RawContentClassification {
+                let read = self.reads.get();
+                self.reads.set(read + 1);
+                if read == 3 {
+                    // A transport failure reveals nothing about the actually absent item.
+                    RawContentClassification::Unreadable(UnreadableKind::Transient)
+                } else {
+                    self.inner.find(svc, account)
+                }
+            }
+            fn delete(&self, svc: &str, account: &str) -> bool {
+                assert_eq!(self.creates.get(), 0, "no delete after create-only restore");
+                self.deletes.set(self.deletes.get() + 1);
+                self.inner.delete(svc, account)
+            }
+            fn add(&self, _: &str, _: &str, _: &str) -> Result<(), PlatformError> {
+                panic!("destructive restore must not be used")
+            }
+            fn add_create_only(
+                &self,
+                svc: &str,
+                account: &str,
+                payload: &str,
+            ) -> Result<CreateOnlyOutcome, PlatformError> {
+                self.creates.set(self.creates.get() + 1);
+                self.inner.add_create_only(svc, account, payload)
+            }
+        }
+        let exec = TransientRestoreRead {
+            inner: ScriptedKeychainExecutor::scripted(RawContentClassification::Content(
+                written.clone().into(),
+            )),
+            reads: std::cell::Cell::new(0),
+            deletes: std::cell::Cell::new(0),
+            creates: std::cell::Cell::new(0),
+        };
+        assert_eq!(
+            clear_unconfirmed_rotation_write_with_executor(
+                &exec,
+                fixture.path(),
+                &handle,
+                ForcedWriteAttempt {
+                    account: acct(2),
+                    raw_json: Some(&written),
+                },
+            ),
+            Ok(true),
+        );
+        assert_eq!(
+            exec.creates.get(),
+            1,
+            "transient restore read must still attempt create-only restoration"
+        );
+        assert_eq!(exec.deletes.get(), 1);
+        assert_eq!(exec.reads.get(), 4);
+        let restored = exec.inner.last_add_payload().expect("siblings restored");
+        let value: serde_json::Value = serde_json::from_str(&restored).unwrap();
+        assert_eq!(
+            value["mcpOAuth"]["fixture-server"]["accessToken"],
+            "fixture-mcp"
+        );
+        assert!(value.get("claudeAiOauth").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn r3_cleanup_restore_collision_preserves_live_item_without_retry() {
+        let _env = crate::platform::test_env::lock();
+        let (fixture, handle, future) = reconcile_fixture();
+        let written = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"fixture-target","refreshToken":"fixture-refresh","expiresAt":{future}}},"mcpOAuth":{{"fixture-server":{{"accessToken":"fixture-mcp"}}}}}}"#
+        );
+        struct Collision {
+            current: std::cell::RefCell<RawContentClassification>,
+            live: RawContentClassification,
+            deletes: std::cell::Cell<usize>,
+            creates: std::cell::Cell<usize>,
+        }
+        impl KeychainExecutor for Collision {
+            fn find(&self, _: &str, _: &str) -> RawContentClassification {
+                self.current.borrow().clone()
+            }
+            fn delete(&self, _: &str, _: &str) -> bool {
+                assert_eq!(
+                    self.creates.get(),
+                    0,
+                    "no delete after create-only collision"
+                );
+                self.deletes.set(self.deletes.get() + 1);
+                *self.current.borrow_mut() = RawContentClassification::Absent;
+                true
+            }
+            fn add(&self, _: &str, _: &str, _: &str) -> Result<(), PlatformError> {
+                panic!("destructive restore must not be used")
+            }
+            fn add_create_only(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<CreateOnlyOutcome, PlatformError> {
+                self.creates.set(self.creates.get() + 1);
+                *self.current.borrow_mut() = self.live.clone();
+                Ok(CreateOnlyOutcome::AlreadyExists)
+            }
+        }
+        let live = written.replace("fixture-target", "fixture-live-rotated");
+        let exec = Collision {
+            current: std::cell::RefCell::new(RawContentClassification::Content(
+                written.clone().into(),
+            )),
+            live: RawContentClassification::Content(live.clone().into()),
+            deletes: std::cell::Cell::new(0),
+            creates: std::cell::Cell::new(0),
+        };
+        assert_eq!(
+            clear_unconfirmed_rotation_write_with_executor(
+                &exec,
+                fixture.path(),
+                &handle,
+                ForcedWriteAttempt {
+                    account: acct(2),
+                    raw_json: Some(&written)
+                }
+            ),
+            Ok(true)
+        );
+        assert_eq!(exec.deletes.get(), 1);
+        assert_eq!(exec.creates.get(), 1);
+        assert!(
+            keychain_content_matches_token(&exec.current.borrow(), &live),
+            "live item must survive create-only collision"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_cleanup_after_delete(case: &str) {
+        let _env = crate::platform::test_env::lock();
+        let (fixture, handle, future) = reconcile_fixture();
+        let written = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"fixture-target","refreshToken":"fixture-refresh","expiresAt":{future}}},"mcpOAuth":{{"fixture-server":{{"accessToken":"fixture-first"}}}}}}"#
+        );
+        let content = RawContentClassification::Content(written.clone().into());
+        let absent = RawContentClassification::Absent;
+        let unreadable = RawContentClassification::Unreadable(UnreadableKind::Transient);
+        let foreign = RawContentClassification::Content(
+            written.replace("fixture-target", "fixture-foreign").into(),
+        );
+        let siblings = RawContentClassification::Content(
+            r#"{"mcpOAuth":{"fixture-server":{"accessToken":"fixture-live-mcp"}}}"#
+                .to_string()
+                .into(),
+        );
+        let queue = match case {
+            "marker_changed" => vec![
+                content.clone(),
+                content.clone(),
+                content.clone(),
+                absent.clone(),
+            ],
+            "item_unreadable" => vec![
+                content.clone(),
+                content.clone(),
+                content.clone(),
+                unreadable.clone(),
+                absent.clone(),
+            ],
+            "delete_unconfirmed" => {
+                vec![content.clone(), content.clone(), unreadable, absent.clone()]
+            }
+            "delete_refused" => vec![
+                content.clone(),
+                content.clone(),
+                content.clone(),
+                content.clone(),
+                absent.clone(),
+            ],
+            "cap" => {
+                let mut q = vec![content.clone(); 1 + 2 * MAX_DUPLICATE_DELETE_ITERATIONS as usize];
+                q.push(absent.clone());
+                q
+            }
+            "rotated" => vec![
+                content.clone(),
+                content.clone(),
+                content.clone(),
+                foreign.clone(),
+                foreign,
+            ],
+            "siblings_present" => {
+                vec![content.clone(), content.clone(), siblings.clone(), siblings]
+            }
+            "add_failure" => vec![content.clone(), content.clone(), absent.clone(), absent],
+            _ => panic!("unknown cleanup fixture"),
+        };
+        struct ExitFixture<'a> {
+            case: &'a str,
+            handle: &'a Path,
+            queue: std::cell::RefCell<std::collections::VecDeque<RawContentClassification>>,
+            state: std::cell::RefCell<RawContentClassification>,
+            reads: std::cell::Cell<usize>,
+            deletes: std::cell::Cell<usize>,
+            creates: std::cell::Cell<usize>,
+        }
+        impl KeychainExecutor for ExitFixture<'_> {
+            fn find(&self, _: &str, _: &str) -> RawContentClassification {
+                let n = self.reads.get();
+                self.reads.set(n + 1);
+                if self.case == "marker_changed" && n == 2 {
+                    crate::accounts::markers::write_csq_account(
+                        self.handle,
+                        crate::testing::identity_fixtures::fixture_uuid_for_slot(2),
+                    )
+                    .unwrap();
+                }
+                let next = self
+                    .queue
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("unexpected cleanup read");
+                *self.state.borrow_mut() = next.clone();
+                next
+            }
+            fn delete(&self, _: &str, _: &str) -> bool {
+                self.deletes.set(self.deletes.get() + 1);
+                if self.case == "delete_refused" && self.deletes.get() == 2 {
+                    return false;
+                }
+                *self.state.borrow_mut() = RawContentClassification::Absent;
+                true
+            }
+            fn add(&self, _: &str, _: &str, _: &str) -> Result<(), PlatformError> {
+                panic!("destructive restore must not be used")
+            }
+            fn add_create_only(
+                &self,
+                _: &str,
+                _: &str,
+                payload: &str,
+            ) -> Result<CreateOnlyOutcome, PlatformError> {
+                self.creates.set(self.creates.get() + 1);
+                assert!(matches!(
+                    *self.state.borrow(),
+                    RawContentClassification::Absent
+                ));
+                if self.case == "add_failure" {
+                    return Err(PlatformError::Keychain(
+                        "fixture_non_duplicate_failure".into(),
+                    ));
+                }
+                let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+                assert_eq!(
+                    v["mcpOAuth"]["fixture-server"]["accessToken"],
+                    "fixture-first"
+                );
+                assert!(v.get("claudeAiOauth").is_none());
+                *self.state.borrow_mut() =
+                    RawContentClassification::Content(payload.to_owned().into());
+                Ok(CreateOnlyOutcome::Created)
+            }
+        }
+        let exec = ExitFixture {
+            case,
+            handle: &handle,
+            queue: std::cell::RefCell::new(queue.into()),
+            state: std::cell::RefCell::new(content),
+            reads: std::cell::Cell::new(0),
+            deletes: std::cell::Cell::new(0),
+            creates: std::cell::Cell::new(0),
+        };
+        let expected_outcome = match case {
+            "marker_changed" => Err("auto_rotate_cleanup_marker_changed"),
+            "item_unreadable" => Err("auto_rotate_cleanup_item_unreadable"),
+            "delete_unconfirmed" | "delete_refused" | "cap" | "siblings_present" => {
+                Err("auto_rotate_cleanup_delete_unconfirmed")
+            }
+            "rotated" | "add_failure" => Ok(true),
+            _ => panic!("unknown cleanup fixture"),
+        };
+        assert_eq!(
+            clear_unconfirmed_rotation_write_with_executor(
+                &exec,
+                fixture.path(),
+                &handle,
+                ForcedWriteAttempt {
+                    account: acct(2),
+                    raw_json: Some(&written)
+                }
+            ),
+            expected_outcome,
+            "cleanup must preserve its specific post-delete outcome for {case}"
+        );
+        assert!(exec.deletes.get() >= 1);
+        assert!(exec.queue.borrow().is_empty());
+        let expected = usize::from(!matches!(case, "rotated" | "siblings_present"));
+        assert_eq!(
+            exec.creates.get(),
+            expected,
+            "every deletion exit must restore once only when absent"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn r3_cleanup_without_siblings_never_adds() {
+        let _env = crate::platform::test_env::lock();
+        let (fixture, handle, future) = reconcile_fixture();
+        let written = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"fixture-target","refreshToken":"fixture-refresh","expiresAt":{future}}}}}"#
+        );
+        let exec = ScriptedKeychainExecutor::scripted(RawContentClassification::Content(
+            written.clone().into(),
+        ));
+        assert_eq!(
+            clear_unconfirmed_rotation_write_with_executor(
+                &exec,
+                fixture.path(),
+                &handle,
+                ForcedWriteAttempt {
+                    account: acct(2),
+                    raw_json: Some(&written)
+                }
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            exec.calls()
+                .iter()
+                .filter(|(verb, _, _)| *verb == "add")
+                .count(),
+            0,
+            "nothing to restore must issue no add"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn r3_cleanup_after_delete_marker_changed() {
+        assert_cleanup_after_delete("marker_changed");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn r3_cleanup_after_delete_item_unreadable() {
+        assert_cleanup_after_delete("item_unreadable");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn r3_cleanup_after_delete_delete_unconfirmed() {
+        assert_cleanup_after_delete("delete_unconfirmed");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn r3_cleanup_after_delete_delete_refused() {
+        assert_cleanup_after_delete("delete_refused");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn r3_cleanup_after_delete_cap() {
+        assert_cleanup_after_delete("cap");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn r3_cleanup_after_delete_rotated() {
+        assert_cleanup_after_delete("rotated");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn r3_cleanup_after_delete_siblings_present() {
+        assert_cleanup_after_delete("siblings_present");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn r3_cleanup_after_delete_add_failure() {
+        assert_cleanup_after_delete("add_failure");
+    }
     /// PRIMARY DIRECTIVE rule 4 (superseding the pre-directive version of
     /// this test, which passed `None` for `forced_write` and expected an
     /// overwrite based on the OTHER account's token merely having an OLDER
@@ -12636,7 +19328,7 @@ mod tests {";
         // concurrent swap moving the marker back to account 1 before this
         // repoint's own failure triggered reconcile.
         let exec = RecordingExecutor::scripted(RawContentClassification::Content(
-            written_for_account_2.clone(),
+            (written_for_account_2.clone()).into(),
         ));
 
         let forced_write = Some(ForcedWriteAttempt {
@@ -12660,6 +19352,279 @@ mod tests {";
         );
     }
 
+    /// Target token force-written for account 2 while the marker still names
+    /// account 1 (the repoint was refused as busy). Returns the executor and
+    /// the forced-write JSON.
+    #[cfg(target_os = "macos")]
+    fn reconcile_busy_scenario(far_future: u64) -> (RecordingExecutor, String) {
+        let written_for_account_2 = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"ACCT-2-TOKEN","refreshToken":"ACCT-2-REFRESH","expiresAt":{}}}}}"#,
+            far_future + 60_000
+        );
+        let exec = RecordingExecutor::scripted(RawContentClassification::Content(
+            written_for_account_2.clone().into(),
+        ));
+        (exec, written_for_account_2)
+    }
+
+    /// N-1: the profiles lock is busy when reconcile starts (the repoint was
+    /// refused as busy by the same holder) but frees within the bounded wait.
+    /// Reconcile must wait and move the keychain back to the source account.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reconcile_waits_for_busy_profiles_lock_and_restores_source_token() {
+        let (fixture, handle_dir, far_future) = reconcile_fixture();
+        let base = fixture.path();
+        let (exec, written) = reconcile_busy_scenario(far_future);
+        let forced_write = Some(ForcedWriteAttempt {
+            account: crate::types::AccountNum::try_from(2u16).unwrap(),
+            raw_json: Some(written.as_str()),
+        });
+
+        let held = crate::accounts::profiles_lock::ProfilesFileLock::acquire(base)
+            .expect("hold profiles lock");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+        let outcome = reconcile_keychain_to_marker_with_wait(
+            &exec,
+            base,
+            &handle_dir,
+            forced_write,
+            100,
+            std::time::Duration::from_millis(50),
+        );
+        releaser.join().expect("releaser thread");
+        assert_eq!(
+            outcome,
+            ReconcileOutcome::Reconciled {
+                marker_account: crate::types::AccountNum::try_from(1u16).unwrap()
+            }
+        );
+        let payload = exec
+            .last_add_payload()
+            .expect("reconcile must have restored the source token");
+        assert!(payload.contains("MARKER-ACCOUNT-TOKEN"), "got: {payload}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn r3dt_reconcile_waits_for_authority_contention_after_native_read() {
+        struct ContendedFind {
+            inner: RecordingExecutor,
+            base: std::path::PathBuf,
+            first: std::cell::Cell<bool>,
+            releaser: std::cell::RefCell<Option<std::thread::JoinHandle<()>>>,
+        }
+        impl KeychainExecutor for ContendedFind {
+            fn find(&self, svc: &str, account: &str) -> RawContentClassification {
+                if self.first.replace(false) {
+                    let held =
+                        crate::accounts::profiles_lock::ProfilesFileLock::acquire(&self.base)
+                            .unwrap();
+                    *self.releaser.borrow_mut() = Some(std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        drop(held);
+                    }));
+                }
+                self.inner.find(svc, account)
+            }
+            fn add(&self, svc: &str, account: &str, raw: &str) -> Result<(), PlatformError> {
+                self.inner.add(svc, account, raw)
+            }
+            fn delete(&self, svc: &str, account: &str) -> bool {
+                self.inner.delete(svc, account)
+            }
+        }
+        let (fixture, handle, expiry) = reconcile_fixture();
+        let (inner, written) = reconcile_busy_scenario(expiry);
+        let exec = ContendedFind {
+            inner,
+            base: fixture.path().to_path_buf(),
+            first: std::cell::Cell::new(true),
+            releaser: Default::default(),
+        };
+        let result = reconcile_keychain_to_marker_with_wait(
+            &exec,
+            fixture.path(),
+            &handle,
+            Some(ForcedWriteAttempt {
+                account: AccountNum::try_from(2u16).unwrap(),
+                raw_json: Some(&written),
+            }),
+            100,
+            std::time::Duration::from_millis(50),
+        );
+        exec.releaser.borrow_mut().take().unwrap().join().unwrap();
+        assert_eq!(
+            result,
+            ReconcileOutcome::Reconciled {
+                marker_account: AccountNum::try_from(1u16).unwrap()
+            }
+        );
+        assert!(exec
+            .inner
+            .last_add_payload()
+            .unwrap()
+            .contains("MARKER-ACCOUNT-TOKEN"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn r3dt_reconcile_refuses_marker_changed_during_custody_wait() {
+        let (fixture, handle, expiry) = reconcile_fixture();
+        let (exec, written) = reconcile_busy_scenario(expiry);
+        let held =
+            crate::accounts::profiles_lock::ProfilesFileLock::acquire(fixture.path()).unwrap();
+        let moved_handle = handle.clone();
+        let mover = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            crate::accounts::markers::write_csq_account_legacy(
+                &moved_handle,
+                AccountNum::try_from(2u16).unwrap(),
+            )
+            .unwrap();
+            drop(held);
+        });
+        let result = reconcile_keychain_to_marker_with_wait(
+            &exec,
+            fixture.path(),
+            &handle,
+            Some(ForcedWriteAttempt {
+                account: AccountNum::try_from(2u16).unwrap(),
+                raw_json: Some(&written),
+            }),
+            100,
+            std::time::Duration::from_millis(50),
+        );
+        mover.join().unwrap();
+        assert_eq!(
+            result,
+            ReconcileOutcome::KeychainUnknown {
+                marker_account: AccountNum::try_from(1u16).unwrap(),
+                reason: KeychainUnknownReason::ForeignLogin
+            }
+        );
+        assert!(exec.calls().iter().all(|(op, _, _)| *op == "find"));
+        assert!(exec.last_add_payload().is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn r3dt_held_profile_force_and_reconcile_preserve_owner_verified_ancestry() {
+        let (fixture, handle, _) = reconcile_fixture();
+        let base = fixture.path();
+        let slot = AccountNum::try_from(1u16).unwrap();
+        let binding =
+            crate::accounts::anthropic_identity::capture_anthropic_binding(base, slot).unwrap();
+        let path = crate::accounts::identity_store::credentials_path_for(base, binding.identity());
+        let old_raw = std::fs::read_to_string(&path).unwrap();
+        let old: crate::credentials::CredentialFile = serde_json::from_str(&old_raw).unwrap();
+        let proof = crate::accounts::anthropic_identity::verify_anthropic_context_with(
+            old.anthropic().unwrap(),
+            &fixture_profile_http(&old),
+        )
+        .unwrap();
+        assert!(matches!(
+            crate::credentials::token_history::record_owner_verified_v2(base, &binding, &proof),
+            crate::credentials::token_history::OwnerVerifiedRecord::Written
+        ));
+        let mut raw: serde_json::Value = serde_json::from_str(&old_raw).unwrap();
+        raw["claudeAiOauth"]["accessToken"] = serde_json::json!("fake-r3dt-new-access");
+        raw["claudeAiOauth"]["refreshToken"] = serde_json::json!("fake-r3dt-new-refresh");
+        let new_raw = serde_json::to_string(&raw).unwrap();
+        crate::credentials::file::save(
+            &path,
+            &serde_json::from_value::<crate::credentials::CredentialFile>(raw).unwrap(),
+        )
+        .unwrap();
+        let held = crate::accounts::profiles_lock::ProfilesFileLock::acquire(base).unwrap();
+        let binding = crate::accounts::anthropic_identity::capture_anthropic_binding_locked(
+            &held, base, slot,
+        )
+        .unwrap();
+        let native =
+            crate::session::handle_dir::capture_native_swap_locked(&held, base, &handle).unwrap();
+        for force in [true, false] {
+            let exec = RecordingExecutor::scripted(RawContentClassification::Content(
+                old_raw.clone().into(),
+            ));
+            if force {
+                assert!(matches!(
+                    force_sync_inner_with_profiles(
+                        &exec,
+                        base,
+                        &handle,
+                        Some(&new_raw),
+                        false,
+                        ForceProfileAuthority {
+                            profiles: Some(&held),
+                            target_binding: Some(&binding),
+                            native_capture: Some(&native)
+                        }
+                    ),
+                    Ok(ForcedSyncResult::Applied { wrote_token: true })
+                ));
+            } else {
+                assert_eq!(
+                    reconcile_keychain_to_marker_with_profiles(
+                        &exec,
+                        base,
+                        &handle,
+                        None,
+                        (1, std::time::Duration::ZERO),
+                        Some(&held)
+                    ),
+                    ReconcileOutcome::Reconciled {
+                        marker_account: slot
+                    }
+                );
+            }
+            assert!(exec
+                .last_add_payload()
+                .unwrap()
+                .contains("fake-r3dt-new-access"));
+        }
+    }
+
+    /// N-1: the lock stays held past the bounded wait. The outcome is the
+    /// distinct retryable `ProfilesBusy`, never `ForeignLogin`, and the
+    /// keychain is not mutated.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reconcile_reports_profiles_busy_when_lock_outlasts_the_wait() {
+        let (fixture, handle_dir, far_future) = reconcile_fixture();
+        let base = fixture.path();
+        let (exec, written) = reconcile_busy_scenario(far_future);
+        let forced_write = Some(ForcedWriteAttempt {
+            account: crate::types::AccountNum::try_from(2u16).unwrap(),
+            raw_json: Some(written.as_str()),
+        });
+
+        let _held = crate::accounts::profiles_lock::ProfilesFileLock::acquire(base)
+            .expect("hold profiles lock");
+        let outcome = reconcile_keychain_to_marker_with_wait(
+            &exec,
+            base,
+            &handle_dir,
+            forced_write,
+            3,
+            std::time::Duration::from_millis(10),
+        );
+        assert_eq!(
+            outcome,
+            ReconcileOutcome::KeychainUnknown {
+                marker_account: crate::types::AccountNum::try_from(1u16).unwrap(),
+                reason: KeychainUnknownReason::ProfilesBusy,
+            }
+        );
+        assert!(exec.last_add_payload().is_none(), "no write while busy");
+        let line = reconcile_outcome_operator_line(&outcome, None);
+        assert!(line.contains("retry"), "got: {line}");
+        assert!(!line.contains("did not write"), "got: {line}");
+    }
+
     /// D-F3 / directive rule 1: X holds real JSON content, but it has NO
     /// `claudeAiOauth` key at all (e.g. a mirror of another service's
     /// sibling item, or a plain `{}`) — this holds no login, so it is free
@@ -12672,7 +19637,7 @@ mod tests {";
         let base = fixture.path();
 
         let exec = RecordingExecutor::scripted(RawContentClassification::Content(
-            r#"{"otherService":{"someKey":"someValue"}}"#.to_string(),
+            (r#"{"otherService":{"someKey":"someValue"}}"#.to_string()).into(),
         ));
         let outcome = reconcile_keychain_to_marker_with_executor(&exec, base, &handle_dir, None);
         assert_eq!(
@@ -12707,7 +19672,7 @@ mod tests {";
             r#"{{"claudeAiOauth":{{"accessToken":"MARKER-ACCOUNT-TOKEN","refreshToken":"MARKER-ACCOUNT-REFRESH","expiresAt":{far_future}}}}}"#
         );
         let exec = RecordingExecutor::scripted(RawContentClassification::Content(
-            identical_to_marker_file,
+            (identical_to_marker_file).into(),
         ));
 
         let outcome = reconcile_keychain_to_marker_with_executor(&exec, base, &handle_dir, None);
@@ -12748,9 +19713,9 @@ mod tests {";
         let base = fixture.path();
 
         let newer_than_file = far_future + 60_000;
-        let exec = RecordingExecutor::scripted(RawContentClassification::Content(format!(
+        let exec = RecordingExecutor::scripted(RawContentClassification::Content((format!(
             r#"{{"claudeAiOauth":{{"accessToken":"SELF-REFRESHED-TOKEN","refreshToken":"SELF-REFRESHED-REFRESH","expiresAt":{newer_than_file}}}}}"#
-        )));
+        )).into()));
 
         let outcome = reconcile_keychain_to_marker_with_executor(&exec, base, &handle_dir, None);
         assert_eq!(
@@ -12777,21 +19742,9 @@ mod tests {";
         );
     }
 
-    /// `keychain-fix-r8.md` C-F7 (reconcile half): the marker account's OWN
-    /// canonical token is untrusted (expired), AND X holds EXACTLY the token
-    /// THIS call itself force-wrote for a DIFFERENT account (2). That token
-    /// is already recorded, safely, in account 2's own canonical store, so
-    /// stripping X here loses nothing — leaving it in place instead would
-    /// strand the terminal silently reading account 2's token while csq
-    /// reports only "marker account (1) untrusted".
-    ///
-    /// RED proof (pre-fix code): this scenario returned
-    /// `KeychainUnknown { reason: MarkerTokenUntrusted }` with ZERO mutation
-    /// — X was left holding `ACCT-2-TOKEN` indefinitely. Quoted failure
-    /// against that code:
-    ///   assertion `left == right` failed
-    ///     left: KeychainUnknown { marker_account: AccountNum(1), reason: MarkerTokenUntrusted }
-    ///    right: Reconciled { marker_account: AccountNum(1) }
+    /// Historical C-F7 raw-force-write attribution cannot authorize native
+    /// deletion when current marker identity authority is untrusted. Preserve
+    /// the foreign bytes and report refusal, even if this call wrote them.
     #[cfg(target_os = "macos")]
     #[test]
     fn reconcile_strips_csq_written_token_when_marker_account_untrusted() {
@@ -12822,7 +19775,7 @@ mod tests {";
             r#"{{"claudeAiOauth":{{"accessToken":"ACCT-2-TOKEN","refreshToken":"ACCT-2-REFRESH","expiresAt":{far_future}}}}}"#
         );
         let exec = RecordingExecutor::scripted(RawContentClassification::Content(
-            written_for_account_2.clone(),
+            (written_for_account_2.clone()).into(),
         ));
         let forced_write = Some(ForcedWriteAttempt {
             account: crate::types::AccountNum::try_from(2u16).unwrap(),
@@ -12833,20 +19786,26 @@ mod tests {";
             reconcile_keychain_to_marker_with_executor(&exec, base, &handle_dir, forced_write);
         assert_eq!(
             outcome,
-            ReconcileOutcome::Reconciled {
-                marker_account: crate::types::AccountNum::try_from(1u16).unwrap()
+            ReconcileOutcome::KeychainUnknown {
+                marker_account: crate::types::AccountNum::try_from(1u16).unwrap(),
+                reason: KeychainUnknownReason::MarkerTokenUntrusted,
             },
-            "a csq_written token must be STRIPPED, not left as MarkerTokenUntrusted"
+            "recorded raw force-write bytes cannot authorize stripping an untrusted identity"
         );
         let calls = exec.calls();
         assert!(
-            calls.iter().any(|(v, ..)| *v == "delete"),
-            "the wrong-account token has no siblings, so the strip must delete X, got {calls:?}"
+            calls.iter().all(|(v, ..)| *v != "delete"),
+            "native content must remain intact without typed current authority, got {calls:?}"
         );
         assert!(
             calls.iter().all(|(v, ..)| *v != "add"),
             "no siblings to preserve — must never re-add a rewritten payload, got {calls:?}"
         );
+        assert_eq!(
+            *exec.find_result.borrow(),
+            RawContentClassification::Content(written_for_account_2.into())
+        );
+        assert_eq!(exec.items_remaining.get(), 1);
     }
 
     /// The marker account's own token is untrusted and X is an emptied
@@ -12873,7 +19832,8 @@ mod tests {";
         crate::accounts::markers::write_csq_account(&handle_dir, uuid)
             .expect("write .csq-account marker");
         let exec = RecordingExecutor::scripted(RawContentClassification::Content(
-            r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}"#.to_string(),
+            (r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}"#.to_string())
+                .into(),
         ));
         let outcome = reconcile_keychain_to_marker_with_executor(&exec, base, &handle_dir, None);
         assert!(
@@ -12894,11 +19854,9 @@ mod tests {";
     fn decide_and_clear_dead_handle_deletes_known_token() {
         // X holds EXACTLY the marker account's own canonical token —
         // known, safe to delete, no adopt attempt needed.
-        let (fixture, handle_dir, _far_future) = reconcile_fixture();
+        let (fixture, handle_dir, far_future) = reconcile_fixture();
         let base = fixture.path();
-        let exec = RecordingExecutor::scripted(RawContentClassification::Content(
-            r#"{"claudeAiOauth":{"accessToken":"MARKER-ACCOUNT-TOKEN","refreshToken":"MARKER-ACCOUNT-REFRESH","expiresAt":4102444800000}}"#.to_string(),
-        ));
+        let exec = RecordingExecutor::scripted(RawContentClassification::Content(format!(r#"{{"claudeAiOauth":{{"accessToken":"MARKER-ACCOUNT-TOKEN","refreshToken":"MARKER-ACCOUNT-REFRESH","expiresAt":{far_future}}}}}"#).into()));
         let result =
             decide_and_clear_dead_handle_with_executor(&exec, base, &handle_dir, &|_, _| {
                 panic!("try_adopt must not be called for a KNOWN token")
@@ -12923,15 +19881,24 @@ mod tests {";
         // A token that matches NEITHER the marker's canonical file NOR its
         // history — an unmatched but structurally valid Anthropic login.
         let unmatched = r#"{"claudeAiOauth":{"accessToken":"UNMATCHED-TOKEN","refreshToken":"UNMATCHED-REFRESH","expiresAt":4102444800000}}"#;
-        let exec =
-            RecordingExecutor::scripted(RawContentClassification::Content(unmatched.to_string()));
+        let exec = RecordingExecutor::scripted(RawContentClassification::Content(
+            (unmatched.to_string()).into(),
+        ));
         let adopt_calls = std::cell::Cell::new(0);
         let result =
             decide_and_clear_dead_handle_with_executor(&exec, base, &handle_dir, &|acct, cand| {
                 adopt_calls.set(adopt_calls.get() + 1);
                 assert_eq!(acct, crate::types::AccountNum::try_from(1u16).unwrap());
                 assert!(cand.raw_json.contains("UNMATCHED-TOKEN"));
-                true // simulate a confirmed adopt
+                let identity =
+                    crate::accounts::profiles::resolve_slot_to_uuid(base, acct.get()).unwrap();
+                crate::credentials::file::save(
+                    &crate::accounts::identity_store::credentials_path_for(base, identity),
+                    &serde_json::from_str::<crate::credentials::CredentialFile>(&cand.raw_json)
+                        .unwrap(),
+                )
+                .unwrap();
+                true // confirmed adoption includes durable exact-pair storage
             });
         assert_eq!(
             result,
@@ -12956,8 +19923,9 @@ mod tests {";
         let (fixture, handle_dir, _far_future) = reconcile_fixture();
         let base = fixture.path();
         let unmatched = r#"{"claudeAiOauth":{"accessToken":"UNMATCHED-TOKEN","refreshToken":"UNMATCHED-REFRESH","expiresAt":4102444800000}}"#;
-        let exec =
-            RecordingExecutor::scripted(RawContentClassification::Content(unmatched.to_string()));
+        let exec = RecordingExecutor::scripted(RawContentClassification::Content(
+            (unmatched.to_string()).into(),
+        ));
         let result =
             decide_and_clear_dead_handle_with_executor(&exec, base, &handle_dir, &|_, _| false);
         assert_eq!(
@@ -12999,27 +19967,32 @@ mod tests {";
     // their decide-gated strip through `apply_dead_handle_strip`. The N1
     // regression (security review 1386: `security delete-generic-password`
     // removes exactly ONE matching item per call) applies here exactly as
-    // it does to the legacy `drain_service_inner` path — these pin that
-    // this decide-gated path drains duplicates too, scoped to the SAME
-    // svc+account throughout, never a blind by-service-only match.
+    // it does to the legacy `drain_service_inner` path. Ownership of the
+    // first item does not prove a subsequent item's ownership: preserve
+    // remaining content and report unconfirmed, scoped to the SAME pair.
 
     #[cfg(target_os = "macos")]
     #[test]
     fn apply_dead_handle_strip_drains_duplicate_item_under_same_service() {
         let unmatched = r#"{"claudeAiOauth":{"accessToken":"UNMATCHED-TOKEN","refreshToken":"UNMATCHED-REFRESH","expiresAt":4102444800000}}"#;
-        let x = RawContentClassification::Content(unmatched.to_string());
+        let x = RawContentClassification::Content((unmatched.to_string()).into());
         // Two never-consolidated items resident under this one service — a
         // single delete call only removes ONE of them.
         let exec = RecordingExecutor::scripted(x.clone()).with_duplicate_items(2);
         let result = apply_dead_handle_strip(&exec, "svc-x", "acct-x", &x);
-        assert_eq!(result, Ok(true));
+        assert_eq!(result, Err(KeychainClearUnconfirmed));
         let calls = exec.calls();
         let delete_count = calls.iter().filter(|(v, ..)| *v == "delete").count();
         assert_eq!(
-            delete_count, 2,
-            "must delete BOTH duplicate items, not stop after the first \
-             confirmed delete, got {calls:?}"
+            delete_count, 1,
+            "only the classified first item may be deleted, got {calls:?}"
         );
+        assert_eq!(
+            exec.items_remaining.get(),
+            1,
+            "unproved duplicate must remain"
+        );
+        assert_eq!(*exec.find_result.borrow(), x);
         assert!(
             calls
                 .iter()
@@ -13036,7 +20009,7 @@ mod tests {";
         // steady-state case with no duplicate: the drain's first re-`find`
         // must observe `Absent` and stop, costing exactly one extra call.
         let known = r#"{"claudeAiOauth":{"accessToken":"MARKER-ACCOUNT-TOKEN","refreshToken":"MARKER-ACCOUNT-REFRESH","expiresAt":4102444800000}}"#;
-        let x = RawContentClassification::Content(known.to_string());
+        let x = RawContentClassification::Content((known.to_string()).into());
         let exec = RecordingExecutor::scripted(x.clone());
         let result = apply_dead_handle_strip(&exec, "svc-x", "acct-x", &x);
         assert_eq!(result, Ok(true));
@@ -13056,7 +20029,7 @@ mod tests {";
         // `delete`) — the drain must never re-find/re-delete that.
         let with_sibling =
             r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"rt"},"mcp":"keep"}"#;
-        let x = RawContentClassification::Content(with_sibling.to_string());
+        let x = RawContentClassification::Content((with_sibling.to_string()).into());
         let exec = RecordingExecutor::scripted(x.clone()).with_duplicate_items(2);
         let result = apply_dead_handle_strip(&exec, "svc-x", "acct-x", &x);
         assert_eq!(result, Ok(true));
@@ -13072,15 +20045,11 @@ mod tests {";
     #[cfg(target_os = "macos")]
     #[test]
     fn apply_dead_handle_strip_drain_bounded_and_unconfirmed_on_budget_exhaustion() {
-        // An adversarial/pathological service that never reaches confirmed-
-        // absent must not loop forever — bounded, and reports the ORIGINAL
-        // clear as `Ok(true)` (the first item WAS confirmed gone) while the
-        // caller cannot claim the drain is fully clean is not observable
-        // from this function's own `bool` return — the drain's exhaustion
-        // is reported via `Err`, taking priority over the already-applied
-        // first strip.
+        // A large duplicate population must remain unconfirmed after the
+        // initial classified item is deleted. A previous iteration budget
+        // does not confer ownership on any remaining item.
         let unmatched = r#"{"claudeAiOauth":{"accessToken":"UNMATCHED-TOKEN","refreshToken":"UNMATCHED-REFRESH","expiresAt":4102444800000}}"#;
-        let x = RawContentClassification::Content(unmatched.to_string());
+        let x = RawContentClassification::Content((unmatched.to_string()).into());
         // More duplicates than the iteration budget can drain.
         let exec = RecordingExecutor::scripted(x.clone())
             .with_duplicate_items(MAX_DUPLICATE_DELETE_ITERATIONS + 10);
@@ -13088,13 +20057,229 @@ mod tests {";
         assert_eq!(
             result,
             Err(KeychainClearUnconfirmed),
-            "budget exhaustion must report unconfirmed, never silent success"
+            "unproved remaining content must report unconfirmed"
         );
         let delete_count = exec.calls().iter().filter(|(v, ..)| *v == "delete").count();
         assert_eq!(
-            delete_count,
-            1 + MAX_DUPLICATE_DELETE_ITERATIONS as usize,
-            "1 from the initial apply + the bounded drain loop's own budget"
+            delete_count, 1,
+            "only the initially classified item may be deleted"
+        );
+        assert_eq!(
+            exec.items_remaining.get(),
+            MAX_DUPLICATE_DELETE_ITERATIONS + 9
+        );
+        assert_eq!(
+            exec.calls().iter().filter(|(v, ..)| *v == "find").count(),
+            1
+        );
+    }
+
+    // ── S2-2: the queued retry's final step runs under the term mint lock ──
+
+    /// A `RecordingExecutor` whose first reads are scripted (the decision read,
+    /// then the gate's re-read) and whose `delete` can run a hook.
+    #[cfg(target_os = "macos")]
+    struct GateExec {
+        inner: RecordingExecutor,
+        reads: std::cell::RefCell<std::collections::VecDeque<RawContentClassification>>,
+        on_delete: std::cell::RefCell<Option<Box<dyn FnMut()>>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl GateExec {
+        fn new(reads: Vec<RawContentClassification>, fallback: &str) -> Self {
+            Self {
+                inner: RecordingExecutor::scripted(RawContentClassification::Content(
+                    fallback.to_string().into(),
+                )),
+                reads: std::cell::RefCell::new(reads.into()),
+                on_delete: std::cell::RefCell::new(None),
+            }
+        }
+        fn deletes(&self) -> usize {
+            self.inner
+                .calls()
+                .iter()
+                .filter(|(v, ..)| *v == "delete")
+                .count()
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl KeychainExecutor for GateExec {
+        fn find(&self, svc: &str, account: &str) -> RawContentClassification {
+            let fallback = self.inner.find(svc, account);
+            self.reads.borrow_mut().pop_front().unwrap_or(fallback)
+        }
+        fn add(&self, svc: &str, account: &str, payload: &str) -> Result<(), PlatformError> {
+            self.inner.add(svc, account, payload)
+        }
+        fn delete(&self, svc: &str, account: &str) -> bool {
+            if let Some(hook) = self.on_delete.borrow_mut().as_mut() {
+                hook();
+            }
+            self.inner.delete(svc, account)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn marker_login(far_future: u64) -> String {
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"MARKER-ACCOUNT-TOKEN","refreshToken":"MARKER-ACCOUNT-REFRESH","expiresAt":{far_future}}}}}"#
+        )
+    }
+
+    /// Run the queued retry's decision through the mint gate against `exec`.
+    #[cfg(target_os = "macos")]
+    fn gated_retry(
+        exec: &GateExec,
+        base: &Path,
+        svc: &str,
+    ) -> Result<bool, KeychainClearUnconfirmed> {
+        let acct = crate::types::AccountNum::try_from(1u16).unwrap();
+        let gated = MintGatedExecutor::new(exec, base, svc, None);
+        decide_and_clear_queued_service_with_executor(
+            &gated,
+            base,
+            svc,
+            Some(acct),
+            None,
+            None,
+            &|_, _| panic!("a known token needs no adopt"),
+        )
+    }
+
+    /// A live `term-<pid>` dir under `base` and the service csq mints for it.
+    #[cfg(target_os = "macos")]
+    fn live_term_dir_service(base: &Path) -> String {
+        let handle = base.join("term-4100000");
+        std::fs::create_dir_all(&handle).unwrap();
+        crate::accounts::markers::write_live_pid(&handle, std::process::id()).unwrap();
+        service_name(&std::fs::canonicalize(&handle).unwrap())
+    }
+
+    /// RED against a retry with no gate: a reused pid's NEW `term-<pid>` exists
+    /// when the delete is reached (it appeared after the retry's own early
+    /// check), so the delete must not run. Mutant: drop the live check in
+    /// `under_mint_after_live_check` and `deletes()` is 1.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_queued_retry_keeps_the_item_when_a_live_dir_appears_before_the_delete() {
+        let (fixture, _handle_dir, far_future) = reconcile_fixture();
+        let base = fixture.path();
+        let svc = live_term_dir_service(base);
+        let login = marker_login(far_future);
+        let read = RawContentClassification::Content(login.clone().into());
+        let exec = GateExec::new(vec![read.clone(), read], &login);
+        let result = gated_retry(&exec, base, &svc);
+        assert_ne!(result, Ok(true), "the item was cleared under a live dir");
+        assert_eq!(exec.deletes(), 0, "{:?}", exec.inner.calls());
+    }
+
+    /// S2-1's sibling: the item's bytes changed between the decision read and
+    /// the delete (a live Claude Code rotated its login), so it must be kept.
+    /// Mutant: drop the byte-equality check in `MintGatedExecutor::gated`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_queued_retry_keeps_an_item_whose_bytes_changed_since_the_decision_read() {
+        let (fixture, _handle_dir, far_future) = reconcile_fixture();
+        let base = fixture.path();
+        let svc = "Claude Code-credentials-0000feed";
+        let login = marker_login(far_future);
+        let rotated = login.replace("MARKER-ACCOUNT-REFRESH", "ROTATED-REFRESH");
+        let exec = GateExec::new(
+            vec![
+                RawContentClassification::Content(login.clone().into()),
+                RawContentClassification::Content(rotated.into()),
+            ],
+            &login,
+        );
+        let result = gated_retry(&exec, base, svc);
+        assert_ne!(result, Ok(true));
+        assert_eq!(exec.deletes(), 0, "{:?}", exec.inner.calls());
+    }
+
+    /// The delete happens UNDER the mint lock (a creator on another thread
+    /// cannot take it while the delete runs), and unchanged bytes still delete.
+    /// Mutant: take no lock in `under_mint_after_live_check`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_queued_retry_deletes_only_while_holding_the_mint_lock() {
+        let (fixture, _handle_dir, far_future) = reconcile_fixture();
+        let base = fixture.path();
+        let svc = "Claude Code-credentials-0000feed";
+        let login = marker_login(far_future);
+        let read = RawContentClassification::Content(login.clone().into());
+        let exec = GateExec::new(vec![read.clone(), read], &login);
+        let held = std::rc::Rc::new(std::cell::Cell::new(None));
+        let (hook_held, hook_base) = (std::rc::Rc::clone(&held), base.to_path_buf());
+        *exec.on_delete.borrow_mut() = Some(Box::new(move || {
+            let b = hook_base.clone();
+            hook_held.set(Some(
+                std::thread::spawn(move || {
+                    matches!(
+                        crate::session::term_mint::try_acquire_for_sweep(&b),
+                        crate::session::term_mint::SweepLock::Busy
+                    )
+                })
+                .join()
+                .unwrap(),
+            ));
+        }));
+        assert_eq!(gated_retry(&exec, base, svc), Ok(true));
+        assert_eq!(exec.deletes(), 1);
+        assert_eq!(held.get(), Some(true), "the delete ran without the lock");
+    }
+
+    /// Logout-origin retry: a live dir at the gate keeps the item and never
+    /// reaches the drain; a free tree runs the drain with the lock held; a busy
+    /// lock keeps the item. Mutants: drop the live check / drop the lock / ignore
+    /// a busy lock.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_logout_retry_drains_only_under_the_lock_and_never_under_a_live_dir() {
+        let base = tempfile::tempdir().unwrap();
+        let svc = live_term_dir_service(base.path());
+        let ran = std::cell::Cell::new(0);
+        let kept = clear_service_under_mint_with(base.path(), &svc, None, |_| {
+            ran.set(ran.get() + 1);
+            Ok(true)
+        });
+        assert_eq!((kept, ran.get()), (Ok(false), 0), "live dir: drain ran");
+
+        let free = tempfile::tempdir().unwrap();
+        let free_svc = "Claude Code-credentials-0000feed";
+        let held = std::cell::Cell::new(None);
+        let b = free.path().to_path_buf();
+        let out = clear_service_under_mint_with(free.path(), free_svc, None, |_| {
+            let b = b.clone();
+            held.set(Some(
+                std::thread::spawn(move || {
+                    matches!(
+                        crate::session::term_mint::try_acquire_for_sweep(&b),
+                        crate::session::term_mint::SweepLock::Busy
+                    )
+                })
+                .join()
+                .unwrap(),
+            ));
+            Ok(true)
+        });
+        assert_eq!(out, Ok(true));
+        assert_eq!(held.get(), Some(true), "the drain ran without the lock");
+
+        // Lock held elsewhere: keep, never drain.
+        let guard = crate::session::term_mint::acquire_for_mint(free.path()).unwrap();
+        let busy_ran = std::cell::Cell::new(false);
+        let busy = clear_service_under_mint_with(free.path(), free_svc, None, |_| {
+            busy_ran.set(true);
+            Ok(true)
+        });
+        drop(guard);
+        assert_eq!(busy, Ok(false));
+        assert!(
+            !busy_ran.get(),
+            "drain ran while the lock was held elsewhere"
         );
     }
 
@@ -13105,12 +20290,13 @@ mod tests {";
     fn decide_and_clear_queued_service_deletes_known_token() {
         // X holds EXACTLY the marker account's own canonical token — known,
         // safe to delete, no adopt attempt needed.
-        let (fixture, _handle_dir, _far_future) = reconcile_fixture();
+        let (fixture, _handle_dir, far_future) = reconcile_fixture();
         let base = fixture.path();
         let acct = crate::types::AccountNum::try_from(1u16).unwrap();
-        let exec = RecordingExecutor::scripted(RawContentClassification::Content(
-            r#"{"claudeAiOauth":{"accessToken":"MARKER-ACCOUNT-TOKEN","refreshToken":"MARKER-ACCOUNT-REFRESH","expiresAt":4102444800000}}"#.to_string(),
-        ));
+        let raw = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"MARKER-ACCOUNT-TOKEN","refreshToken":"MARKER-ACCOUNT-REFRESH","expiresAt":{far_future}}}}}"#
+        );
+        let exec = RecordingExecutor::scripted(RawContentClassification::Content(raw.into()));
         let result = decide_and_clear_queued_service_with_executor(
             &exec,
             base,
@@ -13146,8 +20332,9 @@ mod tests {";
         // A token that matches NEITHER the marker's canonical file NOR its
         // history — an unmatched but structurally valid Anthropic login.
         let unmatched = r#"{"claudeAiOauth":{"accessToken":"UNMATCHED-TOKEN","refreshToken":"UNMATCHED-REFRESH","expiresAt":4102444800000}}"#;
-        let exec =
-            RecordingExecutor::scripted(RawContentClassification::Content(unmatched.to_string()));
+        let exec = RecordingExecutor::scripted(RawContentClassification::Content(
+            (unmatched.to_string()).into(),
+        ));
         let adopt_calls = std::cell::Cell::new(0);
         let result = decide_and_clear_queued_service_with_executor(
             &exec,
@@ -13164,7 +20351,17 @@ mod tests {";
                     cand.candidate_email.is_none(),
                     "candidate_email was None on this call — must stay None, never fabricated"
                 );
-                true // simulate a confirmed adopt
+                // Simulate the confirmed adoption's actual canonical write;
+                // a bare true cannot prove that the grant was durably stored.
+                let identity =
+                    crate::accounts::profiles::resolve_slot_to_uuid(base, acct.get()).unwrap();
+                crate::credentials::file::save(
+                    &crate::accounts::identity_store::credentials_path_for(base, identity),
+                    &serde_json::from_str::<crate::credentials::CredentialFile>(&cand.raw_json)
+                        .unwrap(),
+                )
+                .unwrap();
+                true
             },
         );
         assert_eq!(
@@ -13184,9 +20381,8 @@ mod tests {";
     #[cfg(target_os = "macos")]
     const UNMATCHED_RAW: &str = r#"{"claudeAiOauth":{"accessToken":"UNMATCHED-TOKEN","refreshToken":"UNMATCHED-REFRESH","expiresAt":4102444800000},"mcpOAuth":{"k":"v"}}"#;
 
-    /// Unidentified item, dead handle dir: saved byte-for-byte to the
-    /// quarantine folder, then the WHOLE item is deleted (no sibling remainder
-    /// is written back) and the entry resolves.
+    /// Historical quarantine/delete selector: an unconfirmed candidate now
+    /// retains its exact native payload and does not manufacture strip authority.
     #[cfg(target_os = "macos")]
     #[test]
     fn decide_and_clear_queued_service_quarantines_then_deletes_unconfirmed_candidate() {
@@ -13195,7 +20391,7 @@ mod tests {";
         let base = fixture.path();
         let acct = crate::types::AccountNum::try_from(1u16).unwrap();
         let exec = RecordingExecutor::scripted(RawContentClassification::Content(
-            UNMATCHED_RAW.to_string(),
+            (UNMATCHED_RAW.to_string()).into(),
         ));
         let result = decide_and_clear_queued_service_with_executor(
             &exec,
@@ -13206,18 +20402,19 @@ mod tests {";
             None,
             &|_, _| false,
         );
-        assert_eq!(result, Ok(true));
+        assert_eq!(result, Err(KeychainClearUnconfirmed));
         let calls = exec.calls();
-        assert!(calls.iter().any(|(v, ..)| *v == "delete"), "{calls:?}");
+        assert!(calls.iter().all(|(v, ..)| *v != "delete"), "{calls:?}");
         assert!(
             calls.iter().all(|(v, ..)| *v != "add"),
             "no remainder add: {calls:?}"
         );
-        let saved: Vec<String> = std::fs::read_dir(base.join(QUARANTINE_DIR_NAME))
-            .unwrap()
-            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
-            .collect();
-        assert_eq!(saved, vec![UNMATCHED_RAW.to_string()]);
+        assert!(!base.join(QUARANTINE_DIR_NAME).exists());
+        assert_eq!(
+            *exec.find_result.borrow(),
+            RawContentClassification::Content(UNMATCHED_RAW.to_string().into())
+        );
+        assert_eq!(exec.items_remaining.get(), 1);
     }
 
     /// Taken by every test that reaches a quarantine `warn!` without
@@ -13303,11 +20500,12 @@ mod tests {";
     #[cfg(target_os = "macos")]
     #[test]
     fn fresh_launch_quarantine_event_names_the_saved_file() {
-        let rec =
-            RecordingExecutor::scripted(RawContentClassification::Content(FOREIGN_RAW.to_string()));
+        let rec = RecordingExecutor::scripted(RawContentClassification::Content(
+            (FOREIGN_RAW.to_string()).into(),
+        ));
         let dir = tempfile::tempdir().unwrap();
         let (result, events) = capture_quarantine_events(|| {
-            force_sync_inner(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), true)
+            fixture_force_sync(&rec, dir.path(), dir.path(), Some(VALID_NEW_JSON), true)
         });
         assert!(
             matches!(result, Ok(ForcedSyncResult::Applied { wrote_token: true })),
@@ -13323,7 +20521,7 @@ mod tests {";
         );
     }
 
-    /// The pending-clear quarantine event names the saved file's hash.
+    /// A refused pending clear must not emit a false quarantine-success event.
     #[cfg(target_os = "macos")]
     #[test]
     fn pending_clear_quarantine_event_names_the_saved_file() {
@@ -13331,7 +20529,7 @@ mod tests {";
         let base = fixture.path();
         let acct = crate::types::AccountNum::try_from(1u16).unwrap();
         let exec = RecordingExecutor::scripted(RawContentClassification::Content(
-            UNMATCHED_RAW.to_string(),
+            (UNMATCHED_RAW.to_string()).into(),
         ));
         let (result, events) = capture_quarantine_events(|| {
             decide_and_clear_queued_service_with_executor(
@@ -13344,23 +20542,25 @@ mod tests {";
                 &|_, _| false,
             )
         });
-        assert_eq!(result, Ok(true));
-        let hash = only_quarantine_file_hash(base);
-        assert_eq!(hash, "deadbeef", "suffix of the service name");
+        assert_eq!(result, Err(KeychainClearUnconfirmed));
+        assert!(!base.join(QUARANTINE_DIR_NAME).exists());
         assert!(
-            events.contains(&(
-                "keychain_pending_clear_quarantined_foreign_item".to_string(),
-                hash.clone()
-            )),
-            "expected the event to carry svc_hash={hash}: {events:?}"
+            events.iter().all(|(kind, _)| !kind.contains("quarantined")),
+            "a retained item must not be reported as quarantined/deleted: {events:?}"
         );
+        assert!(exec
+            .calls()
+            .iter()
+            .all(|(verb, ..)| *verb != "add" && *verb != "delete"));
+        assert_eq!(
+            *exec.find_result.borrow(),
+            RawContentClassification::Content(UNMATCHED_RAW.to_string().into())
+        );
+        assert_eq!(exec.items_remaining.get(), 1);
     }
 
-    /// The handle dir that owns the service appears between the first
-    /// ownership check and the delete: the item is kept, the entry stays
-    /// queued, and the event says so. Deterministic: the service is the one
-    /// the quarantine dir itself would own, so the save creates the dir the
-    /// re-check then finds.
+    /// A directory appearing during failed adoption still cannot authorize
+    /// deletion. The captured candidate remains intact and unconfirmed.
     #[cfg(target_os = "macos")]
     #[test]
     fn pending_clear_dir_reappearing_before_delete_keeps_item_and_logs() {
@@ -13374,7 +20574,7 @@ mod tests {";
         );
         assert!(!base.join(QUARANTINE_DIR_NAME).exists());
         let exec = RecordingExecutor::scripted(RawContentClassification::Content(
-            UNMATCHED_RAW.to_string(),
+            (UNMATCHED_RAW.to_string()).into(),
         ));
         let (result, events) = capture_quarantine_events(|| {
             decide_and_clear_queued_service_with_executor(
@@ -13384,20 +20584,30 @@ mod tests {";
                 Some(acct),
                 None,
                 None,
-                &|_, _| false,
+                &|_, _| {
+                    std::fs::create_dir(base.join(QUARANTINE_DIR_NAME)).unwrap();
+                    false
+                },
             )
         });
         assert_eq!(result, Err(KeychainClearUnconfirmed));
         let calls = exec.calls();
         assert!(calls.iter().all(|(v, ..)| *v != "delete"), "{calls:?}");
-        let hash = only_quarantine_file_hash(base);
-        assert!(
-            events.contains(&(
-                "keychain_pending_clear_quarantined_dir_reappeared".to_string(),
-                hash.clone()
-            )),
-            "expected the reappeared event with svc_hash={hash}: {events:?}"
+        assert_eq!(
+            std::fs::read_dir(base.join(QUARANTINE_DIR_NAME))
+                .unwrap()
+                .count(),
+            0
         );
+        assert!(
+            events.iter().all(|(kind, _)| !kind.contains("quarantined")),
+            "no quarantine/deletion success may be reported: {events:?}"
+        );
+        assert_eq!(
+            *exec.find_result.borrow(),
+            RawContentClassification::Content(UNMATCHED_RAW.to_string().into())
+        );
+        assert_eq!(exec.items_remaining.get(), 1);
     }
 
     /// Quarantine cannot be written: the item and the entry are KEPT.
@@ -13410,7 +20620,7 @@ mod tests {";
         std::fs::write(base.join(QUARANTINE_DIR_NAME), b"x").unwrap();
         let acct = crate::types::AccountNum::try_from(1u16).unwrap();
         let exec = RecordingExecutor::scripted(RawContentClassification::Content(
-            UNMATCHED_RAW.to_string(),
+            (UNMATCHED_RAW.to_string()).into(),
         ));
         let result = decide_and_clear_queued_service_with_executor(
             &exec,
@@ -13445,7 +20655,7 @@ mod tests {";
         let svc = service_name(&canonicalize_for_keychain_sync(&live).0);
         let acct = crate::types::AccountNum::try_from(1u16).unwrap();
         let exec = RecordingExecutor::scripted(RawContentClassification::Content(
-            UNMATCHED_RAW.to_string(),
+            (UNMATCHED_RAW.to_string()).into(),
         ));
         let result = decide_and_clear_queued_service_with_executor(
             &exec,
@@ -13464,8 +20674,8 @@ mod tests {";
         assert!(!base.join(QUARANTINE_DIR_NAME).exists());
     }
 
-    /// Quarantine saves, the delete is NOT confirmed: Err (entry kept) and the
-    /// saved copy remains.
+    /// Even a failing delete executor must never be called for an unproved
+    /// candidate: no quarantine copy substitutes for ownership.
     #[cfg(target_os = "macos")]
     #[test]
     fn pending_clear_quarantined_but_delete_unconfirmed_keeps_entry() {
@@ -13474,7 +20684,7 @@ mod tests {";
         let base = fixture.path();
         let acct = crate::types::AccountNum::try_from(1u16).unwrap();
         let exec = RecordingExecutor::scripted(RawContentClassification::Content(
-            UNMATCHED_RAW.to_string(),
+            (UNMATCHED_RAW.to_string()).into(),
         ));
         exec.delete_ok.set(false);
         let result = decide_and_clear_queued_service_with_executor(
@@ -13487,12 +20697,16 @@ mod tests {";
             &|_, _| false,
         );
         assert_eq!(result, Err(KeychainClearUnconfirmed));
+        assert!(!base.join(QUARANTINE_DIR_NAME).exists());
+        assert!(exec
+            .calls()
+            .iter()
+            .all(|(verb, ..)| *verb != "add" && *verb != "delete"));
         assert_eq!(
-            std::fs::read_dir(base.join(QUARANTINE_DIR_NAME))
-                .unwrap()
-                .count(),
-            1
+            *exec.find_result.borrow(),
+            RawContentClassification::Content(UNMATCHED_RAW.to_string().into())
         );
+        assert_eq!(exec.items_remaining.get(), 1);
     }
 
     /// A dir whose real path cannot be resolved counts as present; an
@@ -13509,8 +20723,8 @@ mod tests {";
         ));
     }
 
-    /// Repeated retries of the same unconfirmed item write ONE quarantine
-    /// file, so they cannot push other services' files out of retention.
+    /// Repeated unconfirmed retries preserve native content without creating
+    /// any quarantine artifact or deleting any duplicate.
     #[cfg(target_os = "macos")]
     #[test]
     fn repeated_pending_clear_retry_creates_no_duplicate_quarantine_file() {
@@ -13520,10 +20734,10 @@ mod tests {";
         let acct = crate::types::AccountNum::try_from(1u16).unwrap();
         for _ in 0..3 {
             let exec = RecordingExecutor::scripted(RawContentClassification::Content(
-                UNMATCHED_RAW.to_string(),
+                (UNMATCHED_RAW.to_string()).into(),
             ));
             exec.delete_ok.set(false);
-            let _ = decide_and_clear_queued_service_with_executor(
+            let result = decide_and_clear_queued_service_with_executor(
                 &exec,
                 base,
                 "svc-irrelevant-to-decide",
@@ -13532,13 +20746,18 @@ mod tests {";
                 None,
                 &|_, _| false,
             );
+            assert_eq!(result, Err(KeychainClearUnconfirmed));
+            assert_eq!(
+                *exec.find_result.borrow(),
+                RawContentClassification::Content(UNMATCHED_RAW.to_string().into())
+            );
+            assert_eq!(exec.items_remaining.get(), 1);
+            assert!(exec
+                .calls()
+                .iter()
+                .all(|(verb, ..)| *verb != "add" && *verb != "delete"));
         }
-        assert_eq!(
-            std::fs::read_dir(base.join(QUARANTINE_DIR_NAME))
-                .unwrap()
-                .count(),
-            1
-        );
+        assert!(!base.join(QUARANTINE_DIR_NAME).exists());
     }
 
     /// The recurring warning is emitted once per key per interval.
@@ -13570,9 +20789,7 @@ mod tests {";
         // Same content as the "known token" case above — if the missing-
         // account guard were bypassed, decide would still find a match
         // and delete. The guard must refuse BEFORE ever reaching decide.
-        let exec = RecordingExecutor::scripted(RawContentClassification::Content(
-            r#"{"claudeAiOauth":{"accessToken":"MARKER-ACCOUNT-TOKEN","refreshToken":"MARKER-ACCOUNT-REFRESH","expiresAt":4102444800000}}"#.to_string(),
-        ));
+        let exec = RecordingExecutor::scripted(RawContentClassification::Content((r#"{"claudeAiOauth":{"accessToken":"MARKER-ACCOUNT-TOKEN","refreshToken":"MARKER-ACCOUNT-REFRESH","expiresAt":4102444800000}}"#.to_string()).into()));
         let result = decide_and_clear_queued_service_with_executor(
             &exec,
             base,
@@ -13604,12 +20821,13 @@ mod tests {";
     #[cfg(target_os = "macos")]
     #[test]
     fn decide_and_clear_queued_service_uses_recorded_account_hint_not_live_derivation() {
-        let (fixture, _handle_dir, _far_future) = reconcile_fixture();
+        let (fixture, _handle_dir, far_future) = reconcile_fixture();
         let base = fixture.path();
         let acct = crate::types::AccountNum::try_from(1u16).unwrap();
-        let exec = RecordingExecutor::scripted(RawContentClassification::Content(
-            r#"{"claudeAiOauth":{"accessToken":"MARKER-ACCOUNT-TOKEN","refreshToken":"MARKER-ACCOUNT-REFRESH","expiresAt":4102444800000}}"#.to_string(),
-        ));
+        let raw = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"MARKER-ACCOUNT-TOKEN","refreshToken":"MARKER-ACCOUNT-REFRESH","expiresAt":{far_future}}}}}"#
+        );
+        let exec = RecordingExecutor::scripted(RawContentClassification::Content(raw.into()));
         let non_default_hint = "not-the-live-os-username";
         let result = decide_and_clear_queued_service_with_executor(
             &exec,
@@ -13650,8 +20868,9 @@ mod tests {";
         let base = fixture.path();
         let acct = crate::types::AccountNum::try_from(1u16).unwrap();
         let unmatched = r#"{"claudeAiOauth":{"accessToken":"UNMATCHED-TOKEN","refreshToken":"UNMATCHED-REFRESH","expiresAt":4102444800000}}"#;
-        let exec =
-            RecordingExecutor::scripted(RawContentClassification::Content(unmatched.to_string()));
+        let exec = RecordingExecutor::scripted(RawContentClassification::Content(
+            (unmatched.to_string()).into(),
+        ));
         let seen_email = std::cell::RefCell::new(None);
         let _ = decide_and_clear_queued_service_with_executor(
             &exec,
@@ -13924,6 +21143,452 @@ mod tests {";
         assert_eq!(dead_handle_calls, 0);
     }
 
+    // ── D237 round-2 ruling B/H2 + C: bounded holders + durable spool ──
+
+    /// ROW: a clear recorded while another process holds the queue lock past
+    /// the durable-record budget is NOT dropped — it is spooled, and the
+    /// sweep MERGES it into the queue.
+    ///
+    /// RED (assertion) under a mutation restoring the pre-fix `Ok(None)` arm
+    /// (`return;` without `spool_pending_clear`): the spool is empty and the
+    /// sweep has nothing to merge.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_clear_spools_under_a_held_lock_and_the_sweep_merges_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let svc = "Claude Code-credentials-1234abcd";
+        let held = crate::platform::lock::lock_file(&pending_clears_lock_path(base)).unwrap();
+        let started = std::time::Instant::now();
+        let recorded =
+            record_pending_clear(base, svc, None, PendingClearOrigin::Logout, None, None);
+        let waited = started.elapsed();
+        assert!(
+            recorded,
+            "a successfully spooled clear must be reported as durably recorded — the \
+             outcome is the caller's only signal that the retry path exists"
+        );
+        assert!(
+            waited
+                >= crate::platform::lock::DURABLE_RECORD_LOCK_BUDGET
+                    - crate::platform::lock::DURABLE_RECORD_LOCK_DELAY,
+            "the record must wait out the durable-record budget before falling back \
+             to the spool, not fail early: {waited:?}"
+        );
+        assert!(
+            !pending_clears_path(base).exists(),
+            "the queue was never locked, so it must not have been written unlocked"
+        );
+        assert_eq!(
+            pending_clears_spool_paths(base).len(),
+            1,
+            "the logout clear must be durably spooled, never dropped"
+        );
+
+        drop(held);
+        // A zero clear budget attempts nothing but MUST still merge the
+        // spool into the queue and remove the spool file after the save.
+        let (cleared, remaining) =
+            sweep_pending_clears_inner(base, pending_clears_now_secs(), 0, &mut |_s,
+                                                                                 _a,
+                                                                                 _o,
+                                                                                 _e,
+                                                                                 _h,
+                                                                                 _i|
+             -> Result<
+                bool,
+                KeychainClearUnconfirmed,
+            > {
+                panic!("the zero budget must not attempt any entry")
+            });
+        assert_eq!(cleared, 0);
+        assert_eq!(remaining, 1, "the merged entry must count as remaining");
+        assert_eq!(
+            service_names(&load_pending_clears(base)),
+            vec![svc.to_string()],
+            "the sweep must merge the spooled record into the queue"
+        );
+        assert!(
+            pending_clears_spool_paths(base).is_empty(),
+            "the merged spool file must be removed after the queue save"
+        );
+    }
+
+    /// A minimal well-formed spool record for `service`.
+    #[cfg(target_os = "macos")]
+    fn spool_test_entry(service: &str) -> PendingClearEntry {
+        PendingClearEntry {
+            service: service.to_string(),
+            attempts: 0,
+            next_attempt_unix_secs: 0,
+            generation: 0,
+            account: None,
+            origin: PendingClearOrigin::Logout,
+            candidate_email: None,
+            keychain_account_hint: None,
+            queued_inode: None,
+            queued_ctime: None,
+        }
+    }
+
+    /// Every quarantined spool file for `base`.
+    #[cfg(target_os = "macos")]
+    fn quarantined_spool_files(base: &Path) -> Vec<PathBuf> {
+        let Ok(rd) = std::fs::read_dir(pending_clears_spool_quarantine_dir(base)) else {
+            return Vec::new();
+        };
+        let mut paths: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        paths
+    }
+
+    /// D237 round-2 correctness N5 / security R2-M2, row 1: junk spool files
+    /// whose names sort BEFORE every real record must not starve the valid
+    /// record behind them. They are quarantined — kept on disk, out of the
+    /// merge window — and the valid record is merged into the queue.
+    ///
+    /// RED (assertion) under the pre-fix sort-then-`truncate` shape: the
+    /// first `PENDING_CLEARS_SPOOL_DRAIN_MAX` entries are all junk, the valid
+    /// record is never merged, and `load_pending_clears` stays empty.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_clear_spool_quarantines_a_junk_head_and_still_merges_the_valid_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let svc = "Claude Code-credentials-feedface";
+        let spool = pending_clears_spool_dir(base);
+        std::fs::create_dir_all(&spool).unwrap();
+        // One more junk file than a single merge window, each name sorting
+        // before the nanos-prefixed valid record spooled below.
+        let junk_count = PENDING_CLEARS_SPOOL_DRAIN_MAX + 1;
+        for i in 0..junk_count {
+            std::fs::write(
+                spool.join(format!("{i:030}-0-0.json")),
+                b"not a clear record",
+            )
+            .unwrap();
+        }
+        assert!(spool_pending_clear(base, &spool_test_entry(svc)));
+
+        // A zero clear budget attempts nothing but MUST still merge the
+        // spool into the queue and remove the merged file after the save.
+        let (cleared, remaining) =
+            sweep_pending_clears_inner(base, pending_clears_now_secs(), 0, &mut |_s,
+                                                                                 _a,
+                                                                                 _o,
+                                                                                 _e,
+                                                                                 _h,
+                                                                                 _i|
+             -> Result<
+                bool,
+                KeychainClearUnconfirmed,
+            > {
+                panic!("the zero budget must not attempt any entry")
+            });
+        assert_eq!(cleared, 0);
+        assert_eq!(remaining, 1, "the merged entry must count as remaining");
+        assert_eq!(
+            service_names(&load_pending_clears(base)),
+            vec![svc.to_string()],
+            "a valid record behind a junk head must still be merged into the queue"
+        );
+        assert!(
+            pending_clears_spool_paths(base).is_empty(),
+            "the merged record's file must be removed after the queue save"
+        );
+        assert_eq!(
+            quarantined_spool_files(base).len(),
+            junk_count,
+            "every unparseable head file must be QUARANTINED (kept on disk, out \
+             of the merge window), never deleted"
+        );
+    }
+
+    /// D237 round-2 correctness N5, row 2: the spool has a TOTAL file cap.
+    /// At the cap a new record is REFUSED (loudly — a fixed-vocabulary ERROR
+    /// naming the state), and the already-spooled records still merge.
+    ///
+    /// RED (assertion) under the pre-fix unbounded spool: the record over
+    /// the cap is written, so `pending_clears_spool_paths` exceeds
+    /// `PENDING_CLEARS_SPOOL_MAX_FILES`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_clear_spool_refuses_loudly_at_its_total_cap_and_still_merges() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let spool = pending_clears_spool_dir(base);
+        std::fs::create_dir_all(&spool).unwrap();
+        for i in 0..PENDING_CLEARS_SPOOL_MAX_FILES {
+            assert!(
+                spool_pending_clear(
+                    base,
+                    &spool_test_entry(&format!("Claude Code-credentials-{i:08x}"))
+                ),
+                "spool write {i} must succeed below the total cap"
+            );
+        }
+        assert_eq!(
+            pending_clears_spool_paths(base).len(),
+            PENDING_CLEARS_SPOOL_MAX_FILES,
+            "test precondition: the spool is exactly at its cap"
+        );
+
+        assert!(
+            !spool_pending_clear(base, &spool_test_entry("Claude Code-credentials-deadbeef")),
+            "a spool write AT the cap must be refused — the spool must never \
+             grow without bound"
+        );
+        assert_eq!(
+            pending_clears_spool_paths(base).len(),
+            PENDING_CLEARS_SPOOL_MAX_FILES,
+            "the refusal must not add a file"
+        );
+
+        // The refusal is transient pressure, not a wedged queue: a sweep
+        // still merges a full window of the records already spooled.
+        let (cleared, remaining) =
+            sweep_pending_clears_inner(base, pending_clears_now_secs(), 0, &mut |_s,
+                                                                                 _a,
+                                                                                 _o,
+                                                                                 _e,
+                                                                                 _h,
+                                                                                 _i|
+             -> Result<
+                bool,
+                KeychainClearUnconfirmed,
+            > {
+                panic!("the zero budget must not attempt any entry")
+            });
+        assert_eq!(cleared, 0);
+        assert_eq!(
+            remaining, PENDING_CLEARS_SPOOL_MAX_FILES,
+            "every spooled record must be merged into the queue and counted"
+        );
+        assert_eq!(
+            pending_clears_spool_paths(base).len(),
+            PENDING_CLEARS_SPOOL_MAX_FILES - PENDING_CLEARS_SPOOL_DRAIN_MAX,
+            "one full merge window must drain after the refusal"
+        );
+    }
+
+    /// R3 finding sec M-D / corr L-3 (part 1): a spool REFUSAL at the total
+    /// cap must reach the caller — `record_pending_clear` is what `csq
+    /// logout` calls to keep an unconfirmed keychain clear retryable, so an
+    /// outcome indistinguishable from success is the silent drop the finding
+    /// names.
+    ///
+    /// RED: pre-fix `record_pending_clear` returned `()`, so this assertion
+    /// could not even be written (`expected (), found bool`);
+    /// behaviorally, `spool_pending_clear`'s `false` had no caller-visible
+    /// effect. The sibling
+    /// `pending_clear_spools_under_a_held_lock_and_the_sweep_merges_it`
+    /// asserts the Durable half, so this instrument can return both answers.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn record_pending_clear_reports_a_cap_refusal_to_the_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let spool = pending_clears_spool_dir(base);
+        std::fs::create_dir_all(&spool).unwrap();
+        for i in 0..PENDING_CLEARS_SPOOL_MAX_FILES {
+            std::fs::write(spool.join(format!("{i:030}-0-0.json")), b"{}").unwrap();
+        }
+        assert_eq!(
+            pending_clears_spool_file_count(base),
+            PENDING_CLEARS_SPOOL_MAX_FILES,
+            "test precondition: the spool is exactly at its cap"
+        );
+        let held = crate::platform::lock::lock_file(&pending_clears_lock_path(base)).unwrap();
+        let recorded = record_pending_clear(
+            base,
+            "Claude Code-credentials-cafebabe",
+            None,
+            PendingClearOrigin::Logout,
+            None,
+            None,
+        );
+        drop(held);
+        assert!(
+            !recorded,
+            "a clear refused by the spool cap MUST be reported as not durably \
+             recorded — the logout result renders this outcome to the user"
+        );
+        assert_eq!(
+            pending_clears_spool_file_count(base),
+            PENDING_CLEARS_SPOOL_MAX_FILES,
+            "the refusal must not add a file"
+        );
+    }
+
+    /// R3 finding sec M-D / corr L-3 (part 2): the cap counts DRAIN
+    /// CANDIDATES only. Non-`.json` files and a directory named `*.json`
+    /// (which the drain quarantines, never merges) must not consume cap
+    /// headroom and refuse a real record while the spool has room.
+    ///
+    /// RED (assertion) under the pre-fix `pending_clears_spool_paths().len()`
+    /// count: the directory's `.json` name makes the count reach the cap, so
+    /// `spool_pending_clear` below returns `false`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_clear_spool_cap_counts_only_regular_json_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let spool = pending_clears_spool_dir(base);
+        std::fs::create_dir_all(&spool).unwrap();
+        for i in 0..PENDING_CLEARS_SPOOL_MAX_FILES - 1 {
+            std::fs::write(spool.join(format!("{i:030}-0-0.json")), b"{}").unwrap();
+        }
+        std::fs::write(spool.join("junk.txt"), b"not a record").unwrap();
+        std::fs::write(spool.join("no-extension"), b"not a record").unwrap();
+        std::fs::create_dir(spool.join("directory-named-like-a-record.json")).unwrap();
+        assert_eq!(
+            pending_clears_spool_file_count(base),
+            PENDING_CLEARS_SPOOL_MAX_FILES - 1,
+            "test precondition: only regular `.json` files count toward the cap"
+        );
+        assert!(
+            spool_pending_clear(base, &spool_test_entry("Claude Code-credentials-0badf00d")),
+            "junk that is not a drain candidate must NOT consume cap headroom and \
+             refuse a real clear record while the spool has room"
+        );
+    }
+
+    /// R3 finding sec M-D / corr L-3 (part 3): a TRANSIENT read error must
+    /// leave the record in the spool for the next drain. Quarantine is
+    /// terminal (never re-scanned), so moving a valid record there on a
+    /// permission/interrupt/EMFILE blip is exactly the silent drop the spool
+    /// exists to prevent.
+    ///
+    /// RED (both assertions) under the pre-fix `Err(_) => quarantine`: the
+    /// unreadable record is moved into the quarantine directory, so the
+    /// spool no longer holds it.
+    ///
+    /// Non-vacuity: `pending_clear_spool_quarantines_a_junk_head_and_still_
+    /// merges_the_valid_entry` and
+    /// `pending_clear_spool_quarantines_a_non_utf8_record` prove the
+    /// quarantine path still fires for DETERMINISTIC failures, so the
+    /// "not quarantined" assertion is not merely observing that the drain
+    /// skipped everything.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_clear_spool_transient_read_error_is_left_for_the_next_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let spool = pending_clears_spool_dir(base);
+        std::fs::create_dir_all(&spool).unwrap();
+        let unreadable = spool.join("000000000000000000000000000000-0-0.json");
+        let valid = spool.join("000000000000000000000000000001-0-0.json");
+        std::fs::write(
+            &unreadable,
+            serde_json::to_vec(&spool_test_entry("Claude Code-credentials-11111111")).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &valid,
+            serde_json::to_vec(&spool_test_entry("Claude Code-credentials-22222222")).unwrap(),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(
+            std::fs::read_to_string(&unreadable).is_err(),
+            "running as a user that bypasses mode bits (root) — the transient \
+             permission-denied arm is unreachable in this environment"
+        );
+
+        let mut clears = PendingClears::default();
+        let applied = pending_clears_drain_spool_locked(base, &mut clears);
+        assert_eq!(
+            applied,
+            vec![valid],
+            "the readable record behind the unreadable one must still drain"
+        );
+        assert!(
+            unreadable.exists(),
+            "a transiently unreadable record MUST stay in the spool for the next \
+             drain — quarantine is terminal"
+        );
+        assert!(
+            quarantined_spool_files(base).is_empty(),
+            "a transient read error MUST NOT quarantine the record"
+        );
+        assert_eq!(
+            service_names(&clears),
+            vec!["Claude Code-credentials-22222222".to_string()],
+            "only the readable record may be merged"
+        );
+    }
+
+    /// Non-vacuity control for the transient-retry policy: a DETERMINISTIC
+    /// read failure (bytes that are not UTF-8) is still quarantined, kept on
+    /// disk, and never merged or deleted.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_clear_spool_quarantines_a_non_utf8_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let spool = pending_clears_spool_dir(base);
+        std::fs::create_dir_all(&spool).unwrap();
+        let undecodable = spool.join("000000000000000000000000000000-0-0.json");
+        std::fs::write(&undecodable, [0xff, 0xfe, 0x00]).unwrap();
+
+        let mut clears = PendingClears::default();
+        assert!(pending_clears_drain_spool_locked(base, &mut clears).is_empty());
+        assert!(
+            !undecodable.exists(),
+            "non-UTF-8 bytes can never parse on a retry — the record is quarantined"
+        );
+        assert_eq!(
+            quarantined_spool_files(base).len(),
+            1,
+            "the deterministic failure must be MOVED to quarantine (kept on disk), \
+             not deleted"
+        );
+        assert!(clears.services.is_empty());
+    }
+
+    /// ROW (ruling B/H2): the at-creation resolve runs its clear functions
+    /// with the queue lock RELEASED. The closure takes the same lock — the
+    /// structural oracle that the `security` subprocess / Node HTTP call no
+    /// longer holds it.
+    ///
+    /// RED (assertion) under the pre-split shape, where one guard spans the
+    /// clear call: the closure's non-blocking acquire returns None.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_clear_resolve_holds_no_lock_across_the_clear_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let svc = "Claude Code-credentials-87654321";
+        record_pending_clear(base, svc, None, PendingClearOrigin::DeadHandle, None, None);
+        let lock_path = pending_clears_lock_path(base);
+        let mut clear_calls = 0usize;
+        resolve_pending_clear_at_creation_with(
+            base,
+            svc,
+            &mut |_s| panic!("a DeadHandle entry must never reach the logout closure"),
+            &mut |s, _a, _e, _h| {
+                clear_calls += 1;
+                assert_eq!(s, svc);
+                // In production this closure is decide+adopt: a `security`
+                // call plus a Node HTTP request. Prove the queue lock is NOT
+                // held while it runs.
+                let probe = crate::platform::lock::try_lock_file(&lock_path)
+                    .expect("the queue lock file must be readable");
+                assert!(
+                    probe.is_some(),
+                    "the pending-clear queue lock MUST be released during the clear call"
+                );
+                Ok(true)
+            },
+        );
+        assert_eq!(clear_calls, 1);
+        assert!(
+            load_pending_clears(base).services.is_empty(),
+            "a confirmed clear must still remove the entry via the phase-3 relock"
+        );
+    }
+
     // ── live_handle_dir_maps_to_service (keychain-fix-r10.md S-M-2) ──
 
     /// A live `term-<pid>` handle dir whose canonicalized path hashes to
@@ -13967,6 +21632,90 @@ mod tests {";
         assert!(
             !live_handle_dir_maps_to_service(dir.path(), &svc, None),
             "a dead-pid handle dir must not count as a live collision"
+        );
+    }
+
+    /// Fail closed: an UNREADABLE pid marker on a dir that maps to `svc` is "maps to a live
+    /// dir" (the lenient reader would have said `false` and let the clear delete the item).
+    /// Liveness injected; no `ps`, no real keychain.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn live_handle_dir_maps_to_service_unreadable_marker_is_live() {
+        for marker in [".live-pid", ".live-cc-pid"] {
+            let dir = tempfile::tempdir().unwrap();
+            let handle = dir.path().join("term-2000000011");
+            std::fs::create_dir_all(&handle).unwrap();
+            if marker == ".live-cc-pid" {
+                crate::accounts::markers::write_live_pid(&handle, 2_000_000_012).unwrap();
+            }
+            std::fs::write(handle.join(marker), "9".repeat(4096)).unwrap();
+            let svc = service_name(&std::fs::canonicalize(&handle).unwrap());
+            assert!(
+                live_handle_dir_maps_to_service_with(dir.path(), &svc, None, |_| false),
+                "{marker}: unreadable must count as live"
+            );
+            // An unrelated service name is still not a collision.
+            assert!(
+                !live_handle_dir_maps_to_service_with(
+                    dir.path(),
+                    "Claude Code-credentials-other",
+                    None,
+                    |_| false
+                ),
+                "{marker}: a dir that cannot map to svc is not a collision"
+            );
+        }
+    }
+
+    /// A holder that is alive by `kill(pid, 0)` but whose start-time read FAILED (not ESRCH)
+    /// is LIVE, so the queued logout clear is kept; only `ESRCH` makes it dead. Liveness and
+    /// probe injected: no process, no `ps`, no real keychain.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_holder_whose_start_time_read_fails_is_live() {
+        use crate::sessions::macos::Probe;
+        let yes = |_: u32| true;
+        assert!(holder_is_live(7, &yes, &|_| Probe::Failed), "read failed");
+        assert!(holder_is_live(7, &yes, &|_| Probe::Got(1)), "readable");
+        assert!(!holder_is_live(7, &yes, &|_| Probe::Gone), "ESRCH");
+        assert!(
+            !holder_is_live(7, &|_| false, &|_| panic!("not consulted")),
+            "kill(pid, 0) says dead"
+        );
+        // end to end through the dir walk: the clear is KEPT for a failed read
+        let dir = tempfile::tempdir().unwrap();
+        let handle = dir.path().join("term-2000000031");
+        std::fs::create_dir_all(&handle).unwrap();
+        crate::accounts::markers::write_live_pid(&handle, 2_000_000_031).unwrap();
+        let svc = service_name(&std::fs::canonicalize(&handle).unwrap());
+        let walk = |probe: fn(u32) -> Probe<u64>| {
+            live_handle_dir_maps_to_service_with(dir.path(), &svc, None, |p| {
+                holder_is_live(p, &|_| true, &probe)
+            })
+        };
+        assert!(walk(|_| Probe::Failed), "start read failed -> kept");
+        assert!(!walk(|_| Probe::Gone), "ESRCH -> dead, clear proceeds");
+    }
+
+    /// A dead `.live-pid` with a LIVE `.live-cc-pid` (orphan child of a SIGKILLed csq) is live.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn live_handle_dir_maps_to_service_live_cc_pid_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = dir.path().join("term-2000000021");
+        std::fs::create_dir_all(&handle).unwrap();
+        crate::accounts::markers::write_live_pid(&handle, 2_000_000_021).unwrap();
+        std::fs::write(handle.join(".live-cc-pid"), "2000000022").unwrap();
+        let svc = service_name(&std::fs::canonicalize(&handle).unwrap());
+        assert!(live_handle_dir_maps_to_service_with(
+            dir.path(),
+            &svc,
+            None,
+            |p| p == 2_000_000_022
+        ));
+        assert!(
+            !live_handle_dir_maps_to_service_with(dir.path(), &svc, None, |_| false),
+            "both dead -> not live"
         );
     }
 
@@ -14133,7 +21882,7 @@ mod tests {";
             r#"{{"claudeAiOauth":{{"accessToken":"at-SCRIPTED","refreshToken":"rt-SCRIPTED","expiresAt":{far_future}}}}}"#
         );
         let exec = std::rc::Rc::new(ScriptedKeychainExecutor::scripted(
-            RawContentClassification::Content(unmatched.clone()),
+            RawContentClassification::Content((unmatched.clone()).into()),
         ));
         set_test_keychain_executor(exec);
         let candidates = harvest_account_candidates(base, &uuid.to_string());
@@ -14185,6 +21934,9 @@ mod tests {";
         )
         .unwrap();
 
+        let initial = crate::credentials::load(&identity_creds_path).unwrap();
+        stage_known_login_fixture(base, account, &initial, true);
+
         // The "source dir": a fresh handle dir bound to account 1, whose
         // KEYCHAIN item (scripted) holds an unmatched-but-valid token —
         // T-adopt — never written to the canonical store yet.
@@ -14196,11 +21948,13 @@ mod tests {";
         // stub email format), so the adopt gate's email pre-filter passes.
         std::fs::write(
             handle_dir.join(".claude.json"),
-            r#"{"oauthAccount":{"emailAddress":"fixture-slot-1@test.invalid"}}"#,
+            r#"{"oauthAccount":{"emailAddress":"fixture-slot-1@test.invalid","accountUuid":"00000000-0000-0000-0000-000000000065","organizationUuid":"00000000-0000-0000-0000-0000000000ca"}}"#,
         )
         .unwrap();
 
-        // Strictly greater than T0's expiry — `save_canonical_for_if_fresher`
+        crate::platform::fs::secure_file(&handle_dir.join(".claude.json")).unwrap();
+
+        // Strictly greater than T0's expiry — `save_anthropic_canonical_guarded_locked`
         // re-reads the store's CURRENT expiry under the lock and refuses to
         // write anything not STRICTLY fresher (an equal expiry reads as
         // "store already fresher, keep theirs").
@@ -14209,7 +21963,7 @@ mod tests {";
             r#"{{"claudeAiOauth":{{"accessToken":"at-ADOPT","refreshToken":"rt-ADOPT","expiresAt":{adopt_expiry}}}}}"#
         );
         let exec = std::rc::Rc::new(ScriptedKeychainExecutor::scripted(
-            RawContentClassification::Content(adopt_raw.clone()),
+            RawContentClassification::Content((adopt_raw.clone()).into()),
         ));
         set_test_keychain_executor(exec);
 
@@ -14224,13 +21978,8 @@ mod tests {";
         assert!(candidates[0].raw_json.contains("at-ADOPT"));
 
         // 2. Adopt — the real custodian single-candidate adopt path.
-        let http_get: crate::daemon::usage_poller::HttpGetFn =
-            std::sync::Arc::new(|_url: &str, _tok: &str, _hdrs: &[(&str, &str)]| {
-                Ok((
-                    200,
-                    br#"{"account":{"uuid":"u","email":"fixture-slot-1@test.invalid"}}"#.to_vec(),
-                ))
-            });
+        let adopt_credential: CredentialFile = serde_json::from_str(&adopt_raw).unwrap();
+        let http_get = fixture_profile_http(&adopt_credential);
         let adopted = crate::daemon::custodian::adopt_single_candidate_before_delete(
             base,
             account,
@@ -14252,12 +22001,29 @@ mod tests {";
         //    intended_expiry`) requires this fixture to reflect that, or the
         //    stale source dir's item (still `adopt_expiry`) would read as
         //    LATER than the refreshed token and be refused.
-        let refresh_raw = format!(
-            r#"{{"claudeAiOauth":{{"accessToken":"at-REFRESH","refreshToken":"rt-REFRESH","expiresAt":{}}}}}"#,
-            adopt_expiry + 1_000
+        use crate::accounts::anthropic_identity as ai;
+        let capture = ai::capture_anthropic_binding(base, account).unwrap();
+        let prepared = ai::prepare_anthropic_refresh(base, &capture).unwrap();
+        let current = crate::credentials::load(&identity_creds_path).unwrap();
+        let (refreshed, lineage) = ai::refresh_captured_anthropic_with(&prepared, current.anthropic().unwrap(), |url, body| {
+            assert_eq!(url, crate::credentials::refresh::TOKEN_ENDPOINT);
+            let request: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(request["refresh_token"], "rt-ADOPT", "real refresher must rotate the adopted token");
+            Ok(serde_json::to_vec(&serde_json::json!({"access_token":"at-REFRESH","refresh_token":"rt-REFRESH","expires_in":366u64*24*60*60})).unwrap())
+        }).unwrap();
+        assert!(refreshed.claude_ai_oauth.expires_at > adopt_expiry);
+        assert_eq!(
+            crate::credentials::file::save_anthropic_canonical_guarded(
+                base,
+                &capture,
+                &refreshed,
+                crate::credentials::file::AnthropicWriteWitness::RefreshLineage(&lineage),
+                None
+            )
+            .unwrap(),
+            crate::credentials::file::GuardedWriteOutcome::Written
         );
-        let refreshed_cf: CredentialFile = serde_json::from_str(&refresh_raw).unwrap();
-        crate::credentials::file::save_canonical_for(base, account, &refreshed_cf).unwrap();
+        let refresh_raw = serde_json::to_string(&CredentialFile::Anthropic(refreshed)).unwrap();
 
         // 4. The SOURCE dir's stale keychain item (still holding T-adopt,
         //    since nobody rewrote it) must still be RECOGNISED against the
@@ -14285,7 +22051,7 @@ mod tests {";
             marker_account_history: &history,
             ..KnownTokens::default()
         };
-        let stale_source_x = RawContentClassification::Content(adopt_raw);
+        let stale_source_x = RawContentClassification::Content(adopt_raw.into());
         let decision =
             decide_cc_keychain_write(&stale_source_x, &known, Intended::Token(&refresh_raw));
         assert!(
@@ -14476,7 +22242,7 @@ mod tests {";
     fn build_add_stdin_command_hex_round_trips_payload() {
         let payload = "{\"claudeAiOauth\":{\"accessToken\":\"weird \\\" ' \n \u{1F600}\"}}";
         let cmd = build_add_stdin_command("svc", "acct", payload);
-        let cmd_str = String::from_utf8(cmd).expect("command line must be valid UTF-8");
+        let cmd_str = String::from_utf8(cmd.to_vec()).expect("command line must be valid UTF-8");
         assert!(
             cmd_str.ends_with('\n'),
             "command line must be newline-terminated: {cmd_str:?}"
@@ -14501,7 +22267,7 @@ mod tests {";
     fn build_add_stdin_command_never_places_payload_bytes_raw_in_the_line() {
         let payload = "MARKER-PAYLOAD-TOKEN-\"quoted\"";
         let cmd = build_add_stdin_command("svc", "acct", payload);
-        let cmd_str = String::from_utf8(cmd).expect("command line must be valid UTF-8");
+        let cmd_str = String::from_utf8(cmd.to_vec()).expect("command line must be valid UTF-8");
         assert!(
             !cmd_str.contains(payload),
             "payload must be hex-encoded, never raw, in the stdin command: {cmd_str}"
@@ -14608,7 +22374,7 @@ mod tests {";
         match oversized {
             AddInvocation::ArgvFallback(argv) => {
                 assert_eq!(
-                    argv,
+                    *argv,
                     vec![
                         "add-generic-password".to_string(),
                         "-A".to_string(),
@@ -14651,6 +22417,9 @@ mod tests {";
     #[cfg(target_os = "macos")]
     #[test]
     fn add_argv_fallback_oversized_round_trips_byte_for_byte() {
+        // A bare program name resolves through the process PATH, which sibling tests swap
+        // under the shared env lock; hold it so the spawn cannot see a mid-swap PATH.
+        let _env_lock = crate::platform::test_env::lock();
         if !require_real_keychain_tests_opt_in() {
             return;
         }
@@ -14757,6 +22526,9 @@ mod tests {";
     #[cfg(target_os = "macos")]
     #[test]
     fn security_framework_native_update_preserves_acl() {
+        // A bare program name resolves through the process PATH, which sibling tests swap
+        // under the shared env lock; hold it so the spawn cannot see a mid-swap PATH.
+        let _env_lock = crate::platform::test_env::lock();
         if !require_real_keychain_tests_opt_in() {
             return;
         }
@@ -14850,6 +22622,9 @@ mod tests {";
     #[cfg(target_os = "macos")]
     #[test]
     fn security_framework_create_without_acl_does_not_prompt_headless_here() {
+        // A bare program name resolves through the process PATH, which sibling tests swap
+        // under the shared env lock; hold it so the spawn cannot see a mid-swap PATH.
+        let _env_lock = crate::platform::test_env::lock();
         if !require_real_keychain_tests_opt_in() {
             return;
         }
@@ -14897,6 +22672,9 @@ mod tests {";
     #[cfg(target_os = "macos")]
     #[test]
     fn native_update_large_payload_round_trips_byte_for_byte() {
+        // A bare program name resolves through the process PATH, which sibling tests swap
+        // under the shared env lock; hold it so the spawn cannot see a mid-swap PATH.
+        let _env_lock = crate::platform::test_env::lock();
         if !require_real_keychain_tests_opt_in() {
             return;
         }
@@ -14979,7 +22757,7 @@ mod tests {";
         let hex = hex::encode(json.as_bytes());
         assert_eq!(
             classify_raw_content(Some(fake_output_with_stdout(0, hex.as_bytes()))),
-            RawContentClassification::Content(json.to_string())
+            RawContentClassification::Content((json.to_string()).into())
         );
     }
 
@@ -15089,6 +22867,9 @@ mod tests {";
     #[cfg(target_os = "macos")]
     #[test]
     fn security_dash_i_add_find_round_trips_on_throwaway_keychain() {
+        // A bare program name resolves through the process PATH, which sibling tests swap
+        // under the shared env lock; hold it so the spawn cannot see a mid-swap PATH.
+        let _env_lock = crate::platform::test_env::lock();
         if !require_real_keychain_tests_opt_in() {
             return;
         }
@@ -15201,6 +22982,9 @@ mod tests {";
     #[cfg(target_os = "macos")]
     #[test]
     fn security_dash_g_confirms_non_printable_storage_is_correct_not_hex_text() {
+        // A bare program name resolves through the process PATH, which sibling tests swap
+        // under the shared env lock; hold it so the spawn cannot see a mid-swap PATH.
+        let _env_lock = crate::platform::test_env::lock();
         if !require_real_keychain_tests_opt_in() {
             return;
         }
@@ -15379,7 +23163,7 @@ mod tests {";
         let current_json = no_login_content();
         let intended = tok("new-at", "new-rt");
         let decision = decide_cc_keychain_write(
-            &RawContentClassification::Content(current_json),
+            &RawContentClassification::Content(current_json.into()),
             &KnownTokens::default(),
             Intended::Token(&intended),
         );
@@ -15390,7 +23174,7 @@ mod tests {";
     fn decide_rule1_no_login_content_strip_is_allowed() {
         let current_json = no_login_content();
         let decision = decide_cc_keychain_write(
-            &RawContentClassification::Content(current_json),
+            &RawContentClassification::Content(current_json.into()),
             &KnownTokens::default(),
             Intended::Strip,
         );
@@ -15408,7 +23192,7 @@ mod tests {";
     fn decide_rule1_emptied_login_write_writes() {
         let intended = tok("new-at", "new-rt");
         let decision = decide_cc_keychain_write(
-            &RawContentClassification::Content(emptied_login_content()),
+            &RawContentClassification::Content((emptied_login_content()).into()),
             &KnownTokens::default(),
             Intended::Token(&intended),
         );
@@ -15418,7 +23202,7 @@ mod tests {";
     #[test]
     fn decide_rule1_emptied_login_strip_is_allowed() {
         let decision = decide_cc_keychain_write(
-            &RawContentClassification::Content(emptied_login_content()),
+            &RawContentClassification::Content((emptied_login_content()).into()),
             &KnownTokens::default(),
             Intended::Strip,
         );
@@ -15431,7 +23215,7 @@ mod tests {";
     fn decide_one_empty_token_is_not_no_login() {
         let intended = tok("new-at", "new-rt");
         let decision = decide_cc_keychain_write(
-            &RawContentClassification::Content(tok("", "someone-elses-rt")),
+            &RawContentClassification::Content((tok("", "someone-elses-rt")).into()),
             &KnownTokens::default(),
             Intended::Token(&intended),
         );
@@ -15475,7 +23259,7 @@ mod tests {";
     fn decide_rule4b_partial_identity_match_is_unknown() {
         let intended = tok("new-at", "new-rt");
         let decision = decide_cc_keychain_write(
-            &RawContentClassification::Content(malformed_oauth_content()),
+            &RawContentClassification::Content((malformed_oauth_content()).into()),
             &KnownTokens::default(),
             Intended::Token(&intended),
         );
@@ -15488,7 +23272,7 @@ mod tests {";
     #[test]
     fn decide_rule4b_partial_identity_match_is_unknown_for_strip_too() {
         let decision = decide_cc_keychain_write(
-            &RawContentClassification::Content(malformed_oauth_content()),
+            &RawContentClassification::Content((malformed_oauth_content()).into()),
             &KnownTokens::default(),
             Intended::Strip,
         );
@@ -15504,7 +23288,7 @@ mod tests {";
     #[test]
     fn decide_f5_already_intended_token_is_no_write() {
         let same = tok("same-at", "same-rt");
-        let current = RawContentClassification::Content(same.clone());
+        let current = RawContentClassification::Content((same.clone()).into());
         let decision =
             decide_cc_keychain_write(&current, &KnownTokens::default(), Intended::Token(&same));
         assert_eq!(decision, WriteDecision::NoWrite);
@@ -15515,7 +23299,7 @@ mod tests {";
     #[test]
     fn decide_rule2_matches_marker_canonical_writes_intended() {
         let marker_tok = tok("marker-at", "marker-rt");
-        let current = RawContentClassification::Content(marker_tok.clone());
+        let current = RawContentClassification::Content((marker_tok.clone()).into());
         let intended = tok("new-at", "new-rt");
         let known = KnownTokens {
             marker_account_canonical: Some(&marker_tok),
@@ -15529,7 +23313,7 @@ mod tests {";
     #[test]
     fn decide_rule2_matches_source_canonical_writes_intended() {
         let source_tok = tok("source-at", "source-rt");
-        let current = RawContentClassification::Content(source_tok.clone());
+        let current = RawContentClassification::Content((source_tok.clone()).into());
         let intended = tok("new-at", "new-rt");
         let known = KnownTokens {
             source_account_canonical: Some(&source_tok),
@@ -15544,7 +23328,7 @@ mod tests {";
     #[test]
     fn decide_rule2_matches_csq_written_writes_intended() {
         let written = tok("written-at", "written-rt");
-        let current = RawContentClassification::Content(written.clone());
+        let current = RawContentClassification::Content((written.clone()).into());
         let intended = tok("new-at", "new-rt");
         let known = KnownTokens {
             csq_written: Some(&written),
@@ -15582,7 +23366,7 @@ mod tests {";
             r#"{"claudeAiOauth":{"accessToken":"live-at","refreshToken":"live-rt","expiresAt":9999999999999,"scopes":[]}}"#.to_string();
         let expired =
             r#"{"claudeAiOauth":{"accessToken":"expired-at","refreshToken":"expired-rt","expiresAt":1,"scopes":[]}}"#.to_string();
-        let current = RawContentClassification::Content(live.clone());
+        let current = RawContentClassification::Content((live.clone()).into());
         let known = KnownTokens {
             csq_written: Some(&live),
             ..KnownTokens::default()
@@ -15606,7 +23390,7 @@ mod tests {";
             r#"{"claudeAiOauth":{"accessToken":"earlier-at","refreshToken":"earlier-rt","expiresAt":1000000000000,"scopes":[]}}"#.to_string();
         let newer =
             r#"{"claudeAiOauth":{"accessToken":"newer-at","refreshToken":"newer-rt","expiresAt":9999999999999,"scopes":[]}}"#.to_string();
-        let current = RawContentClassification::Content(earlier.clone());
+        let current = RawContentClassification::Content((earlier.clone()).into());
         let known = KnownTokens {
             csq_written: Some(&earlier),
             ..KnownTokens::default()
@@ -15615,12 +23399,384 @@ mod tests {";
         assert!(matches!(decision, WriteDecision::Write(t) if t == newer));
     }
 
+    /// Owner directive 2026-10-11 (the four slot-4 terminals): a keychain
+    /// token that is the slot's PREVIOUS binding — the identity this slot ran
+    /// BEFORE a rebind — must be recognised as csq-owned and superseded. The
+    /// retired channel is the only channel that can match here: the raw-pair
+    /// channel compares against the NEW binding, history/owner-verified are
+    /// empty, and the store-fingerprint channel names the new canonical's
+    /// refresh. RED at base: without the retired channel the decision is
+    /// `RefuseUnharvested` — the exact refusal measured on live terminals.
+    #[test]
+    fn decide_rule2_recognises_the_slots_previous_binding_after_a_rebind() {
+        let previous =
+            r#"{"claudeAiOauth":{"accessToken":"prev-at","refreshToken":"rt-previous-binding","expiresAt":4102444800000,"scopes":[]}}"#.to_string();
+        let current_new =
+            r#"{"claudeAiOauth":{"accessToken":"new-at","refreshToken":"rt-current-binding","expiresAt":4102444800000,"scopes":[]}}"#.to_string();
+        let intended =
+            r#"{"claudeAiOauth":{"accessToken":"tgt-at","refreshToken":"rt-target","expiresAt":4102444800000,"scopes":[]}}"#.to_string();
+        let current = RawContentClassification::Content((previous.clone()).into());
+        let prev_fp = crate::credentials::token_history::fingerprint_from_raw_json(&previous)
+            .expect("fixture token must fingerprint");
+
+        // The OLD behaviour, pinned in the same test: with no retired
+        // channel, this exact shape is rule 3's unmatched foreign login.
+        let known_without = KnownTokens {
+            marker_account_canonical: Some(&current_new),
+            ..KnownTokens::default()
+        };
+        assert_eq!(
+            decide_cc_keychain_write(&current, &known_without, Intended::Token(&intended)),
+            WriteDecision::RefuseUnharvested,
+            "without the retired channel the previous binding's token is an unmatched foreign login — the measured defect"
+        );
+
+        // With the slot's retired binding admitted, it is rule 2 — via its
+        // CANONICAL, the strong half of the split (review R1 M3).
+        let retired = [crate::credentials::token_history::RetiredBinding {
+            canonical: Some(prev_fp),
+            history: vec![],
+        }];
+        let known = KnownTokens {
+            marker_account_canonical: Some(&current_new),
+            retired_bindings: &retired,
+            ..KnownTokens::default()
+        };
+        assert!(
+            matches!(
+                decide_cc_keychain_write(&current, &known, Intended::Token(&intended)),
+                WriteDecision::Write(t) if t == intended
+            ),
+            "a token of the slot's previous binding must be superseded, never refused"
+        );
+    }
+
+    /// Review R2 §5a end-to-end: the SAME recognition the literal fixture
+    /// above pins, but through the REAL chain — production staging writers
+    /// (canonical via `file::save`, displacement via the real rebind
+    /// writer), the real reader, then the decision. No hand-built
+    /// `RetiredBinding` anywhere.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn decide_rule2_recognises_the_previous_binding_via_the_real_reader() {
+        use crate::accounts::identity_store::IdentityId;
+        let previous = r#"{"claudeAiOauth":{"accessToken":"prev-at","refreshToken":"rt-previous-binding","expiresAt":4102444800000,"scopes":[]}}"#;
+        let current_new = r#"{"claudeAiOauth":{"accessToken":"new-at","refreshToken":"rt-current-binding","expiresAt":4102444800000,"scopes":[]}}"#;
+        let intended = r#"{"claudeAiOauth":{"accessToken":"tgt-at","refreshToken":"rt-target","expiresAt":4102444800000,"scopes":[]}}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let slot = AccountNum::try_from(2u16).unwrap();
+        // The displaced identity's canonical, through the production pair.
+        stage_known_fixture(
+            base,
+            slot,
+            &serde_json::from_str(previous).unwrap(),
+            true,
+            false,
+        );
+        // Rebind slot 2 to the new identity — the real writer records the
+        // displacement in the same locked load-modify-save.
+        let lock = crate::accounts::profiles_lock::ProfilesFileLock::acquire(base).unwrap();
+        crate::accounts::profiles::add_identity_mapping(
+            &lock,
+            base,
+            2,
+            "new@example.com",
+            IdentityId::new_v4(),
+        )
+        .unwrap();
+        let retired =
+            crate::credentials::token_history::retired_bindings_for_slot_locked(&lock, base, slot);
+        drop(lock);
+        assert_eq!(
+            retired.len(),
+            1,
+            "the reader admits exactly the displaced identity"
+        );
+        let known = KnownTokens {
+            marker_account_canonical: Some(current_new),
+            retired_bindings: &retired,
+            ..KnownTokens::default()
+        };
+        let current = RawContentClassification::Content((previous.to_string()).into());
+        assert!(
+            matches!(
+                decide_cc_keychain_write(&current, &known, Intended::Token(intended)),
+                WriteDecision::Write(t) if t == intended
+            ),
+            "a token of the slot's previous binding, produced by the REAL \
+             production chain, must be superseded"
+        );
+    }
+
+    /// Review R2 L-R2-2: `retired_recognition_still_current` re-proves a
+    /// retired-only recognition against the lock-held RELOAD. Live and
+    /// still-unremoved → true; a fingerprint not in the live set → false;
+    /// identity REAPED (tombstoned) between the decision's read and the
+    /// held authority → false (the item may be the token's last copy —
+    /// refuse rather than destroy).
+    #[test]
+    fn retired_recognition_recheck_follows_the_live_identity_store() {
+        use crate::accounts::identity_store::IdentityId;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let slot: AccountNum = 3u16.try_into().unwrap();
+        let prev = IdentityId::new_v4();
+        let cur = IdentityId::new_v4();
+        let old_raw = r#"{"claudeAiOauth":{"accessToken":"old-at","refreshToken":"rt-recheck-old","expiresAt":3102444800000,"scopes":[]}}"#;
+        let canon_raw = r#"{"claudeAiOauth":{"accessToken":"can-at","refreshToken":"rt-recheck-canon","expiresAt":4102444800000,"scopes":[]}}"#;
+        let other_raw = r#"{"claudeAiOauth":{"accessToken":"oth-at","refreshToken":"rt-recheck-other","expiresAt":4102444800000,"scopes":[]}}"#;
+
+        std::fs::create_dir_all(
+            crate::accounts::identity_store::credentials_path_for(base, prev)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
+        let canon: CredentialFile = serde_json::from_str(canon_raw).unwrap();
+        crate::credentials::file::save(
+            &crate::accounts::identity_store::credentials_path_for(base, prev),
+            &canon,
+        )
+        .unwrap();
+        crate::credentials::token_history::append_history(
+            base,
+            prev,
+            crate::credentials::token_history::fingerprint_from_raw_json(old_raw).unwrap(),
+        );
+        crate::credentials::token_history::append_history(
+            base,
+            prev,
+            crate::credentials::token_history::fingerprint_from_raw_json(canon_raw).unwrap(),
+        );
+
+        let lock = crate::accounts::profiles_lock::ProfilesFileLock::acquire(base).unwrap();
+        crate::accounts::profiles::add_identity_mapping(&lock, base, 3, "prev@example.com", prev)
+            .unwrap();
+        crate::accounts::profiles::add_identity_mapping(&lock, base, 3, "cur@example.com", cur)
+            .unwrap();
+
+        let current = RawContentClassification::Content((old_raw.to_string()).into());
+        let recognition = Recognition {
+            retired_history_match: true,
+            ..Recognition::default()
+        };
+        assert!(
+            retired_recognition_still_current(&lock, base, Some(slot), &current, &recognition),
+            "the live, lock-held retired set still recognises the item"
+        );
+        let foreign = RawContentClassification::Content((other_raw.to_string()).into());
+        assert!(
+            !retired_recognition_still_current(&lock, base, Some(slot), &foreign, &recognition),
+            "a fingerprint not in the live set must fail closed"
+        );
+        let canonical_recognition = Recognition {
+            retired_canonical_match: true,
+            ..Recognition::default()
+        };
+        let canonical_current = RawContentClassification::Content((canon_raw.to_string()).into());
+        assert!(
+            retired_recognition_still_current(
+                &lock,
+                base,
+                Some(slot),
+                &canonical_current,
+                &canonical_recognition
+            ),
+            "the canonical half re-proves through the same reload"
+        );
+        // Review R3 L2: when BOTH retired channels fired at decision time,
+        // EVERY one must still hold under the reload. Here the history half
+        // holds (`old_raw` sits strictly before the canonical) and the
+        // canonical half does not — under the old OR this passed on the
+        // weaker channel alone, re-proving a recognition whose stronger
+        // evidence had gone; under AND it fails closed.
+        let both_channels = Recognition {
+            retired_canonical_match: true,
+            retired_history_match: true,
+            ..Recognition::default()
+        };
+        assert!(
+            !retired_recognition_still_current(&lock, base, Some(slot), &current, &both_channels),
+            "every fired channel must still hold — the canonical half is stale here"
+        );
+        crate::accounts::identity_store::mark_identity_removed(base, prev);
+        assert!(
+            !retired_recognition_still_current(&lock, base, Some(slot), &current, &recognition),
+            "a reaped (tombstoned) retired identity must not keep authorising the mutation"
+        );
+        assert!(
+            !retired_recognition_still_current(
+                &lock,
+                base,
+                Some(slot),
+                &canonical_current,
+                &canonical_recognition
+            ),
+            "a reaped (tombstoned) retired identity must not keep authorising the canonical half"
+        );
+    }
+
+    /// Custodian parity (`guard-reader-writer-parity.md`): a keychain token
+    /// whose REFRESH fingerprint equals the stored login's counts as
+    /// recognised even when the access token differs — `raw_match`'s
+    /// whole-`(access, refresh)`-pair comparison misses the ordinary
+    /// same-grant/different-access-token shape (a refresh rotated only the
+    /// access token). RED at base: no other channel can match this fixture,
+    /// so the base decision is `RefuseUnharvested`.
+    #[test]
+    fn decide_rule2_recognises_same_grant_with_a_rotated_access_token() {
+        let stored =
+            r#"{"claudeAiOauth":{"accessToken":"old-at","refreshToken":"shared-grant-rt","expiresAt":4102444800000,"scopes":[]}}"#.to_string();
+        let rotated_access =
+            r#"{"claudeAiOauth":{"accessToken":"rotated-at","refreshToken":"shared-grant-rt","expiresAt":4102444800000,"scopes":[]}}"#.to_string();
+        let intended =
+            r#"{"claudeAiOauth":{"accessToken":"tgt-at","refreshToken":"rt-target","expiresAt":4102444800000,"scopes":[]}}"#.to_string();
+        let current = RawContentClassification::Content((rotated_access.clone()).into());
+        let known = KnownTokens {
+            marker_account_canonical: Some(&stored),
+            ..KnownTokens::default()
+        };
+        assert!(
+            matches!(
+                decide_cc_keychain_write(&current, &known, Intended::Token(&intended)),
+                WriteDecision::Write(t) if t == intended
+            ),
+            "same grant, rotated access token — the stored login's own token — must be recognised"
+        );
+    }
+
+    /// Negative control for the retired channel: a token from an identity
+    /// NEVER in this slot's bindings is still refused even when the retired
+    /// set is populated — the channel must not degrade into
+    /// "accept anything known to csq".
+    #[test]
+    fn decide_rule2_still_refuses_a_genuinely_foreign_token_with_retired_populated() {
+        let never_csq =
+            r#"{"claudeAiOauth":{"accessToken":"x-at","refreshToken":"rt-never-csq","expiresAt":4102444800000,"scopes":[]}}"#.to_string();
+        let current_new =
+            r#"{"claudeAiOauth":{"accessToken":"new-at","refreshToken":"rt-current-binding","expiresAt":4102444800000,"scopes":[]}}"#.to_string();
+        let some_previous =
+            r#"{"claudeAiOauth":{"accessToken":"prev-at","refreshToken":"rt-some-previous","expiresAt":4102444800000,"scopes":[]}}"#.to_string();
+        let intended =
+            r#"{"claudeAiOauth":{"accessToken":"tgt-at","refreshToken":"rt-target","expiresAt":4102444800000,"scopes":[]}}"#.to_string();
+        let current = RawContentClassification::Content((never_csq.clone()).into());
+        let retired = [crate::credentials::token_history::RetiredBinding {
+            canonical: crate::credentials::token_history::fingerprint_from_raw_json(&some_previous),
+            history: vec![],
+        }];
+        let known = KnownTokens {
+            marker_account_canonical: Some(&current_new),
+            retired_bindings: &retired,
+            ..KnownTokens::default()
+        };
+        assert_eq!(
+            decide_cc_keychain_write(&current, &known, Intended::Token(&intended)),
+            WriteDecision::RefuseUnharvested,
+            "a token belonging to no csq identity for this slot must STILL be refused"
+        );
+    }
+
+    /// Review R1 M3: a retired binding's HISTORY entry is WEAKER than its
+    /// canonical. It requires the position-strictly-before-own-canonical
+    /// ordering, then the same relative-expiry guard as
+    /// `marker_account_history`, and it never authorises `Intended::Strip`.
+    /// Each leg is discriminating: dropping the ordering check flips the
+    /// reversed-order leg, dropping the expiry guard flips the later-expiry
+    /// leg, and treating history as strong flips the strip leg.
+    #[test]
+    fn decide_retired_history_entry_is_ordered_expiry_guarded_and_never_strips() {
+        let old =
+            r#"{"claudeAiOauth":{"accessToken":"old-at","refreshToken":"rt-retired-old","expiresAt":1000000000000,"scopes":[]}}"#.to_string();
+        let old_later =
+            r#"{"claudeAiOauth":{"accessToken":"old-at","refreshToken":"rt-retired-old","expiresAt":5102444800000,"scopes":[]}}"#.to_string();
+        let canonical =
+            r#"{"claudeAiOauth":{"accessToken":"new-at","refreshToken":"rt-retired-canonical","expiresAt":4102444800000,"scopes":[]}}"#.to_string();
+        let intended =
+            r#"{"claudeAiOauth":{"accessToken":"tgt-at","refreshToken":"rt-target","expiresAt":4102444800000,"scopes":[]}}"#.to_string();
+        let old_fp = crate::credentials::token_history::fingerprint_from_raw_json(&old)
+            .expect("fixture token must fingerprint");
+        let canonical_fp = crate::credentials::token_history::fingerprint_from_raw_json(&canonical)
+            .expect("fixture token must fingerprint");
+
+        // Ordered history [old, canonical]: old sits strictly before the
+        // canonical, expiry is already past -> the ordinary guarded write.
+        let ordered = [crate::credentials::token_history::RetiredBinding {
+            canonical: Some(canonical_fp),
+            history: vec![old_fp, canonical_fp],
+        }];
+        let known = KnownTokens {
+            retired_bindings: &ordered,
+            ..KnownTokens::default()
+        };
+        let current = RawContentClassification::Content((old.clone()).into());
+        assert!(
+            matches!(
+                decide_cc_keychain_write(&current, &known, Intended::Token(&intended)),
+                WriteDecision::Write(t) if t == intended
+            ),
+            "an ordered, older history entry of a retired binding is superseded"
+        );
+
+        // The relative guard: current's own expiry LATER than the intended
+        // token's -> RefuseUnharvested (the caller harvest-redecides case).
+        let current = RawContentClassification::Content((old_later.clone()).into());
+        assert_eq!(
+            decide_cc_keychain_write(&current, &known, Intended::Token(&intended)),
+            WriteDecision::RefuseUnharvested,
+            "a later-expiring current matches the history only weakly and must refuse"
+        );
+
+        // History-only never strips, on any expiry.
+        let current = RawContentClassification::Content((old.clone()).into());
+        assert_eq!(
+            decide_cc_keychain_write(&current, &known, Intended::Strip),
+            WriteDecision::RefuseUnharvested,
+            "a retired-history match must never authorise a strip"
+        );
+
+        // REVERSED order (canonical first, older entry after): the ordering
+        // check fails, so even the expired current refuses.
+        let reversed = [crate::credentials::token_history::RetiredBinding {
+            canonical: Some(canonical_fp),
+            history: vec![canonical_fp, old_fp],
+        }];
+        let known = KnownTokens {
+            retired_bindings: &reversed,
+            ..KnownTokens::default()
+        };
+        assert_eq!(
+            decide_cc_keychain_write(&current, &known, Intended::Token(&intended)),
+            WriteDecision::RefuseUnharvested,
+            "an entry NOT strictly before its own canonical is not a history match"
+        );
+
+        // The CANONICAL itself stays strong: write and strip both allowed.
+        let known = KnownTokens {
+            retired_bindings: &ordered,
+            ..KnownTokens::default()
+        };
+        let current = RawContentClassification::Content((canonical.clone()).into());
+        assert!(
+            matches!(
+                decide_cc_keychain_write(&current, &known, Intended::Token(&intended)),
+                WriteDecision::Write(t) if t == intended
+            ),
+            "the retired canonical is strong evidence"
+        );
+        assert_eq!(
+            decide_cc_keychain_write(&current, &known, Intended::Strip),
+            WriteDecision::StripAllowed,
+            "the retired canonical is strong enough to strip"
+        );
+    }
+
     // Rule 2 (D-F4): X matches the sweep's pre-refresh identity for the
     // account being refreshed.
     #[test]
     fn decide_rule2_matches_sweep_pre_refresh_writes_intended() {
         let pre_refresh = tok("pre-at", "pre-rt");
-        let current = RawContentClassification::Content(pre_refresh.clone());
+        let current = RawContentClassification::Content((pre_refresh.clone()).into());
         let intended = tok("new-at", "new-rt");
         let known = KnownTokens {
             sweep_pre_refresh: crate::credentials::token_history::fingerprint_from_raw_json(
@@ -15637,7 +23793,7 @@ mod tests {";
     #[test]
     fn decide_rule2_matches_other_account_writes_intended() {
         let other = tok("other-at", "other-rt");
-        let current = RawContentClassification::Content(other.clone());
+        let current = RawContentClassification::Content((other.clone()).into());
         let intended = tok("new-at", "new-rt");
         let known = KnownTokens {
             other_accounts_canonical: &[other.as_str()],
@@ -15651,7 +23807,7 @@ mod tests {";
     #[test]
     fn decide_rule2_strip_matches_known_is_strip_allowed() {
         let known_tok = tok("known-at", "known-rt");
-        let current = RawContentClassification::Content(known_tok.clone());
+        let current = RawContentClassification::Content((known_tok.clone()).into());
         let known = KnownTokens {
             marker_account_canonical: Some(&known_tok),
             ..KnownTokens::default()
@@ -15665,7 +23821,7 @@ mod tests {";
     #[test]
     fn decide_rule3_unmatched_real_login_refuses_unharvested() {
         let foreign = tok("foreign-at", "foreign-rt");
-        let current = RawContentClassification::Content(foreign);
+        let current = RawContentClassification::Content(foreign.into());
         let intended = tok("new-at", "new-rt");
         // A syntactically-valid known token with a DIFFERENT identity than
         // `foreign` — so this test asserts the real "matches nothing known"
@@ -15682,7 +23838,7 @@ mod tests {";
     #[test]
     fn decide_rule3_unmatched_real_login_with_no_known_tokens_at_all() {
         let foreign = tok("foreign-at", "foreign-rt");
-        let current = RawContentClassification::Content(foreign);
+        let current = RawContentClassification::Content(foreign.into());
         let intended = tok("new-at", "new-rt");
         let decision = decide_cc_keychain_write(
             &current,
@@ -15697,7 +23853,7 @@ mod tests {";
     #[test]
     fn decide_rule3_strip_unmatched_real_login_refuses_unharvested() {
         let foreign = tok("foreign-at", "foreign-rt");
-        let current = RawContentClassification::Content(foreign);
+        let current = RawContentClassification::Content(foreign.into());
         let decision = decide_cc_keychain_write(&current, &KnownTokens::default(), Intended::Strip);
         assert_eq!(decision, WriteDecision::RefuseUnharvested);
     }
@@ -15718,7 +23874,7 @@ mod tests {";
         // recognizes it.
         let t_n_minus_2 = tok("at-n-2", "rt-n-2");
         let current_raw = tok("current-at", "current-rt");
-        let current = RawContentClassification::Content(t_n_minus_2.clone());
+        let current = RawContentClassification::Content((t_n_minus_2.clone()).into());
         let intended = tok("new-at", "new-rt");
         let history = vec![
             crate::credentials::token_history::fingerprint_from_raw_json(&t_n_minus_2).unwrap(),
@@ -15745,7 +23901,7 @@ mod tests {";
         // in the same bounded history, strictly AFTER the fingerprint being
         // tested — so this fixture must supply both, canonical last.
         let current_raw = tok("current-at", "current-rt");
-        let current = RawContentClassification::Content(t_n_minus_2.clone());
+        let current = RawContentClassification::Content((t_n_minus_2.clone()).into());
         let history = vec![
             crate::credentials::token_history::fingerprint_from_raw_json(&t_n_minus_2).unwrap(),
             crate::credentials::token_history::fingerprint_from_raw_json(&current_raw).unwrap(),
@@ -15771,7 +23927,7 @@ mod tests {";
         // rolled-back canonical value would discard a still-live session.
         let old_tok = tok("old-at", "old-rt");
         let new_tok = tok("new-at", "new-rt");
-        let current = RawContentClassification::Content(new_tok.clone());
+        let current = RawContentClassification::Content((new_tok.clone()).into());
         let history = vec![
             crate::credentials::token_history::fingerprint_from_raw_json(&old_tok).unwrap(),
             crate::credentials::token_history::fingerprint_from_raw_json(&new_tok).unwrap(),
@@ -15798,7 +23954,7 @@ mod tests {";
     #[test]
     fn decide_history_hit_with_unresolvable_canonical_position_does_not_match() {
         let t_n_minus_2 = tok("at-n-2", "rt-n-2");
-        let current = RawContentClassification::Content(t_n_minus_2.clone());
+        let current = RawContentClassification::Content((t_n_minus_2.clone()).into());
         let history = vec![
             crate::credentials::token_history::fingerprint_from_raw_json(&t_n_minus_2).unwrap(),
         ];
@@ -15824,7 +23980,7 @@ mod tests {";
     #[test]
     fn decide_history_from_another_account_does_not_match() {
         let other_accounts_old_token = tok("other-old-at", "other-old-rt");
-        let current = RawContentClassification::Content(other_accounts_old_token.clone());
+        let current = RawContentClassification::Content((other_accounts_old_token.clone()).into());
         let intended = tok("new-at", "new-rt");
         // The CALLER is only permitted to pass the MARKER account's own
         // history (`token_history::read_history_for_slot` is keyed by
@@ -15868,7 +24024,7 @@ mod tests {";
     fn decide_history_only_match_with_later_current_expiry_refuses_unharvested() {
         let old_still_live = r#"{"claudeAiOauth":{"accessToken":"old-at","refreshToken":"old-rt","expiresAt":9999999999999,"scopes":[]}}"#.to_string();
         let canonical_now = tok("canon-at", "canon-rt"); // tok()'s fixed expiresAt: 4102444800000
-        let current = RawContentClassification::Content(old_still_live.clone());
+        let current = RawContentClassification::Content((old_still_live.clone()).into());
         let history = vec![
             crate::credentials::token_history::fingerprint_from_raw_json(&old_still_live).unwrap(),
             crate::credentials::token_history::fingerprint_from_raw_json(&canonical_now).unwrap(),
@@ -15891,6 +24047,60 @@ mod tests {";
         );
     }
 
+    // Owner-verified superseded login: a STRONG channel. The very fixture of
+    // the history-only test above (current outlives intended) is recognised
+    // once its fingerprint is in the owner-verified set, and still refuses
+    // when the set does not contain it.
+    #[test]
+    fn decide_owner_verified_match_writes_even_with_later_current_expiry() {
+        let old_still_live = r#"{"claudeAiOauth":{"accessToken":"old-at","refreshToken":"old-rt","expiresAt":9999999999999,"scopes":[]}}"#.to_string();
+        let canonical_now = tok("canon-at", "canon-rt");
+        let current = RawContentClassification::Content((old_still_live.clone()).into());
+        let ov = vec![
+            crate::credentials::token_history::fingerprint_from_raw_json(&old_still_live).unwrap(),
+        ];
+        let intended = tok("new-at", "new-rt");
+        let known = KnownTokens {
+            marker_account_canonical: Some(&canonical_now),
+            marker_account_owner_verified: &ov,
+            ..KnownTokens::default()
+        };
+        assert!(matches!(
+            decide_cc_keychain_write(&current, &known, Intended::Token(&intended)),
+            WriteDecision::Write(_)
+        ));
+        // Control: same current, set lacks its fingerprint -> unchanged rule 3.
+        let other = vec![
+            crate::credentials::token_history::fingerprint_from_raw_json(&tok("x-at", "x-rt"))
+                .unwrap(),
+        ];
+        let known = KnownTokens {
+            marker_account_canonical: Some(&canonical_now),
+            marker_account_owner_verified: &other,
+            ..KnownTokens::default()
+        };
+        assert_eq!(
+            decide_cc_keychain_write(&current, &known, Intended::Token(&intended)),
+            WriteDecision::RefuseUnharvested
+        );
+    }
+
+    #[test]
+    fn decide_owner_verified_still_subject_to_intended_expired_backstop() {
+        let old = tok("old-at", "old-rt");
+        let current = RawContentClassification::Content((old.clone()).into());
+        let ov = vec![crate::credentials::token_history::fingerprint_from_raw_json(&old).unwrap()];
+        let expired = r#"{"claudeAiOauth":{"accessToken":"n-at","refreshToken":"n-rt","expiresAt":1000,"scopes":[]}}"#;
+        let known = KnownTokens {
+            marker_account_owner_verified: &ov,
+            ..KnownTokens::default()
+        };
+        assert_eq!(
+            decide_cc_keychain_write(&current, &known, Intended::Token(expired)),
+            WriteDecision::RefuseIntendedExpired
+        );
+    }
+
     // `keychain-fix-r11.md` S-M-3 residual: BOTH history positions now use
     // `rposition` (last occurrence). A bounded history can hold the SAME
     // fingerprint at more than one index — `[X, C, X]`, when X was written,
@@ -15905,7 +24115,7 @@ mod tests {";
         let x_fp = crate::credentials::token_history::fingerprint_from_raw_json(&x_tok).unwrap();
         let c_fp = crate::credentials::token_history::fingerprint_from_raw_json(&c_tok).unwrap();
         let history = vec![x_fp, c_fp, x_fp]; // [X, C, X] — X's LAST occurrence is after C
-        let current = RawContentClassification::Content(x_tok.clone());
+        let current = RawContentClassification::Content((x_tok.clone()).into());
         let known = KnownTokens {
             marker_account_canonical: Some(&c_tok),
             marker_account_history: &history,
@@ -15927,7 +24137,7 @@ mod tests {";
         // confirms the C-F1 addition is a pure widening: an empty history
         // reproduces the pre-C-F1 rule 3 refusal exactly.
         let foreign = tok("foreign-at", "foreign-rt");
-        let current = RawContentClassification::Content(foreign);
+        let current = RawContentClassification::Content(foreign.into());
         let intended = tok("new-at", "new-rt");
         let decision = decide_cc_keychain_write(
             &current,
@@ -15963,11 +24173,633 @@ mod tests {";
     #[test]
     fn raw_content_classification_debug_redacts_content() {
         let leaked = "NOTREALTOKmarker9x";
-        let current = RawContentClassification::Content(tok(leaked, "rt"));
+        let current = RawContentClassification::Content((tok(leaked, "rt")).into());
         let rendered = format!("{current:?}");
         assert!(
             !rendered.contains(leaked),
             "Debug output leaked the raw token: {rendered}"
         );
     }
+    #[test]
+    fn credential_buffer_json_guard_preserves_values_and_wipes_owned_tree() {
+        let json = r#"{"duplicate":"fake-old","middle":true,"duplicate":"fake-new","nested":[null,true,-2,3,1.25,{"escaped":"fake\u002d雪"}]}"#;
+        let mut value: SecretJson = serde_json::from_str(json).unwrap();
+        let reference: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(value.0, reference);
+        assert_eq!(
+            serde_json::to_string(&value.0).unwrap(),
+            serde_json::to_string(&reference).unwrap()
+        );
+        assert!(
+            serde_json::from_str::<SecretJson>(r#"{"nested":["fake-prefix",{"broken":]}"#).is_err()
+        );
+        wipe_json(&mut value.0);
+        assert_eq!(value.0, serde_json::json!({}));
+        let mut array = serde_json::json!(["fake-value", {"key":"fake-sibling"}]);
+        wipe_json(&mut array);
+        assert_eq!(array, serde_json::json!(["", {}]));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn credential_buffer_classifier_native_holders_preserve_fail_closed_states() {
+        let json = r#"{"claudeAiOauth":{"accessToken":"fake-access","refreshToken":"fake-refresh","expiresAt":4102444800000},"mcpOAuth":{"token":"fake-sibling"}}"#;
+        for bytes in [json.as_bytes().to_vec(), hex::encode(json).into_bytes()] {
+            let content = classify_raw_content(Some(fake_output_with_stdout(0, &bytes)));
+            let RawContentClassification::Content(raw) = &content else {
+                panic!("complete object must remain content")
+            };
+            let _: &Zeroizing<String> = raw;
+            assert_eq!(raw.as_str(), json);
+            assert_eq!(content.clone(), content);
+        }
+        for bytes in [
+            vec![0xff],
+            b"ff".to_vec(),
+            b"7bff".to_vec(),
+            b"0g".to_vec(),
+            b"abc".to_vec(),
+            br#"{"secret":"fake-prefix","bad":}"#.to_vec(),
+        ] {
+            assert_eq!(
+                classify_raw_content(Some(fake_output_with_stdout(0, &bytes))),
+                RawContentClassification::Unreadable(UnreadableKind::Transient)
+            );
+        }
+        assert_eq!(
+            classify_raw_content(Some(fake_bounded_output(0, json.as_bytes(), false))),
+            RawContentClassification::Unreadable(UnreadableKind::Transient)
+        );
+        assert_eq!(
+            classify_raw_content(Some(fake_output_with_stdout(44, json.as_bytes()))),
+            RawContentClassification::Absent
+        );
+        assert!(zeroizing_utf8(Zeroizing::new(vec![b'f', 0xff])).is_err());
+        let plan = plan_mirror_write(
+            &RawContentClassification::Content(json.to_owned().into()),
+            json,
+            true,
+        )
+        .unwrap();
+        let _: &Zeroizing<String> = &plan.write_x;
+        assert!(!format!("{plan:?}").contains("fake-access"));
+        for invocation in [
+            select_add_invocation("svc", "account", json).unwrap(),
+            select_add_invocation("svc", "account", &"fake".repeat(2000)).unwrap(),
+        ] {
+            assert!(!format!("{invocation:?}").contains("fake"));
+        }
+    }
+    #[test]
+    fn r2_buffer_canonical_reader_guards_success_invalid_utf8_and_partial_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake-canonical.json");
+        assert_eq!(
+            read_zeroizing_utf8(&path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let raw = r#"{"claudeAiOauth":{"refreshToken":"fake-refresh"}}"#;
+        std::fs::write(&path, raw).unwrap();
+        let value = read_zeroizing_utf8(&path).unwrap();
+        let _: &Zeroizing<String> = &value;
+        assert_eq!(value.as_str(), raw);
+        std::fs::write(&path, [b'{', 0xff]).unwrap();
+        assert_eq!(
+            read_zeroizing_utf8(&path).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        struct PartialError(bool);
+        impl std::io::Read for PartialError {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    return Err(std::io::Error::other("private fixture read failure"));
+                }
+                self.0 = true;
+                let fake = b"fake-prefix";
+                out[..fake.len()].copy_from_slice(fake);
+                Ok(fake.len())
+            }
+        }
+        assert_eq!(
+            read_zeroizing_utf8_from(PartialError(false))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::Other
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn r2_buffer_native_output_wipe_preserves_status_and_completeness() {
+        for code in [0, 44, 36, 45] {
+            let mut output = fake_bounded_output(code, b"fake-native-stdout", false);
+            output.output.stderr = b"fake-native-stderr".to_vec();
+            output.stderr_complete = true;
+            let mut guarded = SecretOutput::new(output);
+            let rendered = format!("{guarded:?}");
+            assert!(rendered.contains("[REDACTED]"));
+            assert!(!rendered.contains("fake-native"));
+            guarded.wipe();
+            assert!(guarded.output.stdout.is_empty());
+            assert!(guarded.output.stderr.is_empty());
+            assert_eq!(guarded.output.status.code(), Some(code));
+            assert!(!guarded.stdout_complete);
+            assert!(guarded.stderr_complete);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn r2_buffer_native_add_and_sibling_restore_preserve_failure_policy() {
+        let invocation = select_add_invocation("svc", "account", "fake-payload").unwrap();
+        let calls = std::cell::RefCell::new(Vec::new());
+        let runner = |args: &[&str], _: Option<Vec<u8>>| {
+            calls.borrow_mut().push(args[0].to_owned());
+            let code = if args[0] == "delete-generic-password" {
+                44
+            } else {
+                45
+            };
+            let mut output = fake_bounded_output(code, b"fake-echo", true);
+            output.output.stderr = b"fake-native-error-echo".to_vec();
+            Some(output)
+        };
+        assert!(add_via_delete_create(
+            "svc",
+            "account",
+            invocation,
+            Some("fake-sibling".to_owned().into()),
+            &runner
+        )
+        .is_err());
+        assert_eq!(*calls.borrow(), ["delete-generic-password", "-i", "-i"]);
+        let argv = select_add_invocation("svc", "account", &"fake-oversized".repeat(1000)).unwrap();
+        assert!(run_add_invocation(argv, &runner).is_err());
+        assert_eq!(calls.borrow().last().unwrap(), "add-generic-password");
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keychain_org_identity_regression_profile_custody_held_across_apply_and_contention_refuses() {
+        use crate::accounts::{
+            anthropic_identity as ai, identity_store, profiles, profiles_lock::ProfilesFileLock,
+        };
+        struct LockChecking {
+            base: std::path::PathBuf,
+            called: std::cell::Cell<bool>,
+        }
+        impl KeychainExecutor for LockChecking {
+            fn find(&self, _: &str, _: &str) -> RawContentClassification {
+                RawContentClassification::Absent
+            }
+            fn add(&self, _: &str, _: &str, _: &str) -> Result<(), PlatformError> {
+                assert!(
+                    ProfilesFileLock::try_acquire(&self.base).unwrap().is_none(),
+                    "cooperative profile writer must not enter during keychain apply"
+                );
+                self.called.set(true);
+                Ok(())
+            }
+            fn delete(&self, _: &str, _: &str) -> bool {
+                panic!("token installation must not strip an absent item")
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let slot = AccountNum::try_from(1u16).unwrap();
+        let id = identity_store::IdentityId::new_v4();
+        let context = ai::AnthropicContext::new(
+            "same@example.test",
+            uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
+            uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
+        )
+        .unwrap();
+        let mut profiles = profiles::ProfilesFile::empty();
+        profiles.by_slot.insert("1".into(), id);
+        profiles.anthropic_contexts.push(ai::AnthropicContextEntry {
+            email: context.email().into(),
+            account_uuid: context.account_uuid(),
+            organization_uuid: context.organization_uuid(),
+            identity_uuid: id,
+            extra: Default::default(),
+        });
+        profiles::save(&profiles::profiles_path(dir.path()), &profiles).unwrap();
+        let identity = identity_store::identity_path(dir.path(), id);
+        std::fs::create_dir_all(&identity).unwrap();
+        crate::platform::fs::secure_dir(&dir.path().join("identities")).unwrap();
+        crate::platform::fs::secure_dir(&identity).unwrap();
+        crate::platform::fs::write_new_private(&identity.join("identity.json"),&serde_json::to_vec(&serde_json::json!({"provider":"anthropic","email":context.email(),"account_uuid":context.account_uuid(),"organization_uuid":context.organization_uuid()})).unwrap()).unwrap();
+        let raw = r#"{"claudeAiOauth":{"accessToken":"fake-known-access","refreshToken":"fake-known-refresh","expiresAt":4102444800000}}"#;
+        let creds = serde_json::from_str::<crate::credentials::CredentialFile>(raw).unwrap();
+        crate::credentials::file::save(
+            &identity_store::credentials_path_for(dir.path(), id),
+            &creds,
+        )
+        .unwrap();
+        let binding = ai::capture_anthropic_binding(dir.path(), slot).unwrap();
+        let handle = dir.path().join("term-999999");
+        std::fs::create_dir(&handle).unwrap();
+        let exec = LockChecking {
+            base: dir.path().to_path_buf(),
+            called: std::cell::Cell::new(false),
+        };
+        assert!(matches!(
+            force_sync_inner_guarded(
+                &exec,
+                dir.path(),
+                &handle,
+                Some(raw),
+                false,
+                Some(&binding),
+                None
+            )
+            .unwrap(),
+            ForcedSyncResult::Applied { wrote_token: true }
+        ));
+        assert!(exec.called.get());
+        let held = ProfilesFileLock::acquire(dir.path()).unwrap();
+        exec.called.set(false);
+        assert!(matches!(
+            force_sync_inner_guarded(
+                &exec,
+                dir.path(),
+                &handle,
+                Some(raw),
+                false,
+                Some(&binding),
+                None
+            )
+            .unwrap(),
+            ForcedSyncResult::TargetTokenInvalidated | ForcedSyncResult::WriteFailedUnknown
+        ));
+        assert!(!exec.called.get());
+        drop(held);
+        assert!(ProfilesFileLock::try_acquire(dir.path()).unwrap().is_some());
+    }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod guarded_swap_receipt_tests {
+    use super::*;
+
+    #[test]
+    fn keychain_org_identity_regression_native_replaced_during_find_preserves_original_receipt() {
+        use crate::accounts::{anthropic_identity as ai, identity_store, profiles};
+        struct ReplacingReader {
+            native: std::path::PathBuf,
+            replacement: &'static str,
+            adds: std::cell::Cell<usize>,
+        }
+        impl KeychainExecutor for ReplacingReader {
+            fn find(&self, _: &str, _: &str) -> RawContentClassification {
+                let staged = self.native.with_extension("replacement");
+                crate::platform::fs::write_new_private(&staged, self.replacement.as_bytes())
+                    .unwrap();
+                std::fs::rename(staged, &self.native).unwrap();
+                RawContentClassification::Absent
+            }
+            fn add(&self, _: &str, _: &str, _: &str) -> Result<(), PlatformError> {
+                self.adds.set(self.adds.get() + 1);
+                Ok(())
+            }
+            fn delete(&self, _: &str, _: &str) -> bool {
+                panic!("an absent native item must not be deleted")
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let slot = AccountNum::try_from(1u16).unwrap();
+        let identity = identity_store::IdentityId::new_v4();
+        let context = ai::AnthropicContext::new(
+            "same@example.test",
+            uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
+            uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
+        )
+        .unwrap();
+        let identity_dir = identity_store::identity_path(dir.path(), identity);
+        std::fs::create_dir_all(&identity_dir).unwrap();
+        crate::platform::fs::secure_dir(&dir.path().join("identities")).unwrap();
+        crate::platform::fs::secure_dir(&identity_dir).unwrap();
+        crate::platform::fs::write_new_private(&identity_dir.join("identity.json"),
+            &serde_json::to_vec(&serde_json::json!({"provider":"anthropic","email":context.email(),
+                "account_uuid":context.account_uuid(),"organization_uuid":context.organization_uuid()})).unwrap()).unwrap();
+        let mut pf = profiles::ProfilesFile::empty();
+        pf.by_slot.insert("1".into(), identity);
+        pf.anthropic_contexts.push(ai::AnthropicContextEntry {
+            email: context.email().into(),
+            account_uuid: context.account_uuid(),
+            organization_uuid: context.organization_uuid(),
+            identity_uuid: identity,
+            extra: Default::default(),
+        });
+        profiles::save(&profiles::profiles_path(dir.path()), &pf).unwrap();
+        let raw = r#"{"claudeAiOauth":{"accessToken":"fake-target-at","refreshToken":"fake-target-rt","expiresAt":4102444800000}}"#;
+        let canonical = identity_store::credentials_path_for(dir.path(), identity);
+        crate::credentials::file::save(
+            &canonical,
+            &serde_json::from_str::<crate::credentials::CredentialFile>(raw).unwrap(),
+        )
+        .unwrap();
+        let binding = ai::capture_anthropic_binding(dir.path(), slot).unwrap();
+        let handle = dir.path().join("term-999999");
+        std::fs::create_dir(&handle).unwrap();
+        crate::accounts::markers::write_csq_account(&handle, identity).unwrap();
+        let native = handle.join(".claude.json");
+        let original = r#"{"oauthAccount":null,"projects":{"retain":1}}"#;
+        let foreign = r#"{"oauthAccount":{"emailAddress":"same@example.test","accountUuid":"11111111-1111-4111-8111-111111111111","organizationUuid":"33333333-3333-4333-8333-333333333333"},"projects":{"retain":2}}"#;
+        let canonical_before = std::fs::read(&canonical).unwrap();
+        let profiles_before = std::fs::read(profiles::profiles_path(dir.path())).unwrap();
+        for reconcile in [false, true] {
+            for replacement in [original, foreign] {
+                std::fs::write(&native, original).unwrap();
+                crate::platform::fs::secure_file(&native).unwrap();
+                let receipt =
+                    crate::session::handle_dir::capture_native_swap(dir.path(), &handle).unwrap();
+                assert!(crate::session::handle_dir::native_swap_is_current(
+                    dir.path(),
+                    &handle,
+                    &receipt,
+                    &binding
+                ));
+                let exec = ReplacingReader {
+                    native: native.clone(),
+                    replacement,
+                    adds: std::cell::Cell::new(0),
+                };
+                if reconcile {
+                    let result = reconcile_keychain_to_marker_with_executor(
+                        &exec,
+                        dir.path(),
+                        &handle,
+                        None,
+                    );
+                    if replacement == original {
+                        assert_eq!(
+                            result,
+                            ReconcileOutcome::Reconciled {
+                                marker_account: slot
+                            }
+                        );
+                    } else {
+                        assert_eq!(
+                            result,
+                            ReconcileOutcome::KeychainUnknown {
+                                marker_account: slot,
+                                reason: KeychainUnknownReason::ForeignLogin
+                            }
+                        );
+                    }
+                } else {
+                    let result = force_sync_inner_guarded(
+                        &exec,
+                        dir.path(),
+                        &handle,
+                        Some(raw),
+                        false,
+                        Some(&binding),
+                        Some(&receipt),
+                    )
+                    .unwrap();
+                    if replacement == original {
+                        assert!(matches!(
+                            result,
+                            ForcedSyncResult::Applied { wrote_token: true }
+                        ));
+                    } else {
+                        assert_eq!(result, ForcedSyncResult::ForeignLoginUnharvested);
+                    }
+                }
+                assert_eq!(
+                    exec.adds.get(),
+                    usize::from(replacement == original),
+                    "only the unchanged original receipt allows a write"
+                );
+                assert_eq!(std::fs::read_to_string(&native).unwrap(), replacement);
+                assert_eq!(std::fs::read(&canonical).unwrap(), canonical_before);
+                assert_eq!(
+                    std::fs::read(profiles::profiles_path(dir.path())).unwrap(),
+                    profiles_before
+                );
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod org_cleanup_regression_tests {
+    use super::*;
+    use crate::accounts::{
+        anthropic_identity as ai, identity_store, profiles, profiles_lock::ProfilesFileLock,
+    };
+
+    fn known_fixture() -> (tempfile::TempDir, AccountNum, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = AccountNum::try_from(1u16).unwrap();
+        let id = identity_store::IdentityId::new_v4();
+        let account_uuid = uuid::Uuid::from_u128(1);
+        let organization_uuid = uuid::Uuid::from_u128(2);
+        let mut pf = profiles::ProfilesFile::empty();
+        pf.by_slot.insert(slot.to_string(), id);
+        pf.anthropic_contexts.push(ai::AnthropicContextEntry {
+            email: "known@example.test".into(),
+            account_uuid,
+            organization_uuid,
+            identity_uuid: id,
+            extra: Default::default(),
+        });
+        profiles::save(&profiles::profiles_path(dir.path()), &pf).unwrap();
+        let identity = identity_store::identity_path(dir.path(), id);
+        std::fs::create_dir_all(&identity).unwrap();
+        crate::platform::fs::secure_dir(&dir.path().join("identities")).unwrap();
+        crate::platform::fs::secure_dir(&identity).unwrap();
+        crate::platform::fs::write_new_private(&identity.join("identity.json"),
+            &serde_json::to_vec(&serde_json::json!({"provider":"anthropic", "email":"known@example.test", "account_uuid":account_uuid, "organization_uuid":organization_uuid})).unwrap()).unwrap();
+        let raw = r#"{"claudeAiOauth":{"accessToken":"fake-owned-access","refreshToken":"fake-owned-refresh","expiresAt":4102444800000}}"#.to_owned();
+        crate::credentials::file::save(
+            &identity_store::credentials_path_for(dir.path(), id),
+            &serde_json::from_str::<crate::credentials::CredentialFile>(&raw).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            ai::capture_anthropic_binding(dir.path(), slot)
+                .unwrap()
+                .context(),
+            ai::StoredAnthropicContext::Known(_)
+        ));
+        (dir, slot, raw)
+    }
+
+    #[test]
+    fn keychain_org_identity_regression_queued_foreign_token_retained_after_failed_adoption() {
+        let (dir, slot, _) = known_fixture();
+        let foreign = r#"{"claudeAiOauth":{"accessToken":"fake-foreign-access","refreshToken":"fake-foreign-refresh","expiresAt":4102444800000}}"#;
+        let exec = super::tests::RecordingExecutor::scripted(RawContentClassification::Content(
+            foreign.to_owned().into(),
+        ));
+        let attempts = std::cell::Cell::new(0);
+        let result = decide_and_clear_queued_service_with_executor(
+            &exec,
+            dir.path(),
+            "Claude Code-credentials-fake",
+            Some(slot),
+            Some("foreign@example.test"),
+            Some("fake-account"),
+            &|_, _| {
+                attempts.set(attempts.get() + 1);
+                false
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts.get(), 1);
+        assert!(exec.calls().iter().all(|(op, _, _)| *op == "find"));
+        assert!(
+            matches!(exec.find("Claude Code-credentials-fake", "fake-account"), RawContentClassification::Content(raw) if raw.as_str() == foreign)
+        );
+        assert!(
+            !dir.path().join(QUARANTINE_DIR_NAME).exists(),
+            "retention does not need another secret copy"
+        );
+    }
+
+    struct BoundItem {
+        base: std::path::PathBuf,
+        raw: String,
+        rebind_during_find: bool,
+        first_find: std::cell::Cell<bool>,
+        present: std::cell::Cell<bool>,
+        deletes: std::cell::Cell<u32>,
+        foreign_tail: Option<String>,
+    }
+    impl KeychainExecutor for BoundItem {
+        fn find(&self, _: &str, _: &str) -> RawContentClassification {
+            if self.first_find.replace(false) && self.rebind_during_find {
+                let _lock = ProfilesFileLock::acquire(&self.base).unwrap();
+                let path = profiles::profiles_path(&self.base);
+                let mut pf = profiles::load(&path).unwrap();
+                // Re-publication of even the same UUID must invalidate an
+                // earlier receipt (the A -> B -> A generation defense).
+                *pf.slot_binding_generations.entry("1".into()).or_default() += 1;
+                profiles::save(&path, &pf).unwrap();
+            }
+            if self.present.get() {
+                RawContentClassification::Content(self.raw.clone().into())
+            } else if let Some(tail) = &self.foreign_tail {
+                RawContentClassification::Content(tail.clone().into())
+            } else {
+                RawContentClassification::Absent
+            }
+        }
+        fn add(&self, _: &str, _: &str, _: &str) -> Result<(), PlatformError> {
+            panic!("fixture has no sibling payload to install")
+        }
+        fn delete(&self, _: &str, _: &str) -> bool {
+            assert!(ProfilesFileLock::try_acquire(&self.base).unwrap().is_none());
+            self.deletes.set(self.deletes.get() + 1);
+            self.present.set(false);
+            true
+        }
+    }
+    #[test]
+    fn keychain_org_identity_regression_known_strip_refuses_binding_change_and_preserves_positive()
+    {
+        for rebind in [false, true] {
+            let (dir, slot, raw) = known_fixture();
+            let exec = BoundItem {
+                base: dir.path().to_path_buf(),
+                raw,
+                rebind_during_find: rebind,
+                first_find: std::cell::Cell::new(true),
+                present: std::cell::Cell::new(true),
+                deletes: std::cell::Cell::new(0),
+                foreign_tail: None,
+            };
+            let result = decide_and_clear_queued_service_with_executor(
+                &exec,
+                dir.path(),
+                "fake-service",
+                Some(slot),
+                None,
+                Some("fake-account"),
+                &|_, _| false,
+            );
+            if rebind {
+                assert!(result.is_err());
+                assert_eq!(exec.deletes.get(), 0);
+                assert!(exec.present.get());
+            } else {
+                assert!(result.unwrap());
+                assert_eq!(exec.deletes.get(), 1);
+                assert!(!exec.present.get());
+            }
+        }
+    }
+    #[test]
+    fn keychain_org_identity_regression_history_fingerprint_does_not_authorize_cleanup() {
+        let (dir, slot, _) = known_fixture();
+        let captured = ai::capture_anthropic_binding(dir.path(), slot).unwrap();
+        let raw = r#"{"claudeAiOauth":{"accessToken":"fake-history-access","refreshToken":"fake-history-refresh","expiresAt":4102444800000}}"#;
+        let fp = crate::credentials::token_history::fingerprint_from_raw_json(raw).unwrap();
+        crate::credentials::token_history::append_history(dir.path(), captured.identity(), fp);
+        assert!(
+            crate::credentials::token_history::read_history_for_slot(dir.path(), slot)
+                .contains(&fp)
+        );
+        let canonical = identity_store::credentials_path_for(dir.path(), captured.identity());
+        let before = std::fs::read(&canonical).unwrap();
+        let exec = super::tests::RecordingExecutor::scripted(RawContentClassification::Content(
+            raw.to_owned().into(),
+        ));
+        let result = decide_and_clear_queued_service_with_executor(
+            &exec,
+            dir.path(),
+            "fake-service",
+            Some(slot),
+            None,
+            Some("fake-account"),
+            &|_, _| false,
+        );
+        assert!(result.is_err());
+        assert!(exec.calls().iter().all(|(op, _, _)| *op == "find"));
+        assert!(
+            matches!(exec.find("fake-service", "fake-account"), RawContentClassification::Content(value) if value.as_str() == raw)
+        );
+        assert_eq!(std::fs::read(canonical).unwrap(), before);
+    }
+
+    #[test]
+    fn keychain_org_identity_regression_owned_first_item_does_not_authorize_foreign_duplicate() {
+        let (dir, slot, raw) = known_fixture();
+        let foreign = r#"{"claudeAiOauth":{"accessToken":"fake-tail-access","refreshToken":"fake-tail-refresh","expiresAt":4102444800000}}"#.to_owned();
+        let exec = BoundItem {
+            base: dir.path().to_path_buf(),
+            raw,
+            rebind_during_find: false,
+            first_find: std::cell::Cell::new(true),
+            present: std::cell::Cell::new(true),
+            deletes: std::cell::Cell::new(0),
+            foreign_tail: Some(foreign.clone()),
+        };
+        let result = decide_and_clear_queued_service_with_executor(
+            &exec,
+            dir.path(),
+            "fake-service",
+            Some(slot),
+            None,
+            Some("fake-account"),
+            &|_, _| false,
+        );
+        assert!(
+            result.is_err(),
+            "the remaining native item stays unconfirmed and queued"
+        );
+        assert_eq!(
+            exec.deletes.get(),
+            1,
+            "only the original proved item may be deleted"
+        );
+        assert!(
+            matches!(exec.find("fake-service", "fake-account"), RawContentClassification::Content(raw) if raw.as_str() == foreign)
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "mirror_sweep_telemetry_tests.rs"]
+mod mirror_sweep_telemetry_tests;

@@ -32,7 +32,7 @@
 //! path still works (INV-P01 only becomes load-bearing when the
 //! daemon owns refresh cadence).
 
-use super::keychain::{self, ProbeResult};
+use super::keychain::ProbeResult;
 use super::surface;
 use crate::accounts::markers;
 use crate::accounts::profiles;
@@ -161,33 +161,14 @@ enum ResidueDecision {
     Decline,
 }
 
-/// Production entry point. Spawns the real `codex` binary and uses
-/// [`std::io::stdin`] / [`std::io::stdout`] for the residue prompt.
-///
-/// Security (PR-C3b review M2): when stdin is NOT a TTY AND a
-/// keychain residue is present, there is no way for the user to
-/// answer the y/N prompt — `read_line` returns EOF (`Ok(0)`) which
-/// the prompt logic treats as `Decline`. That is fail-closed on the
-/// CLI side, and the anyhow error tells the user to re-run in a
-/// terminal. The desktop's future Add-Account modal will not use
-/// this entry point; it will go through the Tauri command layer
-/// which captures the modal response BEFORE calling `perform_with`
-/// with a pre-filled reader.
-pub fn perform(base_dir: &Path, account: AccountNum) -> Result<LoginOutcome> {
-    let stdin = std::io::stdin();
-    let mut reader = stdin.lock();
-    let stdout = std::io::stdout();
-    let mut writer = stdout.lock();
-
-    perform_with(
-        base_dir,
-        account,
-        &mut reader,
-        &mut writer,
-        keychain::probe_residue,
-        keychain::purge_residue,
-        spawn_codex_device_auth,
-    )
+/// Share the bound-identity remedy across CLI and desktop without passing
+/// arbitrary mint error bodies to the operator.
+pub(crate) fn mint_error_message(account: AccountNum, reason: &str) -> String {
+    if reason.starts_with("identity_mint_failed: bound_identity_removed;") {
+        format!("identity_mint_failed: bound_identity_removed; run csq logout {account} then csq login {account}")
+    } else {
+        format!("could not mint identity UUID for Codex slot {account} — check profiles.json permissions and disk space")
+    }
 }
 
 /// Dependency-injected core. Exposed to unit tests so the
@@ -301,8 +282,10 @@ where
     // `model = None`: csq does NOT force a model at login (CC-parity — csq does
     // not own the model key). The user-global `~/.codex/config.toml` `model`
     // propagates via the merge; absent that, codex uses its built-in default.
-    surface::write_config_toml(base_dir, account, None)
-        .with_context(|| "pre-seed config-<N>/config.toml failed")?;
+    surface::write_config_toml(base_dir, account, None).map_err(|error| {
+        let context = surface::config_write_error_context(&error);
+        anyhow::Error::new(error).context(context)
+    })?;
 
     // Step 4: shell out to `codex login --device-auth`.
     writeln!(
@@ -402,7 +385,7 @@ where
     // comment) rather than `detect_bound_surface`'s precedence-ordered union
     // detector, so this call is not ordering-sensitive relative to
     // `mint_for_codex_login`. It stays here, ahead of the mint, to mirror the
-    // CLI Anthropic path's `finalize_login` layout.
+    // CLI Anthropic path's `finalize_verified_login` layout.
     //
     // Security review (GH an internal ticket): the ACTION is deferred to just after
     // `update_profile` succeeds below — the last fallible step in this
@@ -426,8 +409,7 @@ where
     // IR-M5: acquire the lock ONCE here and hold it across both
     // `mint_for_codex_login` and `save_canonical_for` so both writes are
     // atomic from a cross-process perspective. `mint_for_codex_login` now
-    // takes `&ProfilesFileLock` as a type-witness (symmetric with
-    // `mint_for_login`).
+    // takes `&ProfilesFileLock` as a type-witness.
     //
     // CRIT-2: if `save_canonical_for` fails after `mint_for_codex_login`
     // succeeds, roll back the `by_slot[N]` mapping so the next `csq run N`
@@ -462,11 +444,7 @@ where
             "could not mint UUID for Codex slot — login cannot complete"
         );
         // auth_json_guard dropped here: cleanup runs on this error exit.
-        return Err(anyhow!(
-            "could not mint identity UUID for Codex slot {} — \
-             check profiles.json permissions and disk space",
-            account
-        ));
+        return Err(anyhow!(mint_error_message(account, &e)));
     }
 
     // M4-12: `save_canonical_for` writes `identities/<UUID>/credentials-codex.json`
@@ -632,13 +610,7 @@ fn format_label(account: AccountNum, account_id_hint: Option<&str>) -> String {
     // SR-M1: validate at the label-formatting boundary. The call site in
     // perform_with already filters empty strings, but format_label may be
     // called from other contexts; the guard here is the final defence.
-    let valid_hint = account_id_hint.and_then(|id| {
-        if id.is_empty() || id.bytes().any(|b| b < 0x20) {
-            None
-        } else {
-            Some(id)
-        }
-    });
+    let valid_hint = account_id_hint.filter(|id| !id.is_empty() && !id.bytes().any(|b| b < 0x20));
     match valid_hint {
         Some(id) => {
             // Keep the label short — account_id is a UUID, so drop the
@@ -687,30 +659,6 @@ fn update_profile(
 ) -> std::result::Result<(), crate::error::ConfigError> {
     let lock = crate::accounts::profiles_lock::ProfilesFileLock::acquire(base_dir)?;
     crate::accounts::profiles::set_slot_identity(&lock, base_dir, account.get(), label)
-}
-
-/// Production codex-cli spawn. Inherits stdio so the user sees the
-/// device code + status output; waits for codex to exit.
-///
-/// Security (PR-C3b review L1): we strip `CLAUDE_CONFIG_DIR` from
-/// the inherited env so a parent shell that has it set (common when
-/// running inside another csq-managed terminal) does not leak the
-/// Claude-surface state dir into a Codex child. Full `env_clear` +
-/// allowlist is PR-C3c's job for the `csq run` launch flow; at
-/// login time we just need to defend the one cross-surface bleed
-/// that is most likely to be already set.
-fn spawn_codex_device_auth(config_dir: &Path) -> Result<ExitStatus> {
-    std::process::Command::new(surface::CLI_BINARY)
-        .args(["login", "--device-auth"])
-        .env(surface::HOME_ENV_VAR, config_dir)
-        .env_remove("CLAUDE_CONFIG_DIR")
-        .status()
-        .with_context(|| {
-            format!(
-                "spawn `{} login --device-auth` — is codex-cli installed and on PATH?",
-                surface::CLI_BINARY
-            )
-        })
 }
 
 #[cfg(test)]
@@ -849,7 +797,7 @@ mod tests {
     /// Pins ambient configuration and the secret backend for these login fixtures.
     /// Restores both overrides on unwind while holding the workspace env lock.
     struct FreshSlotTestEnv {
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: crate::platform::test_env::EnvTestGuard,
         previous: [Option<std::ffi::OsString>; 2],
     }
 
@@ -1143,7 +1091,14 @@ mod tests {
             "pre: slot must be Gemini-bound before the Codex login attempt"
         );
 
-        // Force the mint's ProfilesFileLock::acquire to fail (EISDIR).
+        let marker = crate::providers::gemini::provisioning::binding_path(base, account);
+        let marker_before = std::fs::read(&marker).unwrap();
+        let profiles_path = crate::accounts::profiles::profiles_path(base);
+        let profiles_before = std::fs::read(&profiles_path).unwrap();
+        // Gemini publication now creates the cooperative authority lockfile.
+        // Replace only this temp fixture's regular file with a directory to
+        // inject the same real mint-acquisition failure (EISDIR) as before.
+        std::fs::remove_file(base.join(".profiles.lock")).unwrap();
         std::fs::create_dir_all(base.join(".profiles.lock")).unwrap();
 
         let mut reader = Cursor::new(Vec::<u8>::new());
@@ -1177,6 +1132,8 @@ mod tests {
              detect point — a failed login must not destroy a binding it never \
              actually replaced"
         );
+        assert_eq!(std::fs::read(marker).unwrap(), marker_before);
+        assert_eq!(std::fs::read(profiles_path).unwrap(), profiles_before);
     }
 
     #[test]
@@ -1908,6 +1865,46 @@ mod tests {
     }
 
     // ── Task 2: mint_for_codex_login wired into perform_with ─────────────────
+
+    #[test]
+    fn perform_with_removed_identity_reports_logout_login_remedy() {
+        let dir = TempDir::new().unwrap();
+        let _env = FreshSlotTestEnv::new(dir.path());
+        let base = dir.path();
+        let account = acc(12);
+        provision_uuid_for_account(base, 12);
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(12);
+        crate::accounts::identity_store::mark_identity_removed(base, uuid);
+        let path = profiles::profiles_path(base);
+        let before = std::fs::read(&path).unwrap();
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::new();
+        let error = perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || panic!("must not purge"),
+            |config_dir| {
+                stub_codex_auth_json(config_dir, "removed-bound-fixture");
+                Ok(fake_success())
+            },
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("bound_identity_removed"),
+            "bound identity remedy lost: {message}"
+        );
+        assert!(message.contains("csq logout 12 then csq login 12"));
+        assert!(!message.contains("disk space"));
+        assert!(!base.join("config-12/auth.json").exists());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert!(crate::accounts::identity_store::is_identity_removed(
+            base, uuid
+        ));
+    }
 
     /// Root-cause regression: `perform_with` on a slot with NO prior UUID mapping
     /// (codex-only slot, daemon Pass 0 not yet run) must succeed by calling

@@ -1,0 +1,9 @@
+# Byte-pinned hook-registry fixtures must check out identically on every platform:
+# Windows `core.autocrlf=true` would otherwise convert LF to CRLF and change the
+# bytes their checksums are pinned to. `-text` stops git transforming them.
+csq-core/tests/fixtures/hook_registry_1b/** -text
+csq-core/tests/fixtures/hook-registry/** -text
+
+# Rust source always checks out with LF, on every platform: tests scan source text
+# at fixed `\n` boundaries.
+*.rs text eol=lf

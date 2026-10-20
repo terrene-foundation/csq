@@ -23,6 +23,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 /// Identity for an account. Wraps a UUID v4.
 ///
@@ -99,6 +100,64 @@ pub fn identity_json_path_for(base: &Path, id: IdentityId) -> PathBuf {
     identity_path(base, id).join("identity.json")
 }
 
+/// The one SEC-2.15 secured-directory entry point for identity writers
+/// (R1 M1): creates AND secures `identities/` and `identities/<UUID>/` at
+/// 0o700 via the shared `platform::fs::ensure_private_dir` — mode at
+/// creation (no create-then-chmod window), symlink-refusing before any
+/// create or chmod, fail-closed on every error.
+///
+/// Every writer that can create these directories routes through here; no
+/// site keeps its own chmod implementation.
+pub fn ensure_private_identity_dir(
+    base: &Path,
+    id: IdentityId,
+) -> Result<(), crate::error::PlatformError> {
+    crate::platform::fs::ensure_private_dir(&identities_dir(base))?;
+    crate::platform::fs::ensure_private_dir(&identity_path(base, id))?;
+    Ok(())
+}
+
+/// Tighten-only twin of [`ensure_private_identity_dir`] for
+/// require-existing credential paths (R2 M2): the identical fd-based
+/// no-follow tighten of `identities/` and `identities/<UUID>/`, but it
+/// NEVER creates. A directory removed between the caller's
+/// require-existing precheck and this call (orphan GC, logout with a
+/// failed lock) makes this fail instead of resurrecting it, so a
+/// credential never lands in a recreated tree and a logged-out identity
+/// stays logged out.
+pub fn tighten_existing_identity_dir(
+    base: &Path,
+    id: IdentityId,
+) -> Result<(), crate::error::PlatformError> {
+    crate::platform::fs::tighten_existing_private_dir(&identities_dir(base))?;
+    crate::platform::fs::tighten_existing_private_dir(&identity_path(base, id))?;
+    Ok(())
+}
+
+/// Stage metadata for a fresh UUID; never overwrite an existing identity.
+pub(crate) fn write_anthropic_metadata_new(
+    base: &Path,
+    id: IdentityId,
+    metadata: &serde_json::Value,
+) -> Result<(), std::io::Error> {
+    // SEC-2.15 (unified, R1 M1): both directories via the one shared
+    // fail-closed helper (0o700 at creation, symlink-refusing). The
+    // never-overwrite guarantee lives at the file level: `write_new_private`
+    // below refuses an existing `identity.json`.
+    ensure_private_identity_dir(base, id)
+        .map_err(|_| std::io::Error::other("identity_namespace_refused"))?;
+    let path = identity_json_path_for(base, id);
+    let bytes =
+        zeroize::Zeroizing::new(serde_json::to_vec(metadata).map_err(std::io::Error::other)?);
+    let tmp = crate::platform::fs::unique_tmp_path(&path);
+    let result = crate::platform::fs::write_new_private(&tmp, &bytes)
+        .and_then(|_| crate::platform::fs::atomic_replace(&tmp, &path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map_err(|_| std::io::Error::other("identity_metadata_stage_failed"))
+}
+
 /// Returns `<base>/identities/<uuid>/credentials.json`.
 ///
 /// Phase 2 adds this as the canonical write site for OAuth tokens.  In Phase 1
@@ -142,43 +201,52 @@ pub fn token_history_path_for(base: &Path, id: IdentityId) -> PathBuf {
 /// `identities/<uuid>/` (never inside it), so it SURVIVES `logout_account`'s
 /// `remove_dir_all` of the identity dir itself.
 ///
-/// **The gap this closes.** `credentials::file::save_uuid_credentials` is
-/// the single canonical-store chokepoint for the refresher, backsync, the
-/// custodian's adopt path, AND login — and it unconditionally
-/// `create_dir_all`s the identity dir if absent, because a FRESH login
-/// legitimately needs that on first provisioning. `logout_account` removes
-/// the identity dir with no lock shared with any of those writers, so a
-/// refresher tick (or backsync, or an in-flight adopt) racing a logout can
-/// silently RECREATE the just-removed identity dir and write a token into
-/// it — resurrecting a credential the operator just logged out. Absent vs.
-/// removed are indistinguishable to `create_dir_all` alone; this tombstone
+/// **The gap this closes.** Canonical persistence can create the identity
+/// directory for a fresh verified login. A tombstone distinguishes that initial
+/// provisioning from an identity deliberately removed by logout, so a refresher
+/// or daemon custodian adoption cannot resurrect its canonical credentials.
+/// Automatic live-to-canonical promotion uses the custodian; explicit login
+/// separately reads freshly authorized native credentials. Absent vs. removed are
+/// indistinguishable to `create_dir_all` alone; this tombstone
 /// is the third state a writer can check for. `is_identity_removed`/
-/// `mark_identity_removed`/`clear_identity_removed_marker` are the
-/// read/write/clear primitives; `logout_account` writes the marker in the
-/// SAME step it removes the dir, `save_uuid_credentials` refuses to write
-/// (fail closed) when it is present, and a fresh authorization event for
-/// that SAME uuid (`daemon::identity_mint::mint_for_login`) clears it —
-/// a legitimate new login supersedes a stale removal.
+/// `mark_identity_removed_checked`/`clear_identity_removed_marker` are the
+/// read/write/clear primitives. Logout writes the last-reference marker while
+/// holding profiles authority, before saving the unbound row and deleting the
+/// directory after attempting to acquire the canonical lock. That lock is
+/// best-effort during logout; a failed lock attempt does not prevent cleanup.
+/// Canonical writers must also check the tombstone under their own canonical
+/// lock, refusing marked or indeterminate removals rather than relying on
+/// logout's lock acquisition. A fresh verified Anthropic login provisions a
+/// new identity after logout.
+/// The removed UUID stays tombstoned. The explicit clear helper is not invoked
+/// by the current production login publisher.
 pub fn identity_removed_marker_path(base: &Path, id: IdentityId) -> PathBuf {
     identities_dir(base).join(format!("{}.removed", id.to_canonical_string()))
 }
 
-/// `true` iff `id` was logged out and no subsequent login has cleared the
-/// tombstone. Absence of the marker file (including any read error — a
-/// missing `identities/` dir, permission failure) reads as "not removed",
-/// which is the correct default for a fresh identity that was never logged
-/// out at all.
+/// Refuses a removed identity or an indeterminate tombstone lookup.
+/// Only a definite `NotFound` permits canonical persistence. Any existing
+/// marker entry (including a symlink or directory), or another stat error,
+/// fails closed rather than treating an unreadable removal as absence.
 pub fn is_identity_removed(base: &Path, id: IdentityId) -> bool {
-    identity_removed_marker_path(base, id).is_file()
+    is_identity_removed_with(base, id, |path| std::fs::symlink_metadata(path))
 }
 
-/// Writes the tombstone for `id`. Best-effort (`security.md` Rule 3: logged,
-/// never fatal to the logout it is part of) — the marker holds no secret, so
-/// a plain empty-file create is sufficient; no atomic-replace ceremony is
-/// needed for a file whose only meaningful state is "exists or not".
+fn is_identity_removed_with<F>(base: &Path, id: IdentityId, stat: F) -> bool
+where
+    F: FnOnce(&Path) -> std::io::Result<std::fs::Metadata>,
+{
+    match stat(&identity_removed_marker_path(base, id)) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Best-effort wrapper for the checked non-secret tombstone writer.
+/// Logout uses [`mark_identity_removed_checked`] and propagates its refusal.
+#[cfg(test)]
 pub fn mark_identity_removed(base: &Path, id: IdentityId) {
-    let path = identity_removed_marker_path(base, id);
-    if let Err(e) = std::fs::write(&path, b"") {
+    if let Err(e) = mark_identity_removed_checked(base, id) {
         tracing::warn!(
             error_kind = "identity_removed_marker_write_failed",
             "logout: could not write the identity-removed tombstone for this \
@@ -186,6 +254,243 @@ pub fn mark_identity_removed(base: &Path, id: IdentityId) {
              the credential: {}",
             crate::error::redact_tokens(&e.to_string())
         );
+    }
+}
+
+/// Confirm a regular, single-link tombstone without following or truncating an
+/// existing entry. Retains the opened marker for attempt-specific rollback.
+/// Newly created markers are synced on every platform; Unix also syncs an
+/// existing read-only marker and its namespace dir before confirmation.
+/// Non-Unix existing markers are confirmed read-only without syncing.
+/// Windows marker sync alone does not claim directory-fsync durability.
+pub(crate) fn mark_identity_removed_checked(
+    base: &Path,
+    id: IdentityId,
+) -> std::io::Result<RemovalMarker> {
+    mark_identity_removed_checked_with(base, id, |file| file.sync_all())
+}
+
+fn mark_identity_removed_checked_with(
+    base: &Path,
+    id: IdentityId,
+    sync: impl Fn(&std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<RemovalMarker> {
+    let namespace = identities_dir(base);
+    if std::fs::symlink_metadata(&namespace).is_ok_and(|metadata| !metadata.is_dir()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "identity_removal_namespace_nonregular",
+        ));
+    }
+    // SEC-2.15 (R1 M2): the tombstone marker lands directly under the
+    // identities namespace; `create_dir_all` alone would leave that root at
+    // the process umask (0o755 under 0o022), leaking `<uuid>.removed` names.
+    // The shared fail-closed helper creates AND secures it — mode at
+    // creation, symlink-refusing.
+    crate::platform::fs::ensure_private_dir(&namespace)
+        .map_err(|e| std::io::Error::other(format!("identity_removal_namespace_refused: {e}")))?;
+    if !std::fs::symlink_metadata(&namespace)?.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "identity_removal_namespace_nonregular",
+        ));
+    }
+    let path = identity_removed_marker_path(base, id);
+    let created = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            require_regular_removal_marker(&metadata)?;
+            false
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => return Err(error),
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).create_new(created);
+    // Existing tombstones require only confirmation, including on Windows.
+    options.write(created);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(&path)?;
+    let result = (|| {
+        require_regular_removal_marker(&file.metadata()?)?;
+        let named = open_removal_marker_nofollow(&path)?;
+        if !same_removal_marker(&file, &named)? {
+            return Err(std::io::Error::other("identity removal marker changed"));
+        }
+        if created || cfg!(unix) {
+            #[cfg(unix)]
+            sync_removal_with_fallback(&file, &sync, plain_removal_fsync)?;
+            #[cfg(not(unix))]
+            sync(&file)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                let directory = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                    .open(&namespace)?;
+                sync_removal_with_fallback(&directory, &sync, plain_removal_fsync)?;
+            }
+        }
+        let named = open_removal_marker_nofollow(&path)?;
+        if !same_removal_marker(&file, &named)? {
+            return Err(std::io::Error::other("identity removal marker changed"));
+        }
+        Ok(())
+    })();
+    let marker = RemovalMarker {
+        path,
+        file,
+        created,
+    };
+    if result.is_err() {
+        marker.rollback_if_created();
+    }
+    result.map(|()| marker)
+}
+
+pub(crate) struct RemovalMarker {
+    path: PathBuf,
+    file: std::fs::File,
+    created: bool,
+}
+
+impl RemovalMarker {
+    pub(crate) fn rollback_if_created(&self) {
+        self.rollback_if_created_with(|path| std::fs::remove_file(path));
+    }
+
+    fn rollback_if_created_with(&self, remove: impl FnOnce(&Path) -> std::io::Result<()>) {
+        // Never remove a pre-existing entry or a replacement we cannot bind
+        // to the held file. Cooperative writers hold profiles authority.
+        // Pathname unlink cannot CAS an uncooperative replacement after this
+        // last check; this does not claim native-writer atomicity.
+        if self.created
+            && open_removal_marker_nofollow(&self.path)
+                .and_then(|named| same_removal_marker(&self.file, &named))
+                .unwrap_or(false)
+        {
+            if let Err(error) = remove(&self.path) {
+                tracing::warn!(
+                    error_kind = "identity_removed_marker_rollback_failed",
+                    io_kind = ?error.kind(),
+                    "identity removal marker rollback failed; inspect the marker and retry logout"
+                );
+            }
+        }
+    }
+}
+
+fn require_regular_removal_marker(metadata: &std::fs::Metadata) -> std::io::Result<()> {
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "identity removal tombstone is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "identity removal tombstone has multiple links",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn mark_identity_removed_with_sync(
+    base: &Path,
+    id: IdentityId,
+    sync: impl Fn(&std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<RemovalMarker> {
+    mark_identity_removed_checked_with(base, id, sync)
+}
+
+#[cfg(unix)]
+fn sync_removal_with_fallback(
+    file: &std::fs::File,
+    sync: impl Fn(&std::fs::File) -> std::io::Result<()>,
+    fallback: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match sync(file) {
+        // Darwin distinguishes ENOTSUP (45) from EOPNOTSUPP (102). Linux
+        // aliases them; errno values remain native, never copied across OSes.
+        Err(error)
+            if error.raw_os_error().is_some_and(|code| {
+                [libc::ENOTSUP, libc::EOPNOTSUPP, libc::EINVAL].contains(&code)
+            }) =>
+        {
+            fallback(file)
+        }
+        result => result,
+    }
+}
+
+#[cfg(unix)]
+fn plain_removal_fsync(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the borrowed File keeps this descriptor open for the call.
+    if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn open_removal_marker_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(path)?;
+    require_regular_removal_marker(&file.metadata()?)?;
+    Ok(file)
+}
+
+fn same_removal_marker(left: &std::fs::File, right: &std::fs::File) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let a = left.metadata()?;
+        let b = right.metadata()?;
+        Ok(a.dev() == b.dev() && a.ino() == b.ino())
+    }
+    #[cfg(windows)]
+    {
+        let identity = |file| {
+            crate::accounts::anthropic_identity::windows_file_identity(file)
+                .map_err(|_| std::io::Error::other("identity removal marker identity refused"))
+        };
+        Ok(identity(left)? == identity(right)?)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (left, right);
+        Err(std::io::Error::other(
+            "identity removal marker identity unsupported",
+        ))
     }
 }
 
@@ -321,7 +626,7 @@ pub fn credential_file_for_slot_write(base: &Path, account: crate::types::Accoun
 pub enum TargetToken {
     /// The file was read and its content is a live (non-expired) Anthropic
     /// `claudeAiOauth` token.
-    Valid(String),
+    Valid(Zeroizing<String>),
     /// The file was read, but its content is not a live Anthropic token —
     /// missing `claudeAiOauth` entirely (e.g. a 3P/Codex-only slot) or one
     /// whose `expiresAt` has already passed.
@@ -375,9 +680,16 @@ impl TargetToken {
 /// and refuse the rotation rather than let an untrustworthy-but-Anthropic
 /// target reach `Intended::Strip`.
 pub fn target_token_for_forced_write(base: &Path, target: crate::types::AccountNum) -> TargetToken {
-    let raw = match std::fs::read_to_string(credential_file_for_slot_write(base, target)) {
-        Ok(s) => s,
-        Err(_) => return TargetToken::Unreadable,
+    use std::io::Read;
+    let mut bytes = Zeroizing::new(Vec::new());
+    let read = std::fs::File::open(credential_file_for_slot_write(base, target))
+        .and_then(|mut file| file.read_to_end(&mut bytes));
+    if read.is_err() {
+        return TargetToken::Unreadable;
+    }
+    let raw = match crate::credentials::keychain::zeroizing_utf8(bytes) {
+        Ok(raw) => raw,
+        Err(()) => return TargetToken::Unreadable,
     };
     match crate::credentials::keychain::anthropic_expiry_ms(&raw) {
         Some(ms) if ms > crate::credentials::keychain::now_ms() => TargetToken::Valid(raw),
@@ -614,16 +926,406 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
+    /// R2 M2: the tighten-only identity entry point never resurrects a
+    /// removed identity dir — the race window is a directory removed (by
+    /// orphan GC or logout) after a caller's require-existing precheck.
+    #[test]
+    fn tighten_existing_identity_dir_does_not_recreate_removed_uuid_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+        let id = IdentityId::new_v4();
+        ensure_private_identity_dir(base, id).unwrap();
+        let id_dir = identity_path(base, id);
+        std::fs::remove_dir_all(&id_dir).unwrap();
+
+        tighten_existing_identity_dir(base, id)
+            .expect_err("a removed uuid dir must fail the tighten, not be recreated");
+        assert!(
+            !id_dir.exists(),
+            "the removed identity dir must stay removed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_removed_marker_never_truncates_or_follows_existing_entries() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(identities_dir(dir.path())).unwrap();
+        let id = IdentityId::new_v4();
+        let marker = identity_removed_marker_path(dir.path(), id);
+        let target = dir.path().join("owned-fixture-target");
+        let original = b"nonsecret fixture content must survive";
+        std::fs::write(&target, original).unwrap();
+        std::os::unix::fs::symlink(&target, &marker).unwrap();
+        let result = mark_identity_removed_checked(dir.path(), id);
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            original,
+            "symlink target must remain untouched"
+        );
+        assert!(result.is_err());
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::hard_link(&target, &marker).unwrap();
+        assert!(mark_identity_removed_checked(dir.path(), id).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::write(&marker, original).unwrap();
+        use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let witness = mark_identity_removed_checked(dir.path(), id).unwrap();
+        // SAFETY: witness owns this live file descriptor throughout fcntl.
+        let access = unsafe { libc::fcntl(witness.file.as_raw_fd(), libc::F_GETFL) };
+        assert!(access >= 0);
+        assert_eq!(
+            access & libc::O_ACCMODE,
+            libc::O_RDONLY,
+            "existing marker must be opened read-only"
+        );
+        assert!(
+            !witness.created,
+            "existing regular marker is not owned by this attempt"
+        );
+        assert_eq!(
+            std::fs::read(marker).unwrap(),
+            original,
+            "regular marker content must not be truncated"
+        );
+    }
+
+    #[test]
+    fn identity_removed_existing_marker_readonly_confirmation_syncs_on_unix() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = IdentityId::new_v4();
+        std::fs::create_dir_all(identities_dir(dir.path())).unwrap();
+        let path = identity_removed_marker_path(dir.path(), id);
+        let original = b"existing nonsecret removal marker";
+        std::fs::write(&path, original).unwrap();
+        let permissions = std::fs::metadata(&path).unwrap().permissions();
+        let mut readonly = permissions.clone();
+        readonly.set_readonly(true);
+        std::fs::set_permissions(&path, readonly).unwrap();
+        let file_syncs = std::cell::Cell::new(0);
+        let directory_syncs = std::cell::Cell::new(0);
+        let result = mark_identity_removed_checked_with(dir.path(), id, |file| {
+            if file.metadata()?.is_file() {
+                file_syncs.set(file_syncs.get() + 1);
+                #[cfg(unix)]
+                {
+                    use std::os::fd::AsRawFd;
+                    // SAFETY: the borrowed file owns this live descriptor.
+                    let access = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+                    assert_eq!(access & libc::O_ACCMODE, libc::O_RDONLY);
+                }
+            } else {
+                assert!(file.metadata()?.is_dir());
+                directory_syncs.set(directory_syncs.get() + 1);
+            }
+            Ok(())
+        });
+        // Restore our own fixture before any assertion can unwind.
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let witness = result.expect("read-only existing marker must confirm after required sync");
+        assert!(!witness.created);
+        assert_eq!(
+            file_syncs.get(),
+            usize::from(cfg!(unix)),
+            "existing Unix marker file sync must run; non-Unix confirmation must skip sync"
+        );
+        assert_eq!(
+            directory_syncs.get(),
+            usize::from(cfg!(unix)),
+            "existing Unix marker namespace sync must run; non-Unix confirmation must skip sync"
+        );
+        witness.rollback_if_created();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_removed_existing_marker_sync_failure_refuses_and_preserves_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = IdentityId::new_v4();
+        std::fs::create_dir_all(identities_dir(dir.path())).unwrap();
+        let path = identity_removed_marker_path(dir.path(), id);
+        let original = b"existing nonsecret removal marker";
+        std::fs::write(&path, original).unwrap();
+        let permissions = std::fs::metadata(&path).unwrap().permissions();
+        let mut readonly = permissions.clone();
+        readonly.set_readonly(true);
+        std::fs::set_permissions(&path, readonly).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let held = open_removal_marker_nofollow(&path).unwrap();
+        let result = mark_identity_removed_checked_with(dir.path(), id, |_| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        });
+        std::fs::set_permissions(&path, permissions).unwrap();
+        assert!(
+            result.is_err(),
+            "existing Unix marker sync failure must refuse confirmation"
+        );
+        assert_eq!(result.err().unwrap().raw_os_error(), Some(libc::EIO));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let named = open_removal_marker_nofollow(&path).unwrap();
+        assert!(
+            same_removal_marker(&held, &named).unwrap(),
+            "failed confirmation must preserve the held existing marker"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_removed_directory_sync_falls_back_only_for_unsupported_full_sync() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let directory = std::fs::File::open(dir.path()).unwrap();
+        for error in [libc::ENOTSUP, libc::EOPNOTSUPP, libc::EINVAL] {
+            let fallback_called = std::cell::Cell::new(false);
+            sync_removal_with_fallback(
+                &directory,
+                |_| Err(std::io::Error::from_raw_os_error(error)),
+                |file| {
+                    fallback_called.set(true);
+                    plain_removal_fsync(file)
+                },
+            )
+            .expect("unsupported directory full sync must use plain fsync");
+            assert!(
+                fallback_called.get(),
+                "unsupported full sync must use plain directory fsync"
+            );
+        }
+        let fallback_called = std::cell::Cell::new(false);
+        let result = sync_removal_with_fallback(
+            &directory,
+            |_| Err(std::io::Error::from_raw_os_error(libc::EACCES)),
+            |_| {
+                fallback_called.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EACCES));
+        assert!(
+            !fallback_called.get(),
+            "ordinary sync errors must not be hidden"
+        );
+        let result = sync_removal_with_fallback(
+            &directory,
+            |_| Err(std::io::Error::from_raw_os_error(libc::ENOTTY)),
+            |_| panic!("ENOTTY must not receive a directory sync fallback"),
+        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOTTY));
+        let result = sync_removal_with_fallback(
+            &directory,
+            |_| Err(std::io::Error::from_raw_os_error(libc::ENOTSUP)),
+            |_| Err(std::io::Error::from_raw_os_error(libc::EIO)),
+        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EIO));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_removed_file_sync_fallback_is_narrow_and_preserves_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for code in [libc::ENOTSUP, libc::EOPNOTSUPP, libc::EINVAL] {
+            let id = IdentityId::new_v4();
+            let calls = std::cell::Cell::new(0);
+            let marker = mark_identity_removed_checked_with(dir.path(), id, |file| {
+                if file.metadata()?.is_file() {
+                    calls.set(calls.get() + 1);
+                    Err(std::io::Error::from_raw_os_error(code))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect("unsupported marker-file full sync must use plain fsync");
+            assert!(marker.created);
+            assert_eq!(calls.get(), 1);
+            assert!(identity_removed_marker_path(dir.path(), id).is_file());
+            marker.rollback_if_created();
+        }
+        for code in [libc::ENOTTY, libc::EACCES, libc::EIO] {
+            let id = IdentityId::new_v4();
+            let result = mark_identity_removed_checked_with(dir.path(), id, |file| {
+                if file.metadata()?.is_file() {
+                    Err(std::io::Error::from_raw_os_error(code))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(
+                result.is_err(),
+                "ordinary file sync errors must refuse marker creation"
+            );
+            assert_eq!(result.err().unwrap().raw_os_error(), Some(code));
+            assert!(
+                !identity_removed_marker_path(dir.path(), id).exists(),
+                "failed marker-file sync must roll back only the new marker"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_removed_rollback_failure_warns_for_readonly_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Arc, Mutex};
+        #[derive(Default)]
+        struct Fields(Vec<(String, String)>);
+        impl tracing::field::Visit for Fields {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.push((field.name().into(), value.into()));
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push((field.name().into(), format!("{value:?}")));
+            }
+        }
+        type Events = Arc<Mutex<Vec<(tracing::Level, Fields)>>>;
+        struct Capture(Events);
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+                Some(tracing::metadata::LevelFilter::TRACE)
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((*event.metadata().level(), fields));
+            }
+        }
+        let _env = crate::platform::test_env::lock();
+        let _tracing = crate::testing::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = IdentityId::new_v4();
+        let marker = mark_identity_removed_checked(dir.path(), id).unwrap();
+        let namespace = identities_dir(dir.path());
+        let original = std::fs::metadata(&namespace).unwrap().permissions();
+        std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let events: Events = Arc::new(Mutex::new(Vec::new()));
+        let removes = std::cell::Cell::new(0);
+        tracing::subscriber::with_default(Capture(events.clone()), || {
+            marker.rollback_if_created_with(|path| {
+                removes.set(removes.get() + 1);
+                // SAFETY: geteuid has no arguments or pointer preconditions.
+                if unsafe { libc::geteuid() } == 0 {
+                    // Privileged runners bypass native mode-bit enforcement.
+                    // Inject the OS failure there; never claim native uid0
+                    // permission denial. Nonroot exercises the actual unlink.
+                    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                } else {
+                    std::fs::remove_file(path)
+                }
+            });
+        });
+        std::fs::set_permissions(&namespace, original).unwrap();
+        assert_eq!(
+            removes.get(),
+            1,
+            "rollback must reach the bound removal attempt"
+        );
+        assert!(identity_removed_marker_path(dir.path(), id).is_file());
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "rollback failure must emit exactly one fixed warning"
+        );
+        assert_eq!(events[0].0, tracing::Level::WARN);
+        assert!(
+            events[0]
+                .1
+                 .0
+                .iter()
+                .any(|(name, value)| name == "error_kind"
+                    && value == "identity_removed_marker_rollback_failed"),
+            "rollback failure must emit its fixed diagnostic tag"
+        );
+        let private_path = dir.path().to_string_lossy();
+        assert!(
+            events[0]
+                .1
+                 .0
+                .iter()
+                .all(|(_, value)| !value.contains(private_path.as_ref())),
+            "rollback warning must not expose its fixture path"
+        );
+        drop(events);
+        marker.rollback_if_created();
+        assert!(!identity_removed_marker_path(dir.path(), id).exists());
+    }
+
+    #[test]
+    fn identity_removed_stat_errors_refuse_canonical_persistence() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = IdentityId::new_v4();
+        let expected = identity_removed_marker_path(dir.path(), id);
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+            std::io::ErrorKind::NotADirectory,
+        ] {
+            let called = std::cell::Cell::new(false);
+            assert!(is_identity_removed_with(dir.path(), id, |path| {
+                assert_eq!(path, expected);
+                called.set(true);
+                Err(std::io::Error::from(kind))
+            }));
+            assert!(called.get(), "the injected stat boundary must be reached");
+        }
+    }
+
+    #[test]
+    fn identity_removed_only_not_found_permits_canonical_persistence() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = IdentityId::new_v4();
+        assert!(!is_identity_removed(dir.path(), id));
+        assert!(!is_identity_removed_with(dir.path(), id, |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        }));
+        mark_identity_removed(dir.path(), id);
+        assert!(is_identity_removed(dir.path(), id));
+        clear_identity_removed_marker(dir.path(), id);
+        let marker = identity_removed_marker_path(dir.path(), id);
+        std::fs::create_dir(&marker).unwrap();
+        assert!(is_identity_removed(dir.path(), id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_removed_dangling_symlink_refuses_canonical_persistence() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = IdentityId::new_v4();
+        std::fs::create_dir_all(identities_dir(dir.path())).unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("absent"),
+            identity_removed_marker_path(dir.path(), id),
+        )
+        .unwrap();
+        assert!(is_identity_removed(dir.path(), id));
+    }
+
     /// S-LOW-1 / `credential-type-hygiene.md` Rule 1: `TargetToken::Valid`
     /// carries a live `.credentials.json` payload. Its manual `Debug` MUST
     /// print a placeholder and MUST NOT print the token bytes; the
     /// non-`Valid` variants print their plain names unchanged.
     #[test]
     fn target_token_debug_redacts_valid() {
-        let valid = TargetToken::Valid(
-            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-NOTREALTOKu9x","refreshToken":"sk-ant-ort01-NOTREALTOKu9x","expiresAt":4102444800000}}"#
-                .to_string(),
-        );
+        let valid = TargetToken::Valid((r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-NOTREALTOKu9x","refreshToken":"sk-ant-ort01-NOTREALTOKu9x","expiresAt":4102444800000}}"#
+                .to_string()).into());
         let debug = format!("{valid:?}");
         assert!(
             debug.contains("REDACTED"),
@@ -1450,6 +2152,37 @@ mod tests {
         assert!(
             !is_codex_only_slot(dir.path(), 1, uuid),
             "dual-bound slot must enumerate as Anthropic, not codex-only"
+        );
+    }
+    #[test]
+    fn credential_buffer_target_native_holder_and_invalid_utf8_preserve_states() {
+        let dir = crate::testing::identity_fixtures::coexisting_fixture(1);
+        let slot = crate::types::AccountNum::try_from(1u16).unwrap();
+        let path = credential_file_for_slot_write(dir.path(), slot);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let json = r#"{"claudeAiOauth":{"accessToken":"fake-access","refreshToken":"fake-refresh","expiresAt":4102444800000}}"#;
+        std::fs::write(&path, json).unwrap();
+        let target = target_token_for_forced_write(dir.path(), slot);
+        let TargetToken::Valid(raw) = &target else {
+            panic!("valid fixture must remain valid")
+        };
+        let _: &Zeroizing<String> = raw;
+        assert_eq!(target.as_valid_str(), Some(json));
+        assert_eq!(target.clone(), target);
+        assert!(!format!("{target:?}").contains("fake-access"));
+        std::fs::write(&path, [b'{', 0xff]).unwrap();
+        assert_eq!(
+            target_token_for_forced_write(dir.path(), slot),
+            TargetToken::Unreadable
+        );
+        std::fs::write(
+            &path,
+            r#"{"claudeAiOauth":{"accessToken":"fake-prefix","broken":}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            target_token_for_forced_write(dir.path(), slot),
+            TargetToken::ExpiredOrInvalid
         );
     }
 }

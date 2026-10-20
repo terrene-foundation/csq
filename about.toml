@@ -46,6 +46,7 @@ no-clearly-defined = true
 # GPL / AGPL / LGPL / EUPL / SSPL are all absent → denied by default.
 accepted = [
   "MIT",
+  "MIT-0", # MIT No Attribution (borrow-or-share); permissive, no reciprocal terms.
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
   "BSD-2-Clause",

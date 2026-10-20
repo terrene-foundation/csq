@@ -273,6 +273,12 @@ fn print_contaminated(slots: &[ContaminatedSlot]) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static HEAL_AFTER_OWNERSHIP_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Applies pass-3 heal: for each contaminated slot, RE-VERIFIES ownership against
 /// `/api/oauth/profile` immediately before deleting (check-then-act, closing the
 /// scan→delete TOCTOU window — a token the daemon adopted after the scan is
@@ -280,17 +286,15 @@ fn print_contaminated(slots: &[ContaminatedSlot]) {
 /// skip, fail-closed on doubt). On confirm, clears the slot so the next
 /// `csq login N` re-authenticates a clean token.
 ///
-/// Deletes TWO files for the slot, both resolved for THIS slot only:
-///  1. the store the daemon polls — [`slot_store_credential_path`] (UUID-keyed
-///     `identities/<UUID>/credentials.json`, or legacy `credentials/N.json`), the
-///     exact path the detector read; and
+/// Deletes TWO files under the original captured binding and canonical lock:
+///  1. the detector's exact UUID-keyed `identities/<UUID>/credentials.json`,
+///     without re-resolving the slot after the profile request; and
 ///  2. the legacy `credentials/N.json` ClaudeCode canonical — the source
 ///     [`phase4_gate_self_heal`] copies back into the identity store on the next
 ///     daemon start. Leaving it would RESURRECT the (possibly still-contaminated)
 ///     token and re-trip the gate; deleting it also makes phase4 Check 3 skip the
 ///     slot (no legacy anthropic canonical → not ClaudeCode-bound-on-disk → no
-///     daemon-start refusal). When (1) already IS the legacy path (no UUID), the
-///     second remove is a benign idempotent no-op.
+///     daemon-start refusal). A missing UUID authority refuses before deletion.
 ///
 /// Never touches another slot's identity dir, never the slot's `identity.json` or
 /// `settings.json` (anchor/label/settings survive so re-login re-mints against the
@@ -300,23 +304,16 @@ fn print_contaminated(slots: &[ContaminatedSlot]) {
 /// `csq repair --apply` as a resolution boundary) so a stale flag from the
 /// contaminated token does not outlive the heal in `csq doctor`.
 ///
-/// **Why the third store-ingest path — `refresh::sync::backsync` — cannot
-/// resurrect the token.** `backsync` is live on every `csq statusline` render and
-/// promotes a live `.credentials.json` into the store when it is fresher, so with
-/// the store now empty a future-dated live file WOULD be promoted. But the live
-/// file `statusline` hands `backsync` is the TERMINAL's handle-dir
-/// `.credentials.json` (`current_config_dir()`), which in the M3-7 handle-dir
-/// model is a SYMLINK into the store we just deleted — so `credentials::load`
-/// fails and `backsync` returns `Ok(false)`, promoting nothing. The store stays
-/// empty until `csq login` (no auto-self-heal; the honest "needs login" state). A
-/// foreign token cannot reach the store through this path either: CC is
-/// keychain-first, so an in-session `/login` to another account writes the foreign
-/// token to the per-config-dir KEYCHAIN (the vector the custodian's ingest gate
-/// guards — `csq-core/src/daemon/custodian.rs` §"the wrong-account guard"), NOT to
-/// the handle-dir file, which stays a symlink. `config-N/.credentials.json` is left
-/// in place (as pass-1 does — CC may hold it, and it is not the handle-dir symlink
-/// target that `backsync` reads); it cannot re-seed a foreign token because the
-/// `config-N` file is same-account-path-keyed per that same threat model.
+/// **Live-to-canonical ingestion is daemon-only.** Statusline rendering and
+/// launch do not promote live credentials. Under spec 02's INV-LIVE-CANON, only
+/// `daemon::custodian::harvest_live_file_candidates` promotes a CC-written live
+/// file, using captured UUID custody and exact-grant ownership checks. A missing
+/// canonical grant prevents capturing its required credential-version witness.
+/// The guarded writer also rechecks canonical custody before adoption. Clearing
+/// the confirmed contaminated canonical therefore leaves the slot needing a verified login;
+/// a live file or keychain item alone does not authorize reseeding it.
+/// `config-N/.credentials.json` remains native login output, not a maintained
+/// canonical mirror.
 ///
 /// **Scope note (deliberate):** the heal is CLI-operator-initiated only. The
 /// daemon/desktop do NOT auto-heal — auto-deleting credentials on a background
@@ -333,9 +330,10 @@ fn apply_contaminated_heal(
     slots: &[ContaminatedSlot],
     http_get: &csq_core::daemon::usage_poller::HttpGetFn,
 ) -> usize {
-    use csq_core::daemon::custodian::{
-        check_slot_store_token_ownership, slot_store_credential_path, SlotOwnership,
+    use csq_core::accounts::{
+        anthropic_identity as ai, identity_store, profiles_lock::ProfilesFileLock,
     };
+    use csq_core::daemon::custodian::{check_slot_store_token_ownership, SlotOwnership};
     let mut cleared = 0usize;
     for c in slots {
         let acct = match AccountNum::try_from(c.slot) {
@@ -344,6 +342,13 @@ fn apply_contaminated_heal(
                 eprintln!("  skipped slot {} — invalid slot: {e}", c.slot);
                 continue;
             }
+        };
+        // Keep the original identity/version across the profile request. The
+        // verifier may release authority before returning; deletion must not
+        // derive a new target from a slot that changed in that window.
+        let Ok(captured) = ai::capture_anthropic_binding(base_dir, acct) else {
+            eprintln!("  slot {} identity authority unavailable — skipped", c.slot);
+            continue;
         };
         // Re-verify under a fresh read right before the irreversible delete.
         if check_slot_store_token_ownership(base_dir, acct, http_get) != SlotOwnership::Contaminated
@@ -355,15 +360,35 @@ fn apply_contaminated_heal(
             );
             continue;
         }
-        // (1) the store the daemon polls; (2) the legacy self-heal source.
-        // In practice a Contaminated slot is ALWAYS UUID-mapped —
-        // `check_slot_store_token_ownership` fail-closes to `Unknown` (never
-        // `Contaminated`) without an `identity.json` anchor, which only a
-        // UUID-mapped slot has — so `store_path` is the UUID-keyed file and
-        // `legacy_path` is the distinct `credentials/N.json`. The dedup guard
-        // below is defensive for the no-UUID case that the re-check above cannot
-        // actually reach.
-        let store_path = slot_store_credential_path(base_dir, acct);
+        #[cfg(test)]
+        HEAL_AFTER_OWNERSHIP_TEST_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        let Ok(authority) = ProfilesFileLock::acquire(base_dir) else {
+            eprintln!("  slot {} identity authority unavailable — skipped", c.slot);
+            continue;
+        };
+        let store_path = identity_store::credentials_path_for(base_dir, captured.identity());
+        let Ok(Some(_canonical)) =
+            csq_core::platform::lock::lock_credential_file(&store_path.with_extension("lock"))
+        else {
+            eprintln!(
+                "  slot {} canonical authority unavailable — skipped",
+                c.slot
+            );
+            continue;
+        };
+        if !ai::binding_matches_locked(&authority, base_dir, &captured).unwrap_or(false) {
+            println!(
+                "  slot {} identity changed during ownership check — skipped",
+                c.slot
+            );
+            continue;
+        }
+        // Both authority locks stay held through deletion and sentinel cleanup.
+        // Resolve the UUID path only from the original captured binding.
         let legacy_path = csq_core::credentials::file::canonical_path(base_dir, acct);
         let mut removed_any = false;
         let mut had_io_error = false;
@@ -375,9 +400,6 @@ fn apply_contaminated_heal(
                     had_io_error = true;
                     eprintln!("  failed to clear a store file for slot {}: {e}", c.slot);
                 }
-            }
-            if store_path == legacy_path {
-                break; // no-UUID slot: the two paths are identical, remove once.
             }
         }
         let outcome = heal_outcome(removed_any, had_io_error);
@@ -592,14 +614,14 @@ fn scan(base_dir: &Path) -> Result<Vec<Finding>> {
     // `uuid_canonical ≠ live_legacy` check flagged every healthy post-M3-7
     // Anthropic OAuth slot as "A++ drift". `config-N/.credentials.json`
     // (`live_legacy`) is a TRANSIENT login landing-spot, not a maintained
-    // mirror: M3-7 retired the daemon's live-mirror PUSH (`refresh/sync.rs`),
+    // mirror: M3-7 retired the daemon's live-mirror push,
     // so after the first daemon refresh the canonical UUID token diverges from
     // the now-frozen `config-N` token BY DESIGN. CC sessions read the canonical
     // token through their handle-dir symlink (`term-<pid>/.credentials.json →
-    // identities/<UUID>/credentials.json`), never `config-N`. The daemon's
-    // `backsync` DOES read `config-N` but only promotes it when it is NEWER
-    // (monotonicity guard, sync.rs:104) — a stale older `config-N` is ignored,
-    // and a newer one self-heals on the next tick. So the divergence is never
+    // identities/<UUID>/credentials.json`), never `config-N`.
+    // Live-file promotion now belongs only to the daemon custodian under
+    // captured identity and exact-grant authority (spec 02 INV-LIVE-CANON);
+    // statusline and launch backsync are retired. This divergence is not
     // actionable, and Pass 0b's only remediation (`apply_contamination`) deletes
     // `credentials/N.json` — a DIFFERENT file that is absent post-M4-12 — so it
     // could not even fix what it flagged. Pass 0 (legacy `credentials/N.json` vs
@@ -628,7 +650,7 @@ fn scan(base_dir: &Path) -> Result<Vec<Finding>> {
             canon_by_token.entry(c.clone()).or_default().push(slot);
         }
     }
-    for (_, slots) in canon_by_token.iter() {
+    for slots in canon_by_token.values() {
         if slots.len() < 2 {
             continue;
         }
@@ -652,7 +674,7 @@ fn scan(base_dir: &Path) -> Result<Vec<Finding>> {
             live_by_token.entry(l.clone()).or_default().push(slot);
         }
     }
-    for (_, slots) in live_by_token.iter() {
+    for slots in live_by_token.values() {
         if slots.len() < 2 {
             continue;
         }
@@ -697,6 +719,20 @@ mod tests {
     use csq_core::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
     use tempfile::TempDir;
 
+    /// Writes `contents` and tightens the file to 0o600 — the mode
+    /// production's atomic-replace path gives every credential file
+    /// (`security.md` MUST Rule 5). A bare `std::fs::write` follows the
+    /// ambient umask (0o644 under 0o022), and the strict readers
+    /// (`read_json(path, private = true)`) refuse group/other bits, so on a
+    /// runner with a permissive umask the fixture fails inside
+    /// `capture_anthropic_binding` for a reason production never reproduces
+    /// (`guard-reader-writer-parity.md` MUST Rule 4: the fixture writes the
+    /// forms production writes).
+    fn write_private(path: &Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        csq_core::platform::fs::secure_file(path).unwrap();
+    }
+
     /// Writes a legacy credential file (canonical or live) with the given refresh token.
     /// Uses the `claudeAiOauth` wrapper that `read_rt_prefix` expects.
     fn write_creds(base: &Path, slot: u16, refresh_token: &str, live: bool) {
@@ -712,7 +748,7 @@ mod tests {
         let json = format!(
             r#"{{"claudeAiOauth":{{"accessToken":"sk-ant-oat01-x","refreshToken":"{refresh_token}","expiresAt":1000}}}}"#
         );
-        std::fs::write(path, json).unwrap();
+        write_private(&path, &json);
     }
 
     /// Writes a UUID-canonical credential file at
@@ -727,7 +763,7 @@ mod tests {
         let json = format!(
             r#"{{"claudeAiOauth":{{"accessToken":"sk-ant-oat01-x","refreshToken":"{refresh_token}","expiresAt":1000}}}}"#
         );
-        std::fs::write(&path, json).unwrap();
+        write_private(&path, &json);
     }
 
     #[test]
@@ -991,7 +1027,11 @@ mod tests {
         std::sync::Arc::new(move |_u: &str, _t: &str, _h: &[(&str, &str)]| {
             Ok((
                 200u16,
-                format!(r#"{{"account":{{"uuid":"u","email":"{email}"}}}}"#).into_bytes(),
+                serde_json::to_vec(&serde_json::json!({
+                    "account": {"uuid": "11111111-1111-4111-8111-111111111111", "email": email},
+                    "organization": {"uuid": "22222222-2222-4222-8222-222222222222"}
+                }))
+                .unwrap(),
             ))
         })
     }
@@ -1004,26 +1044,24 @@ mod tests {
     fn seed_full_anthropic_slot(base: &Path, slot: u16, anchor: &str) {
         use csq_core::accounts::identity_store::{identity_json_path_for, settings_path_for};
         let uuid = fixture_uuid_for_slot(slot);
-        std::fs::write(
-            identity_json_path_for(base, uuid),
-            format!(
+        write_private(
+            &identity_json_path_for(base, uuid),
+            &format!(
                 r#"{{"email":"{anchor}","provider":"anthropic","created_at":"t","key_id":null}}"#
             ),
-        )
-        .unwrap();
+        );
         write_uuid_creds(base, slot, "sk-ant-ort01-store-token"); // identities/<UUID>/credentials.json
         write_creds(base, slot, "sk-ant-ort01-legacy-token", false); // credentials/N.json (self-heal src)
-        std::fs::write(settings_path_for(base, uuid), "{}").unwrap();
+        write_private(&settings_path_for(base, uuid), "{}");
         // Bump the store-version sentinel to the current schema so phase4
         // Check 1/2 pass (coexisting_fixture writes an older schema).
-        std::fs::write(
-            csq_core::accounts::identity_store::store_version_path(base),
-            format!(
+        write_private(
+            &csq_core::accounts::identity_store::store_version_path(base),
+            &format!(
                 r#"{{"schema":{},"minted_at":"t","source":"test"}}"#,
                 csq_core::daemon::identity_mint::STORE_VERSION_SCHEMA_CURRENT
             ),
-        )
-        .unwrap();
+        );
     }
 
     #[test]
@@ -1093,6 +1131,110 @@ mod tests {
             store.exists(),
             "store MUST survive when re-check is not Contaminated"
         );
+    }
+
+    #[test]
+    fn apply_contaminated_heal_postcheck_rebind_or_rotation_preserves_winner() {
+        for rebind in [false, true] {
+            let dir = coexisting_fixture(2);
+            let base = dir.path();
+            seed_full_anthropic_slot(base, 1, "owner@anchor.test");
+            seed_full_anthropic_slot(base, 2, "winner@anchor.test");
+            let source = credentials_path_for(base, fixture_uuid_for_slot(1));
+            let winner = credentials_path_for(base, fixture_uuid_for_slot(2));
+            let source_before = std::fs::read(&source).unwrap();
+            let winner_before = std::fs::read(&winner).unwrap();
+            let legacy = base.join("credentials/1.json");
+            let legacy_before = std::fs::read(&legacy).unwrap();
+            let owned_base = base.to_path_buf();
+            let owned_source = source.clone();
+            let hooks = std::rc::Rc::new(std::cell::Cell::new(0));
+            let hook_calls = hooks.clone();
+            HEAL_AFTER_OWNERSHIP_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    hook_calls.set(hook_calls.get() + 1);
+                    let _authority =
+                        csq_core::accounts::profiles_lock::ProfilesFileLock::acquire(&owned_base)
+                            .unwrap();
+                    if rebind {
+                        let path = csq_core::accounts::profiles::profiles_path(&owned_base);
+                        let mut profiles = csq_core::accounts::profiles::load(&path).unwrap();
+                        profiles
+                            .by_slot
+                            .insert("1".into(), fixture_uuid_for_slot(2));
+                        *profiles
+                            .slot_binding_generations
+                            .entry("1".into())
+                            .or_default() += 1;
+                        csq_core::accounts::profiles::save(&path, &profiles).unwrap();
+                    } else {
+                        let mut credential = csq_core::credentials::load(&owned_source).unwrap();
+                        credential
+                            .expect_anthropic_mut()
+                            .claude_ai_oauth
+                            .access_token =
+                            csq_core::types::AccessToken::new("fake-healed-winning-access".into());
+                        csq_core::credentials::file::save(&owned_source, &credential).unwrap();
+                    }
+                    csq_core::refresh::sentinel::set_broker_failed(
+                        &owned_base,
+                        AccountNum::try_from(1u16).unwrap(),
+                        "winner_failure",
+                    )
+                    .unwrap();
+                }));
+            });
+            struct ResetHook;
+            impl Drop for ResetHook {
+                fn drop(&mut self) {
+                    HEAL_AFTER_OWNERSHIP_TEST_HOOK.with(|hook| *hook.borrow_mut() = None);
+                }
+            }
+            let _reset = ResetHook;
+            assert_eq!(
+                apply_contaminated_heal(
+                    base,
+                    &[ContaminatedSlot {
+                        slot: 1,
+                        label: "owner@anchor.test".into()
+                    }],
+                    &profile_http_get("stranger@foreign.test")
+                ),
+                0
+            );
+            assert_eq!(
+                hooks.get(),
+                1,
+                "complete profile must reach the actual postcheck race seam"
+            );
+            assert_eq!(std::fs::read(&winner).unwrap(), winner_before);
+            assert_eq!(std::fs::read(&legacy).unwrap(), legacy_before);
+            if rebind {
+                assert_eq!(std::fs::read(&source).unwrap(), source_before);
+                assert_eq!(
+                    csq_core::accounts::profiles::resolve_slot_to_uuid(base, 1),
+                    Some(fixture_uuid_for_slot(2))
+                );
+            } else {
+                assert_eq!(
+                    csq_core::credentials::load(&source)
+                        .unwrap()
+                        .expect_anthropic()
+                        .claude_ai_oauth
+                        .access_token
+                        .expose_secret(),
+                    "fake-healed-winning-access"
+                );
+            }
+            assert_eq!(
+                csq_core::refresh::sentinel::read_broker_failed_reason(
+                    base,
+                    AccountNum::try_from(1u16).unwrap()
+                )
+                .as_deref(),
+                Some("winner_failure")
+            );
+        }
     }
 
     #[test]

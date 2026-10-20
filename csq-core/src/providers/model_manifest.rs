@@ -361,7 +361,10 @@ impl ModelManifest {
     pub fn install(base_dir: &Path, source: &Path) -> Result<Self> {
         let bytes = read_bounded(source)?;
         let manifest = Self::from_slice(&bytes)?;
-        std::fs::create_dir_all(base_dir)?;
+        // R2 M3: route the manifest root through the shared SEC-2.15 helper
+        // (creates at 0o700, resilient to a leaf-symlinked operator dir)
+        // instead of a bare create_dir_all at the process umask.
+        crate::platform::fs::ensure_private_dir_root(base_dir)?;
         let destination = manifest_path(base_dir);
         match std::fs::symlink_metadata(&destination) {
             Ok(metadata) if !metadata.file_type().is_file() => {

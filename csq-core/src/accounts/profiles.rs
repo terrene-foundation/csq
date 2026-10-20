@@ -80,6 +80,40 @@ pub struct ProfilesFile {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub by_email: HashMap<String, IdentityId>,
 
+    /// Complete provider context index. Legacy email keys remain display-only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub anthropic_contexts: Vec<super::anthropic_identity::AnthropicContextEntry>,
+
+    /// Changes on every slot binding publication, including A -> B -> A.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub slot_binding_generations: HashMap<String, u64>,
+
+    /// Slot number (as string) → the identities this slot was previously
+    /// bound to and displaced, oldest first, bounded to
+    /// `MAX_SLOT_BINDING_HISTORY`. Owner directive 2026-10-11 (coordinator
+    /// 32b912fa): written at every rebind by BOTH generation-bumping writers —
+    /// `add_identity_mapping` and the Anthropic re-login publication in
+    /// `accounts::anthropic_identity` — each through
+    /// `record_binding_displacement`, in the same locked read-modify-write
+    /// and same `save()` as the `by_slot` overwrite
+    /// and the generation bump. A rebind drops the prior uuid
+    /// from `by_slot`, so without this field a slot's PREVIOUS binding is
+    /// unprovable after a re-login; it exists so
+    /// `token_history::retired_bindings_for_slot` can admit a
+    /// terminal's keychain token that belongs to one of THIS slot's retired
+    /// bindings — never a retired identity of another slot or account.
+    /// A reader that finds no entry (rebinds predating this field) admits
+    /// nothing — the refusal remedy is `csq login <n>` / `csq run <n>`.
+    ///
+    /// Review R1 L5: older builds absorb this key into `extra` and round-trip
+    /// it verbatim (see the struct's merge contract), but a REBIND performed
+    /// by an older binary does not append, so the history can lag that
+    /// binary's rebinds. The effect is narrowing only — a missing entry can
+    /// refuse a token, never admit one — and any rebind by a current binary
+    /// re-establishes the record.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub slot_binding_history: HashMap<String, Vec<IdentityId>>,
+
     /// RN1-D2 (A1 label channel): slot number (as string) → user-chosen
     /// display label. Written by `set_slot_label` (the `rename_account`
     /// flow, post-D3). Read by `get_email` (D3 changes resolution order
@@ -123,6 +157,9 @@ impl ProfilesFile {
         Self {
             by_slot: HashMap::new(),
             by_email: HashMap::new(),
+            anthropic_contexts: Vec::new(),
+            slot_binding_generations: HashMap::new(),
+            slot_binding_history: HashMap::new(),
             by_slot_label: HashMap::new(),
             by_slot_identity: HashMap::new(),
             extra: HashMap::new(),
@@ -146,7 +183,7 @@ impl ProfilesFile {
     ///   Step 1b is checked after the rename channel so a user rename wins.
     /// - **Step 2** `by_slot[N] → UUID → reverse-search by_email` — fallback
     ///   for OAuth slots that have never been renamed and have reached
-    ///   daemon Pass 0 / `mint_for_login`.
+    ///   daemon Pass 0 / `commit_anthropic_login`.
     ///
     /// (The former Step 2 `accounts[N].email` compat seam was removed in
     /// M4-13 / release N+1. The `prune_redundant_accounts_entries`
@@ -168,6 +205,13 @@ impl ProfilesFile {
         // Step 2: identity layer fallback for un-renamed OAuth slots.
         // (Former Step 2 `accounts[N].email` removed in M4-13.)
         let uuid = self.by_slot.get(&slot_key).copied()?;
+        if let Some(entry) = self
+            .anthropic_contexts
+            .iter()
+            .find(|entry| entry.identity_uuid == uuid)
+        {
+            return Some(&entry.email);
+        }
         self.by_email
             .iter()
             .find_map(|(e, u)| (*u == uuid).then_some(e.as_str()))
@@ -287,24 +331,58 @@ pub struct AccountProfile {
 }
 
 /// Loads profiles.json from disk. Returns an empty ProfilesFile if
-/// the file doesn't exist (not an error — profiles are optional).
+/// the file doesn't exist (not an error — profiles are optional) or if its body
+/// is blank (whitespace only; kept for compatibility with a truncated-to-empty
+/// file). The read is bounded (1 MiB), no-follow (a symlink is refused), and
+/// owner-checked (wrong uid or group/other-writable is refused), through the same
+/// secure reader as `anthropic_identity::read_profiles_snapshot`. A concurrent
+/// snapshot replacement is retried at most three times; other refusals are final.
 pub fn load(path: &Path) -> Result<ProfilesFile, ConfigError> {
-    match std::fs::read_to_string(path) {
-        Ok(content) => {
-            if content.trim().is_empty() {
-                return Ok(ProfilesFile::empty());
+    use super::anthropic_identity::{read_profiles_file_at, IdentityError};
+    for attempt in 0..3 {
+        match read_profiles_file_at(path, true) {
+            Ok(profiles) => return Ok(profiles),
+            Err(IdentityError::SnapshotChanged) if attempt < 2 => continue,
+            Err(error) => {
+                let reason = match error {
+                    IdentityError::UnsafePermissions => {
+                        "profiles_permissions_refused: after confirming no other user modified it, run chmod 600 on profiles.json; otherwise restore a trusted backup".to_owned()
+                    }
+                    IdentityError::MultipleLinks => {
+                        "profiles_links_refused: remove the extra link to profiles.json".to_owned()
+                    }
+                    _ => error.to_string(),
+                };
+                return Err(ConfigError::InvalidJson {
+                    path: path.to_path_buf(),
+                    reason,
+                });
             }
-            serde_json::from_str(&content).map_err(|e| ConfigError::InvalidJson {
-                path: path.to_path_buf(),
-                reason: e.to_string(),
-            })
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ProfilesFile::empty()),
-        Err(e) => Err(ConfigError::InvalidJson {
-            path: path.to_path_buf(),
-            reason: e.to_string(),
-        }),
     }
+    unreachable!("every final read attempt returns its result")
+}
+
+#[cfg(test)]
+type ProfilesReadHook = (std::path::PathBuf, Box<dyn FnMut()>);
+
+#[cfg(test)]
+thread_local! {
+    static PROFILES_READ_HOOK: std::cell::RefCell<Option<ProfilesReadHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+// The secure reader invokes this after reading, before checking that the named
+// file still matches the opened snapshot. Other paths/threads cannot fire it.
+#[cfg(test)]
+pub(crate) fn run_profiles_read_hook_for_test(path: &Path) {
+    PROFILES_READ_HOOK.with(|hook| {
+        if let Some((expected, callback)) = hook.borrow_mut().as_mut() {
+            if expected.as_path() == path {
+                callback();
+            }
+        }
+    });
 }
 
 /// Saves profiles.json to disk with atomic write.
@@ -323,8 +401,16 @@ pub fn save(path: &Path, profiles: &ProfilesFile) -> Result<(), ConfigError> {
         reason: format!("serialization: {e}"),
     })?;
 
+    // SEC-2.15 (unified, R1 M1): profiles.json is a direct child of the
+    // accounts root — create AND secure the root fail-closed via the
+    // shared helper (was a silent `.ok()` best-effort).
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
+        crate::platform::fs::ensure_private_dir_root(parent).map_err(|e| {
+            ConfigError::InvalidJson {
+                path: parent.to_path_buf(),
+                reason: format!("accounts_root_refused: {e}"),
+            }
+        })?;
     }
 
     let tmp = crate::platform::fs::unique_tmp_path(path);
@@ -486,17 +572,6 @@ pub fn current_account_drifts(base_dir: &Path) -> Vec<(u16, u16)> {
         .collect()
 }
 
-/// Resolves an email address to its UUID identity.
-///
-/// Returns `Some(uuid)` if `by_email[email]` is present in the loaded
-/// profiles. Returns `None` if the email is not in `by_email` or if
-/// profiles.json is missing. Never returns a silent fallback.
-pub fn resolve_email_to_uuid(base_dir: &Path, email: &str) -> Option<IdentityId> {
-    let path = profiles_path(base_dir);
-    let profiles = load(&path).ok()?;
-    profiles.by_email.get(email).copied()
-}
-
 /// Writes a slot→UUID and email→UUID mapping into profiles.json.
 ///
 /// # Lock precondition
@@ -518,6 +593,74 @@ pub fn resolve_email_to_uuid(base_dir: &Path, email: &str) -> Option<IdentityId>
 /// All other fields and `extra` are preserved unchanged.
 ///
 /// The write follows the §5a-compliant pipeline in `save()`.
+fn advance_binding_generation(profiles: &mut ProfilesFile, slot: u16) -> Result<(), ConfigError> {
+    let key = slot.to_string();
+    let next = profiles
+        .slot_binding_generations
+        .get(&key)
+        .copied()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| ConfigError::InvalidJson {
+            path: "profiles.json".into(),
+            reason: "binding_generation_exhausted".into(),
+        })?;
+    profiles.slot_binding_generations.insert(key, next);
+    Ok(())
+}
+
+/// Reserve a fresh custody epoch before an independent-provider publication.
+/// The profiles witness serializes this with verified-login capture/finalization.
+/// Even byte-identical marker replacement invalidates a pending prior/receipt;
+/// failed publication may conservatively leave the advanced epoch in place.
+pub(crate) fn advance_independent_binding_generation(
+    lock: &ProfilesFileLock,
+    base: &Path,
+    slot: crate::types::AccountNum,
+) -> Result<(), ConfigError> {
+    let path = profiles_path(base);
+    if !lock.protects(base) {
+        return Err(ConfigError::InvalidJson {
+            path,
+            reason: "profiles_lock_refused".into(),
+        });
+    }
+    let mut pf = load(&path)?;
+    advance_binding_generation(&mut pf, slot.get())?;
+    save(&path, &pf)
+}
+
+/// Pass-0 migration may reserve an unknown-context UUID for this exact slot.
+/// It preserves the legacy display-email index and never reuses it as authority.
+pub(crate) fn reserve_legacy_anthropic_slot(
+    lock: &ProfilesFileLock,
+    base: &Path,
+    slot: u16,
+    identity: IdentityId,
+) -> Result<(), ConfigError> {
+    let path = profiles_path(base);
+    if !lock.protects(base) {
+        return Err(ConfigError::InvalidJson {
+            path,
+            reason: "profiles_lock_refused".into(),
+        });
+    }
+    let mut pf = load(&path)?;
+    if pf.by_slot.contains_key(&slot.to_string()) {
+        return Err(ConfigError::InvalidJson {
+            path,
+            reason: "slot_binding_changed".into(),
+        });
+    }
+    // Review R3 M1 (same class, third first-bind writer): this reservation
+    // only ever fires on an UNBOUND slot, so any history under its key is
+    // stale and must not survive into the new binding.
+    let _ = pf.slot_binding_history.remove(&slot.to_string());
+    advance_binding_generation(&mut pf, slot)?;
+    pf.by_slot.insert(slot.to_string(), identity);
+    save(&path, &pf)
+}
+
 pub fn add_identity_mapping(
     _lock: &ProfilesFileLock,
     base_dir: &Path,
@@ -527,10 +670,141 @@ pub fn add_identity_mapping(
 ) -> Result<(), ConfigError> {
     let path = profiles_path(base_dir);
     let mut profiles = load(&path)?;
+    if profiles.by_slot.get(&slot.to_string()).copied() != Some(uuid) {
+        // Owner directive 2026-10-11: a rebind displaces the prior uuid from
+        // `by_slot`, so record it in the slot's bounded binding history in
+        // this same locked load-modify-save, keeping retired bindings
+        // provable for `retired_bindings_for_slot`.
+        match profiles.by_slot.get(&slot.to_string()).copied() {
+            Some(prior) => record_binding_displacement(&mut profiles, slot, prior),
+            // Review R3 M1: a FIRST bind (no prior uuid) starts with NO
+            // lineage — any entry under this key is stale (a logout by a
+            // pre-fix binary, a rollback that unbinds without clearing)
+            // and must not admit foreign identities at this slot.
+            None => {
+                let _ = profiles.slot_binding_history.remove(&slot.to_string());
+            }
+        }
+        advance_binding_generation(&mut profiles, slot)?;
+    }
     profiles.by_slot.insert(slot.to_string(), uuid);
     profiles.by_email.insert(email.to_string(), uuid);
     save(&path, &profiles)
 }
+
+/// Record `prior` as displaced by a rebind of `slot` into
+/// [`ProfilesFile::slot_binding_history`]: newest last, bounded to
+/// `MAX_SLOT_BINDING_HISTORY` (oldest dropped first), and a uuid
+/// re-appearing (A→B→A) moves to the newest position without duplication.
+///
+/// BOTH production rebind writers call this in the same locked
+/// load-modify-save as their `by_slot` overwrite and generation bump:
+/// [`add_identity_mapping`] and the Anthropic re-login publication in
+/// `accounts::anthropic_identity` (coordinator 32b912fa: a writer that
+/// bumps `slot_binding_generations` without recording the displacement
+/// silently kills the history channel for its rebinds).
+///
+/// # `by_email` purge (owner-observed defect, coordinator 0113baed)
+///
+/// A rebind RETIRES `prior` from this slot, so a `by_email` entry whose
+/// value is `prior` MUST NOT outlive that binding: it would be a WRONG
+/// claim on disk — an email that still resolves to a uuid nothing owns.
+/// Observed live: after a per-org rebind,
+/// `by_email[jack@terrene.foundation] → a91640e6` survived, and that
+/// retired uuid had been a Terrene-ORG sign-in. Multiple emails mapped to
+/// `prior` are all removed.
+///
+/// The concrete consumers of the `by_email` VALUES today are
+/// [`ProfilesFile::get_email`]'s step-2 reverse lookup (display only),
+/// `orphan_identity_gc`'s reachable set (KEEP, never a delete), and
+/// `accounts::logout`, which removes a `by_email` entry that points at the
+/// uuid being retired and treats a remaining `by_email` value as keeping
+/// the identity directory reachable (`logout.rs`, the `still_referenced`
+/// and `orphaned_uuid` computations); none of them
+/// hands a uuid back to a login. Email→identity resolution in production
+/// does NOT read this map: `identity_mint::mint_slot` treats the index as
+/// preserved-but-never-a-reuse-source (`daemon/identity_mint.rs`), and
+/// Anthropic logins resolve through [`ProfilesFile::anthropic_contexts`].
+/// The purge keeps it that way by construction, so the map cannot become a
+/// retired-uuid lookup source for a future consumer, and it keeps a
+/// currently-live index faithful for the one key space that DOES re-read
+/// it: the codex synthetic `codex:*` reservations reused by
+/// `mint_for_codex_login` — a key space this purge never touches (codex
+/// identities carry no Anthropic org context, so the `org_contexted`
+/// conjunct below preserves them).
+///
+/// # Direction: REMOVE-only
+///
+/// This purge never ADDS a `by_email` entry, so the map stays a legacy
+/// lookup index rather than an ownership index — the Anthropic publication
+/// deliberately stopped writing it (see `accounts::anthropic_identity`
+/// § "Never ADDS a legacy by_email entry").
+///
+/// # Scope: ORG-CONTEXTED priors only (fail-safe: KEEP on doubt)
+///
+/// The purge fires only when `prior` carries an entry in
+/// [`ProfilesFile::anthropic_contexts`]; two classes of `by_email` entries
+/// are contract-protected and MUST survive, both encoding a deliberate
+/// contract from 12a5c873 ("fix(identity): separate verified Anthropic
+/// organization contexts"):
+///
+/// - **Legacy email-only entries.** An identity that never had an org
+///   context verified (`StoredAnthropicContext::LegacyUnknown`) is exactly
+///   the entry that commit preserves ("Preserve legacy email-only
+///   entries") — it is display/round-trip data the org-contexted index
+///   supersedes, not ownership authority to revoke.
+/// - **Codex reservations.** A codex slot displaced by an Anthropic
+///   TAKEOVER does flow through this function, and `by_email[synthetic_key]`
+///   is the uuid reservation a retry must reuse ("retain original login
+///   authority", CRIT-2 idempotency for the rollback path in
+///   [`remove_slot_mapping`]). Codex identities carry no Anthropic org
+///   context, so the `org_contexted` conjunct alone preserves them; the
+///   rollback path itself never reaches here (it records no displacement).
+///
+/// The stale-entry harm is specific to an org-contexted identity, and the
+/// reference guard below covers the other live-binding case: an entry is
+/// removed only when NO OTHER slot still references `prior` in `by_slot`.
+/// A genuinely shared identity — the same uuid bound at two slots — keeps
+/// its email entries, because purging a live binding's email is identity
+/// loss, while keeping a stale entry is only a stale lookup that the next
+/// rebind of its owner clears. Both call sites invoke this BEFORE
+/// overwriting `by_slot[slot]`, so the slot's own key still holds `prior`
+/// at call time and is excluded from the scan explicitly.
+pub(crate) fn record_binding_displacement(
+    profiles: &mut ProfilesFile,
+    slot: u16,
+    prior: IdentityId,
+) {
+    let history = profiles
+        .slot_binding_history
+        .entry(slot.to_string())
+        .or_default();
+    history.retain(|id| *id != prior);
+    history.push(prior);
+    if history.len() > MAX_SLOT_BINDING_HISTORY {
+        let excess = history.len() - MAX_SLOT_BINDING_HISTORY;
+        history.drain(0..excess);
+    }
+
+    let slot_key = slot.to_string();
+    let still_bound_elsewhere = profiles
+        .by_slot
+        .iter()
+        .any(|(key, id)| key != &slot_key && *id == prior);
+    let org_contexted = profiles
+        .anthropic_contexts
+        .iter()
+        .any(|entry| entry.identity_uuid == prior);
+    if !still_bound_elsewhere && org_contexted {
+        profiles.by_email.retain(|_, id| *id != prior);
+    }
+}
+
+/// Bound on [`ProfilesFile::slot_binding_history`] entries per slot —
+/// oldest dropped first. Bounds both the on-disk growth and the read-side
+/// fingerprint collection; 8 covers more re-logins than any realistic
+/// terminal lifetime while keeping both costs trivial.
+pub(crate) const MAX_SLOT_BINDING_HISTORY: usize = 8;
 
 /// Removes the `by_slot[slot]` entry from `profiles.json`.
 ///
@@ -573,6 +847,11 @@ pub fn remove_slot_mapping(
         // Already absent — idempotent no-op, no disk write.
         return Ok(());
     }
+    // Review R3 M1: unbinding must not leave the slot's binding history
+    // behind for the next tenant — clear it in this same locked save, the
+    // same contract the logout writer and both first binds carry.
+    let _ = profiles.slot_binding_history.remove(&slot_key);
+    advance_binding_generation(&mut profiles, slot)?;
     save(&path, &profiles)
 }
 
@@ -763,6 +1042,9 @@ pub fn swap_slot_mapping(
     a: u16,
     b: u16,
 ) -> Result<bool, ConfigError> {
+    if a == b {
+        return Ok(false);
+    }
     let path = profiles_path(base_dir);
     if !path.exists() {
         tracing::info!(
@@ -830,6 +1112,40 @@ pub fn swap_slot_mapping(
         pf.by_slot_identity.insert(key_a, l);
     }
 
+    // Review R2 M-R2-1 + Review R3 M1/L1: lineage follows the REPOINTED
+    // TERMINALS, not the slot number — exchange the two slots' bounded
+    // binding histories in this same locked load→save, so each slot
+    // admits exactly the identities whose tokens its terminals can now
+    // hold (the measured slot-4 defect is the tokens the moved terminals
+    // still carry). PURE exchange, no synthetic records (review R3 L1: a
+    // displaced uuid recorded at the
+    // slot it LEFT would resurface as admittable history once that slot's
+    // next tenant is displaced — cross-slot breadth; `csq swap` keeps both
+    // uuids bound, each now covered by the other slot's binding, and a
+    // `csq move` records the displacement in the rebind that performs it).
+    //
+    // A side with NO `by_slot` uuid has no live lineage: any entry under
+    // its key is stale (a logout by a pre-fix binary, a rollback that
+    // unbinds without clearing) and MUST be DROPPED rather than carried
+    // to the other side (review R3 M1: stale history on an unbound slot
+    // must never reach FROM through a move and later admit identities at
+    // a rebound FROM).
+    let hist_a = pf
+        .slot_binding_history
+        .remove(&a.to_string())
+        .unwrap_or_default();
+    let hist_b = pf
+        .slot_binding_history
+        .remove(&b.to_string())
+        .unwrap_or_default();
+    if uuid_b.is_some() && !hist_b.is_empty() {
+        pf.slot_binding_history.insert(a.to_string(), hist_b);
+    }
+    if uuid_a.is_some() && !hist_a.is_empty() {
+        pf.slot_binding_history.insert(b.to_string(), hist_a);
+    }
+    advance_binding_generation(&mut pf, a)?;
+    advance_binding_generation(&mut pf, b)?;
     save(&path, &pf)?;
     Ok(true)
 }
@@ -1073,7 +1389,7 @@ pub struct AccountsPruneReport {
     /// `get_email(N)` — the genuinely-unrecoverable set (no `by_slot`,
     /// non-empty label, no `by_slot_label`). These correctly keep the
     /// WINDOW-CLOSE P1 gate OPEN until the user re-logs in (RN1-D R2
-    /// `mint_for_login` captures them then).
+    /// `commit_anthropic_login` captures them then).
     pub kept_unrecoverable: usize,
     /// `accounts[N]` entries removed specifically via arm-4
     /// (by_slot_identity match). Subset of `pruned` — every arm-4
@@ -1099,7 +1415,7 @@ pub struct AccountsPruneReport {
 /// 1. `accounts[N].email` is empty (nothing to lose); OR
 /// 2. `by_slot_label[N]` is present (step 1 wins regardless of step 2 —
 ///    a genuine rename already relocated by [`relocate_labels_to_by_slot_label`]
-///    or captured by `mint_for_login`); OR
+///    or captured by `commit_anthropic_login`); OR
 /// 3. `by_slot[N]` resolves a UUID whose credential file's
 ///    `oauthAccount.emailAddress` equals `accounts[N].email` (the entry is
 ///    the bare OAuth email — step 3 yields the identical value).
@@ -2289,23 +2605,6 @@ mod tests {
         );
     }
 
-    /// `resolve_email_to_uuid` returns `Some(uuid)` iff `by_email[email]` is present.
-    #[test]
-    fn resolve_email_to_uuid_present_and_absent() {
-        let dir = TempDir::new().unwrap();
-        let uuid = IdentityId::new_v4();
-
-        let mut profiles = ProfilesFile::empty();
-        profiles.by_email.insert("alice@x.com".into(), uuid);
-        save(&profiles_path(dir.path()), &profiles).unwrap();
-
-        // Present email returns the UUID.
-        assert_eq!(resolve_email_to_uuid(dir.path(), "alice@x.com"), Some(uuid));
-        // Absent email returns None.
-        assert_eq!(resolve_email_to_uuid(dir.path(), "bob@x.com"), None);
-        assert_eq!(resolve_email_to_uuid(dir.path(), ""), None);
-    }
-
     /// `add_identity_mapping` writes both by_slot and by_email, and the
     /// mapping survives a load round-trip. Also verifies that pre-existing
     /// `extra["accounts"]` entries are preserved (M4-13: via accounts_for_test).
@@ -2349,6 +2648,422 @@ mod tests {
                 .map(|p| p.email.as_str()),
             Some("bob@example.com"),
             "extra[accounts][2].email must survive add_identity_mapping round-trip"
+        );
+    }
+
+    /// Owner directive 2026-10-11 (coordinator 32b912fa): a rebind records
+    /// the displaced uuid in `slot_binding_history[slot]` — same locked
+    /// load-modify-save as the `by_slot` overwrite and the generation bump.
+    /// Legs: a rebind pushes the prior; re-binding an identity already in
+    /// history moves it to the newest position without duplication;
+    /// re-adding the SAME uuid is not a rebind (no push, no bump); the list
+    /// is bounded at `MAX_SLOT_BINDING_HISTORY`, oldest dropped first.
+    #[test]
+    fn add_identity_mapping_records_bounded_binding_history_on_rebind() {
+        let dir = TempDir::new().unwrap();
+        let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+        let path = profiles_path(dir.path());
+        let a = IdentityId::new_v4();
+        let b = IdentityId::new_v4();
+
+        add_identity_mapping(&lock, dir.path(), 4, "a@example.com", a).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(
+            loaded.slot_binding_history.get("4"),
+            None,
+            "a first binding displaces nothing and records nothing"
+        );
+        assert_eq!(loaded.slot_binding_generations.get("4").copied(), Some(1));
+
+        // A → B: A is retired.
+        add_identity_mapping(&lock, dir.path(), 4, "b@example.com", b).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(
+            loaded.slot_binding_history.get("4"),
+            Some(&vec![a]),
+            "the displaced uuid must be recorded"
+        );
+        assert_eq!(loaded.slot_binding_generations.get("4").copied(), Some(2));
+
+        // B → A: B is retired; A moves to newest without duplication.
+        add_identity_mapping(&lock, dir.path(), 4, "a@example.com", a).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(
+            loaded.slot_binding_history.get("4"),
+            Some(&vec![a, b]),
+            "re-binding a former identity must not duplicate it"
+        );
+
+        // Re-adding the SAME uuid is not a rebind.
+        add_identity_mapping(&lock, dir.path(), 4, "a@example.com", a).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.slot_binding_history.get("4"), Some(&vec![a, b]));
+        assert_eq!(
+            loaded.slot_binding_generations.get("4").copied(),
+            Some(3),
+            "same-uuid re-add must not advance the generation"
+        );
+
+        // Bounded: oldest dropped first. Two more rebinds than the cap
+        // guarantee both originals (b oldest, a re-appended at the first
+        // loop rebind) are evicted.
+        for i in 0..MAX_SLOT_BINDING_HISTORY + 2 {
+            add_identity_mapping(
+                &lock,
+                dir.path(),
+                4,
+                &format!("u{i}@example.com"),
+                IdentityId::new_v4(),
+            )
+            .unwrap();
+        }
+        let loaded = load(&path).unwrap();
+        let history = loaded.slot_binding_history.get("4").unwrap();
+        assert_eq!(history.len(), MAX_SLOT_BINDING_HISTORY);
+        assert!(
+            !history.contains(&a) && !history.contains(&b),
+            "the oldest entries must have been dropped"
+        );
+    }
+
+    /// Seeds one `anthropic_contexts` row for `identity` — the ORG-CONTEXTED
+    /// shape a real org sign-in publishes, and the discriminator the purge
+    /// keys on. Callers hold the profiles lock for `dir`.
+    fn seed_org_context(dir: &std::path::Path, identity: IdentityId) {
+        let path = profiles_path(dir);
+        let mut pf = load(&path).unwrap();
+        pf.anthropic_contexts
+            .push(crate::accounts::anthropic_identity::AnthropicContextEntry {
+                email: "ctx@example.com".into(),
+                account_uuid: uuid::Uuid::from_u128(10),
+                organization_uuid: uuid::Uuid::from_u128(20),
+                identity_uuid: identity,
+                extra: Default::default(),
+            });
+        save(&path, &pf).unwrap();
+    }
+
+    /// Owner-observed defect (coordinator 0113baed): a rebind RETIRES the
+    /// prior uuid, so its `by_email` entries must not survive — a stale
+    /// entry is a wrong claim on disk (an email resolving to a uuid no
+    /// slot owns), and the purge keeps the retired uuid unreachable
+    /// through the email index.
+    ///
+    /// Driven through the PRODUCTION writer `add_identity_mapping`, so the
+    /// purge is exercised in the same locked load-modify-save as the
+    /// `by_slot` overwrite. The prior is ORG-CONTEXTED (the live shape:
+    /// a91640e6 was a Terrene-org sign-in) — an uncontexted prior is
+    /// contract-protected and pinned by the sibling test below.
+    #[test]
+    fn rebind_purges_displaced_identity_email_entries() {
+        let dir = TempDir::new().unwrap();
+        let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+        let path = profiles_path(dir.path());
+        let uuid1 = IdentityId::new_v4();
+        let uuid2 = IdentityId::new_v4();
+
+        add_identity_mapping(&lock, dir.path(), 4, "email1@example.com", uuid1).unwrap();
+        seed_org_context(dir.path(), uuid1);
+        let loaded = load(&path).unwrap();
+        assert_eq!(
+            loaded.by_email.get("email1@example.com").copied(),
+            Some(uuid1),
+            "first bind writes by_email[email1] → uuid1"
+        );
+
+        // Rebinding slot 4 retires uuid1; its email entry must not survive.
+        add_identity_mapping(&lock, dir.path(), 4, "email2@example.com", uuid2).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.by_slot.get("4").copied(), Some(uuid2));
+        assert_eq!(
+            loaded.by_email.get("email2@example.com").copied(),
+            Some(uuid2)
+        );
+        assert_eq!(
+            loaded.by_email.get("email1@example.com"),
+            None,
+            "the displaced ORG-CONTEXTED identity's email entry must be purged \
+             on rebind, got {:?}",
+            loaded.by_email.get("email1@example.com")
+        );
+        assert!(
+            loaded.by_email.values().all(|id| *id != uuid1),
+            "a retired identity must stay unreachable through by_email, got {:?}",
+            loaded.by_email
+        );
+    }
+
+    /// 12a5c873 contract ("Preserve legacy email-only entries"), pinned at
+    /// unit scope: an identity with NO org context is a legacy email-only
+    /// entry — display/round-trip data, not ownership authority — so its
+    /// `by_email` entry MUST survive a rebind.
+    #[test]
+    fn rebind_keeps_legacy_email_entries_of_an_uncontexted_identity() {
+        let dir = TempDir::new().unwrap();
+        let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+        let path = profiles_path(dir.path());
+        let legacy = IdentityId::new_v4();
+        let uuid2 = IdentityId::new_v4();
+
+        add_identity_mapping(&lock, dir.path(), 4, "legacy@example.com", legacy).unwrap();
+        // No `seed_org_context` — the legacy shape.
+        assert!(
+            load(&path).unwrap().anthropic_contexts.is_empty(),
+            "precondition: no org context for the legacy identity"
+        );
+
+        add_identity_mapping(&lock, dir.path(), 4, "email2@example.com", uuid2).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.by_slot.get("4").copied(), Some(uuid2));
+        assert_eq!(
+            loaded.by_email.get("legacy@example.com").copied(),
+            Some(legacy),
+            "a legacy email-only entry is contract-protected across a rebind"
+        );
+    }
+
+    /// Fail-safe control for the purge: an identity still bound at ANOTHER
+    /// slot is genuinely shared, so its `by_email` entries MUST be kept —
+    /// purging a live binding's email would be identity loss.
+    ///
+    /// `shared` IS org-contexted, so this control exercises the reference
+    /// guard rather than the contract-preservation path.
+    ///
+    /// At call time the rebound slot still holds `prior` in `by_slot` (both
+    /// writers purge before their overwrite), so this pins that the slot's
+    /// own key is EXCLUDED from the reference scan.
+    #[test]
+    fn rebind_keeps_email_entries_of_identity_still_bound_elsewhere() {
+        let dir = TempDir::new().unwrap();
+        let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+        let path = profiles_path(dir.path());
+        let shared = IdentityId::new_v4();
+        let uuid2 = IdentityId::new_v4();
+
+        // Same uuid bound at slots 4 AND 9 — a shared identity.
+        add_identity_mapping(&lock, dir.path(), 4, "shared@example.com", shared).unwrap();
+        add_identity_mapping(&lock, dir.path(), 9, "shared9@example.com", shared).unwrap();
+        seed_org_context(dir.path(), shared);
+
+        // Rebinding slot 4 leaves slot 9 still referencing `shared`.
+        add_identity_mapping(&lock, dir.path(), 4, "email2@example.com", uuid2).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.by_slot.get("4").copied(), Some(uuid2));
+        assert_eq!(loaded.by_slot.get("9").copied(), Some(shared));
+        assert_eq!(
+            loaded.by_email.get("shared@example.com").copied(),
+            Some(shared),
+            "an identity still bound at another slot keeps its email entry"
+        );
+        assert_eq!(
+            loaded.by_email.get("shared9@example.com").copied(),
+            Some(shared),
+            "ALL entries of a still-shared identity are kept"
+        );
+    }
+
+    /// Review R2 M-R2-1 + Review R3 M1/L1: lineage follows the REPOINTED
+    /// TERMINALS (each slot admits the identities whose tokens its
+    /// terminals can now hold) — `swap_slot_mapping` exchanges the two
+    /// slots' histories in the same locked save as a PURE exchange
+    /// (review R3 L1 blocked the
+    /// record-at-the-left-slot shape as cross-slot breadth: the displaced
+    /// uuid's terminals repoint away, so a record at the slot it left would
+    /// resurface as admittable history once that slot's NEXT tenant is
+    /// displaced). A side with NO `by_slot` uuid contributes and receives
+    /// NOTHING — its entry is stale (review R3 M1) and is DROPPED, so a
+    /// `csq move` (empty target, the only shape production allows —
+    /// `TargetExists`) carries the account's lineage to its new slot and
+    /// the vacated slot keeps none of it.
+    #[test]
+    fn swap_slot_mapping_moves_lineage_as_a_pure_exchange() {
+        // Leg 1: both slots bound, both with prior history — histories
+        // exchange PURELY (newest last, no synthetic record on either side).
+        let dir = TempDir::new().unwrap();
+        let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+        let path = profiles_path(dir.path());
+        let prior_a = IdentityId::new_v4();
+        let prior_b = IdentityId::new_v4();
+        let uuid_a = IdentityId::new_v4();
+        let uuid_b = IdentityId::new_v4();
+        let mut pf = ProfilesFile::empty();
+        pf.by_slot.insert("2".into(), uuid_a);
+        pf.by_slot.insert("5".into(), uuid_b);
+        pf.slot_binding_history.insert("2".into(), vec![prior_a]);
+        pf.slot_binding_history.insert("5".into(), vec![prior_b]);
+        save(&path, &pf).unwrap();
+
+        assert!(swap_slot_mapping(&lock, dir.path(), 2, 5).unwrap());
+
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.by_slot.get("2").copied(), Some(uuid_b));
+        assert_eq!(loaded.by_slot.get("5").copied(), Some(uuid_a));
+        assert_eq!(
+            loaded.slot_binding_history.get("2"),
+            Some(&vec![prior_b]),
+            "slot 2 keeps B's lineage (exchanged in) with NO synthetic record (review R3 L1)"
+        );
+        assert_eq!(
+            loaded.slot_binding_history.get("5"),
+            Some(&vec![prior_a]),
+            "slot 5 keeps A's lineage (exchanged in) with NO synthetic record (review R3 L1)"
+        );
+
+        // Leg 2: the `csq move` shape — target empty. The vacated slot
+        // keeps nothing; the account's lineage travels to TO.
+        let dir2 = TempDir::new().unwrap();
+        let lock2 = ProfilesFileLock::acquire(dir2.path()).unwrap();
+        let path2 = profiles_path(dir2.path());
+        let prior_x = IdentityId::new_v4();
+        let uuid_a2 = IdentityId::new_v4();
+        let mut pf2 = ProfilesFile::empty();
+        pf2.by_slot.insert("2".into(), uuid_a2);
+        pf2.slot_binding_history.insert("2".into(), vec![prior_x]);
+        save(&path2, &pf2).unwrap();
+
+        assert!(swap_slot_mapping(&lock2, dir2.path(), 2, 5).unwrap());
+
+        let loaded2 = load(&path2).unwrap();
+        assert_eq!(loaded2.by_slot.get("5").copied(), Some(uuid_a2));
+        assert_eq!(
+            loaded2.by_slot.get("2"),
+            None,
+            "the vacated slot has no by_slot entry"
+        );
+        assert_eq!(
+            loaded2.slot_binding_history.get("2"),
+            None,
+            "the vacated slot must keep NO lineage (review R2 M-R2-1)"
+        );
+        assert_eq!(
+            loaded2.slot_binding_history.get("5"),
+            Some(&vec![prior_x]),
+            "the moved account's lineage follows it to the target"
+        );
+
+        // Leg 3 (review R3 M1): a STALE entry at the empty target (the
+        // pre-fix-logout / rollback shape) is DROPPED by the move — it
+        // never reaches FROM — and a first bind at FROM afterwards starts
+        // with NO lineage: FROM admits nothing.
+        let dir3 = TempDir::new().unwrap();
+        let lock3 = ProfilesFileLock::acquire(dir3.path()).unwrap();
+        let path3 = profiles_path(dir3.path());
+        let stale = IdentityId::new_v4();
+        let uuid_a3 = IdentityId::new_v4();
+        let uuid_c3 = IdentityId::new_v4();
+        let mut pf3 = ProfilesFile::empty();
+        pf3.by_slot.insert("2".into(), uuid_a3);
+        pf3.slot_binding_history.insert("2".into(), vec![prior_x]);
+        pf3.slot_binding_history.insert("5".into(), vec![stale]);
+        save(&path3, &pf3).unwrap();
+
+        assert!(swap_slot_mapping(&lock3, dir3.path(), 2, 5).unwrap());
+        let loaded3 = load(&path3).unwrap();
+        assert_eq!(loaded3.by_slot.get("5").copied(), Some(uuid_a3));
+        assert_eq!(
+            loaded3.slot_binding_history.get("5"),
+            Some(&vec![prior_x]),
+            "the account's lineage follows it to the target"
+        );
+        assert_eq!(
+            loaded3.slot_binding_history.get("2"),
+            None,
+            "the stale entry at the empty target must be DROPPED, not carried \
+             to FROM (review R3 M1)"
+        );
+
+        add_identity_mapping(&lock3, dir3.path(), 2, "c@example.com", uuid_c3).unwrap();
+        let loaded3 = load(&path3).unwrap();
+        assert_eq!(loaded3.by_slot.get("2").copied(), Some(uuid_c3));
+        assert_eq!(
+            loaded3.slot_binding_history.get("2"),
+            None,
+            "a first bind at FROM starts with NO lineage (review R3 M1)"
+        );
+
+        // Leg 4 (review R3 L1 (i)): a UUID-LESS FROM holds stale history —
+        // dropped, never carried to TO; TO's lineage follows its account to
+        // FROM.
+        let dir4 = TempDir::new().unwrap();
+        let lock4 = ProfilesFileLock::acquire(dir4.path()).unwrap();
+        let path4 = profiles_path(dir4.path());
+        let stale4 = IdentityId::new_v4();
+        let prior_y = IdentityId::new_v4();
+        let uuid_b4 = IdentityId::new_v4();
+        let mut pf4 = ProfilesFile::empty();
+        pf4.slot_binding_history.insert("2".into(), vec![stale4]);
+        pf4.by_slot.insert("5".into(), uuid_b4);
+        pf4.slot_binding_history.insert("5".into(), vec![prior_y]);
+        save(&path4, &pf4).unwrap();
+
+        assert!(swap_slot_mapping(&lock4, dir4.path(), 2, 5).unwrap());
+        let loaded4 = load(&path4).unwrap();
+        assert_eq!(loaded4.by_slot.get("2").copied(), Some(uuid_b4));
+        assert_eq!(loaded4.by_slot.get("5"), None);
+        assert_eq!(
+            loaded4.slot_binding_history.get("2"),
+            Some(&vec![prior_y]),
+            "the account's lineage follows it to its new slot"
+        );
+        assert_eq!(
+            loaded4.slot_binding_history.get("5"),
+            None,
+            "the uuid-less side's stale entry must not survive the move \
+             (review R3 L1 (i))"
+        );
+    }
+
+    /// Review R3 M1 (first-bind clear): a first bind through the production
+    /// writer must start with NO lineage — a stale entry left on an unbound
+    /// slot (logout by a pre-fix binary, rollback unbind) must not admit
+    /// foreign identities at the rebound slot.
+    #[test]
+    fn first_bind_clears_stale_binding_history() {
+        let dir = TempDir::new().unwrap();
+        let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+        let path = profiles_path(dir.path());
+        let stale = IdentityId::new_v4();
+        let uuid = IdentityId::new_v4();
+        let mut pf = ProfilesFile::empty();
+        pf.slot_binding_history.insert("3".into(), vec![stale]);
+        save(&path, &pf).unwrap();
+
+        add_identity_mapping(&lock, dir.path(), 3, "c@example.com", uuid).unwrap();
+
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.by_slot.get("3").copied(), Some(uuid));
+        assert_eq!(
+            loaded.slot_binding_history.get("3"),
+            None,
+            "a first bind must start with NO lineage (review R3 M1)"
+        );
+    }
+
+    /// Review R3 M1 (`remove_slot_mapping`): unbinding must clear the
+    /// slot's binding history in the same locked save — the Codex
+    /// partial-mint rollback shape must not leave lineage for the next
+    /// tenant.
+    #[test]
+    fn remove_slot_mapping_clears_binding_history() {
+        let dir = TempDir::new().unwrap();
+        let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+        let path = profiles_path(dir.path());
+        let x = IdentityId::new_v4();
+        let a = IdentityId::new_v4();
+        add_identity_mapping(&lock, dir.path(), 4, "x@example.com", x).unwrap();
+        add_identity_mapping(&lock, dir.path(), 4, "a@example.com", a).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.slot_binding_history.get("4"), Some(&vec![x]));
+
+        remove_slot_mapping(&lock, dir.path(), 4).unwrap();
+
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.by_slot.get("4"), None);
+        assert_eq!(
+            loaded.slot_binding_history.get("4"),
+            None,
+            "remove_slot_mapping must clear the slot's binding history \
+             (review R3 M1)"
         );
     }
 
@@ -4772,5 +5487,179 @@ mod tests {
             loaded.accounts_for_test().is_empty(),
             "accounts map must be empty after two prune runs"
         );
+    }
+
+    struct ReadHookReset;
+
+    impl Drop for ReadHookReset {
+        fn drop(&mut self) {
+            PROFILES_READ_HOOK.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+
+    fn install_read_hook(path: &Path, callback: impl FnMut() + 'static) -> ReadHookReset {
+        PROFILES_READ_HOOK.with(|hook| {
+            assert!(hook.borrow().is_none(), "read hooks must not overlap");
+            *hook.borrow_mut() = Some((path.to_owned(), Box::new(callback)));
+        });
+        ReadHookReset
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn profiles_load_retries_replaced_snapshot_and_reads_latest_contents() {
+        let dir = TempDir::new().unwrap();
+        let path = profiles_path(dir.path());
+        let mut initial = ProfilesFile::empty();
+        initial.by_slot_label.insert("1".into(), "before".into());
+        save(&path, &initial).unwrap();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = calls.clone();
+        let replacement = path.clone();
+        let _reset = install_read_hook(&path, move || {
+            seen.set(seen.get() + 1);
+            if seen.get() == 1 {
+                let mut next = ProfilesFile::empty();
+                next.by_slot_label.insert("1".into(), "after".into());
+                save(&replacement, &next).unwrap();
+            }
+        });
+        // Reading an unrelated path must not fire this thread's configured hook.
+        let other = dir.path().join("other.json");
+        save(&other, &ProfilesFile::empty()).unwrap();
+        load(&other).unwrap();
+        assert_eq!(calls.get(), 0);
+        let actual = load(&path).unwrap();
+        assert_eq!(
+            actual.by_slot_label.get("1").map(String::as_str),
+            Some("after")
+        );
+        assert_eq!(calls.get(), 2, "one replacement requires one fresh retry");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn profiles_load_snapshot_retries_stop_after_three_attempts() {
+        let dir = TempDir::new().unwrap();
+        let path = profiles_path(dir.path());
+        save(&path, &ProfilesFile::empty()).unwrap();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = calls.clone();
+        let replacement = path.clone();
+        let reset = install_read_hook(&path, move || {
+            seen.set(seen.get() + 1);
+            let mut next = ProfilesFile::empty();
+            next.by_slot_label
+                .insert("1".into(), format!("attempt-{}", seen.get()));
+            save(&replacement, &next).unwrap();
+        });
+        let error = load(&path).unwrap_err().to_string();
+        assert!(error.contains("snapshot_changed"), "{error}");
+        assert_eq!(
+            calls.get(),
+            3,
+            "continuous movement must exhaust exactly three attempts"
+        );
+        drop(reset);
+        let actual = load(&path).unwrap();
+        assert_eq!(
+            actual.by_slot_label.get("1").map(String::as_str),
+            Some("attempt-3")
+        );
+    }
+
+    #[test]
+    fn profiles_load_malformed_body_is_not_retried() {
+        let dir = TempDir::new().unwrap();
+        let path = profiles_path(dir.path());
+        crate::platform::fs::write_new_private(&path, b"{not-json}").unwrap();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = calls.clone();
+        let _reset = install_read_hook(&path, move || seen.set(seen.get() + 1));
+        assert!(load(&path).is_err());
+        assert_eq!(
+            calls.get(),
+            1,
+            "invalid JSON is a final refusal, not movement"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"{not-json}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn profiles_load_writable_mode_gives_chmod_remedy_without_changing_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = profiles_path(dir.path());
+        save(&path, &ProfilesFile::empty()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        for mode in [0o620, 0o602] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let error = load(&path).unwrap_err().to_string();
+            assert!(error.contains("chmod 600"), "{error}");
+            assert!(
+                error.contains("after confirming no other user modified it"),
+                "{error}"
+            );
+            assert!(error.contains("trusted backup"), "{error}");
+            assert!(
+                !error.contains("csq logout"),
+                "unsafe profiles prevent logout too: {error}"
+            );
+            assert!(!error.contains("remove the extra link"), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(load(&path).unwrap().by_slot.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn profiles_load_hardlink_gives_remove_link_remedy_without_changing_file() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = TempDir::new().unwrap();
+        let path = profiles_path(dir.path());
+        save(&path, &ProfilesFile::empty()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let extra = dir.path().join("extra-link.json");
+        std::fs::hard_link(&path, &extra).unwrap();
+        let error = load(&path).unwrap_err().to_string();
+        assert!(error.contains("remove the extra link"), "{error}");
+        assert!(!error.contains("chmod 600"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(&extra).unwrap(), before);
+        assert_eq!(std::fs::metadata(&path).unwrap().nlink(), 2);
+        std::fs::remove_file(&extra).unwrap();
+        assert!(load(&path).unwrap().by_slot.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn load_is_no_follow_bounded_and_keeps_blank_body_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.json");
+        std::fs::write(&real, b"{}").unwrap();
+        let link = dir.path().join("profiles.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(load(&link).is_err(), "a symlinked profiles.json is refused");
+        std::fs::remove_file(&link).unwrap();
+        std::fs::write(&link, vec![b' '; 2 * 1024 * 1024]).unwrap();
+        assert!(
+            load(&link).is_err(),
+            "an oversized profiles.json is refused"
+        );
+        std::fs::write(&link, b"  \n").unwrap();
+        assert!(
+            load(&link).unwrap().by_slot.is_empty(),
+            "blank body stays empty"
+        );
+        assert!(load(&dir.path().join("absent.json"))
+            .unwrap()
+            .by_slot
+            .is_empty());
     }
 }

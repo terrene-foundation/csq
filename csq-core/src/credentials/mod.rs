@@ -12,6 +12,8 @@ pub mod keychain;
 pub mod mutex;
 pub mod post_login;
 pub mod refresh;
+pub mod rescue;
+pub mod session_login;
 pub mod token_history;
 
 pub use file::{load, save, save_canonical_for, save_uuid_settings, write_uuid_settings};

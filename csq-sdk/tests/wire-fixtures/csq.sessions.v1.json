@@ -1,0 +1,35 @@
+{
+  "generated_at": 2000,
+  "host": "host-1",
+  "incomplete": true,
+  "ok": true,
+  "restricted": true,
+  "schema": "csq.sessions.v1",
+  "sessions": [
+    {
+      "account_slot": 9,
+      "branch": "main",
+      "cwd": "/work/repo",
+      "handle_dir": "/home/u/.claude/accounts/term-4242",
+      "inbox_pending": 1,
+      "label": "repo-main",
+      "label_fallback": true,
+      "label_source": "self",
+      "last_directive_at": 1500,
+      "name": "repo-01",
+      "pid": 4242,
+      "repo": "repo",
+      "scratch_dir": "/private/tmp/claude-501/-work-repo/c5c006d3-4fc9-4da3-b8c1-0713f103c735",
+      "scratch_dir_verified": true,
+      "self": true,
+      "session_id": "c5c006d3-4fc9-4da3-b8c1-0713f103c735",
+      "started_at": 1000,
+      "surface": "claude-code",
+      "terminal_title": "repo",
+      "tty": "ttys003"
+    }
+  ],
+  "unreadable_pids": [
+    4243
+  ]
+}

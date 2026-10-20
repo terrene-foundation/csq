@@ -10,7 +10,19 @@ pub mod fs;
 pub mod fs_symlink_unix;
 #[cfg(windows)]
 pub mod fs_symlink_windows;
+#[cfg(windows)]
+pub(crate) mod fs_windows_acl;
+#[cfg(all(test, windows))]
+pub(crate) mod fs_windows_acl_tests;
+#[cfg(windows)]
+mod fs_windows_delete;
+#[cfg(windows)]
+pub(crate) mod fs_windows_stamp;
+#[cfg(windows)]
+mod fs_windows_upgrade;
 pub mod home;
+mod label_level;
+pub mod label_upgrade;
 pub mod lock;
 pub mod process;
 pub mod secret;
@@ -20,6 +32,8 @@ pub mod secret;
 // across both the in-binary tests and integration tests in `tests/`.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_env;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_git;
 
 /// Target platform, detected at compile time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

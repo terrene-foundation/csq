@@ -19,25 +19,49 @@ pub mod exec;
 /// `swap`'s own test modules).
 #[cfg(test)]
 pub(crate) mod fake_daemon_test_support;
+pub(super) mod gate_compose;
+pub mod gate_dispatch;
+pub mod gate_launch;
+pub mod gate_pin;
+pub(crate) mod gate_row_audit;
+mod gate_row_observer;
+pub mod gate_status;
 pub mod inspect_coc;
 pub mod install;
 pub mod keychain_sync;
 pub mod listkeys;
 pub mod login;
 pub mod logout;
+mod mcp_image;
+pub mod mcp_messaging;
+mod mcp_messaging_reload;
 pub mod models;
 pub mod move_slot;
+pub mod pool;
 pub mod probe;
 pub mod repair;
 pub mod rmkey;
 pub mod roster;
 pub mod run;
 pub mod sessions;
+pub mod sessions_directives;
+pub mod sessions_disk;
+pub mod sessions_list;
+pub mod sessions_messages;
 pub mod setkey;
 pub mod status;
 pub mod statusline;
 pub mod suggest;
 pub mod swap;
+/// Shared `#[cfg(test)]` support: bounded hermetic re-exec for the three
+/// TMPDIR `*_outlives_*` regressions (child-process isolation of the
+/// TMPDIR mutation; see the module docs). `all(test, unix)`, not `test`:
+/// all three callers are unix-gated test modules, so on the Windows
+/// cross-lint (`cfg(test)` on, `cfg(unix)` off) a `cfg(test)`-only module
+/// would have zero reachable users — dead_code, denied under `-D warnings`
+/// (measured: 5 `never used` errors on the x86_64-pc-windows-gnu clippy).
+#[cfg(all(test, unix))]
+pub(crate) mod tmpdir_outlives_test_support;
 pub mod unlock;
 pub mod update;
 
@@ -92,12 +116,7 @@ pub fn base_dir() -> Result<PathBuf> {
 /// Honors the `CLAUDE_HOME` environment variable. The override must be a
 /// non-empty absolute path — see [`validated_env_override`].
 pub fn claude_home() -> Result<PathBuf> {
-    if let Some(overridden) = validated_env_override("CLAUDE_HOME") {
-        return overridden;
-    }
-    let home =
-        csq_core::platform::home::home_dir().context("could not determine home directory")?;
-    Ok(home.join(".claude"))
+    crate::daemon_host::claude_home()
 }
 
 /// Returns the current config dir from `CLAUDE_CONFIG_DIR` env var.

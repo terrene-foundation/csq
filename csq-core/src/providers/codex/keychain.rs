@@ -208,15 +208,14 @@ fn run_security_find(service: &str) -> SecurityExit {
     // all, so a locked/hung keychain would block a Codex login forever. Both
     // csq keychain surfaces now share the one runner rather than each
     // carrying its own copy of the timeout/pid-safety logic.
-    // `.map(|bo| bo.output)`: this module only inspects the exit status /
-    // stderr substring, never parses `stdout` as content, so
+    // This module only inspects the exit status / stderr substring and
+    // keeps the complete output owner guarded during classification, so
     // `BoundedOutput`'s completeness flags (BUG-R3-1) are irrelevant here —
     // unlike `credentials::keychain`'s stdout-parsing callers.
     let out = crate::credentials::keychain::run_security_bounded(
         &["find-generic-password", "-s", service],
         None,
-    )
-    .map(|bo| bo.output);
+    );
     classify_security_output(out, "could not be found")
 }
 
@@ -234,32 +233,31 @@ fn run_security_delete(service: &str) -> SecurityExit {
     let out = crate::credentials::keychain::run_security_bounded(
         &["delete-generic-password", "-s", service],
         None,
-    )
-    .map(|bo| bo.output);
+    );
     classify_security_output(out, "could not be found")
 }
 
 #[cfg(target_os = "macos")]
 fn classify_security_output(
-    result: Option<std::process::Output>,
+    result: Option<crate::credentials::keychain::BoundedOutput>,
     not_found_needle: &str,
 ) -> SecurityExit {
     let out = match result {
-        Some(o) => o,
+        Some(o) => crate::credentials::keychain::SecretOutput::new(o),
         // Spawn failure or timeout (the shared runner's own hermetic guard
         // also returns `None` in test mode, but `run_security_find`/
         // `run_security_delete` already short-circuit before reaching here
         // in that mode — this arm is the REAL spawn-failure/timeout case).
         None => return SecurityExit::Error,
     };
-    if out.status.success() {
+    if out.output.status.success() {
         return SecurityExit::Found;
     }
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr = zeroize::Zeroizing::new(String::from_utf8_lossy(&out.output.stderr).into_owned());
     if stderr.contains(not_found_needle) {
         return SecurityExit::NotFound;
     }
-    if let Some(code) = out.status.code() {
+    if let Some(code) = out.output.status.code() {
         // 44 = errSecItemNotFound on modern macOS. Belt-and-suspenders
         // with the stderr substring match above.
         if code == 44 {
@@ -389,5 +387,36 @@ mod tests {
     #[test]
     fn non_macos_purge_is_noop() {
         assert!(!purge_residue().unwrap());
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn r2_buffer_codex_native_classifier_guards_outputs_without_policy_change() {
+        use crate::credentials::keychain::BoundedOutput;
+        use std::os::unix::process::ExitStatusExt;
+        let classify = |code: i32, stderr: &[u8]| {
+            classify_security_output(
+                Some(BoundedOutput {
+                    output: std::process::Output {
+                        status: std::process::ExitStatus::from_raw(code << 8),
+                        stdout: b"fake-native-stdout".to_vec(),
+                        stderr: stderr.to_vec(),
+                    },
+                    stdout_complete: false,
+                    stderr_complete: false,
+                }),
+                "could not be found",
+            )
+        };
+        assert_eq!(classify(0, b"fake-native-echo"), SecurityExit::Found);
+        assert_eq!(classify(44, b"fake-native-echo"), SecurityExit::NotFound);
+        assert_eq!(
+            classify(1, b"\xffcould not be found fake-echo"),
+            SecurityExit::NotFound
+        );
+        assert_eq!(classify(36, b"fake-native-echo"), SecurityExit::Error);
+        assert_eq!(
+            classify_security_output(None, "could not be found"),
+            SecurityExit::Error
+        );
     }
 }

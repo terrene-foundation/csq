@@ -258,6 +258,74 @@ pub fn post_json_probe(
     Ok((status, text))
 }
 
+fn pool_probe_key_header(
+    key: &secrecy::SecretString,
+) -> Result<reqwest::header::HeaderValue, String> {
+    use secrecy::ExposeSecret;
+    let mut header = reqwest::header::HeaderValue::from_str(key.expose_secret())
+        .map_err(|_| "probe_invalid_request".to_string())?;
+    header.set_sensitive(true);
+    Ok(header)
+}
+
+/// One operator-authorized Messages request. No redirects, retries or body output.
+/// The API key is request-scoped and never included in diagnostic text.
+pub fn post_messages_status_once(model: &str, key: &secrecy::SecretString) -> Result<u16, String> {
+    use secrecy::ExposeSecret;
+    if model.is_empty()
+        || model.len() > 128
+        || !model
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b))
+        || crate::pool::validate_key(key.expose_secret()).is_err()
+    {
+        return Err("probe_invalid_request".into());
+    }
+    let client = reqwest::blocking::Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|_| "probe_transport_unavailable".to_string())?;
+    let body = serde_json::json!({"model":model,"max_tokens":1,
+        "messages":[{"role":"user","content":"Hi"}]})
+    .to_string();
+    let key_header = pool_probe_key_header(key)?;
+    let response = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", key_header)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .map_err(|_| crate::error::redact_tokens("probe_transport_failed"))?;
+    Ok(response.status().as_u16())
+}
+
+#[cfg(test)]
+mod pool_probe_tests {
+    #[test]
+    fn messages_probe_rejects_header_injection_before_network_and_never_echoes_key() {
+        let key = secrecy::SecretString::from("synthetic-private-header".to_owned());
+        let header = super::pool_probe_key_header(&key).unwrap();
+        assert!(header.is_sensitive());
+        assert!(!format!("{header:?}").contains("synthetic-private-header"));
+        for (model, value) in [
+            ("model\r\ninjected", "synthetic-key"),
+            ("model", "synthetic-key\r\ninjected"),
+            ("", "synthetic-key"),
+        ] {
+            let key = secrecy::SecretString::from(value.to_owned());
+            assert_eq!(
+                super::post_messages_status_once(model, &key).unwrap_err(),
+                "probe_invalid_request"
+            );
+        }
+    }
+}
+
 /// POSTs a JSON body with custom headers. Returns `(status, response_headers, body)`.
 ///
 /// Like [`post_json_probe`] but also captures response headers. This
@@ -524,8 +592,180 @@ pub fn get_with_headers_full(url: &str, headers: &[(&str, &str)]) -> Result<Full
 
 // ─── Node.js subprocess transport (Anthropic endpoints) ──────
 
-/// Timeout for Node.js subprocess HTTP requests (milliseconds).
+/// In-script request bound for Node.js subprocess HTTP requests
+/// (milliseconds), emitted into every script builder through the ONE
+/// shared [`node_request_timeout_prelude`] snippet so the shapes cannot
+/// drift apart.
+///
+/// TWO shapes, and the script arms both:
+///
+/// 1. a TOTAL wall-clock timer, armed when the request is issued, which
+///    destroys the request and writes the fixed `timeout` diagnostic at
+///    [`NODE_TIMEOUT_MS`] after the request STARTS — whatever the socket
+///    is doing; and
+/// 2. the `timeout` option on `https.request`, kept as the
+///    socket-INACTIVITY guard it always was. A server that trickles bytes
+///    with gaps shorter than this value keeps resetting it, so on its own
+///    it is NOT a total bound — that is exactly the round-2 M2 defect the
+///    total timer closes.
+///
+/// Neither shape bounds process spawn, runtime startup, module loading,
+/// stdin consumption, a connect/DNS phase before the request is issued,
+/// the child's post-timer exit path, or output drain. Those phases are
+/// bounded ONLY on the PARENT side, by [`NODE_CHILD_WAIT_DEADLINE`].
 const NODE_TIMEOUT_MS: u64 = 15_000;
+
+/// Parent-side allowance added to [`NODE_TIMEOUT_MS`] to form
+/// [`NODE_CHILD_WAIT_DEADLINE`], the wall-clock bound on the parent's wait
+/// for one Node child.
+///
+/// # What is enforced, and by which side
+///
+/// The REQUEST is bounded structurally inside the child: the shared
+/// [`node_request_timeout_prelude`] arms a TOTAL timer that destroys the
+/// request at [`NODE_TIMEOUT_MS`] after it starts. A request that is
+/// issued therefore always terminates, and the script always reports.
+///
+/// Everything OUTSIDE the request — spawn/exec, runtime startup, module
+/// loading, stdin consumption, and pipe drain — has no in-child timer.
+/// [`NODE_CHILD_WAIT_DEADLINE`] is the ONLY enforced wall bound over those
+/// phases. This constant is the fixed policy allowance (10 s) added for
+/// them so the total parent wait stays at 25 s. It is a policy bound, NOT
+/// a derivation from an enforced sequence: nothing enforces that spawn +
+/// startup + stdin finish inside it (round-2 L3).
+///
+/// Ordering is therefore structural only within the request phase:
+///
+/// - If the pre-request phases finish inside this margin, a slow request
+///   surfaces the script's own `timeout` diagnostic (via
+///   [`node_failure_error`]) rather than a parent kill.
+/// - If they do not, the parent deadline wins. When the child had already
+///   started emitting stdout by then, the parent returns
+///   [`ERR_NODE_HTTP_OUTCOME_UNKNOWN`] rather than silently discarding a
+///   possibly-committed response (round-2 M2).
+/// - A child wedged before the request is issued (spawn, startup, DNS, a
+///   stuck runtime) is killed at the parent deadline, so the daemon
+///   refresher can never block on it indefinitely.
+const NODE_WAIT_MARGIN_MS: u64 = 10_000;
+
+/// Wall-clock bound on the parent's wait for ONE Node child, exposed so
+/// an enclosing caller can compose its own drain or transaction
+/// deadline from it instead of inventing a literal.
+///
+/// ```text
+/// NODE_CHILD_WAIT_DEADLINE = NODE_TIMEOUT_MS + NODE_WAIT_MARGIN_MS
+///                          = 15 s (TOTAL in-script request timer)
+///                          + 10 s (policy allowance: spawn, runtime
+///                                  startup, module loading, stdin
+///                                  consumption, and the script's
+///                                  post-timer teardown)
+///                          = 25 s
+/// ```
+///
+/// This is the ONLY enforced wall bound over the phases outside the
+/// request itself; the request is separately bounded inside the child by
+/// the total timer. `run_node_script` shares this ONE budget across
+/// spawn, stdin consumption, and the wait, so those stages cannot each
+/// spend the full constant. The pipe drain that follows the child's exit
+/// is bounded separately by `NODE_DRAIN_DEADLINE`, making the composed
+/// worst case of one transport call this deadline plus one drain budget.
+///
+/// A caller issuing several sequential requests can derive its own bound
+/// as a multiple of that composed value. See `NODE_WAIT_MARGIN_MS` for
+/// what is and is not enforced by this deadline.
+pub const NODE_CHILD_WAIT_DEADLINE: Duration =
+    Duration::from_millis(NODE_TIMEOUT_MS + NODE_WAIT_MARGIN_MS);
+
+/// Bound on draining a Node child's stdout/stderr after its leader has
+/// exited or been killed, and on joining the stdin writer after a kill.
+///
+/// A pipe reader reaches EOF only when every holder of the write end is
+/// gone. The child's process GROUP is signalled on the timeout path, which
+/// covers the ordinary case, but a descendant that escaped the group
+/// (`setsid`/detached) — or ANY descendant on Windows, where
+/// [`kill_child_process_group`] cannot signal a group at all — can keep a
+/// pipe open indefinitely. This policy bound (5 s, not derived from a
+/// measurement) is what turns that into a fixed-vocabulary error instead of
+/// a parent-side hang; a reader thread that has still not reached EOF is
+/// detached and documented in [`wait_for_node_child`].
+const NODE_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Poll interval for the parent's deadline loop in
+/// [`wait_for_node_child`]. Small enough that the deadline is enforced
+/// within a few tens of milliseconds, large enough that a 25 s worst
+/// case costs only ~2,500 scheduler wakeups.
+const NODE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Fixed-vocabulary failure for a Node child that outlives
+/// [`NODE_CHILD_WAIT_DEADLINE`] without having emitted any stdout.
+///
+/// Deliberately carries NO body, stderr, or token text: the stdin
+/// payload of the OAuth exchange transports is a live credential, and
+/// a timed-out child may have echoed any of it (rules/security.md §2
+/// and §8). A timeout is a timeout; the child's output is discarded.
+const ERR_NODE_WAIT_TIMEOUT: &str = "node http transport: child exceeded the parent wait deadline";
+
+/// Fixed-vocabulary classification for every RUNTIME failure of the Node
+/// transport that is not one of the two more specific classes below —
+/// spawn/exec failure, a missing or unwritable stdin, the stdin writer
+/// dying, the wait itself failing, a pipe reader that cannot be created or
+/// that errors, a non-zero child exit, and a malformed response framing or
+/// status line.
+///
+/// # Why a constant, not the `io::Error` Display text
+///
+/// `daemon::usage_poller::poll_error::classify_transport_error` classifies
+/// a transport error by EQUALITY against shared constants; any other string
+/// becomes `PollError::Transport`. A formatted `io::Error` string carried
+/// no classification value (it always landed in `Transport` anyway) and
+/// tripped the structural oracle that keeps every poller-facing rejection
+/// comparable — the oracle cannot verify an arbitrary formatted string.
+/// The failure DETAIL is therefore logged here with a fixed `error_kind`
+/// tag and never returned: the returned string is this constant, which the
+/// classifier maps to `Transport`.
+///
+/// It is NOT a `BadUrl`-class constant: these failures are post-pre-flight
+/// runtime problems, so the poller must treat them as a retryable
+/// transport failure, not as an operator misconfiguration.
+pub(crate) const ERR_NODE_TRANSPORT: &str = "node http transport: runtime failed";
+
+/// Fixed-vocabulary classification for a parent-deadline kill AFTER the
+/// child had already written to stdout — i.e. the child had begun emitting
+/// the response, so the server may already have committed a mutation
+/// (in particular an OAuth refresh-token rotation, whose old token is then
+/// dead server-side).
+///
+/// The value is EXACTLY the tag, with no prefix, so a caller can match it
+/// verbatim (`err == http::ERR_NODE_HTTP_OUTCOME_UNKNOWN`) without parsing.
+/// It never carries the body, stderr, or any token text — the body itself
+/// is discarded, because a partially-emitted response is not safe to
+/// surface and the point of this class is that the OUTCOME is unknown.
+///
+/// # What a caller MUST do with it
+///
+/// - Treat it as POSSIBLY COMMITTED, not as a clean transport failure.
+/// - Do NOT retry the same request with a single-use credential (a Codex
+///   refresh token is single-use; an Anthropic refresh token may have been
+///   rotated). A blind retry of a committed rotation can burn the account.
+/// - Do NOT overwrite or delete the stored credential pair on this error:
+///   the old pair may be the only durable copy of a pre-rotation state, and
+///   the new pair was never observed.
+/// - Report the account as needing verification / re-login rather than
+///   reporting a plain network failure.
+pub(crate) const ERR_NODE_HTTP_OUTCOME_UNKNOWN: &str = "node_http_outcome_unknown";
+
+/// Fixed-vocabulary failure when the child's pipe reader cannot reach EOF
+/// inside [`NODE_DRAIN_DEADLINE`] after the child itself is gone.
+///
+/// Internal only: [`wait_for_node_child_with_drain_budget`] maps EVERY
+/// stdout-drain failure to [`ERR_NODE_HTTP_OUTCOME_UNKNOWN`], never to a
+/// plain transport class. A reader delivers its buffer only at EOF, so a
+/// complete body may be sitting in the reader's partial buffer while it is
+/// blocked on a pipe some escaped descendant still holds — discarding that
+/// as an ordinary failure is the same round-2 M2 class as the parent
+/// deadline case.
+const ERR_NODE_DRAIN_TIMEOUT: &str =
+    "node http transport: child output did not drain within the drain deadline";
 
 /// Fixed rejection message for a URL failing [`url_has_unsafe_js_chars`].
 ///
@@ -780,14 +1020,79 @@ fn probe_runtime(path: &Path) -> bool {
 /// echoed request detail, or any other node-side error text cannot leak
 /// a bearer or refresh token into the string returned to the caller.
 ///
-/// Single shared function — used by all three Node-transport
+/// Single shared function — used by all four Node-transport
 /// functions in this module — so a future new call site inherits the
 /// redaction by construction rather than needing to remember to add it
 /// (the `security.md` §5a "named-list drift" failure mode, applied to
 /// this module's error formatting).
+///
+/// The value is now a LOG DETAIL only: the call sites log it through
+/// [`log_node_failure`] and return the shared [`ERR_NODE_TRANSPORT`]
+/// constant, because the poller classifies by equality against shared
+/// constants and a redacted-but-formatted string is not one.
 fn node_failure_error(stderr: &[u8]) -> String {
     let stderr = String::from_utf8_lossy(stderr);
     format!("node http failed: {}", crate::error::redact_tokens(&stderr))
+}
+
+/// Logs a non-zero Node child exit with its REDACTED stderr, so the
+/// operator keeps the runtime's own diagnostic while the caller returns the
+/// shared [`ERR_NODE_TRANSPORT`] constant the poller can classify.
+fn log_node_failure(stderr: &[u8]) {
+    let detail = node_failure_error(stderr);
+    tracing::warn!(
+        error_kind = "node_child_failed",
+        detail = %detail,
+        "node http transport: the JS runtime reported a request failure"
+    );
+}
+
+/// Fixed-vocabulary tag for an `io::Error` KIND — the only failure detail a
+/// transport warning may carry (security round-2 L1). Never the error's
+/// `Display` text: an `io::Error` can render a path, a runtime path, or a
+/// syscall detail, and these warnings fire beside credential-bearing
+/// transport payloads; a fixed tag keeps the diagnostic surface
+/// comparable (the poller classifier's own structural oracle) and guarantees
+/// no formatted foreign string reaches a log line.
+fn io_error_kind(err: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind as K;
+    match err.kind() {
+        K::NotFound => "not_found",
+        K::PermissionDenied => "permission_denied",
+        K::ConnectionRefused => "connection_refused",
+        K::ConnectionReset => "connection_reset",
+        K::ConnectionAborted => "connection_aborted",
+        K::NotConnected => "not_connected",
+        K::AddrInUse => "addr_in_use",
+        K::AddrNotAvailable => "addr_not_available",
+        K::BrokenPipe => "broken_pipe",
+        K::AlreadyExists => "already_exists",
+        K::WouldBlock => "would_block",
+        K::InvalidInput => "invalid_input",
+        K::InvalidData => "invalid_data",
+        K::TimedOut => "timed_out",
+        K::WriteZero => "write_zero",
+        K::Interrupted => "interrupted",
+        K::UnexpectedEof => "unexpected_eof",
+        K::OutOfMemory => "out_of_memory",
+        K::Unsupported => "unsupported",
+        _ => "other",
+    }
+}
+
+/// Fixed-vocabulary tag for one of THIS module's transport constants,
+/// replacing a `%other` render of the same `&'static str` (security
+/// round-2 L1). The mapping is exhaustive over the values
+/// [`run_node_script`] can return and falls back to a fixed tag, so no
+/// future constant can leak an unvetted string into a warning.
+fn transport_class_tag(err: &'static str) -> &'static str {
+    match err {
+        ERR_NODE_TRANSPORT => "node_transport",
+        ERR_NODE_WAIT_TIMEOUT => "node_wait_timeout",
+        ERR_NODE_HTTP_OUTCOME_UNKNOWN => "node_outcome_unknown",
+        ERR_NODE_DRAIN_TIMEOUT => "node_drain_timeout",
+        _ => "other_fixed",
+    }
 }
 
 /// Writes `payload` to `child`'s stdin. On ANY failure — the write
@@ -813,42 +1118,549 @@ fn node_failure_error(stderr: &[u8]) -> String {
 /// this function is called, the write has already failed, so the
 /// process is presumed already gone or exiting — there is no
 /// meaningful action left to take on either call failing.
-fn write_stdin_or_reap(child: &mut std::process::Child, payload: &[u8]) -> Result<(), String> {
+/// # Returned errors
+///
+/// Only the two shared fixed-vocabulary classes are returned —
+/// [`ERR_NODE_WAIT_TIMEOUT`] for a wedged write and [`ERR_NODE_TRANSPORT`]
+/// for every other failure, whose detail is logged here with a fixed
+/// `error_kind` tag. This is what lets a poller classify the enclosing
+/// transport call by equality (see [`ERR_NODE_TRANSPORT`]).
+fn write_stdin_bounded(
+    child: &mut std::process::Child,
+    payload: &[u8],
+    budget: Duration,
+) -> Result<(), &'static str> {
     use std::io::Write;
-    match child.stdin.as_mut() {
-        Some(stdin) => match stdin.write_all(payload) {
-            Ok(()) => Ok(()),
-            // `BrokenPipe` (EPIPE) is NOT a transport failure to report — it
-            // means the child is already gone or has closed stdin. With the
-            // `process.on('uncaughtException', …)` guard now on every script
-            // this module spawns, that is precisely the shape of a child that
-            // failed DELIBERATELY and already wrote its own diagnostic
-            // (`script_error`) to stderr.
-            //
-            // Returning `Err` here would discard that stderr and surface a
-            // generic "stdin write failed: Broken pipe" instead — and WHICH of
-            // the two the operator saw would depend on whether the parent's
-            // `write_all` reached the pipe buffer before the child exited, i.e.
-            // on scheduling. One failure, two different operator-facing strings,
-            // chosen by a race.
-            //
-            // So fall through to the caller's `wait_with_output()`, which reaps
-            // the child (nothing leaks — that is the same call the success path
-            // relies on) and returns the child's own message. All three
-            // production call sites invoke it immediately after this function.
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                Err(format!("stdin write failed: {e}"))
-            }
-        },
-        None => {
+    // The write itself is bounded: a child that stops reading (or never
+    // starts) leaves a full pipe, and a blocking `write_all` on it would
+    // hang this call forever — the very class this function's caller
+    // exists to bound. The writer runs on its own thread so the budget is
+    // enforced here, and a timeout kills the child's process group, which
+    // closes the pipe's read end and unblocks the writer.
+    let Some(mut stdin) = child.stdin.take() else {
+        tracing::warn!(
+            error_kind = "node_stdin_unavailable",
+            "node http transport: the child's stdin pipe is unavailable"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(ERR_NODE_TRANSPORT);
+    };
+    // This is an extra heap copy of a credential-bearing payload; scrub it
+    // when the writer thread drops it instead of leaving it in freed heap
+    // memory (round-2 security L1).
+    //
+    // The type is PINNED on purpose (round-2 correctness L-b): deleting the
+    // `Zeroizing` wrapper is a hard compile error at this annotation, not a
+    // silent regression a passing test could hide. A writer that is still
+    // parked on a pipe (the documented detached-thread residual on the
+    // timeout path) holds this buffer until the pipe closes; zeroing on drop
+    // is the only bound available when the blocked `write_all` cannot be
+    // cancelled portably.
+    let owned: zeroize::Zeroizing<Vec<u8>> = zeroize::Zeroizing::new(payload.to_vec());
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let writer = match std::thread::Builder::new()
+        .name("csq-node-stdin-writer".into())
+        .spawn(move || {
+            let outcome = stdin.write_all(&owned);
+            // Closing stdin is part of the contract: the script reads its
+            // payload to EOF.
+            drop(stdin);
+            let _ = sender.send(outcome);
+        }) {
+        Ok(handle) => handle,
+        Err(e) => {
+            tracing::warn!(
+                error_kind = "node_stdin_writer_spawn_failed",
+                io_kind = io_error_kind(&e),
+                "node http transport: could not start the stdin writer thread"
+            );
             let _ = child.kill();
             let _ = child.wait();
-            Err("failed to open stdin".to_string())
+            return Err(ERR_NODE_TRANSPORT);
+        }
+    };
+    match receiver.recv_timeout(budget) {
+        Ok(outcome) => {
+            let _ = writer.join();
+            match outcome {
+                Ok(()) => Ok(()),
+                // `BrokenPipe` (EPIPE) is NOT a transport failure to report — it
+                // means the child is already gone or has closed stdin. With the
+                // `process.on('uncaughtException', …)` guard now on every script
+                // this module spawns, that is precisely the shape of a child that
+                // failed DELIBERATELY and already wrote its own diagnostic
+                // (`script_error`) to stderr.
+                //
+                // Returning `Err` here would discard that stderr and surface a
+                // generic "stdin write failed: Broken pipe" instead — and WHICH of
+                // the two the operator saw would depend on whether the parent's
+                // `write_all` reached the pipe buffer before the child exited, i.e.
+                // on scheduling. One failure, two different operator-facing strings,
+                // chosen by a race.
+                //
+                // So fall through to the caller's [`wait_for_node_child`], which
+                // reaps the child (nothing leaks — that is the same call the
+                // success path relies on) and returns the child's own message. All
+                // four production call sites invoke it immediately after this
+                // function.
+                // EPIPE is a fall-through (see the contract above): the child is
+                // gone or closed stdin, and the caller's wait surfaces its own
+                // diagnostic.
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                Err(e) => {
+                    tracing::warn!(
+                        error_kind = "node_stdin_write_failed",
+                        io_kind = io_error_kind(&e),
+                        "node http transport: writing the request payload to the child failed"
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    Err(ERR_NODE_TRANSPORT)
+                }
+            }
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // A wedged write: kill the group so the read end closes, then
+            // reap. The writer unblocks on EPIPE and joins.
+            //
+            // `child.kill()` is unconditional, not only on a group-signal
+            // error: the group signal is a no-op (ESRCH, treated as success)
+            // when the child is NOT a process-group leader — a caller that
+            // spawned it directly rather than through `spawn_node_script` —
+            // and `wait()` below would then block forever on a live child.
+            // This is exactly the shape a unit row reproduces, and the one
+            // that hung the http scope during the bounded-waits freeze.
+            if let Err(e) = kill_child_process_group(child) {
+                tracing::warn!(
+                    error_kind = "node_child_group_kill_failed",
+                    io_kind = io_error_kind(&e),
+                    "node http transport: timed-out stdin writer could not signal the child group"
+                );
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            // The kill above closes the pipe's read end, so the writer
+            // normally returns EPIPE at once. Bound the wait for that send
+            // anyway: on Windows there is no process-group kill, and a
+            // descendant that inherited stdin can hold the read end open,
+            // which would otherwise park this call forever (round-2
+            // correctness L2). On expiry the writer thread is detached and
+            // will end when the pipe finally closes; that parked thread is
+            // the documented residual, not a caller hang.
+            let _ = receiver.recv_timeout(NODE_DRAIN_DEADLINE);
+            drop(writer);
+            Err(ERR_NODE_WAIT_TIMEOUT)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            tracing::warn!(
+                error_kind = "node_stdin_writer_lost",
+                "node http transport: the stdin writer thread exited without reporting"
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = writer.join();
+            Err(ERR_NODE_TRANSPORT)
         }
     }
+}
+
+/// Spawns one Node transport child and bounds the WHOLE call — spawn-to-
+/// reap — with [`NODE_CHILD_WAIT_DEADLINE`].
+///
+/// The clock starts before the spawn call, and BOTH later stages receive
+/// only the REMAINING part of that one budget — never the full constant —
+/// so spawn time, the stdin write, and the child wait cannot each spend
+/// [`NODE_CHILD_WAIT_DEADLINE`] in turn (round-2 correctness L1). Every
+/// call site uses this entry point so that bound cannot drift per call
+/// site.
+fn run_node_script(
+    runtime: &str,
+    script: &str,
+    payload: &[u8],
+) -> Result<std::process::Output, &'static str> {
+    let started = std::time::Instant::now();
+    let mut child = match spawn_node_script(runtime, script) {
+        Ok(child) => child,
+        Err(e) => {
+            tracing::warn!(
+                error_kind = "node_child_spawn_failed",
+                io_kind = io_error_kind(&e),
+                "node http transport: could not spawn the JS runtime"
+            );
+            return Err(ERR_NODE_TRANSPORT);
+        }
+    };
+    // A child that never reads stdin leaves a full pipe and would block a
+    // plain `write_all` forever; the bounded writer enforces the remaining
+    // budget and kills the child's process group on expiry.
+    write_stdin_bounded(
+        &mut child,
+        payload,
+        NODE_CHILD_WAIT_DEADLINE.saturating_sub(started.elapsed()),
+    )?;
+    wait_for_node_child(
+        child,
+        NODE_CHILD_WAIT_DEADLINE.saturating_sub(started.elapsed()),
+    )
+}
+
+/// Spawns `runtime -e <script>` with all three stdio pipes connected
+/// and, on Unix, the child in its OWN process group.
+///
+/// Shared by every Node-transport caller so the process-group
+/// invariant cannot drift per call site: [`wait_for_node_child`] kills
+/// the child's process group on timeout, and that only reaches the
+/// whole runtime subtree because the child is a group leader
+/// (`process_group(0)` makes the child's pid its pgid).
+///
+/// A spawn failure is returned as the raw [`std::io::Error`]; the caller
+/// logs it with a fixed tag and classifies it as [`ERR_NODE_TRANSPORT`],
+/// because a formatted OS error string is not a shared constant a poller
+/// can compare against.
+fn spawn_node_script(runtime: &str, script: &str) -> Result<std::process::Child, std::io::Error> {
+    let mut cmd = std::process::Command::new(runtime);
+    cmd.arg("-e")
+        .arg(script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.spawn()
+}
+
+/// Kills `child`'s process group on Unix, or the child alone on other
+/// platforms.
+///
+/// MUST be called BEFORE the child is reaped: an unreaped child (even
+/// a zombie) still owns its pid, so the group id `-pid` cannot have
+/// been recycled onto an unrelated process group in between.
+///
+/// `ESRCH` is success for this purpose — it means the group already
+/// has no members left (the child exited between the last `try_wait`
+/// and this signal).
+///
+/// # Windows: no job object — the subtree is NOT covered
+///
+/// The non-Unix arm kills the DIRECT child only. csq creates no Job
+/// Object for the runtime, so any descendant the child spawned survives
+/// this call — including one holding a stdio pipe, which is why
+/// [`wait_for_node_child`] bounds its reader joins with
+/// [`NODE_DRAIN_DEADLINE`] instead of joining unbounded. The Node
+/// scripts this module spawns (`node -e` request drivers) create no
+/// children, so the gap is latent today; a future script that spawns one
+/// would need a Job Object (or an equivalent) to restore the Unix
+/// group-kill guarantee.
+fn kill_child_process_group(child: &mut std::process::Child) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        // SAFETY: `kill(2)` with a negative pid signals the process
+        // group whose id is `pid`; no pointer is involved. `spawn_node_script`
+        // made this child a process-group leader, so `-pid` names the
+        // group the runtime created.
+        let rc = unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(err)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        child.kill()
+    }
+}
+
+/// One pipe-drain stream: the reader thread sends its buffer once, at EOF,
+/// and the receiving side decides how long to wait for it.
+struct PipeReader {
+    receiver: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+}
+
+/// Reads `pipe` to EOF on a dedicated thread.
+///
+/// One thread per pipe is what makes stdout and stderr drain
+/// CONCURRENTLY: a child that fills the pipe it is not currently
+/// being read from would otherwise block forever, never close the
+/// other pipe, and deadlock a sequential reader. An absent pipe
+/// contributes an empty buffer, exactly as
+/// `std::process::Child::wait_with_output` does.
+///
+/// The thread is created through [`std::thread::Builder`] so a creation
+/// failure is a RETURNED error instead of a panic (round-2 security L2):
+/// the caller has already spawned the child, and an unwinding panic here
+/// would drop the `Child` without killing or reaping it.
+fn spawn_pipe_reader<R>(pipe: Option<R>) -> Result<PipeReader, &'static str>
+where
+    R: std::io::Read + Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let handle = std::thread::Builder::new()
+        .name("csq-node-pipe-reader".into())
+        .spawn(move || {
+            let mut buf = Vec::new();
+            let outcome = match pipe {
+                Some(mut pipe) => pipe.read_to_end(&mut buf).map(|_| buf),
+                None => Ok(buf),
+            };
+            // A failed send means the receiver was dropped after a drain
+            // deadline; the thread is terminating anyway.
+            let _ = sender.send(outcome);
+        })
+        .map_err(|e| {
+            tracing::warn!(
+                error_kind = "node_pipe_reader_spawn_failed",
+                io_kind = io_error_kind(&e),
+                "node http transport: could not start a pipe reader thread"
+            );
+            ERR_NODE_TRANSPORT
+        })?;
+    // The reader is consumed through the channel; the JoinHandle has no
+    // further role (dropping it detaches the thread, which the bounded
+    // drain may leave parked on a pipe held by an escaped descendant).
+    drop(handle);
+    Ok(PipeReader { receiver })
+}
+
+/// Receives one pipe reader's buffer, waiting no later than `until`.
+///
+/// Returns [`ERR_NODE_DRAIN_TIMEOUT`] when the reader has not reached EOF
+/// by then. The reader thread is NOT joined on that path: it may be parked
+/// on a pipe that an escaped descendant still holds open, and joining it
+/// would reintroduce the unbounded hang this budget exists to remove.
+/// Dropping the receiver makes the thread's eventual send fail harmlessly;
+/// the thread ends when the pipe finally closes, and that parked thread is
+/// the documented residual of this bound.
+fn drain_pipe_within(
+    reader: &PipeReader,
+    until: std::time::Instant,
+) -> Result<Vec<u8>, &'static str> {
+    let remaining = until.saturating_duration_since(std::time::Instant::now());
+    match reader.receiver.recv_timeout(remaining) {
+        Ok(Ok(buf)) => Ok(buf),
+        Ok(Err(e)) => {
+            tracing::warn!(
+                error_kind = "node_pipe_read_failed",
+                io_kind = io_error_kind(&e),
+                "node http transport: reading the child's output pipe failed"
+            );
+            Err(ERR_NODE_TRANSPORT)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(ERR_NODE_DRAIN_TIMEOUT),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(ERR_NODE_TRANSPORT),
+    }
+}
+
+/// Waits for `child` under a parent-side wall-clock `deadline`, then
+/// collects its output with the production [`NODE_DRAIN_DEADLINE`].
+///
+/// See [`wait_for_node_child_with_drain_budget`] for the contract.
+fn wait_for_node_child(
+    child: std::process::Child,
+    deadline: Duration,
+) -> Result<std::process::Output, &'static str> {
+    wait_for_node_child_with_drain_budget(child, deadline, NODE_DRAIN_DEADLINE)
+}
+
+/// Waits for `child` under a parent-side wall-clock `deadline`, then
+/// collects its output under a `drain_budget`.
+///
+/// # Contract
+///
+/// - Stdin is dropped first, exactly as
+///   `std::process::Child::wait_with_output` does. Every Node script in
+///   this module reads its request payload from stdin and only issues
+///   the request on stdin `end`; holding the handle open would turn
+///   every call into a timeout.
+/// - stdout and stderr are drained concurrently (see
+///   [`spawn_pipe_reader`]) so a child flooding either pipe cannot
+///   deadlock the parent.
+/// - The child's process group is killed and the child reaped when
+///   `deadline` elapses, so no zombie and no live runtime subtree
+///   survives a wedged call. The unconditional direct `child.kill()`
+///   before every `wait()` is load-bearing: `ESRCH` from the group
+///   signal is indistinguishable from a child that was never a group
+///   leader, and `wait()` must never block on a live child.
+/// - BOTH the post-exit drain and the post-kill drain are bounded by
+///   `drain_budget` (round-2 correctness L2). A pipe held open by an
+///   escaped descendant — or by ANY descendant on Windows, which has no
+///   group kill — ends the wait instead of blocking the caller forever.
+///   The reader thread is detached on that path and ends when the pipe
+///   closes. A stdout drain that FAILS cannot establish that the child
+///   wrote nothing, so it is reported as
+///   [`ERR_NODE_HTTP_OUTCOME_UNKNOWN`], not as a plain transport failure:
+///   a possibly-complete body may be sitting unread in the reader's
+///   buffer.
+/// - On the success path the drained bytes are returned verbatim, as
+///   `Child::wait_with_output` would. If stdout drains completely but
+///   stderr does not, the COMPLETE stdout body is still returned (with a
+///   fixed-tag warning and empty stderr): discarding a complete,
+///   possibly credential-bearing response because its sibling pipe is
+///   held open would be a worse loss than a missing diagnostic.
+/// - On timeout the error is fixed vocabulary and NEVER the child's
+///   output, which may contain the credential-bearing stdin payload or a
+///   token echoed into stderr. It is one of:
+///   - [`ERR_NODE_HTTP_OUTCOME_UNKNOWN`] when the child had already
+///     written to stdout, OR when the stdout drain itself failed (an
+///     unread buffer is zero evidence of "no output"). The response may
+///     have been committed by the server (e.g. a refresh-token rotation)
+///     before the kill, so the caller MUST treat the outcome as possibly
+///     committed — see that constant's doc for the required caller
+///     behaviour;
+///   - [`ERR_NODE_WAIT_TIMEOUT`] only when stdout demonstrably drained to
+///     EOF empty.
+fn wait_for_node_child_with_drain_budget(
+    mut child: std::process::Child,
+    deadline: Duration,
+    drain_budget: Duration,
+) -> Result<std::process::Output, &'static str> {
+    // Mirror `wait_with_output`: close stdin so a script reading its
+    // payload to EOF proceeds. See the contract above.
+    drop(child.stdin.take());
+
+    let stdout_reader = match spawn_pipe_reader(child.stdout.take()) {
+        Ok(reader) => reader,
+        Err(e) => {
+            // The child is already spawned and nothing downstream will
+            // reap it, so this function must (round-2 security L2).
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
+    let stderr_reader = match spawn_pipe_reader(child.stderr.take()) {
+        Ok(reader) => reader,
+        Err(e) => {
+            // The stdout reader thread is detached; killing the child
+            // closes the stdout write end, so it reaches EOF and ends.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
+
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                // `try_wait` failing leaves the child state unknown;
+                // drop would not reap it, so clean up best-effort and
+                // report the wait failure.
+                let _ = child.kill();
+                let _ = child.wait();
+                let drain_until = std::time::Instant::now() + drain_budget;
+                let _ = drain_pipe_within(&stdout_reader, drain_until);
+                let _ = drain_pipe_within(&stderr_reader, drain_until);
+                tracing::warn!(
+                    error_kind = "node_child_wait_failed",
+                    io_kind = io_error_kind(&e),
+                    "node http transport: waiting for the child failed"
+                );
+                return Err(ERR_NODE_TRANSPORT);
+            }
+        }
+
+        let remaining = deadline.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            // Kill BEFORE reaping (see `kill_child_process_group`).
+            // A failed group signal is reported as a fixed-vocabulary
+            // warning, and the direct child is still killed
+            // best-effort so no runtime outlives the deadline.
+            if let Err(e) = kill_child_process_group(&mut child) {
+                tracing::warn!(
+                    error_kind = "node_child_group_kill_failed",
+                    io_kind = io_error_kind(&e),
+                    "node http transport: timed-out child process group could not be signalled"
+                );
+            }
+            // Unconditional direct kill, not only on a group-signal error:
+            // ESRCH from the group signal is indistinguishable from a child
+            // that was never a group leader, and `wait()` must never block on
+            // a live child. Harmless when the group signal already killed it.
+            let _ = child.kill();
+            // Reap so no zombie survives. If the reap itself fails the
+            // timeout error below is still the caller-facing outcome;
+            // there is no further action available here.
+            let _ = child.wait();
+            // Bounded drain. The group signal above releases the ordinary
+            // pipes; a descendant that escaped the group can still hold
+            // one, and the drain budget turns that into a bounded return
+            // instead of a blocked join.
+            let drain_until = std::time::Instant::now() + drain_budget;
+            // stdout is the classification signal: the scripts in this
+            // module emit their wire format only from `res.on('end')`, so
+            // any bytes here mean the response phase had begun and the
+            // server may already have committed a mutation (round-2 M2).
+            //
+            // Only a SUCCESSFUL drain to EOF that is empty establishes
+            // "the child wrote nothing". A failed drain (timeout or read
+            // error) leaves a possibly-complete body unread in the
+            // reader's buffer, which is zero evidence of no output — so it
+            // takes the possibly-committed class, never the plain timeout.
+            let stdout_known_empty = matches!(
+                drain_pipe_within(&stdout_reader, drain_until),
+                Ok(bytes) if bytes.is_empty()
+            );
+            // stderr is never surfaced on this path; draining it only
+            // releases the reader within the same budget.
+            let _ = drain_pipe_within(&stderr_reader, drain_until);
+            if !stdout_known_empty {
+                return Err(ERR_NODE_HTTP_OUTCOME_UNKNOWN);
+            }
+            return Err(ERR_NODE_WAIT_TIMEOUT);
+        }
+        std::thread::sleep(remaining.min(NODE_WAIT_POLL_INTERVAL));
+    };
+
+    let drain_until = std::time::Instant::now() + drain_budget;
+    let stdout = match drain_pipe_within(&stdout_reader, drain_until) {
+        Ok(stdout) => stdout,
+        Err(e) => {
+            // The child exited but its stdout never reached EOF, so a
+            // possibly-complete body may be sitting unread in the reader's
+            // partial buffer. Fail into the possibly-committed class
+            // instead of discarding it as a plain transport failure.
+            tracing::warn!(
+                error_kind = "node_child_stdout_drain_failed",
+                outcome_class = transport_class_tag(e),
+                "node http transport: stdout drain did not complete after the child exited; \
+                 classifying the outcome as possibly committed"
+            );
+            return Err(ERR_NODE_HTTP_OUTCOME_UNKNOWN);
+        }
+    };
+    let stderr = match drain_pipe_within(&stderr_reader, drain_until) {
+        Ok(stderr) => stderr,
+        Err(e) => {
+            // stdout is COMPLETE (the child exited and its stdout reached
+            // EOF). See the contract: keep the body, report the degraded
+            // stderr, never discard a possibly credential-bearing response
+            // because a sibling pipe is still held open.
+            tracing::warn!(
+                error_kind = "node_child_stderr_drain_failed",
+                outcome_class = transport_class_tag(e),
+                "node http transport: stderr drain did not complete after the child exited; \
+                 returning the complete stdout body with empty stderr"
+            );
+            Vec::new()
+        }
+    };
+
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Returns `true` if `url` contains a codepoint that must never reach
@@ -939,6 +1751,42 @@ fn js_url_literal(url: &str) -> Result<String, String> {
     serde_json::to_string(url).map_err(|_| ERR_ENCODE_FAILED.to_string())
 }
 
+/// The ONE shared in-script request-timeout prelude emitted into EVERY
+/// Node script builder (`build_post_script`, `build_post_with_date_script`,
+/// `build_get_bearer_script`, `build_get_bearer_with_retry_after_script`).
+///
+/// # Why a total timer, not just the `timeout` request option
+///
+/// `https.request`'s `timeout` option is a socket-INACTIVITY timer: a
+/// server that trickles bytes with gaps shorter than the value keeps
+/// resetting it, so on its own it is not a bound on the request at all
+/// (round-2 M2). This prelude arms a TOTAL wall-clock timer that destroys
+/// the request `timeout_ms` after it is issued — whatever the socket is
+/// doing — and writes the same fixed `timeout` diagnostic the inactivity
+/// handler writes.
+///
+/// One shared function is what keeps the four builders from drifting: a
+/// builder that lost the timer would otherwise pass every test the other
+/// three pass. The response-end handler calls `__csqSettle()` before
+/// writing stdout, which marks the response as won and clears the timer so
+/// no timer outlives a completed response; `__csqFail` is the single
+/// failure path for both the inactivity timer and request errors.
+fn node_request_timeout_prelude(timeout_ms: u64) -> String {
+    format!(
+        r#"  let __csqSettled = false;
+  const __csqFail = (why) => {{ if (__csqSettled) return; __csqSettled = true; process.stderr.write(why); process.exit(1); }};
+  // TOTAL request timer: fires whatever the socket is doing. The request
+  // option `timeout` above is only an inactivity guard that a trickling
+  // response keeps resetting.
+  const __csqTimer = setTimeout(() => {{ req.destroy(); __csqFail('timeout'); }}, {timeout_ms});
+  // Do not keep the event loop alive after a successful response; the
+  // response-end handler's __csqSettle() is the primary release.
+  if (typeof __csqTimer.unref === 'function') __csqTimer.unref();
+  const __csqSettle = () => {{ if (__csqSettled) return false; __csqSettled = true; clearTimeout(__csqTimer); return true; }};
+"#
+    )
+}
+
 /// Builds the Node.js script body for [`post_json_node`].
 ///
 /// Pure and side-effect-free (round-2 redteam NIT-2) so tests can
@@ -965,7 +1813,8 @@ fn js_url_literal(url: &str) -> Result<String, String> {
 /// passwords). Handling it here bounds every escape hatch to the same
 /// fixed-vocabulary `script_error` literal the module's other error
 /// paths already use.
-fn build_post_script(url_literal: &str) -> String {
+fn build_post_script(url_literal: &str, timeout_ms: u64) -> String {
+    let prelude = node_request_timeout_prelude(timeout_ms);
     format!(
         r#"
 process.on('uncaughtException', () => {{ process.stderr.write('script_error'); process.exit(1); }});
@@ -977,14 +1826,17 @@ process.stdin.on('end', () => {{
   const req = https.request(url, {{
     method: 'POST',
     headers: {{'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body)}},
-    timeout: {NODE_TIMEOUT_MS}
+    timeout: {timeout_ms}
   }}, res => {{
     let data = [];
     res.on('data', c => data.push(c));
-    res.on('end', () => process.stdout.write(Buffer.concat(data)));
+    res.on('end', () => {{
+      if (!__csqSettle()) return;
+      process.stdout.write(Buffer.concat(data));
+    }});
   }});
-  req.on('timeout', () => {{ req.destroy(); process.stderr.write('timeout'); process.exit(1); }});
-  req.on('error', e => {{ process.stderr.write(e.message); process.exit(1); }});
+{prelude}  req.on('timeout', () => {{ req.destroy(); __csqFail('timeout'); }});
+  req.on('error', e => __csqFail(e.message));
   req.write(body);
   req.end();
 }});
@@ -1019,26 +1871,30 @@ pub fn post_json_node(url: &str, body: &str) -> Result<Vec<u8>, String> {
 
     let runtime = find_js_runtime()?;
     let url_literal = js_url_literal(url)?;
-    let script = build_post_script(&url_literal);
+    let script = build_post_script(&url_literal, NODE_TIMEOUT_MS);
 
-    let mut child = std::process::Command::new(&runtime)
-        .arg("-e")
-        .arg(&script)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{runtime} spawn failed: {e}"))?;
-
-    // Write body to stdin, then close it.
-    write_stdin_or_reap(&mut child, body.as_bytes())?;
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("{runtime} wait failed: {e}"))?;
+    let output = match run_node_script(&runtime, &script, body.as_bytes()) {
+        Ok(output) => output,
+        Err(e) if e == ERR_NODE_WAIT_TIMEOUT => {
+            return Err(ERR_NODE_WAIT_TIMEOUT.to_string());
+        }
+        Err(e) if e == ERR_NODE_HTTP_OUTCOME_UNKNOWN => {
+            return Err(ERR_NODE_HTTP_OUTCOME_UNKNOWN.to_string());
+        }
+        Err(other) => {
+            tracing::warn!(
+                error_kind = "node_transport_failed",
+                outcome_class = transport_class_tag(other),
+                "node http transport: runtime failure classified as the shared \
+                 transport constant"
+            );
+            return Err(ERR_NODE_TRANSPORT.to_string());
+        }
+    };
 
     if !output.status.success() {
-        return Err(node_failure_error(&output.stderr));
+        log_node_failure(&output.stderr);
+        return Err(ERR_NODE_TRANSPORT.to_string());
     }
 
     Ok(output.stdout)
@@ -1049,7 +1905,8 @@ pub fn post_json_node(url: &str, body: &str) -> Result<Vec<u8>, String> {
 /// See [`build_post_script`] for the composition-test rationale (NIT-2)
 /// and the `process.on('uncaughtException', ...)` guard this script
 /// shares (LOW-2 follow-up).
-fn build_post_with_date_script(url_literal: &str) -> String {
+fn build_post_with_date_script(url_literal: &str, timeout_ms: u64) -> String {
+    let prelude = node_request_timeout_prelude(timeout_ms);
     format!(
         r#"
 process.on('uncaughtException', () => {{ process.stderr.write('script_error'); process.exit(1); }});
@@ -1061,12 +1918,13 @@ process.stdin.on('end', () => {{
   const req = https.request(url, {{
     method: 'POST',
     headers: {{'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body)}},
-    timeout: {NODE_TIMEOUT_MS}
+    timeout: {timeout_ms}
   }}, res => {{
     const dateHeader = res.headers['date'] || '';
     let data = [];
     res.on('data', c => data.push(c));
     res.on('end', () => {{
+      if (!__csqSettle()) return;
       // First line: `<status> <date>` (status = res.statusCode; date is
       // empty when the header is absent, but the separating space is
       // always emitted so the parser can split on the first space
@@ -1075,8 +1933,8 @@ process.stdin.on('end', () => {{
       process.stdout.write(Buffer.concat(data));
     }});
   }});
-  req.on('timeout', () => {{ req.destroy(); process.stderr.write('timeout'); process.exit(1); }});
-  req.on('error', e => {{ process.stderr.write(e.message); process.exit(1); }});
+{prelude}  req.on('timeout', () => {{ req.destroy(); __csqFail('timeout'); }});
+  req.on('error', e => __csqFail(e.message));
   req.write(body);
   req.end();
 }});
@@ -1134,9 +1992,12 @@ impl fmt::Debug for NodeHttpResponse {
 fn parse_status_date_line(line: &str) -> Result<(u16, Option<String>), String> {
     let mut parts = line.splitn(2, ' ');
     let status_str = parts.next().unwrap_or("");
-    let status: u16 = status_str
-        .parse()
-        .map_err(|_| format!("invalid status in node output: {status_str:?}"))?;
+    // Shared constant, not the offending text: the classifier works by
+    // equality, and the raw status line is server-controlled. The caller
+    // logs a fixed `node_response_malformed` frame tag instead.
+    let Ok(status) = status_str.parse::<u16>() else {
+        return Err(ERR_NODE_TRANSPORT.to_string());
+    };
     let date = match parts.next() {
         Some(rest) if !rest.is_empty() => Some(rest.to_string()),
         _ => None,
@@ -1186,35 +2047,57 @@ pub fn post_json_node_with_date(url: &str, body: &str) -> Result<NodeHttpRespons
 
     let runtime = find_js_runtime()?;
     let url_literal = js_url_literal(url)?;
-    let script = build_post_with_date_script(&url_literal);
+    let script = build_post_with_date_script(&url_literal, NODE_TIMEOUT_MS);
 
-    let mut child = std::process::Command::new(&runtime)
-        .arg("-e")
-        .arg(&script)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{runtime} spawn failed: {e}"))?;
-
-    write_stdin_or_reap(&mut child, body.as_bytes())?;
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("{runtime} wait failed: {e}"))?;
+    let output = match run_node_script(&runtime, &script, body.as_bytes()) {
+        Ok(output) => output,
+        Err(e) if e == ERR_NODE_WAIT_TIMEOUT => {
+            return Err(ERR_NODE_WAIT_TIMEOUT.to_string());
+        }
+        Err(e) if e == ERR_NODE_HTTP_OUTCOME_UNKNOWN => {
+            return Err(ERR_NODE_HTTP_OUTCOME_UNKNOWN.to_string());
+        }
+        Err(other) => {
+            tracing::warn!(
+                error_kind = "node_transport_failed",
+                outcome_class = transport_class_tag(other),
+                "node http transport: runtime failure classified as the shared \
+                 transport constant"
+            );
+            return Err(ERR_NODE_TRANSPORT.to_string());
+        }
+    };
 
     if !output.status.success() {
-        return Err(node_failure_error(&output.stderr));
+        log_node_failure(&output.stderr);
+        return Err(ERR_NODE_TRANSPORT.to_string());
     }
 
     let stdout = output.stdout;
-    let newline_pos = stdout
-        .iter()
-        .position(|&b| b == b'\n')
-        .ok_or("missing status/date line in node output")?;
-    let first_line = std::str::from_utf8(&stdout[..newline_pos])
-        .map_err(|_| "invalid status/date line".to_string())?;
-    let (status, date) = parse_status_date_line(first_line)?;
+    let Some(newline_pos) = stdout.iter().position(|&b| b == b'\n') else {
+        tracing::warn!(
+            error_kind = "node_response_malformed",
+            frame = "status_date_line",
+            "node http transport: the response did not start with a status/date line"
+        );
+        return Err(ERR_NODE_TRANSPORT.to_string());
+    };
+    let Ok(first_line) = std::str::from_utf8(&stdout[..newline_pos]) else {
+        tracing::warn!(
+            error_kind = "node_response_malformed",
+            frame = "status_date_line_utf8",
+            "node http transport: the status/date line was not valid UTF-8"
+        );
+        return Err(ERR_NODE_TRANSPORT.to_string());
+    };
+    let Ok((status, date)) = parse_status_date_line(first_line) else {
+        tracing::warn!(
+            error_kind = "node_response_malformed",
+            frame = "status_date_line_parse",
+            "node http transport: the status/date line was missing or non-numeric"
+        );
+        return Err(ERR_NODE_TRANSPORT.to_string());
+    };
     let body = stdout[newline_pos + 1..].to_vec();
     Ok(NodeHttpResponse { status, body, date })
 }
@@ -1262,7 +2145,12 @@ fn bearer_stdin_payload(token: &str, extra_headers: &[(&str, &str)]) -> Result<S
     }
     let payload =
         serde_json::json!({ "token": token, "extra": serde_json::Value::Object(extra_map) });
-    let encoded = serde_json::to_string(&payload).map_err(|_| ERR_ENCODE_FAILED.to_string())?;
+    // Shared-constant rejection in a `return Err(ERR_...)` shape so the
+    // poller's structural oracle can see it (a `.map_err(..)?` form hides
+    // the constant behind the `?`).
+    let Ok(encoded) = serde_json::to_string(&payload) else {
+        return Err(ERR_ENCODE_FAILED.to_string());
+    };
     #[cfg(debug_assertions)]
     debug_assert!(
         encoded.len() <= BEARER_STDIN_PAYLOAD_MAX_BYTES,
@@ -1290,7 +2178,8 @@ fn bearer_stdin_payload(token: &str, extra_headers: &[(&str, &str)]) -> Result<S
 /// target). The handler bounds that escape hatch, and any future one,
 /// to the same fixed-vocabulary `script_error` literal every other
 /// error path in this module already uses.
-fn build_get_bearer_script(url_literal: &str) -> String {
+fn build_get_bearer_script(url_literal: &str, timeout_ms: u64) -> String {
+    let prelude = node_request_timeout_prelude(timeout_ms);
     format!(
         r#"
 process.on('uncaughtException', () => {{ process.stderr.write('script_error'); process.exit(1); }});
@@ -1304,19 +2193,20 @@ process.stdin.on('end', () => {{
   const req = https.request(url, {{
     method: 'GET',
     headers,
-    timeout: {NODE_TIMEOUT_MS}
+    timeout: {timeout_ms}
   }}, res => {{
     let data = [];
     res.on('data', c => data.push(c));
     res.on('end', () => {{
+      if (!__csqSettle()) return;
       const body = Buffer.concat(data);
       // First line of stdout: status code. Rest: body.
       process.stdout.write(res.statusCode + '\n');
       process.stdout.write(body);
     }});
   }});
-  req.on('timeout', () => {{ req.destroy(); process.stderr.write('timeout'); process.exit(1); }});
-  req.on('error', e => {{ process.stderr.write(e.message); process.exit(1); }});
+{prelude}  req.on('timeout', () => {{ req.destroy(); __csqFail('timeout'); }});
+  req.on('error', e => __csqFail(e.message));
   req.end();
 }});
 "#
@@ -1399,37 +2289,57 @@ pub fn get_bearer_node(
     let runtime = find_js_runtime()?;
     let url_literal = js_url_literal(url)?;
     let payload_json = bearer_stdin_payload(token, extra_headers)?;
-    let script = build_get_bearer_script(&url_literal);
+    let script = build_get_bearer_script(&url_literal, NODE_TIMEOUT_MS);
 
-    let mut child = std::process::Command::new(&runtime)
-        .arg("-e")
-        .arg(&script)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{runtime} spawn failed: {e}"))?;
-
-    write_stdin_or_reap(&mut child, payload_json.as_bytes())?;
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("{runtime} wait failed: {e}"))?;
+    let output = match run_node_script(&runtime, &script, payload_json.as_bytes()) {
+        Ok(output) => output,
+        Err(e) if e == ERR_NODE_WAIT_TIMEOUT => {
+            return Err(ERR_NODE_WAIT_TIMEOUT.to_string());
+        }
+        Err(e) if e == ERR_NODE_HTTP_OUTCOME_UNKNOWN => {
+            return Err(ERR_NODE_HTTP_OUTCOME_UNKNOWN.to_string());
+        }
+        Err(other) => {
+            tracing::warn!(
+                error_kind = "node_transport_failed",
+                outcome_class = transport_class_tag(other),
+                "node http transport: runtime failure classified as the shared \
+                 transport constant"
+            );
+            return Err(ERR_NODE_TRANSPORT.to_string());
+        }
+    };
 
     if !output.status.success() {
-        return Err(node_failure_error(&output.stderr));
+        log_node_failure(&output.stderr);
+        return Err(ERR_NODE_TRANSPORT.to_string());
     }
 
     let stdout = output.stdout;
-    let newline_pos = stdout
-        .iter()
-        .position(|&b| b == b'\n')
-        .ok_or("missing status line in node output")?;
-    let status_str =
-        std::str::from_utf8(&stdout[..newline_pos]).map_err(|_| "invalid status line")?;
-    let status: u16 = status_str
-        .parse()
-        .map_err(|_| format!("invalid status code: {status_str}"))?;
+    let Some(newline_pos) = stdout.iter().position(|&b| b == b'\n') else {
+        tracing::warn!(
+            error_kind = "node_response_malformed",
+            frame = "status_line",
+            "node http transport: the response did not start with a status line"
+        );
+        return Err(ERR_NODE_TRANSPORT.to_string());
+    };
+    let Ok(status_str) = std::str::from_utf8(&stdout[..newline_pos]) else {
+        tracing::warn!(
+            error_kind = "node_response_malformed",
+            frame = "status_line_utf8",
+            "node http transport: the status line was not valid UTF-8"
+        );
+        return Err(ERR_NODE_TRANSPORT.to_string());
+    };
+    let Ok(status) = status_str.parse::<u16>() else {
+        tracing::warn!(
+            error_kind = "node_response_malformed",
+            frame = "status_code",
+            "node http transport: the status line was not a numeric status code"
+        );
+        return Err(ERR_NODE_TRANSPORT.to_string());
+    };
     let body = stdout[newline_pos + 1..].to_vec();
 
     Ok((status, body))
@@ -1444,7 +2354,8 @@ pub fn get_bearer_node(
 /// [`get_bearer_node_with_retry_after`]'s doc for why that line's
 /// content is restricted to `/^\d+$/` (or empty) INSIDE this script,
 /// before it ever reaches Rust.
-fn build_get_bearer_with_retry_after_script(url_literal: &str) -> String {
+fn build_get_bearer_with_retry_after_script(url_literal: &str, timeout_ms: u64) -> String {
+    let prelude = node_request_timeout_prelude(timeout_ms);
     format!(
         r#"
 process.on('uncaughtException', () => {{ process.stderr.write('script_error'); process.exit(1); }});
@@ -1458,11 +2369,12 @@ process.stdin.on('end', () => {{
   const req = https.request(url, {{
     method: 'GET',
     headers,
-    timeout: {NODE_TIMEOUT_MS}
+    timeout: {timeout_ms}
   }}, res => {{
     let data = [];
     res.on('data', c => data.push(c));
     res.on('end', () => {{
+      if (!__csqSettle()) return;
       const body = Buffer.concat(data);
       // retry-after is SERVER-controlled. Emit it ONLY when it is a
       // delay-seconds value (RFC 9110 10.2.3, digits only) -- an
@@ -1480,8 +2392,8 @@ process.stdin.on('end', () => {{
       process.stdout.write(body);
     }});
   }});
-  req.on('timeout', () => {{ req.destroy(); process.stderr.write('timeout'); process.exit(1); }});
-  req.on('error', e => {{ process.stderr.write(e.message); process.exit(1); }});
+{prelude}  req.on('timeout', () => {{ req.destroy(); __csqFail('timeout'); }});
+  req.on('error', e => __csqFail(e.message));
   req.end();
 }});
 "#
@@ -1579,44 +2491,75 @@ pub fn get_bearer_node_with_retry_after(
     let runtime = find_js_runtime()?;
     let url_literal = js_url_literal(url)?;
     let payload_json = bearer_stdin_payload(token, extra_headers)?;
-    let script = build_get_bearer_with_retry_after_script(&url_literal);
+    let script = build_get_bearer_with_retry_after_script(&url_literal, NODE_TIMEOUT_MS);
 
-    let mut child = std::process::Command::new(&runtime)
-        .arg("-e")
-        .arg(&script)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{runtime} spawn failed: {e}"))?;
-
-    write_stdin_or_reap(&mut child, payload_json.as_bytes())?;
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("{runtime} wait failed: {e}"))?;
+    let output = match run_node_script(&runtime, &script, payload_json.as_bytes()) {
+        Ok(output) => output,
+        Err(e) if e == ERR_NODE_WAIT_TIMEOUT => {
+            return Err(ERR_NODE_WAIT_TIMEOUT.to_string());
+        }
+        Err(e) if e == ERR_NODE_HTTP_OUTCOME_UNKNOWN => {
+            return Err(ERR_NODE_HTTP_OUTCOME_UNKNOWN.to_string());
+        }
+        Err(other) => {
+            tracing::warn!(
+                error_kind = "node_transport_failed",
+                outcome_class = transport_class_tag(other),
+                "node http transport: runtime failure classified as the shared \
+                 transport constant"
+            );
+            return Err(ERR_NODE_TRANSPORT.to_string());
+        }
+    };
 
     if !output.status.success() {
-        return Err(node_failure_error(&output.stderr));
+        log_node_failure(&output.stderr);
+        return Err(ERR_NODE_TRANSPORT.to_string());
     }
 
     let stdout = output.stdout;
-    let first_nl = stdout
-        .iter()
-        .position(|&b| b == b'\n')
-        .ok_or("missing status line in node output")?;
-    let status_str = std::str::from_utf8(&stdout[..first_nl]).map_err(|_| "invalid status line")?;
-    let status: u16 = status_str
-        .parse()
-        .map_err(|_| format!("invalid status code: {status_str}"))?;
+    let Some(first_nl) = stdout.iter().position(|&b| b == b'\n') else {
+        tracing::warn!(
+            error_kind = "node_response_malformed",
+            frame = "status_line",
+            "node http transport: the response did not start with a status line"
+        );
+        return Err(ERR_NODE_TRANSPORT.to_string());
+    };
+    let Ok(status_str) = std::str::from_utf8(&stdout[..first_nl]) else {
+        tracing::warn!(
+            error_kind = "node_response_malformed",
+            frame = "status_line_utf8",
+            "node http transport: the status line was not valid UTF-8"
+        );
+        return Err(ERR_NODE_TRANSPORT.to_string());
+    };
+    let Ok(status) = status_str.parse::<u16>() else {
+        tracing::warn!(
+            error_kind = "node_response_malformed",
+            frame = "status_code",
+            "node http transport: the status line was not a numeric status code"
+        );
+        return Err(ERR_NODE_TRANSPORT.to_string());
+    };
 
     let rest = &stdout[first_nl + 1..];
-    let second_nl = rest
-        .iter()
-        .position(|&b| b == b'\n')
-        .ok_or("missing retry-after line in node output")?;
-    let retry_after_str =
-        std::str::from_utf8(&rest[..second_nl]).map_err(|_| "invalid retry-after line")?;
+    let Some(second_nl) = rest.iter().position(|&b| b == b'\n') else {
+        tracing::warn!(
+            error_kind = "node_response_malformed",
+            frame = "retry_after_line",
+            "node http transport: the response did not carry a retry-after line"
+        );
+        return Err(ERR_NODE_TRANSPORT.to_string());
+    };
+    let Ok(retry_after_str) = std::str::from_utf8(&rest[..second_nl]) else {
+        tracing::warn!(
+            error_kind = "node_response_malformed",
+            frame = "retry_after_line_utf8",
+            "node http transport: the retry-after line was not valid UTF-8"
+        );
+        return Err(ERR_NODE_TRANSPORT.to_string());
+    };
     // Empty is the script's explicit "absent or unparseable" sentinel.
     // An empty string also fails `str::parse::<u64>`, so folding this
     // into the parse-failure branch below would behave identically --
@@ -1859,7 +2802,7 @@ mod tests {
     // ── LOW: zombie process on stdin-write failure ──────────────
 
     #[test]
-    fn write_stdin_or_reap_reaps_the_child_on_write_failure() {
+    fn write_stdin_bounded_reaps_the_child_on_write_failure() {
         // Regression test (round-2 redteam LOW finding): a bare `?` on
         // the stdin write left `child` dropped without ever being
         // `.wait()`-ed, leaking a zombie process entry on Unix.
@@ -1881,8 +2824,8 @@ mod tests {
         // stderr. Reporting the write error discarded that message, and which
         // of the two strings an operator saw depended on scheduling.
         //
-        // `write_stdin_or_reap` now returns `Ok(())` on EPIPE so the caller's
-        // `wait_with_output()` reaps the child and surfaces its own diagnostic.
+        // `write_stdin_bounded` now returns `Ok(())` on EPIPE so the caller's
+        // `wait_for_node_child` reaps the child and surfaces its own diagnostic.
         // What this test pins is therefore the CONTRACT, in both directions:
         //   - EPIPE          → `Ok(())`, and the child is still reapable by the
         //                      caller (`try_wait` must not error).
@@ -1900,16 +2843,20 @@ mod tests {
         // Give the child time to actually exit and close its stdin fd.
         std::thread::sleep(std::time::Duration::from_millis(300));
 
-        let result = write_stdin_or_reap(&mut child, b"payload after child already exited");
+        let result = write_stdin_bounded(
+            &mut child,
+            b"payload after child already exited",
+            NODE_CHILD_WAIT_DEADLINE,
+        );
         assert!(
             result.is_ok(),
-            "EPIPE must fall through so the caller's wait_with_output() can \
+            "EPIPE must fall through so the caller's wait_for_node_child can \
              surface the child's OWN stderr; got {result:?}"
         );
 
-        // The child must still be reapable by the caller — `wait_with_output`
-        // is what every production call site does next, and it is what closes
-        // the zombie window on this path.
+        // The child must still be reapable by the caller —
+        // `wait_for_node_child` is what every production call site does
+        // next, and it is what closes the zombie window on this path.
         let post = child.wait();
         assert!(
             post.is_ok(),
@@ -1929,12 +2876,10 @@ mod tests {
             .expect("spawn must succeed");
         drop(child2.stdin.take());
 
-        let result2 = write_stdin_or_reap(&mut child2, b"payload");
+        let result2 = write_stdin_bounded(&mut child2, b"payload", NODE_CHILD_WAIT_DEADLINE);
         assert!(
-            result2
-                .as_ref()
-                .is_err_and(|e| e.contains("failed to open stdin")),
-            "a missing stdin handle must be the missing-handle error variant: {result2:?}"
+            result2.as_ref().is_err_and(|e| *e == ERR_NODE_TRANSPORT),
+            "a missing stdin handle must be the shared transport constant: {result2:?}"
         );
         // `try_wait` returning `Ok(Some(_))` immediately — on a child scripted
         // to live 60s — is only possible because this function already killed
@@ -1943,6 +2888,566 @@ mod tests {
         assert!(
             matches!(post2, Ok(Some(_))),
             "a 60s child must already be reaped after the missing-handle branch: {post2:?}"
+        );
+    }
+
+    /// A child that never reads its stdin must not hang the write: the
+    /// payload is larger than any kernel pipe buffer, so `write_all` blocks
+    /// after the pipe fills. Before the bounded writer this call never
+    /// returned; with it, the budget expires, the child's group is killed,
+    /// and the fixed timeout class comes back. Deterministic: the write is
+    /// guaranteed to block because the child never reads, and the expiry is
+    /// enforced by the budget, not measured latency.
+    #[test]
+    fn write_stdin_bounded_times_out_when_the_child_never_reads_a_full_pipe() {
+        let runtime = find_js_runtime().expect("test host must have node or bun on PATH");
+        let mut child = std::process::Command::new(&runtime)
+            .arg("-e")
+            .arg("setInterval(()=>{},1000);")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn must succeed");
+        let payload = vec![b'x'; 4 * 1024 * 1024];
+        let started = std::time::Instant::now();
+        let result =
+            write_stdin_bounded(&mut child, &payload, std::time::Duration::from_millis(300));
+        let elapsed = started.elapsed();
+        assert!(
+            result.as_ref().is_err_and(|e| *e == ERR_NODE_WAIT_TIMEOUT),
+            "a wedged stdin write must return the fixed timeout class: {result:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the write must be bounded by the budget, took {elapsed:?}"
+        );
+        // Killed and reaped here, so nothing outlives the call.
+        let post = child.try_wait();
+        assert!(
+            matches!(post, Ok(Some(_))),
+            "the wedged child must already be reaped: {post:?}"
+        );
+    }
+
+    // ── Parent-side child deadline ──────────────────────────────
+    //
+    // The in-script `NODE_TIMEOUT_MS` only bounds the request itself.
+    // A child wedged outside it (startup, DNS, stuck runtime) used to
+    // block the parent forever in `wait_with_output()`, and the daemon
+    // refresher awaits these calls. These rows pin the parent-side
+    // bound: a wedged child is killed by PROCESS GROUP and reaped at
+    // the deadline, flooded pipes drain concurrently, and the success
+    // path still returns the child's bytes verbatim.
+
+    /// Spawns a `sh` stub with piped stdio in its OWN process group,
+    /// matching the invariant [`spawn_node_script`] establishes for
+    /// production children.
+    #[cfg(unix)]
+    fn spawn_unix_stub(args: &[&str]) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new("sh")
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("stub spawn must succeed")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_node_child_closes_stdin_and_returns_body_bytes() {
+        // `cat` exits only on stdin EOF, so this row fails (by hitting
+        // the deadline) if the helper ever stops dropping the stdin
+        // handle the way `wait_with_output` does. The byte equality
+        // pins the success-path contract: no re-encoding, no trim.
+        let mut child = spawn_unix_stub(&["-c", r#"cat >/dev/null; printf '200\nhello-body'"#]);
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin is piped")
+            .write_all(b"{\"payload\":\"x\"}")
+            .expect("write to stub stdin must succeed");
+
+        let output = wait_for_node_child(child, Duration::from_secs(10))
+            .expect("a well-behaved stub must finish well inside the deadline");
+
+        assert!(output.status.success(), "stub must exit 0: {output:?}");
+        assert_eq!(output.stdout, b"200\nhello-body");
+        assert!(output.stderr.is_empty(), "stub wrote no stderr");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_node_child_kills_and_reaps_a_wedged_child_at_the_deadline() {
+        // RED without the fix: the old `child.wait_with_output()` blocks
+        // on this stub forever (it sleeps 600 s and reads no stdin), so
+        // this test only ever terminates once the parent deadline kills
+        // and reaps the child. The recorded pid proves both: `kill(pid,
+        // 0)` answers 0 for a zombie, so ESRCH means the child was
+        // actually reaped, not merely killed.
+        let pidfile =
+            std::env::temp_dir().join(format!("csq-node-wait-{}-wedged.pid", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+        let pidfile_arg = pidfile.to_string_lossy().into_owned();
+        let child = spawn_unix_stub(&[
+            "-c",
+            r#"printf '%s' "$$" > "$1"; exec sleep 600"#,
+            "sh",
+            pidfile_arg.as_str(),
+        ]);
+
+        let deadline = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let result = wait_for_node_child(child, deadline);
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            result.err(),
+            Some(ERR_NODE_WAIT_TIMEOUT),
+            "a wedged child must surface the fixed-vocabulary timeout error"
+        );
+        // A generous ceiling, not a latency measurement: it distinguishes
+        // "returned at the deadline" from "returned after the stub's
+        // 600 s sleep".
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "deadline not enforced: call took {elapsed:?}"
+        );
+
+        let pid: libc::pid_t = std::fs::read_to_string(&pidfile)
+            .expect("stub must record its pid before sleeping")
+            .trim()
+            .parse()
+            .expect("recorded pid must be numeric");
+
+        // SAFETY: signal 0 performs the existence/permission check only
+        // and touches no memory.
+        let alive = unsafe { libc::kill(pid, 0) };
+        assert_eq!(
+            alive, -1,
+            "process {pid} survived the deadline kill (kill(pid, 0) == 0)"
+        );
+        let err = std::io::Error::last_os_error();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ESRCH),
+            "process {pid} must be GONE and REAPED after the timeout path: {err}"
+        );
+        let _ = std::fs::remove_file(&pidfile);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_node_child_drains_flooded_stdout_and_stderr_concurrently() {
+        // RED with a SEQUENTIAL reader: the stub fills stderr past the
+        // pipe buffer BEFORE closing stdout. A parent that reads stdout
+        // to EOF first blocks on the child, the child blocks on the full
+        // stderr pipe, and neither ever moves. Concurrent drain lets the
+        // stub finish and exit, so this row returns Ok well inside the
+        // deadline with both streams intact.
+        let child = spawn_unix_stub(&[
+            "-c",
+            "head -c 1048576 /dev/zero >&2; head -c 1048576 /dev/zero; printf tail",
+        ]);
+
+        let output = wait_for_node_child(child, Duration::from_secs(10))
+            .expect("flooded pipes must drain concurrently, not deadlock");
+
+        assert!(output.status.success(), "stub must exit 0: {output:?}");
+        assert_eq!(output.stderr.len(), 1_048_576, "all stderr bytes drained");
+        assert_eq!(
+            output.stdout.len(),
+            1_048_576 + 4,
+            "all stdout bytes drained"
+        );
+        assert!(
+            output.stdout.ends_with(b"tail"),
+            "stdout tail must arrive after the flood"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_node_child_bounds_a_flooding_child_at_the_deadline() {
+        // The deadline row's second shape: a child that floods BOTH
+        // pipes and then stays alive forever must still return at the
+        // injected deadline. RED without the parent deadline: the old
+        // `wait_with_output()` drains concurrently but has no time
+        // bound, so this row hangs for the stub's 600 s sleep. The
+        // flood also fails a sequential drain, which would block on the
+        // stderr pipe before the wait loop ever runs.
+        //
+        // Classification: this stub HAS written stdout (1 MiB) before the
+        // deadline, so the kill is reported as the round-2 M2
+        // possibly-committed class, NOT the plain timeout. The empty-stdout
+        // shape is the wedged row above, which keeps asserting
+        // ERR_NODE_WAIT_TIMEOUT.
+        let child = spawn_unix_stub(&[
+            "-c",
+            "head -c 1048576 /dev/zero >&2; head -c 1048576 /dev/zero; exec sleep 600",
+        ]);
+
+        let deadline = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let result = wait_for_node_child(child, deadline);
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            result.err(),
+            Some(ERR_NODE_HTTP_OUTCOME_UNKNOWN),
+            "a flooding-but-alive child that already emitted stdout must be \
+             classified as a possibly-committed outcome at the parent deadline"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "deadline not enforced under flood: call took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn transport_warning_tags_are_fixed_vocabulary() {
+        // Round-2 security L1: the transport warnings log these tags, never
+        // the `io::Error` Display text. The mapping itself is pinned here so
+        // a future edit cannot widen a tag into free-form text without
+        // changing this row.
+        assert_eq!(
+            io_error_kind(&std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+            "broken_pipe"
+        );
+        assert_eq!(
+            io_error_kind(&std::io::Error::from(std::io::ErrorKind::NotFound)),
+            "not_found"
+        );
+        assert_eq!(
+            io_error_kind(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            "permission_denied"
+        );
+        assert_eq!(transport_class_tag(ERR_NODE_TRANSPORT), "node_transport");
+        assert_eq!(
+            transport_class_tag(ERR_NODE_WAIT_TIMEOUT),
+            "node_wait_timeout"
+        );
+        assert_eq!(
+            transport_class_tag(ERR_NODE_HTTP_OUTCOME_UNKNOWN),
+            "node_outcome_unknown"
+        );
+        assert_eq!(
+            transport_class_tag(ERR_NODE_DRAIN_TIMEOUT),
+            "node_drain_timeout"
+        );
+        // Any other string — a future constant this mapping was not updated
+        // for — falls back to a fixed tag, never to the input itself.
+        assert_eq!(
+            transport_class_tag("an unvetted future string"),
+            "other_fixed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_node_child_kills_the_whole_process_group_not_only_the_leader() {
+        // Round-2 correctness M4: the existing wedged/flood rows use
+        // `exec sleep`, so the DIRECT child is the sleeper and a bare
+        // `child.kill()` satisfies every assertion — deleting the group
+        // kill reds nothing. This row puts the stdout holder in a
+        // GRANDCHILD: `sh -c 'sleep 600 & ...; wait'`. A direct kill of
+        // the shell leaves `sleep` alive and holding the pipe.
+        //
+        // RED without `kill_child_process_group`: the grandchild stays a
+        // live `sleep 600`, so the bounded liveness poll below never sees
+        // ESRCH and the assertion fails (bounded red, no hang — the drain
+        // budget from the same fix still returns the call).
+        //
+        // Event-synchronised (round-2 correctness L-a): the stub writes the
+        // pidfile AND then a readiness marker BEFORE the deadline starts, and
+        // this row waits for that marker first. Previously both the pidfile
+        // write and the grandchild fork raced a 200 ms deadline, so under
+        // load the shell could be killed before `printf` ran and the pidfile
+        // read panicked — a flake in a row that is otherwise a genuine
+        // discriminator. The deadline still governs the call itself: after
+        // readiness the shell is parked in `wait` with the grandchild holding
+        // the pipe, so the call must time out and the group kill is what
+        // releases it.
+        let pidfile =
+            std::env::temp_dir().join(format!("csq-node-wait-{}-group.pid", std::process::id()));
+        let readyfile =
+            std::env::temp_dir().join(format!("csq-node-wait-{}-group.ready", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+        let _ = std::fs::remove_file(&readyfile);
+        let pidfile_arg = pidfile.to_string_lossy().into_owned();
+        let readyfile_arg = readyfile.to_string_lossy().into_owned();
+        let child = spawn_unix_stub(&[
+            "-c",
+            r#"sleep 600 & printf '%s' "$!" > "$1"; printf ready > "$2"; wait"#,
+            "sh",
+            pidfile_arg.as_str(),
+            readyfile_arg.as_str(),
+        ]);
+
+        // Bounded readiness wait. It bounds THIS row's own wait, not the
+        // production call's: the call below still receives the short
+        // deadline, so the kill path under test is unchanged.
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !readyfile.exists() && std::time::Instant::now() < ready_deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let deadline = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let result =
+            wait_for_node_child_with_drain_budget(child, deadline, Duration::from_millis(500));
+        let elapsed = started.elapsed();
+
+        // Checked AFTER the call reaped/killed the group: an unready stub
+        // would otherwise leak a 600 s sleeper.
+        assert!(
+            readyfile.exists(),
+            "the stub must signal readiness (pidfile written, grandchild \
+             holding the pipe) before the deadline starts"
+        );
+
+        assert_eq!(
+            result.err(),
+            Some(ERR_NODE_WAIT_TIMEOUT),
+            "the shell writes no stdout, so the deadline class is the plain timeout"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "deadline not enforced with a grandchild holding the pipe: call took {elapsed:?}"
+        );
+
+        let grandchild: libc::pid_t = std::fs::read_to_string(&pidfile)
+            .expect("stub must record the background sleeper's pid")
+            .trim()
+            .parse()
+            .expect("recorded pid must be numeric");
+
+        // Bounded poll for ESRCH: SIGKILL is asynchronous and a zombie
+        // answers `kill(pid, 0)` until its new parent (launchd/init)
+        // reaps it. Without the group kill this never goes away — the
+        // sleeper is alive for 600 s.
+        let mut gone = false;
+        for _ in 0..100 {
+            // SAFETY: signal 0 performs the existence/permission check only.
+            let rc = unsafe { libc::kill(grandchild, 0) };
+            if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if !gone {
+            // Clean up unconditionally so a RED cannot leak a 600 s sleeper.
+            // SAFETY: signalling our own recorded grandchild.
+            unsafe {
+                libc::kill(grandchild, libc::SIGKILL);
+            }
+        }
+        assert!(
+            gone,
+            "grandchild {grandchild} survived the deadline: the kill did not reach the \
+             process group, only the leader"
+        );
+        let _ = std::fs::remove_file(&pidfile);
+        let _ = std::fs::remove_file(&readyfile);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_node_child_bounds_the_post_exit_drain() {
+        // Round-2 correctness L2: the leader exits immediately, but a
+        // grandchild left in its group holds stdout and stderr open. The
+        // success path's reader joins used to be unbounded, so this row
+        // would only return when the sleeper exits (600 s): RED is a HANG.
+        // The RED run quoted in the review shortened the sleeper to 15 s
+        // and ignored the injected budget (fixed 600 s recv): the call
+        // returned after 15.01 s and this row failed its class + elapsed
+        // assertions. With the bound, the call returns inside the injected
+        // budget with the possibly-committed class, because the complete
+        // body may be sitting unread in the reader's buffer.
+        let pidfile =
+            std::env::temp_dir().join(format!("csq-node-drain-{}-group.pid", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+        let pidfile_arg = pidfile.to_string_lossy().into_owned();
+        let child = spawn_unix_stub(&[
+            "-c",
+            r#"sleep 600 & printf '%s' "$!" > "$1""#,
+            "sh",
+            pidfile_arg.as_str(),
+        ]);
+
+        let started = std::time::Instant::now();
+        let result = wait_for_node_child_with_drain_budget(
+            child,
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            result.err(),
+            Some(ERR_NODE_HTTP_OUTCOME_UNKNOWN),
+            "a pipe held open by a descendant must bound the post-exit drain, and \
+             an undrained stdout is a possibly-committed outcome, not a plain failure"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the post-exit drain must be bounded, took {elapsed:?}"
+        );
+
+        let grandchild: libc::pid_t = std::fs::read_to_string(&pidfile)
+            .expect("stub must record the background sleeper's pid")
+            .trim()
+            .parse()
+            .expect("recorded pid must be numeric");
+        // The group-kill path is not taken on the success path, so the
+        // sleeper is still alive; clean it up.
+        // SAFETY: signalling our own recorded grandchild.
+        unsafe {
+            libc::kill(grandchild, libc::SIGKILL);
+        }
+        let _ = std::fs::remove_file(&pidfile);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_node_child_preserves_nonzero_exit_for_the_caller_to_classify() {
+        // The helper must not turn a non-zero exit into an Err: the
+        // callers classify it through `node_failure_error`, exactly as
+        // they did with `wait_with_output`. Stderr bytes stay verbatim
+        // here; redaction happens in `node_failure_error`.
+        let child = spawn_unix_stub(&["-c", "printf boom >&2; exit 3"]);
+        let output = wait_for_node_child(child, Duration::from_secs(10))
+            .expect("a non-zero exit is still a completed wait");
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stderr, b"boom");
+    }
+
+    // ── Total in-script request timer (round-2 M2) ──────────────
+
+    #[test]
+    fn every_node_script_builder_embeds_the_shared_total_request_timer() {
+        // Round-2 M2: `https.request`'s `timeout` option is only a
+        // socket-INACTIVITY guard, so a trickling response could outlive
+        // the parent deadline. Every builder must carry the ONE shared
+        // total-timer prelude, and every response-end handler must settle
+        // it before writing stdout.
+        //
+        // Mutation proof: deleting the `{prelude}` interpolation from any
+        // one builder fails the `contains` assertion for that builder.
+        let literal = js_url_literal("https://example.com/").expect("encoding must succeed");
+        let timer_line =
+            "const __csqTimer = setTimeout(() => { req.destroy(); __csqFail('timeout'); }, 15000);";
+        for (name, script) in [
+            (
+                "build_post_script",
+                build_post_script(&literal, NODE_TIMEOUT_MS),
+            ),
+            (
+                "build_post_with_date_script",
+                build_post_with_date_script(&literal, NODE_TIMEOUT_MS),
+            ),
+            (
+                "build_get_bearer_script",
+                build_get_bearer_script(&literal, NODE_TIMEOUT_MS),
+            ),
+            (
+                "build_get_bearer_with_retry_after_script",
+                build_get_bearer_with_retry_after_script(&literal, NODE_TIMEOUT_MS),
+            ),
+        ] {
+            assert!(
+                script.contains(timer_line),
+                "{name} must carry the TOTAL request timer (not only the \
+                 inactivity guard): {script}"
+            );
+            assert!(
+                script.contains("if (!__csqSettle()) return;"),
+                "{name}'s response-end handler must settle the timer before \
+                 writing stdout: {script}"
+            );
+            assert!(
+                !script.contains("process.stderr.write('timeout'); process.exit(1); });"),
+                "{name} must route the inactivity timeout through the shared \
+                 __csqFail path, not a second ad hoc handler: {script}"
+            );
+        }
+    }
+
+    /// Semantic proof of the total timer: a response that TRICKLES bytes
+    /// forever (never `end`s) keeps resetting the socket-INACTIVITY timer,
+    /// so only a TOTAL timer can make the script report. The built script
+    /// text is executed with only its transport module and URL swapped for
+    /// a local plain-HTTP trickle server; the timer logic itself is the
+    /// real prelude.
+    ///
+    /// RED without the total timer: the script never exits, the parent
+    /// deadline (10 s) kills it, `wait_for_node_child` returns Err, and the
+    /// `.expect` panics — a bounded red, no hang.
+    #[cfg(unix)]
+    #[test]
+    fn total_request_timer_fires_on_a_trickling_response() {
+        use std::io::Write as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let runtime = find_js_runtime().expect("test host must have node or bun on PATH");
+        let literal = js_url_literal("https://trickle.invalid/x").expect("encoding must succeed");
+        let built = build_get_bearer_script(&literal, 300);
+        let script = built
+            .replace("require('https')", "require('http')")
+            .replace(&literal, "globalThis.__CSQ_TEST_URL");
+        let harness = format!(
+            r#"
+const __http = require('http');
+const __srv = __http.createServer((req, res) => {{
+  res.writeHead(200);
+  res.write('x');
+  const __t = setInterval(() => res.write('x'), 20);
+  req.on('close', () => clearInterval(__t));
+}});
+__srv.listen(0, '127.0.0.1', () => {{
+  globalThis.__CSQ_TEST_URL = 'http://127.0.0.1:' + __srv.address().port;
+  {script}
+}});
+"#
+        );
+        let mut child = std::process::Command::new(&runtime)
+            .arg("-e")
+            .arg(&harness)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn must succeed");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin is piped")
+            .write_all(br#"{"token":"t","extra":{}}"#)
+            .expect("write to the script's stdin must succeed");
+
+        let output = wait_for_node_child_with_drain_budget(
+            child,
+            Duration::from_secs(10),
+            NODE_DRAIN_DEADLINE,
+        )
+        .expect(
+            "the in-script TOTAL timer must make a trickling request exit before \
+                     the parent deadline",
+        );
+        assert!(
+            !output.status.success(),
+            "the total-timer path must exit non-zero: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("timeout"),
+            "the script's OWN timer diagnostic must be the outcome, got {stderr:?}"
         );
     }
 
@@ -2305,7 +3810,7 @@ mod tests {
         // actual composition of the generated script text.
         let malicious = "https://evil.example/');require('child_process').execSync('id');//";
         let literal = js_url_literal(malicious).expect("encoding must succeed");
-        let script = build_post_script(&literal);
+        let script = build_post_script(&literal, NODE_TIMEOUT_MS);
         assert!(
             script.contains(&format!("new URL({literal})")),
             "script must interpolate the JSON literal verbatim: {script}"
@@ -2325,7 +3830,7 @@ mod tests {
     fn build_post_with_date_script_consumes_json_literal_not_a_hand_quoted_url() {
         let malicious = "https://evil.example/');require('child_process').execSync('id');//";
         let literal = js_url_literal(malicious).expect("encoding must succeed");
-        let script = build_post_with_date_script(&literal);
+        let script = build_post_with_date_script(&literal, NODE_TIMEOUT_MS);
         assert!(script.contains(&format!("new URL({literal})")));
         assert!(script.contains("new URL(\""));
     }
@@ -2334,7 +3839,7 @@ mod tests {
     fn build_get_bearer_script_consumes_json_literal_not_a_hand_quoted_url() {
         let malicious = "https://evil.example/');require('child_process').execSync('id');//";
         let literal = js_url_literal(malicious).expect("encoding must succeed");
-        let script = build_get_bearer_script(&literal);
+        let script = build_get_bearer_script(&literal, NODE_TIMEOUT_MS);
         assert!(script.contains(&format!("new URL({literal})")));
         assert!(script.contains("new URL(\""));
     }
@@ -2349,7 +3854,7 @@ mod tests {
         // double-quoted string token, never breaking out into script
         // structure.
         let literal = js_url_literal("https://x.example/\u{2028}").expect("encoding must succeed");
-        let script = build_post_script(&literal);
+        let script = build_post_script(&literal, NODE_TIMEOUT_MS);
         assert!(script.contains(&format!("new URL({literal})")));
     }
 
@@ -2362,9 +3867,9 @@ mod tests {
         // to catch.
         let literal = js_url_literal("https://example.com/").expect("encoding must succeed");
         for script in [
-            build_post_script(&literal),
-            build_post_with_date_script(&literal),
-            build_get_bearer_script(&literal),
+            build_post_script(&literal, NODE_TIMEOUT_MS),
+            build_post_with_date_script(&literal, NODE_TIMEOUT_MS),
+            build_get_bearer_script(&literal, NODE_TIMEOUT_MS),
         ] {
             let guard_pos = script
                 .find("process.on('uncaughtException'")
@@ -2530,7 +4035,8 @@ mod tests {
     /// than forwarded verbatim.
     #[test]
     fn build_get_bearer_with_retry_after_script_validates_header_as_digits_only() {
-        let script = build_get_bearer_with_retry_after_script("\"https://example.com/\"");
+        let script =
+            build_get_bearer_with_retry_after_script("\"https://example.com/\"", NODE_TIMEOUT_MS);
         assert!(
             script.contains(r"/^\d+$/.test(ra)"),
             "script must gate emission on a digits-only regex match: {script}"
@@ -2563,7 +4069,7 @@ mod tests {
         // correct in the script template but unpinned: reverting to
         // `{'Authorization': ..., ...extra}` (spread LAST, letting extra
         // win) previously passed the full suite unnoticed.
-        let script = build_get_bearer_script("\"https://example.com/\"");
+        let script = build_get_bearer_script("\"https://example.com/\"", NODE_TIMEOUT_MS);
         assert!(
             script.contains("{...extra, 'Authorization':"),
             "extra headers must be spread BEFORE 'Authorization' so the fixed \

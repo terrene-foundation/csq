@@ -64,7 +64,7 @@ pick_bin_dir() {
         return
     fi
 
-    if [ -d "$HOME/bin" ] && echo ":$PATH:" | grep -q ":$HOME/bin:"; then
+    if [ -d "$HOME/bin" ] && [[ ":$PATH:" == *":$HOME/bin:"* ]]; then
         echo "$HOME/bin"
     else
         echo "$HOME/.local/bin"
@@ -140,7 +140,7 @@ resolve_tag() {
     tag=$(printf '%s\n' "$tags" \
         | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$' \
         | sort -Vr \
-        | head -1)
+        | head -1)  # pipefail-ok: captured/display output only; the pipeline status is not read
 
     if [ -z "$tag" ]; then
         err "no valid semver tag found in GitHub API response"
@@ -272,7 +272,7 @@ main() {
     # is obsolete and `csq install` backs up any lingering copy.
 
     echo
-    if echo ":$PATH:" | grep -q ":$bin_dir:"; then
+    if [[ ":$PATH:" == *":$bin_dir:"* ]]; then
         info "Next steps:"
         echo "  csq --version         # verify install"
         echo "  csq doctor            # run diagnostics"

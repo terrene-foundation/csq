@@ -1,6 +1,7 @@
 //! Quota tracking — usage windows, state management, and formatting.
 
 pub mod format;
+pub mod origin;
 pub mod state;
 pub mod status;
 
@@ -434,6 +435,10 @@ pub enum PollOutcome {
 /// `CLAUDE_CONFIG_DIR`, or a terminal-scoped JSON blob.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PollerHealth {
+    /// Identity of this attempt, independent of the last successful quota
+    /// row. A failed poll must never relabel previously successful usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<origin::QuotaOrigin>,
     /// Epoch seconds of the most recent poll ATTEMPT (successful or not;
     /// a skip still counts as an attempt to observe the slot this tick).
     pub last_attempt_at: f64,

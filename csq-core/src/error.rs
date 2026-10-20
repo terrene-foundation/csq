@@ -117,6 +117,12 @@ impl From<CsqError> for String {
     fn from(e: CsqError) -> String {
         match &e {
             CsqError::Credential(CredentialError::NotFound { .. }) => format!("NOT_FOUND: {e}"),
+            CsqError::Credential(error @ CredentialError::CanonicalLockRefused { .. }) => {
+                format!(
+                    "CREDENTIALS_CANONICAL_LOCK_REFUSED: {}",
+                    error.redacted_message()
+                )
+            }
             CsqError::Credential(CredentialError::InvalidAccount(_)) => {
                 format!("INVALID_INPUT: {e}")
             }
@@ -180,6 +186,14 @@ pub enum CredentialError {
     #[error("corrupt credential file {path}: {reason}")]
     Corrupt { path: PathBuf, reason: String },
 
+    /// Canonical lock I/O refusal, distinct from malformed credential content.
+    /// Retain only the OS error kind, never an arbitrary source message.
+    #[error("canonical credential lock refused ({io_kind:?}); check lock-file permissions and its parent directory (credentials_canonical_lock_refused)")]
+    CanonicalLockRefused {
+        path: PathBuf,
+        io_kind: std::io::ErrorKind,
+    },
+
     #[error("invalid account number: {0}")]
     InvalidAccount(String),
 
@@ -239,12 +253,46 @@ pub enum CredentialError {
     /// refuses to write because this identity carries a REMOVAL tombstone
     /// (`accounts::identity_store::is_identity_removed`) — `csq logout`
     /// removed this identity's dir, and no subsequent login has cleared the
-    /// marker. Without this refusal, a refresher tick / backsync / adopt
+    /// marker. Without this refusal, a refresher tick / custodian adopt
     /// racing the logout (none of them share a lock with it) would silently
     /// RECREATE the just-removed identity dir and resurrect a logged-out
     /// credential.
     #[error("identity {uuid} was logged out — refusing to write a credential into it")]
     IdentityRemoved { uuid: String },
+
+    #[error("identity {uuid} directory is missing — log out, then log in again using the affected slot number")]
+    IdentityDirectoryMissing { uuid: String },
+
+    /// A launch refused to remove a leftover handle dir because a pid marker in it
+    /// names a live process, or cannot be read (so liveness cannot be ruled out).
+    /// Not a corrupt credential: nothing is wrong with the account, and a retry gets
+    /// a new process id and so a different dir. Carries the dir NAME only (never a
+    /// path), the marker file that decided it, and the live pid when one was read
+    /// (`None` = the marker is present but unreadable).
+    #[error("{}", handle_dir_busy_message(.dir_name, .marker, *.live_pid))]
+    HandleDirBusy {
+        dir_name: String,
+        marker: &'static str,
+        live_pid: Option<u32>,
+    },
+}
+
+/// Operator text for [`CredentialError::HandleDirBusy`]; names the marker and says to retry.
+pub fn handle_dir_busy_message(dir_name: &str, marker: &str, live_pid: Option<u32>) -> String {
+    match live_pid {
+        Some(pid) => format!(
+            "handle dir {dir_name} was left untouched: its {marker} marker names live PID {pid}, \
+             so it may still be in use. Retry the launch; a new launch gets a different \
+             process id and so a different directory. Do not stop PID {pid} unless you have \
+             confirmed it is a leftover csq process."
+        ),
+        None => format!(
+            "handle dir {dir_name} was left untouched: its {marker} marker cannot be read, \
+             so it may still be in use. Retry the launch; a new launch gets a different \
+             process id and so a different directory. If it keeps failing, inspect the \
+             marker and remove the directory by hand if it is stale."
+        ),
+    }
 }
 
 impl CredentialError {
@@ -257,6 +305,7 @@ impl CredentialError {
     pub fn error_kind_tag(&self) -> &'static str {
         match self {
             CredentialError::NotFound { .. } => "credentials_not_found",
+            CredentialError::CanonicalLockRefused { .. } => "credentials_canonical_lock_refused",
             CredentialError::Corrupt { .. } => "credentials_malformed",
             CredentialError::Io { .. } => "credentials_io",
             CredentialError::InvalidAccount(_) => "credentials_invalid_account",
@@ -264,6 +313,10 @@ impl CredentialError {
             CredentialError::RepointFailed { .. } => "credentials_repoint_failed",
             CredentialError::RepointRefusedRealFile { .. } => "credentials_repoint_refused",
             CredentialError::IdentityRemoved { .. } => "credentials_identity_removed",
+            CredentialError::IdentityDirectoryMissing { .. } => {
+                "credentials_identity_directory_missing"
+            }
+            CredentialError::HandleDirBusy { .. } => "handle_dir_busy",
         }
     }
 
@@ -339,6 +392,7 @@ impl CredentialError {
             CredentialError::NotFound { path } => {
                 format!("credential file not found: {}", redact_path(path))
             }
+            CredentialError::CanonicalLockRefused { .. } => self.to_string(),
             CredentialError::Corrupt { path, reason } => {
                 format!("corrupt credential file {}: {reason}", redact_path(path))
             }
@@ -364,6 +418,28 @@ mod credential_error_kind_tag_tests {
     use std::collections::HashSet;
     use std::io;
     use std::path::PathBuf;
+
+    #[test]
+    fn codex_canonical_lock_refusal_has_its_own_diagnostic_tag() {
+        let error = CredentialError::CanonicalLockRefused {
+            path: PathBuf::from("/private/canonical.lock"),
+            io_kind: io::ErrorKind::PermissionDenied,
+        };
+        assert_eq!(error.error_kind_tag(), "credentials_canonical_lock_refused");
+        let text = error.redacted_message();
+        assert!(text.contains("PermissionDenied"), "{text}");
+        assert!(
+            text.contains("permissions and its parent directory"),
+            "{text}"
+        );
+        assert!(!text.contains("corrupt"), "{text}");
+        assert!(!text.contains("/private"), "{text}");
+        let malformed = CredentialError::Corrupt {
+            path: PathBuf::from("/private/credential.json"),
+            reason: "invalid_json".into(),
+        };
+        assert_eq!(malformed.error_kind_tag(), "credentials_malformed");
+    }
 
     #[test]
     fn credential_error_kind_tag_distinct_per_variant() {
@@ -394,12 +470,31 @@ mod credential_error_kind_tag_tests {
                 item: ".current-account",
             }
             .error_kind_tag(),
+            CredentialError::HandleDirBusy {
+                dir_name: "term-1".into(),
+                marker: ".live-pid",
+                live_pid: None,
+            }
+            .error_kind_tag(),
+            CredentialError::IdentityRemoved {
+                uuid: "fixture-uuid".into(),
+            }
+            .error_kind_tag(),
+            CredentialError::IdentityDirectoryMissing {
+                uuid: "fixture-uuid".into(),
+            }
+            .error_kind_tag(),
+            CredentialError::CanonicalLockRefused {
+                path: PathBuf::from("/x"),
+                io_kind: io::ErrorKind::PermissionDenied,
+            }
+            .error_kind_tag(),
         ]
         .into_iter()
         .collect();
         assert_eq!(
             tags.len(),
-            7,
+            11,
             "each CredentialError variant must yield a distinct tag"
         );
     }

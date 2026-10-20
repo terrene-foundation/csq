@@ -66,6 +66,7 @@ pub mod coc_cache_sweeper;
 pub mod custodian;
 pub mod detect;
 pub mod identity_mint;
+pub mod legacy_identity;
 pub mod lifecycle;
 /// Daemon rolling-log GC (#1a-2, daemon-auth-resilience Wave A2) — 14-day
 /// retention sweep over the persistent rolling file log written by the
@@ -114,9 +115,6 @@ pub mod server_windows;
 /// Unix `SIGTERM` path; keeps the drain semantics identical across platforms.
 #[cfg(windows)]
 pub mod shutdown_windows;
-#[cfg(all(test, unix))]
-mod test_socket_fixture;
-
 pub use anchor_task::{spawn as spawn_anchor_task, AnchorTaskHandle};
 pub use auto_rotate::{spawn as spawn_auto_rotate, AutoRotateHandle};
 pub use cache::{TtlCache, DEFAULT_MAX_AGE};
@@ -132,7 +130,9 @@ pub use pid::PidFile;
 pub use refresher::{
     spawn as spawn_refresher, HttpPostFn, HttpPostFnCodex, RefreshStatus, RefresherHandle,
 };
-pub use startup_reconciler::{run_reconciler, ReconcileSummary};
+pub use startup_reconciler::{
+    reconciler_join_failure, run_reconciler, ReconcileSummary, RECONCILER_TASK_FAILED,
+};
 pub use stop_sentinel::{clear_stop_requested, is_stop_requested, set_stop_requested};
 pub use usage_ledger_writer::{
     spawn as spawn_usage_ledger_writer, WriterHandle as UsageLedgerWriterHandle,
@@ -144,8 +144,8 @@ pub use usage_poller::{
 #[cfg(unix)]
 pub use client::{
     harvest_account, http_get_unix, http_get_unix_with_timeout, http_post_unix,
-    http_post_unix_json, http_post_unix_json_with_headers, notify_slot_swap, DaemonClientError,
-    DaemonResponse, DEFAULT_TIMEOUT,
+    http_post_unix_json, http_post_unix_json_with_headers, notify_slot_rebind, notify_slot_swap,
+    DaemonClientError, DaemonResponse, DEFAULT_TIMEOUT,
 };
 #[cfg(windows)]
 pub use client_windows::harvest_account;

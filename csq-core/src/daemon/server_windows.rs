@@ -168,6 +168,10 @@ pub async fn serve(
     };
 
     let pipe_name_owned = pipe_name.to_string();
+    // One noninteractive prior-boot custody check; never block pipe readiness.
+    tokio::spawn(super::server::recover_pool_after_startup(
+        (*state.base_dir).clone(),
+    ));
     let app = std::sync::Arc::new(router(state));
     let join = tokio::spawn(async move {
         accept_loop(first_server, pipe_name_owned, app, shutdown).await;
@@ -315,6 +319,7 @@ mod tests {
             audit_health: crate::audit::new_shared(crate::audit::AuditHealth::Verified),
             audit_records_unverified: 0,
             anchor_sink: None,
+            usage_poller_wake: std::sync::Arc::new(crate::daemon::usage_poller::WakeChannel::new()),
             #[cfg(feature = "enterprise")]
             interactive: Arc::new(
                 crate::daemon::interactive_ipc::InteractiveSessionRegistry::empty(),

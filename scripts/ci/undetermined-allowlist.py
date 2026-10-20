@@ -11,9 +11,12 @@ that failed OPEN on "TBD" / "never" / "2026-1-5").
 
 Output, one line per entry, TAB-separated:
     ALLOW<TAB><scripts/tests/...><TAB><token>
+    INACTIVE<TAB><scripts/tests/...><TAB><reason>
     INVALID<TAB><test or ?><TAB><reason>
 Only ALLOW lines grant anything. Every validation failure is INVALID, so the
 entry grants nothing and its test FAILS on exit 2 — fail closed.
+An installed tool makes a valid declaration INACTIVE, without an error
+annotation. It grants nothing: the test must measure and pass normally.
 
 Exit 0 when the declaration was read (even if every entry is INVALID).
 Exit 2 when the declaration itself cannot be read or parsed: the caller must
@@ -110,7 +113,7 @@ def main() -> int:
             print(f"INVALID\t{test}\trequires_absent {json.dumps(tool)} must name a tool")
             continue
         if shutil.which(tool):
-            print(f"INVALID\t{test}\tprecondition not met: {tool} IS installed here, so this test must measure")
+            print(f"INACTIVE\t{test}\t{tool} IS installed here, so this test must measure")
             continue
         print(f"ALLOW\t{test}\t{token}")
     return 0

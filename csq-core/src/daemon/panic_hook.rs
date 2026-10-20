@@ -85,17 +85,38 @@ mod tests {
     /// process-global mutation (see `audit::verify`'s own panic-hook
     /// swap, which already serializes on it) — reusing it here closes the
     /// race against both this module's OTHER hook-mutating tests and that
-    /// sibling one.
+    /// sibling one. Ordinary tests may still panic without taking that mutex,
+    /// so the temporary hook captures only this calling thread and forwards
+    /// other threads to the prior hook.
     fn capture_formatted_panic(trigger: impl FnOnce() + std::panic::UnwindSafe) -> String {
+        capture_formatted_panic_after(trigger, || {})
+    }
+
+    fn capture_formatted_panic_after(
+        trigger: impl FnOnce() + std::panic::UnwindSafe,
+        after: impl FnOnce(),
+    ) -> String {
         let _guard = crate::platform::test_env::lock();
         let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let captured_in_hook = Arc::clone(&captured);
-        let prior_hook = std::panic::take_hook();
+        let owner = std::thread::current().id();
+        let prior_hook = Arc::new(std::panic::take_hook());
+        let prior_in_hook = Arc::clone(&prior_hook);
         std::panic::set_hook(Box::new(move |info| {
-            *captured_in_hook.lock().unwrap() = Some(format_panic_message(info));
+            if std::thread::current().id() == owner {
+                *captured_in_hook.lock().unwrap() = Some(format_panic_message(info));
+            } else {
+                prior_in_hook(info);
+            }
         }));
         let result = std::panic::catch_unwind(trigger);
-        std::panic::set_hook(prior_hook);
+        // Restore even if the after-trigger regression fixture fails. set_hook
+        // itself cannot run from an unwinding thread, so catch before restoring.
+        let after_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(after));
+        std::panic::set_hook(Box::new(move |info| prior_hook(info)));
+        if let Err(error) = after_result {
+            std::panic::resume_unwind(error);
+        }
         assert!(result.is_err(), "the trigger closure must actually panic");
         let message = captured
             .lock()
@@ -144,6 +165,31 @@ mod tests {
             formatted.contains("panic_hook.rs"),
             "the panic's own source location must be included: {formatted}"
         );
+    }
+
+    /// A joined foreign panic occurs after ours while the capture hook is still
+    /// installed. It must neither overwrite our payload nor our source location.
+    #[test]
+    fn foreign_thread_panic_cannot_replace_the_captured_panic() {
+        let formatted = capture_formatted_panic_after(
+            || panic!("owned panic capture"),
+            || {
+                std::thread::spawn(|| {
+                    let result = std::panic::catch_unwind(|| {
+                        panic!("foreign panic capture");
+                    });
+                    assert!(result.is_err());
+                })
+                .join()
+                .unwrap();
+            },
+        );
+        assert!(
+            formatted.ends_with(": owned panic capture"),
+            "a foreign panic overwrote our captured record: {formatted}"
+        );
+        assert!(formatted.contains("panic_hook.rs"));
+        assert!(!formatted.contains("foreign panic capture"));
     }
 
     /// `install()` MUST be idempotent — calling it twice must not panic,

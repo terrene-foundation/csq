@@ -90,9 +90,22 @@
     interactive_deserialize_error: "The daemon rejected the request payload.",
     interactive_bad_response: "The daemon returned an unexpected response.",
     interactive_request_failed: "The request to the daemon failed.",
+    // orgident r7 item 9: the suppression record is damaged, so launches are refused.
+    suppression_state_damaged:
+      "refresh-suppression state is damaged; run `csq doctor`",
   };
 
+  // `slot_sign_in_shared:<N>` is the launch block (orgident r7 item 9): the picked
+  // account shares its sign-in with another account, so the backend refused to start.
+  // Only a bare decimal slot number is interpolated; anything else falls through.
+  const SHARED_SIGN_IN = /^slot_sign_in_shared:(\d{1,5})$/;
+
   function errorText(tag: string): string {
+    const shared = SHARED_SIGN_IN.exec(tag);
+    if (shared) {
+      const n = shared[1];
+      return `slot ${n} shares its sign-in with another account; run \`csq login ${n}\``;
+    }
     return ERROR_TEXT[tag] ?? `Something went wrong (${tag}).`;
   }
 

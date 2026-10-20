@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "kind": "recorded-native-incident",
+  "recorded_at": "2026-10-07T11:51:17.530476+00:00",
+  "csq_commit": "0c39937ab32cebc5191429ffc41c86e019bb2dfa",
+  "native_tag": "rust-v0.160.1",
+  "native_tree": "d27764b82f7118f674371e6d6e76271d9d606edb",
+  "historical_brief_sha256": "74fed733abe39dd842fec8c8f118401765662f109418628da8052c1e8891d004",
+  "target": {
+    "pid": 33845,
+    "started_at": 1791372826,
+    "handle": "term-31447",
+    "thread_id": "01a0f6f5-1ba8-7202-94c4-bb7233a1f783"
+  },
+  "prior_native_event": {
+    "timestamp": "2026-10-07T11:33:34.797Z",
+    "type": "turn_aborted",
+    "reason": "interrupted",
+    "has_error": false
+  },
+  "send": {
+    "message_id": "c6a62762",
+    "nonce": "cx-7f3a91",
+    "created_at": 1791372880,
+    "receipt_delivery": "codex_queued_unverified"
+  },
+  "native_queue_observation": {
+    "path": "<account sqlite_home>/queue_1.sqlite",
+    "item": [
+      {
+        "id": "01a11624-fed4-71e1-b2a0-cbceaf8db0ff",
+        "thread_id": "01a0f6f5-1ba8-7202-94c4-bb7233a1f783",
+        "queue_order": 0,
+        "created_at_ms": 1791372885716,
+        "updated_at_ms": 1791372885716
+      }
+    ],
+    "thread_revision": [
+      {
+        "revision": 507,
+        "thread_id": "01a0f6f5-1ba8-7202-94c4-bb7233a1f783"
+      }
+    ],
+    "revision_trigger_names": [
+      "queued_items_revision_after_insert",
+      "queued_items_revision_after_update",
+      "queued_items_revision_after_delete"
+    ]
+  },
+  "observed_supervisor_files_from_original_brief": {
+    "wake_pending": false,
+    "wake_item": false,
+    "wake_lock": true
+  },
+  "original_rollout_size": 108544543,
+  "native_policy_from_hash_bound_source": "Resume restores Interrupted; automatic external queue watcher excludes Interrupted; explicit thread/queue/start on owning backend can start exact queued item.",
+  "regression_oracle": {
+    "receipt_is_wake_proof": false,
+    "source_pending_work_must_survive_unconsumed_native_row": true,
+    "queue_start_must_use_existing_item_id": true,
+    "queue_start_must_use_owning_native_backend": true
+  },
+  "limitations": [
+    "The native consumer was not executed in this investigation.",
+    "Original supervisor marker observations are the orchestrator CR6 brief receipt, not independently captured pre-turn bytes.",
+    "Current row/revision/trigger names and historical status-event metadata were read independently in read-only mode.",
+    "This fixture can verify csq retention/retry or native-RPC routing decisions; it cannot prove a newly implemented native wake executed.",
+    "Committed fixture redacts the absolute account path; recorded identities/events/queue metadata retain their original values."
+  ]
+}

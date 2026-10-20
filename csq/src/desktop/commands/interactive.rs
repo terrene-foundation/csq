@@ -224,7 +224,9 @@ fn call_daemon(
     json_body: &str,
     session_key: Option<&str>,
 ) -> Result<(u16, String), String> {
-    let base = std::path::PathBuf::from(base_dir);
+    // R3-fix-check LOW 4: containment via the shared resolver (the sweep
+    // missed this file's `std::path`-qualified conversion).
+    let base = super::resolve_csq_base_dir(base_dir)?;
     let sock = csq_core::daemon::socket_path(&base);
     if !sock.exists() {
         return Err("daemon_unreachable".to_string());
@@ -263,6 +265,15 @@ pub fn interactive_open(
     terminal_label: Option<String>,
     slot: Option<u16>,
 ) -> Result<InteractiveOpenView, String> {
+    // orgident r7 item 9 (CLI/desktop parity with `csq run` / `csq swap`): an explicitly
+    // picked slot whose sign-in is shared with another slot is refused before the daemon
+    // is contacted. The renderer maps the fixed tag to the `csq login N` instruction.
+    if let Some(picked) = slot {
+        let base = super::resolve_csq_base_dir(&base_dir)?;
+        if let Some(refusal) = csq_core::accounts::launch_block::launch_refusal(&base, picked) {
+            return Err(refusal.desktop_tag());
+        }
+    }
     // `slot` (an internal ticket §FD1 escape hatch): the operator-picked subscription account.
     // `None` → daemon default (lowest-with-creds). The daemon validates it is a
     // provider-matching account with credentials and rejects an arbitrary slot
@@ -374,6 +385,34 @@ pub fn interactive_close(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// orgident r7 item 9: the desktop launch mirrors the CLI refusal. The gate answers
+    /// BEFORE the daemon is contacted (no socket exists in this fixture, so an
+    /// un-gated call would say `daemon_unreachable`), and stops once the login cleared it.
+    #[test]
+    fn interactive_open_refuses_a_suppressed_slot_and_stops_after_login() {
+        use csq_core::accounts::launch_block::fixture;
+        let dir = tempfile::TempDir::new().unwrap();
+        fixture::seed_shared_grant(dir.path(), 1, 2);
+        let _g = super::super::test_base_dir_env::BaseDirEnvGuard::set(dir.path());
+        let base = dir.path().to_str().unwrap().to_string();
+
+        assert_eq!(
+            interactive_open(base.clone(), None, Some(2)).unwrap_err(),
+            "slot_sign_in_shared:2"
+        );
+        assert_ne!(
+            interactive_open(base.clone(), None, Some(1)).unwrap_err(),
+            "slot_sign_in_shared:1",
+            "the holder keeps its grant"
+        );
+        fixture::simulate_login(dir.path(), 2);
+        assert_ne!(
+            interactive_open(base, None, Some(2)).unwrap_err(),
+            "slot_sign_in_shared:2",
+            "refusal ends once csq login cleared the suppression"
+        );
+    }
 
     #[test]
     fn validate_text_rejects_empty_oversized_and_control() {

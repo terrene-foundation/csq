@@ -10,6 +10,10 @@ license.workspace = true
 publish = false
 
 [dependencies]
+# rusqlite (a new csq-core dependency, said plainly): `messaging::wake` opens Codex's
+# `queue_1.sqlite` READ-ONLY to learn whether the session consumed a queued wake. `bundled`
+# so no system libsqlite3 is required to build.
+rusqlite = { version = "0.32", features = ["bundled"] }
 # csq-redact — community leaf holding `redact_tokens` + `RedactedString` (W1
 # extraction). Non-optional: both editions need error redaction + the audit
 # chain's RedactedString. csq-core re-exports it (crate::error::redact_tokens,
@@ -19,14 +23,6 @@ csq-redact.workspace = true
 # supplies the app-side builders (EDITION + audit->DTO mapping). Non-optional: the
 # `csq exec/audit verify/sdk capabilities --json` surfaces are edition-uniform.
 csq-sdk.workspace = true
-# csq-merkle — an internal ticket RFC 6962 Merkle verifier leaf. Non-optional: the
-# `CsqLedgerSink` (feature `csq-ledger-sink`) and the EATP anchor-witness path
-# VERIFY the inclusion proof the ledger returns via `csq_merkle::verify_inclusion`
-# before trusting it. Zero-dep leaf (sha2 only), so it adds no moat surface; both
-# editions compile it. Depending on it here is the whole point of the an internal ticket
-# extraction — csq-core can reach the verifier WITHOUT a csq-core→csq-ledger
-# cycle (csq-ledger already depends on csq-core).
-csq-merkle.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -36,7 +32,9 @@ tokio.workspace = true
 tracing.workspace = true
 hex.workspace = true
 sha2.workspace = true
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 unicode-normalization.workspace = true
+unicode-general-category.workspace = true
 secrecy.workspace = true
 urlencoding.workspace = true
 # `url` is pulled in by `reqwest` already; declaring it directly lets the
@@ -138,6 +136,8 @@ security-framework.workspace = true
 # crate is unbuildable on macOS / Windows.
 [target.'cfg(target_os = "linux")'.dependencies]
 secret-service.workspace = true
+secret-service-aes.workspace = true
+secret-service-cbc.workspace = true
 landlock = { version = "0.4.5", optional = true, default-features = false }
 seccompiler = { version = "0.5.0", optional = true, default-features = false }
 
@@ -161,9 +161,16 @@ windows-sys = { version = "0.52", features = [
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
     "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
     "Win32_Security",
     "Win32_Security_Credentials",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
+    # NtSetInformationFile: the handle-relative legacy rename fallback
+    # (`chat_sessions_platform::publish_handle`).
+    "Wdk_Storage_FileSystem",
 ] }
 
 [features]
@@ -187,7 +194,10 @@ secret-in-memory = []
 # `tempfile`. External consumers (integration tests, coc-eval) enable this
 # feature so the fixture surface is available outside `cfg(test)`. Production
 # binaries MUST NOT enable this feature.
-test-utils = ["dep:tempfile"]
+# `secret-in-memory` is implied: `platform::test_env::with_in_memory_secret_backend` pins
+# `CSQ_SECRET_BACKEND=in-memory`, which `open_default_vault` honours only under that
+# feature; without it the pin falls through to the real macOS Keychain.
+test-utils = ["dep:tempfile", "secret-in-memory"]
 
 # ── M07 LedgerSink reference-impl feature flags ─────────────────────────────
 #
@@ -234,6 +244,21 @@ csq-ledger-sink = []
 # `csq-ledger-sink`, it reuses the non-optional `reqwest` dep — no new crate in
 # the graph; the default build never compiles the sink body.
 customer-body-store-sink = []
+
+# Windows-only integration tests that call `csq_core::testing` /
+# `spawn_csq_named_test_process`, both compiled only under `test-utils`.
+# required-features keeps a featureless `--all-targets` build (e.g. the
+# windows-gnu clippy probe) from failing on an unresolved import; the
+# CI windows-cfg lint enables `csq-core/test-utils` and still covers them.
+[[test]]
+name = "integration_codex_refresher_windows"
+path = "tests/integration_codex_refresher_windows.rs"
+required-features = ["test-utils"]
+
+[[test]]
+name = "daemon_windows_graceful_stop"
+path = "tests/daemon_windows_graceful_stop.rs"
+required-features = ["test-utils"]
 
 [[bin]]
 name = "stub-cli"

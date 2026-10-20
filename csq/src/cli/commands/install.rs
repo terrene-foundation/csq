@@ -12,16 +12,15 @@ pub fn handle() -> Result<()> {
     println!("Installing csq...");
     println!();
 
-    // Create directories
+    // Create directories through the shared SEC-2.15 fail-closed helper
+    // (R2 M3): the accounts root resolves a leaf symlink (operator
+    // external-drive setup), `credentials/` below it is strict — 0o700 at
+    // creation with no create-then-chmod window and symlink refusal. The
+    // former create_dir_all + unconditional path-chmod pair is retired.
     let credentials_dir = base_dir.join("credentials");
-    std::fs::create_dir_all(&credentials_dir).context("creating credentials directory")?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&base_dir, std::fs::Permissions::from_mode(0o700))?;
-        std::fs::set_permissions(&credentials_dir, std::fs::Permissions::from_mode(0o700))?;
-    }
+    csq_core::platform::fs::ensure_private_dir_root(&base_dir).context("accounts_root_refused")?;
+    csq_core::platform::fs::ensure_private_dir(&credentials_dir)
+        .context("credentials_dir_refused")?;
 
     println!("  ✓ Created {}", base_dir.display());
     println!("  ✓ Created {}", credentials_dir.display());

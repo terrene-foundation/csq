@@ -59,8 +59,19 @@ pub fn claude_code_model_selector<'a>(model_id: &'a str, base_url: Option<&str>)
 }
 
 impl ModelCatalog {
-    /// Returns model metadata from the validated bundled manifest.
-    /// Runtime callers should load `ModelManifest` with their explicit base dir.
+    /// The catalogue from the RUNTIME manifest (`<base_dir>/model-rates.json`,
+    /// bundled data only when that file is absent). Every production reader of
+    /// model metadata uses this, so a manifest installed with
+    /// `csq models manifest install` reaches it. A present but invalid file is an
+    /// error, never a silent fall back to different metadata (spec 07 §7.11).
+    pub fn load(base_dir: &std::path::Path) -> anyhow::Result<Self> {
+        Ok(super::model_manifest::ModelManifest::load(base_dir)?.catalog())
+    }
+
+    /// Returns model metadata from the validated BUNDLED manifest only, ignoring
+    /// any installed runtime file. Kept for tests and library compatibility;
+    /// production readers call [`ModelCatalog::load`] (no production caller
+    /// remains: `grep -rn 'default_catalog()' csq/src csq-core/src` hits tests).
     pub fn default_catalog() -> Self {
         super::model_manifest::ModelManifest::bundled().catalog()
     }
@@ -521,5 +532,35 @@ mod tests {
                 "{id}: published MAX OUTPUT is 384K"
             );
         }
+    }
+
+    #[test]
+    fn runtime_manifest_reaches_catalogue_load_but_not_default_catalog() {
+        use crate::providers::model_manifest::ModelManifest;
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut v = serde_json::to_value(ModelManifest::bundled()).unwrap();
+        v["models"][0]["context_window"] = serde_json::json!(123_456);
+        let id = v["models"][0]["id"].as_str().unwrap().to_string();
+        let src = dir.path().join("m.json");
+        std::fs::write(&src, v.to_string()).unwrap();
+        ModelManifest::install(dir.path(), &src).unwrap();
+        assert_eq!(
+            ModelCatalog::load(dir.path())
+                .unwrap()
+                .find(&id)
+                .unwrap()
+                .context_window,
+            Some(123_456)
+        );
+        assert_ne!(
+            ModelCatalog::default_catalog()
+                .find(&id)
+                .unwrap()
+                .context_window,
+            Some(123_456)
+        );
+        // A present invalid file is an error, not different metadata.
+        std::fs::write(dir.path().join("model-rates.json"), "{").unwrap();
+        assert!(ModelCatalog::load(dir.path()).is_err());
     }
 }

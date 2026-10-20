@@ -8,13 +8,14 @@ import { tick } from "svelte";
 //   invoke('list_sessions', { baseDir })  — on mount + 5s poll
 
 const mockInvoke = vi.fn();
+const mockHomeDir = vi.fn();
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => mockInvoke(...args),
 }));
 
 vi.mock("@tauri-apps/api/path", () => ({
-  homeDir: () => Promise.resolve("/home/test"),
+  homeDir: () => mockHomeDir(),
   join: (...parts: string[]) => Promise.resolve(parts.join("/")),
 }));
 
@@ -25,6 +26,20 @@ import SessionList from "./SessionList.svelte";
 // Svelte re-renders. State mutations inside the effect add cycles.
 async function settle() {
   for (let i = 0; i < 8; i++) await tick();
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function sessionCalls() {
+  return mockInvoke.mock.calls.filter(([cmd]) => cmd === "list_sessions");
 }
 
 // ── Fixtures ───────────────────────────────────────────────────────
@@ -81,6 +96,7 @@ function setupMocks(overrides: Record<string, unknown> = {}) {
 describe("SessionList", () => {
   beforeEach(() => {
     mockInvoke.mockReset();
+    mockHomeDir.mockReset().mockResolvedValue("/home/test");
     setupMocks();
     try {
       localStorage.removeItem("csq-session-sort");
@@ -93,6 +109,7 @@ describe("SessionList", () => {
 
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
   });
 
   // ── Loading & empty states ──────────────────────────────────
@@ -108,6 +125,73 @@ describe("SessionList", () => {
     await settle();
     expect(container.textContent).toContain("No live Claude Code sessions");
     expect(container.textContent).toContain("claude");
+  });
+
+  it("keeps one session read in flight and resumes polling after it settles", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const pending = deferred<(typeof SESSION_1)[]>();
+    mockInvoke.mockReturnValue(pending.promise);
+    const { container } = render(SessionList);
+    await settle();
+    expect(sessionCalls()).toHaveLength(1);
+    vi.advanceTimersByTime(15000);
+    await settle();
+    expect(sessionCalls()).toHaveLength(1);
+
+    pending.resolve([SESSION_1]);
+    await settle();
+    expect(container.textContent).toContain("project-a");
+    setupMocks({ list_sessions: [SESSION_2] });
+    vi.advanceTimersByTime(5000);
+    await settle();
+    expect(sessionCalls()).toHaveLength(2);
+    expect(container.textContent).toContain("My Session");
+    expect(container.textContent).not.toContain("project-a");
+  });
+
+  it("resumes session polling after a pending read rejects", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const pending = deferred<unknown>();
+    mockInvoke.mockReturnValue(pending.promise);
+    const { container } = render(SessionList);
+    await settle();
+    pending.reject(new Error("slow session read failed"));
+    await settle();
+    expect(container.textContent).toContain("slow session read failed");
+    setupMocks();
+    vi.advanceTimersByTime(5000);
+    await settle();
+    expect(sessionCalls()).toHaveLength(2);
+    expect(container.textContent).toContain("project-a");
+    expect(container.textContent).not.toContain("slow session read failed");
+  });
+
+  it("discards a late session error and stops polling on unmount", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const pending = deferred<unknown>();
+    mockInvoke.mockReturnValue(pending.promise);
+    const { unmount } = render(SessionList);
+    await settle();
+    await unmount();
+    const formatError = vi.fn(() => "late failure");
+    pending.reject({ toString: formatError });
+    await settle();
+    // Formatting the rejection would write the error state after teardown.
+    expect(formatError).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(15000);
+    await settle();
+    expect(sessionCalls()).toHaveLength(1);
+  });
+
+  it("does not start a session invocation if path lookup completes after unmount", async () => {
+    const home = deferred<string>();
+    mockHomeDir.mockReturnValue(home.promise);
+    const { unmount } = render(SessionList);
+    await settle();
+    await unmount();
+    home.resolve("/home/test");
+    await settle();
+    expect(sessionCalls()).toHaveLength(0);
   });
 
   // ── Session row rendering ───────────────────────────────────

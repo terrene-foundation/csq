@@ -252,9 +252,11 @@ pub fn read_live_pid(config_dir: &Path) -> Option<u32> {
 }
 
 /// Reads the `.live-cc-pid` file, used on non-Unix platforms to
-/// record the spawned CC child process PID. On Unix this file is
-/// never written (exec replaces csq-cli with claude so there is a
-/// single PID). The sweep treats the handle dir as live if EITHER
+/// record the spawned CC child process PID. It is written wherever csq
+/// SPAWNS the CLI as a child (Windows `csq run`; Unix `csq exec`, the
+/// captured / inherited-stdio spawn paths and the codex supervisor) and is
+/// absent only where csq exec-replaces itself with the CLI (the plain Unix
+/// `csq run` launch), where `.live-pid` already names the CLI. The sweep treats the handle dir as live if EITHER
 /// `.live-pid` or `.live-cc-pid` is alive, closing the Windows
 /// crash-recovery window where csq-cli died but CC survived as an
 /// orphaned child.
@@ -262,17 +264,109 @@ pub fn read_live_cc_pid(config_dir: &Path) -> Option<u32> {
     read_pid_marker(config_dir, ".live-cc-pid")
 }
 
-fn read_pid_marker(config_dir: &Path, name: &str) -> Option<u32> {
-    let path = config_dir.join(name);
-    // symlink_metadata does NOT follow symlinks; if the path is a
-    // symlink we refuse rather than read through it.
-    match path.symlink_metadata() {
-        Ok(meta) if meta.file_type().is_file() => {}
-        _ => return None,
+/// A pid marker that exists but could not be read as a pid: unreadable, not a regular
+/// file, oversized, or not a decimal pid. Distinct from "no marker".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkerUnreadable;
+
+/// [`read_live_pid`] keeping "could not read" apart from "absent": `Ok(None)` only when
+/// no `.live-pid` exists. A caller that deletes or refuses on the strength of the answer
+/// (the handle-dir sweep, in-use guards) MUST treat `Err` as "possibly live".
+///
+/// # Errors
+/// [`MarkerUnreadable`] when the marker exists but is not a readable decimal pid.
+pub fn read_live_pid_checked(config_dir: &Path) -> Result<Option<u32>, MarkerUnreadable> {
+    read_pid_marker_checked(config_dir, ".live-pid")
+}
+
+/// [`read_live_cc_pid`] keeping "could not read" apart from "absent"; see
+/// [`read_live_pid_checked`].
+///
+/// # Errors
+/// [`MarkerUnreadable`] when the marker exists but is not a readable decimal pid.
+pub fn read_live_cc_pid_checked(config_dir: &Path) -> Result<Option<u32>, MarkerUnreadable> {
+    read_pid_marker_checked(config_dir, ".live-cc-pid")
+}
+
+/// Why a handle dir must be treated as possibly live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandleDirInUse {
+    /// `.live-pid` (or the dir-name pid when that marker is absent) or `.live-cc-pid`
+    /// names a live process.
+    Pid(u32),
+    /// A pid marker is present but unreadable, so liveness cannot be ruled out.
+    MarkerUnreadable,
+}
+
+/// The shared "is this handle dir in use" check for the in-use guards that act on it: logout
+/// REFUSES on it, the orphan-identity GC KEEPS the identity on it, and the keychain
+/// pending-clear KEEPS the queued entry on it. move-slot calls it only to REPORT (it never
+/// refuses a move; the result is telemetry). In use when EITHER `.live-pid` OR `.live-cc-pid` names
+/// a live process (a SIGKILLed csq parent leaves the CLI child alive, with only the
+/// latter naming it), or when either marker is present but unreadable (fail CLOSED,
+/// `guard-reader-writer-parity.md` MUST-2). `dir_name_pid` is the `term-<pid>` fallback,
+/// consulted ONLY when `.live-pid` is absent, never when it is unreadable.
+pub fn handle_dir_in_use(
+    handle_dir: &Path,
+    dir_name_pid: Option<u32>,
+    is_alive: impl Fn(u32) -> bool,
+) -> Option<HandleDirInUse> {
+    match read_live_pid_checked(handle_dir) {
+        Err(MarkerUnreadable) => return Some(HandleDirInUse::MarkerUnreadable),
+        Ok(Some(pid)) if is_alive(pid) => return Some(HandleDirInUse::Pid(pid)),
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            if let Some(pid) = dir_name_pid {
+                if is_alive(pid) {
+                    return Some(HandleDirInUse::Pid(pid));
+                }
+            }
+        }
     }
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
+    match read_live_cc_pid_checked(handle_dir) {
+        Err(MarkerUnreadable) => Some(HandleDirInUse::MarkerUnreadable),
+        Ok(Some(pid)) if is_alive(pid) => Some(HandleDirInUse::Pid(pid)),
+        Ok(_) => None,
+    }
+}
+
+/// A pid marker is a decimal pid; anything longer than this is not one.
+const MAX_PID_MARKER_BYTES: u64 = 64;
+
+/// Lenient form: a marker that cannot be read reads as "no marker". Only for callers whose
+/// answer is not used to delete or refuse; those use [`read_pid_marker_checked`].
+fn read_pid_marker(config_dir: &Path, name: &str) -> Option<u32> {
+    read_pid_marker_checked(config_dir, name).unwrap_or(None)
+}
+
+/// One bounded read of the OPEN handle: refuses a symlink (O_NOFOLLOW), never blocks on a
+/// FIFO swapped in at the path (O_NONBLOCK + fstat), and caps the size. `Ok(None)` only
+/// when the file does not exist; anything present but not a readable decimal pid is
+/// [`MarkerUnreadable`]. Logged at debug: a bad marker is re-read on every statusline
+/// render and sweep tick, and a warning per read would flood the log.
+fn read_pid_marker_checked(config_dir: &Path, name: &str) -> Result<Option<u32>, MarkerUnreadable> {
+    let path = config_dir.join(name);
+    match crate::platform::fs::read_regular_nofollow_bounded(&path, MAX_PID_MARKER_BYTES) {
+        Ok(Some(bytes)) => match std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+        {
+            Some(pid) => Ok(Some(pid)),
+            None => {
+                tracing::debug!(reason = "pid_marker_malformed", "pid marker not a pid");
+                Err(MarkerUnreadable)
+            }
+        },
+        Ok(None) => Ok(None),
+        Err(e) => {
+            tracing::debug!(
+                error_kind = ?e.kind(),
+                reason = "pid_marker_unreadable",
+                "pid marker could not be read"
+            );
+            Err(MarkerUnreadable)
+        }
+    }
 }
 
 /// Writes the `.live-pid` file.
@@ -430,6 +524,62 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write_live_pid(dir.path(), 12345).unwrap();
         assert_eq!(read_live_pid(dir.path()), Some(12345));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_at_pid_marker_reads_absent_without_hanging() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".live-pid");
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_live_pid(&d));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("a FIFO at the marker path must not hang the reader");
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn oversized_pid_marker_reads_absent() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".live-pid"),
+            format!("12345{}", " ".repeat(500)),
+        )
+        .unwrap();
+        assert_eq!(read_live_pid(dir.path()), None);
+    }
+
+    #[test]
+    fn checked_pid_readers_keep_unreadable_apart_from_absent() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(read_live_pid_checked(dir.path()), Ok(None), "absent");
+        assert_eq!(read_live_cc_pid_checked(dir.path()), Ok(None), "absent");
+        std::fs::write(dir.path().join(".live-pid"), "4242\n").unwrap();
+        assert_eq!(read_live_pid_checked(dir.path()), Ok(Some(4242)));
+        for bad in [format!("12345{}", " ".repeat(500)), "not-a-pid".to_string()] {
+            std::fs::write(dir.path().join(".live-cc-pid"), bad).unwrap();
+            assert_eq!(read_live_cc_pid_checked(dir.path()), Err(MarkerUnreadable));
+            assert_eq!(
+                read_live_cc_pid(dir.path()),
+                None,
+                "the lenient reader is unchanged"
+            );
+        }
+        std::fs::remove_file(dir.path().join(".live-cc-pid")).unwrap();
+        std::fs::create_dir(dir.path().join(".live-cc-pid")).unwrap();
+        assert_eq!(
+            read_live_cc_pid_checked(dir.path()),
+            Err(MarkerUnreadable),
+            "a directory"
+        );
     }
 
     #[test]

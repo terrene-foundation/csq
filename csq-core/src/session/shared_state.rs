@@ -232,6 +232,8 @@ pub enum ShareError {
          absolute path to one."
     )]
     Sqlite3NotFound { env_var: &'static str },
+    #[error("CSQ_CODEX_RESUME_TARGET: {reason}; recover the target transcript before retrying the same csq resume command") ]
+    CodexResumeTarget { reason: &'static str },
     #[error("`sqlite3` at {binary} exited with an error against {path}: {detail}")]
     SqliteCommandFailed {
         binary: PathBuf,
@@ -371,9 +373,15 @@ pub enum ShareError {
         /// print it a second time.
         cause: Box<ShareError>,
     },
+    // Fixed vocabulary: the lock's contended state alone cannot name its
+    // holder, so the message lists every holder class that can exclude a
+    // SHARED acquire and says how to look for one — it never asserts which.
     #[error(
-        "a codex cross-slot sqlite migration is in progress; wait for `csq sessions share` \
-         to finish and retry the launch"
+        "the codex cross-slot share lock is held exclusively, either by a running \
+         `csq sessions share` or by a sqlite3 writer left behind by an interrupted one \
+         (that writer exits once its script ends). Retry the launch once the lock is \
+         released; to identify the holder, look for a `csq` or `sqlite3` process (e.g. \
+         with `ps`) whose arguments name the csq accounts directory"
     )]
     CodexShareLockContended,
     #[error(
@@ -389,12 +397,18 @@ pub enum ShareError {
         object_type: String,
         object_name: String,
     },
+    // Fixed vocabulary, as for `CodexShareLockContended`: `{pids}` is the
+    // pre-lock scan's evidence, never a claim about which process holds it.
     #[error(
         "cannot acquire the codex cross-slot share lock: timed out after ~{bound_secs}s \
-         waiting for it to be released. Live codex session(s) observed just before waiting \
-         (pid(s)): {pids}. This is NOT overridden by --force — the lock protects the on-disk \
-         session store from being retargeted while it is in use. Wait for the running \
-         session(s) to exit, then re-run `csq sessions share`."
+         waiting for it to be released. It is held by a running codex session, another \
+         running `csq sessions share`, or a sqlite3 writer left behind by an interrupted \
+         `csq sessions share` or csq run (that writer exits once its script ends). Live codex session(s) observed \
+         just before waiting (pid(s)): {pids}. This is NOT overridden by --force — the lock \
+         protects the on-disk session store from being retargeted while it is in use. To \
+         identify the holder, look for a `codex`, `csq` or `sqlite3` process (e.g. with \
+         `ps`) whose arguments name the csq accounts directory; once it has exited, re-run \
+         `csq sessions share`."
     )]
     CodexShareLockTimedOut { bound_secs: u64, pids: String },
 }
@@ -455,6 +469,144 @@ impl std::fmt::Debug for CodexShareLockGuard {
         f.debug_struct("CodexShareLockGuard")
             .finish_non_exhaustive()
     }
+}
+
+impl Drop for CodexShareLockGuard {
+    fn drop(&mut self) {
+        // G2b item 2: release EXPLICITLY. POSIX flock is bound to the open
+        // file description and is released only by LOCK_UN on any duplicate
+        // or by closing EVERY descriptor to it (`flock(2)`). A fork from
+        // any thread of the holding process keeps the description — and
+        // the lock — alive past this guard's own close, until the child
+        // execs (`FD_CLOEXEC`) or exits. LOCK_UN on any duplicate releases
+        // the whole description, making this drop the release point.
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: `_file` is still open here (field drop runs after this
+            // body); flock(LOCK_UN) touches no memory and only releases an
+            // advisory lock this description holds.
+            if unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+                tracing::warn!(
+                    error_kind = "codex_share_lock_unlock_failed",
+                    errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                    "codex share lock could not be released"
+                );
+            }
+        }
+        // Windows: LockFileEx is released by CloseHandle, std handles are
+        // non-inheritable, and there is no fork() — no duplicate can
+        // outlive the close.
+    }
+}
+
+/// What a writer `sqlite3` child inherits from the migration lock on Unix: the
+/// locked descriptor, plus the `(st_dev, st_ino)` identity of the file it
+/// named when the scope was opened (`None` when `fstat` failed then, which
+/// makes every writer spawn under this token refuse). The child re-checks the
+/// identity before duplicating the descriptor, so a descriptor number that was
+/// closed and reused for another file is never handed to a writer as the lock.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ChildLockToken {
+    pub(crate) fd: std::os::fd::RawFd,
+    pub(crate) identity: Option<(libc::dev_t, libc::ino_t)>,
+}
+
+/// `(st_dev, st_ino)` of the open file `fd` names, or `None` when `fstat`
+/// fails.
+#[cfg(unix)]
+pub(crate) fn fd_identity(fd: std::os::fd::RawFd) -> Option<(libc::dev_t, libc::ino_t)> {
+    // SAFETY: a zeroed `stat` is a valid out-parameter; fstat only reads the
+    // descriptor's metadata and changes nothing.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        (libc::fstat(fd, &mut st) == 0).then_some((st.st_dev, st.st_ino))
+    }
+}
+
+/// What a writer `sqlite3` child inherits from the migration lock: the locked
+/// descriptor on Unix; on Windows only the fact that a lock is held.
+#[cfg(not(unix))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ChildLockToken;
+
+thread_local! {
+    /// The migration lock writer children spawned on THIS thread inherit; set
+    /// only by a live [`ChildLockScope`], which borrows the guard that owns it.
+    static CHILD_LOCK: std::cell::Cell<Option<ChildLockToken>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Makes a held [`CodexShareLockGuard`] the lock every writer repair/merge
+/// `sqlite3` child spawned on this thread inherits, until the scope drops.
+///
+/// The scope BORROWS the guard, so the locked descriptor cannot be closed
+/// while the scope exists, and it is `!Send`, so it is set and cleared on the
+/// same thread. On drop the previous value is restored only while the slot
+/// still holds THIS scope's own token (properly nested scopes); a scope
+/// dropped out of order clears the slot instead, so the slot never names a
+/// descriptor that a still-live scope did not install.
+pub(crate) struct ChildLockScope<'a> {
+    _lock: &'a CodexShareLockGuard,
+    token: ChildLockToken,
+    previous: Option<ChildLockToken>,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl CodexShareLockGuard {
+    /// Hold this lock for writer children spawned on this thread (see
+    /// [`ChildLockScope`]).
+    pub(crate) fn hold_for_children(&self) -> ChildLockScope<'_> {
+        #[cfg(unix)]
+        let token = {
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&self._file);
+            ChildLockToken {
+                fd,
+                identity: fd_identity(fd),
+            }
+        };
+        #[cfg(not(unix))]
+        let token = ChildLockToken;
+        ChildLockScope {
+            _lock: self,
+            token,
+            previous: CHILD_LOCK.with(|held| held.replace(Some(token))),
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for ChildLockScope<'_> {
+    fn drop(&mut self) {
+        CHILD_LOCK.with(|held| {
+            if held.get() == Some(self.token) {
+                held.set(self.previous);
+            } else {
+                held.set(None);
+            }
+        });
+    }
+}
+
+/// Test seam: run `f` with `token` installed as this thread's child lock,
+/// restoring the previous value afterwards (lets a test hand
+/// `RepairChild::spawn` a descriptor or identity no real guard produces).
+#[cfg(all(test, unix))]
+pub(crate) fn with_child_lock_token_for_test<T>(token: ChildLockToken, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<ChildLockToken>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CHILD_LOCK.with(|held| held.set(self.0));
+        }
+    }
+    let _restore = Restore(CHILD_LOCK.with(|held| held.replace(Some(token))));
+    f()
+}
+
+/// The lock a writer child spawned on this thread must inherit, if any.
+pub(crate) fn held_child_lock() -> Option<ChildLockToken> {
+    CHILD_LOCK.with(std::cell::Cell::get)
 }
 
 /// `<base>/shared-state/codex/.share.lock` — created (never unlinked) the
@@ -1033,15 +1185,70 @@ fn list_running_processes() -> Result<Vec<(u32, String)>, String> {
         .collect())
 }
 
+/// The Windows system directory from `GetSystemDirectoryW`, or `None` when
+/// the call fails, returns empty, or yields a non-absolute path.
+#[cfg(windows)]
+fn windows_system_directory() -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buf = [0u16; 520];
+    // SAFETY: `buf` is a live, writable buffer of `buf.len()` u16 units and
+    // the length passed is exactly that.
+    let n = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    // 0 = failure; n >= len = buffer too small (the value is the needed size).
+    if n == 0 || n >= buf.len() {
+        return None;
+    }
+    let dir = std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..n]));
+    dir.is_absolute().then_some(dir)
+}
+
+/// The Windows directory from `GetSystemWindowsDirectoryW`, or `None` when
+/// the call fails, returns empty, or yields a non-absolute path.
+#[cfg(windows)]
+fn windows_directory() -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+    let mut buf = [0u16; 520];
+    // SAFETY: `buf` is a live, writable buffer of `buf.len()` u16 units and
+    // the length passed is exactly that.
+    let n = unsafe { GetSystemWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if n == 0 || n >= buf.len() {
+        return None;
+    }
+    let dir = std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..n]));
+    dir.is_absolute().then_some(dir)
+}
+
 #[cfg(windows)]
 fn list_running_processes() -> Result<Vec<(u32, String)>, String> {
     // S-L4: env_clear so an inherited env var cannot alter `tasklist`'s
-    // output format or locale out from under this parser. `tasklist.exe`
-    // lives in `%SystemRoot%\System32`, which Windows searches before
-    // consulting `PATH` for process creation, so clearing `PATH` here does
-    // not risk failing to resolve it.
-    let output = std::process::Command::new("tasklist")
-        .env_clear()
+    // output format or locale out from under this parser — but `SystemRoot`
+    // and `WINDIR` are put back: `tasklist` enumerates through WMI/COM, which
+    // cannot initialise in a process with no `SystemRoot` (Windows CI run
+    // 38993121327, `live_writer_refuses_and_leaves_originals_untouched`).
+    // The binary is resolved from `GetSystemDirectoryW`, NOT from an
+    // environment variable: the process environment is attacker-influenced
+    // input to a guard this module's destructive rename path depends on
+    // (S-F6, as `/bin/ps` is on unix). A failed call, or a result that is
+    // empty or not absolute, is an `Err` — fail closed, never a bare-name
+    // lookup. The error text is fixed wording and carries no path.
+    let system_dir = windows_system_directory().ok_or_else(|| {
+        "could not resolve the Windows system directory; cannot locate `tasklist`".to_string()
+    })?;
+    let tasklist = system_dir.join("tasklist.exe");
+    let mut command = std::process::Command::new(&tasklist);
+    command.env_clear();
+    // WMI needs SystemRoot; WINDIR is the same value on a stock host. Both
+    // come from `GetSystemWindowsDirectoryW`, never from the environment
+    // (attacker-influenced input to a guard on a destructive path). A failed,
+    // empty or non-absolute result is an `Err`; the text carries no path.
+    let windows_dir = windows_directory().ok_or_else(|| {
+        "could not resolve the Windows directory; cannot run `tasklist`".to_string()
+    })?;
+    command.env("SystemRoot", &windows_dir);
+    command.env("WINDIR", &windows_dir);
+    let output = command
         .args(["/FO", "CSV", "/NH"])
         .output()
         .map_err(|e| format!("could not run `tasklist`: {e}"))?;
@@ -1326,11 +1533,13 @@ fn refuse_if_any_live(live: Vec<LiveWriter>, surface: Surface) -> Result<(), Sha
 /// `Ok` before formatting anything for an empty list) means the pre-lock
 /// scan found no evidence even though the lock itself is still contended —
 /// worth saying plainly, since it means the holder is not a session this
-/// scan can see (a stale lock, or another `csq sessions share` run).
+/// scan can see (another `csq sessions share` run, or a sqlite3 writer left
+/// behind by an interrupted csq run).
 fn format_live_writer_pids(live: &[LiveWriter]) -> String {
     if live.is_empty() {
         return "none identified by the pre-lock scan (the holder may be a process without \
-                 handle-dir bookkeeping, or another `csq sessions share` invocation)"
+                 handle-dir bookkeeping, another `csq sessions share` invocation, or a \
+                 sqlite3 writer left behind by an interrupted `csq sessions share` or csq run)"
             .to_string();
     }
     live.iter()
@@ -1392,11 +1601,15 @@ pub fn share_codex_surface_and_sqlite(
     dry_run: bool,
     force: bool,
 ) -> Result<(Vec<SlotReport>, codex_sqlite::CodexSqliteReport), ShareError> {
-    let _share_lock = if dry_run {
+    let share_lock = if dry_run {
         None
     } else {
         Some(acquire_codex_share_lock_exclusive_bounded_reporting(base)?)
     };
+    // Every writer sqlite3 child below inherits the lock (see `RepairChild`).
+    let _children = share_lock
+        .as_ref()
+        .map(CodexShareLockGuard::hold_for_children);
     if !dry_run {
         ensure_no_live_writers(base, Surface::Codex, force)?;
     }
@@ -1979,9 +2192,22 @@ pub mod codex_sqlite {
         name: &str,
         is_executable: impl Fn(&Path) -> bool,
     ) -> Option<PathBuf> {
+        find_executable_in_dirs_for_platform(dirs, name, is_executable, cfg!(windows))
+    }
+
+    pub(super) fn find_executable_in_dirs_for_platform(
+        dirs: impl Iterator<Item = PathBuf>,
+        name: &str,
+        is_executable: impl Fn(&Path) -> bool,
+        windows: bool,
+    ) -> Option<PathBuf> {
         dirs.filter(|dir| !dir.as_os_str().is_empty() && dir.is_absolute())
             .find_map(|dir| {
-                let candidate = dir.join(name);
+                let candidate = dir.join(if windows && name == "sqlite3" {
+                    "sqlite3.exe"
+                } else {
+                    name
+                });
                 is_executable(&candidate).then_some(candidate)
             })
     }
@@ -2031,12 +2257,1486 @@ pub mod codex_sqlite {
         resolve_with(&RealProbe)
     }
 
+    /// Read-only admission. The embedding process must keep SIGCHLD policy
+    /// stable and must not reap this runner's children while repair is in flight.
+    /// Admission cannot prevent another component changing policy later.
+    #[cfg(unix)]
+    fn repair_child_wait_policy_safe() -> bool {
+        // SAFETY: null input only queries SIGCHLD; initialized output is owned.
+        // This never changes host signal policy or reaps a child.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) == 0
+                && action.sa_sigaction != libc::SIG_IGN
+                && action.sa_flags & libc::SA_NOCLDWAIT == 0
+        }
+    }
+
+    const REPAIR_IO_CAP: usize = 1024 * 1024;
+
+    /// A fresh end-of-script marker for one writer run: `csq-end-` plus 16 hex
+    /// digits from a per-call randomly keyed hash, so database content cannot
+    /// predict (and so cannot print) it.
+    pub(super) fn writer_end_marker() -> String {
+        use std::hash::{BuildHasher, Hasher};
+        static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        hasher.write_u32(std::process::id());
+        format!("csq-end-{:016x}", hasher.finish())
+    }
+
+    /// The statement a writer script ends with: it prints `marker` only once
+    /// every earlier statement ran (the shell stops at the first error).
+    fn writer_end_statement(marker: &str) -> String {
+        format!("SELECT '{marker}';")
+    }
+
+    /// `stdout` with its final line removed, when that final line is exactly
+    /// `marker`; `None` otherwise. A writer whose stdout lacks the marker did
+    /// not execute its whole script, whatever its exit status: a pipe write
+    /// proves only that the bytes were buffered, never that they were read.
+    pub(super) fn strip_writer_end_marker(stdout: &str, marker: &str) -> Option<String> {
+        let body = stdout.strip_suffix('\n').unwrap_or(stdout);
+        let body = body.strip_suffix('\r').unwrap_or(body);
+        let (rest, last) = match body.rfind('\n') {
+            Some(at) => (&body[..=at], &body[at + 1..]),
+            None => ("", body),
+        };
+        (last == marker).then(|| rest.to_owned())
+    }
+
+    /// The fixed detail for a writer spawn refused by `RepairChild::spawn`'s
+    /// own lock checks, or `None` for any other spawn failure.
+    pub(super) fn writer_spawn_refusal_detail(error: &io::Error) -> Option<&'static str> {
+        let text = error.to_string();
+        if text == repair_child::UNLOCKED_WRITER_DETAIL {
+            return Some(repair_child::UNLOCKED_WRITER_DETAIL);
+        }
+        #[cfg(unix)]
+        {
+            if text == repair_child::UNUSABLE_LOCK_DETAIL {
+                return Some(repair_child::UNUSABLE_LOCK_DETAIL);
+            }
+            // Only `RepairChild::spawn`'s own classification produces this
+            // text (an ESTALE confirmed against the descriptor); a bare
+            // ESTALE from any other spawn or execve failure is not mapped.
+            if text == repair_child::LOCK_IDENTITY_MISMATCH_DETAIL {
+                return Some(repair_child::LOCK_IDENTITY_MISMATCH_DETAIL);
+            }
+        }
+        None
+    }
+
+    /// The launch runner's largest accepted script, in bytes (the generators
+    /// batch at `PAGED_BATCH_BYTES`, a sixth of this).
+    const REPAIR_SCRIPT_CAP: usize = 60_000;
+
+    /// The bounded runner's own deadline detail — the pre-spawn refusal and the
+    /// wait-loop kill both carry exactly this. Named once because
+    /// [`is_bounded_deadline_refusal`] matches it EXACTLY: the runner's other
+    /// details embed the child's stderr, which quotes database content (a
+    /// `rollout_path` may contain the word "deadline"), and a substring match
+    /// would let that content steer which refusal class an operator is told to
+    /// act on.
+    pub(super) const ROLLOUT_REPAIR_DEADLINE_DETAIL: &str = "rollout repair deadline";
+
+    /// Both runners' detail for a writer that exited 0 without printing its
+    /// end marker: it did not execute its whole script.
+    pub(super) const WRITER_NOT_FULLY_EXECUTED_DETAIL: &str =
+        "sqlite3 writer exited without running its whole script";
+
+    /// Both runners deliver statements one per stdin line, never in argv; the
+    /// bail probe mirrors that shape.
+    type BailKey = (PathBuf, u64, Option<std::time::SystemTime>);
+
+    fn bail_cache() -> &'static std::sync::Mutex<std::collections::HashSet<BailKey>> {
+        static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<BailKey>>> =
+            std::sync::OnceLock::new();
+        CACHE.get_or_init(Default::default)
+    }
+
+    fn bail_key(binary: &Path) -> Option<BailKey> {
+        let meta = std::fs::metadata(binary).ok()?;
+        Some((binary.to_path_buf(), meta.len(), meta.modified().ok()))
+    }
+
+    /// Run a script of three statements on a scratch `:memory:` database under
+    /// `-bail`: a table with a named CHECK, an INSERT that violates it, then a
+    /// SELECT that prints a marker. True only when the shell exits non-zero AND
+    /// never printed the marker, i.e. it really stopped at the first error. A
+    /// probe that cannot run is a failed probe.
+    pub(super) fn probe_stops_at_first_error(binary: &Path) -> bool {
+        use std::time::{Duration, Instant};
+        // The probe observes its child with `waitid(WNOWAIT)` like the runner:
+        // an auto-reaping SIGCHLD policy fails the probe (closed), never runs it.
+        #[cfg(unix)]
+        if !repair_child_wait_policy_safe() {
+            return false;
+        }
+        let statements = [
+            "CREATE TABLE csq_probe(ok INTEGER CONSTRAINT csq_probe_guard CHECK (ok IS 1));",
+            "INSERT INTO csq_probe VALUES (0);",
+            "SELECT 'csq_probe_reached';",
+        ];
+        let null_rc = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        let mut command = Command::new(binary);
+        command
+            .args([
+                "-init",
+                null_rc,
+                "-batch",
+                "-noheader",
+                "-list",
+                "-bail",
+                ":memory:",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        // Own process group: a probe shell that forks a descendant holding
+        // stdout is killed with that descendant (see `RepairChild::spawn`).
+        // A `:memory:` probe writes no database, so it inherits no lock.
+        let Ok(mut child) = RepairChild::spawn(&mut command, ChildRole::Reader) else {
+            return false;
+        };
+        {
+            // The three statements are far below any pipe buffer, so this
+            // write cannot block; dropping the pipe ends the shell's input.
+            let Some(mut stdin) = child.take_stdin() else {
+                return false;
+            };
+            if stdin.write_all(statements.join("\n").as_bytes()).is_err() {
+                return false;
+            }
+        }
+        let Some(mut stdout) = child.take_stdout() else {
+            return false;
+        };
+        if set_repair_pipe_nonblocking(&stdout).is_err() {
+            return false;
+        }
+        // ONE enforced 5s deadline covers the exit AND the drain of stdout: a
+        // descendant that inherited stdout and outlives the shell can no longer
+        // hold this read open. On expiry (or any failure) `RepairChild`'s drop
+        // kills the process group and reaps within REPAIR_CHILD_CLEANUP_GRACE.
+        let deadline = Instant::now() + PROBE_BUDGET;
+        let mut out = Vec::new();
+        let mut eof = false;
+        loop {
+            if drain_repair_pipe(&mut stdout, &mut out, &mut eof, REPAIR_IO_CAP).is_err() {
+                return false;
+            }
+            match child.exited() {
+                Ok(true) if eof => break,
+                Ok(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                _ => return false,
+            }
+        }
+        let Ok(status) = child.wait() else {
+            return false;
+        };
+        !status.success() && !String::from_utf8_lossy(&out).contains("csq_probe_reached")
+    }
+
+    /// The bail probe's enforced bound: exit plus stdout drain, one window.
+    const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// How long a dropped, still-unreaped repair or probe child is given to be
+    /// reaped after its process group is killed.
+    const REPAIR_CHILD_CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+
+    #[cfg(test)]
+    pub(super) use repair_child::resumed_writer_may_run;
+    #[cfg(all(test, unix))]
+    pub(super) use repair_child::{
+        drop_signal_paths, lock_identity_refusal, LOCK_IDENTITY_MISMATCH_DETAIL,
+        LOCK_IDENTITY_MISMATCH_ERRNO, UNLOCKED_WRITER_DETAIL, UNUSABLE_LOCK_DETAIL,
+    };
+    #[cfg(all(test, windows))]
+    pub(super) use repair_child::{resume_threads, spawn_suspended_in_job};
+    pub(super) use repair_child::{ChildRole, RepairChild};
+
+    /// The ONLY constructor of a repair/probe/merge `sqlite3` child lives here,
+    /// so no call site can spawn one outside its own process group or, for a
+    /// writer, without inheriting the migration lock (the struct's fields are
+    /// private to this module).
+    mod repair_child {
+        use super::REPAIR_CHILD_CLEANUP_GRACE;
+        use std::io;
+        use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus};
+
+        /// The fixed detail a writer spawn refuses with when this thread holds
+        /// no migration lock (`super::super::ChildLockScope`).
+        pub(in super::super) const UNLOCKED_WRITER_DETAIL: &str =
+            "repair writer refused: migration lock not held";
+
+        /// The fixed detail a writer spawn refuses with when the held lock
+        /// token is not a descriptor a child can inherit as the lock: a
+        /// standard-stream number (0-2, which the child's own stdio setup
+        /// overwrites before `exec`) or an identity `fstat` could not read.
+        #[cfg(unix)]
+        pub(in super::super) const UNUSABLE_LOCK_DETAIL: &str =
+            "repair writer refused: migration lock descriptor unusable";
+
+        /// The errno a writer child exits its `pre_exec` with when the lock
+        /// descriptor no longer names the file the scope recorded (closed and
+        /// reused), BEFORE it is duplicated. Distinct from every errno the
+        /// other `pre_exec` steps can return, so the refusal is identifiable.
+        #[cfg(unix)]
+        pub(in super::super) const LOCK_IDENTITY_MISMATCH_ERRNO: i32 = libc::ESTALE;
+
+        /// The error text `RepairChild::spawn` returns (and a runner reports)
+        /// for a writer whose lock descriptor failed the in-child identity
+        /// check: a [`LOCK_IDENTITY_MISMATCH_ERRNO`] spawn failure that the
+        /// parent confirms by re-reading the descriptor's identity
+        /// ([`lock_identity_refusal`]).
+        #[cfg(unix)]
+        pub(in super::super) const LOCK_IDENTITY_MISMATCH_DETAIL: &str =
+            "repair writer refused: migration lock descriptor no longer names the lock file";
+
+        /// Whether a writer spawn failure is the in-child lock-identity
+        /// refusal: its errno is [`LOCK_IDENTITY_MISMATCH_ERRNO`] AND the
+        /// descriptor's identity read again in the parent (`now`) no longer
+        /// equals the recorded one. ESTALE with the descriptor still naming
+        /// the lock file came from somewhere else (e.g. `execve` on a stale
+        /// NFS handle) and is NOT this refusal.
+        /// A Unix spawn failure, with a confirmed lock-identity refusal
+        /// ([`lock_identity_refusal`]) replaced by
+        /// [`LOCK_IDENTITY_MISMATCH_DETAIL`]; any other error is unchanged.
+        #[cfg(unix)]
+        fn writer_spawn_error(
+            error: io::Error,
+            role: ChildRole,
+            lock: Option<super::super::ChildLockToken>,
+        ) -> io::Error {
+            match (role, lock) {
+                (ChildRole::Writer, Some(token)) => {
+                    let now = super::super::fd_identity(token.fd);
+                    if lock_identity_refusal(error.raw_os_error(), token.identity, now) {
+                        io::Error::other(LOCK_IDENTITY_MISMATCH_DETAIL)
+                    } else {
+                        error
+                    }
+                }
+                _ => error,
+            }
+        }
+
+        #[cfg(unix)]
+        pub(in super::super) fn lock_identity_refusal(
+            errno: Option<i32>,
+            recorded: Option<(libc::dev_t, libc::ino_t)>,
+            now: Option<(libc::dev_t, libc::ino_t)>,
+        ) -> bool {
+            errno == Some(LOCK_IDENTITY_MISMATCH_ERRNO) && recorded.is_some() && now != recorded
+        }
+
+        /// Whether a child may write a database.
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        pub(in super::super) enum ChildRole {
+            /// May write the Codex database: inherits the migration lock and
+            /// refuses to spawn without one.
+            Writer,
+            /// `-readonly` inspection or a `:memory:` probe: inherits nothing.
+            Reader,
+        }
+
+        /// A spawned repair/probe/merge `sqlite3` child that, when dropped
+        /// unreaped, is killed and reaped within [`REPAIR_CHILD_CLEANUP_GRACE`].
+        /// On Unix the child is the leader of its own process group
+        /// (`process_group(0)`) and the WHOLE group is `SIGKILL`ed, so a shell
+        /// that forked a descendant holding a pipe does not leave it running. The
+        /// exit is observed with `waitid(WNOWAIT)` ([`RepairChild::exited`]) so
+        /// the leader is never reaped before the group is signalled: an unreaped
+        /// leader keeps its pid reserved as the group id, and once
+        /// [`RepairChild::wait`] reaps it no signal or wait is ever issued for
+        /// that pid again (`reaped`).
+        ///
+        /// On Unix a [`ChildRole::Writer`] child inherits a descriptor of the
+        /// migration lock's open file description. `flock` ownership belongs to
+        /// that description, so the lock stays held until the LAST holder closes
+        /// it: csq releasing its own guard, or dying by any signal including
+        /// `SIGKILL`, does not release the lock while this child or any
+        /// descendant that inherited the descriptor is still running. Another
+        /// csq therefore cannot take the exclusive lock while an orphaned writer
+        /// is still writing. Because the child is in its own process group a
+        /// terminal interrupt is not forwarded to it, and each write batch is
+        /// one transaction that commits or rolls back whole.
+        ///
+        /// The runner's deadline is enforced only WHILE CSQ LIVES: it is the
+        /// runner's own loop plus this type's drop, both in csq. What bounds a
+        /// writer after csq dies is, per platform:
+        /// - Linux: `PR_SET_PDEATHSIG(SIGKILL)`, armed in the writer's
+        ///   `pre_exec` (with a `getppid` check for a parent that died before
+        ///   it was armed). The kernel kills the writer when the THREAD that
+        ///   forked it dies; every runner spawns, waits and drops its child on
+        ///   one thread, so that thread outlives the child's useful life. The
+        ///   killed writer's open transaction is rolled back by SQLite on the
+        ///   next open, and the lock is released with the writer.
+        /// - macOS and other Unix: no death signal exists. Every writer reads
+        ///   its script on stdin (never argv). A launch batch normally fits one
+        ///   pipe buffer and is delivered WHOLE at spawn, so an orphan runs its
+        ///   whole batch to its end, bounded only by its own work and each lock
+        ///   wait's `PRAGMA busy_timeout` ([`super::SQLITE_BUSY_TIMEOUT_MS`]),
+        ///   with the lock held throughout so no other migration can start
+        ///   (fail-closed); every batch is one transaction csq itself would
+        ///   have run. Only a script larger than the pipe buffer is cut short
+        ///   by csq's death: its undelivered remainder ends at EOF and the open
+        ///   transaction rolls back.
+        /// - Windows: `LockFileEx` locks belong to the handle, not an
+        ///   inheritable description, so a writer only refuses to spawn without
+        ///   a held lock. Each writer is created suspended (`CREATE_SUSPENDED`),
+        ///   assigned to a Job Object created with
+        ///   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` whose only handle csq owns,
+        ///   and only then resumed, so it executes nothing outside the job:
+        ///   csq's termination closes the job and the system kills the writer,
+        ///   and csq dying before the assignment leaves a process that never
+        ///   runs. A writer that cannot be assigned or resumed is terminated,
+        ///   reaped and refused.
+        pub(in super::super) struct RepairChild {
+            child: Child,
+            reaped: bool,
+            /// Windows writers only: the Job Object the child is assigned to.
+            /// Declared after `child`, so `Drop` kills and reaps the child
+            /// before this closes the job's last handle.
+            #[cfg(windows)]
+            _job: Option<WriterJob>,
+        }
+
+        /// The fixed detail a Windows writer spawn refuses with when its Job
+        /// Object cannot be created, configured or assigned.
+        #[cfg(windows)]
+        pub(in super::super) const WRITER_JOB_DETAIL: &str =
+            "repair writer refused: could not confine the writer to a kill-on-close job";
+
+        /// A Job Object created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Its
+        /// handle is never inherited or duplicated, so it is csq's only handle:
+        /// closing it, by this drop or by the system when csq terminates for
+        /// any reason, kills every process still assigned to the job.
+        #[cfg(windows)]
+        pub(in super::super) struct WriterJob(windows_sys::Win32::Foundation::HANDLE);
+
+        #[cfg(windows)]
+        impl WriterJob {
+            /// Create and configure the job, or refuse (never a job without the
+            /// kill-on-close limit).
+            fn create() -> io::Result<Self> {
+                use windows_sys::Win32::System::JobObjects::{
+                    CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+                    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                };
+                // SAFETY: null attributes (a non-inheritable handle) and a null
+                // name (an unnamed job no other process can open by name).
+                let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+                if handle == 0 {
+                    return Err(io::Error::other(WRITER_JOB_DETAIL));
+                }
+                let job = Self(handle);
+                // SAFETY: a zeroed limit struct is valid; only the flag is set,
+                // and the pointer/length describe exactly that struct.
+                let configured = unsafe {
+                    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                    SetInformationJobObject(
+                        job.0,
+                        JobObjectExtendedLimitInformation,
+                        std::ptr::addr_of!(limits).cast(),
+                        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                    )
+                };
+                if configured == 0 {
+                    return Err(io::Error::other(WRITER_JOB_DETAIL));
+                }
+                Ok(job)
+            }
+
+            /// Whether `child` is a member of this job (`IsProcessInJob`).
+            #[cfg(test)]
+            pub(in super::super) fn contains(&self, child: &Child) -> io::Result<bool> {
+                use std::os::windows::io::AsRawHandle;
+                use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+                let mut member = 0;
+                // SAFETY: both handles are open for this call; `member` is a
+                // valid out-parameter.
+                let ok = unsafe {
+                    IsProcessInJob(
+                        child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+                        self.0,
+                        &mut member,
+                    )
+                };
+                if ok == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(member != 0)
+            }
+
+            /// Assign `child` to this job.
+            fn assign(&self, child: &Child) -> io::Result<()> {
+                use std::os::windows::io::AsRawHandle;
+                use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+                // SAFETY: both handles are open: the job is owned by `self`, the
+                // process handle by `child`, which outlives this call.
+                let assigned = unsafe {
+                    AssignProcessToJobObject(
+                        self.0,
+                        child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+                    )
+                };
+                if assigned == 0 {
+                    return Err(io::Error::other(WRITER_JOB_DETAIL));
+                }
+                Ok(())
+            }
+        }
+
+        /// Spawn `command` SUSPENDED (`CREATE_SUSPENDED`) and assign it to a
+        /// fresh kill-on-close [`WriterJob`] created before the spawn. The
+        /// child has executed nothing when this returns; a failed assignment
+        /// terminates and reaps it and refuses.
+        #[cfg(windows)]
+        pub(in super::super) fn spawn_suspended_in_job(
+            command: &mut std::process::Command,
+        ) -> io::Result<(Child, WriterJob)> {
+            std::os::windows::process::CommandExt::creation_flags(
+                command,
+                windows_sys::Win32::System::Threading::CREATE_SUSPENDED,
+            );
+            let job = WriterJob::create()?;
+            let mut child = command.spawn()?;
+            if let Err(error) = job.assign(&child) {
+                // Fail closed: an unconfined writer is terminated
+                // (`Child::kill` is `TerminateProcess`) and reaped, never run.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+            Ok((child, job))
+        }
+
+        /// Whether a suspended writer may run: every thread csq found for it
+        /// was resumed from a suspend count of exactly 1 (`ResumeThread`
+        /// returns the PREVIOUS count). No thread found, a failed resume
+        /// (`u32::MAX`), a thread that was not suspended (0) or one still
+        /// suspended after the resume (> 1) all refuse.
+        #[cfg(any(windows, test))]
+        pub(in super::super) fn resumed_writer_may_run(previous_counts: &[u32]) -> bool {
+            !previous_counts.is_empty() && previous_counts.iter().all(|&count| count == 1)
+        }
+
+        /// Resume every thread of the suspended `child` (enumerated with a
+        /// Toolhelp thread snapshot filtered by its pid), or refuse with
+        /// [`WRITER_JOB_DETAIL`] per [`resumed_writer_may_run`].
+        #[cfg(windows)]
+        pub(in super::super) fn resume_threads(child: &Child) -> io::Result<()> {
+            use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+            use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD,
+                THREADENTRY32,
+            };
+            use windows_sys::Win32::System::Threading::{
+                OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+            };
+            let pid = child.id();
+            let refuse = || io::Error::other(WRITER_JOB_DETAIL);
+            // SAFETY: a thread snapshot of the system; the handle is checked
+            // and closed below on every path.
+            let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+            if snapshot == INVALID_HANDLE_VALUE || snapshot == 0 {
+                return Err(refuse());
+            }
+            let mut previous_counts = Vec::new();
+            // SAFETY: a zeroed THREADENTRY32 with `dwSize` set is the
+            // documented input; the snapshot handle is open.
+            let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+            entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            let mut more = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+            while more {
+                if entry.th32OwnerProcessID == pid {
+                    // SAFETY: OpenThread on a thread id from the snapshot; a
+                    // null handle (failure) is recorded as a failed resume.
+                    let thread =
+                        unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                    if thread == 0 {
+                        previous_counts.push(u32::MAX);
+                    } else {
+                        // SAFETY: `thread` is an open handle with
+                        // THREAD_SUSPEND_RESUME, closed right after.
+                        previous_counts.push(unsafe { ResumeThread(thread) });
+                        unsafe { CloseHandle(thread) };
+                    }
+                }
+                // SAFETY: as for Thread32First.
+                more = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+            }
+            // SAFETY: the snapshot handle is owned here and closed once.
+            unsafe { CloseHandle(snapshot) };
+            if resumed_writer_may_run(&previous_counts) {
+                Ok(())
+            } else {
+                Err(refuse())
+            }
+        }
+
+        #[cfg(windows)]
+        impl Drop for WriterJob {
+            fn drop(&mut self) {
+                // SAFETY: the handle is owned by this value and closed once.
+                // A failed close leaves nothing this drop could do instead.
+                unsafe {
+                    windows_sys::Win32::Foundation::CloseHandle(self.0);
+                }
+            }
+        }
+
+        #[cfg(all(test, unix))]
+        thread_local! {
+            /// Drops of this thread's children that reached the signal path.
+            static DROP_SIGNAL_PATHS: std::cell::Cell<usize> =
+                const { std::cell::Cell::new(0) };
+        }
+
+        /// Number of this thread's `RepairChild` drops that reached the
+        /// waitid/kill path (test inspection).
+        #[cfg(all(test, unix))]
+        pub(in super::super) fn drop_signal_paths() -> usize {
+            DROP_SIGNAL_PATHS.with(std::cell::Cell::get)
+        }
+
+        impl RepairChild {
+            /// Spawn `command` as its own process-group leader (Unix). A
+            /// [`ChildRole::Writer`] fails closed with
+            /// [`UNLOCKED_WRITER_DETAIL`] when this thread holds no migration
+            /// lock, and on Unix inherits a non-`CLOEXEC` duplicate of the
+            /// locked descriptor: a token naming fd 0-2 or with no recorded
+            /// identity refuses before fork (`UNUSABLE_LOCK_DETAIL`), and
+            /// the child `fstat`s the descriptor before duplicating it,
+            /// failing with `LOCK_IDENTITY_MISMATCH_ERRNO` when it no longer
+            /// names the recorded file; the parent reports that as
+            /// `LOCK_IDENTITY_MISMATCH_DETAIL` only after re-reading the
+            /// descriptor's identity (`lock_identity_refusal`). On Linux the writer also
+            /// arms `PR_SET_PDEATHSIG` (see the type's docs).
+            pub(in super::super) fn spawn(
+                command: &mut Command,
+                role: ChildRole,
+            ) -> io::Result<Self> {
+                let lock = super::super::held_child_lock();
+                if role == ChildRole::Writer && lock.is_none() {
+                    return Err(io::Error::other(UNLOCKED_WRITER_DETAIL));
+                }
+                #[cfg(unix)]
+                {
+                    std::os::unix::process::CommandExt::process_group(command, 0);
+                    if let (ChildRole::Writer, Some(token)) = (role, lock) {
+                        let fd = token.fd;
+                        let Some(identity) = token.identity else {
+                            return Err(io::Error::other(UNUSABLE_LOCK_DETAIL));
+                        };
+                        if fd <= 2 {
+                            return Err(io::Error::other(UNUSABLE_LOCK_DETAIL));
+                        }
+                        // Captured before fork: the child compares its parent
+                        // with it after arming the death signal.
+                        #[cfg(any(target_os = "linux", target_os = "android"))]
+                        // SAFETY: getpid only queries.
+                        let parent = unsafe { libc::getpid() };
+                        // SAFETY: the closure runs between fork and exec and
+                        // calls only `prctl`, `getppid`, `_exit`, `fcntl` and
+                        // `fstat`, which are async-signal-safe; it allocates
+                        // nothing (the errors are raw OS codes). `fd` stays open in the
+                        // parent for the whole spawn: the `ChildLockScope`
+                        // that published it borrows the guard owning it, on
+                        // this thread.
+                        unsafe {
+                            std::os::unix::process::CommandExt::pre_exec(command, move || {
+                                // Linux: the kernel SIGKILLs this writer when
+                                // the thread that forked it dies, so an orphan
+                                // stops holding the inherited lock with csq.
+                                // A parent that died before `prctl` armed it
+                                // is caught by the `getppid` comparison: the
+                                // child exits instead of running orphaned.
+                                #[cfg(any(target_os = "linux", target_os = "android"))]
+                                {
+                                    if libc::prctl(
+                                        libc::PR_SET_PDEATHSIG,
+                                        libc::SIGKILL as libc::c_ulong,
+                                        0,
+                                        0,
+                                        0,
+                                    ) == -1
+                                    {
+                                        return Err(io::Error::last_os_error());
+                                    }
+                                    if libc::getppid() != parent {
+                                        libc::_exit(127);
+                                    }
+                                }
+                                if libc::fcntl(fd, libc::F_GETFD) == -1 {
+                                    return Err(io::Error::last_os_error());
+                                }
+                                // The descriptor must still name the file the
+                                // scope recorded, checked BEFORE it is
+                                // duplicated into the writer.
+                                let mut st: libc::stat = std::mem::zeroed();
+                                if libc::fstat(fd, &mut st) == -1 {
+                                    return Err(io::Error::last_os_error());
+                                }
+                                if (st.st_dev, st.st_ino) != identity {
+                                    return Err(io::Error::from_raw_os_error(
+                                        LOCK_IDENTITY_MISMATCH_ERRNO,
+                                    ));
+                                }
+                                // F_DUPFD (never F_DUPFD_CLOEXEC): the duplicate
+                                // survives exec and shares the locked description.
+                                if libc::fcntl(fd, libc::F_DUPFD, 3) == -1 {
+                                    return Err(io::Error::last_os_error());
+                                }
+                                Ok(())
+                            });
+                        }
+                    }
+                }
+                // Windows: the writer's job exists, kill-on-close, BEFORE the
+                // spawn, and the writer is created SUSPENDED: it executes no
+                // instruction until it is in the job, and only then are its
+                // threads resumed. csq dying before the assignment leaves a
+                // process that never runs; after it, the job's close kills it.
+                #[cfg(windows)]
+                let (child, job) = if role == ChildRole::Writer {
+                    let (mut child, job) = spawn_suspended_in_job(command)?;
+                    if let Err(error) = resume_threads(&child) {
+                        // Fail closed: an unresumable writer is terminated
+                        // (`Child::kill` is `TerminateProcess`) and reaped.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(error);
+                    }
+                    (child, Some(job))
+                } else {
+                    (command.spawn()?, None)
+                };
+                #[cfg(unix)]
+                let child = command
+                    .spawn()
+                    .map_err(|e| writer_spawn_error(e, role, lock))?;
+                #[cfg(not(any(unix, windows)))]
+                let child = command.spawn()?;
+                Ok(Self {
+                    child,
+                    reaped: false,
+                    #[cfg(windows)]
+                    _job: job,
+                })
+            }
+
+            /// Whether this Windows writer is a member of its job (test
+            /// inspection; `false` for a child with no job).
+            #[cfg(all(test, windows))]
+            pub(in super::super) fn in_writer_job(&self) -> io::Result<bool> {
+                match &self._job {
+                    Some(job) => job.contains(&self.child),
+                    None => Ok(false),
+                }
+            }
+
+            /// The child's pid (test inspection), as the PARENT observed it at
+            /// spawn. The one race-free source for a test that needs it: a pid
+            /// the child writes to a file cannot exist when a deadline kills
+            /// the child before its first scheduling.
+            #[cfg(all(test, unix))]
+            pub(in super::super) fn id(&self) -> u32 {
+                self.child.id()
+            }
+
+            pub(in super::super) fn take_stdin(&mut self) -> Option<ChildStdin> {
+                self.child.stdin.take()
+            }
+
+            pub(in super::super) fn take_stdout(&mut self) -> Option<ChildStdout> {
+                self.child.stdout.take()
+            }
+
+            pub(in super::super) fn take_stderr(&mut self) -> Option<ChildStderr> {
+                self.child.stderr.take()
+            }
+
+            /// True once the child has exited. On Unix the exit is observed
+            /// WITHOUT reaping, keeping the pid reserved for the group kill.
+            pub(in super::super) fn exited(&mut self) -> io::Result<bool> {
+                if self.reaped {
+                    return Ok(true);
+                }
+                #[cfg(unix)]
+                {
+                    // SAFETY: a zeroed siginfo_t is valid; waitid with
+                    // WNOHANG|WNOWAIT neither blocks nor consumes the exit
+                    // status of this exclusively owned, unreaped child.
+                    unsafe {
+                        let mut info: libc::siginfo_t = std::mem::zeroed();
+                        if libc::waitid(
+                            libc::P_PID,
+                            self.child.id() as libc::id_t,
+                            &mut info,
+                            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                        ) == -1
+                        {
+                            let error = io::Error::last_os_error();
+                            return if error.kind() == io::ErrorKind::Interrupted {
+                                Ok(false)
+                            } else {
+                                Err(error)
+                            };
+                        }
+                        Ok(info.si_pid() != 0)
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    Ok(self.child.try_wait()?.is_some())
+                }
+            }
+
+            /// Reap an exited child. Refuses a running one, so no wait blocks
+            /// past a runner's deadline. After this call (whatever it returns)
+            /// the pid may be reused, so `reaped` is set and neither `exited`
+            /// nor `Drop` issues a `waitid` or `kill` for it again.
+            pub(in super::super) fn wait(&mut self) -> io::Result<ExitStatus> {
+                if !self.exited()? {
+                    return Err(io::Error::other("repair child still running"));
+                }
+                let status = self.child.wait();
+                self.reaped = true;
+                status
+            }
+        }
+
+        impl Drop for RepairChild {
+            fn drop(&mut self) {
+                if self.reaped {
+                    return;
+                }
+                #[cfg(all(test, unix))]
+                DROP_SIGNAL_PATHS.with(|count| count.set(count.get() + 1));
+                #[cfg(unix)]
+                {
+                    // Err (ECHILD): no longer this process's unreaped child, so
+                    // the pid may be reused and no signal is authorized. Ok:
+                    // running or an unreaped zombie, so the pid is still
+                    // reserved as this group's id.
+                    if self.exited().is_err() {
+                        return;
+                    }
+                    let group = self.child.id() as libc::pid_t;
+                    // A group id <= 1 (including a wrapped negative) can never
+                    // be a child's own group: `-group` would name init, every
+                    // process, or a single pid. Refuse rather than signal it.
+                    if group <= 1 {
+                        return;
+                    }
+                    // SAFETY: `process_group(0)` made the child its own group
+                    // leader before exec and the leader is unreaped; the
+                    // negative pid targets only that group, never the caller's.
+                    let killed = unsafe { libc::kill(-group, libc::SIGKILL) };
+                    if killed == -1 {
+                        // ESRCH: the group is gone. EPERM: Darwin's answer for a
+                        // group whose leader already exited. Neither leaves a
+                        // member this call can still signal; any other error
+                        // falls back to the leader alone.
+                        let errno = io::Error::last_os_error().raw_os_error();
+                        if !matches!(errno, Some(libc::ESRCH) | Some(libc::EPERM)) {
+                            let _ = self.child.kill();
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    if !matches!(self.child.try_wait(), Ok(None)) {
+                        return;
+                    }
+                    if self.child.kill().is_err() {
+                        return;
+                    }
+                }
+                let cleanup = std::time::Instant::now() + REPAIR_CHILD_CLEANUP_GRACE;
+                while std::time::Instant::now() < cleanup {
+                    if matches!(self.child.try_wait(), Ok(Some(_))) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
+    /// Make an owned child pipe non-blocking so [`drain_repair_pipe`] never
+    /// waits for EOF.
+    #[cfg(unix)]
+    fn set_repair_pipe_nonblocking(pipe: &impl std::os::fd::AsRawFd) -> io::Result<()> {
+        let fd = pipe.as_raw_fd();
+        // SAFETY: the descriptor belongs to an open, exclusively owned child
+        // pipe; the flag change does not transfer its ownership.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags == -1 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// Windows pipes are drained with a peek (`drain_repair_pipe`), which never
+    /// blocks, so there is no mode to change.
+    #[cfg(windows)]
+    fn set_repair_pipe_nonblocking<T>(_pipe: &T) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Refuse a WRITE through a sqlite3 that does not stop at the first error.
+    /// Every statement-failure safety argument in this module (a failed guard
+    /// aborts before the writes, a failed write aborts before COMMIT) assumes
+    /// `-bail` stops the shell, which was measured only on Apple 3.54.0 and
+    /// Linux 3.45.1. This measures it on the binary about to write, once per
+    /// (path, size, mtime); a probe that fails or cannot run refuses, and
+    /// nothing falls back.
+    fn ensure_stops_at_first_error(binary: &Path, db_path: &Path) -> Result<(), ShareError> {
+        #[cfg(test)]
+        if continue_past_errors() {
+            // The defense-in-depth tests run the gates on a deliberately
+            // continuing shell, past this probe.
+            return Ok(());
+        }
+        let refuse = |detail: &str| ShareError::SqliteCommandFailed {
+            binary: PathBuf::from(crate::cli_deps::sanitize::redact_path(binary)),
+            path: PathBuf::from(crate::cli_deps::sanitize::redact_path(db_path)),
+            detail: detail.to_owned(),
+        };
+        let Some(key) = bail_key(binary) else {
+            return Err(refuse("sqlite3 write refused: binary cannot be inspected"));
+        };
+        if bail_cache().lock().is_ok_and(|cache| cache.contains(&key)) {
+            return Ok(());
+        }
+        if !probe_stops_at_first_error(binary) {
+            return Err(refuse(
+                "sqlite3 write refused: -bail probe failed, this sqlite3 does not stop at the first error",
+            ));
+        }
+        if let Ok(mut cache) = bail_cache().lock() {
+            cache.insert(key);
+        }
+        Ok(())
+    }
+
+    /// Test fixtures that are not sqlite3 (hung, flooding, committing children)
+    /// are declared probed so the runner under test still spawns them.
+    #[cfg(all(test, unix))]
+    pub(super) fn trust_bail_for_test(binary: &Path) {
+        if let Some(key) = bail_key(binary) {
+            bail_cache().lock().unwrap().insert(key);
+        }
+    }
+
+    /// Only the guards (which abort before any write) are positively pre-commit,
+    /// and only when the guard is the ONLY error `raw` carries: a failed
+    /// BEGIN IMMEDIATE or a write error before it can leave earlier statements
+    /// committed on a shell that kept going. Any other failure of the script is
+    /// not pre-commit.
+    pub(super) fn merge_failure_is_pre_commit(
+        raw_detail: &Option<String>,
+        mapped: &ShareError,
+    ) -> bool {
+        raw_detail
+            .as_deref()
+            .is_some_and(|detail| only_named_guard_failure(detail, "csq_merge_", true))
+            && matches!(
+                mapped,
+                ShareError::SqliteChangedDuringMerge { .. }
+                    | ShareError::SqliteForeignKeyViolation { .. }
+            )
+    }
+
+    /// True only when `stderr` shows NOTHING but failures of the named guard
+    /// (`CHECK constraint failed: <prefix>...`), plus, when
+    /// `allow_no_transaction`, the `COMMIT` that then finds the transaction
+    /// already rolled back. Any other error line (a failed BEGIN, a UNIQUE
+    /// violation, a locked database) means a write may have landed, so the run is
+    /// NOT a known rollback.
+    pub(super) fn only_named_guard_failure(
+        stderr: &str,
+        prefix: &str,
+        allow_no_transaction: bool,
+    ) -> bool {
+        let named = format!("CHECK constraint failed: {prefix}");
+        let mut seen = false;
+        for line in stderr.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            if line.contains(&named) {
+                seen = true;
+            } else if !(allow_no_transaction
+                && line.contains("cannot commit - no transaction is active"))
+            {
+                return false;
+            }
+        }
+        seen
+    }
+
+    /// `-bail`, which stops the sqlite3 shell at the first error.
+    #[cfg(not(test))]
+    fn bail_flag() -> Option<&'static str> {
+        Some("-bail")
+    }
+
+    /// Test seam: emulate a sqlite3 build that keeps executing past an error
+    /// (Windows and `CSQ_SQLITE3` builds are unmeasured) by dropping `-bail`.
+    #[cfg(test)]
+    fn bail_flag() -> Option<&'static str> {
+        (!continue_past_errors()).then_some("-bail")
+    }
+
+    #[cfg(test)]
+    fn continue_past_errors() -> bool {
+        TEST_CONTINUE_PAST_ERRORS.with(|cell| cell.get())
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static TEST_CONTINUE_PAST_ERRORS: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static TEST_RECORDED_SCRIPTS: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// One call per sqlite3 child spawned by either runner (test builds only).
+    #[cfg(test)]
+    fn record_script(script: &str) {
+        TEST_RECORDED_SCRIPTS.with(|cell| cell.borrow_mut().push(script.to_owned()));
+    }
+
+    /// Scripts this thread's runners spawned since the last call, in order.
+    #[cfg(test)]
+    pub(super) fn take_recorded_scripts() -> Vec<String> {
+        TEST_RECORDED_SCRIPTS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+    }
+
+    #[cfg(all(test, unix))]
+    thread_local! {
+        static TEST_SPAWNED_PIDS: std::cell::RefCell<Vec<u32>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// One call per sqlite3 child the MERGE and REPAIR runners spawn (test
+    /// builds only). This is the runner's own record of the child it created.
+    /// A pid the CHILD writes to a file is a different source with a different
+    /// failure mode: under load the deadline can kill a child before its first
+    /// scheduling, so the file never exists (CI: `fixture leader pid:
+    /// NotFound`, r9_merge_runner_stdin_write_is_bounded). The parent observed
+    /// the pid at spawn, so it cannot race with the child's execution.
+    #[cfg(all(test, unix))]
+    fn record_spawned_pid(pid: u32) {
+        TEST_SPAWNED_PIDS.with(|cell| cell.borrow_mut().push(pid));
+    }
+
+    /// The pid of the last child this thread's merge/repair runners spawned,
+    /// or None when the call refused BEFORE spawning (an expired pre-spawn
+    /// budget). Never fed by the read-only probe path.
+    ///
+    /// TAKES the whole record: the runner records at most one spawn per call,
+    /// so an entry can never carry over into a later loop iteration or a later
+    /// call on this thread. More than one entry is a broken invariant, not a
+    /// value to pick from.
+    #[cfg(all(test, unix))]
+    pub(super) fn take_last_spawned_pid() -> Option<u32> {
+        let pids = TEST_SPAWNED_PIDS.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+        assert!(
+            pids.len() <= 1,
+            "the runner spawn record holds one pid per call; found {}",
+            pids.len()
+        );
+        pids.into_iter().next()
+    }
+
+    /// Run `f` with `-bail` dropped from every runner on this thread.
+    #[cfg(test)]
+    pub(super) fn with_continue_past_errors<T>(f: impl FnOnce() -> T) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_CONTINUE_PAST_ERRORS.with(|cell| cell.set(false));
+            }
+        }
+        TEST_CONTINUE_PAST_ERRORS.with(|cell| cell.set(true));
+        let _reset = Reset;
+        f()
+    }
+
+    /// Split a generated script into complete statements, one per element.
+    /// A `;` terminates a statement only outside `'...'`, `"..."`, `` `...` ``
+    /// and `[...]` quoting (a doubled quote stays inside its literal). Trailing
+    /// text without a `;` is kept as a final statement; blank pieces are dropped.
+    ///
+    /// Refuses, so the caller never spawns: a `--` or `/*` comment outside
+    /// quotes (a quote or `;` inside a comment would mis-split the script), a
+    /// quote, bracket or backtick still open at the end, any piece whose
+    /// first non-space character is `.` (sqlite3 would run it as a shell
+    /// dot-command: `.shell`, `.system`, `.load`), a line that is only `go` or
+    /// `/` (the shell reading stdin ends a statement there, and the next line
+    /// could then be a dot-command), a line starting with `#` (the shell
+    /// skips it), and a `CREATE [TEMP] TRIGGER` piece: a trigger body holds
+    /// `;`, so it would split into fragments that are each complete SQL.
+    pub(super) fn split_sql_statements(script: &str) -> Result<Vec<String>, String> {
+        fn refuse_unsplittable(piece: &str) -> Result<(), String> {
+            let piece = piece.trim_start();
+            if piece.starts_with('.') {
+                return Err("sql statement starts with a sqlite3 dot-command".to_owned());
+            }
+            let mut words = piece.split_whitespace().map(str::to_ascii_uppercase);
+            let mut first = words.next();
+            if first.as_deref() == Some("EXPLAIN") {
+                first = words.next();
+                if first.as_deref() == Some("QUERY") {
+                    words.next(); // PLAN
+                    first = words.next();
+                }
+            }
+            if first.as_deref() == Some("CREATE") {
+                let mut next = words.next();
+                if matches!(next.as_deref(), Some("TEMP" | "TEMPORARY")) {
+                    next = words.next();
+                }
+                if next.as_deref() == Some("TRIGGER") {
+                    return Err("a trigger body cannot be split into statements".to_owned());
+                }
+            }
+            Ok(())
+        }
+        fn refuse_shell_line(line: &str) -> Result<(), String> {
+            let line = line.trim();
+            if line == "/" || line.eq_ignore_ascii_case("go") || line.starts_with('#') {
+                return Err("sql line is a sqlite3 shell terminator or comment".to_owned());
+            }
+            Ok(())
+        }
+        let mut out = Vec::new();
+        let mut current = String::new();
+        let mut line = String::new();
+        // A line that begins inside a quoted literal is data, not shell input.
+        let mut line_is_sql = true;
+        let mut closer: Option<char> = None;
+        let mut chars = script.chars().peekable();
+        while let Some(c) = chars.next() {
+            current.push(c);
+            if c == '\n' {
+                if line_is_sql && closer.is_none() {
+                    refuse_shell_line(&line)?;
+                }
+                line.clear();
+                line_is_sql = closer.is_none();
+            } else {
+                line.push(c);
+            }
+            match closer {
+                Some(end) if c == end => closer = None,
+                Some(_) => {}
+                None => match c {
+                    '\'' | '"' | '`' => closer = Some(c),
+                    '[' => closer = Some(']'),
+                    '-' if chars.peek() == Some(&'-') => {
+                        return Err("sql comment is not allowed in a split script".to_owned());
+                    }
+                    '/' if chars.peek() == Some(&'*') => {
+                        return Err("sql comment is not allowed in a split script".to_owned());
+                    }
+                    ';' => {
+                        if current.trim() != ";" {
+                            refuse_unsplittable(&current)?;
+                            out.push(std::mem::take(&mut current));
+                        }
+                        current.clear();
+                        // The runners join pieces with a newline, so text that
+                        // followed this `;` on the same line starts a new line.
+                        line.clear();
+                        line_is_sql = true;
+                    }
+                    _ => {}
+                },
+            }
+        }
+        if closer.is_some() {
+            return Err("sql script ends inside an open quote or bracket".to_owned());
+        }
+        if line_is_sql {
+            refuse_shell_line(&line)?;
+        }
+        if !current.trim().is_empty() {
+            refuse_unsplittable(&current)?;
+            out.push(current);
+        }
+        Ok(out)
+    }
+
+    /// The `PRAGMA busy_timeout` every generated write script sets, in
+    /// milliseconds — the ONE wait a spawned child is ENFORCED to perform on
+    /// the shared database's lock. Named once so the SQL and the budget
+    /// derivation below cannot drift apart: a budget smaller than this kills a
+    /// contended-but-healthy step while it is still waiting inside SQLite's own
+    /// enforced bound.
+    pub const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
+
+    /// Tolerance for one spawned `sqlite3` child's own work — process start,
+    /// argv transport, the bounded reads, and a small write's COMMIT — plus the
+    /// caller's filesystem allowance before the first child. A TOLERANCE, not a
+    /// bound: no enforced limit bounds scheduler or disk latency, which is why
+    /// it carries `csq-artifact-evidence.md`'s "typical case, never a worst
+    /// case" posture. The measured slow-host case (the host's stage disk:
+    /// a bare `sqlite3 x.db "create table t(a)"` in ~1-2s under load) sits well
+    /// inside it.
+    pub const CODEX_REPAIR_READ_TOLERANCE_MS: u64 = 4_000;
+
+    /// Per-step allowance for the launch repair, DERIVED from the two terms
+    /// above — no measured term:
+    ///
+    /// ```text
+    /// CODEX_REPAIR_STEP_BUDGET = SQLITE_BUSY_TIMEOUT_MS   (5_000: enforced by
+    ///                                                      every generated
+    ///                                                      write script's
+    ///                                                      PRAGMA busy_timeout)
+    ///                          + CODEX_REPAIR_READ_TOLERANCE_MS (4_000: the
+    ///                                                      child's own work and
+    ///                                                      the caller's pre-step
+    ///                                                      allowance)
+    ///                          = 9_000 ms
+    /// ```
+    ///
+    /// Every spawned STEP (one `sqlite3` child) runs under a window of at least
+    /// this much from the moment it starts, so it can always wait out the busy
+    /// timeout its own script enforces and still finish its work: a
+    /// slow-but-progressing host completes the repair, while a hung child is
+    /// killed at its step bound and its database's repair refuses instead of
+    /// extending any wait. The caller's allowance bounds admission, discovery
+    /// and walks; the launch bound is this repair's own arithmetic, never a
+    /// fixed wall-clock cap. The runner's direct API keeps its strict
+    /// expired-deadline refusal; a caller's budget is only re-armed around
+    /// children the repair is about to spawn.
+    pub const CODEX_REPAIR_STEP_BUDGET_MS: u64 =
+        SQLITE_BUSY_TIMEOUT_MS + CODEX_REPAIR_READ_TOLERANCE_MS;
+
+    /// [`CODEX_REPAIR_STEP_BUDGET_MS`] as a `Duration`.
+    pub const CODEX_REPAIR_STEP_BUDGET: std::time::Duration =
+        std::time::Duration::from_millis(CODEX_REPAIR_STEP_BUDGET_MS);
+
+    /// The budget one about-to-spawn step runs under: the caller's budget, or a
+    /// fresh [`CODEX_REPAIR_STEP_BUDGET`] window from now when that is closer.
+    fn step_budget(deadline: std::time::Instant) -> std::time::Instant {
+        deadline.max(std::time::Instant::now() + CODEX_REPAIR_STEP_BUDGET)
+    }
+
+    /// [`CODEX_REPAIR_READ_TOLERANCE_MS`] as a `Duration`.
+    const CODEX_REPAIR_READ_TOLERANCE: std::time::Duration =
+        std::time::Duration::from_millis(CODEX_REPAIR_READ_TOLERANCE_MS);
+
+    /// The budget the caller-side work over ONE returned page runs under: the
+    /// current budget, or a fresh [`CODEX_REPAIR_READ_TOLERANCE`] window from
+    /// the moment the page read returned when that is later. Without it, the
+    /// in-process walk of a page is charged to the window of the child that
+    /// produced it, so a child that finished late inside its own enforced step
+    /// window would leave its page no time to be walked. The paged walk also
+    /// re-arms it after every acknowledged write batch, and the exact route
+    /// arms it for its row walk and transcript filename search.
+    fn page_budget(deadline: std::time::Instant) -> std::time::Instant {
+        deadline.max(std::time::Instant::now() + CODEX_REPAIR_READ_TOLERANCE)
+    }
+
+    /// Launch-only runner. SQL is fed on stdin, one statement per line, and
+    /// never appears in argv (so `ps` never shows it, and a dead csq means
+    /// EOF on the script). The script is written non-blocking from the runner's
+    /// own loop ([`StdinFeeder`]), so no blocked stdin writer can hold the call
+    /// past the caller's budget; on Windows the feeder's writer thread ends
+    /// when the deadline kill closes the pipe. Each owned output pipe has
+    /// exactly one reader; finite reads never wait for EOF.
+    /// Unix embedding requires stable SIGCHLD disposition and sole ownership of
+    /// waits for these children. Unsafe auto-reap policies refuse before spawn.
+    pub(super) fn run_repair_sqlite_bounded(
+        binary: &Path,
+        db_path: &Path,
+        script: &str,
+        readonly: bool,
+        deadline: std::time::Instant,
+    ) -> Result<String, ShareError> {
+        run_repair_sqlite_bounded_tracking(binary, db_path, script, readonly, deadline, &mut false)
+    }
+
+    // Track whether a write might have committed. Pre-spawn refusals remain
+    // known-not-committed; a named paged guard aborts before the final COMMIT.
+    pub(super) fn run_repair_sqlite_bounded_tracking(
+        binary: &Path,
+        db_path: &Path,
+        script: &str,
+        readonly: bool,
+        deadline: std::time::Instant,
+        commit_unknown: &mut bool,
+    ) -> Result<String, ShareError> {
+        *commit_unknown = false;
+        use std::time::{Duration, Instant};
+        let error = |detail: &str| ShareError::SqliteCommandFailed {
+            binary: PathBuf::from(crate::cli_deps::sanitize::redact_path(binary)),
+            path: PathBuf::from(crate::cli_deps::sanitize::redact_path(db_path)),
+            detail: detail.to_owned(),
+        };
+        if Instant::now() >= deadline {
+            return Err(error(ROLLOUT_REPAIR_DEADLINE_DETAIL));
+        }
+        // A writer's script ends with a per-run marker it must print (M1).
+        let marker = (!readonly).then(writer_end_marker);
+        let mut sent = format!("PRAGMA trusted_schema=OFF;\n{script}");
+        if let Some(marker) = &marker {
+            sent.push('\n');
+            sent.push_str(&writer_end_statement(marker));
+        }
+        // One launch-time step stays small: the generators batch at
+        // `PAGED_BATCH_BYTES`, and anything far above that is refused before
+        // spawn rather than handed to a child under the launch budget.
+        if sent.len() > REPAIR_SCRIPT_CAP {
+            return Err(error("rollout repair SQL size limit"));
+        }
+        let db_arg = if readonly {
+            readonly_db_arg(db_path)?
+        } else {
+            db_path.as_os_str().to_owned()
+        };
+        let stdin_script = split_sql_statements(&sent)
+            .map_err(|detail| error(&format!("rollout repair {detail}")))?
+            .join("\n");
+        #[cfg(unix)]
+        if !repair_child_wait_policy_safe() {
+            return Err(error("rollout repair unsafe SIGCHLD disposition"));
+        }
+        if !readonly {
+            ensure_stops_at_first_error(binary, db_path)?;
+        }
+        let null_rc = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        let mut command = Command::new(binary);
+        command.args(["-init", null_rc, "-batch", "-noheader", "-list"]);
+        command.args(bail_flag());
+        if readonly {
+            command.arg("-readonly");
+        }
+        // Do not use binary_supports_safe_flag: its generic probe is unbounded.
+        command.arg(db_arg);
+        // One statement PER LINE on stdin. Measured: Apple's sqlite3 3.54.0
+        // reports a statement that fails at run time (a CHECK) and keeps
+        // executing the rest of the SAME line (or argv argument), so a failed
+        // named guard was followed by the UPDATEs and the COMMIT; `-bail` does
+        // stop between lines on that build and on Linux sqlite3 3.45.1, and
+        // `ensure_stops_at_first_error` measured exactly this shape on this
+        // binary above. Windows sqlite3 was not measured. Every
+        // generated UPDATE/INSERT is additionally predicated on ALL of its
+        // transaction's guards (`gate_exists`; the paged batch and the merge emit
+        // every guard before the first write), so a failed guard voids the
+        // writes even on a shell that keeps going. The merge FK guard necessarily
+        // follows its writes and is `INSERT OR ROLLBACK`, which makes the final
+        // `COMMIT` fail instead.
+        #[cfg(test)]
+        record_script(script);
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // Own process group, so a timed-out step is killed with every
+        // descendant it forked; a writer also inherits the migration lock and
+        // refuses to spawn without it (see `RepairChild::spawn`).
+        let role = if readonly {
+            ChildRole::Reader
+        } else {
+            ChildRole::Writer
+        };
+        let mut child = RepairChild::spawn(&mut command, role).map_err(|e| {
+            error(writer_spawn_refusal_detail(&e).unwrap_or("rollout repair spawn failed"))
+        })?;
+        #[cfg(all(test, unix))]
+        record_spawned_pid(child.id());
+        *commit_unknown = !readonly;
+        let stdin = child.take_stdin().ok_or_else(|| error("missing stdin"))?;
+        let mut output = child.take_stdout().ok_or_else(|| error("missing stdout"))?;
+        let mut errors = child.take_stderr().ok_or_else(|| error("missing stderr"))?;
+        if set_repair_pipe_nonblocking(&output).is_err()
+            || set_repair_pipe_nonblocking(&errors).is_err()
+        {
+            return Err(error("rollout repair pipe setup failed"));
+        }
+        let mut feeder = StdinFeeder::start(stdin, stdin_script.into_bytes())
+            .map_err(|_| error("rollout repair script delivery failed"))?;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut out_eof = false;
+        let mut err_eof = false;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(error(ROLLOUT_REPAIR_DEADLINE_DETAIL));
+            }
+            feeder
+                .pump()
+                .map_err(|_| error("rollout repair script delivery failed"))?;
+            drain_repair_pipe(&mut output, &mut stdout, &mut out_eof, REPAIR_IO_CAP)
+                .map_err(|_| error("rollout repair stdout limit or read failure"))?;
+            drain_repair_pipe(&mut errors, &mut stderr, &mut err_eof, REPAIR_IO_CAP)
+                .map_err(|_| error("rollout repair stderr limit or read failure"))?;
+            // Observe the exit without reaping (`RepairChild::exited`): until
+            // both pipes reach EOF a descendant may still hold one, and the
+            // drop's group kill needs the leader's pid still reserved.
+            if out_eof
+                && err_eof
+                && child
+                    .exited()
+                    .map_err(|_| error("rollout repair wait failed"))?
+            {
+                let status = child
+                    .wait()
+                    .map_err(|_| error("rollout repair wait failed"))?;
+                if !status.success() {
+                    // -bail stops at this generated guard before COMMIT
+                    // (measured on Apple 3.54.0 and Linux 3.45.1 only; every
+                    // write is also gated) and closing SQLite rolls back the
+                    // still-open transaction.
+                    // Other child failures retain the conservative unknown.
+                    let guard_failure = String::from_utf8_lossy(&stderr);
+                    if status.code().is_some()
+                        && only_named_guard_failure(&guard_failure, "csq_paged_", false)
+                    {
+                        *commit_unknown = false;
+                    }
+                    let detail = crate::cli_deps::sanitize::redact_home_anywhere(
+                        &crate::error::redact_tokens(String::from_utf8_lossy(&stderr).trim()),
+                    );
+                    return Err(error(&format!(
+                        "rollout repair exit {:?}: {detail}",
+                        status.code()
+                    )));
+                }
+                // A shell that exited 0 without taking the whole script did
+                // not run it: fail closed, and the commit stays unknown.
+                // `finish` proves only that the bytes were written to the
+                // pipe (a launch script fits one pipe buffer), so a writer
+                // must ALSO have printed its end marker, which only the
+                // script's last statement prints.
+                if !feeder.finish() {
+                    return Err(error("rollout repair script not fully delivered"));
+                }
+                let stdout = String::from_utf8(stdout)
+                    .map_err(|_| error("rollout repair output is not UTF-8"))?;
+                let stdout = match &marker {
+                    Some(marker) => strip_writer_end_marker(&stdout, marker)
+                        .ok_or_else(|| error(WRITER_NOT_FULLY_EXECUTED_DETAIL))?,
+                    None => stdout,
+                };
+                *commit_unknown = false;
+                return Ok(stdout);
+            }
+            std::thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(2)),
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn drain_repair_pipe(
+        reader: &mut impl std::io::Read,
+        bytes: &mut Vec<u8>,
+        eof: &mut bool,
+        cap: usize,
+    ) -> io::Result<()> {
+        let mut buf = [0; 4096];
+        for _ in 0..8 {
+            match reader.read(&mut buf) {
+                Ok(0) => {
+                    *eof = true;
+                    break;
+                }
+                Ok(n) => {
+                    if bytes.len() + n > cap {
+                        return Err(io::Error::other("output cap"));
+                    }
+                    bytes.extend_from_slice(&buf[..n]);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn drain_repair_pipe(
+        reader: &mut (impl std::io::Read + std::os::windows::io::AsRawHandle),
+        bytes: &mut Vec<u8>,
+        eof: &mut bool,
+        cap: usize,
+    ) -> io::Result<()> {
+        use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+        let mut buf = [0; 4096];
+        for _ in 0..8 {
+            let mut available = 0;
+            // SAFETY: the handle is an open, exclusively owned read end of an
+            // anonymous child pipe. No other thread reads or operates on it.
+            // Peek and the following bounded read execute on the same thread.
+            let ok = unsafe {
+                PeekNamedPipe(
+                    reader.as_raw_handle() as _,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::BrokenPipe {
+                    *eof = true;
+                    break;
+                }
+                return Err(e);
+            }
+            if available == 0 {
+                break;
+            }
+            let count = (available as usize).min(buf.len());
+            let n = reader.read(&mut buf[..count])?;
+            if n == 0 {
+                *eof = true;
+                break;
+            }
+            if bytes.len() + n > cap {
+                return Err(io::Error::other("output cap"));
+            }
+            bytes.extend_from_slice(&buf[..n]);
+        }
+        Ok(())
+    }
+
     /// Run `script` against `db_path` via the resolved `sqlite3` binary,
     /// hermetically: cleared environment (minus a minimal `PATH`, in case
     /// the vendored `sqlite3` itself needs to resolve a shared library
     /// helper), no shell, argv only. Returns stdout as-is; a non-zero exit
     /// is a hard error naming the binary, the db path, and stderr.
-    fn run_sqlite3(binary: &Path, db_path: &Path, script: &str) -> Result<String, ShareError> {
+    pub(super) fn run_sqlite3(
+        binary: &Path,
+        db_path: &Path,
+        script: &str,
+    ) -> Result<String, ShareError> {
         run_sqlite3_with(binary, db_path, script, false)
     }
 
@@ -2122,6 +3822,35 @@ pub mod codex_sqlite {
         script: &str,
         readonly: bool,
     ) -> Result<String, ShareError> {
+        let deadline = std::time::Instant::now() + MERGE_SQLITE_BUDGET;
+        run_sqlite3_with_deadline(binary, db_path, script, readonly, deadline)
+    }
+
+    /// The merge runner's enforced per-invocation bound (an enforced cap, not
+    /// a measurement): script delivery, exit and output drain share this one
+    /// window, after which the child's process group is killed. Generous on
+    /// purpose, so it ends a wedged child rather than a slow merge.
+    const MERGE_SQLITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// The merge runner's deadline detail.
+    pub(super) const MERGE_SQLITE_DEADLINE_DETAIL: &str = "sqlite3 deadline";
+
+    /// The merge runner's retained-output cap per pipe. Larger than the launch
+    /// runner's [`REPAIR_IO_CAP`]: merge-side reads list whole tables.
+    const MERGE_IO_CAP: usize = 256 * 1024 * 1024;
+
+    /// [`run_sqlite3_with`] under an explicit `deadline`.
+    pub(super) fn run_sqlite3_with_deadline(
+        binary: &Path,
+        db_path: &Path,
+        script: &str,
+        readonly: bool,
+        deadline: std::time::Instant,
+    ) -> Result<String, ShareError> {
+        use std::time::{Duration, Instant};
+        if !readonly {
+            ensure_stops_at_first_error(binary, db_path)?;
+        }
         let db_arg = if readonly {
             readonly_db_arg(db_path)?
         } else {
@@ -2132,8 +3861,10 @@ pub mod codex_sqlite {
         // remaining statements after one fails, so a failed `INSERT ...
         // SELECT *` can be followed by a `COMMIT` that lands a HALF-merged
         // transaction (the sibling `UPDATE`, but not the `INSERT`) while csq
-        // reports an error. `-bail` stops the shell at the first error,
-        // before that `COMMIT` line is ever reached; the transaction's
+        // reports an error. `-bail` stops the shell at the first error
+        // (measured: Apple 3.54.0 only when the next statement is on its own
+        // line, which the script splitter below guarantees), before that
+        // `COMMIT` line is ever reached; the transaction's
         // BEGIN never lands a commit record, so closing the connection with
         // it still open lets SQLite's own crash-recovery / uncommitted-
         // transaction discard drop it entirely.
@@ -2142,7 +3873,8 @@ pub mod codex_sqlite {
         // `.separator` / `.mode` would change the `-list` output every caller
         // here parses. No rc file is ever read.
         let empty_rc = if cfg!(windows) { "NUL" } else { "/dev/null" };
-        command.args(["-init", empty_rc, "-batch", "-noheader", "-list", "-bail"]);
+        command.args(["-init", empty_rc, "-batch", "-noheader", "-list"]);
+        command.args(bail_flag());
         if readonly {
             command.arg("-readonly");
             // S-F8 (defense in depth): `-safe` disables dangerous shell
@@ -2176,45 +3908,114 @@ pub mod codex_sqlite {
         let mut sent = String::with_capacity(script.len() + 32);
         sent.push_str("PRAGMA trusted_schema=OFF;\n");
         sent.push_str(script);
-        let script = sent;
+        // One statement per line: measured on Apple's sqlite3 3.54.0, `-bail`
+        // does not stop at a run-time failure (a CHECK guard) when the next
+        // statement is on the SAME line, and the rest of that line still runs.
+        let redacted_binary = || PathBuf::from(crate::cli_deps::sanitize::redact_path(binary));
+        let redacted_path = || PathBuf::from(crate::cli_deps::sanitize::redact_path(db_path));
+        let script = split_sql_statements(&sent)
+            .map_err(|detail| ShareError::SqliteCommandFailed {
+                binary: redacted_binary(),
+                path: redacted_path(),
+                detail,
+            })?
+            .join("\n");
+        #[cfg(test)]
+        record_script(&script);
+        // A writer's script ends with a per-run marker it must print (M1);
+        // appended after recording, so recorded scripts stay the generated SQL.
+        let marker = (!readonly).then(writer_end_marker);
+        let script = match &marker {
+            Some(marker) => format!("{script}\n{}", writer_end_statement(marker)),
+            None => script,
+        };
         // S-L4 / operator-surface-verification.md Rule 1: neither the
         // path nor the binary this error names may leak the operator's
         // full `$HOME`-rooted host path, and sqlite3's own stderr is
         // attacker- or corruption-influenced content that must not reach
         // an operator surface un-redacted.
-        let redacted_binary = || PathBuf::from(crate::cli_deps::sanitize::redact_path(binary));
-        let redacted_path = || PathBuf::from(crate::cli_deps::sanitize::redact_path(db_path));
-        let mut child = command
+        let fail = |detail: String| ShareError::SqliteCommandFailed {
+            binary: redacted_binary(),
+            path: redacted_path(),
+            detail,
+        };
+        // The child is observed with `waitid(WNOWAIT)` (`RepairChild`): an
+        // auto-reaping SIGCHLD policy refuses before spawn.
+        #[cfg(unix)]
+        if !repair_child_wait_policy_safe() {
+            return Err(fail("unsafe SIGCHLD disposition".to_string()));
+        }
+        if Instant::now() >= deadline {
+            return Err(fail(MERGE_SQLITE_DEADLINE_DETAIL.to_string()));
+        }
+        command
             .arg(&db_arg)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| ShareError::SqliteCommandFailed {
-                binary: redacted_binary(),
-                path: redacted_path(),
-                detail: format!("spawn: {e}"),
-            })?;
-        child
-            .stdin
-            .take()
-            .expect("stdin was piped")
-            .write_all(script.as_bytes())
-            .map_err(|e| ShareError::SqliteCommandFailed {
-                binary: redacted_binary(),
-                path: redacted_path(),
-                detail: format!("write script: {e}"),
-            })?;
-        let output = child
-            .wait_with_output()
-            .map_err(|e| ShareError::SqliteCommandFailed {
-                binary: redacted_binary(),
-                path: redacted_path(),
-                detail: format!("wait: {e}"),
-            })?;
-        if !output.status.success() {
+            .stderr(Stdio::piped());
+        // Own process group: a deadline kills the shell together with its
+        // descendants. A writer inherits the migration lock and refuses to
+        // spawn without it (see `RepairChild::spawn`).
+        let role = if readonly {
+            ChildRole::Reader
+        } else {
+            ChildRole::Writer
+        };
+        let mut child =
+            RepairChild::spawn(&mut command, role).map_err(
+                |e| match writer_spawn_refusal_detail(&e) {
+                    Some(detail) => fail(detail.to_string()),
+                    None => fail(format!("spawn: {e}")),
+                },
+            )?;
+        #[cfg(all(test, unix))]
+        record_spawned_pid(child.id());
+        let stdin = child
+            .take_stdin()
+            .ok_or_else(|| fail("missing stdin".to_string()))?;
+        let mut output = child
+            .take_stdout()
+            .ok_or_else(|| fail("missing stdout".to_string()))?;
+        let mut errors = child
+            .take_stderr()
+            .ok_or_else(|| fail("missing stderr".to_string()))?;
+        if set_repair_pipe_nonblocking(&output).is_err()
+            || set_repair_pipe_nonblocking(&errors).is_err()
+        {
+            return Err(fail("pipe setup failed".to_string()));
+        }
+        // The script is fed without ever blocking past `deadline`: a child
+        // that stops reading stdin can no longer wedge this call on a full
+        // pipe buffer.
+        let mut feeder = StdinFeeder::start(stdin, script.into_bytes())
+            .map_err(|e| fail(format!("write script: {e}")))?;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut out_eof = false;
+        let mut err_eof = false;
+        let status = loop {
+            if Instant::now() >= deadline {
+                return Err(fail(MERGE_SQLITE_DEADLINE_DETAIL.to_string()));
+            }
+            feeder
+                .pump()
+                .map_err(|e| fail(format!("write script: {e}")))?;
+            drain_repair_pipe(&mut output, &mut stdout, &mut out_eof, MERGE_IO_CAP)
+                .map_err(|_| fail("stdout limit or read failure".to_string()))?;
+            drain_repair_pipe(&mut errors, &mut stderr, &mut err_eof, MERGE_IO_CAP)
+                .map_err(|_| fail("stderr limit or read failure".to_string()))?;
+            if out_eof && err_eof && child.exited().map_err(|e| fail(format!("wait: {e}")))? {
+                break child.wait().map_err(|e| fail(format!("wait: {e}")))?;
+            }
+            std::thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(2)),
+            );
+        };
+        if !status.success() {
             // M3: `redact_tokens` alone catches SECRET-shaped substrings
             // (an `sk-ant-*` prefix, long hex); it does not touch a home-
             // rooted PATH sqlite3's own stderr can legitimately embed (an
@@ -2224,15 +4025,125 @@ pub mod codex_sqlite {
             // finds a path occurring anywhere mid-sentence, not only at the
             // start of the string.
             let stderr = crate::cli_deps::sanitize::redact_home_anywhere(
-                &crate::error::redact_tokens(String::from_utf8_lossy(&output.stderr).trim()),
+                &crate::error::redact_tokens(String::from_utf8_lossy(&stderr).trim()),
             );
-            return Err(ShareError::SqliteCommandFailed {
-                binary: redacted_binary(),
-                path: redacted_path(),
-                detail: format!("exit {:?}: {stderr}", output.status.code()),
-            });
+            return Err(fail(format!("exit {:?}: {stderr}", status.code())));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        // A shell that exited 0 without taking the whole script did not run
+        // it: fail closed rather than report a partial script as applied.
+        // `finish` proves only that the bytes reached the pipe, so a writer
+        // must also have printed its end marker (its script's last statement).
+        if !feeder.finish() {
+            return Err(fail("script not fully delivered".to_string()));
+        }
+        let stdout = String::from_utf8_lossy(&stdout).into_owned();
+        match &marker {
+            Some(marker) => strip_writer_end_marker(&stdout, marker)
+                .ok_or_else(|| fail(WRITER_NOT_FULLY_EXECUTED_DETAIL.to_string())),
+            None => Ok(stdout),
+        }
+    }
+
+    /// Delivers a script to a child's stdin without blocking the caller past
+    /// its deadline: non-blocking writes, pumped from the runner's loop. The
+    /// pipe is closed (EOF ends the shell's input) once the script is written;
+    /// a closed read end (the shell stopped reading, e.g. under `-bail`) ends
+    /// delivery, which [`StdinFeeder::finish`] then reports as incomplete.
+    #[cfg(unix)]
+    struct StdinFeeder {
+        pipe: Option<std::process::ChildStdin>,
+        script: Vec<u8>,
+        written: usize,
+    }
+
+    #[cfg(unix)]
+    impl StdinFeeder {
+        fn start(pipe: std::process::ChildStdin, script: Vec<u8>) -> io::Result<Self> {
+            set_repair_pipe_nonblocking(&pipe)?;
+            let mut feeder = Self {
+                pipe: Some(pipe),
+                script,
+                written: 0,
+            };
+            feeder.pump()?;
+            Ok(feeder)
+        }
+
+        fn pump(&mut self) -> io::Result<()> {
+            let Some(pipe) = self.pipe.as_mut() else {
+                return Ok(());
+            };
+            while self.written < self.script.len() {
+                match pipe.write(&self.script[self.written..]) {
+                    Ok(0) => return Ok(()),
+                    Ok(n) => self.written += n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                        self.pipe = None;
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            self.pipe = None;
+            Ok(())
+        }
+
+        /// True only when every script byte was written into the pipe. That
+        /// proves delivery to the pipe buffer, NOT that the child read or ran
+        /// it; writers prove execution with their end marker instead.
+        fn finish(self) -> bool {
+            self.written == self.script.len()
+        }
+    }
+
+    /// Windows anonymous pipes have no non-blocking write mode: a dedicated
+    /// writer thread feeds the script, and the runner never waits on it past
+    /// its deadline. A deadline kill of the child closes the pipe's read end,
+    /// which fails the thread's blocked write and ends it.
+    #[cfg(windows)]
+    struct StdinFeeder {
+        done: std::sync::mpsc::Receiver<bool>,
+        delivered: Option<bool>,
+    }
+
+    #[cfg(windows)]
+    impl StdinFeeder {
+        fn start(mut pipe: std::process::ChildStdin, script: Vec<u8>) -> io::Result<Self> {
+            let (sender, done) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("csq-sqlite3-stdin".to_string())
+                .spawn(move || {
+                    let delivered = pipe.write_all(&script).is_ok();
+                    drop(pipe);
+                    // A gone receiver means the runner already gave up.
+                    let _ = sender.send(delivered);
+                })?;
+            Ok(Self {
+                done,
+                delivered: None,
+            })
+        }
+
+        fn pump(&mut self) -> io::Result<()> {
+            if self.delivered.is_none() {
+                if let Ok(delivered) = self.done.try_recv() {
+                    self.delivered = Some(delivered);
+                }
+            }
+            Ok(())
+        }
+
+        /// True only when the writer thread wrote every script byte into the
+        /// pipe. That proves delivery to the pipe, NOT that the child read or
+        /// ran it; writers prove execution with their end marker instead.
+        fn finish(mut self) -> bool {
+            if self.delivered.is_none() {
+                self.delivered = self.done.recv_timeout(REPAIR_CHILD_CLEANUP_GRACE).ok();
+            }
+            self.delivered == Some(true)
+        }
     }
 
     /// Single-quote-escape a path for interpolation into an `ATTACH DATABASE`
@@ -2290,35 +4201,98 @@ pub mod codex_sqlite {
         format!("\"{}\"", name.replace('"', "\"\""))
     }
 
-    /// Whether the resolved `sqlite3` binary's `-help` output advertises
-    /// `-safe`. Probed once per process (the binary is resolved once and
-    /// reused for the whole migration run) rather than on every invocation,
-    /// so the merge's normal path is not a second spawn per SQL call.
-    static SAFE_FLAG_SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    /// The outcome of this process's one `-safe` probe.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(super) enum SafeFlagProbe {
+        /// The probe ran to completion: whether `-help` advertises `-safe`.
+        Completed(bool),
+        /// The probe timed out or could not run: unknown for this process.
+        /// Never read as a completed "unsupported" answer.
+        Unknown,
+    }
 
+    /// Whether the resolved `sqlite3` binary's `-help` output advertises
+    /// `-safe`. Probed AT MOST ONCE per process (the binary is resolved once
+    /// and reused for the whole migration run), so neither the merge's normal
+    /// path nor a binary whose probe keeps timing out costs a probe spawn per
+    /// SQL call.
+    static SAFE_FLAG_SUPPORTED: std::sync::OnceLock<SafeFlagProbe> = std::sync::OnceLock::new();
+
+    /// A probe that timed out or could not run is recorded as
+    /// [`SafeFlagProbe::Unknown`]: this and every later call in the process
+    /// run `-readonly` without `-safe` and never probe again.
     fn binary_supports_safe_flag(binary: &Path) -> bool {
-        *SAFE_FLAG_SUPPORTED.get_or_init(|| {
-            // S-L4: env_clear so an inherited env var cannot change
-            // `-help`'s wording (or, in principle, substitute a shared
-            // library the resolved binary depends on) out from under the
-            // `.contains("-safe")` check below.
-            let Ok(output) = Command::new(binary)
-                .env_clear()
-                .env("PATH", "/usr/bin:/bin")
-                .arg("-help")
-                .output()
-            else {
-                return false;
-            };
-            // `-help`'s flag list may land on stdout or stderr depending on
-            // the build; check both rather than assume one.
+        supports_safe_flag_cached(&SAFE_FLAG_SUPPORTED, || probe_safe_flag(binary))
+    }
+
+    pub(super) fn supports_safe_flag_cached(
+        cache: &std::sync::OnceLock<SafeFlagProbe>,
+        probe: impl FnOnce() -> Option<bool>,
+    ) -> bool {
+        let outcome = cache.get_or_init(|| match probe() {
+            Some(supported) => SafeFlagProbe::Completed(supported),
+            None => SafeFlagProbe::Unknown,
+        });
+        matches!(outcome, SafeFlagProbe::Completed(true))
+    }
+
+    /// `None` when the probe could not run to completion.
+    fn probe_safe_flag(binary: &Path) -> Option<bool> {
+        // S-L4: env_clear so an inherited env var cannot change
+        // `-help`'s wording (or, in principle, substitute a shared
+        // library the resolved binary depends on) out from under the
+        // `.contains("-safe")` check below.
+        let mut command = Command::new(binary);
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .arg("-help")
+            .stdin(Stdio::null());
+        // Bounded like every other sqlite3 child (`PROBE_BUDGET`); a probe
+        // that cannot finish returns `None`, which is never cached.
+        let (stdout, stderr) = run_probe_capture(&mut command)?;
+        // `-help`'s flag list may land on stdout or stderr depending on
+        // the build; check both rather than assume one.
+        Some(
             format!(
                 "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
             )
-            .contains("-safe")
-        })
+            .contains("-safe"),
+        )
+    }
+
+    /// Run a short probe child to completion under [`PROBE_BUDGET`], returning
+    /// its stdout and stderr; `None` when it cannot spawn, overruns, or fails
+    /// to drain (its process group is then killed by `RepairChild`'s drop).
+    fn run_probe_capture(command: &mut Command) -> Option<(Vec<u8>, Vec<u8>)> {
+        use std::time::{Duration, Instant};
+        #[cfg(unix)]
+        if !repair_child_wait_policy_safe() {
+            return None;
+        }
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = RepairChild::spawn(command, ChildRole::Reader).ok()?;
+        let mut output = child.take_stdout()?;
+        let mut errors = child.take_stderr()?;
+        set_repair_pipe_nonblocking(&output).ok()?;
+        set_repair_pipe_nonblocking(&errors).ok()?;
+        let deadline = Instant::now() + PROBE_BUDGET;
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let (mut out_eof, mut err_eof) = (false, false);
+        loop {
+            drain_repair_pipe(&mut output, &mut stdout, &mut out_eof, REPAIR_IO_CAP).ok()?;
+            drain_repair_pipe(&mut errors, &mut stderr, &mut err_eof, REPAIR_IO_CAP).ok()?;
+            if out_eof && err_eof && child.exited().ok()? {
+                child.wait().ok()?;
+                return Some((stdout, stderr));
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     /// Role a codex sqlite database plays in cross-slot sharing, determined
@@ -2574,6 +4548,14 @@ pub mod codex_sqlite {
             // contain `|`.
             &format!("SELECT {SCHEMA_OBJECT_ROW_EXPR} FROM sqlite_master WHERE type IN ('trigger','view');"),
         )?;
+        validate_schema_objects(basename, db_path, &out)
+    }
+
+    fn validate_schema_objects(
+        basename: &str,
+        db_path: &Path,
+        out: &str,
+    ) -> Result<Vec<String>, ShareError> {
         let rows: Vec<String> = out
             .lines()
             .map(str::trim)
@@ -4015,7 +5997,7 @@ pub mod codex_sqlite {
                 Some((epoch, mtime, path))
             })
             .collect();
-        backups.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+        backups.sort_by_key(|backup| std::cmp::Reverse((backup.0, backup.1)));
         let mut kept = 0usize;
         for (_, _, path) in backups {
             if path == just_created {
@@ -4583,6 +6565,10 @@ pub mod codex_sqlite {
     /// would then be misclassified as this guard.
     const FK_GUARD_CONSTRAINT_NAME: &str = "csq_merge_fk_guard_must_be_zero";
 
+    /// Name of the aggregate gate every destination write is predicated on
+    /// (see [`gate_exists`]).
+    const MERGE_GATE: &str = "csq_merge_write_gate";
+
     /// Names of the destination guards [`merge_sources_into_guarded`] runs
     /// right after `BEGIN IMMEDIATE`; each is a NAMED `CHECK`, so a failure
     /// reads `CHECK constraint failed: <name>` (same mechanism as
@@ -4608,12 +6594,30 @@ pub mod codex_sqlite {
     }
 
     /// SQL for a one-row temp table whose NAMED `CHECK` fails unless
-    /// `condition` evaluates to 1.
-    fn named_guard_sql(name: &str, condition: &str) -> String {
+    /// `condition` evaluates to 1. `IS 1`, not `= 1`: a `CHECK` passes NULL, so
+    /// a condition that yielded NULL would otherwise insert a row and satisfy
+    /// both the guard and [`gate_exists`].
+    pub(super) fn named_guard_sql(name: &str, condition: &str) -> String {
         format!(
-            "CREATE TEMP TABLE {name}(ok INTEGER CONSTRAINT {name} CHECK (ok = 1));\n\
+            "CREATE TEMP TABLE {name}(ok INTEGER CONSTRAINT {name} CHECK (ok IS 1));\n\
              INSERT INTO {name} SELECT ({condition});\n"
         )
+    }
+
+    /// SQL condition true only when EVERY named guard table (see
+    /// [`named_guard_sql`]) holds its `ok IS 1` row, i.e. every guard's `INSERT`
+    /// succeeded.
+    /// A write predicate carrying it is a no-op after a failed guard even when
+    /// the sqlite3 shell keeps executing past the failure. Never use
+    /// `RAISE`/`INSERT OR ROLLBACK` for a guard that a WRITE follows: the
+    /// statement after the rollback would autocommit. A guard followed only by
+    /// `COMMIT` (the merge FK guard) may use it: that `COMMIT` then fails.
+    pub(super) fn gate_exists(names: &[&str]) -> String {
+        names
+            .iter()
+            .map(|n| format!("EXISTS (SELECT 1 FROM temp.{n} WHERE ok IS 1)"))
+            .collect::<Vec<_>>()
+            .join(" AND ")
     }
 
     /// SQL condition: the rows `row_expr` yields from `from_clause` are
@@ -4659,6 +6663,7 @@ pub mod codex_sqlite {
     /// cannot be embedded safely (the caller refuses precisely).
     fn dest_guard_script(expect: &DestExpectation<'_>) -> Option<String> {
         let mut script = String::new();
+        let mut names = vec![DEST_MIGRATIONS_TABLE_GUARD];
         let has_table = "(SELECT count(*) FROM sqlite_master WHERE type='table' \
                           AND name='_sqlx_migrations')";
         match expect.migrations_sig {
@@ -4672,6 +6677,7 @@ pub mod codex_sqlite {
                     &format!("{has_table} = 1"),
                 ));
                 let rows = guard_rows(sig)?;
+                names.push(DEST_MIGRATIONS_GUARD);
                 script.push_str(&named_guard_sql(
                     DEST_MIGRATIONS_GUARD,
                     &row_set_condition(MIGRATION_ROW_EXPR, "_sqlx_migrations", &rows),
@@ -4680,6 +6686,8 @@ pub mod codex_sqlite {
         }
         // Before any write: a trigger or view planted in the destination
         // after it was verified must be refused here, never fire.
+        names.push(DEST_SCHEMA_OBJECTS_GUARD);
+        names.push(DEST_THREADS_SCHEMA_GUARD);
         let object_rows = guard_rows(&expect.schema_objects.join("\n"))?;
         script.push_str(&named_guard_sql(
             DEST_SCHEMA_OBJECTS_GUARD,
@@ -4697,6 +6705,12 @@ pub mod codex_sqlite {
                 "pragma_table_info('threads')",
                 &schema_rows,
             ),
+        ));
+        // One row only when EVERY guard above inserted its row; each merge
+        // write carries `gate_exists(&[MERGE_GATE])`, so none lands after a failed guard.
+        script.push_str(&format!(
+            "CREATE TEMP TABLE {MERGE_GATE}(ok INTEGER);\nINSERT INTO {MERGE_GATE} SELECT 1 WHERE {};\n",
+            gate_exists(&names)
         ));
         Some(script)
     }
@@ -4926,7 +6940,12 @@ pub mod codex_sqlite {
         let id_q = quote_ident("id");
         let set_clause = threads_merge_set_clause(columns);
 
-        let mut script = String::from("PRAGMA busy_timeout=5000;\n");
+        let mut script = format!("PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};\n");
+        let gate = if expect.is_some() {
+            gate_exists(&[MERGE_GATE])
+        } else {
+            "1".to_owned()
+        };
         let mut aliases: Vec<String> = Vec::with_capacity(sources.len());
         let mut dest_columns_cache: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
@@ -4964,13 +6983,13 @@ pub mod codex_sqlite {
 
         for (i, alias) in aliases.iter().enumerate() {
             script.push_str(&format!(
-                "INSERT INTO threads SELECT * FROM {alias}.threads WHERE {id_q} NOT IN (SELECT {id_q} FROM threads);\n"
+                "INSERT INTO threads SELECT * FROM {alias}.threads WHERE {id_q} NOT IN (SELECT {id_q} FROM threads) AND {gate};\n"
             ));
             if !columns.is_empty() {
                 script.push_str(&format!(
                     "UPDATE threads SET\n  {set_clause}\n\
                      FROM (SELECT * FROM {alias}.threads) AS s\n\
-                     WHERE threads.{id_q} = s.{id_q};\n"
+                     WHERE threads.{id_q} = s.{id_q} AND {gate};\n"
                 ));
             }
             for t in &per_source_carry[i] {
@@ -5010,7 +7029,7 @@ pub mod codex_sqlite {
                     .join(", ");
                 let tq = quote_ident(t);
                 script.push_str(&format!(
-                    "INSERT OR IGNORE INTO main.{tq} ({col_list}) SELECT {col_list} FROM {alias}.{tq};\n"
+                    "INSERT OR IGNORE INTO main.{tq} ({col_list}) SELECT {col_list} FROM {alias}.{tq} WHERE {gate};\n"
                 ));
             }
         }
@@ -5019,7 +7038,7 @@ pub mod codex_sqlite {
             let cq = quote_ident(column);
             let tq = quote_ident(target_table);
             script.push_str(&format!(
-                "UPDATE threads SET {cq} = NULL WHERE {cq} IS NOT NULL AND {cq} NOT IN (SELECT {id_q} FROM {tq});\n"
+                "UPDATE threads SET {cq} = NULL WHERE {cq} IS NOT NULL AND {cq} NOT IN (SELECT {id_q} FROM {tq}) AND {gate};\n"
             ));
         }
 
@@ -5028,6 +7047,18 @@ pub mod codex_sqlite {
         // any OTHER table entirely — trips this NAMED `CHECK` and aborts
         // the script (`-bail`) before `COMMIT` is ever reached, so the
         // uncommitted transaction is discarded when this connection closes.
+        // It is `INSERT OR ROLLBACK`: it necessarily follows the writes, so it
+        // cannot be gated, and only `COMMIT` follows it. On a sqlite3 that
+        // keeps executing past an error, the rollback has already ended the
+        // transaction and that `COMMIT` fails ("no transaction is active")
+        // instead of landing the violating rows (measured without `-bail` on
+        // 3.45.1 and 3.50.4; Apple's /usr/bin/sqlite3 3.54.0 is covered by
+        // `orphan_refusal_holds_on_a_sqlite3_that_does_not_bail`; stderr still
+        // names the constraint). That holds when BEGIN IMMEDIATE succeeded; the
+        // run is classed pre-commit only when stderr holds no other error
+        // (`only_named_guard_failure`), and every write is refused up front
+        // unless `ensure_stops_at_first_error` measured that this sqlite3
+        // stops at the first error.
         // The constraint is NAMED (`CONSTRAINT <name> CHECK (...)`) rather
         // than bare specifically so `remap_fk_guard_violation` can match on
         // an identifier no source database's own schema could plausibly
@@ -5050,23 +7081,21 @@ pub mod codex_sqlite {
         // failure this is trying to eliminate, not relocate.)
         script.push_str(&format!(
             "CREATE TEMP TABLE fk_guard(n INTEGER CONSTRAINT {FK_GUARD_CONSTRAINT_NAME} CHECK (n = 0));\n\
-             INSERT INTO fk_guard SELECT count(*) FROM pragma_foreign_key_check;\n\
+             INSERT OR ROLLBACK INTO fk_guard SELECT count(*) FROM pragma_foreign_key_check;\n\
              COMMIT;\n"
         ));
 
         run_sqlite3(binary, dest, &script).map_err(|e| {
+            let raw = match &e {
+                ShareError::SqliteCommandFailed { detail, .. } => Some(detail.clone()),
+                _ => None,
+            };
             let e = remap_fk_guard_violation(
                 basename,
                 dest,
                 remap_dest_guard_violation(basename, dest, e),
             );
-            // Only the guards (which abort before any write) are positively
-            // pre-commit; any other failure of the script is not.
-            let pre_commit = matches!(
-                e,
-                ShareError::SqliteChangedDuringMerge { .. }
-                    | ShareError::SqliteForeignKeyViolation { .. }
-            );
+            let pre_commit = merge_failure_is_pre_commit(&raw, &e);
             MergeFailure { err: e, pre_commit }
         })?;
         Ok(())
@@ -5131,6 +7160,1138 @@ pub mod codex_sqlite {
         db_path: &Path,
         base: &Path,
     ) -> Result<usize, ShareError> {
+        let shared_root = PathBuf::from(format!(
+            "{}/shared-state/codex/codex-sessions",
+            base.display()
+        ));
+        repair_dead_rollout_paths_in(binary, db_path, base, &[shared_root])
+    }
+
+    /// Repairs dead `threads.rollout_path` rows (R9) in a slot's `state_5`
+    /// database: a row is rewritten only when its old path is gone AND the same
+    /// relative path exists as a regular file under one of `session_roots`.
+    /// Returns the number of rows rewritten; `Ok(0)` when the database does not
+    /// exist or has nothing to repair. The caller supplies the whole budget
+    /// (`deadline`). It has no production caller: the launch repair is
+    /// `repair_resume_all_before` / `repair_resume_target_before`, budgeted in
+    /// `csq/src/cli/commands/run.rs`. Kept for the R9 fixtures and the run.rs
+    /// launch tests that drive the rollout-path repair directly.
+    pub fn repair_slot_rollout_paths_before(
+        lock: &super::CodexShareLockGuard,
+        base: &Path,
+        state_db: &Path,
+        session_roots: &[PathBuf],
+        deadline: std::time::Instant,
+    ) -> Result<usize, ShareError> {
+        let _children = lock.hold_for_children();
+        match state_db.symlink_metadata() {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(ShareError::io(state_db, e)),
+        }
+        let binary = resolve_sqlite3()?;
+        repair_dead_rollout_paths_before(&binary, state_db, base, session_roots, Some(deadline))
+    }
+
+    /// `visited` counts rows OBSERVED: rows of a batch that held no UPDATE are
+    /// read and counted but never committed or rechecked in a transaction.
+    /// `rewritten` counts only rewrites whose transaction was acknowledged. An
+    /// unacknowledged write is never included in `rewritten`, even if its
+    /// transaction may have reached COMMIT (`in_flight_commit_unknown`).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct PagedResumeProgress {
+        pub visited: usize,
+        pub rewritten: usize,
+        pub databases_completed: usize,
+        pub in_flight_commit_unknown: bool,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum PagedResumeOutcome {
+        Complete(PagedResumeProgress),
+        Partial {
+            progress: PagedResumeProgress,
+            reason: &'static str,
+        },
+    }
+
+    struct ResumeFilenameIndex {
+        roots: Vec<PathBuf>,
+        names: std::collections::HashMap<std::ffi::OsString, Vec<(PathBuf, PathBuf)>>,
+    }
+
+    #[cfg(all(test, unix))]
+    thread_local! {
+        static TEST_PAGED_INDEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn test_paged_index_builds(reset: bool) -> usize {
+        TEST_PAGED_INDEX_BUILDS.with(|count| {
+            let old = count.get();
+            if reset {
+                count.set(0);
+            }
+            old
+        })
+    }
+
+    fn build_resume_filename_index(
+        roots: &[PathBuf],
+        deadline: std::time::Instant,
+    ) -> Result<ResumeFilenameIndex, &'static str> {
+        if std::time::Instant::now() >= deadline {
+            return Err("persistent transcript index incomplete within budget");
+        }
+        #[cfg(all(test, unix))]
+        TEST_PAGED_INDEX_BUILDS.with(|count| count.set(count.get() + 1));
+        let mut index = ResumeFilenameIndex {
+            roots: Vec::new(),
+            names: std::collections::HashMap::new(),
+        };
+        for root in roots {
+            if std::time::Instant::now() >= deadline {
+                return Err("persistent transcript index incomplete within budget");
+            }
+            match root.canonicalize() {
+                Ok(root) => {
+                    if !index.roots.contains(&root) {
+                        index.roots.push(root);
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => return Err("persistent transcript root unreadable"),
+            }
+        }
+        let mut visited = 0usize;
+        for root in &index.roots {
+            let mut pending = vec![(PathBuf::new(), 0usize)];
+            while let Some((rest, depth)) = pending.pop() {
+                if depth > 64 || std::time::Instant::now() >= deadline {
+                    return Err("persistent transcript index incomplete within budget");
+                }
+                for entry in fs::read_dir(root.join(&rest))
+                    .map_err(|_| "persistent transcript directory unreadable")?
+                {
+                    visited += 1;
+                    if visited > 20_000 || std::time::Instant::now() >= deadline {
+                        return Err("persistent transcript index incomplete within budget");
+                    }
+                    let entry = entry.map_err(|_| "persistent transcript entry unreadable")?;
+                    let child = rest.join(entry.file_name());
+                    let meta = entry
+                        .path()
+                        .symlink_metadata()
+                        .map_err(|_| "persistent transcript metadata unreadable")?;
+                    #[cfg(windows)]
+                    let linked = {
+                        use std::os::windows::fs::MetadataExt;
+                        meta.file_type().is_symlink() || meta.file_attributes() & 0x400 != 0
+                    };
+                    #[cfg(not(windows))]
+                    let linked = meta.file_type().is_symlink();
+                    if linked {
+                        continue;
+                    }
+                    if meta.is_dir() {
+                        pending.push((child, depth + 1));
+                    } else if meta.is_file() {
+                        index
+                            .names
+                            .entry(entry.file_name())
+                            .or_default()
+                            .push((root.clone(), child));
+                    }
+                }
+            }
+        }
+        Ok(index)
+    }
+
+    fn indexed_resume_candidate(
+        recorded: &str,
+        index: &ResumeFilenameIndex,
+    ) -> Result<Option<RepairCandidate>, &'static str> {
+        let recorded = Path::new(recorded);
+        if !recorded.is_absolute()
+            || recorded.components().any(|part| {
+                matches!(
+                    part,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+        {
+            return Err("recorded transcript path is not admitted");
+        }
+        match recorded.canonicalize() {
+            Ok(path) => {
+                for root in &index.roots {
+                    if let Ok(rest) = path.strip_prefix(root) {
+                        return admit_rollout_candidate(root, rest)
+                            .map_err(|_| "recorded transcript failed fresh no-follow admission")?
+                            .map(Some)
+                            .ok_or("recorded transcript is not an admitted regular file");
+                    }
+                }
+                return Err("recorded transcript is outside persistent roots");
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err("recorded transcript metadata unreadable"),
+        }
+        let name = recorded
+            .file_name()
+            .ok_or("recorded transcript has no filename")?;
+        let Some(candidates) = index.names.get(name) else {
+            // Absence is meaningful only after the one complete index build.
+            return Ok(None);
+        };
+        if candidates.len() != 1 {
+            return Err("transcript filename has multiple persistent candidates");
+        }
+        let (root, rest) = &candidates[0];
+        admit_rollout_candidate(root, rest)
+            .map_err(|_| "indexed transcript failed fresh no-follow admission")?
+            .map(Some)
+            .ok_or("indexed transcript changed after discovery")
+    }
+
+    pub(super) struct PagedResumeRow {
+        rowid: i64,
+        id: String,
+        old: String,
+        new: Option<String>,
+        _owner: Option<RepairCandidate>,
+    }
+
+    #[cfg(test)]
+    impl PagedResumeRow {
+        pub(super) fn for_test(n: i64, rewrite: bool) -> Self {
+            Self {
+                rowid: n + 1,
+                id: format!("r{n}"),
+                old: format!("/missing/r{n}.jsonl"),
+                new: rewrite.then(|| format!("/persistent/r{n}.jsonl")),
+                _owner: None,
+            }
+        }
+    }
+
+    /// Full resume repair traverses live rowid-keyset pages, not a global frozen
+    /// database snapshot. In a write batch that holds at least one UPDATE, every
+    /// row travelling with it is guarded, including canonical and
+    /// absent-everywhere no-update rows, so a no-update row that changed voids
+    /// that batch's UPDATEs. A batch that holds NO UPDATE spends no transaction
+    /// and guards nothing: its rows are only observed (counted in `visited`,
+    /// never in `rewritten`), so a retry after a partial run does not pay a
+    /// commit per row it already repaired.
+    pub fn repair_resume_all_before(
+        lock: &super::CodexShareLockGuard,
+        base: &Path,
+        databases: &[PathBuf],
+        roots: &[PathBuf],
+        deadline: std::time::Instant,
+    ) -> PagedResumeOutcome {
+        // Every write batch's child inherits the caller's migration lock.
+        let _children = lock.hold_for_children();
+        let mut progress = PagedResumeProgress::default();
+        let result = (|| {
+            if !base.is_absolute() || ensure_safe_attach_path(base).is_err() {
+                return Err("resume repair base is not admitted");
+            }
+            let index = build_resume_filename_index(roots, deadline)?;
+            let binary = resolve_sqlite3().map_err(|_| "sqlite dependency unavailable")?;
+            // The caller's deadline bounds admission, discovery and the index
+            // walk above. Each database's repair is bounded by its OWN
+            // windows, never by one coarse deadline over the whole walk:
+            // every spawned sqlite3 child gets a fresh step window (see
+            // `CODEX_REPAIR_STEP_BUDGET`) and the caller-side walk of each
+            // returned page a fresh read-tolerance window (`page_budget`), so
+            // a slow-but-progressing database completes and a child or page
+            // that overruns its own window still refuses. A database that
+            // returned Ok has finished every step inside its windows; its
+            // committed work is NOT re-judged against a stale budget after
+            // the fact. Only empty work is checked against the caller's
+            // deadline, so an already-spent caller budget still ends Partial
+            // with default progress rather than claiming Complete.
+            //
+            // ENFORCED WORST CASE (arithmetic over enforced mechanisms, never
+            // a measurement). Per database, let R be the rows the walk visits.
+            // Each is a distinct rowid strictly above the previous one (the
+            // "cursor did not advance" refusal) and at or below the highwater
+            // read before paging (the page SQL's `rowid<=highwater`), so R is
+            // bounded by the distinct rowids at or below that highwater that
+            // exist DURING the walk, not by a count captured before it: rows
+            // inserted below the highwater mid-walk are visited too. Page
+            // reads P <= R + 1 (at most 500 rows per page, at least one per
+            // non-final page); flushed write batches B <= R (each holds at
+            // least one row and spawns at most one child). Every re-arm
+            // extends the budget by at most its own window past the moment it
+            // is armed, so:
+            //   (5 fixed reads + P page reads + B batches)
+            //       x (STEP 9s + REPAIR_CHILD_CLEANUP_GRACE 100ms)
+            //   + (P + B) x READ_TOLERANCE 4s
+            // where the 4s windows are the walk window armed after each page
+            // read and re-armed after each acknowledged batch, each
+            // max(remaining window, 4s); plus the -bail probe's enforced
+            // PROBE_BUDGET 5s + 100ms grace once per probe-cache key (binary
+            // path, size, mtime) per process; summed over at most 1024
+            // discovered databases (the caller's discovery cap), after the
+            // caller's own 13s allowance.
+            // NOT BOUNDED: one row's filesystem admission
+            // (`indexed_resume_candidate` canonicalizes a database-supplied
+            // path, then opens the candidate) runs between deadline checks and
+            // no timer interrupts it, so a hung mount under a recorded path can
+            // stall the launch indefinitely.
+            if databases.is_empty() && std::time::Instant::now() >= deadline {
+                return Err("shared resume repair deadline exhausted");
+            }
+            for db in databases {
+                repair_resume_database_paged(
+                    &binary,
+                    db,
+                    &index,
+                    step_budget(deadline),
+                    &mut progress,
+                )?;
+                progress.databases_completed += 1;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => PagedResumeOutcome::Complete(progress),
+            Err(reason) => PagedResumeOutcome::Partial { progress, reason },
+        }
+    }
+
+    // Bind each admitted schema row once. Repeating the large upstream
+    // trigger projection per object can exhaust the write budget before a row.
+    fn paged_schema_condition(objects: &[String]) -> String {
+        let from = "sqlite_master WHERE type IN ('trigger','view')";
+        if objects.is_empty() {
+            return format!("(SELECT count(*) FROM {from})=0");
+        }
+        let values = objects
+            .iter()
+            .map(|row| format!("('{}')", sql_quote_str(row)))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("(SELECT count(*) FROM {from})={} AND NOT EXISTS (SELECT {SCHEMA_OBJECT_ROW_EXPR} FROM {from} EXCEPT SELECT column1 FROM (VALUES {values}))", objects.len())
+    }
+
+    fn repair_resume_database_paged(
+        binary: &Path,
+        db: &Path,
+        index: &ResumeFilenameIndex,
+        deadline: std::time::Instant,
+        progress: &mut PagedResumeProgress,
+    ) -> Result<(), &'static str> {
+        // Every read and every batch write below spawns one sqlite3 child:
+        // each runs under a fresh step window (see `CODEX_REPAIR_STEP_BUDGET`)
+        // so a slow but progressing host completes the repair.
+        let budget = std::cell::Cell::new(deadline);
+        let read = |sql: &str| {
+            let next = step_budget(budget.get());
+            budget.set(next);
+            run_repair_sqlite_bounded(binary, db, sql, true, next)
+                .map_err(|_| "bounded resume database read failed")
+        };
+        let schema = read(&format!(
+            "SELECT {SCHEMA_OBJECT_ROW_EXPR} FROM sqlite_master WHERE type IN ('trigger','view');"
+        ))?;
+        let objects = validate_schema_objects("paged resume", db, &schema)
+            .map_err(|_| "resume database schema objects are not admitted")?;
+        let table = read("SELECT hex(coalesce(sql,'')) FROM sqlite_master WHERE type='table' AND name='threads' LIMIT 2;")?;
+        let tables: Vec<_> = table.lines().collect();
+        if tables.is_empty() {
+            return Ok(());
+        }
+        if tables.len() != 1 {
+            return Err("resume database table is ambiguous");
+        }
+        let table_sql = decode_resume_hex(tables[0])
+            .map_err(|_| "resume table schema encoding is not admitted")?;
+        if !table_sql
+            .trim_start()
+            .to_ascii_uppercase()
+            .starts_with("CREATE TABLE")
+        {
+            return Err("resume cursor requires an ordinary SQLite table");
+        }
+        let columns = read("PRAGMA table_info(threads);")?;
+        let names: Vec<_> = columns
+            .lines()
+            .filter_map(|line| line.split('|').nth(1))
+            .collect();
+        if !names.contains(&"rollout_path") {
+            return Ok(()); // Valid legacy schema has no rollout projection.
+        }
+        if !names.contains(&"id")
+            || names.iter().any(|name| {
+                ["rowid", "_rowid_", "oid"]
+                    .iter()
+                    .any(|reserved| name.eq_ignore_ascii_case(reserved))
+            })
+        {
+            return Err("resume database does not expose an unshadowed physical rowid");
+        }
+        // WITHOUT ROWID is conservatively unsupported; query also proves the
+        // real physical cursor exists before interpreting any empty page.
+        read("SELECT rowid FROM threads LIMIT 1;")
+            .map_err(|_| "resume database does not expose a physical rowid")?;
+        let mut header =
+            format!("PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};\nBEGIN IMMEDIATE;\n");
+        header.push_str(&named_guard_sql(
+            "csq_paged_schema_unchanged",
+            &paged_schema_condition(&objects),
+        ));
+        header.push_str(&named_guard_sql("csq_paged_table_unchanged", &format!(
+            "(SELECT count(*) FROM sqlite_master WHERE type='table' AND name='threads' AND hex(coalesce(sql,''))='{}')=1",
+            sql_quote_str(tables[0]))));
+        // Capture a finite per-database tail. Later appends are left to the
+        // next launch; keyset traversal is not a globally frozen snapshot.
+        let tail = read(
+            "SELECT coalesce(max(rowid),'EMPTY') FROM threads WHERE rollout_path IS NOT NULL;",
+        )?;
+        if tail.trim() == "EMPTY" {
+            return Ok(());
+        }
+        let highwater = tail
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| "invalid resume highwater cursor")?;
+        let mut cursor: Option<i64> = None;
+        loop {
+            if std::time::Instant::now() >= budget.get() {
+                return Err("shared resume repair deadline exhausted");
+            }
+            let after = cursor.map_or(String::new(), |rowid| format!(" AND rowid>{rowid}"));
+            // The cumulative encoded payload is bounded independently of row
+            // count. An individually oversized first row emits a short refusal
+            // marker instead of impersonating end-of-table.
+            let sql = format!("WITH candidates AS (SELECT rowid AS r,id,rollout_path FROM threads WHERE rollout_path IS NOT NULL AND rowid<={highwater}{after} ORDER BY rowid LIMIT 500), sized AS (SELECT r,id,rollout_path,SUM(length(hex(id))+length(hex(rollout_path))+32) OVER (ORDER BY r ROWS UNBOUNDED PRECEDING) AS bytes FROM candidates) SELECT payload FROM (SELECT r AS sequence,r||'|'||hex(id)||'|'||hex(rollout_path) AS payload FROM sized WHERE bytes<=524288 UNION ALL SELECT r AS sequence,'OVERSIZE' AS payload FROM sized WHERE bytes>524288 AND r=(SELECT min(r) FROM sized)) ORDER BY sequence;");
+            let page = read(&sql)?;
+            if page.is_empty() {
+                return Ok(());
+            }
+            #[cfg(test)]
+            test_paged_walk_point(PagedWalkPoint::PageRead);
+            // The walk of this page is the caller's own work, not the read
+            // child's: give it its own window from the moment the page arrived
+            // (see `page_budget`).
+            budget.set(page_budget(budget.get()));
+            let mut batch = PagedBatch::new(&header);
+            let mut pending = Vec::new();
+            for line in page.lines() {
+                #[cfg(test)]
+                test_paged_walk_point(PagedWalkPoint::Row);
+                if std::time::Instant::now() >= budget.get() {
+                    return Err("shared resume repair deadline exhausted");
+                }
+                if line == "OVERSIZE" {
+                    return Err("resume row exceeds bounded read payload");
+                }
+                let mut fields = line.split('|');
+                let rowid = fields
+                    .next()
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .ok_or("invalid resume row cursor")?;
+                if cursor.is_some_and(|last| rowid <= last) {
+                    return Err("resume physical cursor did not advance");
+                }
+                let id = decode_resume_hex(fields.next().ok_or("missing resume id")?)
+                    .map_err(|_| "resume id encoding is not admitted")?;
+                let old = decode_resume_hex(fields.next().ok_or("missing resume path")?)
+                    .map_err(|_| "resume path encoding is not admitted")?;
+                if fields.next().is_some()
+                    || id.is_empty()
+                    || contains_sql_literal_control_byte(&id)
+                    || contains_sql_literal_control_byte(&old)
+                {
+                    return Err("resume row data is not admitted");
+                }
+                let candidate = indexed_resume_candidate(&old, index)?;
+                let new = candidate
+                    .as_ref()
+                    .map(|candidate| {
+                        candidate
+                            .path
+                            .to_str()
+                            .ok_or("persistent transcript path is not UTF-8")
+                    })
+                    .transpose()?;
+                if new.is_some_and(contains_sql_literal_control_byte) {
+                    return Err("persistent transcript path contains control bytes");
+                }
+                let new = new.filter(|path| *path != old).map(str::to_owned);
+                let row = PagedResumeRow {
+                    rowid,
+                    id,
+                    old,
+                    new,
+                    _owner: candidate,
+                };
+                cursor = Some(rowid);
+                let (guard, update) = paged_row_sql(&row);
+                if (batch.projected_len(&guard, update.as_deref()) > PAGED_BATCH_BYTES
+                    || pending.len() >= 32)
+                    && !pending.is_empty()
+                {
+                    let next = step_budget(budget.get());
+                    budget.set(next);
+                    commit_resume_batch(binary, db, &batch, &pending, next, progress)?;
+                    #[cfg(test)]
+                    test_paged_walk_point(PagedWalkPoint::BatchCommitted);
+                    // The rows after this batch are the caller's own work, not
+                    // the batch child's: re-arm their walk window from the
+                    // moment the batch was acknowledged (see `page_budget`).
+                    budget.set(page_budget(budget.get()));
+                    pending.clear();
+                    batch = PagedBatch::new(&header);
+                }
+                if batch.projected_len(&guard, update.as_deref()) > PAGED_BATCH_BYTES {
+                    return Err("resume row guard exceeds bounded write payload");
+                }
+                batch.push(&guard, update.as_deref());
+                pending.push(row);
+            }
+            if !pending.is_empty() {
+                let next = step_budget(budget.get());
+                budget.set(next);
+                commit_resume_batch(binary, db, &batch, &pending, next, progress)?;
+                #[cfg(test)]
+                test_paged_walk_point(PagedWalkPoint::BatchCommitted);
+                // As above: the loop's own check before the next page read is
+                // not charged to this batch child's window.
+                budget.set(page_budget(budget.get()));
+            }
+        }
+    }
+
+    /// A point in the caller-side walk at which a test may spend time, to model
+    /// a child that returned late inside its own window, or a slow walk.
+    #[cfg(test)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum PagedWalkPoint {
+        /// A non-empty page read returned, before its walk window is armed.
+        PageRead,
+        /// The top of one row's walk, before its deadline check.
+        Row,
+        /// A write batch was acknowledged, before the walk window is re-armed.
+        BatchCommitted,
+        /// The exact route's target-row read returned, before its walk window.
+        ExactRowsRead,
+        /// The exact route's filename search pops one directory, before its
+        /// deadline check.
+        ExactSearchDir,
+    }
+
+    #[cfg(test)]
+    type PagedWalkHook = Box<dyn FnMut(PagedWalkPoint)>;
+
+    #[cfg(test)]
+    thread_local! {
+        static TEST_PAGED_WALK_HOOK: std::cell::RefCell<Option<PagedWalkHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Clears the walk hook on drop, including on a panicking test. Unix-only,
+    /// like every test that installs a hook.
+    #[cfg(all(test, unix))]
+    pub(super) struct PagedWalkHookGuard;
+
+    #[cfg(all(test, unix))]
+    impl Drop for PagedWalkHookGuard {
+        fn drop(&mut self) {
+            TEST_PAGED_WALK_HOOK.with(|cell| *cell.borrow_mut() = None);
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn set_test_paged_walk_hook(
+        hook: impl FnMut(PagedWalkPoint) + 'static,
+    ) -> PagedWalkHookGuard {
+        TEST_PAGED_WALK_HOOK.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
+        PagedWalkHookGuard
+    }
+
+    #[cfg(test)]
+    fn test_paged_walk_point(point: PagedWalkPoint) {
+        TEST_PAGED_WALK_HOOK.with(|cell| {
+            if let Some(hook) = cell.borrow_mut().as_mut() {
+                hook(point);
+            }
+        });
+    }
+
+    /// The row guard and, when the row needs rewriting, its UPDATE. The guard
+    /// is a row in the batch's `csq_paged_rows` table, whose `CHECK` fails when
+    /// the row changed since it was read; the UPDATE is predicated on the batch
+    /// gate, which only holds when EVERY row guard (all emitted before the first
+    /// UPDATE) and both header guards held.
+    pub(super) fn paged_row_sql(row: &PagedResumeRow) -> (String, Option<String>) {
+        let guard = format!(
+            "INSERT INTO {PAGED_ROWS} SELECT ((SELECT count(*) FROM threads WHERE id='{}')=1 AND (SELECT count(*) FROM threads WHERE rowid={} AND id='{}' AND rollout_path='{}')=1);\n",
+            sql_quote_str(&row.id), row.rowid, sql_quote_str(&row.id), sql_quote_str(&row.old));
+        let update = row.new.as_ref().map(|new| format!("UPDATE threads SET rollout_path='{}' WHERE rowid={} AND id='{}' AND rollout_path='{}' AND {};\n",
+            sql_quote_str(new), row.rowid, sql_quote_str(&row.id), sql_quote_str(&row.old),
+            gate_exists(&[PAGED_BATCH_GATE])));
+        (guard, update)
+    }
+
+    /// 10k UTF-8 script bytes keep one launch-time transaction small, far
+    /// under the launch runner's `REPAIR_SCRIPT_CAP`.
+    const PAGED_BATCH_BYTES: usize = 10_000;
+    const COMMIT_SQL: &str = "COMMIT;\n";
+    const PAGED_ROWS: &str = "csq_paged_rows";
+    const PAGED_BATCH_GATE: &str = "csq_paged_batch_gate";
+    const PAGED_HEADER_GUARDS: [&str; 2] =
+        ["csq_paged_schema_unchanged", "csq_paged_table_unchanged"];
+
+    /// One transaction's script, laid out as: header guards, the row-guard
+    /// table, EVERY row guard, one batch gate that requires all of them, then
+    /// the UPDATEs (each predicated on the batch gate), then `COMMIT`. A failed
+    /// row guard therefore voids every UPDATE of the batch even on a sqlite3
+    /// that keeps executing past an error, so a failed GUARD cannot leave a
+    /// partly committed batch and is a known rollback. Failures that are not
+    /// guards (a UNIQUE violation, a failed BEGIN) are not covered by the gate:
+    /// they are stopped by `-bail`, which `ensure_stops_at_first_error` measures
+    /// on the binary before any write, and are classed unknown by
+    /// `only_named_guard_failure` if they do occur.
+    pub(super) struct PagedBatch<'a> {
+        header: &'a str,
+        guards: String,
+        updates: String,
+        rows: usize,
+    }
+
+    impl<'a> PagedBatch<'a> {
+        pub(super) fn new(header: &'a str) -> Self {
+            Self {
+                header,
+                guards: String::new(),
+                updates: String::new(),
+                rows: 0,
+            }
+        }
+
+        /// The text before the row guards and the gate that follows them, for a
+        /// batch of `rows` rows.
+        fn frame(&self, rows: usize) -> (String, String) {
+            let header_terms = PAGED_HEADER_GUARDS
+                .into_iter()
+                .map(|n| format!("(SELECT count(*) FROM temp.{n} WHERE ok IS 1)=1"))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            (
+                format!(
+                    "{}CREATE TEMP TABLE {PAGED_ROWS}(ok INTEGER CONSTRAINT {PAGED_ROWS} CHECK (ok IS 1));\n",
+                    self.header
+                ),
+                named_guard_sql(
+                    PAGED_BATCH_GATE,
+                    &format!("(SELECT count(*) FROM temp.{PAGED_ROWS} WHERE ok IS 1)={rows} AND {header_terms}"),
+                ),
+            )
+        }
+
+        /// Exact byte length of the script after adding one more row.
+        pub(super) fn projected_len(&self, guard: &str, update: Option<&str>) -> usize {
+            let (pre, gate) = self.frame(self.rows + 1);
+            pre.len()
+                + self.guards.len()
+                + guard.len()
+                + gate.len()
+                + self.updates.len()
+                + update.map_or(0, str::len)
+                + COMMIT_SQL.len()
+        }
+
+        pub(super) fn has_updates(&self) -> bool {
+            !self.updates.is_empty()
+        }
+
+        pub(super) fn push(&mut self, guard: &str, update: Option<&str>) {
+            self.guards.push_str(guard);
+            if let Some(update) = update {
+                self.updates.push_str(update);
+            }
+            self.rows += 1;
+        }
+
+        pub(super) fn script(&self) -> String {
+            let (pre, gate) = self.frame(self.rows);
+            format!("{pre}{}{gate}{}{COMMIT_SQL}", self.guards, self.updates)
+        }
+    }
+
+    fn commit_resume_batch(
+        binary: &Path,
+        db: &Path,
+        batch: &PagedBatch<'_>,
+        rows: &[PagedResumeRow],
+        deadline: std::time::Instant,
+        progress: &mut PagedResumeProgress,
+    ) -> Result<(), &'static str> {
+        if std::time::Instant::now() >= deadline {
+            return Err("shared resume repair deadline exhausted before write");
+        }
+        if !batch.has_updates() {
+            // Nothing to write, so nothing to guard: no transaction.
+            progress.visited += rows.len();
+            return Ok(());
+        }
+        #[cfg(test)]
+        TEST_REPAIR_BEFORE_WRITE.with(|cell| {
+            if let Some(hook) = cell.borrow_mut().take() {
+                hook();
+            }
+        });
+        let script = batch.script();
+        let mut commit_unknown = false;
+        if run_repair_sqlite_bounded_tracking(
+            binary,
+            db,
+            &script,
+            false,
+            deadline,
+            &mut commit_unknown,
+        )
+        .is_err()
+        {
+            // A timeout/read failure may occur after COMMIT but before receipt.
+            // No unacknowledged batch contributes to `rewritten`, the committed counter.
+            progress.in_flight_commit_unknown = commit_unknown;
+            return Err("resume write batch completion was not acknowledged");
+        }
+        progress.visited += rows.len();
+        progress.rewritten += rows.iter().filter(|row| row.new.is_some()).count();
+        Ok(())
+    }
+
+    /// Exact resume admission; unlike migration repair this never reads unrelated rows.
+    /// Returns one when the target is admitted, zero when this database lacks it.
+    pub fn repair_resume_target_before(
+        lock: &super::CodexShareLockGuard,
+        base: &Path,
+        state_db: &Path,
+        session_roots: &[PathBuf],
+        target: &str,
+        deadline: std::time::Instant,
+    ) -> Result<usize, ShareError> {
+        // The rewrite's child inherits the caller's migration lock.
+        let _children = lock.hold_for_children();
+        if target.is_empty()
+            || target.len() > 128
+            || !target
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        {
+            return Err(ShareError::CodexResumeTarget {
+                reason: "invalid exact thread id",
+            });
+        }
+        match state_db.symlink_metadata() {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(ShareError::io(state_db, e)),
+        }
+        let binary = resolve_sqlite3()?;
+        repair_rollout_paths_selected(
+            &binary,
+            state_db,
+            base,
+            session_roots,
+            Some(deadline),
+            Some(target),
+        )
+    }
+
+    /// True when `err` says the exact route's BOUNDED WORK BUDGET expired — the
+    /// deadline class — rather than that the target is unadmittable. Three
+    /// shapes carry it: the bounded runner's own deadline (a
+    /// [`ShareError::SqliteCommandFailed`] whose detail IS exactly
+    /// `ROLLOUT_REPAIR_DEADLINE_DETAIL`, emitted by both its pre-spawn
+    /// refusal and its wait-loop kill), the row/root walk's `TimedOut` IO
+    /// error, and the bounded filename search's budget refusal.
+    ///
+    /// The match is EXACT, never a substring: every other runner detail embeds
+    /// the child's stderr, which quotes database content, so a `contains`
+    /// match would let a `rollout_path` containing the word "deadline" pick
+    /// the class an operator is told to act on.
+    ///
+    /// The caller must refuse for the RIGHT reason: a starved host is retryable
+    /// and leaves persistent state untouched, while a damaged or ambiguous
+    /// target needs an operator. Which leg spent the budget never changes the
+    /// class — every deadline-expiry is the deadline class.
+    pub fn is_bounded_deadline_refusal(err: &ShareError) -> bool {
+        match err {
+            ShareError::SqliteCommandFailed { detail, .. } => {
+                detail == ROLLOUT_REPAIR_DEADLINE_DETAIL
+            }
+            ShareError::Io { source, .. } => source.kind() == io::ErrorKind::TimedOut,
+            ShareError::CodexResumeTarget { reason } => {
+                *reason == "target filename search exceeded its bounded budget"
+            }
+            _ => false,
+        }
+    }
+
+    fn decode_resume_hex(value: &str) -> Result<String, ShareError> {
+        let invalid = || ShareError::CodexResumeTarget {
+            reason: "invalid target row encoding",
+        };
+        if !value.len().is_multiple_of(2) || value.len() > 131_072 {
+            return Err(invalid());
+        }
+        let mut bytes = Vec::with_capacity(value.len() / 2);
+        for pair in value.as_bytes().as_chunks::<2>().0 {
+            let high = (pair[0] as char).to_digit(16).ok_or_else(invalid)?;
+            let low = (pair[1] as char).to_digit(16).ok_or_else(invalid)?;
+            bytes.push((high * 16 + low) as u8);
+        }
+        String::from_utf8(bytes).map_err(|_| invalid())
+    }
+
+    fn resume_candidate(
+        recorded: &str,
+        roots: &[PathBuf],
+        deadline: Option<std::time::Instant>,
+    ) -> Result<RepairCandidate, ShareError> {
+        let refuse = |reason| ShareError::CodexResumeTarget { reason };
+        let recorded = Path::new(recorded);
+        if !recorded.is_absolute()
+            || recorded
+                .components()
+                .any(|p| matches!(p, std::path::Component::ParentDir))
+        {
+            return Err(refuse(
+                "target recorded path is relative or contains traversal components",
+            ));
+        }
+        let mut canonical_roots = Vec::new();
+        for root in roots {
+            match root.canonicalize() {
+                Ok(root) => {
+                    if !canonical_roots.contains(&root) {
+                        canonical_roots.push(root);
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(ShareError::io(root, e)),
+            }
+        }
+        // Resolving term aliases must be rewritten too: a later native activity
+        // can re-record CODEX_HOME even after an earlier canonicalization.
+        match recorded.canonicalize() {
+            Ok(path) => {
+                for root in &canonical_roots {
+                    if let Ok(rest) = path.strip_prefix(root) {
+                        if let Some(candidate) = admit_rollout_candidate(root, rest)? {
+                            return Ok(candidate);
+                        }
+                    }
+                }
+                return Err(refuse("recorded rollout is outside the admitted persistent roots or not a regular file"));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(ShareError::io(recorded, e)),
+        }
+        if recorded.components().any(|p| {
+            matches!(
+                p,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        }) {
+            return Err(refuse("target recorded path contains traversal components"));
+        }
+        let filename = recorded
+            .file_name()
+            .ok_or_else(|| refuse("target rollout has no filename"))?;
+        let mut found: Option<RepairCandidate> = None;
+        let mut visited = 0usize;
+        for root in &canonical_roots {
+            let mut pending = vec![(PathBuf::new(), 0usize)];
+            while let Some((rest, depth)) = pending.pop() {
+                #[cfg(test)]
+                test_paged_walk_point(PagedWalkPoint::ExactSearchDir);
+                if depth > 64 || deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    return Err(refuse("target filename search exceeded its bounded budget"));
+                }
+                for entry in fs::read_dir(root.join(&rest)).map_err(|e| ShareError::io(root, e))? {
+                    visited += 1;
+                    if visited > 20_000 || deadline.is_some_and(|d| std::time::Instant::now() >= d)
+                    {
+                        return Err(refuse("target filename search exceeded its bounded budget"));
+                    }
+                    let entry = entry.map_err(|e| ShareError::io(root, e))?;
+                    let child = rest.join(entry.file_name());
+                    let meta = entry
+                        .path()
+                        .symlink_metadata()
+                        .map_err(|e| ShareError::io(&entry.path(), e))?;
+                    #[cfg(windows)]
+                    let linked = {
+                        use std::os::windows::fs::MetadataExt;
+                        meta.file_type().is_symlink() || meta.file_attributes() & 0x400 != 0
+                    };
+                    #[cfg(not(windows))]
+                    let linked = meta.file_type().is_symlink();
+                    if entry.file_name() == filename {
+                        if let Some(candidate) = admit_rollout_candidate(root, &child)? {
+                            if found.as_ref().is_some_and(|old| old.path != candidate.path) {
+                                return Err(refuse(
+                                    "target filename has multiple admissible transcripts",
+                                ));
+                            }
+                            if found.is_none() {
+                                found = Some(candidate);
+                            }
+                        }
+                    }
+                    if meta.is_dir() && !linked {
+                        pending.push((child, depth + 1));
+                    }
+                }
+            }
+        }
+        found.ok_or_else(|| refuse("target transcript is missing from persistent storage"))
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static TEST_REPAIR_BEFORE_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_test_repair_before_write(hook: impl FnOnce() + 'static) {
+        TEST_REPAIR_BEFORE_WRITE.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn rollout_relative_tail(
+        base: &str,
+        recorded: &str,
+        windows: bool,
+    ) -> Option<String> {
+        let normalize = |s: &str| {
+            if windows {
+                s.replace('\\', "/")
+            } else {
+                s.to_owned()
+            }
+        };
+        let recorded = normalize(recorded);
+        let prefix = format!("{}/term-", normalize(base));
+        let after = recorded.strip_prefix(&prefix)?;
+        let (pid, rest) = after.split_once("/sessions/")?;
+        if pid.is_empty()
+            || !pid.bytes().all(|b| b.is_ascii_digit())
+            || rest.is_empty()
+            || rest
+                .split('/')
+                .any(|p| p.is_empty() || p == "." || p == ".." || (windows && p.contains(':')))
+        {
+            return None;
+        }
+        Some(rest.to_owned())
+    }
+
+    struct RepairCandidate {
+        path: PathBuf,
+        // Own the exact no-follow regular file during admission and selection.
+        // This is not a lock against later namespace renames; callers require a
+        // stable persistent-root namespace while staging and applying repair.
+        _owner: fs::File,
+    }
+
+    fn recorded_rollout_is_missing(path: &Path) -> Result<bool, ShareError> {
+        match path.symlink_metadata() {
+            Ok(_) => Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
+            Err(e) => Err(ShareError::io(path, e)),
+        }
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static TEST_REPAIR_BEFORE_CANDIDATE_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn set_test_repair_before_candidate_open(hook: impl FnOnce() + 'static) {
+        TEST_REPAIR_BEFORE_CANDIDATE_OPEN.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    fn admit_rollout_candidate(
+        root: &Path,
+        rest: &Path,
+    ) -> Result<Option<RepairCandidate>, ShareError> {
+        let root = match root.canonicalize() {
+            Ok(root) => root,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(ShareError::io(root, e)),
+        };
+        let candidate = root.join(rest);
+        // Root aliases are intentional; aliases in the untrusted suffix are not.
+        let mut probe = root.clone();
+        for part in rest.components() {
+            probe.push(part);
+            let meta = match probe.symlink_metadata() {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(ShareError::io(&probe, e)),
+            };
+            #[cfg(not(windows))]
+            let reparse = meta.file_type().is_symlink();
+            #[cfg(windows)]
+            let reparse = {
+                use std::os::windows::fs::MetadataExt;
+                meta.file_type().is_symlink() || meta.file_attributes() & 0x400 != 0
+            };
+            if reparse {
+                return Err(ShareError::io(
+                    &probe,
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "rollout candidate suffix contains a symlink or reparse point",
+                    ),
+                ));
+            }
+        }
+        let canonical = candidate
+            .canonicalize()
+            .map_err(|e| ShareError::io(&candidate, e))?;
+        if !canonical.starts_with(&root) {
+            return Err(ShareError::io(
+                &candidate,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "rollout candidate escapes its persistent root",
+                ),
+            ));
+        }
+        #[cfg(test)]
+        TEST_REPAIR_BEFORE_CANDIDATE_OPEN.with(|cell| {
+            if let Some(hook) = cell.borrow_mut().take() {
+                hook();
+            }
+        });
+        let file = open_rollout_nofollow(&root, rest).map_err(|e| ShareError::io(&candidate, e))?;
+        let meta = file.metadata().map_err(|e| ShareError::io(&candidate, e))?;
+        if !meta.file_type().is_file() || meta.file_type().is_symlink() {
+            return Ok(None);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
+            use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+            let mut buf = vec![0u16; 32768];
+            // SAFETY: file owns a live handle, and buf is writable for its length.
+            let n = unsafe {
+                GetFinalPathNameByHandleW(
+                    file.as_raw_handle() as _,
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                    0,
+                )
+            };
+            if n == 0 || n as usize >= buf.len() {
+                return Err(ShareError::io(&candidate, io::Error::last_os_error()));
+            }
+            let opened = PathBuf::from(std::ffi::OsString::from_wide(&buf[..n as usize]));
+            if opened != canonical || !opened.starts_with(&root) {
+                return Err(ShareError::io(
+                    &candidate,
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "opened rollout candidate differs from its contained path",
+                    ),
+                ));
+            }
+        }
+        Ok(Some(RepairCandidate {
+            path: canonical,
+            _owner: file,
+        }))
+    }
+
+    #[cfg(unix)]
+    fn open_rollout_nofollow(root: &Path, rest: &Path) -> io::Result<fs::File> {
+        use std::os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+        };
+        let mut dir = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(root)?;
+        let parts: Vec<_> = rest.components().collect();
+        for (index, part) in parts.iter().enumerate() {
+            let name = std::ffi::CString::new(part.as_os_str().as_bytes()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "NUL in rollout suffix")
+            })?;
+            let final_part = index + 1 == parts.len();
+            let flags = if final_part {
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC
+            } else {
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+            };
+            // SAFETY: dir owns a live descriptor, name is NUL-terminated, and
+            // openat returns a new descriptor anchored beneath that directory.
+            let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: this newly opened descriptor transfers exactly once.
+            let file = unsafe { fs::File::from_raw_fd(fd) };
+            if final_part {
+                return Ok(file);
+            }
+            dir = file;
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty rollout suffix",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn open_rollout_nofollow(root: &Path, rest: &Path) -> io::Result<fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x0020_0000)
+            .open(root.join(rest))
+    }
+
+    fn repair_dead_rollout_paths_in(
+        binary: &Path,
+        db_path: &Path,
+        base: &Path,
+        session_roots: &[PathBuf],
+    ) -> Result<usize, ShareError> {
+        repair_dead_rollout_paths_before(binary, db_path, base, session_roots, None)
+    }
+
+    fn repair_dead_rollout_paths_before(
+        binary: &Path,
+        db_path: &Path,
+        base: &Path,
+        session_roots: &[PathBuf],
+        deadline: Option<std::time::Instant>,
+    ) -> Result<usize, ShareError> {
+        repair_rollout_paths_selected(binary, db_path, base, session_roots, deadline, None)
+    }
+
+    fn repair_rollout_paths_selected(
+        binary: &Path,
+        db_path: &Path,
+        base: &Path,
+        session_roots: &[PathBuf],
+        deadline: Option<std::time::Instant>,
+        target: Option<&str>,
+    ) -> Result<usize, ShareError> {
         if !base.is_absolute() {
             // The prefix match below is meaningless against a relative
             // base, and could in principle match relative to sqlite3's own
@@ -5150,7 +8311,25 @@ pub mod codex_sqlite {
         // path this module interpolates into a SQL literal.
         ensure_safe_attach_path(base)?;
 
-        let has_threads = table_set(binary, db_path)?.contains("threads");
+        // Launch-time repairs bypass the merge planner. Inspect the same exact
+        // trigger/view allowlist here, before opening any writable connection.
+        // Every call below spawns one sqlite3 child, so each one runs under a
+        // fresh step window (see `CODEX_REPAIR_STEP_BUDGET`) — a slow but
+        // progressing host completes the repair instead of refusing it.
+        let budget = std::cell::Cell::new(deadline);
+        let run = |sql: &str, readonly: bool| match budget.get() {
+            Some(current) => {
+                let next = step_budget(current);
+                budget.set(Some(next));
+                run_repair_sqlite_bounded(binary, db_path, sql, readonly, next)
+            }
+            None => run_sqlite3_with(binary, db_path, sql, readonly),
+        };
+        let schema = run(&format!("SELECT {SCHEMA_OBJECT_ROW_EXPR} FROM sqlite_master WHERE type IN ('trigger','view');"), true)?;
+        let schema_objects = validate_schema_objects("rollout repair", db_path, &schema)?;
+        let has_threads = run("SELECT name FROM sqlite_master WHERE type='table';", true)?
+            .lines()
+            .any(|name| name.trim() == "threads");
         if !has_threads {
             return Ok(0);
         }
@@ -5163,7 +8342,7 @@ pub mod codex_sqlite {
         // rollout_path`), which would fail this call over a column that was
         // simply never expected to be there. Check first, via
         // `PRAGMA table_info`, and skip cleanly when it is absent.
-        let columns = run_sqlite3_readonly(binary, db_path, "PRAGMA table_info(threads);")?;
+        let columns = run("PRAGMA table_info(threads);", true)?;
         let has_rollout_path = columns.lines().any(|line| {
             let mut fields = line.split('|');
             let _cid = fields.next();
@@ -5178,25 +8357,67 @@ pub mod codex_sqlite {
         }
 
         let base_str = base.display().to_string();
-        let term_prefix = format!("{base_str}/term-");
-        let shared_sessions_root = format!("{base_str}/shared-state/codex/codex-sessions/");
 
         // Coarse pre-filter only — every candidate is re-verified in Rust
         // below against the EXACT `<base>/term-<digits>/sessions/` shape,
         // so a `%`/`_` occurring literally inside `base_str` can only widen
         // this SELECT's candidate set, never cause an incorrect REWRITE.
-        let rows = run_sqlite3_readonly(
-            binary,
-            db_path,
-            "SELECT id, rollout_path FROM threads WHERE rollout_path LIKE '%/term-%/sessions/%';",
-        )?;
-
-        let mut updates: Vec<(String, String, String)> = Vec::new(); // (id, old, new)
+        let rows = if let Some(target) = target {
+            run(
+                &format!(
+                    "SELECT hex(id), hex(rollout_path) FROM threads WHERE id='{}' LIMIT 2;",
+                    sql_quote_str(target)
+                ),
+                true,
+            )?
+        } else {
+            run(
+                "SELECT id, rollout_path FROM threads WHERE rollout_path IS NOT NULL;",
+                true,
+            )?
+        };
+        #[cfg(test)]
+        test_paged_walk_point(PagedWalkPoint::ExactRowsRead);
+        // The row walk below, including the exact route's transcript filename
+        // search, is the caller's own work, not the row read child's: give it
+        // its own window from the moment the rows arrived (see `page_budget`).
+        budget.set(budget.get().map(page_budget));
+        let mut selected = Vec::new();
         for line in rows.lines() {
-            let mut fields = line.splitn(2, '|');
-            let (Some(id), Some(rollout_path)) = (fields.next(), fields.next()) else {
-                continue;
-            };
+            if let Some((id, path)) = line.split_once('|') {
+                selected.push(if target.is_some() {
+                    (decode_resume_hex(id)?, decode_resume_hex(path)?)
+                } else {
+                    (id.to_owned(), path.to_owned())
+                });
+            } else if target.is_some() {
+                return Err(ShareError::CodexResumeTarget {
+                    reason: "invalid exact target row",
+                });
+            }
+        }
+        if let Some(target) = target {
+            if selected.is_empty() {
+                return Ok(0);
+            }
+            if selected.len() != 1 || selected[0].0 != target {
+                return Err(ShareError::CodexResumeTarget {
+                    reason: "ambiguous exact target row",
+                });
+            }
+        }
+        let mut updates: Vec<(String, String, String)> = Vec::new(); // (id, old, new)
+        let mut target_owners = Vec::new();
+        for (id, rollout_path) in &selected {
+            if budget
+                .get()
+                .is_some_and(|limit| std::time::Instant::now() >= limit)
+            {
+                return Err(ShareError::io(
+                    db_path,
+                    io::Error::new(io::ErrorKind::TimedOut, "rollout repair deadline"),
+                ));
+            }
             // M1: `id`/`rollout_path` are read from the database this call is
             // about to WRITE BACK into via a generated SQL literal — a row
             // this module did not itself insert (a hand-modified or
@@ -5207,24 +8428,35 @@ pub mod codex_sqlite {
             if contains_sql_literal_control_byte(id)
                 || contains_sql_literal_control_byte(rollout_path)
             {
+                if target.is_some() {
+                    return Err(ShareError::CodexResumeTarget {
+                        reason: "target row contains control bytes",
+                    });
+                }
                 continue;
             }
-            let Some(after_term) = rollout_path.strip_prefix(&term_prefix) else {
-                continue;
-            };
-            let Some(slash_idx) = after_term.find('/') else {
-                continue;
-            };
-            let (pid_part, remainder) = after_term.split_at(slash_idx);
-            if pid_part.is_empty() || !pid_part.chars().all(|c| c.is_ascii_digit()) {
+            if target.is_some() {
+                let candidate = resume_candidate(rollout_path, session_roots, budget.get())?;
+                let new_path = candidate
+                    .path
+                    .to_str()
+                    .ok_or(ShareError::CodexResumeTarget {
+                        reason: "target path is not UTF-8",
+                    })?;
+                if contains_sql_literal_control_byte(new_path) {
+                    return Err(ShareError::CodexResumeTarget {
+                        reason: "target path contains control bytes",
+                    });
+                }
+                if new_path != rollout_path {
+                    updates.push((id.clone(), rollout_path.clone(), new_path.to_owned()));
+                }
+                target_owners.push(candidate);
                 continue;
             }
-            let Some(rest) = remainder[1..].strip_prefix("sessions/") else {
+            let Some(rest) = rollout_relative_tail(&base_str, rollout_path, cfg!(windows)) else {
                 continue;
             };
-            if rest.is_empty() {
-                continue;
-            }
             // M1: `rest` becomes a path SUFFIX appended onto
             // `shared_sessions_root` below — a `..` component (or an
             // absolute/prefix/`.` component `Path::join` would still resolve
@@ -5233,30 +8465,92 @@ pub mod codex_sqlite {
             // OUTSIDE `shared-state/codex/codex-sessions/` entirely, at a
             // path this call never verified. Every component must be a
             // plain (`Component::Normal`) segment.
-            let rest_is_safe = Path::new(rest)
+            let rest_is_safe = Path::new(&rest)
                 .components()
                 .all(|c| matches!(c, std::path::Component::Normal(_)));
             if !rest_is_safe {
                 continue;
             }
-            let new_path = format!("{shared_sessions_root}{rest}");
-            if contains_sql_literal_control_byte(&new_path) {
+            if !recorded_rollout_is_missing(Path::new(rollout_path))? {
                 continue;
             }
-            let old_exists = Path::new(rollout_path).symlink_metadata().is_ok();
-            // A regular FILE, not merely "something exists": a `rest` with a
-            // trailing `/` (which `components()` drops) names a directory in
-            // the shared root, and a rollout path must name a transcript.
-            let new_exists = fs::metadata(&new_path)
-                .map(|m| m.is_file())
-                .unwrap_or(false);
-            if !old_exists && new_exists {
-                updates.push((id.to_string(), rollout_path.to_string(), new_path));
+            let mut found: Option<RepairCandidate> = None;
+            for root in session_roots {
+                if budget
+                    .get()
+                    .is_some_and(|limit| std::time::Instant::now() >= limit)
+                {
+                    return Err(ShareError::io(
+                        db_path,
+                        io::Error::new(io::ErrorKind::TimedOut, "rollout repair deadline"),
+                    ));
+                }
+                if let Some(candidate) = admit_rollout_candidate(root, Path::new(&rest))? {
+                    if let Some(existing) = &found {
+                        if existing.path != candidate.path {
+                            return Err(ShareError::io(
+                                db_path,
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "rollout repair found conflicting persistent candidates",
+                                ),
+                            ));
+                        }
+                    } else {
+                        found = Some(candidate);
+                    }
+                }
+            }
+            if let Some(candidate) = found {
+                let Some(new_path) = candidate.path.to_str() else {
+                    return Err(ShareError::io(
+                        &candidate.path,
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "rollout candidate path is not UTF-8",
+                        ),
+                    ));
+                };
+                if contains_sql_literal_control_byte(new_path) {
+                    return Err(ShareError::io(
+                        &candidate.path,
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "rollout candidate path contains SQL control bytes",
+                        ),
+                    ));
+                }
+                updates.push((
+                    id.to_string(),
+                    rollout_path.to_string(),
+                    new_path.to_owned(),
+                ));
             }
         }
 
-        if updates.is_empty() {
+        if updates.is_empty() && target.is_none() {
             return Ok(0);
+        }
+
+        // ead5c0cf8's trade, extended to the exact route: a target row that is
+        // ALREADY canonical (the candidate resolved above, and it equals the
+        // recorded path — so `updates` is empty) is admitted by the reads
+        // alone. Everything below exists to carry UPDATES: `BEGIN IMMEDIATE` +
+        // `busy_timeout` take a write lock on the SHARED database, and the two
+        // named guards are emitted before the first UPDATE and gate every
+        // UPDATE through `gate_exists` — with no UPDATE planned they write
+        // nothing and guard nothing, while still spending a write-lock
+        // acquisition inside the caller's bounded admission budget (the same
+        // budget a starved host is already straining). The recheck this skips
+        // is the no-update row's: a concurrent mutation landing between the
+        // reads above and this line no longer turns the verdict into a
+        // refusal. Nothing is written on this path, so the skipped recheck
+        // cannot lose an integrity property; every guard stays in any run that
+        // does write. `Ok(1)` is load-bearing: `Ok(0)` means "this database
+        // lacks the target" to `run.rs`'s caller and would refuse a launch the
+        // reads just admitted.
+        if updates.is_empty() {
+            return Ok(1);
         }
 
         // This is the SHARED database: another already-migrated slot's live
@@ -5266,18 +8560,46 @@ pub mod codex_sqlite {
         // ordinary read/write traffic from slots that already ARE). A busy
         // timeout makes a transient collision wait and retry inside sqlite3
         // itself rather than surfacing as `SQLITE_BUSY`.
-        let mut script = String::from("PRAGMA busy_timeout=5000;\nBEGIN IMMEDIATE;\n");
+        #[cfg(test)]
+        TEST_REPAIR_BEFORE_WRITE.with(|cell| {
+            if let Some(hook) = cell.borrow_mut().take() {
+                hook();
+            }
+        });
+        let mut script =
+            format!("PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};\nBEGIN IMMEDIATE;\n");
+        // The readonly inspection releases its lock. Recheck its exact SQL
+        // snapshot under this write transaction, before the first UPDATE.
+        script.push_str(&named_guard_sql(
+            "csq_rollout_schema_unchanged",
+            &row_set_condition(
+                SCHEMA_OBJECT_ROW_EXPR,
+                "sqlite_master WHERE type IN ('trigger','view')",
+                &schema_objects,
+            ),
+        ));
+        if let Some(target) = target {
+            let old = &selected[0].1;
+            script.push_str(&named_guard_sql("csq_resume_target_unchanged", &format!(
+                "(SELECT count(*) FROM threads WHERE id='{}')=1 AND (SELECT count(*) FROM threads WHERE id='{}' AND rollout_path='{}')=1",
+                sql_quote_str(target), sql_quote_str(target), sql_quote_str(old))));
+        }
+        let mut gates = vec!["csq_rollout_schema_unchanged"];
+        if target.is_some() {
+            gates.push("csq_resume_target_unchanged");
+        }
+        let gate = gate_exists(&gates);
         for (id, old, new) in &updates {
             script.push_str(&format!(
-                "UPDATE threads SET rollout_path = '{}' WHERE id = '{}' AND rollout_path = '{}';\n",
+                "UPDATE threads SET rollout_path = '{}' WHERE id = '{}' AND rollout_path = '{}' AND {gate};\n",
                 sql_quote_str(new),
                 sql_quote_str(id),
                 sql_quote_str(old),
             ));
         }
         script.push_str("COMMIT;\n");
-        run_sqlite3(binary, db_path, &script)?;
-        Ok(updates.len())
+        run(&script, false)?;
+        Ok(if target.is_some() { 1 } else { updates.len() })
     }
 
     /// Delete every row from every table in `db_path` except sqlite's own
@@ -5511,13 +8833,17 @@ pub mod codex_sqlite {
         // exit (every return path, including `?`), releasing it for the
         // next launch or migration. S-M1: bounded, not blocking — see
         // `super::acquire_codex_share_lock_exclusive_bounded_reporting`.
-        let _share_lock = if dry_run {
+        let share_lock = if dry_run {
             None
         } else {
             Some(super::acquire_codex_share_lock_exclusive_bounded_reporting(
                 base,
             )?)
         };
+        // Every writer sqlite3 child below inherits the lock (see `RepairChild`).
+        let _children = share_lock
+            .as_ref()
+            .map(super::CodexShareLockGuard::hold_for_children);
         if !dry_run {
             ensure_no_live_writers(base, Surface::Codex, force)?;
         }
@@ -6599,8 +9925,49 @@ pub mod codex_sqlite {
 // assert on the EXACT pid list or an uncontended/empty result.
 #[cfg(test)]
 mod tests {
+    /// Hold a migration lock (on a scratch directory of its own) for the rest
+    /// of the enclosing block, as every production writer path does, so a
+    /// test driving an internal writer directly is not refused by
+    /// `RepairChild::spawn`'s unlocked-writer guard.
+    macro_rules! hold_test_migration_lock {
+        () => {
+            let _csq_test_lock_dir = tempfile::tempdir().expect("lock scratch dir");
+            let _csq_test_lock =
+                crate::session::shared_state::acquire_codex_share_lock_shared_bounded(
+                    _csq_test_lock_dir.path(),
+                    50,
+                    std::time::Duration::from_millis(20),
+                )
+                .expect("migration lock io")
+                .expect("migration lock admitted");
+            let _csq_test_held = _csq_test_lock.hold_for_children();
+        };
+    }
+
     use super::*;
     use tempfile::TempDir;
+
+    /// The share-lock refusals name every holder class and never assert that
+    /// a share or a named session is the one running: a writer orphaned by an
+    /// interrupted csq run holds the lock just as well. Falsifying result with
+    /// the former wording: "migration is in progress" is present and
+    /// "interrupted" absent.
+    #[test]
+    fn share_lock_refusals_do_not_assert_the_holder() {
+        let contended = ShareError::CodexShareLockContended.to_string();
+        let timed_out = ShareError::CodexShareLockTimedOut {
+            bound_secs: 3,
+            pids: format_live_writer_pids(&[]),
+        }
+        .to_string();
+        for message in [&contended, &timed_out] {
+            assert!(message.contains("interrupted"), "{message}");
+            assert!(message.contains("`ps`"), "{message}");
+            assert!(!message.contains("is in progress"), "{message}");
+            assert!(!message.contains("Wait for the running"), "{message}");
+        }
+        assert!(timed_out.contains("running codex session"), "{timed_out}");
+    }
 
     fn slot_num(n: u16) -> AccountNum {
         AccountNum::try_from(n).unwrap()
@@ -6629,6 +9996,7 @@ mod tests {
     /// readers never exclude each other.
     #[test]
     fn codex_share_lock_shared_permits_concurrent_readers() {
+        hold_test_migration_lock!();
         let t = TempDir::new().unwrap();
         let base = t.path();
 
@@ -6647,11 +10015,41 @@ mod tests {
         );
     }
 
+    /// G2b item 2 — same class as the login lock: a forked child inherits
+    /// the lock descriptor, and POSIX flock is released only when every
+    /// descriptor to the open file description closes. Dropping the guard
+    /// MUST release explicitly (LOCK_UN), or an EXCLUSIVE acquire inside
+    /// that window still sees the SHARED lock held.
+    #[cfg(unix)]
+    #[test]
+    fn fork_child_does_not_hold_the_share_lock_past_drop() {
+        use crate::fork_harness::ForkedChild;
+
+        let t = TempDir::new().unwrap();
+        let base = t.path();
+
+        let guard = acquire_codex_share_lock_shared_bounded(base, 1, std::time::Duration::ZERO)
+            .unwrap()
+            .expect("uncontended SHARED acquire");
+        let child = ForkedChild::spawn();
+        drop(guard);
+
+        let outcome =
+            acquire_codex_share_lock_exclusive_bounded(base, 1, std::time::Duration::ZERO).unwrap();
+        assert!(
+            outcome.is_some(),
+            "an inherited duplicate kept the SHARED share lock alive past the guard's drop — \
+             Drop must LOCK_UN, not rely on close"
+        );
+        drop(child);
+    }
+
     /// An EXCLUSIVE holder (the migration side) must exclude a concurrent
     /// SHARED attempt (a launch) for as long as it is held, and release it
     /// on drop — the RED/GREEN pair this test proves in one run.
     #[test]
     fn codex_share_lock_exclusive_excludes_a_concurrent_shared_attempt() {
+        hold_test_migration_lock!();
         let t = TempDir::new().unwrap();
         let base = t.path();
 
@@ -6690,6 +10088,7 @@ mod tests {
     /// concurrent EXCLUSIVE attempt (a migration) until it is dropped.
     #[test]
     fn codex_share_lock_shared_excludes_a_concurrent_exclusive_attempt() {
+        hold_test_migration_lock!();
         let t = TempDir::new().unwrap();
         let base = t.path();
 
@@ -6730,6 +10129,7 @@ mod tests {
     /// actually surfaces [`ShareError::CodexShareLockContended`].
     #[test]
     fn public_shared_acquire_reports_contention_rather_than_hanging() {
+        hold_test_migration_lock!();
         let t = TempDir::new().unwrap();
         let base = t.path();
         let _exclusive = acquire_codex_share_lock_exclusive_bounded(
@@ -6754,6 +10154,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn codex_share_lock_file_and_dir_are_secured() {
+        hold_test_migration_lock!();
         use std::os::unix::fs::PermissionsExt;
 
         let t = TempDir::new().unwrap();
@@ -6781,6 +10182,7 @@ mod tests {
     /// production constant.
     #[test]
     fn exclusive_bounded_reporting_times_out_and_names_the_scanned_pids() {
+        hold_test_migration_lock!();
         // Hermetic: the pre-lock scan reads the real host-wide process
         // table (Signal 1) unless overridden — force it empty so this
         // assertion is not at the mercy of whether a real `codex`/`claude`
@@ -6985,6 +10387,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn share_lock_refuses_a_symlinked_shared_state_dir() {
+        hold_test_migration_lock!();
         use std::os::unix::fs::symlink;
 
         let t = TempDir::new().unwrap();
@@ -7016,6 +10419,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn share_lock_refuses_a_symlinked_lock_file() {
+        hold_test_migration_lock!();
         use std::os::unix::fs::symlink;
 
         let t = TempDir::new().unwrap();
@@ -7046,6 +10450,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn share_lock_refuses_a_symlinked_intermediate_shared_state_component() {
+        hold_test_migration_lock!();
         use std::os::unix::fs::symlink;
 
         let t = TempDir::new().unwrap();
@@ -7085,6 +10490,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn share_entry_refuses_a_symlinked_shared_state_target() {
+        hold_test_migration_lock!();
         use std::os::unix::fs::symlink;
 
         let t = TempDir::new().unwrap();
@@ -7128,6 +10534,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlinked_shared_state_error_redacts_the_home_path() {
+        hold_test_migration_lock!();
         use std::os::unix::fs::symlink;
 
         let _env_guard = crate::platform::test_env::lock();
@@ -7157,6 +10564,7 @@ mod tests {
     /// handle-dir path either.
     #[test]
     fn format_live_writer_pids_redacts_unreadable_handle_dir() {
+        hold_test_migration_lock!();
         let _env_guard = crate::platform::test_env::lock();
         let t = TempDir::new().unwrap();
         let _restore = HomeRestoreForSymlinkTests(std::env::var_os("HOME"));
@@ -7200,6 +10608,7 @@ mod tests {
 
     #[test]
     fn attach_only_preflight_dry_run_preserves_namespace_and_bytes() {
+        hold_test_migration_lock!();
         let (t, home, root) = attach_fixture();
         let report = attach_slot_to_existing_shared(t.path(), Surface::Codex, slot_num(21), true)
             .unwrap()
@@ -7220,6 +10629,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn attach_only_links_fresh_slot_preserving_shared_history_and_identity() {
+        hold_test_migration_lock!();
         let (t, home, root) = attach_fixture();
         // A private live-writer-shaped handle must not cause process discovery
         // or migration. No test resolves or signals this PID.
@@ -7263,6 +10673,7 @@ mod tests {
 
     #[test]
     fn attach_only_late_local_entry_ineligible_before_any_publication() {
+        hold_test_migration_lock!();
         for content in [b"".as_slice(), b"TEST INPUT local"] {
             let (t, home, root) = attach_fixture();
             write(&home.join("codex-thread-writer-locks"), content);
@@ -7293,6 +10704,7 @@ mod tests {
 
     #[test]
     fn attach_only_missing_or_wrong_target_never_seeds_or_links() {
+        hold_test_migration_lock!();
         for wrong_shape in [false, true] {
             let (t, home, root) = attach_fixture();
             fs::remove_dir(root.join("codex-thread-writer-locks")).unwrap();
@@ -7312,6 +10724,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn attach_only_conflicting_or_dangling_link_is_not_repointed() {
+        hold_test_migration_lock!();
         let (t, home, _) = attach_fixture();
         let foreign = t.path().join("missing-foreign");
         std::os::unix::fs::symlink(&foreign, home.join("codex-thread-writer-locks")).unwrap();
@@ -7330,6 +10743,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn attach_only_metadata_error_is_not_absence() {
+        hold_test_migration_lock!();
         let (t, home, root) = attach_fixture();
         fs::remove_dir_all(&root).unwrap();
         fs::remove_dir(root.parent().unwrap()).unwrap();
@@ -7344,6 +10758,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn attach_only_concurrent_identical_attach_is_idempotent() {
+        hold_test_migration_lock!();
         let (t, home, root) = attach_fixture();
         let report = attach_slot_with(
             t.path(),
@@ -7367,6 +10782,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn attach_only_publication_race_never_overwrites_and_partial_error_is_retryable() {
+        hold_test_migration_lock!();
         let (t, home, root) = attach_fixture();
         let mut calls = 0;
         let result = attach_slot_with(
@@ -7408,6 +10824,7 @@ mod tests {
 
     #[test]
     fn attach_only_permission_failure_is_error_without_cleanup_or_fallback() {
+        hold_test_migration_lock!();
         let (t, home, _) = attach_fixture();
         let result = attach_slot_with(t.path(), Surface::Codex, slot_num(21), false, |_, _, _| {
             Err(io::Error::new(
@@ -7423,6 +10840,7 @@ mod tests {
 
     #[test]
     fn merge_does_not_lose_data_across_two_slots() {
+        hold_test_migration_lock!();
         let t = TempDir::new().unwrap();
         let base = t.path();
 
@@ -7461,6 +10879,7 @@ mod tests {
 
     #[test]
     fn running_share_slot_twice_is_a_noop_the_second_time() {
+        hold_test_migration_lock!();
         let t = TempDir::new().unwrap();
         let base = t.path();
         let home = slot_home(base, Surface::Codex, slot_num(3)).unwrap();
@@ -7494,6 +10913,7 @@ mod tests {
 
     #[test]
     fn identity_file_stays_a_real_per_slot_file_after_migration() {
+        hold_test_migration_lock!();
         let t = TempDir::new().unwrap();
         let base = t.path();
         let home = slot_home(base, Surface::Codex, slot_num(5)).unwrap();
@@ -7534,6 +10954,7 @@ mod tests {
     /// the sqlite too" would do.
     #[test]
     fn merge_jsonl_refuses_a_non_utf8_shared_file_instead_of_erasing_it() {
+        hold_test_migration_lock!();
         let t = TempDir::new().unwrap();
         let base = t.path();
         let home = slot_home(base, Surface::Codex, slot_num(1)).unwrap();
@@ -7566,6 +10987,7 @@ mod tests {
     /// first-ever share.
     #[test]
     fn merge_jsonl_treats_an_absent_shared_file_as_empty_not_an_error() {
+        hold_test_migration_lock!();
         let t = TempDir::new().unwrap();
         let base = t.path();
         let home = slot_home(base, Surface::Codex, slot_num(1)).unwrap();
@@ -7588,6 +11010,7 @@ mod tests {
 
     #[test]
     fn jsonl_dedupe_collapses_duplicate_id_updated_at_keeps_distinct_ids() {
+        hold_test_migration_lock!();
         let t = TempDir::new().unwrap();
         let base = t.path();
         let home1 = slot_home(base, Surface::Codex, slot_num(1)).unwrap();
@@ -7635,6 +11058,7 @@ mod tests {
 
     #[test]
     fn dry_run_reports_counts_but_touches_nothing() {
+        hold_test_migration_lock!();
         let t = TempDir::new().unwrap();
         let base = t.path();
         let home = slot_home(base, Surface::Codex, slot_num(7)).unwrap();
@@ -7663,6 +11087,7 @@ mod tests {
 
     #[test]
     fn directory_collision_hash_identical_dedupes_different_kept_both() {
+        hold_test_migration_lock!();
         let t = TempDir::new().unwrap();
         let base = t.path();
         let home1 = slot_home(base, Surface::Codex, slot_num(21)).unwrap();
@@ -7715,6 +11140,7 @@ mod tests {
 
     #[test]
     fn discover_slots_finds_codex_and_kimi_homes() {
+        hold_test_migration_lock!();
         let t = TempDir::new().unwrap();
         let base = t.path();
         fs::create_dir_all(base.join("config-1")).unwrap();
@@ -7743,6 +11169,7 @@ mod tests {
 
     #[test]
     fn removing_a_slot_home_does_not_touch_the_shared_store() {
+        hold_test_migration_lock!();
         let t = TempDir::new().unwrap();
         let base = t.path();
         let home1 = slot_home(base, Surface::Codex, slot_num(11)).unwrap();
@@ -7780,6 +11207,7 @@ mod tests {
 
     #[test]
     fn live_writer_guard_refuses_on_either_signal_and_force_overrides() {
+        hold_test_migration_lock!();
         let t = TempDir::new().unwrap();
         let base = t.path();
 
@@ -7863,6 +11291,7 @@ mod tests {
     /// for a host that produces it (`guard-reader-writer-parity.md` MUST-4).
     #[test]
     fn live_writer_guard_sees_a_codex_handle_dir_whose_items_are_not_symlinks() {
+        hold_test_migration_lock!();
         let t = TempDir::new().unwrap();
         let base = t.path();
 
@@ -7899,6 +11328,7 @@ mod tests {
     /// presence must not turn every `term-*` dir into a refusal.
     #[test]
     fn live_writer_guard_ignores_a_handle_dir_without_the_codex_pair() {
+        hold_test_migration_lock!();
         let t = TempDir::new().unwrap();
         let base = t.path();
 
@@ -7921,6 +11351,7 @@ mod tests {
     /// absent path is an io error — never a silent pass.
     #[test]
     fn verify_is_symlink_refuses_a_real_file_and_removes_it() {
+        hold_test_migration_lock!();
         let t = TempDir::new().unwrap();
         let base = t.path();
 
@@ -7956,6 +11387,7 @@ mod tests {
     /// cannot tell, never an empty list a caller would read as "safe".
     #[test]
     fn live_writer_guard_is_undeterminable_for_surfaces_with_no_detector() {
+        hold_test_migration_lock!();
         let tmp = TempDir::new().unwrap();
         for surface in [Surface::Kimi, Surface::Grok] {
             let err = ensure_no_live_writers_with(&[], tmp.path(), surface)
@@ -7971,6 +11403,7 @@ mod tests {
 
     #[test]
     fn unsupported_surface_errors_rather_than_guessing() {
+        hold_test_migration_lock!();
         let t = TempDir::new().unwrap();
         let err = share_slot(t.path(), Surface::ClaudeCode, slot_num(1), true).unwrap_err();
         assert!(matches!(
@@ -7983,6 +11416,7 @@ mod tests {
 
     #[test]
     fn kimi_and_grok_specs_resolve_under_native_homes() {
+        hold_test_migration_lock!();
         let t = TempDir::new().unwrap();
         let base = t.path();
         let home = slot_home(base, Surface::Kimi, slot_num(4)).unwrap();
@@ -8154,6 +11588,10 @@ mod tests {
         /// triggers. The original fixtures above build a minimal table with no
         /// triggers, which is why a refusal of every trigger passed them while
         /// refusing every real codex database.
+        ///
+        /// `.gitattributes` marks the fixture `-text`, so a Windows checkout under
+        /// `core.autocrlf=true` keeps codex-cli's LF bytes and the triggers it creates hash
+        /// to the values `CODEX_OWN_TRIGGERS` pins.
         const CODEX_THREADS_SCHEMA: &str =
             include_str!("../../tests/fixtures/codex-state5-threads-0.159.2.sql");
 
@@ -8252,6 +11690,7 @@ mod tests {
 
         #[test]
         fn resolver_prefers_env_override_when_executable() {
+            hold_test_migration_lock!();
             // An override must be ABSOLUTE; `/opt/...` is not on Windows, so
             // build one that is absolute on every platform.
             let custom = std::env::temp_dir().join("custom").join("sqlite3");
@@ -8265,6 +11704,7 @@ mod tests {
 
         #[test]
         fn resolver_errors_loudly_on_non_executable_env_override_rather_than_falling_back() {
+            hold_test_migration_lock!();
             let probe = FakeProbe {
                 env: Some(OsString::from("/opt/custom/sqlite3")),
                 executables: vec![], // the override is NOT executable
@@ -8276,6 +11716,7 @@ mod tests {
 
         #[test]
         fn resolver_falls_back_to_path_when_no_override_set() {
+            hold_test_migration_lock!();
             let probe = FakeProbe {
                 env: None,
                 executables: vec![],
@@ -8297,6 +11738,7 @@ mod tests {
         #[test]
         #[cfg(unix)]
         fn resolver_prefers_system_sqlite3_over_a_path_hit() {
+            hold_test_migration_lock!();
             let probe = FakeProbe {
                 env: None,
                 executables: vec![PathBuf::from("/usr/bin/sqlite3")],
@@ -8311,6 +11753,7 @@ mod tests {
 
         #[test]
         fn resolver_errors_when_nothing_found_anywhere() {
+            hold_test_migration_lock!();
             let probe = FakeProbe {
                 env: None,
                 executables: vec![],
@@ -8325,6 +11768,7 @@ mod tests {
         /// already said "absolute path", but nothing enforced it.
         #[test]
         fn resolver_rejects_a_relative_env_override_even_if_executable() {
+            hold_test_migration_lock!();
             let probe = FakeProbe {
                 env: Some(OsString::from("relative/sqlite3")),
                 executables: vec![PathBuf::from("relative/sqlite3")],
@@ -8339,6 +11783,7 @@ mod tests {
         /// so only the absolute, non-empty entry may ever be returned.
         #[test]
         fn path_lookup_skips_empty_and_relative_entries() {
+            hold_test_migration_lock!();
             // `/usr/bin` is not absolute on Windows; use a platform-absolute dir.
             let abs_dir = std::env::temp_dir();
             let dirs = vec![
@@ -8348,13 +11793,19 @@ mod tests {
             ];
             let found =
                 codex_sqlite::find_executable_in_dirs(dirs.into_iter(), "sqlite3", |_| true);
-            assert_eq!(found, Some(abs_dir.join("sqlite3")));
+            let filename = if cfg!(windows) {
+                "sqlite3.exe"
+            } else {
+                "sqlite3"
+            };
+            assert_eq!(found, Some(abs_dir.join(filename)));
         }
 
         /// S-F10: with ONLY empty/relative entries present, nothing may be
         /// returned, even though `is_executable` would say yes for every one.
         #[test]
         fn path_lookup_finds_nothing_when_only_empty_or_relative_entries_present() {
+            hold_test_migration_lock!();
             let dirs = vec![PathBuf::from(""), PathBuf::from("relative/bin")];
             let found =
                 codex_sqlite::find_executable_in_dirs(dirs.into_iter(), "sqlite3", |_| true);
@@ -8427,6 +11878,60 @@ mod tests {
                 thread_name(&bin, &home11.join("state_5.sqlite"), "01a0d8a0-thread"),
                 "py"
             );
+        }
+
+        /// `share_codex_surface_and_sqlite` itself makes its EXCLUSIVE lock the
+        /// one its merge writers inherit: driven through a real two-slot merge
+        /// (so writer `sqlite3` children spawn) with NO test-held lock on this
+        /// thread, it succeeds. Falsifying result with the fn's
+        /// `hold_for_children` line deleted: the first writer spawn is refused
+        /// ("migration lock not held") and the call returns `Err`.
+        #[test]
+        fn share_codex_surface_and_sqlite_merges_under_its_own_lock_scope() {
+            let Some(bin) = require_sqlite3() else {
+                return;
+            };
+            // Hermetic: the real live-writer guard runs (force=false).
+            let _procs_guard = super::force_list_running_processes(vec![]);
+            assert_eq!(
+                crate::session::shared_state::held_child_lock(),
+                None,
+                "this test must start with no lock held on its thread"
+            );
+            let t = TempDir::new().unwrap();
+            let base = t.path();
+            let home11 = slot_home(base, Surface::Codex, slot_num(11)).unwrap();
+            let home14 = slot_home(base, Surface::Codex, slot_num(14)).unwrap();
+            for (home, name, ms) in [(&home11, "", 100), (&home14, "py", 200)] {
+                fs::create_dir_all(home).unwrap();
+                create_state_db(
+                    &bin,
+                    &home.join("state_5.sqlite"),
+                    &[ThreadRow {
+                        id: "01a0d8a0-thread",
+                        name,
+                        updated_at_ms: ms,
+                    }],
+                    true,
+                );
+            }
+
+            let result = super::share_codex_surface_and_sqlite(base, false, false);
+            let (_, report) = result.expect("the merge must run under the fn's own scope");
+            assert_eq!(report.databases.len(), 1, "{report:?}");
+            assert!(
+                matches!(
+                    report.databases[0].outcome,
+                    SqliteDbOutcome::Merged { slots_merged: 2 }
+                ),
+                "{:?}",
+                report.databases[0].outcome
+            );
+            assert_eq!(
+                thread_name(&bin, &home11.join("state_5.sqlite"), "01a0d8a0-thread"),
+                "py"
+            );
+            assert_eq!(crate::session::shared_state::held_child_lock(), None);
         }
 
         #[test]
@@ -9296,6 +12801,7 @@ mod tests {
 
         #[test]
         fn note_unit_none_vs_some_names_missing_table() {
+            hold_test_migration_lock!();
             let shared = PathBuf::from("/shared/state_5.sqlite");
             let slot = PathBuf::from("/slot11/state_5.sqlite");
             let msg = codex_sqlite::migrations_mismatch_note(
@@ -9312,6 +12818,7 @@ mod tests {
 
         #[test]
         fn note_unit_some_vs_none_is_symmetric() {
+            hold_test_migration_lock!();
             let shared = PathBuf::from("/shared/state_5.sqlite");
             let slot = PathBuf::from("/slot11/state_5.sqlite");
             let msg = codex_sqlite::migrations_mismatch_note(
@@ -9330,6 +12837,7 @@ mod tests {
 
         #[test]
         fn note_unit_count_differs_slot_behind_names_that_copy() {
+            hold_test_migration_lock!();
             let shared = PathBuf::from("/shared/state_5.sqlite");
             let slot = PathBuf::from("/slot11/state_5.sqlite");
             // `a` = slot (1 migration, behind), `b` = shared (2 migrations).
@@ -9347,6 +12855,7 @@ mod tests {
 
         #[test]
         fn note_unit_count_differs_shared_behind_names_the_shared_index() {
+            hold_test_migration_lock!();
             let shared = PathBuf::from("/shared/state_5.sqlite");
             let slot = PathBuf::from("/slot11/state_5.sqlite");
             // `a` = shared (1 migration, BEHIND), `b` = slot (2 migrations).
@@ -9364,6 +12873,7 @@ mod tests {
 
         #[test]
         fn note_unit_same_count_different_checksum_names_different_builds() {
+            hold_test_migration_lock!();
             let shared = PathBuf::from("/shared/state_5.sqlite");
             let slot = PathBuf::from("/slot11/state_5.sqlite");
             let msg = codex_sqlite::migrations_mismatch_note(
@@ -9999,6 +13509,7 @@ mod tests {
         /// interpolated into an `ATTACH DATABASE` statement.
         #[test]
         fn attach_path_with_newline_is_refused() {
+            hold_test_migration_lock!();
             let path = PathBuf::from("/tmp/evil\nrm -rf /.sqlite");
             let err = codex_sqlite::ensure_safe_attach_path(&path).unwrap_err();
             assert!(
@@ -10010,6 +13521,7 @@ mod tests {
         /// A clean path (no newline/CR/NUL) passes the ATTACH-path check.
         #[test]
         fn attach_path_without_control_bytes_is_accepted() {
+            hold_test_migration_lock!();
             let path = PathBuf::from("/tmp/state_5.sqlite.merge-src");
             assert!(codex_sqlite::ensure_safe_attach_path(&path).is_ok());
         }
@@ -10048,6 +13560,7 @@ mod tests {
         /// bare `.sqlite` suffix — must never be picked up as a basename.
         #[test]
         fn a_basename_containing_the_scratch_pattern_is_excluded() {
+            hold_test_migration_lock!();
             let t = TempDir::new().unwrap();
             let base = t.path();
             let home11 = slot_home(base, Surface::Codex, slot_num(11)).unwrap();
@@ -10071,6 +13584,7 @@ mod tests {
         /// scratch copy must not remain.
         #[test]
         fn symlink_failure_restores_the_original_and_leaves_no_merge_src() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -10156,6 +13670,7 @@ mod tests {
         /// it was.
         #[test]
         fn a_db_that_changes_between_snapshot_and_rename_refuses_and_rolls_back() {
+            hold_test_migration_lock!();
             // Hermetic: `apply_basename_plan_with`'s mid-loop recheck calls
             // the REAL live-writer guard (force=false) for BOTH slot 11
             // and slot 14 before this test's own fingerprint-mismatch
@@ -10329,6 +13844,7 @@ mod tests {
         /// and re-enter the merge, not report `AlreadyShared`.
         #[test]
         fn crash_between_backup_and_symlink_is_recovered_by_a_fresh_plan() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -10408,6 +13924,7 @@ mod tests {
         /// symlink, no shared DB created.
         #[test]
         fn work_copy_reverify_refuses_a_trigger_planted_between_plan_and_apply() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -10485,6 +14002,7 @@ mod tests {
         /// `SqliteChangedDuringMerge`, and nothing is merged.
         #[test]
         fn work_copy_reverify_refuses_an_extra_migration_planted_between_plan_and_apply() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -10551,6 +14069,7 @@ mod tests {
         /// alone cannot see it; the raw schema fingerprint catches it.
         #[test]
         fn work_copy_reverify_refuses_an_added_column_planted_between_plan_and_apply() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -10615,6 +14134,7 @@ mod tests {
         /// re-run on the work copy, the same as a planted trigger.
         #[test]
         fn work_copy_reverify_refuses_a_view_planted_between_plan_and_apply() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -10678,6 +14198,7 @@ mod tests {
         /// backup slot on content it never touched.
         #[test]
         fn plan_apply_gap_on_existing_shared_db_refuses_before_any_backup_is_taken() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -10872,6 +14393,7 @@ mod tests {
         /// migrations guard must refuse, writing nothing.
         #[test]
         fn shared_migrations_changed_between_reverify_and_merge_is_refused() {
+            hold_test_migration_lock!();
             if require_sqlite3().is_none() {
                 return;
             }
@@ -10899,6 +14421,7 @@ mod tests {
         /// guards) is not positively pre-commit, so the backup is KEPT.
         #[test]
         fn generic_merge_script_failure_keeps_the_backup() {
+            hold_test_migration_lock!();
             if require_sqlite3().is_none() {
                 return;
             }
@@ -10923,6 +14446,7 @@ mod tests {
         /// marker row) and nothing changes.
         #[test]
         fn trigger_planted_between_reverify_and_merge_is_refused_and_never_fires() {
+            hold_test_migration_lock!();
             if require_sqlite3().is_none() {
                 return;
             }
@@ -10949,6 +14473,7 @@ mod tests {
         /// in-transaction `threads` fingerprint guard must refuse.
         #[test]
         fn shared_threads_schema_changed_between_reverify_and_merge_is_refused() {
+            hold_test_migration_lock!();
             if require_sqlite3().is_none() {
                 return;
             }
@@ -10981,6 +14506,22 @@ mod tests {
         /// exactly as it was before this call.
         #[test]
         fn orphan_on_a_carried_table_refuses_and_leaves_the_shared_db_untouched() {
+            hold_test_migration_lock!();
+            orphan_refusal_fixture(false);
+        }
+
+        /// Same refusal on a sqlite3 that keeps executing past an error (the
+        /// seam drops `-bail`): the post-write FK guard is `INSERT OR ROLLBACK`,
+        /// so the following `COMMIT` fails and the shared DB is unchanged.
+        /// Falsifying result with a plain `INSERT`: the orphan rows commit and
+        /// the row counts change.
+        #[test]
+        fn orphan_refusal_holds_on_a_sqlite3_that_does_not_bail() {
+            hold_test_migration_lock!();
+            orphan_refusal_fixture(true);
+        }
+
+        fn orphan_refusal_fixture(continue_past_errors: bool) {
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -11052,7 +14593,13 @@ mod tests {
                  VALUES ('proj-ghost', 0, '/nowhere');",
             );
 
-            let err = codex_sqlite::share_codex_sqlite(base, false, true).unwrap_err();
+            let err = if continue_past_errors {
+                codex_sqlite::with_continue_past_errors(|| {
+                    codex_sqlite::share_codex_sqlite(base, false, true).unwrap_err()
+                })
+            } else {
+                codex_sqlite::share_codex_sqlite(base, false, true).unwrap_err()
+            };
             assert!(
                 matches!(err, ShareError::SqliteForeignKeyViolation { .. }),
                 "{err:?}"
@@ -11102,6 +14649,7 @@ mod tests {
         /// operator's recovery path.
         #[test]
         fn existing_shared_db_refusal_in_rename_loop_names_the_backup() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -11192,6 +14740,7 @@ mod tests {
         /// of rank, is what makes "the new one survives" true.
         #[test]
         fn prune_never_deletes_the_backup_this_run_just_made_even_under_clock_skew() {
+            hold_test_migration_lock!();
             let t = TempDir::new().unwrap();
             let dir = t.path();
             let basename = "state_5.sqlite";
@@ -11231,6 +14780,7 @@ mod tests {
         /// `200` must all survive; only `100` is pruned.
         #[test]
         fn prune_never_counts_sidecar_names_as_their_own_backup() {
+            hold_test_migration_lock!();
             let t = TempDir::new().unwrap();
             let dir = t.path();
             let basename = "state_5.sqlite";
@@ -11268,6 +14818,7 @@ mod tests {
         /// leaves it alone no matter how many backups surround it.
         #[test]
         fn prune_ignores_private_tmp_dirs() {
+            hold_test_migration_lock!();
             let t = TempDir::new().unwrap();
             let dir = t.path();
             let basename = "state_5.sqlite";
@@ -11290,6 +14841,7 @@ mod tests {
         /// is "dead", this process's pid is "alive".
         #[test]
         fn sweep_removes_dead_pid_dir_keeps_live_and_non_matching() {
+            hold_test_migration_lock!();
             let t = TempDir::new().unwrap();
             let dir = t.path();
             let basename = "state_5.sqlite";
@@ -11323,6 +14875,7 @@ mod tests {
         /// "alive"), so they are swept even when liveness claims otherwise.
         #[test]
         fn sweep_treats_out_of_range_pids_as_dead() {
+            hold_test_migration_lock!();
             let t = TempDir::new().unwrap();
             let dir = t.path();
             let basename = "state_5.sqlite";
@@ -11347,6 +14900,7 @@ mod tests {
         /// is alive (pid reuse).
         #[test]
         fn sweep_removes_old_dir_even_when_pid_is_alive() {
+            hold_test_migration_lock!();
             let t = TempDir::new().unwrap();
             let dir = t.path();
             let basename = "state_5.sqlite";
@@ -11371,6 +14925,7 @@ mod tests {
         /// what displaces the real `200` backup out of the keep-3 budget.
         #[test]
         fn prune_old_naive_parser_would_have_wrongly_evicted_a_real_backup() {
+            hold_test_migration_lock!();
             let t = TempDir::new().unwrap();
             let dir = t.path();
             let basename = "state_5.sqlite";
@@ -11401,7 +14956,7 @@ mod tests {
                     Some((epoch, dir.join(name)))
                 })
                 .collect();
-            backups.sort_by(|a, b| b.0.cmp(&a.0));
+            backups.sort_by_key(|backup| std::cmp::Reverse(backup.0));
             for (_, path) in backups.into_iter().skip(3) {
                 let _ = fs::remove_file(&path);
             }
@@ -11511,12 +15066,13 @@ mod tests {
         /// redacted `~/` form.
         #[test]
         fn failing_attach_stderr_never_leaks_the_home_path() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
             let _env_guard = crate::platform::test_env::lock();
             let private_home = TempDir::new().unwrap();
-            let real_home = std::env::var_os("HOME");
+            let restore_home = HomeRestore(std::env::var_os("HOME"));
             std::env::set_var("HOME", private_home.path());
 
             let t = TempDir::new().unwrap();
@@ -11549,13 +15105,8 @@ mod tests {
             .unwrap_err();
             let msg = err.to_string();
 
-            // Restore the REAL $HOME before any assertion can early-return
-            // via a panic and leave the process's env mutated for whatever
-            // test runs next.
-            match real_home {
-                Some(h) => std::env::set_var("HOME", h),
-                None => std::env::remove_var("HOME"),
-            }
+            // Restore before diagnostics; Drop also covers earlier unwinds.
+            drop(restore_home);
 
             let private_home_str = private_home.path().display().to_string();
             assert!(
@@ -11577,6 +15128,7 @@ mod tests {
         /// leak the (percent-encoded) home path.
         #[test]
         fn failing_attach_stderr_never_leaks_a_home_path_containing_a_space() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -11584,7 +15136,7 @@ mod tests {
             let tmp_root = TempDir::new().unwrap();
             let private_home = tmp_root.path().join("home with space");
             fs::create_dir_all(&private_home).unwrap();
-            let real_home = std::env::var_os("HOME");
+            let restore_home = HomeRestore(std::env::var_os("HOME"));
             std::env::set_var("HOME", &private_home);
 
             let t = TempDir::new().unwrap();
@@ -11612,10 +15164,7 @@ mod tests {
             .unwrap_err();
             let msg = err.to_string();
 
-            match real_home {
-                Some(h) => std::env::set_var("HOME", h),
-                None => std::env::remove_var("HOME"),
-            }
+            drop(restore_home);
 
             let private_home_str = private_home.display().to_string();
             assert!(
@@ -11719,6 +15268,7 @@ mod tests {
         /// through the normal fixtures at all).
         #[test]
         fn threads_repairable_fk_targets_skips_a_fk_targeting_a_non_id_column() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -11757,6 +15307,7 @@ mod tests {
         /// whose real primary key IS `id` is still recognised.
         #[test]
         fn threads_repairable_fk_targets_resolves_an_empty_to_against_the_real_primary_key() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -11792,6 +15343,7 @@ mod tests {
         /// creates must be removed even when `VACUUM INTO` itself fails.
         #[test]
         fn private_tmp_dir_is_removed_when_vacuum_into_fails() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -11825,6 +15377,7 @@ mod tests {
         /// file between the two steps.
         #[test]
         fn private_tmp_dir_is_removed_when_integrity_check_fails() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -11858,6 +15411,7 @@ mod tests {
         #[test]
         #[cfg(unix)]
         fn chmod_failure_on_the_backup_is_an_error_and_leaves_no_backup() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -11883,6 +15437,7 @@ mod tests {
         /// fails with `AlreadyExists` instead.
         #[test]
         fn backup_via_vacuum_into_refuses_a_pre_existing_dst() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -11983,6 +15538,7 @@ mod tests {
         /// backup into place — only report what a real run would repair.
         #[test]
         fn dry_run_never_restores_a_stranded_pre_share_backup() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -12049,6 +15605,7 @@ mod tests {
         #[test]
         #[cfg(unix)]
         fn a_symlinked_backup_masquerade_is_refused_not_restored() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -12188,6 +15745,7 @@ mod tests {
         /// folded into the merge by then).
         #[test]
         fn a_write_landing_during_the_copy_phase_refuses_before_any_rename() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -12263,6 +15821,7 @@ mod tests {
         /// renamed+linked earlier in the same loop.
         #[test]
         fn live_writer_detected_mid_loop_rolls_back_already_renamed_entries() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -12378,6 +15937,7 @@ mod tests {
         #[test]
         #[cfg(unix)]
         fn rename_to_backup_failure_for_a_later_slot_rolls_back_earlier_slots() {
+            hold_test_migration_lock!();
             use std::os::unix::fs::PermissionsExt;
 
             let Some(bin) = require_sqlite3() else {
@@ -12481,6 +16041,7 @@ mod tests {
         /// they started.
         #[test]
         fn sidecar_rename_failure_undoes_the_main_rename() {
+            hold_test_migration_lock!();
             let t = TempDir::new().unwrap();
             let base = t.path();
             let src = base.join("state_5.sqlite");
@@ -12523,6 +16084,7 @@ mod tests {
         /// compare, once the file is already at `backup`.
         #[test]
         fn a_write_landing_on_the_backup_after_rename_refuses_and_rolls_back() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -12628,6 +16190,7 @@ mod tests {
         #[test]
         #[cfg(unix)]
         fn chmod_failure_after_per_slot_rename_self_heals() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -12713,6 +16276,7 @@ mod tests {
         #[test]
         #[cfg(unix)]
         fn chmod_failure_on_first_creation_rename_self_heals() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -12784,6 +16348,7 @@ mod tests {
         /// implicit FK target whose key is spelled `ID` still counts as `id`.
         #[test]
         fn primary_key_column_is_read_exactly_and_id_matches_case_insensitively() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -12813,6 +16378,7 @@ mod tests {
         /// guard compares the row SET, not just the count.
         #[test]
         fn shared_migration_checksum_changed_between_reverify_and_merge_is_refused() {
+            hold_test_migration_lock!();
             if require_sqlite3().is_none() {
                 return;
             }
@@ -12832,6 +16398,7 @@ mod tests {
         /// embed gets its own precise refusal, not "changed during merge".
         #[test]
         fn unembeddable_guard_value_is_refused_precisely() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -12864,6 +16431,7 @@ mod tests {
         /// problem is ruled out (source and destination directory writable).
         #[test]
         fn hard_link_unsupported_classifier() {
+            hold_test_migration_lock!();
             let t = TempDir::new().unwrap();
             let src = t.path().join("s");
             fs::write(&src, b"x").unwrap();
@@ -12891,6 +16459,7 @@ mod tests {
         /// error, nothing moved.
         #[test]
         fn stray_shared_sidecar_is_refused_with_an_actionable_error() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -12947,6 +16516,7 @@ mod tests {
         /// sidecars all absent): the backup and its sidecars come back as a set.
         #[test]
         fn clean_stranded_backup_is_recovered_as_a_set() {
+            hold_test_migration_lock!();
             let t = TempDir::new().unwrap();
             let p = t.path().join("state_5.sqlite");
             let backup = t.path().join("state_5.sqlite.pre-share-1000");
@@ -12963,6 +16533,7 @@ mod tests {
         /// manual commands; nothing is touched.
         #[test]
         fn any_stray_at_the_slot_blocks_recovery_and_lists_every_file() {
+            hold_test_migration_lock!();
             for stray_sfx in ["-wal", "-shm"] {
                 let t = TempDir::new().unwrap();
                 let p = t.path().join("state_5.sqlite");
@@ -13007,6 +16578,7 @@ mod tests {
         /// has nothing to restore (so reports nothing).
         #[test]
         fn refused_forward_move_never_touches_the_slot() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -13077,6 +16649,7 @@ mod tests {
         /// slot is named for manual attention.
         #[test]
         fn restore_never_replaces_a_file_at_the_original_path() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -13216,6 +16789,7 @@ mod tests {
         #[test]
         #[cfg(unix)]
         fn sidecars_are_not_restored_when_the_main_file_is_not() {
+            hold_test_migration_lock!();
             if require_sqlite3().is_none() {
                 return;
             }
@@ -13242,6 +16816,7 @@ mod tests {
         #[test]
         #[cfg(unix)]
         fn a_foreign_symlink_at_the_original_path_survives_the_restore() {
+            hold_test_migration_lock!();
             if require_sqlite3().is_none() {
                 return;
             }
@@ -13273,6 +16848,7 @@ mod tests {
         #[test]
         #[cfg(unix)]
         fn a_failed_restore_puts_the_link_back() {
+            hold_test_migration_lock!();
             if require_sqlite3().is_none() {
                 return;
             }
@@ -13299,6 +16875,7 @@ mod tests {
         /// with no main file and no sidecar, and the backup set intact.
         #[test]
         fn failed_sidecar_move_in_recovery_leaves_no_main_file_at_the_slot() {
+            hold_test_migration_lock!();
             let t = TempDir::new().unwrap();
             let p = t.path().join("state_5.sqlite");
             let backup = t.path().join("state_5.sqlite.pre-share-1000");
@@ -13327,6 +16904,7 @@ mod tests {
         /// error must name the sidecar left at the slot (both paths).
         #[test]
         fn failed_undo_in_recovery_names_the_sidecar_left_at_the_slot() {
+            hold_test_migration_lock!();
             let t = TempDir::new().unwrap();
             let p = t.path().join("state_5.sqlite");
             let backup = t.path().join("state_5.sqlite.pre-share-1000");
@@ -13350,6 +16928,7 @@ mod tests {
         #[test]
         #[cfg(unix)]
         fn non_utf8_sentence_redacts_the_home_directory() {
+            hold_test_migration_lock!();
             use std::os::unix::ffi::OsStrExt;
             let _g = crate::platform::test_env::lock();
             let home = TempDir::new().unwrap();
@@ -13376,6 +16955,7 @@ mod tests {
         /// slot's database is untouched.
         #[test]
         fn symlink_incapable_host_is_refused_before_anything_is_written() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -13435,6 +17015,7 @@ mod tests {
         /// an existing symlink — with `AlreadyExists`, leaving it untouched.
         #[test]
         fn create_real_symlink_refuses_an_existing_path() {
+            hold_test_migration_lock!();
             let t = TempDir::new().unwrap();
             let target = t.path().join("target-absent");
 
@@ -13458,6 +17039,7 @@ mod tests {
         /// A verbatim prefix on either side does not hide our own link.
         #[test]
         fn normalize_verbatim_strips_the_prefix_forms() {
+            hold_test_migration_lock!();
             assert_eq!(codex_sqlite::normalize_verbatim(r"\\?\C:\a\b"), r"C:\a\b");
             assert_eq!(
                 codex_sqlite::normalize_verbatim(r"\\?\UNC\srv\share\b"),
@@ -13499,6 +17081,7 @@ mod tests {
         #[test]
         #[cfg(unix)]
         fn stale_probe_link_is_reused_and_a_foreign_entry_is_refused() {
+            hold_test_migration_lock!();
             let t = TempDir::new().unwrap();
             let dir = t.path().join("shared");
             fs::create_dir_all(&dir).unwrap();
@@ -13532,6 +17115,7 @@ mod tests {
         #[test]
         #[cfg(unix)]
         fn non_utf8_path_gets_a_sentence_not_a_wrong_command() {
+            hold_test_migration_lock!();
             use std::os::unix::ffi::OsStrExt;
             let bad = PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/x\xff/state.pre-share-1"));
             let slot = PathBuf::from("/tmp/x/state_5.sqlite");
@@ -13547,6 +17131,7 @@ mod tests {
         #[test]
         #[cfg(unix)]
         fn link_recreation_never_replaces_a_file_that_appeared() {
+            hold_test_migration_lock!();
             if require_sqlite3().is_none() {
                 return;
             }
@@ -13576,9 +17161,10 @@ mod tests {
         #[test]
         #[cfg(unix)]
         fn manual_recovery_commands_survive_hostile_paths_in_a_real_shell() {
+            hold_test_migration_lock!();
             let _g = crate::platform::test_env::lock();
             let home = TempDir::new().unwrap();
-            let prior = std::env::var_os("HOME");
+            let restore_home = HomeRestore(std::env::var_os("HOME"));
             std::env::set_var("HOME", home.path());
             let dir = home.path().join(".claude").join("a$b`c'd $(touch pwned)");
             fs::create_dir_all(&dir).unwrap();
@@ -13627,10 +17213,7 @@ mod tests {
                 .env("PATH", "/usr/bin:/bin")
                 .status()
                 .unwrap();
-            match prior {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
+            drop(restore_home);
             assert!(status.success(), "{commands}");
             assert_eq!(fs::read(&p).unwrap(), b"main");
             assert_eq!(fs::read(format!("{}-wal", p.display())).unwrap(), b"wal");
@@ -13651,6 +17234,7 @@ mod tests {
         /// refused by the no-replace rename, and its file is untouched.
         #[test]
         fn dst_created_after_the_precheck_is_not_replaced() {
+            hold_test_migration_lock!();
             let t = TempDir::new().unwrap();
             let src = t.path().join("a.sqlite");
             let dst = t.path().join("b.sqlite.pre-share-1");
@@ -13668,6 +17252,7 @@ mod tests {
         /// The backup-name search is bounded.
         #[test]
         fn fresh_pre_share_path_gives_up_after_the_limit() {
+            hold_test_migration_lock!();
             let t = TempDir::new().unwrap();
             let orig = t.path().join("state_5.sqlite");
             for e in 100..103 {
@@ -13683,6 +17268,7 @@ mod tests {
         #[test]
         #[cfg(unix)]
         fn stranded_wal_after_a_failed_forward_move_is_named() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -13760,6 +17346,7 @@ mod tests {
         /// UTF-16 units from the original units.
         #[test]
         fn verbatim_wide_handles_drive_unc_nonbmp_and_refusals() {
+            hold_test_migration_lock!();
             let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
             let long = "a".repeat(300);
             assert_eq!(codex_sqlite::verbatim_wide(&w(r"C:\short")), None);
@@ -13857,6 +17444,7 @@ mod tests {
         #[test]
         #[cfg(unix)]
         fn failed_main_undo_without_sidecars_is_named_not_dropped() {
+            hold_test_migration_lock!();
             if require_sqlite3().is_none() {
                 return;
             }
@@ -13882,6 +17470,7 @@ mod tests {
         #[test]
         #[cfg(unix)]
         fn restore_brings_back_only_the_wal_when_the_main_file_is_home() {
+            hold_test_migration_lock!();
             if require_sqlite3().is_none() {
                 return;
             }
@@ -13990,6 +17579,7 @@ mod tests {
         #[test]
         #[cfg(unix)]
         fn restore_chmod_failure_for_a_linked_sibling_keeps_the_restored_file() {
+            hold_test_migration_lock!();
             if require_sqlite3().is_none() {
                 return;
             }
@@ -14012,6 +17602,7 @@ mod tests {
         #[test]
         #[cfg(unix)]
         fn restore_chmod_failure_for_the_current_entry_keeps_the_restored_file() {
+            hold_test_migration_lock!();
             if require_sqlite3().is_none() {
                 return;
             }
@@ -14034,6 +17625,7 @@ mod tests {
         /// silently dropped.
         #[test]
         fn failed_current_entry_restore_is_named_in_the_note() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -14087,6 +17679,7 @@ mod tests {
         /// byte — the slot is untouched and the old file is byte-identical.
         #[test]
         fn forward_move_refuses_to_replace_an_existing_destination() {
+            hold_test_migration_lock!();
             let t = TempDir::new().unwrap();
             for existing in ["", "-wal", "-shm"] {
                 let src = t.path().join(format!("a{existing}.sqlite"));
@@ -14122,6 +17715,7 @@ mod tests {
         /// bare all-digit epoch, which stranded-backup recovery parses).
         #[test]
         fn fresh_pre_share_path_skips_taken_names() {
+            hold_test_migration_lock!();
             let t = TempDir::new().unwrap();
             let orig = t.path().join("state_5.sqlite");
             fs::write(format!("{}.pre-share-100", orig.display()), b"x").unwrap();
@@ -14137,6 +17731,7 @@ mod tests {
         /// away from it), and the error names both failures.
         #[test]
         fn failed_main_undo_leaves_sidecars_beside_it_and_names_both() {
+            hold_test_migration_lock!();
             let t = TempDir::new().unwrap();
             let src = t.path().join("a.sqlite");
             let dst = t.path().join("b.sqlite.pre-share-1");
@@ -14172,6 +17767,7 @@ mod tests {
         /// test fails.
         #[test]
         fn guard_distinguishes_null_from_empty_migration_checksum() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -14217,6 +17813,7 @@ mod tests {
         /// must actually return the columns there.
         #[test]
         fn pragma_table_info_works_on_the_readonly_path() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -14235,6 +17832,7 @@ mod tests {
         /// error (forced through the link seam), and nothing is left at dst.
         #[test]
         fn backup_hard_link_unsupported_is_refused_precisely() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -14268,6 +17866,7 @@ mod tests {
         /// successfully.
         #[test]
         fn merge_succeeds_when_threads_has_no_rollout_path_column() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -14348,6 +17947,7 @@ mod tests {
         /// test creates.
         #[test]
         fn rollout_path_repair_rewrites_a_dead_term_path_when_the_shared_file_exists() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -14381,9 +17981,3552 @@ mod tests {
             let repaired = thread_field(&bin, &shared_path, "t1", "rollout_path");
             assert_eq!(
                 repaired,
-                alive.display().to_string(),
+                alive.canonicalize().unwrap().display().to_string(),
                 "the dead term-<pid> path must be rewritten to the shared-root equivalent"
             );
+        }
+
+        #[cfg(unix)]
+        fn r9_path_fixture(case: &str) {
+            let _env = crate::platform::test_env::lock();
+            let bin = codex_sqlite::resolve_sqlite3().expect("real sqlite3 required");
+            let t = TempDir::new().unwrap();
+            let base = t.path().canonicalize().unwrap();
+            let root = base.join("persistent");
+            let second = base.join("other-persistent");
+            fs::create_dir(&root).unwrap();
+            fs::create_dir(&second).unwrap();
+            let nested = case == "parent_escape" || case == "candidate_metadata";
+            let suffix = if nested {
+                "nested/rollout.jsonl"
+            } else {
+                "rollout.jsonl"
+            };
+            let dead = base.join("term-123/sessions").join(suffix);
+            let db = base.join("state_5.sqlite");
+            r9_fixture_sql(&bin, &db, &format!(
+                "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT); INSERT INTO threads VALUES('t1','{}');", dead.display()));
+            let outside = base.join("outside.jsonl");
+            fs::write(&outside, b"outside").unwrap();
+            let mut roots = vec![root.clone()];
+            match case {
+                "metadata" => {
+                    fs::write(base.join("term-123"), b"not a directory").unwrap();
+                    assert_eq!(
+                        dead.symlink_metadata().unwrap_err().kind(),
+                        io::ErrorKind::NotADirectory
+                    );
+                    fs::write(root.join(suffix), b"valid candidate").unwrap();
+                }
+                "leaf_escape" => std::os::unix::fs::symlink(&outside, root.join(suffix)).unwrap(),
+                "parent_escape" => {
+                    fs::write(second.join("rollout.jsonl"), b"outside root").unwrap();
+                    std::os::unix::fs::symlink(&second, root.join("nested")).unwrap();
+                }
+                "candidate_metadata" => fs::write(root.join("nested"), b"not a directory").unwrap(),
+                "conflicting" => {
+                    fs::write(root.join(suffix), b"first transcript").unwrap();
+                    fs::write(second.join(suffix), b"different transcript").unwrap();
+                    roots.push(second);
+                }
+                "owned_open_race" => {
+                    let candidate = root.join(suffix);
+                    fs::write(&candidate, b"admitted transcript").unwrap();
+                    codex_sqlite::set_test_repair_before_candidate_open(move || {
+                        fs::remove_file(&candidate).unwrap();
+                        std::os::unix::fs::symlink(&outside, candidate).unwrap();
+                    });
+                }
+                "root_alias" => {
+                    fs::write(root.join(suffix), b"valid transcript").unwrap();
+                    let alias = base.join("intentional-root-alias");
+                    std::os::unix::fs::symlink(&root, &alias).unwrap();
+                    roots.insert(0, alias);
+                }
+                _ => panic!("unknown path fixture"),
+            }
+            let before = fs::read(&db).unwrap();
+            let result = r9_repair_paths(&base, &db, &roots);
+            if case == "root_alias" {
+                assert_eq!(result.unwrap(), 1);
+                assert_eq!(
+                    r9_fixture_sql(&bin, &db, "SELECT rollout_path FROM threads WHERE id='t1';")
+                        .trim(),
+                    root.join(suffix).to_str().unwrap()
+                );
+                assert_eq!(r9_repair_paths(&base, &db, &roots).unwrap(), 0);
+            } else {
+                assert!(result.is_err(), "{case} must refuse: {result:?}");
+                assert_eq!(
+                    fs::read(&db).unwrap(),
+                    before,
+                    "{case}: refusal must not write database bytes"
+                );
+                assert_eq!(
+                    r9_fixture_sql(&bin, &db, "SELECT rollout_path FROM threads WHERE id='t1';")
+                        .trim(),
+                    dead.to_str().unwrap()
+                );
+            }
+            assert_eq!(
+                r9_fixture_sql(&bin, &db, "SELECT count(*) FROM threads;").trim(),
+                "1"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn r9_paths_refuse_recorded_metadata_error() {
+            hold_test_migration_lock!();
+            r9_path_fixture("metadata");
+        }
+        #[cfg(unix)]
+        #[test]
+        fn r9_paths_refuse_leaf_symlink_escape() {
+            hold_test_migration_lock!();
+            r9_path_fixture("leaf_escape");
+        }
+        #[cfg(unix)]
+        #[test]
+        fn r9_paths_refuse_parent_symlink_escape() {
+            hold_test_migration_lock!();
+            r9_path_fixture("parent_escape");
+        }
+        #[cfg(unix)]
+        #[test]
+        fn r9_paths_refuse_candidate_metadata_error() {
+            hold_test_migration_lock!();
+            r9_path_fixture("candidate_metadata");
+        }
+        #[cfg(unix)]
+        #[test]
+        fn r9_paths_refuse_conflicting_real_roots() {
+            hold_test_migration_lock!();
+            r9_path_fixture("conflicting");
+        }
+        #[cfg(unix)]
+        #[test]
+        fn r9_paths_refuse_symlink_swap_at_owned_open() {
+            hold_test_migration_lock!();
+            r9_path_fixture("owned_open_race");
+        }
+        #[cfg(unix)]
+        #[test]
+        fn r9_paths_accept_intentional_root_aliases() {
+            hold_test_migration_lock!();
+            r9_path_fixture("root_alias");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn r9_paths_refuse_database_metadata_error() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let t = TempDir::new().unwrap();
+            let blocker = t.path().join("not-a-directory");
+            fs::write(&blocker, b"file").unwrap();
+            let db = blocker.join("state_5.sqlite");
+            assert_eq!(
+                db.symlink_metadata().unwrap_err().kind(),
+                io::ErrorKind::NotADirectory
+            );
+            assert!(
+                r9_repair_paths(t.path(), &db, &[]).is_err(),
+                "unreadable database metadata must not report successful no-op"
+            );
+        }
+
+        #[cfg(unix)]
+        fn r9_disposition_fixture(no_cld_wait: bool, selected: &str) {
+            use std::os::unix::fs::PermissionsExt;
+            let _env = crate::platform::test_env::lock();
+            const MODE: &str = "CSQ_R9_DISPOSITION_FIXTURE";
+            if let Some(dir) = std::env::var_os(MODE) {
+                let dir = PathBuf::from(dir);
+                let bin = dir.join("owned-fixture");
+                // The private control child cannot exit on its own between a
+                // wait probe and kill: it publishes a canary then waits forever.
+                // This avoids deliberately recreating PID reuse on the host.
+                fs::write(&bin, format!("#!/usr/bin/python3\nimport time\nopen({:?},'w').write('spawned')\nwhile True: time.sleep(1)\n", dir.join("spawned").to_str().unwrap())).unwrap();
+                fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+                struct Restore(libc::sigaction);
+                impl Drop for Restore {
+                    fn drop(&mut self) {
+                        // SAFETY: isolated child restores its own saved policy.
+                        unsafe {
+                            libc::sigaction(libc::SIGCHLD, &self.0, std::ptr::null_mut());
+                        }
+                    }
+                }
+                let mut prior: libc::sigaction = unsafe { std::mem::zeroed() };
+                // SAFETY: only the re-executed single-test child changes its own
+                // process policy. The parent and other tests remain untouched.
+                unsafe {
+                    let mut action: libc::sigaction = std::mem::zeroed();
+                    action.sa_sigaction = if no_cld_wait {
+                        libc::SIG_DFL
+                    } else {
+                        libc::SIG_IGN
+                    };
+                    action.sa_flags = if no_cld_wait { libc::SA_NOCLDWAIT } else { 0 };
+                    libc::sigemptyset(&mut action.sa_mask);
+                    assert_eq!(libc::sigaction(libc::SIGCHLD, &action, &mut prior), 0);
+                }
+                let restore = Restore(prior);
+                let result = codex_sqlite::run_repair_sqlite_bounded(
+                    &bin,
+                    &dir.join("private.sqlite"),
+                    "SELECT 1;",
+                    false,
+                    std::time::Instant::now() + std::time::Duration::from_millis(500),
+                );
+                drop(restore);
+                let refused = matches!(result, Err(ShareError::SqliteCommandFailed { detail, .. })
+                    if detail == "rollout repair unsafe SIGCHLD disposition");
+                fs::write(
+                    dir.join("result"),
+                    format!("{refused} {}", dir.join("spawned").exists()),
+                )
+                .unwrap();
+                return;
+            }
+            let t = TempDir::new().unwrap();
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", selected, "--test-threads=1"])
+                .env_clear()
+                .env("HOME", t.path())
+                .env("CSQ_BASE_DIR", t.path().join("base"))
+                .env("PATH", "/usr/bin:/bin")
+                .env(MODE, t.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let (status, out, err) =
+                r9_bounded_output(child, "isolated SIGCHLD fixture", R9_RUNNER_HANG_GUARD);
+            assert!(
+                out.len() <= 16384 && err.len() <= 16384 && status.success(),
+                "isolated fixture failed: {out}{err}"
+            );
+            assert_eq!(
+                fs::read_to_string(t.path().join("result")).unwrap(),
+                "true false",
+                "unsafe SIGCHLD must refuse before the actual child executes"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn r9_disposition_ignored_refuses_before_spawn() {
+            hold_test_migration_lock!();
+            r9_disposition_fixture(false, "session::shared_state::tests::codex_sqlite_tests::r9_disposition_ignored_refuses_before_spawn");
+        }
+        #[cfg(unix)]
+        #[test]
+        fn r9_disposition_no_cld_wait_refuses_before_spawn() {
+            hold_test_migration_lock!();
+            r9_disposition_fixture(true, "session::shared_state::tests::codex_sqlite_tests::r9_disposition_no_cld_wait_refuses_before_spawn");
+        }
+
+        #[test]
+        fn r9_platform_windows_exe_resolution() {
+            hold_test_migration_lock!();
+            let dir = std::env::temp_dir().join("r9-sqlite-exe");
+            let expected = dir.join("sqlite3.exe");
+            assert_eq!(
+                codex_sqlite::find_executable_in_dirs_for_platform(
+                    [PathBuf::new(), PathBuf::from("relative"), dir.clone()].into_iter(),
+                    "sqlite3",
+                    |p| p == expected,
+                    true
+                ),
+                Some(expected)
+            );
+            assert_eq!(
+                codex_sqlite::find_executable_in_dirs_for_platform(
+                    [dir.clone()].into_iter(),
+                    "sqlite3",
+                    |p| p == dir.join("sqlite3"),
+                    false
+                ),
+                Some(dir.join("sqlite3"))
+            );
+        }
+
+        #[test]
+        fn r9_platform_windows_rollout_separators() {
+            hold_test_migration_lock!();
+            assert_eq!(
+                codex_sqlite::rollout_relative_tail(
+                    r"C:\csq",
+                    r"C:\csq\term-10\sessions\2026\rollout.jsonl",
+                    true
+                ),
+                Some("2026/rollout.jsonl".into())
+            );
+            assert_eq!(
+                codex_sqlite::rollout_relative_tail(
+                    r"C:\csq",
+                    r"C:\csq\term-10\sessions\..\escape.jsonl",
+                    true
+                ),
+                None
+            );
+            assert_eq!(
+                codex_sqlite::rollout_relative_tail(
+                    "/csq",
+                    "/csq/term-10/sessions/2026/rollout.jsonl",
+                    false
+                ),
+                Some("2026/rollout.jsonl".into())
+            );
+            assert_eq!(
+                codex_sqlite::rollout_relative_tail("/csq", "/csq/term-x/sessions/a", false),
+                None
+            );
+            assert_eq!(
+                codex_sqlite::rollout_relative_tail("/csq", "/csq/term-1/sessions/./a", false),
+                None
+            );
+        }
+
+        #[test]
+        fn r9_platform_positive_known_upstream_schema() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let bin = codex_sqlite::resolve_sqlite3().expect("real sqlite3 required");
+            let t = TempDir::new().unwrap();
+            let base = t.path().canonicalize().unwrap();
+            let root = base.join("codex-sessions");
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("rollout.jsonl"), b"fixture").unwrap();
+            let db = base.join("state_5.sqlite");
+            r9_fixture_sql(&bin, &db, CODEX_THREADS_SCHEMA);
+            let schema_before = r9_fixture_sql(
+                &bin,
+                &db,
+                "SELECT hex(sql) FROM sqlite_master WHERE type='trigger' ORDER BY name;",
+            );
+            assert_eq!(
+                schema_before.lines().count(),
+                5,
+                "fixture must contain all real upstream triggers"
+            );
+            let dead = base.join("term-123/sessions/rollout.jsonl");
+            r9_fixture_sql(&bin, &db, &format!(
+                "INSERT INTO threads(id,rollout_path,created_at,updated_at,source,model_provider,cwd,title,sandbox_policy,approval_mode) \
+                 VALUES('t1','{}',1,1,'cli','openai','/work','fixture','default','default');", dead.display()));
+            assert_eq!(
+                r9_repair_paths(&base, &db, std::slice::from_ref(&root)).unwrap(),
+                1
+            );
+            assert_eq!(
+                r9_fixture_sql(&bin, &db, "SELECT rollout_path FROM threads WHERE id='t1';").trim(),
+                root.join("rollout.jsonl").to_str().unwrap()
+            );
+            assert_eq!(
+                r9_fixture_sql(
+                    &bin,
+                    &db,
+                    "SELECT hex(sql) FROM sqlite_master WHERE type='trigger' ORDER BY name;"
+                ),
+                schema_before
+            );
+            assert_eq!(r9_repair_paths(&base, &db, &[root]).unwrap(), 0);
+        }
+
+        #[test]
+        fn r9_platform_runner_refuses_expired_budget_and_oversized_sql() {
+            hold_test_migration_lock!();
+            let t = TempDir::new().unwrap();
+            let absent = t.path().join("not-a-program");
+            let db = t.path().join("private.sqlite");
+            let result = codex_sqlite::run_repair_sqlite_bounded(
+                &absent,
+                &db,
+                "SELECT 1;",
+                false,
+                std::time::Instant::now(),
+            );
+            assert!(
+                matches!(result, Err(ShareError::SqliteCommandFailed { detail, .. }) if detail == "rollout repair deadline")
+            );
+            let result = codex_sqlite::run_repair_sqlite_bounded(
+                &absent,
+                &db,
+                &"x".repeat(60001),
+                false,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            );
+            assert!(
+                matches!(result, Err(ShareError::SqliteCommandFailed { detail, .. }) if detail == "rollout repair SQL size limit")
+            );
+            assert!(!db.exists());
+        }
+
+        /// The launch runner never puts SQL in argv: the writer's argv holds
+        /// only flags and the database, and the whole script arrives on stdin.
+        /// Falsifying result with the former argv transport: the captured argv
+        /// carries the `UPDATE` and the captured stdin is empty.
+        #[cfg(unix)]
+        #[test]
+        fn r9_launch_runner_argv_carries_no_sql() {
+            hold_test_migration_lock!();
+            let t = tempfile::Builder::new()
+                .prefix("cr-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let bin = r9_native_fixture(t.path(), "argv-capture");
+            let db = t.path().join("argv.sqlite");
+            let script = "BEGIN IMMEDIATE;\nUPDATE threads SET rollout_path='csq-marker' WHERE rowid=1;\nCOMMIT;";
+            let result = codex_sqlite::run_repair_sqlite_bounded(
+                &bin,
+                &db,
+                script,
+                false,
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+            );
+            assert!(result.is_ok(), "{result:?}");
+            let argv = fs::read_to_string(t.path().join("captured-argv")).unwrap();
+            let stdin = fs::read_to_string(t.path().join("captured-stdin")).unwrap();
+            for token in ["UPDATE", "csq-marker", "BEGIN", "COMMIT", "PRAGMA"] {
+                assert!(!argv.contains(token), "argv carries SQL ({token}): {argv}");
+                assert!(stdin.contains(token), "stdin lacks {token}: {stdin}");
+            }
+            assert!(
+                argv.lines()
+                    .last()
+                    .is_some_and(|last| last.ends_with("argv.sqlite")),
+                "the database must be argv's last argument: {argv}"
+            );
+        }
+
+        #[cfg(unix)]
+        fn r9_native_fixture(base: &Path, mode: &str) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            // TempDir permissions follow umask on this Darwin; pin this owned root.
+            fs::set_permissions(base, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(base.join("fixture-mode"), mode).unwrap();
+            let fixture = base.join("r9-sqlite-fixture");
+            std::os::unix::fs::symlink(r9_stub_cli_binary(), &fixture).unwrap();
+            // Not sqlite3 (hung, flooding, committing children): declared probed
+            // so the runner under test spawns it. `continue` is a sqlite3 that
+            // ignores -bail and must go through the real probe.
+            if mode != "continue" {
+                codex_sqlite::trust_bail_for_test(&fixture);
+            }
+            fixture
+        }
+
+        /// Resolve the `stub-cli` fixture binary beside the test executable,
+        /// building it on demand when the active target profile has never seen
+        /// an explicit `cargo build`.
+        ///
+        /// `stub-cli` is declared `test = false` in `csq-core/Cargo.toml`, so NO
+        /// `cargo test` invocation builds it: a `cargo test --lib` run against a
+        /// fresh target dir holds no binary, and both r9 fixture tests then die
+        /// on the availability assert instead of testing the runner (run-1
+        /// evidence: "R9 native fixture requires cargo build -p csq-core --bin
+        /// stub-cli" from BOTH tests, while the immediately following run that
+        /// reused a target dir carrying the binary passed). Build it once per
+        /// test process into this very profile instead of depending on prior
+        /// build history in a shared target directory.
+        #[cfg(unix)]
+        fn r9_stub_cli_binary() -> &'static Path {
+            static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+            BINARY
+                .get_or_init(|| {
+                    let executable = std::env::current_exe().unwrap();
+                    let executable_dir = executable.parent().unwrap();
+                    let profile = if executable_dir
+                        .file_name()
+                        .is_some_and(|name| name == "deps")
+                    {
+                        executable_dir.parent().unwrap()
+                    } else {
+                        executable_dir
+                    };
+                    let binary = profile.join("stub-cli");
+                    // Always ask cargo: an existing binary may predate this
+                    // source (the commit-unknown test reads a pid file only the
+                    // current stub writes). An up-to-date build is a no-op.
+                    let target_dir = profile.parent().expect("cargo target dir above profile");
+                    let mut command = std::process::Command::new(
+                        std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()),
+                    );
+                    command
+                        .args(["build", "-p", "csq-core", "--bin", "stub-cli"])
+                        .current_dir(crate::testing::manifest_dir(env!("CARGO_MANIFEST_DIR")))
+                        .env("CARGO_TARGET_DIR", target_dir);
+                    match profile.file_name().and_then(|name| name.to_str()) {
+                        Some("release") => {
+                            command.arg("--release");
+                        }
+                        Some("debug") | None => {}
+                        Some(other) => {
+                            command.args(["--profile", other]);
+                        }
+                    }
+                    let output = command
+                        .output()
+                        .expect("run cargo build for the stub-cli fixture");
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    assert!(
+                        output.status.success() && binary.is_file(),
+                        "R9 native fixture requires cargo build -p csq-core --bin stub-cli \
+                         (status {:?}; stderr: {stderr})",
+                        output.status,
+                    );
+                    binary
+                })
+                .as_path()
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn r9_platform_runner_bounds_hung_and_flooding_children() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            for mode in ["hung", "stdout", "stderr"] {
+                let t = tempfile::Builder::new()
+                    .prefix("cr-")
+                    .tempdir_in("/tmp")
+                    .unwrap();
+                let lock = r9_test_lock(t.path());
+                let _held = lock.hold_for_children();
+                let bin = r9_native_fixture(t.path(), mode);
+                // Exercise the same deadline/output caps without executing a
+                // newly written shebang wrapper inside the short test budget.
+                let started = std::time::Instant::now();
+                let mut commit_unknown = false;
+                let result = codex_sqlite::run_repair_sqlite_bounded_tracking(
+                    &bin,
+                    &t.path().join("private.sqlite"),
+                    "SELECT 1;",
+                    false,
+                    started + std::time::Duration::from_secs(1),
+                    &mut commit_unknown,
+                );
+                // The pid comes from the RUNNER's spawn record, not from a
+                // file the child writes: a deadline can kill the child before
+                // its first scheduling, and then `owned-pid` never exists (the
+                // CI `fixture leader pid: NotFound` class).
+                let spawned = codex_sqlite::take_last_spawned_pid();
+                // A child that was spawned and never acknowledged may have
+                // committed: the classification must stay UNKNOWN on every
+                // post-spawn failure (deadline, output caps). With NO spawn
+                // (an expired pre-spawn budget) nothing could have committed,
+                // and this mode's property is not exercised — never silently
+                // asserted as if a child had run.
+                if spawned.is_some() {
+                    assert!(commit_unknown, "{mode}: post-spawn failure must be unknown");
+                } else {
+                    assert!(
+                        !commit_unknown,
+                        "{mode}: a pre-spawn refusal cannot be unknown"
+                    );
+                }
+                eprintln!(
+                    "native fixture mode={mode} elapsed={:?} result={result:?}",
+                    started.elapsed()
+                );
+                let expected = match mode {
+                    "hung" => "deadline",
+                    "stdout" => "stdout limit",
+                    _ => "stderr limit",
+                };
+                assert!(
+                    matches!(result, Err(ShareError::SqliteCommandFailed { detail, .. }) if detail.contains(expected)),
+                    "{mode}"
+                );
+                assert!(started.elapsed() < std::time::Duration::from_secs(2));
+                if let Some(pid) = spawned.map(|pid| pid as i32) {
+                    assert!(pid > 1, "refusing to probe implausible fixture pid {pid}");
+                    // SAFETY: signal zero only checks the pid the RUNNER
+                    // recorded at spawn; it sends no signal. Drop already
+                    // reaped the owned child.
+                    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+                    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+                }
+            }
+        }
+
+        /// Hang guard for runner calls and fixture waits whose RESULT must never
+        /// depend on host speed. Only a wedged child ever reaches it; a
+        /// slow-but-finishing child (the host: fsync 180-300ms, a bare sqlite3
+        /// write 1.1-1.4s) must not flip a classification, because a deadline
+        /// that fires after the spawn is by design an UNKNOWN commit.
+        const R9_RUNNER_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
+
+        /// Wait for a fixture child to finish, bounded by a HANG GUARD (never a
+        /// speed bound): a wedged child is killed and reds with the fixture's
+        /// name instead of hanging the job. Each pipe is drained on its own
+        /// thread, so a chatty child cannot block the wait; at most 16385 bytes
+        /// of each are kept.
+        fn r9_bounded_output(
+            mut child: std::process::Child,
+            what: &str,
+            guard: std::time::Duration,
+        ) -> (std::process::ExitStatus, String, String) {
+            use std::io::Read;
+            fn drain<R: Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<String> {
+                std::thread::spawn(move || {
+                    let mut kept = Vec::new();
+                    let _ = (&mut pipe).take(16385).read_to_end(&mut kept);
+                    let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+                    String::from_utf8_lossy(&kept).into_owned()
+                })
+            }
+            let out = drain(child.stdout.take().unwrap());
+            let err = drain(child.stderr.take().unwrap());
+            let deadline = std::time::Instant::now() + guard;
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{what} exceeded hang guard ({guard:?})");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            };
+            (status, out.join().unwrap(), err.join().unwrap())
+        }
+
+        /// Run the rollout-path repair with a HANG GUARD as its budget. The
+        /// repair spawns several default-durability sqlite3 children; these tests
+        /// assert what it does, so its answer must not depend on how long fsync
+        /// takes on the host (the host's stage disk: ~1s per commit under
+        /// load, measured with a bare `sqlite3 x.db "create table t(a)"`).
+        fn r9_repair_paths(base: &Path, db: &Path, roots: &[PathBuf]) -> Result<usize, ShareError> {
+            codex_sqlite::repair_slot_rollout_paths_before(
+                &r9_test_lock(base),
+                base,
+                db,
+                roots,
+                std::time::Instant::now() + std::time::Duration::from_secs(120),
+            )
+        }
+
+        // Own only real sqlite3 children against private fixture files. Avoid
+        // .sqliterc, inherited credentials and a host HOME in these new probes.
+        fn r9_fixture_sql(bin: &Path, db: &Path, sql: &str) -> String {
+            r9_fixture_sql_guarded(bin, db, sql, R9_RUNNER_HANG_GUARD)
+        }
+
+        fn r9_fixture_sql_guarded(
+            bin: &Path,
+            db: &Path,
+            sql: &str,
+            guard: std::time::Duration,
+        ) -> String {
+            let null_rc = if cfg!(windows) { "NUL" } else { "/dev/null" };
+            let child = Command::new(bin)
+                .args(["-init", null_rc, "-batch", "-bail", "-noheader", "-list"])
+                .arg(db)
+                .arg(format!(
+                    "PRAGMA trusted_schema=OFF;\nPRAGMA synchronous=OFF;\n{sql}"
+                ))
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", db.parent().unwrap())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let (status, out, err) = r9_bounded_output(child, "private sqlite fixture", guard);
+            assert!(
+                out.len() <= 16384 && err.len() <= 16384,
+                "fixture output cap"
+            );
+            assert!(status.success(), "private sqlite fixture failed: {err}");
+            out
+        }
+
+        /// The deadline classifier separates the runner's OWN deadline detail
+        /// from every other runner detail — including one that quotes database
+        /// content mentioning a "deadline" path — and catches the walk and IO
+        /// shapes it must.
+        ///
+        /// Falsifying result for the loose rule (`detail.contains("deadline")`):
+        /// the near-miss child failure below is classified as the deadline class
+        /// and this test fails, so the assertion discriminates the exact match
+        /// from the substring one.
+        #[cfg(unix)]
+        #[test]
+        fn r9p_deadline_classifier_separates_the_runner_deadline_from_a_child_failure() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let f = PagedRepairFixture::new();
+            // The runner's own deadline, taken from its PRE-SPAWN refusal: an
+            // already-expired budget spawns nothing.
+            let expired = codex_sqlite::run_repair_sqlite_bounded(
+                &f.binary,
+                &f.db,
+                "SELECT 1;",
+                true,
+                std::time::Instant::now() - std::time::Duration::from_millis(1),
+            )
+            .unwrap_err();
+            assert!(
+                codex_sqlite::is_bounded_deadline_refusal(&expired),
+                "the runner's own deadline must be the deadline class: {expired:?}"
+            );
+            // A child failure whose stderr quotes a path containing "deadline":
+            // database content must not steer which class the operator is told.
+            let near_miss = ShareError::SqliteCommandFailed {
+                binary: f.binary.clone(),
+                path: f.db.clone(),
+                detail:
+                    "rollout repair exit Some(1): no such table: /missing/deadline/rollout.jsonl"
+                        .to_owned(),
+            };
+            assert!(
+                !codex_sqlite::is_bounded_deadline_refusal(&near_miss),
+                "a child failure quoting a 'deadline' path is not the deadline class: {near_miss:?}"
+            );
+            // The walk's two failure shapes: its budget refusal IS the class,
+            // every other reason is not.
+            assert!(codex_sqlite::is_bounded_deadline_refusal(
+                &ShareError::CodexResumeTarget {
+                    reason: "target filename search exceeded its bounded budget"
+                }
+            ));
+            assert!(!codex_sqlite::is_bounded_deadline_refusal(
+                &ShareError::CodexResumeTarget {
+                    reason: "target filename search found conflicting transcripts"
+                }
+            ));
+            // The row/root walk's TimedOut, against an ordinary IO failure.
+            assert!(codex_sqlite::is_bounded_deadline_refusal(&ShareError::io(
+                &f.db,
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "rollout repair deadline"),
+            )));
+            assert!(!codex_sqlite::is_bounded_deadline_refusal(&ShareError::io(
+                &f.db,
+                std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
+            )));
+        }
+
+        /// The REWRITE path: the recorded path is missing but resolvable by
+        /// filename under a persistent root, so the admission plans an UPDATE —
+        /// and must not land it when the schema, the row, or the row's
+        /// uniqueness changed after the read. Every named guard stays in the
+        /// batch, so the UPDATE is voided and the refusal names the guard.
+        ///
+        /// The no-update case (an already-canonical target row) is no longer
+        /// covered here: it spends no write transaction and therefore has no
+        /// re-check to trip — see
+        /// `r9p_canonical_exact_target_spends_no_write_transaction`, which pins
+        /// that absence and its one-leg spawn difference.
+        fn r9_exact_target_rewrite_race_voids_the_update(kind: &str) {
+            let _env = crate::platform::test_env::lock();
+            let bin = codex_sqlite::resolve_sqlite3().expect("actual sqlite3 required");
+            let temp = TempDir::new().unwrap();
+            let base = temp.path().canonicalize().unwrap();
+            let root = base.join("codex-sessions");
+            fs::create_dir(&root).unwrap();
+            let rollout = root.join("rollout.jsonl");
+            fs::write(&rollout, b"private canonical transcript").unwrap();
+            // A missing recorded path whose FILENAME resolves to the candidate:
+            // the admission plans the rewrite to `rollout` and takes the write
+            // leg the guards below live in.
+            let dead = base.join("missing/rollout.jsonl");
+            let db = base.join("state_5.sqlite");
+            r9_fixture_sql(&bin, &db, &format!("CREATE TABLE threads(id TEXT, rollout_path TEXT); INSERT INTO threads VALUES('target','{}');", dead.to_str().unwrap().replace('\'', "''")));
+            let sql = match kind {
+                "schema" => "CREATE VIEW planted AS SELECT * FROM threads;",
+                "duplicate" => "INSERT INTO threads VALUES('target','/missing/other.jsonl');",
+                _ => "UPDATE threads SET rollout_path='/missing/changed.jsonl' WHERE id='target';",
+            };
+            let selected_kind = kind.to_owned();
+            let fixture_bin = bin.clone();
+            let fixture_db = db.clone();
+            codex_sqlite::set_test_repair_before_write(move || {
+                r9_fixture_sql(&fixture_bin, &fixture_db, sql);
+            });
+            let result = codex_sqlite::repair_resume_target_before(
+                &r9_test_lock(&base),
+                &base,
+                &db,
+                &[root],
+                "target",
+                std::time::Instant::now() + std::time::Duration::from_secs(4),
+            );
+            let expected = if selected_kind == "schema" {
+                "csq_rollout_schema_unchanged"
+            } else {
+                "csq_resume_target_unchanged"
+            };
+            assert!(
+                matches!(&result, Err(ShareError::SqliteCommandFailed { detail, .. }) if detail.contains(expected)),
+                "exact-target guarded rewrite refusal: {result:?}"
+            );
+            assert_eq!(
+                r9_fixture_sql(&bin, &db, "SELECT count(*) FROM threads;").trim(),
+                if selected_kind == "duplicate" {
+                    "2"
+                } else {
+                    "1"
+                }
+            );
+            // The planned rewrite must not have landed on the changed row: the
+            // candidate path is what the voided UPDATE would have written.
+            assert_eq!(
+                r9_fixture_sql(
+                    &bin,
+                    &db,
+                    &format!(
+                        "SELECT count(*) FROM threads WHERE rollout_path='{}';",
+                        rollout.to_str().unwrap().replace('\'', "''")
+                    )
+                )
+                .trim(),
+                "0",
+                "a voided guard must leave no rewrite behind"
+            );
+        }
+        #[cfg(unix)]
+        struct PagedRepairFixture {
+            _temp: tempfile::TempDir,
+            base: PathBuf,
+            root: PathBuf,
+            db: PathBuf,
+            binary: PathBuf,
+        }
+
+        #[cfg(unix)]
+        impl PagedRepairFixture {
+            fn new() -> Self {
+                // Keep fixture paths portable even when the caller inherits a deep TMPDIR.
+                let temp = tempfile::Builder::new()
+                    .prefix("cp-")
+                    .tempdir_in("/tmp")
+                    .unwrap();
+                let base = temp.path().canonicalize().unwrap();
+                let root = base.join("persistent");
+                fs::create_dir(&root).unwrap();
+                let db = base.join("state_5.sqlite");
+                let binary = codex_sqlite::resolve_sqlite3()
+                    .expect("private paged repair fixtures require real sqlite3");
+                let f = Self {
+                    _temp: temp,
+                    base,
+                    root,
+                    db,
+                    binary,
+                };
+                f.sql(
+                    &f.db,
+                    "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT);",
+                );
+                f
+            }
+            fn sql(&self, db: &Path, sql: &str) -> String {
+                let missing_prefix = format!(
+                    "'{}/missing/",
+                    self.base.to_str().unwrap().replace('\'', "''")
+                );
+                let sql = sql.replace("'/missing/", &missing_prefix);
+                let output = std::process::Command::new(&self.binary)
+                    .env_clear()
+                    .env("HOME", &self.base)
+                    .current_dir(&self.base)
+                    .args([
+                        "-init",
+                        if cfg!(windows) { "NUL" } else { "/dev/null" },
+                        "-batch",
+                        "-bail",
+                    ])
+                    .arg(db)
+                    .arg(format!("\n{sql}"))
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "private paged SQLite fixture: {output:?}"
+                );
+                String::from_utf8(output.stdout).unwrap()
+            }
+            fn run(&self, databases: &[PathBuf]) -> codex_sqlite::PagedResumeOutcome {
+                codex_sqlite::repair_resume_all_before(
+                    &r9_test_lock(&self.base),
+                    &self.base,
+                    databases,
+                    std::slice::from_ref(&self.root),
+                    std::time::Instant::now() + std::time::Duration::from_secs(12),
+                )
+            }
+            fn candidate(&self, name: &str) -> PathBuf {
+                let path = self.root.join(name);
+                fs::write(&path, b"private transcript").unwrap();
+                path
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn r9p_full_paging_reaches_last_row_beyond_large_old_output() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let f = PagedRepairFixture::new();
+            f.sql(&f.db, "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<8228) INSERT INTO threads SELECT 'dead-'||i, '/missing/'||printf('%0200d',i)||'/absent.jsonl' FROM n;");
+            let candidate = f.candidate("last.jsonl");
+            f.sql(
+                &f.db,
+                "INSERT INTO threads VALUES('last','/missing/last.jsonl');",
+            );
+            let result = f.run(std::slice::from_ref(&f.db));
+            assert!(
+                matches!(result, codex_sqlite::PagedResumeOutcome::Complete(p) if p.visited==8229 && p.rewritten==1),
+                "full paged last-row coverage: {result:?}"
+            );
+            assert_eq!(
+                f.sql(&f.db, "SELECT rollout_path FROM threads WHERE id='last';")
+                    .trim(),
+                candidate.to_str().unwrap()
+            );
+            assert_eq!(f.sql(&f.db,"SELECT count(*) FROM threads WHERE id LIKE 'dead-%' AND rollout_path != '/missing/'||printf('%0200d',CAST(substr(id,6) AS INTEGER))||'/absent.jsonl';").trim(),"0");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn r9p_one_complete_index_is_shared_across_all_databases() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let f = PagedRepairFixture::new();
+            let other = f.base.join("state_6.sqlite");
+            f.sql(&other,"CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT); INSERT INTO threads VALUES('two','/missing/one.jsonl');");
+            f.sql(
+                &f.db,
+                "INSERT INTO threads VALUES('one','/missing/one.jsonl');",
+            );
+            let candidate = f.candidate("one.jsonl");
+            codex_sqlite::test_paged_index_builds(true);
+            assert!(
+                matches!(f.run(&[f.db.clone(),other.clone()]),codex_sqlite::PagedResumeOutcome::Complete(p) if p.visited==2 && p.rewritten==2 && p.databases_completed==2)
+            );
+            assert_eq!(
+                codex_sqlite::test_paged_index_builds(false),
+                1,
+                "exactly one index for multiple database consumers"
+            );
+            assert_eq!(
+                f.sql(&other, "SELECT rollout_path FROM threads;").trim(),
+                candidate.to_str().unwrap()
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn r9p_read_pages_and_write_batches_are_byte_bounded() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let f = PagedRepairFixture::new();
+            // Every component is below NAME_MAX and each full path below
+            // macOS PATH_MAX. Long IDs plus three path components make the
+            // first 500 rows exceed the runner's 1MiB output cap: paging by
+            // row count alone must fail, while 512KiB read pages complete.
+            // Every 7th row has a distinct basename with a candidate transcript, so
+            // it IS rewritten; a batch that holds no UPDATE spends no transaction
+            // (`has_updates`), so without these rows no long-row write batch runs.
+            let rewritten_rows = (1..=600).filter(|i| i % 7 == 0).count();
+            for i in (1..=600).filter(|i| i % 7 == 0) {
+                f.candidate(&format!("cand-{i}.jsonl"));
+            }
+            f.sql(&f.db,"WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<600) INSERT INTO threads SELECT 'long-'||printf('%0600d',i), '/missing/'||printf('%0180d',i)||'/'||printf('%0180d',i)||'/'||printf('%0180d',i)||'/'||CASE WHEN i%7=0 THEN 'cand-'||i||'.jsonl' ELSE 'absent.jsonl' END FROM n;");
+            let payload: usize = f
+                .sql(&f.db, "SELECT sum(length(hex(id))+length(hex(rollout_path))+32) FROM (SELECT id,rollout_path FROM threads ORDER BY rowid LIMIT 500);")
+                .trim().parse().unwrap();
+            assert!(payload > 1024 * 1024, "fixture read payload: {payload}");
+            let longest_path: usize = f
+                .sql(&f.db, "SELECT max(length(rollout_path)) FROM threads;")
+                .trim()
+                .parse()
+                .unwrap();
+            assert!(longest_path < 1024, "fixture path bytes: {longest_path}");
+            codex_sqlite::take_recorded_scripts();
+            let result = f.run(std::slice::from_ref(&f.db));
+            assert!(
+                matches!(result,codex_sqlite::PagedResumeOutcome::Complete(p) if p.visited==600 && p.rewritten==rewritten_rows),
+                "byte-bounded read/write coverage: {result:?}"
+            );
+            let write_batches = codex_sqlite::take_recorded_scripts()
+                .iter()
+                .filter(|s| s.contains("BEGIN IMMEDIATE"))
+                .count();
+            // Arithmetic: 600 rows at the 32-row cap alone make ceil(600/32) = 19
+            // batches, and every 7th row is rewritten so each of them would
+            // write. Each rewrite row carries a >1200-byte hex id guard plus a
+            // >1000-byte path guard, ~3KB against the 10_000-byte batch bound, so
+            // a byte-bounded split puts at most 3 rewrite rows in a batch:
+            // ceil(85/3) = 29 write batches. More than 19 can only come from the
+            // byte bound; `>= 2` held under the row cap alone too.
+            let row_cap_only = 600usize.div_ceil(32);
+            assert!(
+                write_batches > row_cap_only,
+                "long-row rewrites must split by BYTES, not only the 32-row cap: \
+                 {write_batches} write batches vs {row_cap_only} from the row cap alone"
+            );
+        }
+
+        /// MED-R2-1: on a sqlite3 that keeps executing past an error, a failed
+        /// guard of row 2 must void row 1's UPDATE too (every guard precedes
+        /// every UPDATE and each UPDATE carries the aggregate gate), and the
+        /// failure is a KNOWN rollback. Falsifying result with per-row gating:
+        /// row `one` is rewritten while row `two` is not.
+        #[cfg(unix)]
+        #[test]
+        fn r9p_two_row_batch_with_a_failed_second_guard_commits_no_row_on_a_continuing_sqlite3() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let f = PagedRepairFixture::new();
+            f.candidate("one.jsonl");
+            f.candidate("two.jsonl");
+            f.sql(
+                &f.db,
+                "INSERT INTO threads VALUES('one','/missing/one.jsonl');INSERT INTO threads VALUES('two','/missing/two.jsonl');",
+            );
+            let binary = f.binary.clone();
+            let db = f.db.clone();
+            codex_sqlite::set_test_repair_before_write(move || {
+                let output = std::process::Command::new(binary)
+                    .env_clear()
+                    .args(["-init", if cfg!(windows) { "NUL" } else { "/dev/null" }])
+                    .arg(db)
+                    .arg("UPDATE threads SET rollout_path='/changed/two.jsonl' WHERE id='two';")
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+            });
+            let result =
+                codex_sqlite::with_continue_past_errors(|| f.run(std::slice::from_ref(&f.db)));
+            assert!(
+                matches!(&result, codex_sqlite::PagedResumeOutcome::Partial{progress,..} if progress.visited==0 && progress.rewritten==0 && !progress.in_flight_commit_unknown),
+                "failed guard is a known rollback: {result:?}"
+            );
+            assert_eq!(
+                f.sql(
+                    &f.db,
+                    "SELECT count(*) FROM threads WHERE id='one' AND rollout_path='/missing/one.jsonl';"
+                )
+                .trim(),
+                "1",
+                "row one must not be rewritten when row two's guard failed"
+            );
+        }
+
+        /// sqlite3 children one full resume repair spawns for `rows` rows:
+        /// (read spawns, write transactions). `rewrite` makes every row's old
+        /// path repairable, otherwise no row needs an UPDATE.
+        #[cfg(unix)]
+        fn resume_repair_spawns(rows: usize, rewrite: bool) -> (usize, usize) {
+            let f = PagedRepairFixture::new();
+            let mut sql = String::new();
+            for i in 0..rows {
+                if rewrite {
+                    f.candidate(&format!("r{i}.jsonl"));
+                }
+                sql.push_str(&format!(
+                    "INSERT INTO threads VALUES('r{i}','/missing/r{i}.jsonl');"
+                ));
+            }
+            f.sql(&f.db, &sql);
+            codex_sqlite::take_recorded_scripts();
+            let result = f.run(std::slice::from_ref(&f.db));
+            assert!(
+                matches!(&result, codex_sqlite::PagedResumeOutcome::Complete(p) if p.visited == rows),
+                "{result:?}"
+            );
+            let scripts = codex_sqlite::take_recorded_scripts();
+            let writes = scripts
+                .iter()
+                .filter(|s| s.contains("BEGIN IMMEDIATE"))
+                .count();
+            (scripts.len() - writes, writes)
+        }
+
+        /// `projected_len` is the exact length of the script `push` then builds, so
+        /// the byte bound neither over-reserves (more transactions) nor
+        /// under-reserves (an oversize script).
+        #[test]
+        fn paged_batch_projection_is_exact() {
+            hold_test_migration_lock!();
+            let header = "BEGIN IMMEDIATE;\n".to_owned();
+            let mut batch = codex_sqlite::PagedBatch::new(&header);
+            for i in 0..12 {
+                let guard = "INSERT INTO csq_paged_rows SELECT (1 = 1);\n".to_owned();
+                let update = (i % 2 == 0).then(|| format!("UPDATE threads SET a = {i};\n"));
+                let projected = batch.projected_len(&guard, update.as_deref());
+                batch.push(&guard, update.as_deref());
+                assert_eq!(projected, batch.script().len(), "row {i}");
+            }
+        }
+
+        /// Write transactions one full resume repair needs. Measured after the
+        /// single-table row guards: 15 on Linux and 16 on darwin (longer
+        /// canonical /tmp) for 300 rewritable rows, against 21 on Linux before;
+        /// the byte bound is what limits a batch, and each transaction costs an
+        /// fsync on the launch budget.
+        #[cfg(unix)]
+        #[test]
+        fn r9p_resume_repair_write_transactions_stay_within_the_measured_bounds() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            for (rows, rewrite, max_writes) in [
+                (32, true, 2),
+                (32, false, 0),
+                (96, true, 5),
+                (300, true, 17),
+                (300, false, 0),
+            ] {
+                let (reads, writes) = resume_repair_spawns(rows, rewrite);
+                eprintln!("SPAWNS rows={rows} rewrite={rewrite} reads={reads} write_txns={writes}");
+                assert!(
+                    writes <= max_writes,
+                    "rows={rows} rewrite={rewrite}: {writes} write transactions > {max_writes}"
+                );
+            }
+        }
+
+        /// A retry after a partial run must not spend write transactions on rows
+        /// the first run already repaired. Falsifying result (before the
+        /// skip): the second run re-walks every repaired row in guard-only
+        /// batches, so its write transactions scale with the table, not with
+        /// the rows still to do.
+        #[cfg(unix)]
+        #[test]
+        fn r9p_retry_after_a_partial_run_spends_no_transaction_on_repaired_rows() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let f = PagedRepairFixture::new();
+            let mut sql = String::new();
+            for i in 0..200 {
+                f.candidate(&format!("r{i}.jsonl"));
+                sql.push_str(&format!(
+                    "INSERT INTO threads VALUES('r{i}','/missing/r{i}.jsonl');"
+                ));
+            }
+            sql.push_str("INSERT INTO threads VALUES('zz','/missing/zz.jsonl');");
+            f.sql(&f.db, &sql);
+            f.candidate("zz.jsonl");
+            let nested = f.root.join("nested");
+            fs::create_dir(&nested).unwrap();
+            fs::write(nested.join("zz.jsonl"), b"other transcript").unwrap();
+            codex_sqlite::take_recorded_scripts();
+            let first = f.run(std::slice::from_ref(&f.db));
+            let done = match &first {
+                codex_sqlite::PagedResumeOutcome::Partial { progress, .. } => progress.rewritten,
+                other => panic!("the ambiguous last row must stop the first run: {other:?}"),
+            };
+            assert!(done >= 150, "the first run must repair most rows: {done}");
+            let first_writes = codex_sqlite::take_recorded_scripts()
+                .iter()
+                .filter(|s| s.contains("BEGIN IMMEDIATE"))
+                .count();
+            fs::remove_file(nested.join("zz.jsonl")).unwrap();
+            let second = f.run(std::slice::from_ref(&f.db));
+            assert!(
+                matches!(&second, codex_sqlite::PagedResumeOutcome::Complete(p) if p.visited == 201),
+                "{second:?}"
+            );
+            let second_writes = codex_sqlite::take_recorded_scripts()
+                .iter()
+                .filter(|s| s.contains("BEGIN IMMEDIATE"))
+                .count();
+            eprintln!("RETRY first_writes={first_writes} second_writes={second_writes}");
+            assert!(
+                second_writes <= 2,
+                "retry re-walked repaired rows: {second_writes} write transactions (first run {first_writes})"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn r9p_no_update_row_changed_in_a_writing_batch_voids_its_updates() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let f = PagedRepairFixture::new();
+            f.candidate("two.jsonl");
+            f.sql(
+                &f.db,
+                "INSERT INTO threads VALUES('one','/missing/absent.jsonl');INSERT INTO threads VALUES('two','/missing/two.jsonl');",
+            );
+            let binary = f.binary.clone();
+            let db = f.db.clone();
+            codex_sqlite::set_test_repair_before_write(move || {
+                let output = std::process::Command::new(binary)
+                    .env_clear()
+                    .args(["-init", if cfg!(windows) { "NUL" } else { "/dev/null" }])
+                    .arg(db)
+                    .arg("UPDATE threads SET rollout_path='/changed/absent.jsonl' WHERE id='one';")
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+            });
+            let result = f.run(std::slice::from_ref(&f.db));
+            assert!(
+                matches!(result,codex_sqlite::PagedResumeOutcome::Partial{progress,..} if progress.visited==0 && progress.rewritten==0 && !progress.in_flight_commit_unknown),
+                "a changed no-update row must void the batch's UPDATE: {result:?}"
+            );
+            assert_eq!(
+                f.sql(
+                    &f.db,
+                    "SELECT count(*) FROM threads WHERE id='two' AND rollout_path='/missing/two.jsonl';"
+                )
+                .trim(),
+                "1"
+            );
+        }
+
+        /// A batch with no UPDATE needs no transaction: the table is walked by
+        /// reads alone.
+        #[cfg(unix)]
+        #[test]
+        fn r9p_a_batch_without_updates_spends_no_write_transaction() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let f = PagedRepairFixture::new();
+            f.sql(
+                &f.db,
+                "INSERT INTO threads VALUES('one','/missing/absent.jsonl');",
+            );
+            codex_sqlite::take_recorded_scripts();
+            let result = f.run(std::slice::from_ref(&f.db));
+            assert!(
+                matches!(&result, codex_sqlite::PagedResumeOutcome::Complete(p) if p.visited == 1 && p.rewritten == 0),
+                "{result:?}"
+            );
+            assert!(codex_sqlite::take_recorded_scripts()
+                .iter()
+                .all(|s| !s.contains("BEGIN IMMEDIATE")));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn r9p_duplicate_id_and_schema_changes_refuse_before_rewrite() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            for mutation in [
+                "INSERT INTO threads VALUES('one','/other/one.jsonl');",
+                "CREATE VIEW foreign_view AS SELECT id FROM threads;",
+            ] {
+                let f = PagedRepairFixture::new();
+                f.candidate("one.jsonl");
+                f.sql(&f.db,"DROP TABLE threads;CREATE TABLE threads(id TEXT,rollout_path TEXT);INSERT INTO threads VALUES('one','/missing/one.jsonl');");
+                let binary = f.binary.clone();
+                let db = f.db.clone();
+                codex_sqlite::set_test_repair_before_write(move || {
+                    let output = std::process::Command::new(binary)
+                        .env_clear()
+                        .args(["-init", if cfg!(windows) { "NUL" } else { "/dev/null" }])
+                        .arg(db)
+                        .arg(mutation)
+                        .output()
+                        .unwrap();
+                    assert!(output.status.success());
+                });
+                let result = f.run(std::slice::from_ref(&f.db));
+                assert!(
+                    matches!(result,codex_sqlite::PagedResumeOutcome::Partial{progress,..} if progress.visited==0 && progress.rewritten==0 && !progress.in_flight_commit_unknown),
+                    "paged transaction must refuse changed row/schema: {result:?}"
+                );
+                assert_eq!(
+                    f.sql(
+                        &f.db,
+                        "SELECT count(*) FROM threads WHERE rollout_path='/missing/one.jsonl';"
+                    )
+                    .trim(),
+                    "1"
+                );
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn r9p_partial_budget_and_unsupported_cursor_are_typed() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let f = PagedRepairFixture::new();
+            let result = codex_sqlite::repair_resume_all_before(
+                &r9_test_lock(&f.base),
+                &f.base,
+                std::slice::from_ref(&f.db),
+                std::slice::from_ref(&f.root),
+                std::time::Instant::now(),
+            );
+            assert!(
+                matches!(result,codex_sqlite::PagedResumeOutcome::Partial{progress,..} if progress==codex_sqlite::PagedResumeProgress::default())
+            );
+            assert!(
+                matches!(codex_sqlite::repair_resume_all_before(&r9_test_lock(&f.base), &f.base,&[],&[],std::time::Instant::now()),codex_sqlite::PagedResumeOutcome::Partial{progress,..} if progress==codex_sqlite::PagedResumeProgress::default()),
+                "expired empty work must not claim complete"
+            );
+            f.sql(&f.db,"DROP TABLE threads;CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT) WITHOUT ROWID;");
+            assert!(
+                matches!(f.run(std::slice::from_ref(&f.db)),codex_sqlite::PagedResumeOutcome::Partial{progress,..} if progress.visited==0)
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn r9p_partial_reports_only_acknowledged_batches() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let f = PagedRepairFixture::new();
+            f.sql(&f.db,"WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<40) INSERT INTO threads SELECT 'dead-'||i,'/missing/one.jsonl' FROM n; INSERT INTO threads VALUES('ambiguous','/missing/ambiguous.jsonl');");
+            let canonical = f.candidate("one.jsonl");
+            f.candidate("ambiguous.jsonl");
+            let nested = f.root.join("nested");
+            fs::create_dir(&nested).unwrap();
+            fs::write(nested.join("ambiguous.jsonl"), b"other transcript").unwrap();
+            let result = f.run(std::slice::from_ref(&f.db));
+            let confirmed = f
+                .sql(
+                    &f.db,
+                    &format!(
+                        "SELECT count(*) FROM threads WHERE rollout_path='{}';",
+                        canonical.to_str().unwrap().replace('\'', "''")
+                    ),
+                )
+                .trim()
+                .parse::<usize>()
+                .unwrap();
+            assert!(
+                confirmed > 0 && confirmed < 40,
+                "private database must expose only previously committed batches"
+            );
+            assert!(
+                matches!(result,codex_sqlite::PagedResumeOutcome::Partial{progress,..} if progress.visited==confirmed && progress.rewritten==confirmed && !progress.in_flight_commit_unknown),
+                "confirmed partial counters exclude pending batch: {result:?}"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn r9p_indexed_candidate_requires_fresh_nofollow_admission() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let f = PagedRepairFixture::new();
+            let candidate = f.candidate("swap.jsonl");
+            let outside = f.base.join("outside.jsonl");
+            fs::write(&outside, b"outside persistent root").unwrap();
+            f.sql(
+                &f.db,
+                "INSERT INTO threads VALUES('one','/missing/swap.jsonl');",
+            );
+            codex_sqlite::set_test_repair_before_candidate_open(move || {
+                fs::remove_file(&candidate).unwrap();
+                std::os::unix::fs::symlink(&outside, &candidate).unwrap();
+            });
+            let result = f.run(std::slice::from_ref(&f.db));
+            assert!(
+                matches!(result,codex_sqlite::PagedResumeOutcome::Partial{progress,..} if progress.visited==0 && progress.rewritten==0),
+                "fresh owned admission must reject index-to-symlink race: {result:?}"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn r9p_full_paging_supports_actual_upstream_schema_guard_budget() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let f = PagedRepairFixture::new();
+            f.sql(&f.db, "DROP TABLE threads;");
+            f.sql(&f.db, CODEX_THREADS_SCHEMA);
+            let before = f.sql(
+                &f.db,
+                "SELECT hex(sql) FROM sqlite_master WHERE type='trigger' ORDER BY name;",
+            );
+            assert_eq!(
+                before.lines().count(),
+                5,
+                "actual upstream trigger denominator"
+            );
+            let candidate = f.candidate("real.jsonl");
+            let missing = f
+                .base
+                .join("missing")
+                .join("x".repeat(200))
+                .join("y".repeat(200))
+                .join("z".repeat(200))
+                .join("w".repeat(200))
+                .join("real.jsonl");
+            assert!(
+                missing.to_str().unwrap().len() < 1024,
+                "fixture path must remain below macOS PATH_MAX"
+            );
+            f.sql(&f.db,&format!("INSERT INTO threads(id,rollout_path,created_at,updated_at,source,model_provider,cwd,title,sandbox_policy,approval_mode) VALUES('99999999-9999-4999-8999-999999999999','{}',1,1,'cli','openai','/private-work','fixture','default','default');",missing.to_str().unwrap().replace('\'',"''")));
+            let result = f.run(std::slice::from_ref(&f.db));
+            assert!(
+                matches!(result,codex_sqlite::PagedResumeOutcome::Complete(p) if p.visited==1 && p.rewritten==1),
+                "real upstream schema fits bounded write guard: {result:?}"
+            );
+            assert_eq!(
+                f.sql(&f.db, "SELECT rollout_path FROM threads;").trim(),
+                candidate.to_str().unwrap()
+            );
+            assert_eq!(
+                f.sql(
+                    &f.db,
+                    "SELECT hex(sql) FROM sqlite_master WHERE type='trigger' ORDER BY name;"
+                ),
+                before
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn r9p_captured_tail_does_not_chase_new_appends() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let f = PagedRepairFixture::new();
+            f.sql(
+                &f.db,
+                "INSERT INTO threads VALUES('one','/missing/one.jsonl');",
+            );
+            f.candidate("one.jsonl");
+            let binary = f.binary.clone();
+            let db = f.db.clone();
+            let appended = f
+                .base
+                .join("missing/one.jsonl")
+                .to_str()
+                .unwrap()
+                .replace('\'', "''");
+            codex_sqlite::set_test_repair_before_write(move || {
+                let output = std::process::Command::new(binary)
+                    .env_clear()
+                    .args([
+                        "-init",
+                        if cfg!(windows) { "NUL" } else { "/dev/null" },
+                        "-batch",
+                        "-bail",
+                    ])
+                    .arg(db)
+                    .arg(format!("INSERT INTO threads VALUES('late','{appended}');"))
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+            });
+            let result = f.run(std::slice::from_ref(&f.db));
+            assert!(
+                matches!(result, codex_sqlite::PagedResumeOutcome::Complete(p) if p.visited==1 && p.rewritten==1),
+                "finite captured tail must exclude later append: {result:?}"
+            );
+            assert_eq!(f.sql(&f.db,"SELECT count(*) FROM threads WHERE id='late' AND rollout_path='/missing/one.jsonl';").trim(),"1");
+        }
+
+        #[cfg(unix)]
+        fn r9p_assert_pre_spawn_refusal_and_known_rollback(binary: &Path, db: &Path) {
+            let deadline = || std::time::Instant::now() + R9_RUNNER_HANG_GUARD;
+            let mut unknown = true;
+            assert!(codex_sqlite::run_repair_sqlite_bounded_tracking(
+                binary,
+                db,
+                &"x".repeat(60_001),
+                false,
+                deadline(),
+                &mut unknown
+            )
+            .is_err());
+            assert!(!unknown, "pre-spawn refusal has no unknown commit");
+            assert!(codex_sqlite::run_repair_sqlite_bounded_tracking(binary,db,
+                "BEGIN IMMEDIATE;CREATE TEMP TABLE csq_paged_fixture(ok INTEGER CONSTRAINT csq_paged_fixture CHECK(ok=1));INSERT INTO csq_paged_fixture VALUES(0);COMMIT;",
+                false,deadline(),&mut unknown).is_err());
+            assert!(!unknown, "named guard failure is a known rollback");
+        }
+
+        /// The classification holds when the child needs far longer than the old
+        /// 2s deadline: the sqlite3 is started 3s late by the `delayed` fixture.
+        /// Falsifying result with a 2s deadline: the deadline fires after the
+        /// spawn, `unknown` is true, and the known-rollback assertion fails.
+        #[cfg(unix)]
+        #[test]
+        fn r9p_known_rollback_classification_holds_when_the_child_is_slow() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let f = PagedRepairFixture::new();
+            let wrapper = r9_native_fixture(&f.base, "delayed");
+            fs::write(
+                f.base.join("fixture-exec"),
+                format!("3000\n{}", f.binary.display()),
+            )
+            .unwrap();
+            r9p_assert_pre_spawn_refusal_and_known_rollback(&wrapper, &f.db);
+        }
+
+        /// Run the full paged repair with an already-short caller deadline, so
+        /// every window under test is one the walk armed itself.
+        #[cfg(unix)]
+        fn r9p_run_short(f: &PagedRepairFixture) -> codex_sqlite::PagedResumeOutcome {
+            codex_sqlite::repair_resume_all_before(
+                &r9_test_lock(&f.base),
+                &f.base,
+                std::slice::from_ref(&f.db),
+                std::slice::from_ref(&f.root),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+        }
+
+        /// Install a walk hook that sleeps `late` at the first `late_at` point
+        /// (a child that returned late inside its own 9s window) and `walk` at
+        /// the `walk_nth` (0-based) `walk_at` point (a slow caller-side walk).
+        #[cfg(unix)]
+        fn r9p_slow_walk(
+            late_at: codex_sqlite::PagedWalkPoint,
+            late: std::time::Duration,
+            walk_at: codex_sqlite::PagedWalkPoint,
+            walk_nth: usize,
+            walk: std::time::Duration,
+        ) -> codex_sqlite::PagedWalkHookGuard {
+            let mut late_done = false;
+            let mut seen = 0usize;
+            codex_sqlite::set_test_paged_walk_hook(move |point| {
+                if point == late_at && !late_done {
+                    late_done = true;
+                    std::thread::sleep(late);
+                }
+                if point == walk_at {
+                    if seen == walk_nth {
+                        std::thread::sleep(walk);
+                    }
+                    seen += 1;
+                }
+            })
+        }
+
+        /// A page read that returns 7.5s into its 9s step window, followed by a
+        /// 2.5s walk, completes: the walk gets its own 4s window. Falsifying
+        /// result without the post-read `page_budget`: the walk inherits the
+        /// ~1.5s leftover and the row check refuses (Partial).
+        #[cfg(unix)]
+        #[test]
+        fn r9p_a_late_page_read_followed_by_a_short_walk_completes() {
+            hold_test_migration_lock!();
+            use codex_sqlite::PagedWalkPoint::{PageRead, Row};
+            let _env = crate::platform::test_env::lock();
+            let f = PagedRepairFixture::new();
+            f.sql(
+                &f.db,
+                "INSERT INTO threads VALUES('one','/missing/one.jsonl');",
+            );
+            let candidate = f.candidate("one.jsonl");
+            let ms = std::time::Duration::from_millis;
+            let _hook = r9p_slow_walk(PageRead, ms(7500), Row, 0, ms(2500));
+            let result = r9p_run_short(&f);
+            assert!(
+                matches!(&result, codex_sqlite::PagedResumeOutcome::Complete(p) if p.visited == 1 && p.rewritten == 1),
+                "late page read then short walk: {result:?}"
+            );
+            assert_eq!(
+                f.sql(&f.db, "SELECT rollout_path FROM threads WHERE id='one';")
+                    .trim(),
+                candidate.to_str().unwrap()
+            );
+        }
+
+        /// A walk that runs 5.5s past its re-armed 4s window refuses. Falsifying
+        /// result without the per-row deadline check: the row is walked and its
+        /// batch commits under a fresh step window (Complete).
+        #[cfg(unix)]
+        #[test]
+        fn r9p_a_walk_exceeding_its_rearmed_window_refuses() {
+            hold_test_migration_lock!();
+            use codex_sqlite::PagedWalkPoint::{PageRead, Row};
+            let _env = crate::platform::test_env::lock();
+            let f = PagedRepairFixture::new();
+            f.sql(
+                &f.db,
+                "INSERT INTO threads VALUES('one','/missing/one.jsonl');",
+            );
+            f.candidate("one.jsonl");
+            let ms = std::time::Duration::from_millis;
+            let _hook = r9p_slow_walk(PageRead, ms(7500), Row, 0, ms(5500));
+            let result = r9p_run_short(&f);
+            assert!(
+                matches!(&result, codex_sqlite::PagedResumeOutcome::Partial { progress, reason }
+                    if *reason == "shared resume repair deadline exhausted" && progress.visited == 0 && progress.rewritten == 0),
+                "walk past its window: {result:?}"
+            );
+            assert_eq!(
+                f.sql(&f.db, "SELECT rollout_path FROM threads WHERE id='one';")
+                    .trim(),
+                format!("{}/missing/one.jsonl", f.base.display())
+            );
+        }
+
+        /// 34 rewriting rows flush one batch mid-page (the flush is driven by
+        /// `PAGED_BATCH_BYTES`, the projected script size, not the 32-row cap);
+        /// that batch is acknowledged 7.5s into its 9s step window and row 34
+        /// then takes 2.5s. The page completes, and the late batch is the ONLY
+        /// commit before row 34's walk, so the 2.5s is charged to the window
+        /// that batch re-armed. Falsifying result without the post-batch
+        /// re-arm: row 34 inherits the batch's ~1.5s leftover and refuses with
+        /// the first batch committed (Partial).
+        #[cfg(unix)]
+        #[test]
+        fn r9p_rows_after_a_late_mid_page_batch_get_their_own_window() {
+            hold_test_migration_lock!();
+            use codex_sqlite::PagedWalkPoint::{BatchCommitted, Row};
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let _env = crate::platform::test_env::lock();
+            let f = PagedRepairFixture::new();
+            for i in 0..34 {
+                f.sql(
+                    &f.db,
+                    &format!("INSERT INTO threads VALUES('t{i}','/missing/t{i}.jsonl');"),
+                );
+                f.candidate(&format!("t{i}.jsonl"));
+            }
+            let ms = std::time::Duration::from_millis;
+            let commits = std::sync::Arc::new(AtomicUsize::new(0));
+            let commits_before_row_33 = std::sync::Arc::new(AtomicUsize::new(usize::MAX));
+            let (counted, observed) = (commits.clone(), commits_before_row_33.clone());
+            let mut rows = 0usize;
+            let _hook = codex_sqlite::set_test_paged_walk_hook(move |point| match point {
+                BatchCommitted => {
+                    // The first commit is the late one.
+                    if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                        std::thread::sleep(ms(7500));
+                    }
+                }
+                Row => {
+                    if rows == 33 {
+                        observed.store(counted.load(Ordering::SeqCst), Ordering::SeqCst);
+                        std::thread::sleep(ms(2500));
+                    }
+                    rows += 1;
+                }
+                _ => {}
+            });
+            let result = r9p_run_short(&f);
+            assert_eq!(
+                commits_before_row_33.load(Ordering::SeqCst),
+                1,
+                "the late batch must be the only commit before row 33"
+            );
+            assert!(
+                matches!(&result, codex_sqlite::PagedResumeOutcome::Complete(p) if p.visited == 34 && p.rewritten == 34),
+                "rows after a late mid-page batch: {result:?}"
+            );
+        }
+
+        /// The exact route's row read returns 7.5s into its 9s window and the
+        /// transcript filename search then takes 2.5s: the target is admitted
+        /// and rewritten. Falsifying result without the exact route's walk
+        /// window: the search inherits the ~1.5s leftover and refuses with
+        /// "target filename search exceeded its bounded budget".
+        #[cfg(unix)]
+        #[test]
+        fn r9_exact_target_search_gets_its_own_window() {
+            hold_test_migration_lock!();
+            use codex_sqlite::PagedWalkPoint::{ExactRowsRead, ExactSearchDir};
+            let _env = crate::platform::test_env::lock();
+            let bin = codex_sqlite::resolve_sqlite3().expect("actual sqlite3 required");
+            let temp = TempDir::new().unwrap();
+            let base = temp.path().canonicalize().unwrap();
+            let root = base.join("codex-sessions");
+            fs::create_dir(&root).unwrap();
+            let rollout = root.join("rollout.jsonl");
+            fs::write(&rollout, b"private canonical transcript").unwrap();
+            let dead = base.join("missing/rollout.jsonl");
+            let db = base.join("state_5.sqlite");
+            r9_fixture_sql(&bin, &db, &format!("CREATE TABLE threads(id TEXT, rollout_path TEXT); INSERT INTO threads VALUES('target','{}');", dead.to_str().unwrap().replace('\'', "''")));
+            let ms = std::time::Duration::from_millis;
+            let _hook = r9p_slow_walk(ExactRowsRead, ms(7500), ExactSearchDir, 0, ms(2500));
+            let result = codex_sqlite::repair_resume_target_before(
+                &r9_test_lock(&base),
+                &base,
+                &db,
+                &[root],
+                "target",
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            );
+            assert!(matches!(result, Ok(1)), "exact search window: {result:?}");
+            assert_eq!(
+                r9_fixture_sql(&bin, &db, "SELECT rollout_path FROM threads;").trim(),
+                rollout.to_str().unwrap()
+            );
+        }
+
+        /// True once `pid` no longer runs: gone (ESRCH), or on Linux a zombie
+        /// left for a non-reaping init to collect.
+        #[cfg(unix)]
+        fn r9_descendant_gone(pid: i32) -> bool {
+            // kill(-1) signals every process the caller may signal, and
+            // kill(0) its own group: a test must never probe or signal either.
+            assert!(pid > 1, "refusing to signal implausible fixture pid {pid}");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                // SAFETY: signal zero sends nothing; it only probes `pid`.
+                let alive = unsafe { libc::kill(pid, 0) } == 0;
+                let zombie = fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                    stat.rsplit_once(") ")
+                        .is_some_and(|(_, rest)| rest.starts_with('Z'))
+                });
+                if !alive || zombie {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        /// Read the fixture descendant's pid and assert it is dead. It is NEVER
+        /// signalled: the group kill lands it, init reaps the orphan, and a
+        /// reaped pid can be REUSED — signalling it could hit an unrelated
+        /// process. `Some(gone)` when the fixture forked (asserted gone here);
+        /// `None` when the child was killed before it forked and wrote the
+        /// file. A None attempt does NOT pass on its own: each caller retries
+        /// with a fresh fixture and FAILS as NOT EXERCISED when no attempt
+        /// produced a descendant. The descendant's 30 s sleep bounds the
+        /// orphan if this assertion ever fails.
+        #[cfg(unix)]
+        fn r9_reap_descendant(base: &Path) -> Option<bool> {
+            let pid: i32 = match fs::read_to_string(base.join("descendant-pid")) {
+                Ok(raw) => raw.trim().parse().expect("fixture descendant pid"),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+                Err(error) => panic!("fixture descendant pid: {error}"),
+            };
+            assert!(
+                pid > 1,
+                "refusing to probe implausible fixture descendant pid {pid}"
+            );
+            let gone = r9_descendant_gone(pid);
+            assert!(
+                gone,
+                "the fixture descendant (pid {pid}) is still alive; it is an \
+                 orphan bounded by its 30 s sleep"
+            );
+            Some(gone)
+        }
+
+        /// A step whose shell exits but leaves a forked descendant holding
+        /// stdout times out, and the descendant dies with the step's process
+        /// group. Falsifying result without `process_group(0)`: the leader's
+        /// pid is no group id, the group kill finds nothing, and the descendant
+        /// is still sleeping.
+        #[cfg(unix)]
+        #[test]
+        fn r9_platform_runner_kills_the_step_process_group() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            const ATTEMPTS: usize = 3;
+            let mut exercised = false;
+            for attempt in 1..=ATTEMPTS {
+                let t = tempfile::Builder::new()
+                    .prefix("cr-")
+                    .tempdir_in("/tmp")
+                    .unwrap();
+                let bin = r9_native_fixture(t.path(), "forked");
+                let started = std::time::Instant::now();
+                let result = codex_sqlite::run_repair_sqlite_bounded(
+                    &bin,
+                    &t.path().join("private.sqlite"),
+                    "SELECT 1;",
+                    true,
+                    started + std::time::Duration::from_secs(1),
+                );
+                let spawned = codex_sqlite::take_last_spawned_pid();
+                let gone = r9_reap_descendant(t.path());
+                assert!(
+                    matches!(&result, Err(ShareError::SqliteCommandFailed { detail, .. }) if detail.contains("deadline")),
+                    "{result:?}"
+                );
+                match gone {
+                    Some(gone) => {
+                        assert!(gone, "the step's forked descendant survived its group kill");
+                        exercised = true;
+                        break;
+                    }
+                    None => {
+                        let cause = match spawned {
+                            Some(_) => {
+                                "spawned-but-pid-unwritten (the child died before it forked)"
+                            }
+                            None => "pre-spawn deadline (the runner refused before spawning)",
+                        };
+                        eprintln!(
+                            "r9_platform_runner_kills_the_step_process_group attempt \
+                             {attempt}/{ATTEMPTS} did NOT exercise the group kill: {cause}"
+                        );
+                    }
+                }
+            }
+            assert!(
+                exercised,
+                "group-kill property NOT EXERCISED in {ATTEMPTS} attempts"
+            );
+        }
+
+        /// The -bail probe's stdout drain is bounded by its own 5s deadline: a
+        /// probed shell that forks a descendant holding stdout fails the probe
+        /// in well under the descendant's 30s, and the descendant dies with the
+        /// group. Falsifying result with a blocking drain: the probe returns
+        /// only when the descendant exits after 30s.
+        #[cfg(unix)]
+        #[test]
+        fn r9_bail_probe_drain_is_bounded_against_a_descendant_holding_stdout() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            const ATTEMPTS: usize = 3;
+            let mut exercised = false;
+            for attempt in 1..=ATTEMPTS {
+                let t = tempfile::Builder::new()
+                    .prefix("cr-")
+                    .tempdir_in("/tmp")
+                    .unwrap();
+                let bin = r9_native_fixture(t.path(), "forked");
+                let started = std::time::Instant::now();
+                let stops = codex_sqlite::probe_stops_at_first_error(&bin);
+                let elapsed = started.elapsed();
+                let started_child = t.path().join("owned-pid").exists();
+                let gone = r9_reap_descendant(t.path());
+                assert!(!stops, "a shell that exits 0 never passes the probe");
+                assert!(
+                    elapsed < std::time::Duration::from_secs(10),
+                    "probe drain was not bounded: {elapsed:?}"
+                );
+                match gone {
+                    Some(gone) => {
+                        assert!(
+                            gone,
+                            "the probe's forked descendant survived its group kill"
+                        );
+                        exercised = true;
+                        break;
+                    }
+                    None => {
+                        // The probe spawns outside the runner spawn record, so
+                        // the distinction comes from the fixture's own startup
+                        // file: `owned-pid` is written before the mode forks.
+                        let cause = if started_child {
+                            "spawned-but-pid-unwritten (the child started but died before it forked)"
+                        } else {
+                            "never scheduled (the probe window ended before the child ran)"
+                        };
+                        eprintln!(
+                            "r9_bail_probe_drain_is_bounded_against_a_descendant_holding_stdout \
+                             attempt {attempt}/{ATTEMPTS} did NOT exercise the group kill: {cause}"
+                        );
+                    }
+                }
+            }
+            assert!(
+                exercised,
+                "group-kill property NOT EXERCISED in {ATTEMPTS} attempts"
+            );
+        }
+
+        /// The migration lock writer repair children inherit, held SHARED as
+        /// the launch routes hold it.
+        fn r9_test_lock(base: &Path) -> crate::session::shared_state::CodexShareLockGuard {
+            crate::session::shared_state::acquire_codex_share_lock_shared_bounded(
+                base,
+                50,
+                std::time::Duration::from_millis(20),
+            )
+            .expect("migration lock io")
+            .expect("migration lock admitted")
+        }
+
+        /// Child half of `r9_writer_child_holds_the_migration_lock_after_csq_dies`:
+        /// take the lock EXCLUSIVE, spawn a writer child that sleeps 20s, print
+        /// its pid, then wait to be SIGKILLed (the "csq dies" step). The child
+        /// is deliberately left unreaped: the parent kills its group.
+        #[cfg(unix)]
+        fn r9_lock_holder_child(base: std::ffi::OsString) -> ! {
+            use std::io::Write as _;
+            let base = PathBuf::from(base);
+            let Ok(Some(lock)) =
+                crate::session::shared_state::acquire_codex_share_lock_exclusive_bounded(
+                    &base,
+                    50,
+                    std::time::Duration::from_millis(20),
+                )
+            else {
+                std::process::exit(3);
+            };
+            let _held = lock.hold_for_children();
+            let mut command = std::process::Command::new("/bin/sleep");
+            command
+                .arg("20")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let Ok(child) =
+                codex_sqlite::RepairChild::spawn(&mut command, codex_sqlite::ChildRole::Writer)
+            else {
+                std::process::exit(4);
+            };
+            let mut stdout = std::io::stdout();
+            let _ = writeln!(stdout, "CSQ_R9_LOCK_CHILD_PID={}", child.id());
+            let _ = stdout.flush();
+            std::mem::forget(child);
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+        }
+
+        /// Spawn this test binary as the lock holder (`r9_lock_holder_child`)
+        /// for the test named `test`, then SIGKILL it ("csq dies") once it has
+        /// reported its writer child. Returns the writer's pid.
+        #[cfg(unix)]
+        fn r9_kill_lock_holder_after_its_writer_spawns(test: &str, base: &Path) -> libc::pid_t {
+            use std::io::BufRead as _;
+            let name = format!(
+                "{}::{test}",
+                module_path!()
+                    .split_once("::")
+                    .expect("crate-qualified path")
+                    .1
+            );
+            let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                .env(R9_LOCK_HOLDER_CHILD, base)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let stdout = holder.stdout.take().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout)
+                    .lines()
+                    .map_while(Result::ok)
+                {
+                    // libtest may print "test <name> ... " before the body's output
+                    // on the same line.
+                    if let Some((_, pid)) = line.split_once("CSQ_R9_LOCK_CHILD_PID=") {
+                        let _ = tx.send(pid.trim().parse::<libc::pid_t>().ok());
+                    }
+                }
+            });
+            let pid = rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .ok()
+                .flatten();
+            // "csq dies": SIGKILL, which no handler can catch, then reap it.
+            let _ = holder.kill();
+            let holder_status = holder.wait();
+            let Some(pid) = pid else {
+                panic!("lock holder never reported its writer child: {holder_status:?}");
+            };
+            pid
+        }
+
+        /// The env var that turns a re-invoked test binary into the lock holder.
+        #[cfg(unix)]
+        const R9_LOCK_HOLDER_CHILD: &str = "CSQ_R9_LOCK_HOLDER_CHILD";
+
+        /// One non-blocking exclusive attempt on `base`'s migration lock.
+        #[cfg(unix)]
+        fn r9_try_exclusive(base: &Path) -> bool {
+            crate::session::shared_state::acquire_codex_share_lock_exclusive_bounded(
+                base,
+                1,
+                std::time::Duration::from_millis(0),
+            )
+            .expect("lock io")
+            .is_some()
+        }
+
+        /// SIGKILL `pid`'s process group if `pid` still leads one.
+        #[cfg(unix)]
+        fn r9_kill_group_if_leader(pid: libc::pid_t) {
+            // SAFETY: getpgid only queries; the negative pid targets only the
+            // group `pid` was just re-proved to lead (the orphaned writer).
+            if unsafe { libc::getpgid(pid) } == pid {
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+            }
+        }
+
+        /// macOS and other non-Linux Unix: a writer repair child keeps the
+        /// migration lock held after csq dies by SIGKILL (no death signal
+        /// exists there; the lock stays held = fail-closed), and releases it
+        /// when the child itself dies. Runs the lock holder in a subprocess of
+        /// this test binary. Falsifying result without the inherited
+        /// descriptor (`F_DUPFD_CLOEXEC`): the holder's death closes the only
+        /// description and a fresh exclusive attempt succeeds while the child
+        /// is still alive.
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+        #[test]
+        fn r9_writer_child_holds_the_migration_lock_after_csq_dies() {
+            if let Some(base) = std::env::var_os(R9_LOCK_HOLDER_CHILD) {
+                r9_lock_holder_child(base);
+            }
+            let t = tempfile::Builder::new()
+                .prefix("cr-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let pid = r9_kill_lock_holder_after_its_writer_spawns(
+                "r9_writer_child_holds_the_migration_lock_after_csq_dies",
+                t.path(),
+            );
+            // Proof of ownership before any kill: the pid leads its own group.
+            // SAFETY: getpgid only queries.
+            assert_eq!(
+                unsafe { libc::getpgid(pid) },
+                pid,
+                "writer child is not its own group leader"
+            );
+            let acquired_while_child_lived = r9_try_exclusive(t.path());
+            r9_kill_group_if_leader(pid);
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut acquired_after_child_died = false;
+            while std::time::Instant::now() < until {
+                if r9_try_exclusive(t.path()) {
+                    acquired_after_child_died = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                !acquired_while_child_lived,
+                "the exclusive lock was free while the orphaned writer still ran"
+            );
+            assert!(
+                acquired_after_child_died,
+                "the lock stayed held after the writer child was killed"
+            );
+        }
+
+        /// Linux: when csq dies by SIGKILL, its writer child (a 20s sleeper
+        /// holding the inherited lock) is killed by `PR_SET_PDEATHSIG` and the
+        /// exclusive lock becomes acquirable well before the sleeper would have
+        /// exited on its own. Falsifying result without the `prctl`: the
+        /// orphan keeps running and holding the lock for the rest of its 20s
+        /// (the holder is killed as soon as it reports the writer), so no
+        /// exclusive attempt succeeds within the 10s window.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[test]
+        fn r9_writer_child_dies_with_csq_and_releases_the_lock() {
+            if let Some(base) = std::env::var_os(R9_LOCK_HOLDER_CHILD) {
+                r9_lock_holder_child(base);
+            }
+            let t = tempfile::Builder::new()
+                .prefix("cr-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let pid = r9_kill_lock_holder_after_its_writer_spawns(
+                "r9_writer_child_dies_with_csq_and_releases_the_lock",
+                t.path(),
+            );
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut acquired = false;
+            while std::time::Instant::now() < until {
+                if r9_try_exclusive(t.path()) {
+                    acquired = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // Dead means gone or a zombie awaiting its new parent's reap; a
+            // zombie has closed every descriptor already.
+            let state = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok();
+            let running = state.as_deref().is_some_and(|stat| {
+                stat.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().next())
+                    .is_some_and(|code| code != "Z" && code != "X")
+            });
+            if running {
+                r9_kill_group_if_leader(pid);
+            }
+            assert!(
+                acquired,
+                "the exclusive lock stayed held after csq died (writer pid {pid})"
+            );
+            assert!(!running, "the orphaned writer {pid} survived csq's death");
+        }
+
+        /// A writer spawn on a thread holding no migration lock is refused with
+        /// the fixed detail, and the same spawn under a held lock runs.
+        /// Falsifying result without the refusal: the unlocked writer spawns.
+        #[cfg(unix)]
+        #[test]
+        fn r9_writer_spawn_without_the_migration_lock_is_refused() {
+            let sleeper = || {
+                let mut command = std::process::Command::new("/bin/sleep");
+                command
+                    .arg("5")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                command
+            };
+            let unlocked =
+                codex_sqlite::RepairChild::spawn(&mut sleeper(), codex_sqlite::ChildRole::Writer);
+            let refused = matches!(&unlocked, Err(e) if e.to_string() == codex_sqlite::UNLOCKED_WRITER_DETAIL);
+            drop(unlocked);
+            let t = tempfile::Builder::new()
+                .prefix("cr-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let lock = r9_test_lock(t.path());
+            let held = lock.hold_for_children();
+            let locked =
+                codex_sqlite::RepairChild::spawn(&mut sleeper(), codex_sqlite::ChildRole::Writer);
+            let spawned = locked.is_ok();
+            drop(locked);
+            drop(held);
+            assert!(refused, "an unlocked writer spawn was not refused");
+            assert!(spawned, "a writer spawn under a held lock failed");
+        }
+
+        /// A sleeper command for the lock-token refusal tests.
+        #[cfg(unix)]
+        fn r9_token_sleeper() -> std::process::Command {
+            let mut command = std::process::Command::new("/bin/sleep");
+            command
+                .arg("5")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            command
+        }
+
+        /// A lock token naming a standard-stream descriptor (0-2) is refused
+        /// before fork: the child's stdio setup overwrites 0-2 before `exec`,
+        /// so the writer would inherit a pipe in place of the lock. Falsifying
+        /// result without the `fd <= 2` refusal: the spawn succeeds.
+        #[cfg(unix)]
+        #[test]
+        fn r9_writer_spawn_refuses_a_standard_stream_lock_descriptor() {
+            let identity = crate::session::shared_state::fd_identity(2);
+            assert!(identity.is_some(), "fstat(2) must succeed for this test");
+            let token = crate::session::shared_state::ChildLockToken { fd: 2, identity };
+            let result =
+                crate::session::shared_state::with_child_lock_token_for_test(token, || {
+                    codex_sqlite::RepairChild::spawn(
+                        &mut r9_token_sleeper(),
+                        codex_sqlite::ChildRole::Writer,
+                    )
+                    .map(drop)
+                });
+            assert!(
+                matches!(&result, Err(e) if e.to_string() == codex_sqlite::UNUSABLE_LOCK_DETAIL),
+                "{result:?}"
+            );
+        }
+
+        /// A lock token whose recorded `(st_dev, st_ino)` no longer matches
+        /// the descriptor is refused in the child BEFORE `F_DUPFD`, and the
+        /// same descriptor with its true identity spawns. Falsifying result
+        /// without the `fstat` comparison: the mismatched spawn succeeds.
+        #[cfg(unix)]
+        #[test]
+        fn r9_writer_spawn_refuses_a_lock_descriptor_whose_identity_changed() {
+            let t = tempfile::Builder::new()
+                .prefix("cr-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let lock = r9_test_lock(t.path());
+            let held = lock.hold_for_children();
+            let real = crate::session::shared_state::held_child_lock().expect("scope installed");
+            let (dev, ino) = real.identity.expect("identity recorded");
+            let wrong = crate::session::shared_state::ChildLockToken {
+                fd: real.fd,
+                identity: Some((dev, ino.wrapping_add(1))),
+            };
+            let mismatched =
+                crate::session::shared_state::with_child_lock_token_for_test(wrong, || {
+                    codex_sqlite::RepairChild::spawn(
+                        &mut r9_token_sleeper(),
+                        codex_sqlite::ChildRole::Writer,
+                    )
+                    .map(drop)
+                });
+            let matched = codex_sqlite::RepairChild::spawn(
+                &mut r9_token_sleeper(),
+                codex_sqlite::ChildRole::Writer,
+            )
+            .map(drop);
+            drop(held);
+            assert!(
+                matches!(&mismatched, Err(e) if e.to_string() == codex_sqlite::LOCK_IDENTITY_MISMATCH_DETAIL),
+                "{mismatched:?}"
+            );
+            assert!(matched.is_ok(), "the true identity must spawn: {matched:?}");
+        }
+
+        /// A scope dropped out of order clears the slot rather than restoring
+        /// a token it did not install over a still-live scope's. Falsifying
+        /// result with the unconditional restore: after the outer scope drops
+        /// first and then the inner, the inner restores its `previous` and the
+        /// slot names the outer scope's token although that scope is gone.
+        #[cfg(unix)]
+        #[test]
+        fn r9_child_lock_scope_out_of_order_drop_never_leaves_a_foreign_token() {
+            let a = tempfile::Builder::new()
+                .prefix("cr-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let b = tempfile::Builder::new()
+                .prefix("cr-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let outer_lock = r9_test_lock(a.path());
+            let inner_lock = r9_test_lock(b.path());
+            assert_eq!(crate::session::shared_state::held_child_lock(), None);
+            let outer = outer_lock.hold_for_children();
+            let outer_token = crate::session::shared_state::held_child_lock();
+            let inner = inner_lock.hold_for_children();
+            let inner_token = crate::session::shared_state::held_child_lock();
+            assert_ne!(outer_token, inner_token);
+            drop(outer);
+            let after_outer = crate::session::shared_state::held_child_lock();
+            drop(inner);
+            let after_inner = crate::session::shared_state::held_child_lock();
+            assert_eq!(after_outer, None, "out-of-order drop left a token");
+            assert_eq!(
+                after_inner, None,
+                "the inner drop restored a dropped scope's token"
+            );
+            // Properly nested scopes still restore.
+            let outer = outer_lock.hold_for_children();
+            let inner = inner_lock.hold_for_children();
+            drop(inner);
+            assert_eq!(crate::session::shared_state::held_child_lock(), outer_token);
+            drop(outer);
+            assert_eq!(crate::session::shared_state::held_child_lock(), None);
+        }
+
+        /// M1: a writer that exits 0 without running its script (the stub
+        /// sleeps, never reads stdin, exits 0; the script fits the pipe buffer
+        /// so every write succeeded) is NOT reported as applied by either
+        /// runner, and the launch runner keeps the commit unknown. Falsifying
+        /// result with the delivery-only check (`StdinFeeder::finish`): both
+        /// runners return `Ok` and `commit_unknown` is cleared.
+        #[cfg(unix)]
+        #[test]
+        fn r9_writer_exiting_0_without_its_end_marker_is_not_applied() {
+            hold_test_migration_lock!();
+            let t = tempfile::Builder::new()
+                .prefix("cr-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let bin = r9_native_fixture(t.path(), "exit-early");
+            let db = t.path().join("early.sqlite");
+            let mut unknown = false;
+            let launch = codex_sqlite::run_repair_sqlite_bounded_tracking(
+                &bin,
+                &db,
+                "BEGIN IMMEDIATE;\nCOMMIT;",
+                false,
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                &mut unknown,
+            );
+            assert!(
+                matches!(&launch, Err(ShareError::SqliteCommandFailed { detail, .. }) if detail == codex_sqlite::WRITER_NOT_FULLY_EXECUTED_DETAIL),
+                "{launch:?}"
+            );
+            assert!(
+                unknown,
+                "an unexecuted script must leave the commit unknown"
+            );
+            let merge = codex_sqlite::run_sqlite3(&bin, &db, "BEGIN IMMEDIATE;\nCOMMIT;");
+            assert!(
+                matches!(&merge, Err(ShareError::SqliteCommandFailed { detail, .. }) if detail == codex_sqlite::WRITER_NOT_FULLY_EXECUTED_DETAIL),
+                "{merge:?}"
+            );
+        }
+
+        /// The end marker is accepted only as stdout's exact final line, and
+        /// is stripped from what the caller sees. Falsifying result with a
+        /// substring check: the lookalike and not-last cases are accepted.
+        #[test]
+        fn writer_end_marker_must_be_the_exact_final_line() {
+            let marker = codex_sqlite::writer_end_marker();
+            assert!(
+                marker.starts_with("csq-end-") && marker.len() == 24,
+                "{marker}"
+            );
+            assert_ne!(marker, codex_sqlite::writer_end_marker(), "fresh per run");
+            let strip = |out: &str| codex_sqlite::strip_writer_end_marker(out, &marker);
+            assert_eq!(strip(&format!("{marker}\n")), Some(String::new()));
+            assert_eq!(strip(&format!("a|b\n{marker}\n")), Some("a|b\n".to_owned()));
+            assert_eq!(
+                strip(&format!("x\r\n{marker}\r\n")),
+                Some("x\r\n".to_owned())
+            );
+            assert_eq!(strip(""), None);
+            assert_eq!(strip(&format!("{marker}\nlater\n")), None, "not last");
+            assert_eq!(strip(&format!("{marker}0\n")), None, "lookalike");
+            assert_eq!(strip(&format!("x{marker}\n")), None, "lookalike");
+        }
+
+        /// L1: the launch runner reports `RepairChild::spawn`'s own lock
+        /// refusals with their fixed details, not the generic spawn failure.
+        /// Falsifying result with the former blanket mapping: both details are
+        /// "rollout repair spawn failed".
+        #[cfg(unix)]
+        #[test]
+        fn r9_launch_runner_names_lock_descriptor_refusals() {
+            let t = tempfile::Builder::new()
+                .prefix("cr-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let bin = r9_native_fixture(t.path(), "argv-capture");
+            let db = t.path().join("refused.sqlite");
+            let run = || {
+                codex_sqlite::run_repair_sqlite_bounded(
+                    &bin,
+                    &db,
+                    "SELECT 1;",
+                    false,
+                    std::time::Instant::now() + std::time::Duration::from_secs(30),
+                )
+            };
+            let detail_of = |result: Result<String, ShareError>| match result {
+                Err(ShareError::SqliteCommandFailed { detail, .. }) => detail,
+                other => panic!("expected a refusal, got {other:?}"),
+            };
+            let stdio = crate::session::shared_state::ChildLockToken {
+                fd: 2,
+                identity: crate::session::shared_state::fd_identity(2),
+            };
+            let unusable =
+                detail_of(crate::session::shared_state::with_child_lock_token_for_test(stdio, run));
+            let lock_dir = tempfile::Builder::new()
+                .prefix("cr-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let lock = r9_test_lock(lock_dir.path());
+            let held = lock.hold_for_children();
+            let real = crate::session::shared_state::held_child_lock().expect("scope installed");
+            let (dev, ino) = real.identity.expect("identity recorded");
+            let wrong = crate::session::shared_state::ChildLockToken {
+                fd: real.fd,
+                identity: Some((dev, ino.wrapping_add(1))),
+            };
+            let mismatched =
+                detail_of(crate::session::shared_state::with_child_lock_token_for_test(wrong, run));
+            drop(held);
+            assert_eq!(unusable, codex_sqlite::UNUSABLE_LOCK_DETAIL);
+            assert_eq!(mismatched, codex_sqlite::LOCK_IDENTITY_MISMATCH_DETAIL);
+        }
+
+        /// Windows runtime check of the suspended-writer path (runs only on a
+        /// Windows host; csq's is the GitHub Windows CI leg). Step view: the
+        /// writer is in its kill-on-close job while still suspended and has
+        /// not run, then after resume it is still in the job and exits 0.
+        /// Full path: `RepairChild::spawn` of a Writer under a real held lock
+        /// yields a child in its job that runs and exits 0. Falsifying result
+        /// with an unconfined spawn: `IsProcessInJob` is false; with no
+        /// resume: the child never exits.
+        #[cfg(windows)]
+        #[test]
+        fn windows_writer_runs_only_inside_its_kill_on_close_job() {
+            let t = TempDir::new().unwrap();
+            let lock = crate::session::shared_state::acquire_codex_share_lock_shared_bounded(
+                t.path(),
+                50,
+                std::time::Duration::from_millis(20),
+            )
+            .expect("migration lock io")
+            .expect("migration lock admitted");
+            let _held = lock.hold_for_children();
+            let harmless = || {
+                let mut command = Command::new("cmd");
+                command
+                    .args(["/c", "exit", "0"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                command
+            };
+            let (mut child, job) = codex_sqlite::spawn_suspended_in_job(&mut harmless()).unwrap();
+            assert!(
+                job.contains(&child).unwrap(),
+                "suspended writer outside its job"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "a suspended writer ran"
+            );
+            codex_sqlite::resume_threads(&child).unwrap();
+            assert!(job.contains(&child).unwrap(), "resumed writer left its job");
+            assert!(
+                child.wait().unwrap().success(),
+                "resumed writer did not exit 0"
+            );
+
+            let mut writer =
+                codex_sqlite::RepairChild::spawn(&mut harmless(), codex_sqlite::ChildRole::Writer)
+                    .unwrap();
+            assert!(
+                writer.in_writer_job().unwrap(),
+                "spawned writer outside its job"
+            );
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !writer.exited().unwrap() {
+                assert!(std::time::Instant::now() < until, "writer never exited");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(writer.wait().unwrap().success(), "writer did not exit 0");
+        }
+
+        /// ESTALE maps to the lock-identity refusal only when the descriptor's
+        /// identity re-read in the parent has changed; an ESTALE with the lock
+        /// intact (a generic spawn/execve failure) or another errno is not
+        /// mapped, and the runner's detail mapping no longer keys on the
+        /// errno. Falsifying result with the former errno-only mapping: the
+        /// bare ESTALE maps to the identity detail.
+        #[cfg(unix)]
+        #[test]
+        fn lock_identity_refusal_maps_estale_only_from_the_identity_check() {
+            let recorded = Some((7 as libc::dev_t, 11 as libc::ino_t));
+            let other = Some((7 as libc::dev_t, 12 as libc::ino_t));
+            let estale = Some(codex_sqlite::LOCK_IDENTITY_MISMATCH_ERRNO);
+            let refusal = codex_sqlite::lock_identity_refusal;
+            assert!(refusal(estale, recorded, other));
+            assert!(refusal(estale, recorded, None));
+            assert!(!refusal(estale, recorded, recorded), "execve ESTALE");
+            assert!(!refusal(Some(libc::ENOENT), recorded, other));
+            assert!(!refusal(estale, None, other));
+            let bare =
+                std::io::Error::from_raw_os_error(codex_sqlite::LOCK_IDENTITY_MISMATCH_ERRNO);
+            assert_eq!(codex_sqlite::writer_spawn_refusal_detail(&bare), None);
+            let confirmed = std::io::Error::other(codex_sqlite::LOCK_IDENTITY_MISMATCH_DETAIL);
+            assert_eq!(
+                codex_sqlite::writer_spawn_refusal_detail(&confirmed),
+                Some(codex_sqlite::LOCK_IDENTITY_MISMATCH_DETAIL)
+            );
+        }
+
+        /// The Windows suspended-writer resume verdict: runnable only when at
+        /// least one thread was found and every one resumed from a suspend
+        /// count of exactly 1. Falsifying result with an `all`-only check: the
+        /// empty list (no thread found) is admitted.
+        #[test]
+        fn windows_resumed_writer_verdict_fails_closed() {
+            assert!(codex_sqlite::resumed_writer_may_run(&[1]));
+            assert!(codex_sqlite::resumed_writer_may_run(&[1, 1, 1]));
+            let refused = |counts: &[u32]| !codex_sqlite::resumed_writer_may_run(counts);
+            assert!(refused(&[]), "no thread found");
+            assert!(refused(&[1, u32::MAX]), "a failed resume");
+            assert!(refused(&[0]), "a thread that was not suspended");
+            assert!(refused(&[2]), "still suspended after resume");
+        }
+
+        /// Dropping a child after `wait()` reaped it reaches no waitid/kill
+        /// path; dropping an unreaped one does (the counter discriminates).
+        /// Falsifying result without the `reaped` flag: the post-reap drop is
+        /// counted.
+        #[cfg(unix)]
+        #[test]
+        fn r9_drop_after_wait_sends_no_signal() {
+            hold_test_migration_lock!();
+            let quick = || {
+                let mut command = std::process::Command::new("/bin/sh");
+                command
+                    .args(["-c", "exit 0"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                command
+            };
+            let mut child =
+                codex_sqlite::RepairChild::spawn(&mut quick(), codex_sqlite::ChildRole::Reader)
+                    .unwrap();
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !child.exited().unwrap() {
+                assert!(std::time::Instant::now() < until, "child never exited");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            child.wait().unwrap();
+            let before = codex_sqlite::drop_signal_paths();
+            drop(child);
+            let after_reaped = codex_sqlite::drop_signal_paths();
+            let unreaped =
+                codex_sqlite::RepairChild::spawn(&mut quick(), codex_sqlite::ChildRole::Reader)
+                    .unwrap();
+            drop(unreaped);
+            let after_unreaped = codex_sqlite::drop_signal_paths();
+            assert_eq!(
+                after_reaped, before,
+                "a reaped child's drop reached waitid/kill"
+            );
+            assert_eq!(
+                after_unreaped,
+                after_reaped + 1,
+                "the counter does not discriminate"
+            );
+        }
+
+        /// A `-safe` probe that did not complete (timeout, spawn failure:
+        /// `None`) is attempted at most once per process: it is recorded as
+        /// `Unknown` (never as a completed answer) and no later call probes
+        /// again. Falsifying result with the former retry-on-next-call cache:
+        /// the second call runs its probe (and panics). A completed answer is
+        /// cached as `Completed` and likewise never re-probed.
+        #[test]
+        fn r9_safe_flag_probe_timeout_is_attempted_once_and_never_completed() {
+            let cache = std::sync::OnceLock::new();
+            let first = codex_sqlite::supports_safe_flag_cached(&cache, || None);
+            let second = codex_sqlite::supports_safe_flag_cached(&cache, || -> Option<bool> {
+                unreachable!("a non-completed probe was retried in the same process")
+            });
+            assert_eq!((first, second), (false, false));
+            assert_eq!(cache.get(), Some(&codex_sqlite::SafeFlagProbe::Unknown));
+
+            let completed = std::sync::OnceLock::new();
+            let first = codex_sqlite::supports_safe_flag_cached(&completed, || Some(true));
+            let second = codex_sqlite::supports_safe_flag_cached(&completed, || -> Option<bool> {
+                unreachable!("a completed answer was re-probed")
+            });
+            assert_eq!((first, second), (true, true));
+            assert_eq!(
+                completed.get(),
+                Some(&codex_sqlite::SafeFlagProbe::Completed(true))
+            );
+        }
+
+        /// The merge runner's stdin delivery and wait are bounded: a child that
+        /// never reads stdin, fed a script larger than any pipe buffer, fails at
+        /// the deadline — and the child was SPAWNED (the runner's own record).
+        /// Falsifying result with the former blocking `write_all` +
+        /// `wait_with_output`: the call blocks until the hung child exits after
+        /// 10s, then fails with a write error. Group kill is NOT this row's
+        /// property: the leader is already reaped when the runner returns, and
+        /// this fixture never forks — `r9_platform_runner_kills_the_step_process_group`
+        /// covers it.
+        #[cfg(unix)]
+        #[test]
+        fn r9_merge_runner_stdin_write_is_bounded() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            const ATTEMPTS: usize = 3;
+            let script = "SELECT 1;".repeat(120_000);
+            let mut exercised = false;
+            for attempt in 1..=ATTEMPTS {
+                let t = tempfile::Builder::new()
+                    .prefix("cr-")
+                    .tempdir_in("/tmp")
+                    .unwrap();
+                let lock = r9_test_lock(t.path());
+                let _held = lock.hold_for_children();
+                let bin = r9_native_fixture(t.path(), "hung-late-start");
+                let started = std::time::Instant::now();
+                let result = codex_sqlite::run_sqlite3_with_deadline(
+                    &bin,
+                    &t.path().join("private.sqlite"),
+                    &script,
+                    false,
+                    started + std::time::Duration::from_secs(1),
+                );
+                let elapsed = started.elapsed();
+                assert!(
+                    matches!(&result, Err(ShareError::SqliteCommandFailed { detail, .. })
+                        if detail == codex_sqlite::MERGE_SQLITE_DEADLINE_DETAIL),
+                    "{result:?}"
+                );
+                assert!(
+                    elapsed < std::time::Duration::from_secs(5),
+                    "merge runner was not bounded: {elapsed:?}"
+                );
+                // The pid comes from the RUNNER's own spawn record, never from
+                // a file the child writes: `hung-late-start` sleeps before
+                // writing `owned-pid`, so under the 1s deadline that file can
+                // never exist — the exact CI shape, deterministic. The row
+                // needs a SPAWNED child; it never signals the leader (the
+                // runner has already reaped it, so a live pid there would be
+                // someone else's).
+                let Some(_pid) = codex_sqlite::take_last_spawned_pid() else {
+                    eprintln!(
+                        "r9_merge_runner_stdin_write_is_bounded attempt \
+                         {attempt}/{ATTEMPTS} did NOT exercise the bounded stdin \
+                         write of a SPAWNED child: pre-spawn deadline (the runner \
+                         refused before spawning, at the check after the 1.08 MB \
+                         statement split; no child existed)"
+                    );
+                    continue;
+                };
+                exercised = true;
+                break;
+            }
+            assert!(
+                exercised,
+                "spawned bounded-stdin-write property NOT EXERCISED in {ATTEMPTS} attempts"
+            );
+        }
+
+        /// The fixture helper waits for the child's completion, not a deadline: a
+        /// sqlite3 that starts 11s late (past the former 10s guard) still returns
+        /// its output.
+        #[cfg(unix)]
+        #[test]
+        fn r9_fixture_sql_waits_for_the_child_not_a_deadline() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let f = PagedRepairFixture::new();
+            let wrapper = r9_native_fixture(&f.base, "delayed");
+            fs::write(
+                f.base.join("fixture-exec"),
+                format!("11000\n{}", f.binary.display()),
+            )
+            .unwrap();
+            assert_eq!(
+                r9_fixture_sql(&wrapper, &f.db, "SELECT count(*) FROM threads;").trim(),
+                "0"
+            );
+        }
+
+        /// A child that never exits reds with the fixture's name inside the hang
+        /// guard instead of hanging. Falsifying result with an unbounded
+        /// `wait_with_output`: the child sleeps 30s, the call returns "0" after
+        /// that wait and the test fails with "did not panic".
+        #[cfg(unix)]
+        #[test]
+        #[should_panic(expected = "private sqlite fixture exceeded hang guard")]
+        fn r9_fixture_sql_hang_guard_names_the_fixture() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let f = PagedRepairFixture::new();
+            let wrapper = r9_native_fixture(&f.base, "delayed");
+            fs::write(
+                f.base.join("fixture-exec"),
+                format!("30000\n{}", f.binary.display()),
+            )
+            .unwrap();
+            r9_fixture_sql_guarded(
+                &wrapper,
+                &f.db,
+                "SELECT count(*) FROM threads;",
+                std::time::Duration::from_secs(1),
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn r9p_write_outcome_separates_pre_spawn_rollback_and_unknown() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let f = PagedRepairFixture::new();
+            r9p_assert_pre_spawn_refusal_and_known_rollback(&f.binary, &f.db);
+            // The native child really commits with SQLite in its own PID, then
+            // withholds acknowledgement. Ordering, not elapsed time: the runner
+            // gets a hang-guard deadline, this thread waits for the child's
+            // "committed" marker (written after the COMMIT returned) and only
+            // then kills the child by the PID it recorded.
+            let wrapper = r9_native_fixture(&f.base, "commit");
+            let marker = f.base.join("committed");
+            let pid_file = f.base.join("commit.pid");
+            let runner = {
+                let db = f.db.clone();
+                let base = f.base.clone();
+                std::thread::spawn(move || {
+                    let lock = r9_test_lock(&base);
+                    let _held = lock.hold_for_children();
+                    let mut unknown = true;
+                    let result = codex_sqlite::run_repair_sqlite_bounded_tracking(&wrapper,&db,
+                        "BEGIN IMMEDIATE;INSERT INTO threads VALUES('committed','/missing/absent.jsonl');COMMIT;",
+                        false,std::time::Instant::now()+R9_RUNNER_HANG_GUARD,&mut unknown);
+                    (result.is_err(), unknown)
+                })
+            };
+            let guard = std::time::Instant::now() + R9_RUNNER_HANG_GUARD
+                - std::time::Duration::from_secs(10);
+            while !marker.exists() {
+                assert!(
+                    std::time::Instant::now() < guard && !runner.is_finished(),
+                    "native fixture never reported its COMMIT"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let pid: libc::pid_t = fs::read_to_string(&pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            // SAFETY: the PID was written by our own owned fixture child, which is
+            // still sleeping inside the runner's wait loop (it has not been reaped).
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+            let (failed, unknown) = runner.join().unwrap();
+            assert!(failed, "an unacknowledged killed child is a runner error");
+            assert!(unknown, "post-spawn unacknowledged commit remains unknown");
+            assert_eq!(
+                fs::read_to_string(f.base.join("committed")).unwrap(),
+                "committed\n"
+            );
+            assert_eq!(
+                f.sql(&f.db, "SELECT count(*) FROM threads WHERE id='committed';")
+                    .trim(),
+                "1"
+            );
+        }
+
+        #[test]
+        fn r9_exact_target_rewrite_guards_row_race() {
+            hold_test_migration_lock!();
+            r9_exact_target_rewrite_race_voids_the_update("row");
+        }
+        #[test]
+        fn r9_exact_target_rewrite_guards_schema_race() {
+            hold_test_migration_lock!();
+            r9_exact_target_rewrite_race_voids_the_update("schema");
+        }
+        #[test]
+        fn r9_exact_target_rewrite_guards_duplicate_id_race() {
+            hold_test_migration_lock!();
+            r9_exact_target_rewrite_race_voids_the_update("duplicate");
+        }
+
+        /// A canonical exact target row is admitted by the READS alone: no
+        /// write transaction, and exactly one fewer sqlite3 child than the same
+        /// admission with a rewrite planned (the write leg is the difference,
+        /// so this is a spawn-count compare, not an assumption about which
+        /// scripts were recorded).
+        ///
+        /// Falsifying result pre-fix: the canonical admission spends a
+        /// guard-only `BEGIN IMMEDIATE` batch, so the write-transaction scan
+        /// finds one and the spawn counts are equal.
+        #[cfg(unix)]
+        #[test]
+        fn r9p_canonical_exact_target_spends_no_write_transaction() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let bin = codex_sqlite::resolve_sqlite3().expect("actual sqlite3 required");
+            // Keep fixture paths portable even when the caller inherits a deep TMPDIR.
+            let temp = tempfile::Builder::new()
+                .prefix("cp-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let base = temp.path().canonicalize().unwrap();
+            let root = base.join("codex-sessions");
+            fs::create_dir(&root).unwrap();
+            let rollout = root.join("rollout.jsonl");
+            fs::write(&rollout, b"private canonical transcript").unwrap();
+            let db = base.join("state_5.sqlite");
+            r9_fixture_sql(&bin, &db, &format!("CREATE TABLE threads(id TEXT, rollout_path TEXT); INSERT INTO threads VALUES('target','{}');", rollout.to_str().unwrap().replace('\'', "''")));
+
+            codex_sqlite::take_recorded_scripts();
+            let canonical = codex_sqlite::repair_resume_target_before(
+                &r9_test_lock(&base),
+                &base,
+                &db,
+                std::slice::from_ref(&root),
+                "target",
+                std::time::Instant::now() + std::time::Duration::from_secs(4),
+            );
+            assert!(
+                matches!(canonical, Ok(1)),
+                "a canonical target must be admitted (Ok(1), never Ok(0)): {canonical:?}"
+            );
+            let canonical_scripts = codex_sqlite::take_recorded_scripts();
+            assert!(
+                canonical_scripts
+                    .iter()
+                    .all(|script| !script.contains("BEGIN IMMEDIATE")),
+                "the canonical admission spent a write transaction: {canonical_scripts:?}"
+            );
+
+            // The identical admission with a rewrite planned still spends
+            // exactly one guarded write transaction, so the leg difference is
+            // the write leg itself and the recording is not simply silent.
+            let dead = base.join("missing/rollout.jsonl");
+            r9_fixture_sql(
+                &bin,
+                &db,
+                &format!(
+                    "UPDATE threads SET rollout_path='{}' WHERE id='target';",
+                    dead.to_str().unwrap().replace('\'', "''")
+                ),
+            );
+            codex_sqlite::take_recorded_scripts();
+            let rewrite = codex_sqlite::repair_resume_target_before(
+                &r9_test_lock(&base),
+                &base,
+                &db,
+                std::slice::from_ref(&root),
+                "target",
+                std::time::Instant::now() + std::time::Duration::from_secs(4),
+            );
+            assert!(matches!(rewrite, Ok(1)), "{rewrite:?}");
+            let rewrite_scripts = codex_sqlite::take_recorded_scripts();
+            assert_eq!(
+                rewrite_scripts
+                    .iter()
+                    .filter(|script| script.contains("BEGIN IMMEDIATE"))
+                    .count(),
+                1,
+                "the rewrite path must still spend exactly one guarded write transaction"
+            );
+            assert_eq!(
+                r9_fixture_sql(
+                    &bin,
+                    &db,
+                    "SELECT rollout_path FROM threads WHERE id='target';"
+                )
+                .trim(),
+                rollout.to_str().unwrap()
+            );
+            assert_eq!(
+                canonical_scripts.len() + 1,
+                rewrite_scripts.len(),
+                "spawn count: canonical must spend exactly the write leg less: {canonical_scripts:?} vs {rewrite_scripts:?}"
+            );
+        }
+
+        fn split_ok(script: &str) -> Vec<String> {
+            codex_sqlite::split_sql_statements(script).unwrap()
+        }
+
+        #[test]
+        fn repair_runner_splits_statements_outside_quotes_only() {
+            hold_test_migration_lock!();
+            let parts = split_ok(
+                "PRAGMA a;\nUPDATE t SET p = 'x;''y\n;z--w' WHERE id = \"a;b\";\n\nCOMMIT;\n",
+            );
+            assert_eq!(
+                parts,
+                vec![
+                    "PRAGMA a;".to_owned(),
+                    "\nUPDATE t SET p = 'x;''y\n;z--w' WHERE id = \"a;b\";".to_owned(),
+                    "\n\nCOMMIT;".to_owned(),
+                ]
+            );
+            // backtick and bracket quoting, `;;`, and trailing text without `;`.
+            assert_eq!(
+                split_ok("SELECT `a;b`;;SELECT [c;d] FROM t;SELECT 1"),
+                vec![
+                    "SELECT `a;b`;".to_owned(),
+                    "SELECT [c;d] FROM t;".to_owned(),
+                    "SELECT 1".to_owned()
+                ]
+            );
+        }
+
+        #[test]
+        fn repair_runner_splitter_refuses_what_it_cannot_split_safely() {
+            hold_test_migration_lock!();
+            for (script, why) in [
+                ("SELECT 1; -- don't\nSELECT 2;", "line comment"),
+                ("SELECT 1 /* x; */;", "block comment"),
+                ("SELECT 'open;", "unterminated quote"),
+                ("SELECT \"open;", "unterminated double quote"),
+                ("SELECT `open;", "unterminated backtick"),
+                ("SELECT [open;", "unterminated bracket"),
+                ("SELECT 1;\n.print X\n", "dot command after statement"),
+                ("SELECT 1;\n  .shell id", "indented dot command"),
+                (".system id;", "leading dot command"),
+                ("SELECT 1\ngo\n.shell id;", "go terminator line"),
+                ("SELECT 1\nGO\n.shell id;", "GO terminator line"),
+                ("SELECT 1\n/\n.shell id;", "slash terminator line"),
+                ("SELECT 1;\n  /  \n", "indented slash terminator"),
+                (
+                    "SELECT 1;\n# it's a comment\nSELECT 2;",
+                    "hash comment line",
+                ),
+                ("SELECT 1;\ngo", "trailing go line"),
+                ("SELECT 1;#x\n.shell id;", "hash after a semicolon on the same line"),
+                ("SELECT 1;go\n.shell id;", "go after a semicolon on the same line"),
+                ("SELECT 1; /\n.shell id;", "slash after a semicolon on the same line"),
+                ("EXPLAIN CREATE TRIGGER t AFTER UPDATE ON x BEGIN DELETE FROM x; END;", "explain trigger"),
+                ("explain  query\tplan CREATE TEMP TRIGGER t AFTER UPDATE ON x BEGIN DELETE FROM x; END;", "explain query plan trigger"),
+                (
+                    "CREATE TRIGGER t AFTER UPDATE ON x BEGIN DELETE FROM x; END;",
+                    "trigger body",
+                ),
+                (
+                    "create  temp  trigger t AFTER UPDATE ON x BEGIN DELETE FROM x; END;",
+                    "temp trigger body",
+                ),
+                (
+                    "SELECT 1;\nCREATE TEMPORARY TRIGGER t AFTER UPDATE ON x BEGIN SELECT 1; END;",
+                    "temporary trigger later piece",
+                ),
+            ] {
+                assert!(
+                    codex_sqlite::split_sql_statements(script).is_err(),
+                    "must refuse {why}: {script:?}"
+                );
+            }
+        }
+
+        /// A sqlite3 that ignores `-bail` is refused before ANY write, on both
+        /// runner shapes, and nothing is written. Falsifying result without the
+        /// probe: the CREATE TABLE lands in the database file.
+        #[cfg(unix)]
+        #[test]
+        fn a_sqlite3_that_does_not_stop_at_the_first_error_is_refused_before_any_write() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let real = codex_sqlite::resolve_sqlite3().expect("real sqlite3 required");
+            let t = tempfile::Builder::new()
+                .prefix("cr-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let stub = r9_native_fixture(t.path(), "continue");
+            fs::write(t.path().join("real-sqlite3"), real.to_str().unwrap()).unwrap();
+            let script = "BEGIN IMMEDIATE;CREATE TABLE written(a);COMMIT;";
+            let db = t.path().join("argv.sqlite");
+            let mut unknown = true;
+            let argv = codex_sqlite::run_repair_sqlite_bounded_tracking(
+                &stub,
+                &db,
+                script,
+                false,
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                &mut unknown,
+            );
+            assert!(
+                matches!(&argv, Err(ShareError::SqliteCommandFailed { detail, .. }) if detail.contains("does not stop at the first error")),
+                "{argv:?}"
+            );
+            assert!(!unknown, "a pre-spawn refusal is a known non-commit");
+            assert!(
+                !db.exists(),
+                "the launch runner wrote through a continuing sqlite3"
+            );
+            let db = t.path().join("stdin.sqlite");
+            let stdin = codex_sqlite::run_sqlite3(&stub, &db, script);
+            assert!(
+                matches!(&stdin, Err(ShareError::SqliteCommandFailed { detail, .. }) if detail.contains("does not stop at the first error")),
+                "{stdin:?}"
+            );
+            assert!(
+                !db.exists(),
+                "the stdin runner wrote through a continuing sqlite3"
+            );
+        }
+
+        /// Only the named guard may appear on stderr for a run to count as a
+        /// known rollback; a failed BEGIN or any other error line means a write
+        /// may have landed.
+        #[test]
+        fn only_named_guard_failure_rejects_any_other_error_line() {
+            hold_test_migration_lock!();
+            let guard = "Runtime error near line 5: CHECK constraint failed: csq_paged_rows (19)";
+            assert!(codex_sqlite::only_named_guard_failure(
+                guard,
+                "csq_paged_",
+                false
+            ));
+            let nothing = "";
+            assert!(!codex_sqlite::only_named_guard_failure(
+                nothing,
+                "csq_paged_",
+                false
+            ));
+            let begin_failed = "Runtime error near line 2: database is locked (5)";
+            assert!(!codex_sqlite::only_named_guard_failure(
+                begin_failed,
+                "csq_paged_",
+                false
+            ));
+            let mixed = format!("{begin_failed}\n{guard}");
+            assert!(!codex_sqlite::only_named_guard_failure(
+                &mixed,
+                "csq_paged_",
+                false
+            ));
+            let write_error = format!("{guard}\nRuntime error near line 9: UNIQUE constraint failed: threads.rollout_path (19)");
+            assert!(!codex_sqlite::only_named_guard_failure(
+                &write_error,
+                "csq_paged_",
+                false
+            ));
+            let other_prefix = "Runtime error: CHECK constraint failed: csq_other (19)";
+            assert!(!codex_sqlite::only_named_guard_failure(
+                other_prefix,
+                "csq_paged_",
+                false
+            ));
+            let rolled_back = "Runtime error near line 5: CHECK constraint failed: csq_merge_fk_guard_must_be_zero (19)\nRuntime error near line 6: cannot commit - no transaction is active";
+            assert!(codex_sqlite::only_named_guard_failure(
+                rolled_back,
+                "csq_merge_",
+                true
+            ));
+            assert!(!codex_sqlite::only_named_guard_failure(
+                rolled_back,
+                "csq_merge_",
+                false
+            ));
+        }
+
+        /// The merge's pre-commit verdict needs the guard to be the only error.
+        #[test]
+        fn merge_pre_commit_verdict_requires_a_guard_only_stderr() {
+            hold_test_migration_lock!();
+            let fk = || ShareError::SqliteForeignKeyViolation {
+                basename: "state_5.sqlite".to_owned(),
+                path: PathBuf::from("/x"),
+                detail: String::new(),
+            };
+            let guard = "exit Some(1): Runtime error near line 9: CHECK constraint failed: csq_merge_fk_guard_must_be_zero (19)".to_owned();
+            assert!(codex_sqlite::merge_failure_is_pre_commit(
+                &Some(guard.clone()),
+                &fk()
+            ));
+            let begin_failed =
+                format!("exit Some(1): Runtime error near line 2: database is locked (5)\n{guard}");
+            assert!(!codex_sqlite::merge_failure_is_pre_commit(
+                &Some(begin_failed),
+                &fk()
+            ));
+            assert!(!codex_sqlite::merge_failure_is_pre_commit(&None, &fk()));
+            let other = ShareError::SqliteUnsafeAttachPath {
+                path: PathBuf::from("/x"),
+            };
+            assert!(!codex_sqlite::merge_failure_is_pre_commit(
+                &Some(guard),
+                &other
+            ));
+        }
+
+        /// A non-guard statement failure on a shell that keeps going part-commits
+        /// the batch (the hazard the bail probe prevents); the classification must
+        /// stay UNKNOWN, never a known rollback.
+        #[cfg(unix)]
+        #[test]
+        fn r9p_a_non_guard_write_error_is_classed_commit_unknown() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let f = PagedRepairFixture::new();
+            f.candidate("same.jsonl");
+            f.sql(
+                &f.db,
+                "CREATE UNIQUE INDEX u ON threads(rollout_path);INSERT INTO threads VALUES('a','/missing/x/same.jsonl');INSERT INTO threads VALUES('b','/missing/y/same.jsonl');",
+            );
+            let result =
+                codex_sqlite::with_continue_past_errors(|| f.run(std::slice::from_ref(&f.db)));
+            assert!(
+                matches!(&result, codex_sqlite::PagedResumeOutcome::Partial{progress,..} if progress.in_flight_commit_unknown && progress.visited == 0),
+                "a UNIQUE failure is not a known rollback: {result:?}"
+            );
+        }
+
+        /// Lines that merely look like the refused shapes inside a literal or
+        /// as part of a longer token are not refused.
+        #[test]
+        fn repair_runner_splitter_admits_lookalikes() {
+            hold_test_migration_lock!();
+            for script in [
+                "SELECT 'go\n/\n#x';",
+                "SELECT 1 AS gold;\nSELECT 2;",
+                "CREATE TABLE trigger_log(a);\nCREATE TEMP TABLE t(a);",
+            ] {
+                assert!(
+                    codex_sqlite::split_sql_statements(script).is_ok(),
+                    "must admit {script:?}"
+                );
+            }
+        }
+
+        /// A guard condition that yields NULL must NOT satisfy the guard (a bare
+        /// `CHECK (ok = 1)` passes NULL). Falsifying result without `IS 1`: the
+        /// INSERT succeeds and the process exits 0.
+        #[test]
+        fn named_guard_refuses_a_null_condition() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let Some(bin) = require_sqlite3() else {
+                return;
+            };
+            let t = TempDir::new().unwrap();
+            let run = |condition: &str| {
+                std::process::Command::new(&bin)
+                    .env_clear()
+                    .args([
+                        "-init",
+                        if cfg!(windows) { "NUL" } else { "/dev/null" },
+                        "-batch",
+                        "-bail",
+                    ])
+                    .arg(t.path().join(format!("g{}.sqlite", condition.len())))
+                    .arg(codex_sqlite::named_guard_sql("csq_null_probe", condition))
+                    .output()
+                    .unwrap()
+            };
+            let null = run("NULL");
+            assert!(!null.status.success(), "NULL satisfied the guard: {null:?}");
+            assert!(
+                String::from_utf8_lossy(&null.stderr)
+                    .contains("CHECK constraint failed: csq_null_probe"),
+                "{null:?}"
+            );
+            assert!(run("1 = 1").status.success());
+            assert!(!run("1 = 0").status.success());
+        }
+
+        /// Every generated write carries the gate. Returns (write count,
+        /// writes without it). Guard and gate INSERTs target `csq_*` / `fk_guard`
+        /// temp tables and are not writes to the database under repair.
+        fn write_gate_audit(scripts: &[String]) -> (usize, Vec<String>) {
+            let mut writes = 0;
+            let mut ungated = Vec::new();
+            for script in scripts {
+                for piece in codex_sqlite::split_sql_statements(script)
+                    .expect("a generated script must split")
+                {
+                    let piece = piece.trim();
+                    let upper = piece.to_ascii_uppercase();
+                    if !["UPDATE ", "DELETE ", "REPLACE ", "INSERT "]
+                        .iter()
+                        .any(|verb| upper.starts_with(verb))
+                    {
+                        continue;
+                    }
+                    if upper.starts_with("INSERT") {
+                        let target = piece
+                            .split_whitespace()
+                            .skip_while(|word| !word.eq_ignore_ascii_case("INTO"))
+                            .nth(1)
+                            .unwrap_or("");
+                        if target.starts_with("csq_") || target == "fk_guard" {
+                            continue;
+                        }
+                    }
+                    writes += 1;
+                    if !(piece.contains("EXISTS (SELECT 1 FROM temp.")
+                        && piece.contains("WHERE ok IS 1)"))
+                    {
+                        ungated.push(piece.to_owned());
+                    }
+                }
+            }
+            (writes, ungated)
+        }
+
+        /// The real paged-resume generator gates every UPDATE. Platform
+        /// independent: the audit reads the generated text, so it reds on Linux
+        /// as well as Apple sqlite3. Falsifying result: removing `AND {gate}`
+        /// from `paged_row_sql` leaves `ungated` non-empty.
+        #[cfg(unix)]
+        #[test]
+        fn r9p_generated_paged_script_gates_every_write() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let f = PagedRepairFixture::new();
+            for i in 1..=3 {
+                f.candidate(&format!("w{i}.jsonl"));
+                f.sql(
+                    &f.db,
+                    &format!("INSERT INTO threads VALUES('w{i}','/missing/w{i}.jsonl');"),
+                );
+            }
+            f.sql(
+                &f.db,
+                "INSERT INTO threads VALUES('keep','/missing/none.jsonl');",
+            );
+            codex_sqlite::take_recorded_scripts();
+            let result = f.run(std::slice::from_ref(&f.db));
+            assert!(
+                matches!(&result, codex_sqlite::PagedResumeOutcome::Complete(p) if p.rewritten == 3),
+                "{result:?}"
+            );
+            let scripts = codex_sqlite::take_recorded_scripts();
+            assert_one_statement_per_line(&scripts);
+            let (writes, ungated) = write_gate_audit(&scripts);
+            assert_eq!(writes, 3, "the audit must see the three UPDATEs");
+            assert!(ungated.is_empty(), "ungated writes: {ungated:?}");
+        }
+
+        /// Same audit for the rollout-path repair script.
+        #[cfg(unix)]
+        #[test]
+        fn r9_generated_rollout_script_gates_every_write() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let bin = codex_sqlite::resolve_sqlite3().expect("real sqlite3 required");
+            let t = TempDir::new().unwrap();
+            let base = t.path().canonicalize().unwrap();
+            let root = base.join("persistent");
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("rollout.jsonl"), b"valid").unwrap();
+            let db = base.join("state_5.sqlite");
+            let dead = base.join("term-123/sessions/rollout.jsonl");
+            r9_fixture_sql(&bin, &db, &format!(
+                "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT); INSERT INTO threads VALUES('t1','{}');", dead.display()));
+            codex_sqlite::take_recorded_scripts();
+            assert_eq!(r9_repair_paths(&base, &db, &[root]).unwrap(), 1);
+            let scripts = codex_sqlite::take_recorded_scripts();
+            assert_one_statement_per_line(&scripts);
+            let (writes, ungated) = write_gate_audit(&scripts);
+            assert!(writes >= 1, "the audit must see the rollout UPDATE");
+            assert!(ungated.is_empty(), "ungated writes: {ungated:?}");
+        }
+
+        /// Same audit for the destination-guarded merge script.
+        #[test]
+        fn generated_merge_script_gates_every_write() {
+            let Some(bin) = require_sqlite3() else {
+                return;
+            };
+            let t = TempDir::new().unwrap();
+            let base = t.path();
+            let home11 = slot_home(base, Surface::Codex, slot_num(11)).unwrap();
+            create_codex_state_db(
+                &bin,
+                &home11.join("state_5.sqlite"),
+                &[ThreadRow {
+                    id: "t1",
+                    name: "orig",
+                    updated_at_ms: 1,
+                }],
+                1,
+            );
+            codex_sqlite::share_codex_sqlite(base, false, true).unwrap();
+            let home14 = slot_home(base, Surface::Codex, slot_num(14)).unwrap();
+            create_codex_state_db(
+                &bin,
+                &home14.join("state_5.sqlite"),
+                &[ThreadRow {
+                    id: "t2",
+                    name: "new",
+                    updated_at_ms: 2,
+                }],
+                1,
+            );
+            codex_sqlite::take_recorded_scripts();
+            codex_sqlite::share_codex_sqlite(base, false, true).unwrap();
+            let scripts = codex_sqlite::take_recorded_scripts();
+            assert!(
+                scripts
+                    .iter()
+                    .any(|script| script.contains("csq_merge_write_gate")),
+                "the second share must run the destination-guarded merge"
+            );
+            assert_one_statement_per_line(&scripts);
+            let (writes, ungated) = write_gate_audit(&scripts);
+            assert!(writes >= 1, "the audit must see merge writes");
+            assert!(ungated.is_empty(), "ungated writes: {ungated:?}");
+        }
+
+        /// The production generators end every statement at the end of its line
+        /// (a statement may span lines, two never share one), so each lands on
+        /// its own stdin line: the piece count equals the number of lines that
+        /// end in `;`.
+        fn assert_one_statement_per_line(scripts: &[String]) {
+            assert!(!scripts.is_empty(), "no script was recorded");
+            for script in scripts {
+                let pieces = split_ok(script);
+                let terminated = script
+                    .lines()
+                    .filter(|l| l.trim_end().ends_with(';'))
+                    .count();
+                assert_eq!(
+                    pieces.len(),
+                    terminated,
+                    "pieces != terminated lines in {script:?}"
+                );
+            }
+        }
+
+        /// The real paged batch builder: header, row-guard table, one guard per
+        /// row, two gate statements, one UPDATE per rewritten row, COMMIT.
+        #[test]
+        fn repair_runner_argv_count_matches_generated_statements() {
+            hold_test_migration_lock!();
+            let header = "BEGIN IMMEDIATE;\n".to_owned();
+            let mut batch = codex_sqlite::PagedBatch::new(&header);
+            let rows: Vec<_> = (0..4)
+                .map(|i| codex_sqlite::PagedResumeRow::for_test(i, i % 2 == 0))
+                .collect();
+            for row in &rows {
+                let (guard, update) = codex_sqlite::paged_row_sql(row);
+                batch.push(&guard, update.as_deref());
+            }
+            let script = batch.script();
+            assert_eq!(split_ok(&script).len(), 1 + 1 + 4 + 2 + 2 + 1, "{script}");
+            assert_one_statement_per_line(&[script]);
+        }
+
+        /// A runner that does not stop after a failed guard must still write
+        /// nothing: the write predicate carries the gate. Falsifying result:
+        /// the id changes to 'x' (gate removed, Apple sqlite3 3.54.0).
+        #[cfg(unix)]
+        #[test]
+        fn gated_write_is_a_noop_after_a_failed_guard_in_one_argument() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let bin = codex_sqlite::resolve_sqlite3().expect("fixture requires real sqlite3");
+            let t = TempDir::new().unwrap();
+            let db = t.path().canonicalize().unwrap().join("gate.sqlite");
+            r9_fixture_sql(
+                &bin,
+                &db,
+                "CREATE TABLE threads(id TEXT PRIMARY KEY); INSERT INTO threads VALUES('t1');",
+            );
+            let script = format!(
+                "BEGIN IMMEDIATE;\n{}UPDATE threads SET id = 'x' WHERE {};\nCOMMIT;\n",
+                codex_sqlite::named_guard_sql("csq_gate_probe", "0 = 1"),
+                codex_sqlite::gate_exists(&["csq_gate_probe"]),
+            );
+            let out = std::process::Command::new(&bin)
+                .env_clear()
+                .args([
+                    "-init",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                    "-batch",
+                    "-bail",
+                ])
+                .arg(&db)
+                .arg(&script)
+                .output()
+                .unwrap();
+            assert!(!out.status.success(), "guard must fail: {out:?}");
+            assert_eq!(
+                r9_fixture_sql(&bin, &db, "SELECT id FROM threads;").trim(),
+                "t1"
+            );
+        }
+
+        /// Two statements on one line: Apple sqlite3 3.54.0 keeps executing the
+        /// rest of the line after a failed CHECK, so the stdin runner puts every
+        /// statement on its own line. Falsifying result: count 0 (DELETE ran).
+        #[test]
+        fn stdin_runner_failed_guard_with_two_statements_on_one_line_runs_nothing_after() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let bin = codex_sqlite::resolve_sqlite3().expect("fixture requires real sqlite3");
+            let t = TempDir::new().unwrap();
+            let db = t.path().canonicalize().unwrap().join("line.sqlite");
+            r9_fixture_sql(
+                &bin,
+                &db,
+                "CREATE TABLE threads(id TEXT PRIMARY KEY); INSERT INTO threads VALUES('t1');",
+            );
+            let result = codex_sqlite::run_sqlite3(
+                &bin,
+                &db,
+                "BEGIN IMMEDIATE; CREATE TEMP TABLE g(ok INTEGER CONSTRAINT g CHECK (ok = 1)); \
+                 INSERT INTO g SELECT (0); DELETE FROM threads; COMMIT;",
+            );
+            assert!(
+                matches!(&result, Err(ShareError::SqliteCommandFailed { detail, .. }) if detail.contains("CHECK constraint failed: g")),
+                "guard must fail: {result:?}"
+            );
+            assert_eq!(
+                r9_fixture_sql(&bin, &db, "SELECT count(*) FROM threads;").trim(),
+                "1"
+            );
+        }
+
+        #[test]
+        fn runners_refuse_a_dot_command_before_spawning() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let bin = codex_sqlite::resolve_sqlite3().expect("fixture requires real sqlite3");
+            let t = TempDir::new().unwrap();
+            let base = t.path().canonicalize().unwrap();
+            let db = base.join("dot.sqlite");
+            let marker = base.join("shell-ran");
+            let script = format!("SELECT 1;\n.shell touch {}\n", marker.display());
+            let stdin_result = codex_sqlite::run_sqlite3(&bin, &db, &script);
+            assert!(
+                matches!(&stdin_result, Err(ShareError::SqliteCommandFailed { detail, .. }) if detail.contains("dot-command")),
+                "{stdin_result:?}"
+            );
+            let argv_result = codex_sqlite::run_repair_sqlite_bounded(
+                &bin,
+                &db,
+                &script,
+                false,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            );
+            assert!(
+                matches!(&argv_result, Err(ShareError::SqliteCommandFailed { detail, .. }) if detail.contains("dot-command")),
+                "{argv_result:?}"
+            );
+            assert!(!marker.exists(), "no dot-command may have run");
+            assert!(
+                !db.exists(),
+                "refused before spawn: sqlite3 never opened the db"
+            );
+        }
+
+        /// A failed named guard MUST stop every later statement of the same
+        /// script. On macOS sqlite3 3.54.0 `-bail` does not stop inside one
+        /// multi-statement line, so the runner sends one stdin line per
+        /// statement. Falsifying result: the row count is 0 (DELETE ran).
+        #[test]
+        fn repair_runner_failed_guard_runs_no_later_statement() {
+            hold_test_migration_lock!();
+            let _env = crate::platform::test_env::lock();
+            let bin = codex_sqlite::resolve_sqlite3().expect("fixture requires real sqlite3");
+            let t = TempDir::new().unwrap();
+            let db = t.path().canonicalize().unwrap().join("g.sqlite");
+            r9_fixture_sql(
+                &bin,
+                &db,
+                "CREATE TABLE threads(id TEXT PRIMARY KEY); INSERT INTO threads VALUES('t1');",
+            );
+            let result = codex_sqlite::run_repair_sqlite_bounded(
+                &bin,
+                &db,
+                "BEGIN IMMEDIATE;\nCREATE TEMP TABLE g(ok INTEGER CONSTRAINT g CHECK (ok = 1));\n\
+                 INSERT INTO g SELECT (0);\nDELETE FROM threads;\nCOMMIT;\n",
+                false,
+                std::time::Instant::now() + std::time::Duration::from_secs(10),
+            );
+            assert!(
+                matches!(&result, Err(ShareError::SqliteCommandFailed { detail, .. }) if detail.contains("CHECK constraint failed: g")),
+                "guard must fail: {result:?}"
+            );
+            assert_eq!(
+                r9_fixture_sql(&bin, &db, "SELECT count(*) FROM threads;").trim(),
+                "1"
+            );
+        }
+
+        fn r9_schema_fixture(object: &str, race: bool) {
+            let _env = crate::platform::test_env::lock();
+            let bin = codex_sqlite::resolve_sqlite3().expect("R9 fixture requires real sqlite3");
+            let t = TempDir::new().unwrap();
+            let base = t.path().canonicalize().unwrap();
+            let root = base.join("codex-sessions");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("rollout.jsonl"), b"private transcript").unwrap();
+            let dead = base.join("term-2776/sessions/rollout.jsonl");
+            let db = base.join("state_5.sqlite");
+            r9_fixture_sql(
+                &bin,
+                &db,
+                &format!(
+                    "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT); \
+                 INSERT INTO threads VALUES('t1','{}');",
+                    dead.display()
+                ),
+            );
+            let before = fs::read(&db).unwrap();
+            let sql = match object {
+                "view" => "CREATE VIEW planted AS SELECT * FROM threads;",
+                "spoofed" => "CREATE TRIGGER threads_recency_at_after_insert AFTER UPDATE ON threads BEGIN DELETE FROM threads; END;",
+                _ => "CREATE TRIGGER planted AFTER UPDATE ON threads BEGIN DELETE FROM threads; END;",
+            };
+            let before = if race {
+                let bin = bin.clone();
+                let db = db.clone();
+                let sql = sql.to_owned();
+                codex_sqlite::set_test_repair_before_write(move || {
+                    r9_fixture_sql(&bin, &db, &sql);
+                });
+                before
+            } else {
+                r9_fixture_sql(&bin, &db, sql);
+                fs::read(&db).unwrap()
+            };
+            let result = r9_repair_paths(&base, &db, &[root]);
+            if race {
+                assert!(
+                    matches!(&result, Err(ShareError::SqliteCommandFailed { detail, .. })
+                    if detail.contains("csq_rollout_schema_unchanged")),
+                    "race guard: {result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(&result, Err(ShareError::SqliteUntrustedSchemaObject { .. })),
+                    "readonly schema refusal: {result:?}"
+                );
+                assert_eq!(
+                    fs::read(&db).unwrap(),
+                    before,
+                    "refusal writes no database bytes"
+                );
+            }
+            assert_eq!(
+                r9_fixture_sql(&bin, &db, "SELECT count(*) FROM threads;").trim(),
+                "1"
+            );
+            assert_eq!(
+                r9_fixture_sql(&bin, &db, "SELECT rollout_path FROM threads WHERE id='t1';").trim(),
+                dead.to_str().unwrap()
+            );
+        }
+
+        #[test]
+        fn r9_schema_refuses_trigger_before_write() {
+            hold_test_migration_lock!();
+            r9_schema_fixture("trigger", false);
+        }
+        #[test]
+        fn r9_schema_refuses_view_before_write() {
+            hold_test_migration_lock!();
+            r9_schema_fixture("view", false);
+        }
+        #[test]
+        fn r9_schema_refuses_spoofed_upstream_trigger() {
+            hold_test_migration_lock!();
+            r9_schema_fixture("spoofed", false);
+        }
+        #[test]
+        fn r9_schema_transaction_refuses_new_trigger() {
+            hold_test_migration_lock!();
+            r9_schema_fixture("trigger", true);
+        }
+        #[test]
+        fn r9_schema_transaction_refuses_new_view() {
+            hold_test_migration_lock!();
+            r9_schema_fixture("view", true);
+        }
+
+        /// R9: the launch-time repair rewrites a reaped handle-dir path to the
+        /// SLOT's own persistent sessions root (a slot not yet shared — its
+        /// `codex-sessions` is a real directory, not the shared root), leaves a
+        /// row whose recorded path still exists untouched, and is idempotent.
+        #[test]
+        fn slot_repair_rewrites_reaped_handle_path_to_slot_sessions_root() {
+            hold_test_migration_lock!();
+            let Some(bin) = require_sqlite3() else {
+                return;
+            };
+            let t = TempDir::new().unwrap();
+            let base = t.path();
+            let home = slot_home(base, Surface::Codex, slot_num(12)).unwrap();
+            let slot_sessions = home.join("codex-sessions");
+            let shared = base.join("shared-state/codex/codex-sessions");
+            let file = slot_sessions.join("2026/10/06/rollout-01a10f3a.jsonl");
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(&file, b"TRANSCRIPT").unwrap();
+
+            let dead = base.join("term-2776/sessions/2026/10/06/rollout-01a10f3a.jsonl");
+            let db = home.join("state_5.sqlite");
+            create_state_db_with_rollout(&bin, &db, "dead", &dead.display().to_string());
+            // A second row whose recorded path still resolves must not move.
+            let live = base.join("term-9/sessions/x.jsonl");
+            fs::create_dir_all(live.parent().unwrap()).unwrap();
+            fs::write(&live, b"LIVE").unwrap();
+            sh(
+                &bin,
+                &db,
+                &format!(
+                    "INSERT INTO threads (id, title, name, updated_at, updated_at_ms, cwd, \
+                     model_provider, rollout_path) VALUES ('live', 't', 'n', 'ts', 1, '/w', \
+                     'a', '{}');",
+                    live.display()
+                ),
+            );
+
+            let roots = vec![slot_sessions.canonicalize().unwrap(), shared];
+            let n = r9_repair_paths(base, &db, &roots).unwrap();
+            assert_eq!(n, 1, "exactly the dead row is repaired");
+            assert_eq!(
+                thread_field(&bin, &db, "dead", "rollout_path"),
+                slot_sessions
+                    .canonicalize()
+                    .unwrap()
+                    .join("2026/10/06/rollout-01a10f3a.jsonl")
+                    .display()
+                    .to_string(),
+            );
+            assert_eq!(
+                thread_field(&bin, &db, "live", "rollout_path"),
+                live.display().to_string(),
+                "a row whose recorded path still exists must not be rewritten"
+            );
+            let again = r9_repair_paths(base, &db, &roots).unwrap();
+            assert_eq!(again, 0, "second pass is a no-op");
         }
 
         /// A row whose file is missing EVERYWHERE (neither the recorded
@@ -14392,6 +21535,7 @@ mod tests {
         /// target with no transcript behind it.
         #[test]
         fn rollout_path_repair_leaves_a_row_alone_when_the_file_is_missing_everywhere() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -14426,6 +21570,7 @@ mod tests {
         /// shared-root file of the same name also happens to exist.
         #[test]
         fn rollout_path_repair_leaves_a_still_resolving_path_alone() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -14477,6 +21622,7 @@ mod tests {
         /// `codex-sessions` subtree.
         #[test]
         fn rollout_path_repair_refuses_a_traversal_rest_even_when_the_target_exists() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };
@@ -14525,6 +21671,7 @@ mod tests {
         /// what an existence-only check produced.
         #[test]
         fn rollout_path_repair_never_points_a_thread_at_a_directory() {
+            hold_test_migration_lock!();
             let Some(bin) = require_sqlite3() else {
                 return;
             };

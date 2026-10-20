@@ -30,14 +30,194 @@
 //!
 //! ## Design constraints
 //!
-//! - stdlib only (no third-party crates).
+//! - Uses existing libc/rusqlite dependencies for the private Unix R9 fixture; no new dependencies.
 //! - Minimal: this stub is a test fixture, not a production tool.
 //! - `test = false` / `doctest = false` so it is not run as a test binary.
 
 use std::io::Write;
 use std::time::Duration;
 
+#[cfg(unix)]
+fn run_r9_native_fixture() -> bool {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let executable = std::path::Path::new(&args[0]);
+    if executable.file_name().and_then(|name| name.to_str()) != Some("r9-sqlite-fixture") {
+        return false;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let base = executable
+        .parent()
+        .expect("private fixture parent")
+        .canonicalize()
+        .unwrap();
+    let temporary_root = std::path::Path::new("/tmp").canonicalize().unwrap();
+    assert_eq!(base.parent(), Some(temporary_root.as_path()));
+    let name = base.file_name().unwrap().to_str().unwrap();
+    assert!(name.starts_with("cr-") || name.starts_with("cp-"));
+    let metadata = std::fs::metadata(&base).unwrap();
+    assert!(metadata.is_dir() && metadata.mode() & 0o077 == 0);
+    // SAFETY: read the fixture child's own effective UID; no state is changed.
+    assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+    let mode_metadata = std::fs::symlink_metadata(base.join("fixture-mode")).unwrap();
+    assert!(mode_metadata.is_file() && mode_metadata.len() <= 16);
+    let mode = std::fs::read_to_string(base.join("fixture-mode")).expect("private fixture mode");
+    if mode.trim() == "hung-late-start" {
+        // A child killed BEFORE its first scheduling (the CI race made
+        // deterministic): the deadline fires while this sleeps, so the pid
+        // file below can never exist. A reader must source the pid from the
+        // runner's own spawn record, never from a file the child writes.
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    std::fs::write(base.join("owned-pid"), std::process::id().to_string()).unwrap();
+    match mode.as_str() {
+        "hung" | "hung-late-start" => std::thread::sleep(Duration::from_secs(10)),
+        "forked" => {
+            // A shell that forks a descendant holding its stdout/stderr, then
+            // exits at once: the descendant's pid is recorded so the test can
+            // prove the runner killed the whole process group.
+            let descendant = std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .expect("fixture descendant");
+            std::fs::write(base.join("descendant-pid"), descendant.id().to_string()).unwrap();
+            std::process::exit(0);
+        }
+        "stdout" | "stderr" => {
+            let mut output: Box<dyn Write> = if mode == "stdout" {
+                Box::new(std::io::stdout().lock())
+            } else {
+                Box::new(std::io::stderr().lock())
+            };
+            let block = [0u8; 65536];
+            while output.write_all(&block).is_ok() {}
+        }
+        "delayed" => {
+            // A slow host, made deterministic: sleep the recorded milliseconds,
+            // then become the real sqlite3 with the runner's own argv. The spec
+            // is `<ms>\n<absolute sqlite3 path>` in `fixture-exec`.
+            use std::os::unix::process::CommandExt;
+            let exec_metadata =
+                std::fs::symlink_metadata(base.join("fixture-exec")).expect("fixture-exec");
+            assert!(exec_metadata.is_file() && exec_metadata.len() <= 4096);
+            let spec = std::fs::read_to_string(base.join("fixture-exec")).expect("fixture-exec");
+            let (millis, real) = spec.split_once('\n').expect("fixture-exec shape");
+            // Absolute only: a relative name would resolve through PATH.
+            assert!(std::path::Path::new(real.trim()).is_absolute());
+            std::thread::sleep(Duration::from_millis(millis.parse().expect("delay ms")));
+            let error = std::process::Command::new(real.trim())
+                .args(&args[1..])
+                .exec();
+            panic!("exec of the real sqlite3 failed: {error}");
+        }
+        "commit" => {
+            // Real SQLite COMMIT in the same owned PID; no detached child.
+            // argv is `<flags...> <db>`: the runner sends the script on stdin,
+            // one statement per line, and closes it once delivered.
+            let database_at = {
+                let mut at = 1;
+                while args[at].to_str().is_some_and(|arg| arg.starts_with('-')) {
+                    // `-init` takes a value; every other runner flag is bare.
+                    at += if args[at] == "-init" { 2 } else { 1 };
+                }
+                at
+            };
+            assert_eq!(args.len(), database_at + 1, "no SQL may arrive in argv");
+            let mut script = String::new();
+            {
+                use std::io::Read;
+                std::io::stdin().read_to_string(&mut script).unwrap();
+            }
+            std::fs::write(base.join("commit.pid"), std::process::id().to_string()).unwrap();
+            let connection = rusqlite::Connection::open({
+                let database = std::path::Path::new(&args[database_at]);
+                assert_eq!(database.parent().unwrap().canonicalize().unwrap(), base);
+                assert!(std::fs::symlink_metadata(database).unwrap().is_file());
+                database
+            })
+            .unwrap();
+            connection.execute_batch(&script).unwrap();
+            std::fs::write(base.join("committed"), b"committed\n").unwrap();
+            // Withhold acknowledgement until the test (or the runner's hang
+            // guard) ends this process.
+            std::thread::sleep(Duration::from_secs(3600));
+        }
+        "argv-capture" => {
+            // Record argv and the stdin script separately, then exit 0, so a
+            // test can prove which channel carried the SQL.
+            use std::io::Read;
+            let argv = args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(base.join("captured-argv"), argv).unwrap();
+            let mut script = String::new();
+            std::io::stdin().read_to_string(&mut script).unwrap();
+            // Like a shell that ran the whole script: print the writer's end
+            // marker (its last statement, `SELECT '<marker>';`).
+            if let Some(marker) = script
+                .lines()
+                .last()
+                .and_then(|line| line.strip_prefix("SELECT '"))
+                .and_then(|rest| rest.strip_suffix("';"))
+            {
+                println!("{marker}");
+            }
+            std::fs::write(base.join("captured-stdin"), script).unwrap();
+        }
+        "exit-early" => {
+            // A shell that exits 0 without reading its script: the runner's
+            // pipe writes all succeed (the script fits the pipe buffer), but
+            // nothing ran.
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        "continue" => {
+            // A sqlite3 that ignores `-bail`: feed every statement to the real
+            // shell on stdin WITHOUT `-bail`, so it keeps executing past an
+            // error. argv is `<flags...> <db> <statement>...`; with no
+            // statement arguments the statements arrive on this process's stdin.
+            use std::io::Read;
+            let real = std::fs::read_to_string(base.join("real-sqlite3")).unwrap();
+            let database_at = {
+                let mut at = 1;
+                while args[at].to_str().is_some_and(|arg| arg.starts_with('-')) {
+                    at += if args[at] == "-init" { 2 } else { 1 };
+                }
+                at
+            };
+            let mut input = args[database_at + 1..]
+                .iter()
+                .map(|arg| arg.to_str().unwrap())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if args.len() == database_at + 1 {
+                std::io::stdin().read_to_string(&mut input).unwrap();
+            }
+            let mut child = std::process::Command::new(real.trim())
+                .args(["-init", "/dev/null", "-batch", "-noheader", "-list"])
+                .arg(&args[database_at])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            let status = child.wait().unwrap();
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        _ => panic!("invalid private fixture mode"),
+    }
+    true
+}
+
 fn main() {
+    #[cfg(unix)]
+    if run_r9_native_fixture() {
+        return;
+    }
     let args: Vec<String> = std::env::args().collect();
 
     let mut exit_code: i32 = 0;

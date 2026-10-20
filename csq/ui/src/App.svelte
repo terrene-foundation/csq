@@ -7,6 +7,8 @@
   import Toast from "./lib/components/Toast.svelte";
   import UpdateBanner from "./lib/components/UpdateBanner.svelte";
   import CorruptPrefsBanner from "./lib/components/CorruptPrefsBanner.svelte";
+  import CodexSlotStatusPanel from "./lib/components/CodexSlotStatusPanel.svelte";
+  import ClaudeAutoCompactStatusPanel from "./lib/components/ClaudeAutoCompactStatusPanel.svelte";
   import InteractiveConsole from "./lib/components/InteractiveConsole.svelte";
   import PolicyConsole from "./lib/components/PolicyConsole.svelte";
 
@@ -120,6 +122,8 @@
   <main>
     {#if activeTab === "accounts"}
       <div id="accounts-panel" role="tabpanel" aria-labelledby="tab-accounts">
+        <CodexSlotStatusPanel />
+        <ClaudeAutoCompactStatusPanel />
         <AccountList />
       </div>
     {:else if activeTab === "sessions"}

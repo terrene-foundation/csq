@@ -73,6 +73,12 @@ async-trait.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+# csq-core again, TEST-SCOPED, with `test-utils`: the kailash-free guard
+# resolves this crate's source tree at RUN time (`testing::manifest_dir`) so a
+# stale target artifact carried across checkouts cannot make it scan the wrong
+# tree. Dev-only — the production dependency above stays feature-free, so
+# `test-utils` (and its `tempfile`) never reach the shipped binary.
+csq-core = { path = "../csq-core", features = ["test-utils"] }
 tempfile.workspace = true
 reqwest.workspace = true
 # tower `util` feature: ServiceExt::oneshot for in-process handler tests.

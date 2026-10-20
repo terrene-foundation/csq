@@ -263,11 +263,11 @@ _csq_edition_echo() {
     fi
 }
 
-# Runs `$1 --version` with a hard wall-clock deadline AND a hard capture-size
+# Runs `$1 --version` with a shared nominal polling budget and a hard capture-size
 # bound, in a bash-3.2-compatible way (macOS ships 3.2: no `wait -n`, no
-# `timeout(1)` by default). Kills the child if it is still alive at
-# CSQ_EDITION_VERSION_TIMEOUT_MS; reads at most CSQ_EDITION_CAPTURE_MAX_BYTES
-# of its stdout regardless of how much it tries to write.
+# `timeout(1)` by default). Scheduling and synchronous operations can exceed the
+# polling allocation. Kills the child when its polling budget is exhausted;
+# reads at most CSQ_EDITION_CAPTURE_MAX_BYTES of stdout regardless of output size.
 #
 # Bash 3.2 has no `local -n`/nameref, so multiple return values go out
 # through global variables rather than the local scope a caller could shadow
@@ -283,8 +283,8 @@ _csq_edition_echo() {
 #   _CSQ_V_TIMED_OUT 0 completed | 1 killed at the deadline | 2 setup failed
 #                    (mktemp/mkfifo unavailable -- an environment problem,
 #                    not a statement about the binary)
-#   _CSQ_V_TRUNCATED 1 when the binary was still writing at the cap, i.e. its
-#                    answer could NOT be read whole; 0 otherwise
+#   _CSQ_V_TRUNCATED 1 when the byte cap or remaining reader budget prevents
+#                    reading the answer whole; 0 otherwise
 _csq_edition_capture_version() {
     local bin="$1"
     _CSQ_V_OUT=""
@@ -370,15 +370,16 @@ _csq_edition_capture_version() {
     # reachable Desktop-mode shape is exactly this -- a daemon supervisor
     # subprocess), that grandchild inherited its own copy of the fifo's write
     # end and keeps it open independently of $pid's fate. We own head, unlike
-    # the binary under test, so give it a brief grace window to drain
-    # whatever the writer already flushed to the pipe before $pid died, then
-    # force it closed rather than trusting an EOF that may never come.
+    # the binary under test, so drain within the REMAINING version budget,
+    # then force it closed rather than trusting an EOF that may never come.
+    # A separate 500ms grace misclassified healthy writers when the reader
+    # was delayed by scheduling even though the ordinary budget remained.
     local head_waited_ms=0
     while kill -0 "$head_pid" 2>/dev/null; do
-        if [ "$head_waited_ms" -ge 500 ]; then
+        if [ "$((elapsed_ms + head_waited_ms))" -ge "$CSQ_EDITION_VERSION_TIMEOUT_MS" ]; then
             # Reaching here means head NEVER saw EOF — we are cutting it off
             # mid-read — so the answer could not be read whole. That is the
-            # same class the byte cap flags, arriving through the grace window
+            # same class the byte cap flags, arriving through the remaining deadline
             # instead, and it MUST set the same flag: `captured` here is just
             # whatever the writer had flushed, routinely at-or-under the cap,
             # so the cap test below would leave TRUNCATED=0 and the partial
@@ -449,7 +450,7 @@ _csq_edition_capture_version() {
     if [ "$_CSQ_V_TIMED_OUT" -eq 0 ]; then
         if [ "$_CSQ_V_STATUS" -eq 141 ]; then
             # 128+13. Reclassified whether or not the cap was reached: the
-            # head-grace kill below can also close the pipe early.
+            # reader-budget kill below can also close the pipe early.
             _CSQ_V_STATUS=0
         elif [ "$_CSQ_V_STATUS" -eq 1 ] && [ "$_CSQ_V_TRUNCATED" -eq 1 ]; then
             _CSQ_V_STATUS=0
@@ -693,8 +694,8 @@ csq_detect_edition() {
     # vocabulary fixed for the operator, the log grep and the self-test.
     if [ "${_CSQ_V_TRUNCATED:-0}" -eq 1 ]; then
         _csq_edition_diag "$bin" 'unrecognized-format' \
-            "The --version call was still writing after ${CSQ_EDITION_CAPTURE_MAX_BYTES} bytes, so its" \
-            'output could not be read whole and any edition tag found in the part that WAS' \
+            "The --version output exceeded ${CSQ_EDITION_CAPTURE_MAX_BYTES} bytes or its reader" \
+            'did not reach EOF within the remaining version budget; any tag in the part that WAS' \
             'read may be contradicted by the part that was not.' \
             "First line of its output: $(_csq_edition_echo "$out")" \
             'A real --version line is a couple of dozen bytes; treating a runaway one as an' \

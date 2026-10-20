@@ -2359,6 +2359,13 @@ mod tests {
     /// "~/"`), not just the negative one.
     #[test]
     fn materialize_error_display_never_leaks_raw_home_path() {
+        // `redact_path` reads `$HOME` at Display time, while this test roots its
+        // fixture under the `$HOME` it read at entry. A concurrent HOME-mutating
+        // test (all of them hold this same lock) landing between the two makes
+        // the substitution miss: measured as a full-suite red on 2026-10-18 (one
+        // run in ~10; isolated 5/5 green). Holding the env-test lock across
+        // read -> emit -> assert closes that window.
+        let _env = crate::platform::test_env::lock();
         // Resolve home the way `redact_home_prefix` does, NOT via `HOME` alone.
         // Measured on GitHub's windows-latest runner 2026-08-19: `HOME` is
         // `NotPresent` there, so a bare `var("HOME").expect(..)` panics before the

@@ -26,7 +26,7 @@ const FORBIDDEN: &[&str] = &["use kailash", "kailash::", "kailash_", "use eatp",
 
 #[test]
 fn csq_ledger_source_has_no_kailash_or_eatp_usage() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src = csq_core::testing::manifest_dir(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut offenders = Vec::new();
     scan_dir(&src, &mut offenders);
     assert!(
@@ -74,7 +74,7 @@ fn scan_file(path: &Path, offenders: &mut Vec<String>) {
 /// (security-reviewer LOW-1, an internal journal entry).
 #[test]
 fn csq_ledger_cargo_toml_declares_no_kailash_or_eatp_dependency() {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let manifest = csq_core::testing::manifest_dir(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let text = fs::read_to_string(&manifest).expect("read csq-ledger Cargo.toml");
     let mut offenders = Vec::new();
     for (idx, line) in text.lines().enumerate() {

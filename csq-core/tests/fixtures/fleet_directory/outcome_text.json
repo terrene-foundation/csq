@@ -1,0 +1,15 @@
+[
+{"tag":"coverage_incomplete","text":"fleet discovery incomplete; recipient undetermined"},
+{"tag":"clock_skew","text":"fleet clock unsafe or skew exceeds 300 seconds; operation refused"},
+{"tag":"ok","text":"fleet directory query completed; inspect coverage"},
+{"tag":"unknown_host","text":"fleet host unknown; recipient undetermined"},
+{"tag":"directory_unavailable","text":"fleet directory unavailable, coverage undetermined"},
+{"tag":"directory_host_offline","text":"fleet directory reports host offline; reachability undetermined"},
+{"tag":"directory_host_revoked","text":"fleet directory reports host revoked; discovery refused"},
+{"tag":"directory_identity_mismatch","text":"fleet directory identity mismatch; discovery refused"},
+{"tag":"descriptor_expired","text":"fleet directory descriptor expired; discovery refused"},
+{"tag":"incompatible_version","text":"fleet directory version incompatible; discovery refused"},
+{"tag":"invalid_descriptor","text":"fleet directory descriptor invalid; discovery refused"},
+{"tag":"timeout","text":"fleet directory query timed out; coverage undetermined"},
+{"tag":"directory_rate_limited","text":"fleet directory rate limit exceeded; coverage undetermined"}
+]

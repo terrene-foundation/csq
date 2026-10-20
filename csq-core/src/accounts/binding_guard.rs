@@ -178,6 +178,61 @@ pub fn detect_bound_surface(base_dir: &Path, slot: AccountNum) -> Option<BoundSu
     None
 }
 
+/// Independent OAuth binding facts, without third-party settings discovery.
+/// Both signals are retained so a consumer can preserve its own precedence.
+pub(crate) struct OAuthSlotEvidence {
+    pub(crate) anthropic: bool,
+    pub(crate) codex: bool,
+}
+
+/// Reads non-secret identity metadata and credential-node presence only.
+/// Callers must validate local regular metadata nodes before requesting both
+/// facts; conflict detection retains its lazy per-predicate read boundary.
+pub(crate) fn oauth_slot_evidence(base_dir: &Path, slot: AccountNum) -> OAuthSlotEvidence {
+    OAuthSlotEvidence {
+        anthropic: identity_store::is_anthropic_bound_slot(base_dir, slot),
+        codex: identity_store::is_codex_bound_slot_identity_aware(base_dir, slot),
+    }
+}
+
+/// Every binding fact a Claude-Code-statusline consumer needs about ONE slot,
+/// sourced from the per-surface predicates directly rather than from the
+/// precedence-ordered [`detect_bound_surface`]. READ-ONLY.
+#[derive(Debug)]
+pub struct ClaudeCodeSlotEvidence {
+    /// The slot carries a Codex, Gemini or native (Kimi/Grok) binding: it has no
+    /// Claude Code statusline, so nothing about it can be shown to be Anthropic.
+    pub other_surface: bool,
+    /// The slot carries an Anthropic OAuth binding (identity-store `by_slot`, or
+    /// the pre-A++ legacy mirror).
+    pub anthropic: bool,
+    /// The slot's own `settings.json` names a third-party provider. `Err` when it
+    /// could not be read, which a caller must NOT treat as `Ok(false)`.
+    pub third_party: Result<bool, ConfigError>,
+}
+
+/// Gathers [`ClaudeCodeSlotEvidence`] for `slot`.
+///
+/// Why not [`detect_bound_surface`]: it returns the FIRST match (Codex, then
+/// Anthropic, ..., then third-party), so a slot rebound from Anthropic to a
+/// third-party provider without `csq logout` reports Anthropic and the
+/// third-party evidence is masked (`guard-reader-writer-parity.md` MUST-3). This
+/// asks each predicate separately so the caller can see BOTH. It also reads only
+/// this slot's `settings.json`
+/// ([`crate::accounts::third_party::is_third_party_slot`]); the union detector's
+/// third-party arm scans every slot's settings, which a per-render caller must
+/// not do.
+pub fn claude_code_slot_evidence(base_dir: &Path, slot: AccountNum) -> ClaudeCodeSlotEvidence {
+    let other_surface = identity_store::is_codex_bound_slot_identity_aware(base_dir, slot)
+        || crate::providers::gemini::provisioning::is_gemini_bound_slot(base_dir, slot)
+        || crate::providers::native::native_surface_for_slot(base_dir, slot).is_some();
+    ClaudeCodeSlotEvidence {
+        other_surface,
+        anthropic: identity_store::is_anthropic_bound_slot(base_dir, slot),
+        third_party: crate::accounts::third_party::is_third_party_slot(base_dir, slot),
+    }
+}
+
 /// Detects a stale ADDITIVE marker binding (Gemini / native Kimi-Grok) on
 /// `slot`. PURE — no side effect, nothing is deleted. The first half of the
 /// OAuth-login (replacing) reverse-cleanup pair; the caller CAPTURES this
@@ -205,13 +260,13 @@ pub fn detect_bound_surface(base_dir: &Path, slot: AccountNum) -> Option<BoundSu
 /// to the marker-based variants. That detector is precedence-ordered Codex →
 /// Anthropic → Gemini → native → 3P, so it reports the HIGHEST-precedence
 /// binding a slot carries — and an internal ticket's
-/// [`crate::accounts::login::ensure_login_identity_minted`] mints
-/// `by_slot[slot]` for the FRESH Anthropic identity BEFORE `finalize_login`
+/// [`crate::accounts::anthropic_identity::commit_anthropic_login`] publishes
+/// `by_slot[slot]` for the FRESH Anthropic identity BEFORE [`crate::accounts::login::finalize_verified_login`]
 /// (and therefore this function) ever runs, on every production caller. A
 /// delegated call therefore always saw Anthropic ahead of the stale Gemini
 /// or native marker and reported `None` — this detection was DEAD CODE in
 /// production; only the two hand-fixtured unit tests, which never call
-/// `ensure_login_identity_minted`, exercised the "sees the marker" path.
+/// `commit_anthropic_login`, exercised the "sees the marker" path.
 /// Calling the [`crate::providers::gemini::provisioning::is_gemini_bound_slot`]
 /// and [`crate::providers::native::native_surface_for_slot`] marker
 /// predicates directly — bypassing precedence entirely — fixes this and
@@ -587,6 +642,79 @@ mod tests {
     fn detect_returns_none_for_free_slot() {
         let dir = TempDir::new().unwrap();
         assert_eq!(detect_bound_surface(dir.path(), slot(1)), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_legacy_codex_short_circuits_fifo_identity() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let _env = crate::platform::test_env::lock();
+        const CHILD_ROOT: &str = "CSQ_TEST_BINDING_FIFO_CHILD_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            assert_eq!(
+                detect_bound_surface(Path::new(&root), slot(1)),
+                Some(BoundSurface::Codex)
+            );
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let uuid = {
+            let lock =
+                crate::accounts::profiles_lock::ProfilesFileLock::acquire(dir.path()).unwrap();
+            crate::daemon::identity_mint::mint_for_codex_login(
+                &lock,
+                dir.path(),
+                1,
+                Some("synthetic-fifo-account"),
+            )
+            .unwrap()
+        };
+        plant_codex(dir.path(), 1);
+        let identity = identity_store::identity_json_path_for(dir.path(), uuid);
+        std::fs::remove_file(&identity).unwrap();
+        let name = std::ffi::CString::new(identity.as_os_str().as_bytes()).unwrap();
+        // SAFETY: name is NUL-terminated and remains live during creation of
+        // this private TempDir FIFO; its contents never contain credentials.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .env("HOME", dir.path())
+            .env(CHILD_ROOT, dir.path())
+            .args([
+                "--exact",
+                "accounts::binding_guard::tests::detect_legacy_codex_short_circuits_fifo_identity",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // Env custody is done: the child is spawned with `.env_clear()`, so
+        // it never sees this process's environment, and nothing below reads
+        // env. Release the shared lock rather than hold it across the bound.
+        drop(_env);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let outcome = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Err(error) => break Err(error),
+                Ok(None) if Instant::now() >= deadline => {
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "legacy Codex detector blocked on FIFO identity",
+                    ));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        };
+        if outcome.is_err() {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        assert!(outcome.is_ok(), "bounded FIFO child failed: {outcome:?}");
+        assert!(outcome.unwrap().success());
     }
 
     #[test]

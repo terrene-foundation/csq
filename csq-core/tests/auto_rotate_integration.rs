@@ -5,12 +5,17 @@
 //! without writing to config-N/, and the two can diverge independently
 //! once their cooldowns expire at different times.
 
+// Uses the `test-utils` surface of csq-core; a plain `cargo test -p csq-core` builds it
+// as an empty test binary instead of failing to compile. Gated here rather than with
+// `required-features` so the manifest never names a file the community extraction removes.
+#![cfg(feature = "test-utils")]
+
 use csq_core::accounts::markers;
 use csq_core::credentials::{
     self, file as cred_file, AnthropicCredentialFile, CredentialFile, OAuthPayload,
 };
 use csq_core::daemon::auto_rotate::tick;
-use csq_core::quota::{state as quota_state, AccountQuota, QuotaFile, UsageWindow};
+use csq_core::quota::{state as quota_state, AccountQuota, UsageWindow};
 use csq_core::rotation::config::{save as save_rotation_config, RotationConfig};
 use csq_core::session::handle_dir::{create_handle_dir, sweep_dead_handles};
 use csq_core::types::{AccessToken, AccountNum, RefreshToken};
@@ -40,7 +45,9 @@ fn setup_account(base: &Path, account: u16) {
 }
 
 fn setup_quota(base: &Path, account: u16, five_hour_pct: f64) {
-    let mut quota = quota_state::load_state(base).unwrap_or_else(|_| QuotaFile::empty());
+    // The writers' unfiltered read (`load_state_or_skip`): the filtered reader would drop sibling rows whose organization binding
+    // is not yet (or no longer) matched by a stamp, and the save would erase them.
+    let mut quota = quota_state::load_state_or_skip(base).unwrap();
     quota.set(
         account,
         AccountQuota {
@@ -52,6 +59,26 @@ fn setup_quota(base: &Path, account: u16, five_hour_pct: f64) {
             ..Default::default()
         },
     );
+    quota_state::save_state(base, &quota).unwrap();
+    stamp_quota_origins(base);
+}
+
+/// The usage poller stamps each Anthropic row with the slot's origin; an organization-bound
+/// slot shows only a row carrying its current stamp. Stamp every row whose slot is bound
+/// (a no-op for slots without a binding yet, and again after `setup_slot_uuid`).
+fn stamp_quota_origins(base: &Path) {
+    let mut quota = quota_state::load_state_or_skip(base).unwrap();
+    for (slot, row) in quota.accounts.iter_mut() {
+        let Ok(num) = slot.parse::<u16>().map(AccountNum::try_from) else {
+            continue;
+        };
+        if let Some(origin) = num
+            .ok()
+            .and_then(|n| csq_core::quota::origin::stamp_for_tests(base, n))
+        {
+            row.extras = Some(serde_json::json!({ "csq_anthropic_origin": origin }));
+        }
+    }
     quota_state::save_state(base, &quota).unwrap();
 }
 
@@ -85,6 +112,21 @@ fn setup_handle_dir(base: &Path, claude_home: &Path, pid: u32, account: u16) -> 
 /// `csq_core::testing::identity_fixtures::fixture_uuid_for_slot` (canonical).
 #[cfg(any(test, feature = "test-utils"))]
 fn setup_slot_uuid(base: &Path, slot: u16) {
+    setup_slot_identity(base, slot, true);
+}
+
+/// `org_bound = true` is what a fresh login mints today: `identity.json` carries the
+/// verified email, account UUID and organization UUID, and `profiles.json` indexes that
+/// context in `anthropic_contexts`. `false` is the migrated pre-organization state: the
+/// email alone, no index row (`StoredAnthropicContext::LegacyUnknown`).
+///
+/// Either way `identity.json` declares provider "anthropic" at 0600. Without the provider
+/// the quota origin classifies the slot Invalid and hides every quota row; without the
+/// email (legacy) or the context index (bound) the rotation target's binding capture is
+/// refused, so the tick never repoints.
+#[cfg(any(test, feature = "test-utils"))]
+fn setup_slot_identity(base: &Path, slot: u16, org_bound: bool) {
+    use csq_core::accounts::anthropic_identity::AnthropicContextEntry;
     use csq_core::accounts::identity_store;
     use csq_core::accounts::profiles;
     use csq_core::testing::identity_fixtures::fixture_uuid_for_slot;
@@ -93,15 +135,39 @@ fn setup_slot_uuid(base: &Path, slot: u16) {
     let path = profiles::profiles_path(base);
     let mut pf = profiles::load(&path).unwrap_or_else(|_| profiles::ProfilesFile::empty());
     pf.by_slot.insert(slot.to_string(), uuid);
+    // A real mint bumps the slot's binding generation; a zero would make the origin
+    // stamp indistinguishable from the pre-generation legacy form.
+    pf.slot_binding_generations.insert(slot.to_string(), 1);
+    let email = format!("slot{slot}@example.com");
+    let account_uuid = uuid::Uuid::from_u128(0xA000 + u128::from(slot));
+    let organization_uuid = uuid::Uuid::from_u128(0xB000 + u128::from(slot));
+    let body = if org_bound {
+        pf.anthropic_contexts.push(AnthropicContextEntry {
+            email: email.clone(),
+            account_uuid,
+            organization_uuid,
+            identity_uuid: uuid,
+            extra: Default::default(),
+        });
+        format!(
+            r#"{{"provider":"anthropic","email":"{email}","account_uuid":"{account_uuid}","organization_uuid":"{organization_uuid}","created_at":"fixture","key_id":null}}"#
+        )
+    } else {
+        format!(
+            r#"{{"provider":"anthropic","email":"{email}","created_at":"fixture","key_id":null}}"#
+        )
+    };
     profiles::save(&path, &pf).unwrap();
 
-    // M4-4: also seed identities/<UUID>/credentials.json so the post-flip
-    // reader finds credentials for this slot. Mirror the legacy creds
-    // that setup_account writes; both paths carry the same content per
-    // the M2-2 identity-FIRST/legacy-SECOND write-order invariant.
+    let identity_json = identity_store::identity_json_path_for(base, uuid);
+    std::fs::create_dir_all(identity_json.parent().unwrap()).unwrap();
+    std::fs::write(&identity_json, body).unwrap();
+    csq_core::platform::fs::secure_file(&identity_json).unwrap();
+    // M4-4: also seed identities/<UUID>/credentials.json so the post-flip reader finds
+    // credentials for this slot (same content as the legacy path setup_account writes).
     let creds = make_creds(&format!("at-{slot}"), &format!("rt-{slot}"));
-    let identity_path = identity_store::credentials_path_for(base, uuid);
-    credentials::save(&identity_path, &creds).unwrap();
+    credentials::save(&identity_store::credentials_path_for(base, uuid), &creds).unwrap();
+    stamp_quota_origins(base);
 }
 
 /// Two independent terminals rotate independently.
@@ -371,5 +437,36 @@ fn sweep_races_rotate_on_dead_handle_dir() {
         std::fs::read(&cred_path_2).unwrap(),
         pre_2,
         "config-2/.credentials.json MUST NOT be modified by tick or sweep"
+    );
+}
+
+/// The migrated pre-organization state (email only, no context index) is a real state on
+/// upgraded installs; rotation must work there too.
+#[test]
+fn legacy_unbound_identities_still_rotate() {
+    let dir = TempDir::new().unwrap();
+    let claude_home = TempDir::new().unwrap();
+    setup_account(dir.path(), 1);
+    setup_account(dir.path(), 2);
+    setup_quota(dir.path(), 1, 97.0);
+    setup_quota(dir.path(), 2, 10.0);
+    setup_config_dir(dir.path(), 1);
+    setup_config_dir(dir.path(), 2);
+    setup_slot_identity(dir.path(), 1, false);
+    setup_slot_identity(dir.path(), 2, false);
+    let handle = setup_handle_dir(dir.path(), claude_home.path(), 20001, 1);
+    let cfg = RotationConfig {
+        enabled: true,
+        threshold_percent: 95.0,
+        cooldown_secs: 300,
+        ..RotationConfig::default()
+    };
+    save_rotation_config(dir.path(), &cfg).unwrap();
+    let mut cooldowns = HashMap::new();
+    tick(dir.path(), Some(claude_home.path()), &mut cooldowns);
+    assert_eq!(
+        markers::read_csq_account(&handle),
+        Some(AccountNum::try_from(2u16).unwrap()),
+        "legacy-bound handle must be repointed to account 2"
     );
 }

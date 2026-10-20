@@ -404,11 +404,54 @@ instructions = "User authored: be terse"
     }
 
     #[test]
+    fn merge_preserves_codex_hook_trust_state() {
+        let canonical = "cli_auth_credentials_store = \"file\"\n[hooks.state.\"/h/hooks.json:stop:0:0\"]\ntrusted_hash = \"abc\"\nenabled = true\n";
+        let merged = merge_instructions_via_toml_value(canonical, "body", &no_overlay()).unwrap();
+        let parsed: toml::Value = toml::from_str(&merged).unwrap();
+        let entry = &parsed["hooks"]["state"]["/h/hooks.json:stop:0:0"];
+        assert_eq!(entry["trusted_hash"].as_str(), Some("abc"), "{merged}");
+        assert_eq!(entry["enabled"].as_bool(), Some(true), "{merged}");
+    }
+
+    #[test]
     fn merge_preserves_model_key_after_round_trip() {
         let merged =
             merge_instructions_via_toml_value(canonical_minimal(), "body", &no_overlay()).unwrap();
         let parsed: toml::Value = toml::from_str(&merged).unwrap();
         assert_eq!(parsed["model"].as_str().unwrap(), "gpt-5");
+    }
+
+    #[test]
+    fn merge_preserves_owner_concurrency_and_arbitrary_tables() {
+        let canonical = r#"cli_auth_credentials_store = "file"
+model = "owner-model"
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+[agents]
+max_threads = 8
+
+[features.multi_agent_v2]
+max_concurrent_threads_per_session = 8
+
+[owner_extension]
+labels = ["private", "fixture"]
+[owner_extension.nested]
+enabled = true
+"#;
+        let before: toml::Value = toml::from_str(canonical).unwrap();
+        let merged =
+            merge_instructions_via_toml_value(canonical, "scaffold", &no_overlay()).unwrap();
+        let mut after: toml::Value = toml::from_str(&merged).unwrap();
+        assert_eq!(after["developer_instructions"].as_str(), Some("scaffold"));
+        after
+            .as_table_mut()
+            .unwrap()
+            .remove("developer_instructions");
+        assert_eq!(
+            after, before,
+            "all owner settings must survive scaffold delivery"
+        );
     }
 
     #[test]

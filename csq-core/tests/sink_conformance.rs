@@ -19,6 +19,11 @@
 //!   --test sink_conformance
 //! ```
 
+// Uses the `test-utils` surface of csq-core; a plain `cargo test -p csq-core` builds it
+// as an empty test binary instead of failing to compile. Gated here rather than with
+// `required-features` so the manifest never names a file the community extraction removes.
+#![cfg(feature = "test-utils")]
+
 use csq_core::audit::traits::LedgerSink;
 use csq_core::audit::types::{
     CsqRunPayload, Ed25519Signature, EventKind, EventPayload, KeyId, RecordId, Sha256Hex,

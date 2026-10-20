@@ -19,16 +19,27 @@ never literally appears -- every grep-shaped check is structurally blind to it.
 
 This gate expands csq's ACTUAL grants through the manifests to a set of leaf
 permission IDENTIFIERS, and fails when that set changes without the snapshot
-being updated deliberately. (An identifier is not a command: a manifest lists the
-commands an identifier unlocks separately, under `commands.allow`. In Tauri's core
-manifests the mapping is 1:1 today, but the ratchet is over identifiers.)
+being updated deliberately. Plugin permissions are recorded as leaf IDENTIFIERS AND expanded to
+`plugin-command:<plugin>:<command>` entries per `commands.allow` (a command added under
+an unchanged identifier is named in the diff); every `commands.deny` list is recorded
+under `permission_command_denies` and compared, so a shrunk deny list trips the ratchet.
+csq's own APPLICATION permissions and sets (`csq/permissions/*.toml`, recorded under
+`__app-acl__`) are expanded further, to `app-command:<name>` entries, so an added
+command is named in the diff.
 `tauri-commands.md` treats the renderer as adversarial; this makes the adversary's
 granted surface a reviewed constant instead of an upstream side effect.
 
 A reference the manifests cannot resolve is the one way this could degrade
 quietly, so it never passes unremarked: an unexpandable `:default` bundle is fatal
 at exit 2, and every other unresolved key is recorded in the snapshot so that its
-own movement trips the ratchet. See `expand()`.
+own movement trips the ratchet. A bare (application) grant with no `__app-acl__`
+section to resolve it against is likewise fatal at exit 2 -- never an opaque leaf
+that `--update` would bless. See `expand()`.
+
+A permission can carry a `scope` (the URL / path patterns its commands are limited
+to). The leaf IDENTIFIER does not change when a scope widens, so every granted
+leaf's normalised scope is recorded under `permission_scopes` and compared too: a
+scope that widens upstream (or in `csq/permissions`) trips the ratchet at exit 1.
 
 Exit 0 = surface unchanged. Exit 1 = surface changed (review, then --update).
 Exit 2 = the gate could not run (missing/corrupt/unexpandable input, or any
@@ -78,8 +89,63 @@ def split_ref(ref: str, current_plugin: str) -> tuple[str, str]:
     return plugin, name
 
 
+def norm_scope(raw: object, what: str) -> dict[str, list[str]] | None:
+    """Normalise a permission's `scope` to a comparable form.
+
+    Returns None when the permission carries no scope entries, otherwise
+    `{"allow": [...], "deny": [...]}` (only the non-empty sides) with each entry
+    canonical JSON and the list sorted, so ordering never reads as a change. Any
+    shape this gate does not understand (a non-object scope, a non-list side, a key
+    other than allow/deny) is fatal at exit 2: ignoring it would record a surface
+    narrower than the one granted.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        die(f"{what}: scope is not an object.")
+    unknown = sorted(set(raw) - {"allow", "deny"})
+    if unknown:
+        die(f"{what}: scope has unknown key(s) {unknown!r}; this gate only understands allow/deny.")
+    out: dict[str, list[str]] = {}
+    for side in ("allow", "deny"):
+        items = raw.get(side)
+        if items is None:
+            continue
+        if not isinstance(items, list):
+            die(f"{what}: scope.{side} is not a list.")
+        if items:
+            out[side] = sorted(json.dumps(i, sort_keys=True) for i in items)
+    return out or None
+
+
+def norm_commands(raw: object, what: str) -> tuple[list[str], list[str]]:
+    """Return the (allow, deny) command-name lists of a permission's `commands`.
+
+    A permission with no `commands` unlocks none. Any other shape (a non-object, or an
+    allow/deny that is not a list of strings) is fatal at exit 2: skipping it would
+    record a surface narrower than the one granted.
+    """
+    if raw is None:
+        return [], []
+    if not isinstance(raw, dict):
+        die(f"{what}: commands is not an object.")
+    sides: list[list[str]] = []
+    for side in ("allow", "deny"):
+        items = raw.get(side, [])
+        if not isinstance(items, list) or not all(isinstance(c, str) for c in items):
+            die(f"{what}: commands.{side} is malformed (expected a list of strings).")
+        sides.append(sorted(set(items)))
+    return sides[0], sides[1]
+
+
 def expand(
-    ref: str, manifests: dict, current_plugin: str, seen: set[str], unresolved: set[str]
+    ref: str,
+    manifests: dict,
+    current_plugin: str,
+    seen: set[str],
+    unresolved: set[str],
+    scopes: dict[str, dict[str, list[str]]],
+    denies: dict[str, list[str]],
 ) -> set[str]:
     """Expand one permission reference into its set of leaf permissions.
 
@@ -89,12 +155,74 @@ def expand(
 
     `unresolved` collects every key whose plugin is absent from the manifests; see
     the unknown-plugin branch below for why that set is carried into the snapshot.
+    `scopes` collects the normalised scope of every granted leaf that carries one.
+    `denies` collects the sorted `commands.deny` list of every granted leaf that has
+    one. A plugin leaf also expands to a `plugin-command:<plugin>:<command>` entry per
+    `commands.allow` command, so a command added under an UNCHANGED identifier is named
+    in the diff (a Tauri bump can do exactly that), exactly as app permissions are.
     """
     plugin, name = split_ref(ref, current_plugin)
     key = f"{plugin}:{name}"
     if key in seen:
         return set()
     seen.add(key)
+
+    if plugin == "":
+        # A bare reference in capabilities/default.json names an APPLICATION
+        # permission or permission SET (csq's own `permissions/*.toml`), recorded by
+        # tauri-build under the `__app-acl__` key. Expand it to the COMMANDS it
+        # unlocks so an added command is named in the diff instead of hiding behind
+        # an opaque identifier. A name that is neither is fatal: recording it as an
+        # unresolved leaf would let `--update` bless a set whose members then widen
+        # at exit 0.
+        app = manifests.get("__app-acl__")
+        if app is None:
+            # Without the section a bare grant cannot be resolved. Falling through
+            # would record it as an opaque unresolved leaf, hiding every command
+            # behind it, and `--update` would bless that. Fatal, not a diff.
+            die(
+                f"bare permission {ref!r} names an application permission, but "
+                f"{MANIFESTS.name} has no __app-acl__ section to resolve it against; its "
+                f"commands cannot be expanded."
+            )
+        if not isinstance(app, dict):
+            die("__app-acl__ in the manifests is not an object.")
+        perms = app.get("permissions", {})
+        sets = app.get("permission_sets", {})
+        if not isinstance(perms, dict) or not isinstance(sets, dict):
+            die("__app-acl__ permissions / permission_sets are not objects.")
+        if name == "default":
+            dp = app.get("default_permission")
+            if dp is None:
+                return set()
+            if not isinstance(dp, dict) or not isinstance(dp.get("permissions", []), list):
+                die("__app-acl__ default_permission is malformed.")
+            out = set()
+            for m in dp.get("permissions", []):
+                out |= expand(m, manifests, "", seen, unresolved, scopes, denies)
+            return out
+        if name in perms:
+            if not isinstance(perms[name], dict):
+                die(f"app permission {name!r} is not an object.")
+            allow, deny = norm_commands(perms[name].get("commands"), f"app permission {name!r}")
+            if deny:
+                denies[f"app:{name}"] = deny
+            sc = norm_scope(perms[name].get("scope"), f"app permission {name!r}")
+            if sc is not None:
+                scopes[f"app:{name}"] = sc
+            return {f"app:{name}"} | {f"app-command:{c}" for c in allow}
+        if name in sets:
+            members = sets[name].get("permissions") if isinstance(sets[name], dict) else None
+            if not isinstance(members, list) or not all(isinstance(m, str) for m in members):
+                die(f"app permission set {name!r} has malformed members (expected a list of strings).")
+            out = {f"app:{name}"}
+            for m in members:
+                out |= expand(m, manifests, "", seen, unresolved, scopes, denies)
+            return out
+        die(
+            f"bare permission {name!r} is neither an application permission nor a set in "
+            f"__app-acl__ of {MANIFESTS.name}; its commands cannot be expanded."
+        )
 
     entry = manifests.get(plugin)
     if entry is None:
@@ -135,20 +263,29 @@ def expand(
         members = entry.get("default_permission", {}).get("permissions", [])
         out: set[str] = set()
         for m in members:
-            out |= expand(m, manifests, plugin, seen, unresolved)
+            out |= expand(m, manifests, plugin, seen, unresolved, scopes, denies)
         return out
 
     pset = entry.get("permission_sets", {}).get(name)
     if pset:
         out = set()
         for m in pset.get("permissions", []):
-            out |= expand(m, manifests, plugin, seen, unresolved)
+            out |= expand(m, manifests, plugin, seen, unresolved, scopes, denies)
         return out
 
+    perm = entry.get("permissions", {}).get(name)
+    if isinstance(perm, dict):
+        sc = norm_scope(perm.get("scope"), f"permission {key!r}")
+        if sc is not None:
+            scopes[key] = sc
+        allow, deny = norm_commands(perm.get("commands"), f"permission {key!r}")
+        if deny:
+            denies[key] = deny
+        return {key} | {f"plugin-command:{plugin}:{c}" for c in allow}
     return {key}
 
 
-def compute_surface() -> dict[str, list[str]]:
+def compute_surface() -> dict:
     caps = load_json(CAPABILITIES)
     manifests = load_json(MANIFESTS)
 
@@ -158,11 +295,13 @@ def compute_surface() -> dict[str, list[str]]:
 
     leaves: set[str] = set()
     unresolved: set[str] = set()
+    scopes: dict[str, dict[str, list[str]]] = {}
+    denies: dict[str, list[str]] = {}
     for g in grants:
         if not isinstance(g, str):
             die(f"non-string permission grant {g!r}; object-form scoped grants are not yet handled by this gate.")
         plugin, _ = split_ref(g, "")
-        leaves |= expand(g, manifests, plugin, set(), unresolved)
+        leaves |= expand(g, manifests, plugin, set(), unresolved, scopes, denies)
 
     if not leaves:
         die("expanded grant surface is empty -- the manifests or capabilities file is malformed.")
@@ -171,6 +310,8 @@ def compute_surface() -> dict[str, list[str]]:
         "granted": sorted(grants),
         "effective_leaf_permissions": sorted(leaves),
         "unresolved_references": sorted(unresolved),
+        "permission_scopes": {k: scopes[k] for k in sorted(scopes)},
+        "permission_command_denies": {k: denies[k] for k in sorted(denies)},
     }
 
 
@@ -219,11 +360,47 @@ def main() -> int:
     old_unresolved = sorted(recorded.get("unresolved_references", []))
     unresolved_changed = old_unresolved != current["unresolved_references"]
 
-    if not added and not removed and not grants_changed and not unresolved_changed:
+    # A leaf's identifier does not change when its SCOPE widens (a manifest lists the
+    # patterns a permission is limited to separately), so scopes are compared on
+    # their own. A snapshot recorded before scopes were tracked has no key: that
+    # reads as "no scopes recorded", so any scope now granted trips the ratchet.
+    old_scopes = recorded.get("permission_scopes", {})
+    if not isinstance(old_scopes, dict):
+        die("recorded snapshot permission_scopes is not an object.")
+    new_scopes = current["permission_scopes"]
+    scopes_changed = old_scopes != new_scopes
+    # `commands.deny` carves commands OUT of a permission, so a deny list that shrinks
+    # (or vanishes) widens the surface while every leaf identifier and scope stays put.
+    # Any movement is a reviewable event, in either direction.
+    old_denies = recorded.get("permission_command_denies", {})
+    if not isinstance(old_denies, dict):
+        die("recorded snapshot permission_command_denies is not an object.")
+    new_denies = current["permission_command_denies"]
+    denies_changed = old_denies != new_denies
+
+    if not added and not removed and not grants_changed and not unresolved_changed and not scopes_changed and not denies_changed:
         print(f"ACL GRANT SURFACE UNCHANGED — {len(new)} effective leaf permissions.")
         return 0
 
     print("ACL GRANT SURFACE CHANGED — the renderer's granted permission surface moved.\n")
+    if scopes_changed:
+        print("  permission SCOPES changed (the identifier is the same; what it may reach is not):")
+        for k in sorted(set(old_scopes) | set(new_scopes)):
+            if old_scopes.get(k) == new_scopes.get(k):
+                continue
+            print(f"      ~ {k}")
+            print(f"          was: {json.dumps(old_scopes.get(k))}")
+            print(f"          now: {json.dumps(new_scopes.get(k))}")
+        print()
+    if denies_changed:
+        print("  permission commands.deny lists changed (a SHRUNK deny list widens the surface):")
+        for k in sorted(set(old_denies) | set(new_denies)):
+            if old_denies.get(k) == new_denies.get(k):
+                continue
+            print(f"      ~ {k}")
+            print(f"          was: {json.dumps(old_denies.get(k))}")
+            print(f"          now: {json.dumps(new_denies.get(k))}")
+        print()
     if unresolved_changed:
         print("  references that could not be expanded against the manifests changed:")
         for r in sorted(set(current["unresolved_references"]) - set(old_unresolved)):

@@ -114,7 +114,7 @@ pub fn fixture_uuid_for_slot(slot: u16) -> IdentityId {
 /// shape (`markers::write_csq_account`) rather than the legacy decimal
 /// shape (`markers::write_csq_account_legacy`).
 ///
-/// Every fixture in the swap / auto-rotate / backsync test suites wrote the
+/// Every fixture in the swap / auto-rotate / credential-ingestion test suites wrote the
 /// decimal marker exclusively before this helper existed — which is why the
 /// narrow-marker-reader defect (`guard-reader-writer-parity.md`,
 /// `account-terminal-separation.md` MUST NOT Rule 3) went undetected across

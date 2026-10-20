@@ -173,8 +173,23 @@ fn is_cache_fresh(cache_path: &Path) -> bool {
 /// Writes (or overwrites) the cache timestamp file by touching it.
 fn write_cache_timestamp(cache_path: &Path) {
     // Create parent directory if needed (should already exist as base_dir).
+    // SEC-2.15 (unified, R1 M1): when it does not, the shared fail-closed
+    // helper creates it at 0o700 rather than the process umask.
     if let Some(parent) = cache_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        // R2 LOW 6 / R3 LOW 1: no silent discard — a failed secure is
+        // surfaced with a fixed-vocabulary tag (redacted); the best-effort
+        // write continues. The ROOT variant applies here: the cache file is
+        // `<base>/.csq-update-check`, so `parent` IS the accounts root —
+        // the operator-symlinkable component (R2 H1). The strict variant
+        // warned on every update check against a symlinked root and never
+        // tightened the real target.
+        if let Err(e) = crate::platform::fs::ensure_private_dir_root(parent) {
+            tracing::warn!(
+                error_kind = "update_cache_parent_secure_failed",
+                "update cache parent dir could not be secured: {}",
+                crate::error::redact_tokens(&e.to_string())
+            );
+        }
     }
     // Write an empty file — only the mtime matters.
     let _ = std::fs::write(cache_path, b"");
@@ -386,6 +401,44 @@ mod tests {
         assert!(
             path.exists(),
             "write_cache_timestamp must create parent dirs"
+        );
+    }
+
+    /// R3 LOW 1 regression: on a SYMLINKED accounts root (the cache file is
+    /// `<base>/.csq-update-check`, so `parent` IS the root) the strict helper
+    /// refused the link — every update check warned and the real target was
+    /// never tightened. The root variant must resolve the leaf symlink and
+    /// secure the target.
+    #[cfg(unix)]
+    #[test]
+    fn write_cache_timestamp_tightens_the_resolved_root_behind_a_symlink() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _umask = crate::platform::test_env::UmaskGuard::pin(0o022);
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real-accounts");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = dir.path().join("accounts");
+        std::os::unix::fs::symlink(&real, &root).unwrap();
+
+        write_cache_timestamp(&root.join(".csq-update-check"));
+
+        assert!(
+            real.join(".csq-update-check").exists(),
+            "the cache file must land at the symlink target"
+        );
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "the resolved root must be tightened through the symlink"
+        );
+        assert!(
+            std::fs::symlink_metadata(&root)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the root symlink must survive"
         );
     }
 }

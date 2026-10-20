@@ -77,12 +77,10 @@ use crate::desktop::AppState;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use csq_core::accounts::login_lock::{AccountLoginLock, AcquireOutcome};
-use csq_core::credentials;
 use csq_core::error::{redact_tokens, OAuthError};
 use csq_core::oauth::race::{drive_race, prepare_race, RaceWinner, DEFAULT_OVERALL_TIMEOUT};
 use csq_core::types::AccountNum;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
@@ -769,9 +767,14 @@ pub async fn start_claude_login_race(
     account: u16,
 ) -> Result<StartRaceResponse, String> {
     let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
-    let base = PathBuf::from(&base_dir);
+    // R3 LOW 5: CONTAIN the renderer-supplied base_dir through the shared
+    // canonical-equality resolver (the same S-H1 defense every other
+    // desktop prefs path uses) — a raw `PathBuf::from` would let the
+    // renderer name ANY euid-owned directory (e.g. $HOME), and the login
+    // lock (and, on the login path, root tightening) would operate on it.
+    let base = super::resolve_csq_base_dir(&base_dir)?;
     if !base.is_dir() {
-        return Err(format!("base directory does not exist: {base_dir}"));
+        return Err("base directory does not exist".to_string());
     }
 
     // GH an internal ticket: the reverse conflict guard that used to run here
@@ -805,6 +808,14 @@ pub async fn start_claude_login_race(
             ));
         }
     };
+
+    let prior_base = base.clone();
+    let prior = tokio::task::spawn_blocking(move || {
+        csq_core::accounts::anthropic_identity::capture_login_prior(&prior_base, account_num)
+    })
+    .await
+    .map_err(|_| "identity capture task failed".to_string())?
+    .map_err(|e| format!("identity capture failed: {e}"))?;
 
     // Two-phase race: prepare binds the loopback listener and mints
     // the URLs SYNCHRONOUSLY (microseconds), then drive blocks on
@@ -998,7 +1009,7 @@ pub async fn start_claude_login_race(
                 }
                 emit_exchanging(&app_handle, &window_label_for_task, acct_num_inner);
 
-                let outcome = finalize_login(&base_clone, account_num, &result).await;
+                let outcome = finalize_login(&base_clone, account_num, &result, prior).await;
                 match outcome {
                     Ok(email) => {
                         if let Ok(mut p) = phase_for_task.lock() {
@@ -1057,6 +1068,24 @@ pub async fn start_claude_login_race(
         account: account_num.get(),
         race_token,
     })
+}
+
+/// The one (message, kind) pair the race flow reports when the verified-login commit
+/// refuses. Uses the account-aware wording the CLI and the other desktop login paths use,
+/// so a refusal reads the same on every surface and `csq login N` names the real slot.
+fn identity_commit_failure(
+    error: &csq_core::accounts::anthropic_identity::IdentityError,
+    account: AccountNum,
+) -> (String, &'static str) {
+    (
+        format!(
+            "identity verification failed: {}",
+            csq_core::accounts::login::LoginCommitOutcome::describe_commit_failure_for_account(
+                error, account
+            )
+        ),
+        "identity_failed",
+    )
 }
 
 /// Renders an `LoginInProgressElsewhere` error consistently across
@@ -1252,6 +1281,7 @@ async fn finalize_login(
     base: &std::path::Path,
     account: AccountNum,
     result: &csq_core::oauth::race::RaceResult,
+    prior: csq_core::accounts::anthropic_identity::LoginPrior,
 ) -> Result<String, (String, &'static str)> {
     use csq_core::oauth::exchange_code;
 
@@ -1288,41 +1318,33 @@ async fn finalize_login(
             )
         })?;
 
-        // an internal ticket (unregistered race-flow sibling): this exchange-based path
-        // has NO `config-N/.claude.json`, so the subprocess-flow helper
-        // `ensure_login_identity_minted` (which reads the email from that file)
-        // does not apply. This command is currently unregistered (renderer uses
-        // `start_claude_login_subprocess`). If re-registered as a live first-login
-        // path, mint the UUID from `credential`'s `oauthAccount.emailAddress`
-        // BEFORE this save, or fresh installs reintroduce an internal ticket (fail-closed save).
-        credentials::save_canonical_for(&base_owned, account, &credential).map_err(|e| {
-            (
-                format!("credential write failed: {}", redact_tokens(&e.to_string())),
-                "credential_write",
-            )
-        })?;
-
-        // Run finalize_login here so the email is populated BEFORE
-        // we return — M3 reads the email from this Result rather
-        // than re-reading profiles.json.
+        let committed = csq_core::accounts::anthropic_identity::commit_anthropic_login(
+            &base_owned,
+            account,
+            &credential,
+            None,
+            prior,
+        )
+        .map_err(|e| identity_commit_failure(&e, account))?;
         let email =
-            csq_core::accounts::login::finalize_login(&base_owned, account).map_err(|e| {
-                (
-                    format!("finalize failed: {}", redact_tokens(&e.to_string())),
-                    "post_login",
-                )
-            })?;
+            csq_core::accounts::login::finalize_verified_login(&base_owned, account, committed)
+                .map_err(|e| {
+                    (
+                        format!("finalize failed: {}", redact_tokens(&e.to_string())),
+                        "post_login",
+                    )
+                })?;
 
         // Tell the daemon its account-discovery cache is stale so
         // get_accounts picks up the new slot on the dashboard's
         // next 5s poll.
-        #[cfg(unix)]
-        {
-            let sock = csq_core::daemon::socket_path(&base_owned);
-            if sock.exists() {
-                let _ = csq_core::daemon::http_post_unix(&sock, "/api/invalidate-cache");
-            }
-        }
+        super::notify_daemon_cache_invalidated(&base_owned);
+
+        // login-followup: the commit + finalize above SUCCEEDED, so wake
+        // the daemon's usage poller for an immediate quota tick instead
+        // of a wait up to 5 minutes. Best-effort (absent daemon is the
+        // common case); cross-platform via the notify chokepoint.
+        csq_core::daemon::notify::slot_rebind(&base_owned, account.get());
 
         Ok::<String, (String, &'static str)>(email)
     });
@@ -1526,6 +1548,37 @@ fn emit_cancelled<R: tauri::Runtime>(app: &AppHandle<R>, window_label: &str, acc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use csq_core::accounts::anthropic_identity::{IdentityError, SlotKey};
+
+    /// Twin parity with the CLI: the desktop race flow shows the same facts and the same
+    /// remedy for the two slot-naming refusals, with the real slot numbers substituted.
+    #[test]
+    fn identity_commit_failure_names_the_slot_and_the_remedy() {
+        let account = AccountNum::try_from(4u16).unwrap();
+        let (text, kind) = identity_commit_failure(
+            &IdentityError::SiblingCustodyUnreadable {
+                sibling: SlotKey::from_key("2"),
+            },
+            account,
+        );
+        assert_eq!(kind, "identity_failed");
+        assert_eq!(
+            text,
+            "identity verification failed: slot 2's stored identity is unreadable; run `csq login 2` or `csq logout 2` to replace it (the slot being logged in is unaffected) (oauth_identity_refused)"
+        );
+        let (text, _) = identity_commit_failure(
+            &IdentityError::LoginCredentialHeldElsewhere {
+                holder: SlotKey::from_key("2"),
+            },
+            account,
+        );
+        assert_eq!(
+            text,
+            "identity verification failed: this login produced a credential that slot 2 already holds; run `csq login 4` again so a fresh credential is issued, or `csq logout 2` if slot 2 is the one that is stale (oauth_identity_refused)"
+        );
+        assert!(!text.contains("csq login N"), "{text}");
+    }
+
     use std::sync::Arc;
     use tokio::sync::oneshot;
 

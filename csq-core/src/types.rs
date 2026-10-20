@@ -414,8 +414,8 @@ mod tests {
     fn scan_serializable_token_holders() -> (std::collections::BTreeSet<String>, usize) {
         use std::collections::{HashMap, HashSet};
 
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let src_root = std::path::PathBuf::from(manifest_dir).join("src");
+        let manifest_dir = crate::testing::manifest_dir(env!("CARGO_MANIFEST_DIR"));
+        let src_root = manifest_dir.join("src");
 
         let field_re = regex::Regex::new(
             r"^(?:pub(?:\([^)]*\))?\s+)?[A-Za-z_][A-Za-z0-9_]*\s*:\s*(?:Option<|Vec<|Box<)*([A-Za-z_][A-Za-z0-9_]*)",

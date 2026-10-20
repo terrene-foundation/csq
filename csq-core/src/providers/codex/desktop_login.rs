@@ -219,8 +219,10 @@ where
     // `model = None`: csq does NOT force a model at login (CC-parity). The
     // user-global `~/.codex/config.toml` `model` propagates; absent → codex
     // built-in default. Mirrors `login.rs` (twin-parity).
-    surface::write_config_toml(base_dir, account, None)
-        .with_context(|| "pre-seed config-<N>/config.toml failed")?;
+    surface::write_config_toml(base_dir, account, None).map_err(|error| {
+        let context = surface::config_write_error_context(&error);
+        anyhow::Error::new(error).context(context)
+    })?;
 
     // Step 4: shell out via the caller-supplied spawn closure. The
     // closure bridges stdout lines into device-code events.
@@ -325,10 +327,7 @@ where
         // readable between attempts) — the mint failed, so no canonical write
         // happened; the retry path expects `written` absent.
         scrub_and_remove_written(&written, account, "mint_failed");
-        return Err(anyhow!(
-            "could not mint identity UUID for Codex slot {} — check profiles.json permissions and disk space",
-            account
-        ));
+        return Err(anyhow!(super::login::mint_error_message(account, &e)));
     }
 
     if let Err(e) = cred_file::save_canonical_for(base_dir, account, &canonical) {
@@ -1007,6 +1006,43 @@ mod tests {
     }
 
     #[test]
+    fn complete_login_removed_identity_reports_logout_login_remedy() {
+        let dir = TempDir::new().unwrap();
+        let _env = FreshSlotTestEnv::new(dir.path());
+        let base = dir.path();
+        tos::acknowledge(base).unwrap();
+        provision_uuid_for_account(base, 12);
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(12);
+        crate::accounts::identity_store::mark_identity_removed(base, uuid);
+        let path = profiles::profiles_path(base);
+        let before = std::fs::read(&path).unwrap();
+        let error = complete_login(
+            base,
+            acc(12),
+            false,
+            || panic!("must not purge"),
+            |config_dir, _| {
+                stub_codex_auth_json(config_dir, "removed-bound-fixture");
+                Ok(fake_success())
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("bound_identity_removed"),
+            "bound identity remedy lost: {message}"
+        );
+        assert!(message.contains("csq logout 12 then csq login 12"));
+        assert!(!message.contains("disk space"));
+        assert!(!base.join("config-12/auth.json").exists());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert!(crate::accounts::identity_store::is_identity_removed(
+            base, uuid
+        ));
+    }
+
+    #[test]
     fn complete_login_success_path_writes_canonical_and_profile() {
         let dir = TempDir::new().unwrap();
         tos::acknowledge(dir.path()).unwrap();
@@ -1062,7 +1098,7 @@ mod tests {
     /// Pins ambient configuration and the secret backend for these login fixtures.
     /// Restores both overrides on unwind while holding the workspace env lock.
     struct FreshSlotTestEnv {
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: crate::platform::test_env::EnvTestGuard,
         previous: [Option<std::ffi::OsString>; 2],
     }
 
@@ -1339,7 +1375,14 @@ mod tests {
             "pre: slot must be Gemini-bound before the desktop Codex login attempt"
         );
 
-        // Force the mint's ProfilesFileLock::acquire to fail (EISDIR).
+        let marker = crate::providers::gemini::provisioning::binding_path(base, account);
+        let marker_before = std::fs::read(&marker).unwrap();
+        let profiles_path = crate::accounts::profiles::profiles_path(base);
+        let profiles_before = std::fs::read(&profiles_path).unwrap();
+        // Gemini publication now creates the cooperative authority lockfile.
+        // Replace only this temp fixture's regular file with a directory to
+        // inject the same real mint-acquisition failure (EISDIR) as before.
+        std::fs::remove_file(base.join(".profiles.lock")).unwrap();
         std::fs::create_dir_all(base.join(".profiles.lock")).unwrap();
 
         // Pinned for the same reason as the sibling cleanup test, and for one
@@ -1370,6 +1413,8 @@ mod tests {
              detect point — a failed login must not destroy a binding it never \
              actually replaced"
         );
+        assert_eq!(std::fs::read(marker).unwrap(), marker_before);
+        assert_eq!(std::fs::read(profiles_path).unwrap(), profiles_before);
     }
 
     #[test]

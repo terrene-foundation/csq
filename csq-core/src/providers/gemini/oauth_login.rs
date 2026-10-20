@@ -241,13 +241,11 @@ pub fn perform(base_dir: &Path, slot: AccountNum) -> Result<(), OauthLoginError>
     // gemini-cli would silently use ambient API-key auth at next
     // `csq run N`.
     let cwd = std::env::current_dir().map_err(OauthLoginError::CwdResolveFailed)?;
-    // Round-2 redteam LOW-2: treat HOME=="" the same as HOME unset; an
-    // empty HOME would resolve `~/.gemini/oauth_creds.json` to the
+    // Round-2 redteam LOW-2: treat an empty home the same as an unavailable one; an
+    // empty home would resolve `~/.gemini/oauth_creds.json` to the
     // CWD-relative path `.gemini/oauth_creds.json`, which then fails
     // with NotFound and surfaces the wrong remediation hint.
-    let home_dir = std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(PathBuf::from);
+    let home_dir = crate::platform::home::home_dir().filter(|h| !h.as_os_str().is_empty());
     if let DotenvScanResult::ShadowAuthFound { env_file, variable } =
         pre_spawn_dotenv_scan(&cwd, home_dir.as_deref())
     {
@@ -262,12 +260,7 @@ pub fn perform(base_dir: &Path, slot: AccountNum) -> Result<(), OauthLoginError>
     let oauth_creds_path = home_dir
         .as_ref()
         .map(|h| h.join(".gemini").join("oauth_creds.json"))
-        .ok_or_else(|| {
-            OauthLoginError::CwdResolveFailed(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "HOME env var not set or empty",
-            ))
-        })?;
+        .ok_or_else(home_unavailable)?;
     match verify_oauth_creds(&oauth_creds_path, slot) {
         Ok(()) => {
             // Tokens are valid; no OAuth needed (idempotent path).
@@ -384,7 +377,8 @@ fn verify_oauth_creds(path: &Path, slot: AccountNum) -> Result<(), OauthLoginErr
 /// Reuses `verify_oauth_creds` — the exact `exists + valid + fresh` check
 /// gemini-cli's own auth will apply — so a green pre-flight means gemini-cli
 /// will find usable creds and run non-interactively. `home_dir` is injected
-/// for testability; production passes the process `HOME`. Read-only: no
+/// for testability; production calls [`check_headless_oauth_ready_for_process`], which
+/// resolves it with `platform::home::home_dir`. Read-only: no
 /// secret is extracted or copied (`feedback_delegate_to_reference_client`).
 pub fn check_headless_oauth_ready(
     home_dir: Option<&Path>,
@@ -392,13 +386,26 @@ pub fn check_headless_oauth_ready(
 ) -> Result<(), OauthLoginError> {
     let oauth_creds_path = home_dir
         .map(|h| h.join(".gemini").join("oauth_creds.json"))
-        .ok_or_else(|| {
-            OauthLoginError::CwdResolveFailed(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "HOME env var not set or empty",
-            ))
-        })?;
+        .ok_or_else(home_unavailable)?;
     verify_oauth_creds(&oauth_creds_path, slot)
+}
+
+/// [`check_headless_oauth_ready`] for the current process: the home directory comes from
+/// `platform::home::home_dir` (an empty one counts as unavailable), the SAME resolver the
+/// OAuth writer ([`super::oauth_flow`]), the usage poller and the spawn plan use, so a
+/// credential file written for one is the file the others read (on Windows `HOME` is
+/// usually unset and the known-folder profile directory is the real home).
+pub fn check_headless_oauth_ready_for_process(slot: AccountNum) -> Result<(), OauthLoginError> {
+    let home = crate::platform::home::home_dir().filter(|h| !h.as_os_str().is_empty());
+    check_headless_oauth_ready(home.as_deref(), slot)
+}
+
+/// The "no usable home directory" error shared by the login and headless paths.
+fn home_unavailable() -> OauthLoginError {
+    OauthLoginError::CwdResolveFailed(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "home directory unavailable or empty",
+    ))
 }
 
 #[cfg(test)]
@@ -431,16 +438,32 @@ mod tests {
         }
     }
 
+    struct FixtureEnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl FixtureEnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self(
+                keys.iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            )
+        }
+    }
+    impl Drop for FixtureEnvRestore {
+        fn drop(&mut self) {
+            for (key, previous) in self.0.drain(..).rev() {
+                match previous {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     fn with_home<R>(home: &str, f: impl FnOnce() -> R) -> R {
         let _g = crate::platform::test_env::lock();
-        let prior = std::env::var_os("HOME");
+        let _restore = FixtureEnvRestore::capture(&["HOME"]);
         std::env::set_var("HOME", home);
-        let out = f();
-        match prior {
-            Some(p) => std::env::set_var("HOME", p),
-            None => std::env::remove_var("HOME"),
-        }
-        out
+        f()
     }
 
     #[test]
@@ -695,7 +718,7 @@ mod tests {
 
     #[test]
     fn check_headless_oauth_ready_not_found_when_absent() {
-        // Empty HOME with no ~/.gemini/oauth_creds.json → typed NotFound,
+        // A home with no ~/.gemini/oauth_creds.json → typed NotFound,
         // NOT a hang. This is the an internal ticket headless contract.
         let home = TempDir::new().unwrap();
         let err = check_headless_oauth_ready(Some(home.path()), slot(10)).unwrap_err();
@@ -710,7 +733,7 @@ mod tests {
         let err = check_headless_oauth_ready(None, slot(10)).unwrap_err();
         matches!(err, OauthLoginError::CwdResolveFailed(_))
             .then_some(())
-            .expect("expected CwdResolveFailed when HOME is absent");
+            .expect("expected CwdResolveFailed when the home directory is unavailable");
     }
 
     #[test]

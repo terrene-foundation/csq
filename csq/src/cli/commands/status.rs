@@ -22,7 +22,7 @@
 use anyhow::Result;
 use csq_core::accounts::snapshot;
 use csq_core::quota::status::{render_status_table, show_status, AccountStatus};
-use csq_core::sdk::{self, Envelope, SCHEMA_STATUS_V1};
+use csq_core::sdk::{self, Envelope, SCHEMA_STATUS_V2};
 use csq_core::types::AccountNum;
 use serde::Serialize;
 use std::path::Path;
@@ -34,15 +34,44 @@ use csq_core::daemon::{self, DetectResult};
 #[cfg(unix)]
 use csq_core::quota::status::compose_status;
 
-/// `csq.status.v1` payload (an internal ticket Track B). **R1** — hand-authored, explicit
-/// field: `data` carries the pre-existing `Vec<AccountStatus>` rows UNCHANGED. Before
-/// this schema existed `csq status --json` emitted a BARE top-level array, so a host
-/// had nothing to feature-detect against. Migration for an existing consumer is a
-/// one-line jq change: `.[0].id` -> `.data[0].id` (workspace `sdk-surface`
-/// LAUNCH-LEDGER 2026-08-09-wave3 Track B).
+/// `csq.status.v2` preserves v1 account rows and adds token-free daemon
+/// snapshot evidence. Missing or stale evidence is explicitly unknown.
 #[derive(Debug, Serialize)]
 struct StatusPayload {
     data: Vec<AccountStatus>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    session_logins: Vec<csq_core::credentials::session_login::SessionLogin>,
+    sessions_undetermined: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keychain_mirror_age_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keychain_mirror: Option<csq_core::credentials::keychain::MirrorSyncStatus>,
+    /// The orphan sweep's published state, from the SAME accessor `csq doctor`
+    /// and the desktop use. Omitted when the sweep never published.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keychain_orphans: Option<csq_core::credentials::keychain::orphans::OrphanDiagnosticView>,
+    /// Slots whose identity holds a pending post-commit rescue record.
+    /// A pending record blocks the refresher's provider request (the
+    /// canonical may hold an already-consumed token), so it is surfaced
+    /// here instead of staying a log-only state. Fixed vocabulary; no
+    /// paths, no credential material.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    rescue_pending: Vec<csq_core::credentials::rescue::PendingRescue>,
+}
+
+/// The one text line `csq status` prints for the orphan sweep (the wording is
+/// the accessor's `summary`; only the level tag is added here).
+pub(crate) fn keychain_orphans_text(
+    view: &csq_core::credentials::keychain::orphans::OrphanDiagnosticView,
+) -> String {
+    use csq_core::credentials::keychain::orphans::DiagnosticLevel;
+    let tag = match view.level {
+        DiagnosticLevel::Ok => "ok",
+        DiagnosticLevel::Info => "info",
+        DiagnosticLevel::Warn => "warn",
+        DiagnosticLevel::NeedsAction => "NEEDS ACTION",
+    };
+    format!("Keychain orphans [{tag}]: {}", view.summary)
 }
 
 pub fn handle(base_dir: &Path, json: bool) -> Result<()> {
@@ -56,14 +85,47 @@ pub fn handle(base_dir: &Path, json: bool) -> Result<()> {
 
     let accounts = resolve_accounts(base_dir, active);
 
+    let login_diagnostics = csq_core::credentials::session_login::read_diagnostics(base_dir);
+    let keychain_orphans =
+        csq_core::credentials::keychain::orphans::read_diagnostic(base_dir).view();
+    let rescue_pending = csq_core::credentials::rescue::pending_rescues(base_dir);
+
     if json {
         // R3: emit() is the only stdout writer for the enveloped surface.
         sdk::emit(&Envelope::success(
-            SCHEMA_STATUS_V1,
+            SCHEMA_STATUS_V2,
             None,
-            StatusPayload { data: accounts },
+            StatusPayload {
+                data: accounts,
+                session_logins: login_diagnostics.session_logins,
+                sessions_undetermined: login_diagnostics.sessions_undetermined,
+                keychain_mirror_age_secs: login_diagnostics.snapshot_age_secs,
+                keychain_mirror: login_diagnostics.keychain_mirror,
+                keychain_orphans,
+                rescue_pending,
+            },
         ))?;
         return Ok(());
+    }
+
+    for login in &login_diagnostics.session_logins {
+        if let Some(line) = csq_core::credentials::session_login::finding_line(login) {
+            println!("{line}");
+        }
+    }
+    println!(
+        "{}",
+        csq_core::credentials::session_login::snapshot_line(
+            login_diagnostics.keychain_mirror.as_ref(),
+            login_diagnostics.snapshot_age_secs,
+            login_diagnostics.sessions_undetermined
+        )
+    );
+    if let Some(view) = &keychain_orphans {
+        println!("{}", keychain_orphans_text(view));
+    }
+    for rescue in &rescue_pending {
+        println!("{}", render_rescue_line(rescue));
     }
 
     if accounts.is_empty() {
@@ -78,6 +140,19 @@ pub fn handle(base_dir: &Path, json: bool) -> Result<()> {
     println!();
 
     Ok(())
+}
+
+/// Renders ONE pending-rescue status line with the shared fixed-vocabulary
+/// message from `csq-core` (`PendingRescue::status_line`), so `csq status`,
+/// `csq doctor` and the desktop row cannot drift apart.
+fn render_rescue_line(rescue: &csq_core::credentials::rescue::PendingRescue) -> String {
+    use csq_core::credentials::rescue::RescuePendingState;
+    let icon = match rescue.state {
+        // Undetermined is a warning too: silence would read as "all clear".
+        RescuePendingState::Unadoptable | RescuePendingState::Unknown => "⚠",
+        RescuePendingState::Adoptable => "ℹ",
+    };
+    format!("  Rescue: {icon} {}", rescue.status_line())
 }
 
 /// Returns the composed [`AccountStatus`] entries, trying the
@@ -195,8 +270,8 @@ mod tests {
     }
 
     /// Golden fixture (an internal ticket Track B): every pre-existing `AccountStatus`
-    /// row field, unchanged, now lives at `data[N].<field>` under the
-    /// `csq.status.v1` envelope. A rename or retype of ANY field asserted here
+    /// row field remains unchanged at `data[N].<field>` under the
+    /// `csq.status.v2` envelope. A rename or retype of ANY field asserted here
     /// REDS this test — that non-vacuity is the entire point of versioning the
     /// schema (verified by hand: renaming `StatusPayload.data` to `.rows` fails
     /// this test with "missing field `data`" / a null `data[0]` lookup).
@@ -204,12 +279,19 @@ mod tests {
     fn status_json_envelope_matches_golden_shape() {
         let payload = StatusPayload {
             data: vec![sample_row()],
+            session_logins: Vec::new(),
+            sessions_undetermined: true,
+            keychain_mirror_age_secs: None,
+            keychain_mirror: None,
+            keychain_orphans: None,
+            rescue_pending: Vec::new(),
         };
-        let env = Envelope::success(SCHEMA_STATUS_V1, None, payload);
+        let env = Envelope::success(SCHEMA_STATUS_V2, None, payload);
         let line = env.to_line().unwrap();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
 
-        assert_eq!(v["schema"], "csq.status.v1");
+        assert_eq!(v["schema"], "csq.status.v2");
+        assert_eq!(v["sessions_undetermined"], true);
         assert_eq!(v["ok"], true);
         assert!(
             v.get("error").is_none(),
@@ -234,13 +316,165 @@ mod tests {
         assert!(row.get("stale_secs").is_none());
     }
 
+    /// Seeds a profiles binding plus an identity directory for `slot`, and
+    /// writes `record` at the legacy rescue path when given.
+    fn seed_slot_with_rescue(
+        base: &Path,
+        slot: u16,
+        record: Option<&[u8]>,
+    ) -> csq_core::accounts::identity_store::IdentityId {
+        let uuid = csq_core::testing::identity_fixtures::fixture_uuid_for_slot(slot);
+        let mut profiles = csq_core::accounts::profiles::ProfilesFile::empty();
+        profiles.by_slot.insert(slot.to_string(), uuid);
+        csq_core::accounts::profiles::save(
+            &csq_core::accounts::profiles::profiles_path(base),
+            &profiles,
+        )
+        .unwrap();
+        let identity_dir = csq_core::accounts::identity_store::credentials_path_for(base, uuid)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::fs::create_dir_all(&identity_dir).unwrap();
+        if let Some(bytes) = record {
+            std::fs::write(
+                csq_core::credentials::rescue::rescue_record_path(&identity_dir),
+                bytes,
+            )
+            .unwrap();
+        }
+        uuid
+    }
+
+    /// A record adoption can never install is VISIBLE on `csq status` with
+    /// the fixed-vocabulary action — the block is otherwise log-only.
+    ///
+    /// RED mutation: make `render_rescue_line` print the adoptable text for
+    /// every state — the exact line assertion fails.
+    #[test]
+    fn unparseable_rescue_renders_visible_status_line() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed_slot_with_rescue(dir.path(), 3, Some(b"not json"));
+
+        let lines: Vec<String> = csq_core::credentials::rescue::pending_rescues(dir.path())
+            .iter()
+            .map(render_rescue_line)
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "  Rescue: ⚠ slot 3: a saved login could not be restored; sign in again for this account"
+                    .to_string()
+            ],
+            "an unadoptable rescue must be visible with its action"
+        );
+
+        // The JSON envelope carries the same state additively.
+        let payload = StatusPayload {
+            data: Vec::new(),
+            session_logins: Vec::new(),
+            sessions_undetermined: true,
+            keychain_mirror_age_secs: None,
+            keychain_mirror: None,
+            keychain_orphans: None,
+            rescue_pending: csq_core::credentials::rescue::pending_rescues(dir.path()),
+        };
+        let line = Envelope::success(SCHEMA_STATUS_V2, None, payload)
+            .to_line()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["rescue_pending"][0]["slot"], 3);
+        assert_eq!(v["rescue_pending"][0]["state"], "unadoptable");
+    }
+
+    /// A slot with no pending record prints no rescue line at all — the
+    /// unadoptable line above is not a constant.
+    #[test]
+    fn no_rescue_record_renders_no_line() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed_slot_with_rescue(dir.path(), 4, None);
+        assert!(
+            csq_core::credentials::rescue::pending_rescues(dir.path()).is_empty(),
+            "no record means no visible rescue state"
+        );
+    }
+
+    /// `profiles.json` unreadable: the fallback enumerator still surfaces the
+    /// rescued identity on `csq status`, labelled by its canonical UUID.
+    ///
+    /// RED mutation: return `Vec::new()` when profiles cannot be loaded —
+    /// this test renders zero lines.
+    #[test]
+    fn fallback_rescue_renders_identity_line_when_profiles_unreadable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = csq_core::testing::identity_fixtures::fixture_uuid_for_slot(6);
+        let identity_dir = csq_core::accounts::identity_store::identity_path(base, uuid);
+        std::fs::create_dir_all(&identity_dir).unwrap();
+        std::fs::write(
+            csq_core::credentials::rescue::rescue_record_path(&identity_dir),
+            b"not json",
+        )
+        .unwrap();
+        std::fs::write(
+            csq_core::accounts::profiles::profiles_path(base),
+            b"not json",
+        )
+        .unwrap();
+
+        let lines: Vec<String> = csq_core::credentials::rescue::pending_rescues(base)
+            .iter()
+            .map(render_rescue_line)
+            .collect();
+        assert_eq!(
+            lines,
+            vec![format!(
+                "  Rescue: ⚠ identity {uuid}: a saved login could not be restored; sign in again for this account"
+            )],
+            "the fallback identity must be visible with its action"
+        );
+    }
+
+    /// `profiles.json` AND the identities directory unreadable/absent: ONE
+    /// explicit UNKNOWN line, never silence.
+    ///
+    /// RED mutation: return `Vec::new()` from the identities-scan failure arm
+    /// — this test renders zero lines.
+    #[test]
+    fn unknown_rescue_renders_one_explicit_line() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+        std::fs::write(
+            csq_core::accounts::profiles::profiles_path(base),
+            b"not json",
+        )
+        .unwrap();
+        assert!(!csq_core::accounts::identity_store::identities_dir(base).exists());
+
+        let lines: Vec<String> = csq_core::credentials::rescue::pending_rescues(base)
+            .iter()
+            .map(render_rescue_line)
+            .collect();
+        assert_eq!(
+            lines,
+            vec!["  Rescue: ⚠ rescue status unknown: profiles unreadable".to_string()],
+            "exactly one explicit unknown row"
+        );
+    }
+
     #[test]
     fn status_json_envelope_is_a_single_line() {
         let env = Envelope::success(
-            SCHEMA_STATUS_V1,
+            SCHEMA_STATUS_V2,
             None,
             StatusPayload {
                 data: vec![sample_row()],
+                session_logins: Vec::new(),
+                sessions_undetermined: true,
+                keychain_mirror_age_secs: None,
+                keychain_mirror: None,
+                keychain_orphans: None,
+                rescue_pending: Vec::new(),
             },
         );
         let line = env.to_line().unwrap();

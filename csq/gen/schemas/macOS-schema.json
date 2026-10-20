@@ -345,6 +345,60 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Enables the pool_add command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pool-add",
+          "markdownDescription": "Enables the pool_add command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the pool_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pool-list",
+          "markdownDescription": "Enables the pool_list command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the pool_remove command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pool-remove",
+          "markdownDescription": "Enables the pool_remove command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the pool_set_reset command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pool-set-reset",
+          "markdownDescription": "Enables the pool_set_reset command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pool_add command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pool-add",
+          "markdownDescription": "Denies the pool_add command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pool_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pool-list",
+          "markdownDescription": "Denies the pool_list command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pool_remove command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pool-remove",
+          "markdownDescription": "Denies the pool_remove command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pool_set_reset command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pool-set-reset",
+          "markdownDescription": "Denies the pool_set_reset command without any pre-configured scope."
+        },
+        {
+          "description": "Preserve existing local main-window app commands when enabling the application ACL.",
+          "type": "string",
+          "const": "legacy-main",
+          "markdownDescription": "Preserve existing local main-window app commands when enabling the application ACL."
+        },
+        {
           "description": "This permission set configures if your\napplication can enable or disable auto\nstarting the application on boot.\n\n#### Granted Permissions\n\nIt allows all to check, enable and\ndisable the automatic start on boot.\n\n\n#### This default permission set includes:\n\n- `allow-enable`\n- `allow-disable`\n- `allow-is-enabled`",
           "type": "string",
           "const": "autostart:default",

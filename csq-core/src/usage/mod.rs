@@ -43,3 +43,4 @@ pub mod cost_rates;
 pub mod launch_log;
 pub mod ledger;
 pub mod request;
+pub mod session_cost;

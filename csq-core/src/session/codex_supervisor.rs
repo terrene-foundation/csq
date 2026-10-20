@@ -1634,6 +1634,9 @@ mod tests {
     /// it to exit, then verifies the record now reads as dead.
     #[test]
     fn verify_supervisor_alive_false_after_process_exits() {
+        // A bare program name resolves through the process PATH, which sibling tests swap
+        // under the shared env lock; hold it so the spawn cannot see a mid-swap PATH.
+        let _env_lock = crate::platform::test_env::lock();
         let dir = tmp_handle_dir();
         let mut child = Command::new("true")
             .stdin(Stdio::null())
@@ -2377,6 +2380,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn signal_supervisor_delivers_to_a_real_child() {
+        // A bare program name resolves through the process PATH, which sibling tests swap
+        // under the shared env lock; hold it so the spawn cannot see a mid-swap PATH.
+        let _env_lock = crate::platform::test_env::lock();
         // A child that ignores SIGUSR1 via a trap, then exits 0 once
         // signalled — proves delivery rather than merely that `kill`
         // returned success against a PID.

@@ -44,8 +44,8 @@
 
 #![cfg(unix)]
 
-#[path = "../src/daemon/test_socket_fixture.rs"]
-mod test_socket_fixture;
+#[path = "../src/testing/socket_fixture.rs"]
+mod socket_fixture;
 
 use csq_core::audit::persist::{gen_run_id, AuditRecord, Decision, ResultState, Surface};
 use csq_core::daemon::startup_reconciler::run_reconciler;
@@ -54,12 +54,12 @@ use csq_core::daemon::{
     server::{serve, RouterState, DISCOVERY_CACHE_MAX_AGE},
 };
 use csq_core::oauth::OAuthStateStore;
+use socket_fixture::UnixSocketFixture;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use test_socket_fixture::UnixSocketFixture;
 
 // ── Load test configuration ──────────────────────────────────────────────────
 
@@ -96,6 +96,7 @@ fn make_router_state(base: &Path) -> RouterState {
         audit_health: csq_core::audit::new_shared(csq_core::audit::AuditHealth::Verified),
         audit_records_unverified: 0,
         anchor_sink: None,
+        usage_poller_wake: std::sync::Arc::new(csq_core::daemon::usage_poller::WakeChannel::new()),
         #[cfg(feature = "enterprise")]
         interactive: Arc::new(csq_core::daemon::InteractiveSessionRegistry::empty()),
     }

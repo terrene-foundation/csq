@@ -114,7 +114,7 @@ pub enum OauthFlowError {
     TokenExchange(String),
     #[error("oauth_creds.json write failed at {path}: {reason}")]
     WriteFailed { path: PathBuf, reason: String },
-    #[error("HOME env var not set; cannot resolve `~/.gemini/oauth_creds.json`")]
+    #[error("home directory unavailable; cannot resolve `~/.gemini/oauth_creds.json`")]
     HomeNotSet,
 }
 
@@ -700,9 +700,11 @@ fn exchange_code(
 /// Atomically writes the OAuth creds to `~/.gemini/oauth_creds.json`
 /// at mode 0600.
 fn write_oauth_creds(creds: &OauthCreds) -> Result<(), OauthFlowError> {
-    let home = std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(PathBuf::from)
+    // The shared home resolver (`dirs::home_dir`: HOME on unix, the known-folder API
+    // on Windows where HOME is usually unset), the same one the daemon-start
+    // integrity-label sweep uses for this file.
+    let home = crate::platform::home::home_dir()
+        .filter(|h| !h.as_os_str().is_empty())
         .ok_or(OauthFlowError::HomeNotSet)?;
     let gemini_dir = home.join(".gemini");
     std::fs::create_dir_all(&gemini_dir).map_err(|e| OauthFlowError::WriteFailed {
@@ -976,6 +978,24 @@ fn extract_assigned_string(body: &str, var_name: &str) -> Option<String> {
         return Some(value.to_string());
     }
     None
+}
+
+/// Test seam: writes a minimal credential file through the production writer
+/// ([`write_oauth_creds`]) so a parity test can prove the writer, the usage poller and the
+/// headless check resolve the same home directory.
+#[cfg(test)]
+pub(crate) fn write_creds_for_test(
+    access_token: &str,
+    expiry_date: i64,
+) -> Result<(), OauthFlowError> {
+    write_oauth_creds(&OauthCreds {
+        access_token: access_token.to_string(),
+        refresh_token: "1//parity".to_string(),
+        scope: "parity".to_string(),
+        token_type: "Bearer".to_string(),
+        id_token: String::new(),
+        expiry_date,
+    })
 }
 
 #[cfg(test)]

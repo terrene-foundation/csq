@@ -366,7 +366,13 @@ pub fn handle_switch(
             // across launch re-merges). This is the ONLY path that writes a
             // model; login/spawn/reconciler pass `None`.
             providers::codex::surface::write_config_toml(base_dir, slot_num, Some(&model_id))
-                .map_err(|e| anyhow!("failed to write config.toml for slot {slot_num}: {e}"))?;
+                .map_err(|e| {
+                    anyhow!(
+                        "{} for slot {slot_num}: {}",
+                        providers::codex::surface::config_write_error_context(&e),
+                        providers::codex::surface::config_write_error_source(&e)
+                    )
+                })?;
             println!(
                 "Switched {} model on slot {} to {}",
                 provider_id, slot_num, model_id

@@ -2,12 +2,20 @@
   "edition": "enterprise",
   "features": {
     "exec": {
-      "providers_routable": ["claude", "gemini", "codex"]
+      "providers_routable": [
+        "claude",
+        "gemini",
+        "codex"
+      ]
     }
   },
   "id": "corr-id-2",
   "ok": true,
-  "ops": ["exec.v1", "capabilities.v1", "verify.v1"],
+  "ops": [
+    "exec.v1",
+    "capabilities.v1",
+    "verify.v1"
+  ],
   "providers": [
     {
       "binary": "claude-cli",
@@ -32,7 +40,7 @@
       }
     ],
     "crate": "csq-sdk",
-    "version": "2.19.0"
+    "version": "2.20.2"
   },
   "tool": {
     "edition": "enterprise",

@@ -214,8 +214,11 @@ pub fn save(base_dir: &Path, posture: DaemonPosture) -> Result<(), PostureError>
     let path = posture_path(base_dir);
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| PostureError::Io {
-            message: format!("create parent dir for {POSTURE_FILE_NAME}: {e}"),
+        // SEC-2.15 (unified, R1 M1): posture.json's parent chain is the
+        // accounts root — create AND secure it fail-closed via the shared
+        // helper.
+        crate::platform::fs::ensure_private_dir_root(parent).map_err(|e| PostureError::Io {
+            message: format!("secure parent dir for {POSTURE_FILE_NAME}: {e}"),
         })?;
     }
 

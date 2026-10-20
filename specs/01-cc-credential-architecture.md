@@ -1,6 +1,6 @@
 # 01 Claude Code Credential Architecture
 
-Spec version: 1.1.0 | Status: DRAFT | Governs: how Claude Code reads, writes, caches, and invalidates OAuth credentials | Upstream: Claude Code CLI 2.1.104
+Spec version: 1.1.2 | Status: DRAFT | Governs: how Claude Code reads, writes, caches, and invalidates OAuth credentials | Upstream: Claude Code CLI 2.1.104
 
 ---
 
@@ -101,7 +101,7 @@ When CC saves OAuth tokens, it writes through a secure-storage abstraction. On m
 1. **On macOS, `/login` writes ONLY to the keychain.** The `.credentials.json` file is not touched on a successful keychain write. csq, by contrast, keeps the file path canonical: the daemon refresher writes `identities/<UUID>/credentials.json` (`credentials::file::save_canonical_for`), and handle dirs reach it via symlink. (Swap repoints symlinks and writes no credentials.)
 2. **On first successful keychain write ever, the plaintext fallback file is deleted.** After this, CC operates in keychain-only mode and the mtime check in section 1.4 goes through the missing-file branch on every call.
 3. **On Linux/Windows, the secure-storage backend is the plaintext file directly.** Writes go to `<CLAUDE_CONFIG_DIR>/.credentials.json` with `0o600` permissions. File mtime changes, cross-process mtime check fires instantly.
-4. **Subscription metadata preservation:** CC explicitly preserves `subscriptionType` and `rateLimitTier` from the existing stored value if the new tokens don't carry them. csq mirrors this behavior in the daemon refresher's canonical write path (`refresh::sync` back-sync preserves `subscription_type`/`rate_limit_tier` when the live file has `None` — see `backsync_preserves_subscription_type_when_live_has_none` in `csq-core/src/refresh/sync.rs`).
+4. **Subscription metadata preservation:** CC explicitly preserves `subscriptionType` and `rateLimitTier` from the existing stored value if the new tokens don't carry them. csq preserves existing `subscription_type`/`rate_limit_tier` through its guarded canonical credential writer (`credentials::file::save_anthropic_canonical_guarded_locked`) when incoming credentials omit them. The daemon custodian (`daemon::custodian::harvest_live_file_candidates`) ingests CC-written live-session credential files. Explicit native login also reads the post-login grant through `credentials::read_fresh_after_login` and passes that exact selected grant to `accounts::anthropic_identity::commit_anthropic_login`, with the native expected context and pre-login custody (CLI `handle_direct_post_subprocess`; desktop `start_claude_login_subprocess`). Launch and statusline do not ingest live credentials.
 5. **After write, CC clears its own in-process memoize.** This is what makes `/login` in-flight inside the same process — the writing process sees its new tokens on the next call. Other processes, with their own separate memoizes, only see the new tokens via the mtime check (file path) or TTL expiry (keychain path).
 6. **Consequence for csq:** when the csq CLI (a separate process from the running `claude`) writes credentials, it cannot clear CC's in-process memoize. It can only signal CC via the file-path mtime mechanism. This is why csq MUST write through the file (symlink-resolved in the handle-dir model), not keychain-only.
 
@@ -145,3 +145,8 @@ When CC's binary version bumps, re-verify:
 6. The secure-storage fallback still writes keychain-primary on macOS.
 
 Any of these changing invalidates this spec and requires both code and spec updates before csq should claim compatibility with that CC version.
+
+## Revisions
+
+- 2026-10-10 — 1.1.2 — Corrected §1.7 fact 4 to include explicit native-login grant reading and verified commit beside daemon custodian ingestion. This changes csq source-path wording, not upstream or runtime evidence.
+- 2026-10-10 — 1.1.1 — Corrected canonical subscription preservation and daemon-only live credential ingestion references.

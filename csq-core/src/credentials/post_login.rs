@@ -92,6 +92,13 @@ const MINT_WINDOW_MS: u64 = 60 * 60 * 1_000; // 60 minutes
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FreshLoginError {
     /// No credential appeared in the keychain or `.credentials.json` at all.
+    ///
+    /// This is a read-back outcome about the two LOGIN-ARTIFACT sources, never
+    /// a verdict that the account holds no credential: a durable rescue record
+    /// (see `credentials::rescue`) may still be pending adoption. The Display
+    /// text says so, and [`read_fresh_after_login`] adopts such a record
+    /// before returning this error, so an operator is never told to log in
+    /// while a rescued pair exists.
     NoCredentials,
     /// Only an already-expired credential was readable across the full retry
     /// budget — CC's keychain write may not have committed, or keychain access
@@ -104,8 +111,11 @@ impl std::fmt::Display for FreshLoginError {
         match self {
             Self::NoCredentials => write!(
                 f,
-                "no credentials captured after login — keychain and \
-                 .credentials.json both empty"
+                "no credentials were captured after login — the keychain and \
+                 .credentials.json read-back saw nothing. This is a local capture \
+                 miss, not a verdict that the account has no credential: retry the \
+                 login (a durably rescued pair, if one was pending, is adopted \
+                 independently by the daemon)"
             ),
             Self::OnlyStale => write!(
                 f,
@@ -127,7 +137,7 @@ impl std::error::Error for FreshLoginError {}
 /// race. See the module docs for the full rationale.
 pub fn read_fresh_after_login(config_dir: &Path) -> Result<CredentialFile, FreshLoginError> {
     let file_path = config_dir.join(".credentials.json");
-    read_fresh_after_login_with(
+    let result = read_fresh_after_login_with(
         || {
             // Explicit migration to the classified boundary
             // (`guard-reader-writer-parity.md` MUST-1/MUST-2,
@@ -157,7 +167,102 @@ pub fn read_fresh_after_login(config_dir: &Path) -> Result<CredentialFile, Fresh
                 .unwrap_or_default()
                 .as_millis() as u64
         },
-    )
+    );
+    if result.is_err() {
+        // Reader parity (ROOT ruling A): a failed capture must not leave a
+        // durable post-commit rescue record unadopted, and must never report
+        // LOGIN-NEEDED while one is pending. Adoption repairs the ACCOUNT's
+        // canonical credential; it deliberately does NOT become this login's
+        // result — see `adopt_pending_login_rescue`'s rationale.
+        adopt_pending_login_rescue(config_dir);
+    }
+    result
+}
+
+/// Adopts a pending post-commit rescue record for the account this login
+/// config dir is bound to, if one exists.
+///
+/// # Scope — what this site can and cannot know
+///
+/// This function receives ONLY the CC config dir. It has no `base_dir` and no
+/// slot argument, so it must not parse the directory NAME for a slot
+/// (`account-terminal-separation.md` MUST Rule 3: the `.csq-account` marker,
+/// not a terminal-derived path, is the sole identity authority). Identity is
+/// therefore read from that marker, accepting BOTH forms production writes —
+/// the M4-7 UUID form and the legacy numeric form resolved through
+/// `profiles.json::by_slot` (`guard-reader-writer-parity.md` MUST-1). The
+/// store root is the config dir's parent, which every login call site
+/// constructs as `<base_dir>/config-<N>`; when either resolution fails this
+/// is a no-op and the caller's capture error is unchanged (a rescue record is
+/// UUID-keyed and cannot be located without an identity).
+///
+/// # Why the rescued pair is NOT returned as the login result
+///
+/// A login proves itself by capturing the token the login just minted. A
+/// rescued pair was rotated by a PREVIOUS refresh; returning it here would
+/// (a) report success for a credential this login never observed, and
+/// (b) let the pre-login account's pair be committed under a just-performed
+/// account switch. The rule the rescue protocol imposes on this site is the
+/// OTHER half: while a record exists, the account is not credential-less, so
+/// the failure is a recoverable capture miss rather than a login-needed
+/// verdict. Adoption (installing the durable pair) is safe and is exactly
+/// what the next refresher tick would have done.
+///
+/// A refused adoption is left PENDING and logged; the next tick retries.
+fn adopt_pending_login_rescue(config_dir: &Path) {
+    let Some(base_dir) = config_dir.parent() else {
+        return;
+    };
+    let Some(uuid) = login_target_identity(base_dir, config_dir) else {
+        return;
+    };
+    let Some(identity_dir) = crate::accounts::identity_store::credentials_path_for(base_dir, uuid)
+        .parent()
+        .map(Path::to_path_buf)
+    else {
+        return;
+    };
+    if crate::credentials::rescue::rescue_record_pending(&identity_dir).is_none() {
+        return;
+    }
+    match crate::credentials::rescue::adopt_rescue_record(base_dir, &uuid.to_string()) {
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            error_kind = "rescue_adopt_refused",
+            reason = error.error_kind_tag(),
+            "post-login: pending rescue record could not be adopted; left pending"
+        ),
+    }
+}
+
+/// Resolves the login target's identity from the config dir's `.csq-account`
+/// marker, accepting both the UUID content modern writers emit and the
+/// legacy numeric content.
+///
+/// Returns `None` when the marker is absent/unparseable or a numeric marker
+/// has no `by_slot` mapping — there is then no UUID an adoption could key
+/// on, and this function never invents one (no-silent-fallback guarantee).
+fn login_target_identity(
+    base_dir: &Path,
+    config_dir: &Path,
+) -> Option<crate::accounts::identity_store::IdentityId> {
+    use crate::accounts::markers::{self, IdentityMarker};
+    match markers::read_identity_marker(config_dir)? {
+        IdentityMarker {
+            uuid: Some(uuid), ..
+        } => Some(uuid),
+        IdentityMarker {
+            numeric: Some(slot),
+            ..
+        } => crate::accounts::profiles::resolve_slot_to_uuid(base_dir, slot.get()),
+        // `read_identity_marker` never yields both-`None` from a successful
+        // parse (exactly one form parses); return `None` rather than invent
+        // an identity if that invariant ever changes.
+        IdentityMarker {
+            uuid: None,
+            numeric: None,
+        } => None,
+    }
 }
 
 /// Testable core: injected keychain + file readers, sleep hook, and `now_ms`
@@ -521,6 +626,133 @@ mod tests {
         let err = read_fresh_after_login_with(|| None, || None, 3, no_sleep(), wall_clock())
             .expect_err("none");
         assert_eq!(err, FreshLoginError::NoCredentials);
+    }
+
+    /// ROOT ruling A reader parity: a failed post-login capture must adopt a
+    /// pending rescue record for the account the config dir is bound to, and
+    /// must report a recoverable capture miss — never a no-credential /
+    /// login-needed verdict while the durable pair exists.
+    ///
+    /// RED: delete the `adopt_pending_login_rescue` call in
+    /// `read_fresh_after_login` -> the record stays pending and the stale
+    /// canonical is never repaired.
+    #[test]
+    fn failed_capture_adopts_pending_rescue_and_reports_recoverable() {
+        use crate::accounts::identity_store;
+        use tempfile::TempDir;
+
+        fn cred_with(token: &str, refresh: &str, expires_at_ms: u64) -> CredentialFile {
+            let oauth = format!(
+                r#"{{"accessToken":"{token}","refreshToken":"{refresh}","expiresAt":{expires_at_ms},"scopes":["user:inference"]}}"#
+            );
+            serde_json::from_str(&format!(r#"{{"claudeAiOauth":{oauth}}}"#)).unwrap()
+        }
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        // Every login call site builds `<base_dir>/config-<N>`; identity is
+        // read from the `.csq-account` marker, never from the dir name.
+        let config_dir = base.join("config-7");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(7);
+        std::fs::write(config_dir.join(".csq-account"), uuid.to_string()).unwrap();
+
+        let canonical = identity_store::credentials_path_for(base, uuid);
+        let identity_dir = canonical.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&identity_dir).unwrap();
+        crate::platform::fs::secure_dir(&base.join("identities")).unwrap();
+        crate::platform::fs::secure_dir(&identity_dir).unwrap();
+        file::save(
+            &canonical,
+            &cred_with("sk-ant-oat01-STALE", "rt-stale", 1_000),
+        )
+        .unwrap();
+
+        // D237 round-2 H-c: adoption re-runs the writer's source gate, so the
+        // fixture needs the same identity context a real install has.
+        let context = crate::accounts::anthropic_identity::RescueKnownContext {
+            email: "post-login@example.test".into(),
+            account_uuid: uuid::Uuid::from_u128(0x71),
+            organization_uuid: uuid::Uuid::from_u128(0x72),
+        };
+        let identity_json = identity_dir.join("identity.json");
+        std::fs::write(
+            &identity_json,
+            serde_json::to_vec(&serde_json::json!({
+                "email": context.email, "provider": "anthropic",
+                "created_at": "2026-01-01T00:00:00Z", "key_id": null,
+                "account_uuid": context.account_uuid,
+                "organization_uuid": context.organization_uuid
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        crate::platform::fs::secure_file(&identity_json).unwrap();
+
+        let stale = cred_with("sk-ant-oat01-STALE", "rt-stale", 1_000);
+        let rescued = cred_with(
+            "sk-ant-oat01-RESCUED",
+            "rt-rescued",
+            FIXED_NOW_MS + CC_ACCESS_TOKEN_TTL_MS,
+        );
+        let witness = crate::credentials::rescue::RescueWitness::Anthropic(
+            crate::accounts::anthropic_identity::RescueLineageWitness {
+                kind: crate::accounts::anthropic_identity::RescueWitnessKind::Refresh,
+                source_version:
+                    crate::accounts::anthropic_identity::CredentialVersion::for_credentials(
+                        stale.anthropic().unwrap(),
+                    )
+                    .unwrap(),
+                result_version:
+                    crate::accounts::anthropic_identity::CredentialVersion::for_credentials(
+                        rescued.anthropic().unwrap(),
+                    )
+                    .unwrap(),
+                context: Some(context),
+                legacy_email: None,
+            },
+        );
+        crate::credentials::rescue::write_rescue_record(
+            &identity_dir,
+            "anthropic",
+            &uuid.to_string(),
+            "post_commit_lock_timeout",
+            &serde_json::to_value(&rescued).unwrap(),
+            &witness,
+        )
+        .unwrap();
+
+        // No login artifact exists in the config dir (the keychain mirror is
+        // disabled under `cfg(test)`), so the capture fails.
+        let error = read_fresh_after_login(&config_dir)
+            .expect_err("no login artifact exists; capture must fail");
+
+        assert_eq!(error, FreshLoginError::NoCredentials);
+        // Recoverable framing, not a conclusive no-credential verdict.
+        let text = error.to_string();
+        assert!(
+            text.contains("retry the login"),
+            "a capture miss must say retry, got: {text}"
+        );
+        assert!(
+            !text.contains("both empty"),
+            "the message must not present the capture sources as conclusive: {text}"
+        );
+        // The rescued pair was adopted: canonical repaired, record gone.
+        assert!(
+            crate::credentials::rescue::rescue_record_pending(&identity_dir).is_none(),
+            "the failed capture must adopt the pending rescue record"
+        );
+        let installed = crate::credentials::load(&canonical).unwrap();
+        assert_eq!(
+            installed
+                .anthropic()
+                .unwrap()
+                .claude_ai_oauth
+                .access_token
+                .expose_secret(),
+            "sk-ant-oat01-RESCUED"
+        );
     }
 
     // ── Extra AC1: keychain IS login-fresh → correct winner ──────────────────

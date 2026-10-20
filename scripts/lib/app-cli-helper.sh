@@ -102,7 +102,7 @@ add_cli_helper() {
         # deterministic (still a guess, but a reproducible one, so a wrong
         # guess is diagnosable instead of intermittent). A well-formed Tauri
         # bundle never reaches here: it always has a valid CFBundleExecutable.
-        main_bin="$(find "$app_dir/Contents/MacOS" -maxdepth 1 -type f 2>/dev/null | sort | head -1 || true)"
+        main_bin="$(find "$app_dir/Contents/MacOS" -maxdepth 1 -type f 2>/dev/null | sort | head -1 || true)"  # pipefail-ok: captured output only; the pipeline status is not read
     fi
 
     if [[ -z "$main_bin" || ! -f "$main_bin" ]]; then

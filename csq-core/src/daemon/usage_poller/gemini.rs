@@ -324,7 +324,10 @@ pub fn drain_slot(
     let mut outcome = DrainOutcome::default();
     {
         let _q_guard = state.quota_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let mut quota = quota_state::load_state(base_dir).map_err(|e| DrainError::Io {
+        // Write leg: public READERS gain an origin/binding filter; writer
+        // loads stay STRICT RAW (schema-guarded) so sibling rows a filtered
+        // read would hide can never be clobbered by this load→save cycle.
+        let mut quota = quota_state::load_state_or_skip(base_dir).map_err(|e| DrainError::Io {
             path: base_dir.to_path_buf(),
             source: std::io::Error::other(format!("quota load: {e}")),
         })?;
@@ -489,7 +492,7 @@ pub fn apply_event_with_source(
 /// by [`run_midnight_reset`]; exposed for unit-testable apply.
 pub fn apply_midnight_reset(quota: &mut QuotaFile, now_ts_iso: String) {
     let now = epoch_now_secs() as f64;
-    for (_, entry) in quota.accounts.iter_mut() {
+    for entry in quota.accounts.values_mut() {
         if entry.surface != EVENT_SURFACE_GEMINI {
             continue;
         }
@@ -527,7 +530,9 @@ pub async fn run_midnight_reset(
         // Reset under the quota mutex so the active drainer cannot
         // race the reset.
         let _q_guard = state.quota_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let mut quota = match quota_state::load_state(&base_dir) {
+        // Write leg: strict RAW load (see the drain leg above) — the public
+        // read filter must never be reachable from a load→save cycle.
+        let mut quota = match quota_state::load_state_or_skip(&base_dir) {
             Ok(q) => q,
             Err(e) => {
                 warn!(error = %e, "midnight reset: quota load failed");

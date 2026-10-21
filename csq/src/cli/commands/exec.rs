@@ -234,6 +234,34 @@ fn run_exec(base_dir: &Path, claude_home: &Path, args: &ExecArgs) -> Result<Exec
     let prompt = resolve_prompt(args)?;
     let (slot, surface) = resolve_slot(base_dir, args)?;
 
+    // orgident r7 item 9 (block new launches): `csq exec` starts a fresh `claude` against the
+    // slot's credentials, so a slot whose sign-in is shared (or whose suppression record is
+    // unknown) is refused BEFORE any handle dir, keychain mirror or spawn. Same gate and
+    // wording as `csq run`; no override. Only the Claude surface is affected.
+    if matches!(surface, ExecSurface::Claude) {
+        csq_core::accounts::launch_block::check_launch(base_dir, slot.get())
+            .map_err(|message| SdkError::trusted(SdkErrorCode::SpawnFailed, message))?;
+    }
+
+    let provider_surface = match surface {
+        ExecSurface::Claude => csq_core::providers::catalog::Surface::ClaudeCode,
+        ExecSurface::Gemini => csq_core::providers::catalog::Surface::Gemini,
+        ExecSurface::Codex => csq_core::providers::catalog::Surface::Codex,
+    };
+    let warning = super::run::admit_exec_provider_session(
+        base_dir,
+        claude_home,
+        slot,
+        provider_surface,
+        None,
+    )
+    .map_err(|error| SdkError::trusted(SdkErrorCode::SpawnFailed, error.to_string()))?;
+    if !matches!(surface, ExecSurface::Claude) {
+        if let Some(warning) = warning {
+            eprintln!("csq: warning: {warning}");
+        }
+    }
+
     match surface {
         ExecSurface::Claude => {
             let bin = find_claude_binary().ok_or_else(|| {
@@ -264,6 +292,18 @@ fn run_exec(base_dir: &Path, claude_home: &Path, args: &ExecArgs) -> Result<Exec
             // be skipped when it did not (see that function's doc for why).
             let (handle_dir_abs, handle_dir_is_canonical) =
                 csq_core::credentials::keychain::canonicalize_for_keychain_sync(&handle_dir);
+
+            let warning = super::run::admit_exec_provider_session(
+                base_dir,
+                claude_home,
+                slot,
+                provider_surface,
+                Some(&handle_dir_abs.join("settings.json")),
+            )
+            .map_err(|error| SdkError::trusted(SdkErrorCode::SpawnFailed, error.to_string()))?;
+            if let Some(warning) = warning {
+                eprintln!("csq: warning: {warning}");
+            }
 
             // Security review 1386 F10: `csq exec` has no daemon requirement,
             // so an exec-only install (no `csq run`, no daemon) would never
@@ -465,6 +505,29 @@ fn run_exec(base_dir: &Path, claude_home: &Path, args: &ExecArgs) -> Result<Exec
     }
 }
 
+#[cfg(test)]
+pub(crate) fn provider_session_test_run_exec(
+    base_dir: &Path,
+    claude_home: &Path,
+    slot: u16,
+) -> Result<(), SdkError> {
+    run_exec(
+        base_dir,
+        claude_home,
+        &ExecArgs {
+            prompt: Some("private admission fixture".to_string()),
+            stdin: false,
+            provider: None,
+            slot: Some(slot),
+            model: None,
+            system: None,
+            id: None,
+            timeout_secs: 1,
+        },
+    )
+    .map(|_| ())
+}
+
 /// Positional prompt XOR stdin. Both-or-neither → `invalid_input`. Empty → `invalid_input`.
 fn resolve_prompt(args: &ExecArgs) -> Result<String, SdkError> {
     let prompt = match (args.prompt.as_deref(), args.stdin) {
@@ -643,6 +706,8 @@ fn slot_serves_claude(base_dir: &Path, slot: AccountNum) -> bool {
 
 /// Pick the first healthy Anthropic slot: authenticated, not broker-failed.
 fn resolve_healthy_claude_slot(base_dir: &Path) -> Result<AccountNum, SdkError> {
+    // A slot the launch gate refuses is never auto-picked (orgident r7 item 9).
+    let mut refused: Option<String> = None;
     for acc in csq_core::accounts::discovery::discover_anthropic(base_dir) {
         let Ok(slot) = AccountNum::try_from(acc.id) else {
             continue;
@@ -650,7 +715,14 @@ fn resolve_healthy_claude_slot(base_dir: &Path) -> Result<AccountNum, SdkError> 
         if csq_core::refresh::sentinel::is_broker_failed(base_dir, slot) {
             continue;
         }
+        if let Err(message) = csq_core::accounts::launch_block::check_launch(base_dir, slot.get()) {
+            refused.get_or_insert(message);
+            continue;
+        }
         return Ok(slot);
+    }
+    if let Some(message) = refused {
+        return Err(SdkError::trusted(SdkErrorCode::SpawnFailed, message));
     }
     Err(SdkError::trusted(
         SdkErrorCode::NoHealthySlot,
@@ -1993,6 +2065,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn capture_bounded_bounds_real_child_pipe_and_child_exits() {
+        // A bare program name resolves through the process PATH, which sibling tests swap
+        // under the shared env lock; hold it so the spawn cannot see a mid-swap PATH.
+        let _env_lock = csq_core::platform::test_env::lock();
         use std::process::{Command, Stdio};
         // Emit 9 MiB (> the 8 MiB cap) then close. `yes` SIGPIPEs when `head`
         // has taken its bytes; the pipeline (sh) exit status is head's (0).
@@ -2136,24 +2211,72 @@ mod tests {
         );
     }
 
+    fn private_slot_fixture(prefix: &str) -> tempfile::TempDir {
+        let directory = tempfile::Builder::new().prefix(prefix).tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        directory
+    }
+
     #[test]
     fn healthy_slot_none_when_no_anthropic_slots() {
-        // A base dir with no accounts yields no healthy Claude slot.
-        let tmp = std::env::temp_dir().join(format!("csq-exec-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&tmp);
-        let err = resolve_healthy_claude_slot(&tmp).unwrap_err();
+        let tmp = private_slot_fixture("csq-exec-test-");
+        let err = resolve_healthy_claude_slot(tmp.path()).unwrap_err();
         assert_eq!(err.code, SdkErrorCode::NoHealthySlot);
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// AC1 — no healthy gemini slot in an empty base dir.
     #[test]
     fn healthy_gemini_slot_none_when_no_gemini_slots() {
-        let tmp = std::env::temp_dir().join(format!("csq-gemini-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&tmp);
-        let err = resolve_healthy_gemini_slot(&tmp).unwrap_err();
+        let tmp = private_slot_fixture("csq-gemini-test-");
+        let err = resolve_healthy_gemini_slot(tmp.path()).unwrap_err();
         assert_eq!(err.code, SdkErrorCode::NoHealthySlot);
-        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn healthy_slot_fixture_roots_are_unique_private_and_independently_cleaned() {
+        for prefix in ["csq-exec-test-", "csq-gemini-test-"] {
+            let first = private_slot_fixture(prefix);
+            std::fs::write(first.path().join("stale-fixture-marker"), b"synthetic").unwrap();
+            let second = private_slot_fixture(prefix);
+            assert_ne!(
+                first.path(),
+                second.path(),
+                "same-process fixtures must not collide"
+            );
+            assert!(!second.path().join("stale-fixture-marker").exists());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(first.path())
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o7777,
+                    0o700
+                );
+                assert_eq!(
+                    std::fs::metadata(second.path())
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o7777,
+                    0o700
+                );
+            }
+            let first_path = first.path().to_path_buf();
+            first.close().unwrap();
+            assert!(!first_path.exists());
+            assert!(second.path().is_dir());
+            let second_path = second.path().to_path_buf();
+            drop(second);
+            assert!(!second_path.exists());
+        }
     }
 
     // ── 3P slot reachability + native Kimi/Grok misrouting fix (coc-bench H-contrast) ──
@@ -2313,31 +2436,33 @@ mod tests {
         assert_eq!(err.code, SdkErrorCode::NoHealthySlot);
     }
 
-    /// [`keychain-fix-r8c.md`'s NIT] routing half: `csq exec` always
-    /// creates a FRESH handle dir and forces the mirror write via the same
-    /// `force_sync_for_launch` → `force_sync_for_launch_locked` →
-    /// `force_sync_account_changed` chain as `csq run` — mirrors that
-    /// file's identical regression guard
-    /// (`foreign_login_unharvested_routes_through_force_sync_account_changed_for_a_fresh_launch_dir`)
-    /// for the OTHER launch site named by the finding. X holds a valid
-    /// Anthropic login this call cannot identify as the account it is about
-    /// to bind, which must classify as `ForeignLoginUnharvested` (rule 3),
-    /// never a silent write.
+    /// [`keychain-fix-r8c.md`'s NIT], retargeted by the custody model — the
+    /// `csq exec` twin of run.rs's
+    /// `no_custody_forced_write_refuses_an_unmatched_foreign_login_on_a_fresh_launch_dir`
+    /// (see that test's doc for the full history). `csq exec` always creates
+    /// a FRESH handle dir; driving the no-custody entry
+    /// `force_sync_account_changed` with a foreign keychain item X and no
+    /// captured target custody must REFUSE (`TargetTokenInvalidated`), never
+    /// silently write.
     ///
-    /// NOTE on scope: see `run.rs`'s twin test for why this drives
-    /// `force_sync_account_changed` directly rather than the public
-    /// `force_sync_for_launch` wrapper (whose own top-level
-    /// `keychain_mirror_disabled_now()` check runs BEFORE the
-    /// test-installed-executor override and unconditionally short-circuits
-    /// under `cfg(feature = "test-utils")`) — the message text itself
-    /// (produced by keychain.rs's private `decide_launch_disposition`) was
-    /// verified by direct source inspection to already carry the C-F1
-    /// wording, no "just refreshed" text remaining at either
-    /// `ForeignLoginUnharvested` arm.
+    /// STALE PREMISE, corrected (quoted for history): this doc used to claim
+    /// the launch chain is `force_sync_for_launch` →
+    /// `force_sync_for_launch_locked` → `force_sync_account_changed`, and
+    /// that X "must classify as `ForeignLoginUnharvested` (rule 3)". Since
+    /// `12a5c873c`, `force_sync_account_changed` refuses an `Intended::Token`
+    /// with `target_binding == None` (keychain.rs:7803-7805 — AFTER
+    /// `decide_cc_keychain_write` at :7793, so rule 3's source-binding
+    /// refusal at :7833-7835 is never reached through it). The launch's REAL
+    /// chain ends in `force_sync_account_changed_for_launch`
+    /// (custody-carrying), and the classification whose C-F1 operator wording
+    /// the NIT concerned is reached there — `csq run`'s quarantine test
+    /// drives it end-to-end. What this twin pins is that the foreign login is
+    /// never a silent write, asserted on the executor's own call log (the
+    /// return variant alone is shared with the expired-target case at
+    /// :7789).
     #[cfg(target_os = "macos")]
     #[test]
-    fn foreign_login_unharvested_routes_through_force_sync_account_changed_for_a_fresh_launch_dir()
-    {
+    fn no_custody_forced_write_refuses_an_unmatched_foreign_login_on_a_fresh_launch_dir() {
         use csq_core::accounts::identity_store;
         use csq_core::credentials::keychain::{
             clear_test_keychain_executor, set_test_keychain_executor, ForcedSyncResult,
@@ -2383,8 +2508,10 @@ mod tests {
         assert!(is_canonical, "fixture: canonicalize must succeed");
 
         // X holds a valid Anthropic identity from a DIFFERENT, unknown
-        // account — no history entry matches it, so decide_cc_keychain_write
-        // classifies it as rule 3 (ForeignLoginUnharvested).
+        // account: no history entry matches it, so
+        // `decide_cc_keychain_write` classifies it as `RefuseUnharvested`
+        // (rule 3) — but the custody refusal returns before that
+        // classification is applied (see the test doc above).
         let foreign = CredentialFile::Anthropic(AnthropicCredentialFile {
             claude_ai_oauth: OAuthPayload {
                 access_token: AccessToken::new("at-FOREIGN".into()),
@@ -2399,13 +2526,19 @@ mod tests {
         });
         let foreign_json = serde_json::to_string(&foreign).unwrap();
         let exec = std::rc::Rc::new(ScriptedKeychainExecutor::scripted(
-            RawContentClassification::Content(foreign_json),
+            RawContentClassification::Content(foreign_json.into()),
         ));
-        set_test_keychain_executor(exec);
+        // The global takes ownership of the `Rc`; the clone kept here is what
+        // lets the assertions inspect the executor's own call log. A return
+        // value alone cannot separate "refused before touching the keychain"
+        // from "wrote, then returned the refusal variant".
+        set_test_keychain_executor(exec.clone());
 
-        // Mirrors force_sync_for_launch_locked's own call exactly: base,
-        // handle_dir_abs, and `Some(own_raw)` (what a real `csq exec` reads
-        // from handle_dir_abs/.credentials.json — this account's own token).
+        // The no-custody entry point: base, handle_dir_abs, and
+        // `Some(own_raw)` (what a real `csq exec` reads from
+        // handle_dir_abs/.credentials.json — this account's own token), but
+        // NO captured target custody (`target_binding == None` inside
+        // `force_sync_inner_with_profiles`). See the test doc above.
         let result = csq_core::credentials::keychain::force_sync_account_changed(
             base.path(),
             &handle_dir_abs,
@@ -2414,9 +2547,24 @@ mod tests {
         clear_test_keychain_executor();
 
         assert!(
-            matches!(result, Ok(ForcedSyncResult::ForeignLoginUnharvested)),
-            "an unmatched foreign login on a fresh launch dir must classify as \
-             ForeignLoginUnharvested (rule 3), never a silent write: {result:?}"
+            matches!(result, Ok(ForcedSyncResult::TargetTokenInvalidated)),
+            "a forced write carrying a token but NO captured target custody must \
+             refuse: {result:?}"
         );
+        let calls = exec.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|(verb, _, _)| matches!(*verb, "add" | "delete")),
+            "the refusal must be decided BEFORE any keychain mutation — a write \
+             followed by this variant is indistinguishable from the refusal by \
+             the return value alone: {calls:?}"
+        );
+        assert_eq!(
+            calls.len(),
+            1,
+            "exactly one `find` (the single X read) and no mutation: {calls:?}"
+        );
+        assert_eq!(calls[0].0, "find");
     }
 }

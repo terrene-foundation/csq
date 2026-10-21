@@ -574,18 +574,54 @@ PY
 
 If `PUBKEY DRIFT` appears, **STOP** — signing with a key whose public component doesn't match the baked pubkey breaks auto-updater verification for every existing v2.7.x user (silent failure: app rejects the update with no user-visible error).
 
+**`VERSION` MUST be release semver** (`MAJOR.MINOR.PATCH`, optionally followed by `-prerelease`; build metadata `+…` is refused): it is written verbatim into the signature's trusted comment and compared by every updater with semver equality that includes build metadata, so a `+build` suffix could never match the advertised version. The block below validates it and refuses to sign anything else. The signer MUST also be the CLI pinned in `csq/package-lock.json` — install it with `npm ci` in `csq/` and invoke `csq/node_modules/.bin/tauri`; a global `tauri` or an on-demand `npx @tauri-apps/cli` fetch can resolve a different version.
+
 ```bash
 # Sign the tarball. Use env var (TAURI_SIGNING_PRIVATE_KEY_PASSWORD) rather
 # than the --password CLI flag: the flag puts the password in `ps` output
 # where any same-UID process can see it during the brief signing window.
+#
+# --app-version binds the signature to the release version (it is written into
+# the minisign trusted comment, which the signature covers). csq/tauri.conf.json
+# sets plugins.updater.requireSignedVersion, so a client that installed a build
+# with that setting REJECTS an update whose signature carries no version
+# (MissingSignedVersion) or a different one — without the flag the user can no
+# longer auto-update and must download by hand. Needs @tauri-apps/cli >= 2.11.5
+# (csq/package-lock.json pins it; an older CLI fails loudly with
+# "unexpected argument '--app-version'").
+VERSION=$(grep '^version' Cargo.toml | head -1 | awk -F'"' '{print $2}')
+
+# VERSION MUST be release semver: MAJOR.MINOR.PATCH, optionally followed by
+# -prerelease. BUILD METADATA (+...) is REFUSED — the client compares the
+# signed version against the advertised one with semver equality INCLUDING
+# build, so 2.21.0+ci never matches an advertised 2.21.0. VERSION is written
+# verbatim into the signature's trusted comment, so refuse to sign anything
+# else. Works in both bash and zsh.
+SEMVER_RE='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*))?$'
+printf '%s\n' "$VERSION" | grep -Eq "$SEMVER_RE" \
+  || { echo "::error::VERSION '$VERSION' is not strict semver — refusing to sign"; exit 1; }
+
+# Install the PINNED CLI from the lockfile, then invoke that local binary.
+# NEVER a global `tauri` or an on-demand `npx @tauri-apps/cli` fetch: either
+# can resolve to a different version than csq/package-lock.json pins (and an
+# older one lacks --app-version).
+(cd csq && npm ci)
+
 cd csq && env TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" \
-  npx @tauri-apps/cli signer sign \
+  ./node_modules/.bin/tauri signer sign \
     --private-key-path ~/.tauri/csq-updater.key \
+    --app-version "$VERSION" \
     "$OLDPWD/$APP_TARBALL"
 cd -
 
 # Result: $APP_TARBALL.sig is created alongside the tarball.
 ls -la "$APP_TARBALL" "$APP_TARBALL.sig"
+
+# MANDATORY: the .sig must carry exactly this release's version. release.yml
+# re-checks every platform's signature with the same gate before it publishes
+# latest.json, but failing here costs seconds instead of a re-sign + re-upload.
+bash scripts/verify/latest-json-signed-version.sh sig "$APP_TARBALL.sig" "$VERSION" \
+  || { echo "::error::signature is not bound to v$VERSION — re-sign with --app-version"; exit 1; }
 ```
 
 (Gap from v2.7.8 cut, an internal journal entry: prior runbook directed the maintainer to load the key from a 1Password vault that did not exist; key was on disk all along at the Tauri default path.)

@@ -162,7 +162,7 @@ pub fn prune_orphan_identities(
     };
 
     // Guard 2 — fresh / pre-mint install: both maps empty → KEEP everything.
-    if pf.by_slot.is_empty() && pf.by_email.is_empty() {
+    if pf.by_slot.is_empty() && pf.by_email.is_empty() && pf.anthropic_contexts.is_empty() {
         return Ok(report);
     }
 
@@ -175,13 +175,18 @@ pub fn prune_orphan_identities(
         }
     }
 
-    // Reachable set: by_slot ∪ by_email. Typed as HashSet<IdentityId>, never
+    // Reachable set: by_slot ∪ by_email ∪ anthropic_contexts. Typed as HashSet<IdentityId>, never
     // string-compared. `by_slot_identity` (labels, not UUIDs) is NOT consulted.
     let reachable: HashSet<IdentityId> = pf
         .by_slot
         .values()
         .copied()
         .chain(pf.by_email.values().copied())
+        .chain(
+            pf.anthropic_contexts
+                .iter()
+                .map(|entry| entry.identity_uuid),
+        )
         .collect();
 
     // Enumerate identities/. Missing or unreadable dir → no-op success.
@@ -252,11 +257,32 @@ fn classify(
 /// resolves into `identities/<uuid>/`. Defense-in-depth so the irreversible
 /// delete does not depend transitively on logout's point-in-time in-use guard.
 fn live_handle_dir_points_into(base_dir: &Path, uuid: IdentityId) -> bool {
+    // The `read_dir` result is a parameter of the inner function so a test can inject a
+    // per-entry error; production hands it the real directory listing.
+    let entries =
+        std::fs::read_dir(base_dir).map(|rd| rd.map(|e| e.map(|e| e.path())).collect::<Vec<_>>());
+    live_handle_dir_points_into_with(
+        base_dir,
+        uuid,
+        entries,
+        crate::platform::process::is_pid_alive,
+    )
+}
+
+/// The guard with the directory listing and liveness injected. FAIL CLOSED on every read
+/// failure: the caller deletes an identity dir irreversibly, so a failed listing, or ONE
+/// entry whose `readdir` step failed (it may be exactly the live dir), answers `true`
+/// (keep). `entries.flatten()` here used to skip such an entry silently.
+fn live_handle_dir_points_into_with(
+    base_dir: &Path,
+    uuid: IdentityId,
+    entries: std::io::Result<Vec<std::io::Result<std::path::PathBuf>>>,
+    is_pid_alive: impl Fn(u32) -> bool,
+) -> bool {
     use crate::accounts::markers;
-    use crate::platform::process::is_pid_alive;
 
     let target_dir = identity_path(base_dir, uuid);
-    let entries = match std::fs::read_dir(base_dir) {
+    let entries = match entries {
         Ok(e) => e,
         // Fail CLOSED: a transient read_dir failure must KEEP the dir (treat as
         // possibly-live), never flip the defense-in-depth guard off and allow
@@ -264,8 +290,14 @@ fn live_handle_dir_points_into(base_dir: &Path, uuid: IdentityId) -> bool {
         Err(_) => return true,
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for entry in entries {
+        let Ok(path) = entry else {
+            tracing::warn!(
+                error_kind = "orphan_gc_readdir_entry_error",
+                "handle-dir listing failed for one entry; keeping the identity (fail closed)"
+            );
+            return true;
+        };
         let name = match path.file_name().and_then(|n| n.to_str()) {
             Some(n) => n.to_string(),
             None => continue,
@@ -275,11 +307,19 @@ fn live_handle_dir_points_into(base_dir: &Path, uuid: IdentityId) -> bool {
         }
         // Liveness: prefer the .live-pid marker, fall back to the dir-name PID
         // (mirrors `logout::scan_live_handle_dirs_for_account`).
-        let pid = markers::read_live_pid(&path)
-            .or_else(|| name.strip_prefix("term-").and_then(|s| s.parse().ok()));
-        let Some(pid) = pid else { continue };
-        if !is_pid_alive(pid) {
-            continue;
+        // Either marker; an unreadable one counts as live (fail CLOSED — the caller
+        // deletes an identity dir irreversibly). The credential-link check below still
+        // decides whether THIS identity is the one the dir uses.
+        let fallback = name.strip_prefix("term-").and_then(|s| s.parse().ok());
+        match markers::handle_dir_in_use(&path, fallback, &is_pid_alive) {
+            None => continue,
+            Some(markers::HandleDirInUse::Pid(_)) => {}
+            Some(markers::HandleDirInUse::MarkerUnreadable) => {
+                tracing::warn!(
+                    error_kind = "orphan_gc_pid_marker_unreadable",
+                    "handle dir has an unreadable pid marker; treating it as live"
+                );
+            }
         }
         // Resolve the credential symlinks and check whether any points into the
         // candidate identity dir. Link names MUST match what `session::handle_dir`
@@ -635,6 +675,33 @@ mod tests {
         assert!(identity_path(dir.path(), orphan).exists());
     }
 
+    /// A per-entry `readdir` error must make the guard answer "live" (keep). The old
+    /// `entries.flatten()` skipped it, so a possibly-live dir could not block the delete.
+    #[test]
+    fn per_entry_readdir_error_keeps_the_identity() {
+        let base = TempDir::new().unwrap();
+        let uuid = IdentityId::new_v4();
+        let entries: std::io::Result<Vec<std::io::Result<std::path::PathBuf>>> = Ok(vec![
+            Err(std::io::Error::other("injected readdir failure")),
+            Ok(base.path().join("unrelated")),
+        ]);
+        assert!(live_handle_dir_points_into_with(
+            base.path(),
+            uuid,
+            entries,
+            |_| false
+        ));
+        // Control: the same listing without the error is not live.
+        let clean: std::io::Result<Vec<std::io::Result<std::path::PathBuf>>> =
+            Ok(vec![Ok(base.path().join("unrelated"))]);
+        assert!(!live_handle_dir_points_into_with(
+            base.path(),
+            uuid,
+            clean,
+            |_| false
+        ));
+    }
+
     /// Redteam C1 regression: a live Codex handle dir symlinks `auth.json` (NOT
     /// `.credentials.json`) → `identities/<UUID>/credentials-codex.json`
     /// (`session::handle_dir::create_handle_dir_codex`). The live-handle scan
@@ -681,6 +748,74 @@ mod tests {
             "{report:?}"
         );
         assert!(identity_path(dir.path(), orphan).exists());
+    }
+
+    /// Plant an orphan identity plus a `term-<dead pid>` dir whose credential link
+    /// points into it, returning the term dir.
+    #[cfg(unix)]
+    fn orphan_with_dead_term_dir(base: &Path) -> (IdentityId, std::path::PathBuf) {
+        let orphan = IdentityId::new_v4();
+        plant_identity_dir(base, orphan);
+        write_profiles(base, &[("1", IdentityId::new_v4())], &[]);
+        let term = base.join("term-999999041");
+        std::fs::create_dir_all(&term).unwrap();
+        std::os::unix::fs::symlink(
+            identity_path(base, orphan).join("credentials.json"),
+            term.join(".credentials.json"),
+        )
+        .unwrap();
+        (orphan, term)
+    }
+
+    /// `.live-pid` dead, `.live-cc-pid` this (live) process: the identity is KEPT.
+    #[test]
+    #[cfg(unix)]
+    fn live_cc_pid_only_handle_dir_keeps_orphan() {
+        let dir = TempDir::new().unwrap();
+        let (orphan, term) = orphan_with_dead_term_dir(dir.path());
+        std::fs::write(term.join(".live-pid"), "999999042").unwrap();
+        std::fs::write(term.join(".live-cc-pid"), std::process::id().to_string()).unwrap();
+        let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+        let report = prune_orphan_identities(&lock, dir.path()).unwrap();
+        assert_eq!(report.pruned_count, 0, "{report:?}");
+        assert!(identity_path(dir.path(), orphan).exists());
+    }
+
+    /// An unreadable marker counts as live; with both dead the orphan is still pruned.
+    #[test]
+    #[cfg(unix)]
+    fn unreadable_pid_marker_keeps_orphan_but_dead_markers_do_not() {
+        for (marker, kind) in [
+            (".live-cc-pid", "dir"),
+            (".live-cc-pid", "oversized"),
+            (".live-pid", "dir"),
+            (".live-pid", "oversized"),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let (orphan, term) = orphan_with_dead_term_dir(dir.path());
+            if marker == ".live-cc-pid" {
+                std::fs::write(term.join(".live-pid"), "999999043").unwrap();
+            }
+            let p = term.join(marker);
+            if kind == "dir" {
+                std::fs::create_dir(&p).unwrap();
+            } else {
+                std::fs::write(&p, "9".repeat(4096)).unwrap();
+            }
+            let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+            let report = prune_orphan_identities(&lock, dir.path()).unwrap();
+            assert_eq!(report.pruned_count, 0, "{marker} {kind}: {report:?}");
+            assert!(identity_path(dir.path(), orphan).exists());
+        }
+        // Control: both markers dead -> the orphan is pruned.
+        let dir = TempDir::new().unwrap();
+        let (orphan, term) = orphan_with_dead_term_dir(dir.path());
+        std::fs::write(term.join(".live-pid"), "999999044").unwrap();
+        std::fs::write(term.join(".live-cc-pid"), "999999045").unwrap();
+        let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+        let report = prune_orphan_identities(&lock, dir.path()).unwrap();
+        assert_eq!(report.pruned_count, 1, "{report:?}");
+        assert!(!identity_path(dir.path(), orphan).exists());
     }
 
     /// Redteam MED-1 / FM1-CRITICAL: a Codex slot minted via the REAL
@@ -798,5 +933,36 @@ mod tests {
 
         assert_eq!(report.pruned_count, 0, "parse failure must KEEP all");
         assert!(identity_path(dir.path(), a).exists());
+    }
+    #[test]
+    fn gc_org_identity_regression_context_index_only_identity_is_reachable() {
+        let dir = TempDir::new().unwrap();
+        let kept = IdentityId::new_v4();
+        let orphan = IdentityId::new_v4();
+        plant_identity_dir(dir.path(), kept);
+        plant_identity_dir(dir.path(), orphan);
+        let preserved =
+            std::fs::read(identity_path(dir.path(), kept).join("credentials.json")).unwrap();
+        let mut profiles = ProfilesFile::empty();
+        profiles.anthropic_contexts.push(
+            crate::accounts::anthropic_identity::AnthropicContextEntry {
+                email: "same@example.test".into(),
+                account_uuid: uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+                    .unwrap(),
+                organization_uuid: uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222")
+                    .unwrap(),
+                identity_uuid: kept,
+                extra: Default::default(),
+            },
+        );
+        save(&profiles_path(dir.path()), &profiles).unwrap();
+        let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+        let report = prune_orphan_identities(&lock, dir.path()).unwrap();
+        assert_eq!(report.pruned_count, 1);
+        assert!(!identity_path(dir.path(), orphan).exists());
+        assert_eq!(
+            std::fs::read(identity_path(dir.path(), kept).join("credentials.json")).unwrap(),
+            preserved
+        );
     }
 }

@@ -1,6 +1,9 @@
 pub mod claude_login_subprocess;
 pub mod interactive;
+pub mod pool;
 pub mod race;
+#[cfg(all(test, unix))]
+pub(crate) mod test_recording_daemon;
 pub use race::RaceLoginState;
 
 use crate::desktop::{AppState, CachedUpdateInfo};
@@ -58,6 +61,23 @@ pub type NativeLoginChildren = Arc<
 /// exceeding ~1h). Anthropic + Codex display branches both use this.
 const TOKEN_WARN_SECS: u64 = 3600;
 
+/// Status-surface twin of the daemon's duplicate-grant refresh suppression (F5/L3).
+///
+/// `suppressed` is the result of ONE `suppressed_slots` call per account-list build: with a
+/// corrupt state file each lookup is a live audit of every canonical, so a lookup per row
+/// would be N audits per poll.
+fn refresh_suppression_tag(
+    suppressed: &std::collections::BTreeMap<u16, u16>,
+    slot: u16,
+    anthropic: bool,
+    existing: Option<String>,
+) -> Option<String> {
+    if existing.is_none() && anthropic && suppressed.contains_key(&slot) {
+        return Some(csq_core::accounts::refresh_token_audit::SUPPRESSED_TAG.to_string());
+    }
+    existing
+}
+
 /// Public view of a single account, safe to send over IPC.
 ///
 /// Credentials, tokens, and keys are never included.
@@ -103,6 +123,19 @@ pub struct AccountView {
     /// "Expired — invalid token" so users know WHY a slot is
     /// stuck, not just that it is.
     pub last_refresh_error: Option<String>,
+    /// Pending post-commit rescue state for this slot's identity:
+    /// `"adoptable"` (a blocked refresh tick is transient — the next tick
+    /// installs or discards the record) or `"unadoptable"` (the saved login
+    /// cannot be restored; the user must sign in again for this account).
+    /// `None` for rows with no identity (3P / manual / native) and for
+    /// identities with no pending record. Fixed vocabulary, no credential
+    /// material and no paths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rescue_pending: Option<String>,
+    /// Fixed-vocabulary operator text for [`Self::rescue_pending`], so the
+    /// row renders the SAME message `csq status` and `csq doctor` show.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rescue_pending_message: Option<String>,
     /// Third-party provider id ("mm" | "zai" | "deepseek" | "ollama")
     /// for slots bound to a 3P provider, else None. Lets the
     /// frontend branch on stable ids rather than on the display
@@ -187,6 +220,11 @@ pub struct AccountView {
 pub struct DaemonStatusView {
     pub running: bool,
     pub pid: Option<u32>,
+    /// The keychain orphan sweep's published state: counts and fixed tokens
+    /// only, from the SAME accessor `csq status` and `csq doctor` read.
+    /// Omitted when the sweep never published.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keychain_orphans: Option<csq_core::credentials::keychain::orphans::OrphanDiagnosticView>,
 }
 
 /// Returns the build edition this binary was compiled as: `"community"` or
@@ -205,13 +243,65 @@ pub fn get_build_edition() -> Result<&'static str, String> {
 /// `base_dir` is the Claude accounts directory (e.g. `~/.claude/accounts`).
 /// Returns a validation error if the directory does not exist.
 #[tauri::command]
-pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
-    let base = PathBuf::from(&base_dir);
+pub async fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
+    run_desktop_read("get_accounts", move || get_accounts_blocking(base_dir)).await
+}
+
+/// Pending post-commit rescue rows for the desktop list-level notice.
+///
+/// The per-card `rescue_pending` fields on [`AccountView`] can only name a
+/// rescue whose slot→identity mapping is readable. Two states have no card
+/// to live on: a row enumerated by the identities-directory fallback when
+/// `profiles.json` is unreadable (it is labelled by UUID, `slot: null`), and
+/// the explicit `unknown` row emitted when not even that scan can run. Both
+/// are surfaced as rows ABOVE the account list so the desktop cannot show
+/// silence where `csq status` and `csq doctor` show a warning.
+///
+/// Same fixed-vocabulary accessor as the CLI surfaces
+/// ([`csq_core::credentials::rescue::pending_rescues`]); the per-row
+/// `message` and `status_line` fields are serialized by `csq-core`, so the
+/// renderer never re-derives operator text.
+#[tauri::command]
+pub async fn get_pending_rescues(
+    base_dir: String,
+) -> Result<Vec<csq_core::credentials::rescue::PendingRescue>, String> {
+    run_desktop_read("get_pending_rescues", move || {
+        get_pending_rescues_blocking(base_dir)
+    })
+    .await
+}
+
+fn get_pending_rescues_blocking(
+    base_dir: String,
+) -> Result<Vec<csq_core::credentials::rescue::PendingRescue>, String> {
+    let base = resolve_csq_base_dir(&base_dir)?;
+    if !base.is_dir() {
+        return Err(format!("base directory does not exist: {base_dir}"));
+    }
+    Ok(csq_core::credentials::rescue::pending_rescues(&base))
+}
+
+// Filesystem discovery, ledger parsing and OS session enumeration must not
+// occupy Tauri's invoke thread. Keep their existing validation and results
+// together on a blocking-pool thread, including cold-cache reads.
+async fn run_desktop_read<T: Send + 'static>(
+    command: &'static str,
+    read: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(read)
+        .await
+        .map_err(|e| format!("{command} task join error: {e}"))?
+}
+
+fn get_accounts_blocking(base_dir: String) -> Result<Vec<AccountView>, String> {
+    let base = resolve_csq_base_dir(&base_dir)?;
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
 
     let accounts = discovery::discover_all(&base);
+    // F5/L3: ONE suppression lookup for the whole list (see `refresh_suppression_tag`).
+    let suppressed_refresh = csq_core::accounts::refresh_token_audit::suppressed_slots(&base);
     // an internal ticket: salvage per-row — read-only IPC query, never writes back.
     let quota: QuotaFile = quota_state::load_state_salvage(&base);
 
@@ -404,6 +494,16 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
                     Err(_) => ("missing".to_string(), None, None),
                 }
             };
+
+            // F5/L3: a slot whose refresh the duplicate-grant audit suppressed surfaces the same
+            // fixed tag the daemon cache uses; `csq doctor` prints the matching text from the
+            // same `refresh_token_audit` module. Never overrides a real broker failure tag.
+            let last_refresh_error = refresh_suppression_tag(
+                &suppressed_refresh,
+                a.id,
+                matches!(a.source, AccountSource::Anthropic),
+                last_refresh_error,
+            );
 
             // Resolve the stable provider id ("mm", "zai", "deepseek",
             // "ollama") for 3P slots so the frontend can branch on a value
@@ -664,6 +764,11 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
                 }
                 _ => q.surface.as_str() == a.surface.as_str(),
             });
+            // Pending post-commit rescue state, from the SAME accessor the
+            // CLI and doctor use. `None` for rows with no identity binding
+            // (3P / manual / native) and for identities with no record.
+            let rescue_pending = csq_core::accounts::profiles::resolve_slot_to_uuid(&base, a.id)
+                .and_then(|uuid| csq_core::credentials::rescue::rescue_pending_state(&base, uuid));
             AccountView {
                 id: a.id,
                 label: a.label,
@@ -701,6 +806,8 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
                 token_status,
                 expires_in_secs,
                 last_refresh_error,
+                rescue_pending: rescue_pending.map(|state| state.tag().to_string()),
+                rescue_pending_message: rescue_pending.map(|state| state.message().to_string()),
                 provider_id,
                 billing_mode: a.billing_mode.to_string(),
                 quota_kind,
@@ -727,7 +834,7 @@ pub fn get_accounts(base_dir: String) -> Result<Vec<AccountView>, String> {
 ///   are rejected (prevents terminal injection and JSON display artifacts).
 #[tauri::command]
 pub fn rename_account(base_dir: String, account: u16, name: String) -> Result<(), String> {
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
     let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -834,6 +941,26 @@ fn warn_outcome_emit_failed(account: u16, e: &csq_core::audit::persist::AuditV2E
     );
 }
 
+/// The `remove_account` refusal string. Two distinct tags so the UI never says "a session
+/// is still running" for a handle dir whose pid marker merely could not be read:
+/// `ACCOUNT_IN_USE:` (a live pid is known) and `ACCOUNT_MARKER_UNREADABLE:` (only unreadable
+/// dirs, named by dir NAME). Carries no paths and no secrets (`tauri-command-security.md`).
+fn logout_in_use_error(
+    account: csq_core::types::AccountNum,
+    pids: &[u32],
+    unreadable_dirs: &[String],
+) -> String {
+    let tag = if pids.is_empty() {
+        "ACCOUNT_MARKER_UNREADABLE"
+    } else {
+        "ACCOUNT_IN_USE"
+    };
+    format!(
+        "{tag}: {}",
+        csq_core::accounts::logout::in_use_message(account, pids, unreadable_dirs)
+    )
+}
+
 /// Async so the UI thread never waits on the keychain: the interactive
 /// keychain bound inside `logout_account` is up to 60s per call (a password
 /// dialog the user may be answering). The body, including its
@@ -858,7 +985,7 @@ fn remove_account_blocking(base_dir: String, account: u16) -> Result<RemoveAccou
         delete_api_key_from_vault, is_gemini_bound_slot, unbind as gemini_unbind,
     };
 
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
     let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
 
     // D7: Gemini-specific cleanup — runs BEFORE `logout_account` so the
@@ -967,13 +1094,9 @@ fn remove_account_blocking(base_dir: String, account: u16) -> Result<RemoveAccou
     }) {
         Ok(s) => {
             // Best-effort daemon cache invalidation. Mirrors `csq logout`.
-            #[cfg(unix)]
-            {
-                let sock = csq_core::daemon::socket_path(&base);
-                if sock.exists() {
-                    let _ = csq_core::daemon::http_post_unix(&sock, "/api/invalidate-cache");
-                }
-            }
+            // Runs on the blocking pool (`remove_account` spawn_blocking), on
+            // both transports (the Windows arm used to be missing).
+            notify_daemon_cache_invalidated(&base);
             // logout_account emitted its own INTENT+OUTCOME. Gemini vault
             // cleanup's OUTCOME is handled by the gemini_marker_removed path
             // if the slot was also a Gemini-only slot. For mixed slots
@@ -996,6 +1119,13 @@ fn remove_account_blocking(base_dir: String, account: u16) -> Result<RemoveAccou
                 config_dir_removed: s.config_dir_removed,
                 profiles_entry_removed: s.profiles_entry_removed,
                 keychain_cleared: s.keychain_cleared,
+                keychain_retry_queue_failed: s.keychain_retry_queue_failed,
+                // D237 round 2 (ROOT ruling D): the command SUCCEEDED but the
+                // local credential folder is still on disk until the next
+                // cleanup pass. Carried on the existing result payload so the
+                // caller can state it; the core already logged the
+                // fixed-vocabulary WARN (`logout_identity_dir_lock_busy`).
+                identity_dir_pending_removal: s.identity_dir_pending_removal,
             })
         }
         // Gemini-only slots have no `credentials/N.json` or `config-N/`,
@@ -1004,13 +1134,9 @@ fn remove_account_blocking(base_dir: String, account: u16) -> Result<RemoveAccou
         // success — the Gemini-specific state was already cleaned by the
         // vault delete and `unbind` call above.
         Err(LogoutError::NotConfigured { .. }) if gemini_marker_removed.is_some() => {
-            #[cfg(unix)]
-            {
-                let sock = csq_core::daemon::socket_path(&base);
-                if sock.exists() {
-                    let _ = csq_core::daemon::http_post_unix(&sock, "/api/invalidate-cache");
-                }
-            }
+            // Runs on the blocking pool (`remove_account` spawn_blocking), on
+            // both transports (the Windows arm used to be missing).
+            notify_daemon_cache_invalidated(&base);
             // M13b FIX-6: emit OUTCOME for the Gemini-only cleanup path.
             if let Some((chain_id, corr_id, payload)) = gemini_marker_removed {
                 if let Err(oe) = op_emit::emit_outcome(
@@ -1033,13 +1159,22 @@ fn remove_account_blocking(base_dir: String, account: u16) -> Result<RemoveAccou
                 // step never ran (no handle-dir/config-N state to process for a
                 // Gemini-only slot), so nothing was cleared by THIS call.
                 keychain_cleared: false,
+                // No keychain step ran, so no retry could be refused.
+                keychain_retry_queue_failed: false,
+                // The Gemini-only path has no `identities/<UUID>/` delete of
+                // its own; nothing is pending here.
+                identity_dir_pending_removal: false,
             })
         }
         // R2-FIX-2: emit OUTCOME:Failed for the committed Gemini INTENT when
         // logout_account returns InUse (pre-side-effect rejection from the CC
         // layer — the Gemini vault was already deleted, so the INTENT is live).
         // R2-FIX-3: no {e} in the returned String — InUse carries no path.
-        Err(LogoutError::InUse { account: a, pids }) => {
+        Err(LogoutError::InUse {
+            account: a,
+            pids,
+            unreadable_dirs,
+        }) => {
             if let Some((chain_id, corr_id, payload)) = gemini_marker_removed {
                 if let Err(oe) = op_emit::emit_outcome(
                     &base,
@@ -1054,11 +1189,7 @@ fn remove_account_blocking(base_dir: String, account: u16) -> Result<RemoveAccou
                     warn_outcome_emit_failed(account, &oe);
                 }
             }
-            Err(format!(
-                "ACCOUNT_IN_USE: account {} is bound to live process(es) {:?} \
-                 — exit those terminals first",
-                a, pids
-            ))
+            Err(logout_in_use_error(a, &pids, &unreadable_dirs))
         }
         // R2-FIX-3: NotConfigured carries only the slot number — safe to format.
         Err(LogoutError::NotConfigured { account: a }) => Err(format!(
@@ -1085,6 +1216,45 @@ fn remove_account_blocking(base_dir: String, account: u16) -> Result<RemoveAccou
                 }
             }
             Err("REMOVE_FAILED: filesystem error during logout".into())
+        }
+        // Preserve the distinct diagnostic without exposing the internal marker path.
+        Err(LogoutError::NonregularTombstone { .. }) => {
+            if let Some((chain_id, corr_id, payload)) = gemini_marker_removed {
+                if let Err(oe) = op_emit::emit_outcome(
+                    &base,
+                    &chain_id,
+                    EventKind::AccountLogout,
+                    payload,
+                    corr_id,
+                    OpOutcome::Failed {
+                        reason: RedactedString::from_untrusted(
+                            "logout_account failed after vault delete",
+                        ),
+                    },
+                ) {
+                    warn_outcome_emit_failed(account, &oe);
+                }
+            }
+            Err("IDENTITY_REMOVAL_MARKER_NONREGULAR: logout refused; repair the identity removal marker before retrying".into())
+        }
+        Err(LogoutError::UnsafeTombstoneNamespace { .. }) => {
+            if let Some((chain_id, corr_id, payload)) = gemini_marker_removed {
+                if let Err(oe) = op_emit::emit_outcome(
+                    &base,
+                    &chain_id,
+                    EventKind::AccountLogout,
+                    payload,
+                    corr_id,
+                    OpOutcome::Failed {
+                        reason: RedactedString::from_untrusted(
+                            "logout_account failed after vault delete",
+                        ),
+                    },
+                ) {
+                    warn_outcome_emit_failed(account, &oe);
+                }
+            }
+            Err("IDENTITY_REMOVAL_NAMESPACE_NONREGULAR: logout refused; restore the identities directory as a real directory before retrying".into())
         }
         Err(LogoutError::Profiles(_)) => {
             if let Some((chain_id, corr_id, payload)) = gemini_marker_removed {
@@ -1146,6 +1316,120 @@ pub struct RemoveAccountSummary {
     /// confirmed for at least one handle dir bound to this slot. Safe on IPC
     /// per `tauri-commands.md` MUST-3.
     pub keychain_cleared: bool,
+    /// Mirrors `LogoutSummary::keychain_retry_queue_failed` (R3 sec M-D /
+    /// corr L-3): an unconfirmed keychain clear could not be queued for
+    /// automatic retry, so the item may survive the logout. Additive, no
+    /// path or secret — safe on IPC per `tauri-commands.md` MUST-3.
+    pub keychain_retry_queue_failed: bool,
+    /// Mirrors `LogoutSummary::identity_dir_pending_removal` (D237 round 2,
+    /// ROOT ruling D): `true` when the command SUCCEEDED but the slot's local
+    /// credential folder (`identities/<UUID>/`) was NOT removed — its
+    /// credential lock was busy or the delete failed. The account is
+    /// tombstoned (no writer can recreate it); the next cleanup pass removes
+    /// the folder. No path, no secret — safe on IPC. The desktop UI should
+    /// surface this alongside the success result rather than reporting a
+    /// fully-completed removal.
+    pub identity_dir_pending_removal: bool,
+}
+
+/// One Codex slot with a recorded config-write condition: the desktop twin of `csq doctor`'s
+/// `codex_slot_write_status` row (same reader, same fixed status words).
+#[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct CodexSlotWriteStatusView {
+    pub slot: u16,
+    /// Fixed words: `raced`, `exchange-unsupported`, `purge-failed`, `carry-skipped`,
+    /// `unrecognised-marker`.
+    pub status: Vec<String>,
+    /// The owner's acknowledgement is meaningful: a `raced` flag or raced marker is recorded
+    /// (the ack clears only those; other kinds clear by their own handle's success).
+    pub ackable: bool,
+    /// The overflow marker recorded a non-raced kind (or is unrecognised): the ack does not
+    /// clear it; the panel names `config-<N>/.csq-status-markers/overflow` for manual removal.
+    pub overflow_stuck: bool,
+}
+
+/// Read-only and idempotent Claude settings diagnostic, shared with `csq doctor`.
+/// Returns only relative typed locations and key-presence flags; no settings values.
+///
+/// # Errors
+/// `base_dir` does not match the resolved csq accounts directory, or the worker fails.
+#[tauri::command]
+pub async fn get_claude_autocompact_status(
+    base_dir: String,
+) -> Result<csq_core::session::settings_diagnostics::AutoCompactSettingsReport, String> {
+    let base = resolve_csq_base_dir(&base_dir)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        csq_core::session::settings_diagnostics::collect_autocompact_settings(&base)
+    })
+    .await
+    .map_err(|_| "Claude auto-compact diagnostic unavailable".to_string())
+}
+
+/// Lists the Codex slots with a recorded config-write condition. Read-only and idempotent.
+///
+/// # Errors
+/// `base_dir` does not match the resolved csq accounts directory.
+#[tauri::command]
+pub fn get_codex_slot_write_status(
+    base_dir: String,
+) -> Result<Vec<CodexSlotWriteStatusView>, String> {
+    use csq_core::providers::codex::surface::{
+        slot_overflow_stuck, slot_write_statuses, SlotWriteStatus,
+    };
+    let base = resolve_csq_base_dir(&base_dir)?;
+    Ok((1..=csq_core::types::MAX_ACCOUNTS)
+        .filter_map(|n| {
+            let account = AccountNum::try_from(n).ok()?;
+            let status = slot_write_statuses(&base, account);
+            (!status.is_empty()).then(|| CodexSlotWriteStatusView {
+                slot: n,
+                ackable: status.contains(&SlotWriteStatus::Raced),
+                overflow_stuck: slot_overflow_stuck(&base, account),
+                status: status.iter().map(|s| s.word().to_owned()).collect(),
+            })
+        })
+        .collect())
+}
+
+/// Result of [`ack_codex_slot_raced`].
+#[derive(serde::Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodexAckView {
+    pub slot: u16,
+    pub cleared: bool,
+    pub tmp_removed: usize,
+    pub markers_removed: usize,
+}
+
+/// The owner's acknowledgement of a Codex slot's `raced` flag: the SAME core operation as
+/// `csq doctor --ack-raced <N>` (`surface::ack_slot_raced`). Removes the slot's leftover
+/// config tmp files and status markers and clears the sticky flag. Idempotent: a second
+/// call on an acknowledged slot clears nothing. The wait for the slot lock is up to 5s, so
+/// the body runs on the blocking pool.
+///
+/// # Errors
+/// `INVALID_INPUT: ...` for a slot outside 1..=MAX_ACCOUNTS or a `base_dir` that is not the
+/// csq accounts directory; `ACK_FAILED: <fixed cause>` when the slot has no config dir, the
+/// lock times out or a leftover cannot be removed (the flag then stays).
+#[tauri::command]
+pub async fn ack_codex_slot_raced(base_dir: String, slot: u16) -> Result<CodexAckView, String> {
+    tauri::async_runtime::spawn_blocking(move || ack_codex_slot_raced_blocking(&base_dir, slot))
+        .await
+        .map_err(|e| format!("ack_codex_slot_raced task join error: {e}"))?
+}
+
+fn ack_codex_slot_raced_blocking(base_dir: &str, slot: u16) -> Result<CodexAckView, String> {
+    use csq_core::providers::codex::surface::{ack_slot_raced, describe_slot_error};
+    let account =
+        AccountNum::try_from(slot).map_err(|e| format!("INVALID_INPUT: slot={slot}: {e}"))?;
+    let base = resolve_csq_base_dir(base_dir).map_err(|e| format!("INVALID_INPUT: {e}"))?;
+    let out = ack_slot_raced(&base, account)
+        .map_err(|e| format!("ACK_FAILED: {}", describe_slot_error(&e)))?;
+    Ok(CodexAckView {
+        slot,
+        cleared: out.cleared,
+        tmp_removed: out.tmp_removed,
+        markers_removed: out.markers_removed,
+    })
 }
 
 /// Renames slot `from` to slot `to`. Wraps `csq_core::accounts::move_slot::move_account`.
@@ -1173,7 +1457,7 @@ pub struct RemoveAccountSummary {
 pub fn move_account(base_dir: String, from: u16, to: u16) -> Result<MoveAccountSummary, String> {
     use csq_core::accounts::move_slot::{move_account as core_move, MoveError};
 
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
     let from_num =
         AccountNum::try_from(from).map_err(|e| format!("INVALID_INPUT: from={from}: {e}"))?;
     let to_num = AccountNum::try_from(to).map_err(|e| format!("INVALID_INPUT: to={to}: {e}"))?;
@@ -1185,16 +1469,8 @@ pub fn move_account(base_dir: String, from: u16, to: u16) -> Result<MoveAccountS
             // 2. /api/slot-swap         — targeted per-slot TtlCache invalidation (SEC-2.11)
             // Both route through the shared csq_core helpers so CLI and desktop
             // use the same production chokepoint.
-            #[cfg(unix)]
-            {
-                let sock = csq_core::daemon::socket_path(&base);
-                if sock.exists() {
-                    let _ = csq_core::daemon::http_post_unix(&sock, "/api/invalidate-cache");
-                }
-                // Shared chokepoint: `notify_slot_swap` handles absent-socket no-op
-                // and CRLF validation. Do NOT inline the JSON body here.
-                let _ = csq_core::daemon::notify_slot_swap(&sock, s.from.get(), s.to.get());
-            }
+            // Same two shared chokepoints as `csq move`, on both transports.
+            notify_after_move(&base, s.from.get(), s.to.get());
             Ok(MoveAccountSummary {
                 from: s.from.get(),
                 to: s.to.get(),
@@ -1285,12 +1561,13 @@ pub struct MoveAccountSummary {
 // completes. This cache is therefore the FALLBACK, not the primary path;
 // the comment above describes only the fallback.
 
+#[cfg(test)]
 type UsagePairs = Vec<(AccountNum, csq_core::usage::ledger::UsageEvent)>;
 
 struct UsageCacheEntry {
     base_dir: String,
     computed_at: std::time::Instant,
-    pairs: Result<std::sync::Arc<UsagePairs>, String>,
+    pairs: Result<csq_core::usage::aggregator::PassPairs, String>,
 }
 
 // SINGLE-BASE ASSUMPTION: csq desktop runs with exactly one `~/.claude/accounts`
@@ -1310,17 +1587,90 @@ static USAGE_REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool =
 /// background scan to at most once per interval while the dashboard is open.
 const USAGE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// How long a FAILED refresh is served before the next attempt. A failed pass
+/// (e.g. a malformed manifest) is surfaced to the caller, not hidden; this only
+/// stops the poll from re-running a failing full scan on every 5s tick.
+const USAGE_ERROR_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether a cache entry of the given age is still served without a refresh.
+/// A good entry lives `USAGE_CACHE_TTL`; a FAILED one only `USAGE_ERROR_RETRY`,
+/// so a failing scan is retried on the next poll after 30 s rather than every
+/// 5 s tick or never. The age is a parameter so tests need no sleep.
+fn usage_entry_is_fresh(is_ok: bool, age: std::time::Duration) -> bool {
+    age < if is_ok {
+        USAGE_CACHE_TTL
+    } else {
+        USAGE_ERROR_RETRY
+    }
+}
+
 fn usage_cache() -> &'static std::sync::Mutex<Option<UsageCacheEntry>> {
     USAGE_CACHE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+/// Change-detection memory for the refresh thread. Touched only by the single
+/// in-flight refresh thread (guarded by `USAGE_REFRESH_IN_FLIGHT`), on a plain
+/// OS thread — never held across an await.
+static USAGE_REFRESH_STATE: std::sync::OnceLock<std::sync::Mutex<UsageRefreshState>> =
+    std::sync::OnceLock::new();
+
+struct UsageRefreshState {
+    base: Option<PathBuf>,
+    pass: csq_core::usage::aggregator::PassCache,
+    scanner: csq_core::usage::aggregator::IncrementalScanner,
+}
+
+impl Default for UsageRefreshState {
+    fn default() -> Self {
+        Self {
+            base: None,
+            pass: Default::default(),
+            scanner: csq_core::usage::aggregator::IncrementalScanner::for_desktop(),
+        }
+    }
+}
+
+/// One refresh: skips the transcript scan when every input is `stat`-identical
+/// to the previous pass (see [`csq_core::usage::aggregator::PassCache`]),
+/// otherwise reaggregates with retained transcript projections. `now` is injected.
+fn refresh_usage_pairs(
+    state: &mut UsageRefreshState,
+    base: &std::path::Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<
+    (
+        csq_core::usage::aggregator::PassPairs,
+        csq_core::usage::aggregator::PassKind,
+    ),
+    String,
+> {
+    let claude_home = base
+        .parent()
+        .ok_or_else(|| "INVALID_INPUT: usage base has no parent".to_string())?;
+    if state.base.as_deref() != Some(base) {
+        *state = UsageRefreshState::default();
+        state.base = Some(base.to_path_buf());
+    }
+    let snapshot = csq_core::usage::aggregator::snapshot_inputs(claude_home, base, now);
+    state.pass.refresh(snapshot, || {
+        state
+            .scanner
+            .aggregate(claude_home, base, now, |slot| {
+                csq_core::providers::settings::model_id_for_slot(base, slot.get())
+                    .unwrap_or_else(|| "claude-sonnet-5".to_string())
+            })
+            .map_err(|error| format!("MODEL_MANIFEST: {error:#}"))
+    })
+}
+
 /// Runs the aggregator for `base` and returns the all-slots (slot, event)
-/// pairs. Synchronous; used by the background refresh thread and by tests.
+/// pairs. Synchronous uncached reference, used only by tests.
 ///
 /// The real per-turn model is sourced from the transcript (an internal ticket); the
 /// callback below is only a FALLBACK for sessions whose transcript had no
 /// model line (prior to an internal ticket this hardcoded model was applied to EVERY slot,
 /// costing a DeepSeek slot at Sonnet rates).
+#[cfg(test)]
 fn aggregate_usage_pairs(
     base: &std::path::Path,
     now: chrono::DateTime<chrono::Utc>,
@@ -1341,19 +1691,13 @@ fn aggregate_usage_pairs(
     .map_err(|error| format!("MODEL_MANIFEST: {error:#}"))
 }
 
-/// Filters the cached pairs to one slot and summarizes into the IPC view.
+/// Summarizes one slot of the cached (slim) pass into the IPC view.
 fn summarize_slot(
-    pairs: &UsagePairs,
+    pairs: &csq_core::usage::aggregator::SlimLedger,
     account_num: AccountNum,
     now: chrono::DateTime<chrono::Utc>,
 ) -> UsageSummaryView {
-    let events: Vec<csq_core::usage::ledger::UsageEvent> = pairs
-        .iter()
-        .filter(|(s, _)| *s == account_num)
-        .map(|(_, ev)| ev.clone())
-        .collect();
-    let summary = csq_core::usage::ledger::summarize(&events, now);
-    summary_to_view(summary)
+    summary_to_view(pairs.summarize_slot(account_num, now))
 }
 
 /// Maps a core [`csq_core::usage::ledger::UsageSummary`] to the IPC view.
@@ -1404,7 +1748,9 @@ fn summary_to_view(summary: csq_core::usage::ledger::UsageSummary) -> UsageSumma
 /// Returns the cached all-slots pairs (cloning the `Arc`), kicking ONE guarded
 /// background refresh when the entry is stale/absent/for a different base. The
 /// caller gets an immediate answer; refreshed numbers appear on the next poll.
-fn cached_or_refresh_pairs(base_dir: &str) -> Result<std::sync::Arc<UsagePairs>, String> {
+fn cached_or_refresh_pairs(
+    base_dir: &str,
+) -> Result<csq_core::usage::aggregator::PassPairs, String> {
     use std::sync::atomic::Ordering;
 
     let (pairs, needs_refresh) = {
@@ -1412,13 +1758,12 @@ fn cached_or_refresh_pairs(base_dir: &str) -> Result<std::sync::Arc<UsagePairs>,
         match guard.as_ref() {
             Some(c)
                 if c.base_dir == base_dir
-                    && c.computed_at.elapsed() < USAGE_CACHE_TTL
-                    && c.pairs.is_ok() =>
+                    && usage_entry_is_fresh(c.pairs.is_ok(), c.computed_at.elapsed()) =>
             {
                 (c.pairs.clone(), false)
             }
             Some(c) if c.base_dir == base_dir => (c.pairs.clone(), true), // stale → serve + refresh
-            _ => (Ok(std::sync::Arc::new(Vec::new())), true),             // absent / different base
+            _ => (Ok(Default::default()), true),                          // absent / different base
         }
     };
 
@@ -1444,12 +1789,19 @@ fn cached_or_refresh_pairs(base_dir: &str) -> Result<std::sync::Arc<UsagePairs>,
                 let _reset = ResetInFlight;
 
                 let now = chrono::Utc::now();
-                let fresh = aggregate_usage_pairs(&PathBuf::from(&base_owned), now);
+                let fresh = {
+                    let mut pc = USAGE_REFRESH_STATE
+                        .get_or_init(|| std::sync::Mutex::new(Default::default()))
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    refresh_usage_pairs(&mut pc, &PathBuf::from(&base_owned), now)
+                        .map(|(pairs, _kind)| pairs)
+                };
                 let mut guard = usage_cache().lock().unwrap_or_else(|e| e.into_inner());
                 *guard = Some(UsageCacheEntry {
                     base_dir: base_owned,
                     computed_at: std::time::Instant::now(),
-                    pairs: fresh.map(std::sync::Arc::new),
+                    pairs: fresh,
                 });
                 // `_reset` drops here (or on unwind), releasing the flag.
             });
@@ -1460,6 +1812,165 @@ fn cached_or_refresh_pairs(base_dir: &str) -> Result<std::sync::Arc<UsagePairs>,
     }
 
     pairs
+}
+
+#[cfg(test)]
+#[path = "usage_refresh_tests.rs"]
+mod usage_refresh_tests;
+
+// ── Ledger-first read cache ────────────────────────────────────────────────
+//
+// The BillingLedger polls every 5 s per slot; re-reading and re-parsing a
+// slot's whole ndjson each time was measurable. The parsed result is cached per
+// slot as the slim summarize-relevant form, keyed by the ledger file's
+// (path, file identity, length, mtime): an unchanged file is not re-read; any
+// change re-parses. The identity is `(dev, ino)` of the OPEN handle on unix, so
+// a rename-based replacement (which preserves mtime and can preserve length)
+// is a miss. Non-unix targets have no stable identity in std (`file_index` is
+// unstable), so there the key stays (path, length, mtime) and a same-length,
+// same-mtime replacement is not detected. The cache is bounded by construction — one entry per slot
+// (`AccountNum` is 1..=MAX_ACCOUNTS), and an entry is dropped whenever its slot
+// turns absent, empty or unreadable, so only slots with a live non-empty ledger
+// are held. (A same-length rewrite inside one mtime tick would be missed; the
+// daemon rewrites on a 600 s cadence at nanosecond mtime granularity.)
+
+/// Result of a cached ledger-first read.
+enum LedgerOutcome {
+    /// Non-empty ledger, parsed (now or earlier) and unchanged since.
+    Served(std::sync::Arc<csq_core::usage::aggregator::SlimLedger>),
+    /// No ledger file.
+    Absent,
+    /// A ledger file that parsed to zero events.
+    Empty,
+    /// The ledger could not be statted or read; never served from cache.
+    Unreadable(String),
+}
+
+/// `(dev, ino)` of the opened ledger; `None` where std exposes no identity.
+type FileIdentity = Option<(u64, u64)>;
+
+#[cfg(unix)]
+fn file_identity(meta: &std::fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_meta: &std::fs::Metadata) -> FileIdentity {
+    None
+}
+
+struct LedgerCacheEntry {
+    path: PathBuf,
+    identity: FileIdentity,
+    len: u64,
+    mtime: Option<std::time::SystemTime>,
+    ledger: std::sync::Arc<csq_core::usage::aggregator::SlimLedger>,
+}
+
+#[derive(Default)]
+struct LedgerCache {
+    by_slot: std::collections::HashMap<AccountNum, LedgerCacheEntry>,
+}
+
+static LEDGER_CACHE: std::sync::OnceLock<std::sync::Mutex<LedgerCache>> =
+    std::sync::OnceLock::new();
+
+fn ledger_cache() -> &'static std::sync::Mutex<LedgerCache> {
+    LEDGER_CACHE.get_or_init(|| std::sync::Mutex::new(LedgerCache::default()))
+}
+
+/// Cached ledger-first read. `read` parses the ledger and is injected so a test
+/// can count parses; the lock is never held while it runs (stat first, then
+/// read outside the lock, then store — so a concurrent change is picked up on
+/// the next poll rather than mislabeled).
+fn read_ledger_cached<R>(
+    cache: &std::sync::Mutex<LedgerCache>,
+    base: &std::path::Path,
+    slot: AccountNum,
+    read: R,
+) -> LedgerOutcome
+where
+    R: FnOnce(
+        &std::path::Path,
+        AccountNum,
+    ) -> std::io::Result<Vec<csq_core::usage::ledger::UsageEvent>>,
+{
+    let path = csq_core::usage::ledger::ledger_path(base, slot);
+    let forget = |cache: &std::sync::Mutex<LedgerCache>| {
+        cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .by_slot
+            .remove(&slot);
+    };
+    // OPEN, not just stat: a ledger whose permissions were revoked keeps its
+    // (len, mtime), so a stat-only key would keep serving the stale parse.
+    // Opening proves readability for the cost of one syscall, no parse.
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            forget(cache);
+            return LedgerOutcome::Absent;
+        }
+        Err(e) => {
+            forget(cache);
+            return LedgerOutcome::Unreadable(format!("open: {e}"));
+        }
+    };
+    let meta = match file.metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            forget(cache);
+            return LedgerOutcome::Unreadable(format!("stat: {e}"));
+        }
+    };
+    drop(file);
+    let (len, mtime, identity) = (meta.len(), meta.modified().ok(), file_identity(&meta));
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = guard.by_slot.get(&slot) {
+            // An unknown mtime cannot prove "unchanged": never serve on it.
+            if entry.path == path
+                && entry.identity == identity
+                && entry.len == len
+                && mtime.is_some()
+                && entry.mtime == mtime
+            {
+                return LedgerOutcome::Served(entry.ledger.clone());
+            }
+        }
+    }
+    match read(base, slot) {
+        Err(e) => {
+            forget(cache);
+            LedgerOutcome::Unreadable(e.to_string())
+        }
+        Ok(events) if events.is_empty() => {
+            forget(cache);
+            LedgerOutcome::Empty
+        }
+        Ok(events) => {
+            let pairs: Vec<_> = events.into_iter().map(|e| (slot, e)).collect();
+            let ledger =
+                std::sync::Arc::new(csq_core::usage::aggregator::SlimLedger::from_pairs(&pairs));
+            cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .by_slot
+                .insert(
+                    slot,
+                    LedgerCacheEntry {
+                        path,
+                        identity,
+                        len,
+                        mtime,
+                        ledger: ledger.clone(),
+                    },
+                );
+            LedgerOutcome::Served(ledger)
+        }
+    }
 }
 
 /// Phase B' (an internal journal entry) — returns the per-account usage summary for the
@@ -1476,7 +1987,14 @@ fn cached_or_refresh_pairs(base_dir: &str) -> Result<std::sync::Arc<UsagePairs>,
 /// transcript is held whole. Conversation content is never retained or
 /// persisted (an internal ticket).
 #[tauri::command]
-pub fn get_account_usage(base_dir: String, account: u16) -> Result<UsageSummaryView, String> {
+pub async fn get_account_usage(base_dir: String, account: u16) -> Result<UsageSummaryView, String> {
+    run_desktop_read("get_account_usage", move || {
+        get_account_usage_blocking(base_dir, account)
+    })
+    .await
+}
+
+fn get_account_usage_blocking(base_dir: String, account: u16) -> Result<UsageSummaryView, String> {
     let account_num = AccountNum::try_from(account).map_err(|e| format!("INVALID_INPUT: {e}"))?;
     let now = chrono::Utc::now();
 
@@ -1487,20 +2005,28 @@ pub fn get_account_usage(base_dir: String, account: u16) -> Result<UsageSummaryV
     // The desktop app runs the in-process daemon, so the writer's immediate
     // first tick populates the ledger within seconds of launch and refreshes it
     // every 10 min — the read path never pays the ~20s scan.
-    let base = std::path::PathBuf::from(&base_dir);
-    if csq_core::usage::ledger::ledger_path(&base, account_num).exists() {
-        if let Ok(result) = csq_core::usage::ledger::read_all(&base, account_num) {
-            // Treat the ledger as a cache: a NON-EMPTY read is a hit → serve it
-            // fast. An EMPTY read is a miss (rolled-off / never-populated slot)
-            // → fall through to the authoritative live-scan below, which yields
-            // the same zero but defends against a transient empty tick blanking
-            // a populated slot. (an internal ticket redteam R1 MEDIUM-1.)
-            if !result.events.is_empty() {
-                let summary = csq_core::usage::ledger::summarize(&result.events, now);
-                return Ok(summary_to_view(summary));
-            }
+    let base = resolve_csq_base_dir(&base_dir)?;
+    match read_ledger_cached(ledger_cache(), &base, account_num, |b, slot| {
+        csq_core::usage::ledger::read_all(b, slot).map(|r| r.events)
+    }) {
+        // A NON-EMPTY ledger is a hit → served from the parsed, slim cache
+        // (re-parsed only when the file's length or mtime changed).
+        LedgerOutcome::Served(slim) => {
+            return Ok(summary_to_view(slim.summarize_slot(account_num, now)));
         }
-        // A read error (I/O, not "absent") also falls through to the live scan.
+        // Absent / empty: a miss. An EMPTY read falls through to the
+        // authoritative live-scan below, which defends against a transient
+        // empty tick blanking a populated slot. (an internal ticket redteam R1 MEDIUM-1.)
+        LedgerOutcome::Absent | LedgerOutcome::Empty => {}
+        // Unreadable (I/O, not "absent"): falls through to the live scan as
+        // before, but is SURFACED, and nothing stale is served for it.
+        LedgerOutcome::Unreadable(reason) => {
+            tracing::warn!(
+                error_kind = "usage_ledger_unreadable",
+                slot = account,
+                "usage ledger unreadable, using live scan: {reason}"
+            );
+        }
     }
 
     // Cold-start fallback: no daemon-written ledger yet (fresh install, or the
@@ -1574,14 +2100,14 @@ pub struct UsageSummaryView {
 /// Returns defaults if `rotation.json` does not exist.
 #[tauri::command]
 pub fn get_rotation_config(base_dir: String) -> Result<RotationConfig, String> {
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
     rotation_config::load(&base).map_err(|e| e.redacted_message())
 }
 
 /// Enables or disables auto-rotation, writing the change to `rotation.json`.
 #[tauri::command]
 pub fn set_rotation_enabled(base_dir: String, enabled: bool) -> Result<(), String> {
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
     let mut config = rotation_config::load(&base).map_err(|e| e.redacted_message())?;
     config.enabled = enabled;
     rotation_config::save(&base, &config).map_err(|e| e.redacted_message())
@@ -1665,7 +2191,7 @@ impl From<CapabilityLayerTogglesView> for CapabilityLayerToggles {
 pub fn get_capability_layer_toggles(
     base_dir: String,
 ) -> Result<CapabilityLayerTogglesView, String> {
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
@@ -1686,7 +2212,7 @@ pub fn set_capability_layer_toggles(
     base_dir: String,
     toggles: CapabilityLayerTogglesView,
 ) -> Result<CapabilityLayerTogglesView, String> {
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
@@ -1916,11 +2442,17 @@ fn session_quota_fields(row: Option<&AccountQuota>) -> (bool, Option<f64>, Optio
 /// user. Each entry is one terminal's `claude` process with the
 /// current account and 5-hour quota for its bound config dir.
 ///
-/// Unknown on Windows (returns an empty vector). See
-/// `csq_core::sessions::windows` for the rationale.
+/// On Windows the sessions are enumerated through a Toolhelp32 process
+/// snapshot plus a PEB walk of each `claude.exe` (see
+/// `csq_core::sessions::windows` for the mechanism and its fragility
+/// vectors); a process whose environment cannot be read is skipped.
 #[tauri::command]
-pub fn list_sessions(base_dir: String) -> Result<Vec<SessionView>, String> {
-    let base = PathBuf::from(&base_dir);
+pub async fn list_sessions(base_dir: String) -> Result<Vec<SessionView>, String> {
+    run_desktop_read("list_sessions", move || list_sessions_blocking(base_dir)).await
+}
+
+fn list_sessions_blocking(base_dir: String) -> Result<Vec<SessionView>, String> {
+    let base = resolve_csq_base_dir(&base_dir)?;
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
@@ -1987,20 +2519,35 @@ pub fn list_sessions(base_dir: String) -> Result<Vec<SessionView>, String> {
 }
 /// Returns whether the csq daemon is running.
 #[tauri::command]
-pub fn get_daemon_status(base_dir: String) -> Result<DaemonStatusView, String> {
-    let base = PathBuf::from(&base_dir);
-    let pid_path = csq_core::daemon::pid_file_path(&base);
+pub async fn get_daemon_status(base_dir: String) -> Result<DaemonStatusView, String> {
+    run_desktop_read("get_daemon_status", move || {
+        get_daemon_status_blocking(base_dir)
+    })
+    .await
+}
+
+fn get_daemon_status_blocking(base_dir: String) -> Result<DaemonStatusView, String> {
+    let base = resolve_csq_base_dir(&base_dir)?;
+    Ok(daemon_status_view(&base))
+}
+
+/// Compose the status view for an already-validated base dir.
+fn daemon_status_view(base: &Path) -> DaemonStatusView {
+    let pid_path = csq_core::daemon::pid_file_path(base);
     let status = csq_core::daemon::status_of(&pid_path);
-    Ok(match status {
+    let keychain_orphans = csq_core::credentials::keychain::orphans::read_diagnostic(base).view();
+    match status {
         csq_core::daemon::DaemonStatus::Running { pid } => DaemonStatusView {
             running: true,
             pid: Some(pid),
+            keychain_orphans,
         },
         _ => DaemonStatusView {
             running: false,
             pid: None,
+            keychain_orphans,
         },
-    })
+    }
 }
 
 /// Public view of a provider entry, safe to send over IPC.
@@ -2184,7 +2731,7 @@ fn resolve_native_login_request(
     let descriptor = native::descriptor_by_id(native_id)
         .ok_or_else(|| format!("unknown native CLI id: {native_id}"))?;
     let slot_num = AccountNum::try_from(slot).map_err(|e| format!("invalid slot: {e}"))?;
-    let base = PathBuf::from(base_dir);
+    let base = resolve_csq_base_dir(base_dir)?;
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
@@ -2420,16 +2967,10 @@ pub async fn complete_native_login(
     login_result?;
 
     // Best-effort daemon cache invalidation, mirroring
-    // complete_codex_login / the retired provision_native_cli. Fast
-    // local Unix-socket call — no spawn_blocking wrapper needed.
-    #[cfg(unix)]
-    {
-        let base = PathBuf::from(&base_dir);
-        let sock = csq_core::daemon::socket_path(&base);
-        if sock.exists() {
-            let _ = csq_core::daemon::http_post_unix(&sock, "/api/invalidate-cache");
-        }
-    }
+    // complete_codex_login / the retired provision_native_cli. The notify
+    // body is blocking, so it runs on the blocking pool.
+    let base = resolve_csq_base_dir(&base_dir)?;
+    notify_daemon_blocking(move || notify_daemon_cache_invalidated(&base)).await;
 
     Ok(())
 }
@@ -2634,12 +3175,31 @@ impl From<LoginRequest> for ClaudeLoginView {
 ///   (unlikely in practice but possible under rapid re-opens)
 #[tauri::command]
 #[allow(dead_code)]
-pub fn begin_claude_login(
+pub async fn begin_claude_login(
     state: State<'_, AppState>,
+    base_dir: String,
     account: u16,
 ) -> Result<ClaudeLoginView, String> {
     let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
-    csq_core::oauth::login::start_login(&state.oauth_store, account_num)
+    // fixcheck2 LOW 1: even this unregistered command must pass the
+    // containment resolver before any filesystem use (the sweep guard now
+    // scans every spelling under src/desktop).
+    let base = resolve_csq_base_dir(&base_dir)?;
+    let store = Arc::clone(&state.oauth_store);
+    tokio::task::spawn_blocking(move || begin_claude_login_for_base(&store, &base, account_num))
+        .await
+        .map_err(|_| "identity capture task failed".to_string())?
+}
+
+fn begin_claude_login_for_base(
+    store: &csq_core::oauth::OAuthStateStore,
+    base: &Path,
+    account: AccountNum,
+) -> Result<ClaudeLoginView, String> {
+    let base = std::fs::canonicalize(base).map_err(|_| "identity base refused".to_string())?;
+    let prior = csq_core::accounts::anthropic_identity::capture_login_prior(&base, account)
+        .map_err(|e| format!("identity capture failed: {e}"))?;
+    csq_core::oauth::login::start_login_with_prior(store, account, base, prior)
         .map(ClaudeLoginView::from)
         .map_err(|e| e.to_string())
 }
@@ -2677,7 +3237,7 @@ pub fn begin_claude_login(
 #[allow(dead_code)]
 pub async fn start_claude_login(base_dir: String, account: u16) -> Result<u16, String> {
     let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
-    let base = std::path::PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
 
     // GH an internal ticket: the reverse conflict guard that used to run here
     // (redteam R3) is retired — a stale Gemini/native marker is now detected
@@ -2694,6 +3254,10 @@ pub async fn start_claude_login(base_dir: String, account: u16) -> Result<u16, S
             "CLAUDE_NOT_FOUND: could not locate the `claude` binary in $PATH or any standard install location".to_string()
         })?;
 
+        // SEC-2.15 (unified, R1 M1): secure the accounts root (config-N's
+        // parent) fail-closed before creating the handle dir.
+        csq_core::platform::fs::ensure_private_dir_root(&base)
+            .map_err(|e| format!("accounts_root_refused: {e}"))?;
         let config_dir = base.join(format!("config-{}", account_num));
         std::fs::create_dir_all(&config_dir)
             .map_err(|e| format!("failed to create config dir: {e}"))?;
@@ -2709,6 +3273,8 @@ pub async fn start_claude_login(base_dir: String, account: u16) -> Result<u16, S
         // Run claude auth login with isolated config dir, calling
         // by absolute path so the Finder-default $PATH gap can't
         // bite us.
+        let prior = csq_core::accounts::anthropic_identity::capture_login_prior(&base, account_num)
+            .map_err(|e| format!("identity capture failed: {e}"))?;
         let status = std::process::Command::new(&claude_bin)
             .args(["auth", "login"])
             .env("CLAUDE_CONFIG_DIR", &config_dir)
@@ -2733,44 +3299,24 @@ pub async fn start_claude_login(base_dir: String, account: u16) -> Result<u16, S
         let creds = csq_core::credentials::read_fresh_after_login(&config_dir)
             .map_err(|e| e.to_string())?;
 
-        // an internal ticket: mint the slot's identity UUID BEFORE save_canonical_for
-        // (which is fail-closed on an absent UUID, M4-12). Mirrors the two live
-        // login twins (CLI handle_direct_post_subprocess + desktop
-        // start_claude_login_subprocess) so re-enabling this rollback knob can't
-        // hit the fresh-install / keychain-only "no credentials configured"
-        // failure. Idempotent + no-op when already minted or no email source.
-        csq_core::accounts::login::ensure_login_identity_minted(&base, account_num)
-            .map_err(|e| format!("mint identity: {e}"))?;
+        let expected = csq_core::accounts::anthropic_identity::read_native_expectation(&config_dir)
+            .map_err(|e| format!("identity metadata failed: {e}"))?;
+        let committed = csq_core::accounts::anthropic_identity::commit_anthropic_login(
+            &base, account_num, &creds, Some(&expected), prior,
+        ).map_err(|e| format!("identity verification failed: {}", csq_core::accounts::login::LoginCommitOutcome::describe_commit_failure_for_account(&e, account_num)))?;
 
-        // Save canonical (UUID-keyed path; M4-12: fail-closed if UUID absent)
-        credentials::save_canonical_for(&base, account_num, &creds)
-            .map_err(|e| format!("credential write failed: {e}"))?;
-
-        // Mark this dir with the account number — AFTER the credential read +
-        // save succeed (M8 / REV-R1-02 ordering, mirroring the live CLI path).
-        // M4-7: identity UUID if `by_slot` maps; otherwise legacy decimal.
-        match csq_core::accounts::profiles::resolve_slot_to_uuid(&base, account_num.get()) {
-            Some(uuid) => csq_core::accounts::markers::write_csq_account(&config_dir, uuid)
-                .map_err(|e| format!("failed to write marker: {e}"))?,
-            None => csq_core::accounts::markers::write_csq_account_legacy(&config_dir, account_num)
-                .map_err(|e| format!("failed to write marker: {e}"))?,
-        }
-
-        // profiles.json email update + broker-failed clear — shared with
-        // `csq login` so the dashboard sees the real email instead of "unknown".
-        csq_core::accounts::login::finalize_login(&base, account_num)
+        // Only the receipt-consuming finalizer writes the authoritative marker.
+        csq_core::accounts::login::finalize_verified_login(&base, account_num, committed)
             .map_err(|e| format!("post-login bookkeeping failed: {e}"))?;
 
         // Tell the daemon its account-discovery cache is stale so
         // get_accounts picks up the new slot on the dashboard's
         // next 5s poll.
-        #[cfg(unix)]
-        {
-            let sock = csq_core::daemon::socket_path(&base);
-            if sock.exists() {
-                let _ = csq_core::daemon::http_post_unix(&sock, "/api/invalidate-cache");
-            }
-        }
+        notify_daemon_cache_invalidated(&base);
+
+        // login-followup: wake the daemon's usage poller for an immediate
+        // quota tick (the commit + finalize above succeeded). Best-effort.
+        csq_core::daemon::notify::slot_rebind(&base, account_num.get());
 
         Ok(account_num.get())
     })
@@ -2841,50 +3387,208 @@ pub async fn submit_oauth_code(
 
     // Run the blocking token exchange on a worker thread so we
     // don't freeze the Tauri event loop during the HTTP call.
-    let base_dir_clone = base_dir.clone();
+    // R3-fix-check LOW 4: the third renderer-supplied base_dir sibling —
+    // resolved through the containment helper BEFORE the worker thread
+    // (the former in-closure conversion of the renamed clone was missed
+    // by the first sweep; its spelling now exists only in the guard's
+    // split-literal pattern).
+    let base = resolve_csq_base_dir(&base_dir)?;
     tokio::task::spawn_blocking(move || {
-        let credential = exchange_code(
+        let account = pending.account;
+        complete_pending_claude_login_using(
+            &base,
+            pending,
             &code,
-            &pending.code_verifier,
-            PASTE_CODE_REDIRECT_URI,
             csq_core::http::post_json_node,
-        )
-        .map_err(|e| format!("exchange failed: {e}"))?;
-
-        // Persist to `credentials/N.json` via the canonical helper
-        // which handles atomic replace + 0o600 permissions.
-        let base = PathBuf::from(&base_dir_clone);
-        if !base.is_dir() {
-            return Err(format!("base directory does not exist: {base_dir_clone}"));
-        }
-
-        credentials::save_canonical_for(&base, pending.account, &credential)
-            .map_err(|e| format!("credential write failed: {e}"))?;
-
-        // Mirror the start_claude_login bookkeeping so the paste-code
-        // path also populates profiles.json. In this branch CC did
-        // NOT run, so `.claude.json` is unlikely to exist with an
-        // emailAddress field — finalize_login falls back to "unknown"
-        // gracefully and still writes the marker + clears the
-        // broker-failed flag.
-        // RN1-C: finalize_login now propagates the UUID credential seed error
-        // fail-closed. Discard the Ok(email) string but propagate Err.
-        csq_core::accounts::login::finalize_login(&base, pending.account)
-            .map_err(|e| format!("post-login bookkeeping failed: {e}"))?;
+            |base, account, credential, prior| {
+                csq_core::accounts::anthropic_identity::commit_anthropic_login(
+                    base, account, credential, None, prior,
+                )
+            },
+        )?;
 
         // Tell the daemon its account-discovery cache is stale.
-        #[cfg(unix)]
-        {
-            let sock = csq_core::daemon::socket_path(&base);
-            if sock.exists() {
-                let _ = csq_core::daemon::http_post_unix(&sock, "/api/invalidate-cache");
-            }
-        }
+        notify_daemon_cache_invalidated(&base);
 
-        Ok(pending.account.get())
+        // login-followup: wake the daemon's usage poller for an immediate
+        // quota tick (the paste-code commit above succeeded). Best-effort.
+        csq_core::daemon::notify::slot_rebind(&base, account.get());
+
+        Ok(account.get())
     })
     .await
     .map_err(|e| format!("exchange task failed: {e}"))?
+}
+
+#[cfg(test)]
+fn complete_pending_claude_login(
+    base: &Path,
+    pending: csq_core::oauth::state_store::PendingState,
+    code: &str,
+    exchange: impl Fn(&str, &str) -> Result<Vec<u8>, String>,
+    profile: &csq_core::daemon::usage_poller::HttpGetFn,
+) -> Result<(), String> {
+    complete_pending_claude_login_using(
+        base,
+        pending,
+        code,
+        exchange,
+        |base, account, credential, prior| {
+            csq_core::accounts::anthropic_identity::commit_anthropic_login_with(
+                base, account, credential, profile, None, prior,
+            )
+        },
+    )
+}
+
+fn complete_pending_claude_login_using(
+    base: &Path,
+    pending: csq_core::oauth::state_store::PendingState,
+    code: &str,
+    exchange: impl Fn(&str, &str) -> Result<Vec<u8>, String>,
+    commit: impl FnOnce(
+        &Path,
+        AccountNum,
+        &credentials::CredentialFile,
+        csq_core::accounts::anthropic_identity::LoginPrior,
+    ) -> Result<
+        csq_core::accounts::anthropic_identity::CommittedAnthropicLogin,
+        csq_core::accounts::anthropic_identity::IdentityError,
+    >,
+) -> Result<(), String> {
+    let pending_login = pending
+        .verified_login
+        .ok_or_else(|| "identity authority missing".to_string())?;
+    let base = std::fs::canonicalize(base).map_err(|_| "identity base refused".to_string())?;
+    if base != pending_login.base {
+        return Err("identity base changed".to_string());
+    }
+    let credential = exchange_code(
+        code,
+        &pending.code_verifier,
+        PASTE_CODE_REDIRECT_URI,
+        exchange,
+    )
+    .map_err(|e| format!("exchange failed: {e}"))?;
+    let committed =
+        commit(&base, pending.account, &credential, pending_login.prior).map_err(|e| {
+            format!(
+                "identity verification failed: {}",
+                csq_core::accounts::login::LoginCommitOutcome::describe_commit_failure_for_account(
+                    &e,
+                    pending.account
+                )
+            )
+        })?;
+    csq_core::accounts::login::finalize_verified_login(&base, pending.account, committed).map_err(
+        |e| {
+            format!(
+                "post-login bookkeeping failed: {}",
+                csq_core::error::redact_tokens(&e.to_string())
+            )
+        },
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod pending_oauth_context_tests {
+    use super::*;
+    fn exchange_fixture(_: &str, _: &str) -> Result<Vec<u8>, String> {
+        Ok(br#"{"access_token":"fixture-browser-token","refresh_token":"fixture-browser-refresh","expires_in":3153600000}"#.to_vec())
+    }
+    fn profile_fixture() -> csq_core::daemon::usage_poller::HttpGetFn {
+        Arc::new(|url, token, _| {
+            assert_eq!(url, "https://api.anthropic.com/api/oauth/profile");
+            assert_eq!(token, "fixture-browser-token");
+            Ok((200, br#"{"account":{"uuid":"11111111-1111-4111-8111-111111111111","email":"browser-fixture@test.invalid"},"organization":{"uuid":"22222222-2222-4222-8222-222222222222"}}"#.to_vec()))
+        })
+    }
+    #[test]
+    fn browser_wait_rebind_refuses_original_pending_authority_and_preserves_winner() {
+        csq_core::platform::test_env::with_in_memory_secret_backend(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let store = csq_core::oauth::OAuthStateStore::new();
+            let account = AccountNum::try_from(7).unwrap();
+            let initial = begin_claude_login_for_base(&store, dir.path(), account).unwrap();
+            let winner = begin_claude_login_for_base(&store, dir.path(), account).unwrap();
+            complete_pending_claude_login(
+                dir.path(),
+                store.consume(&winner.state).unwrap(),
+                "fixture-code",
+                exchange_fixture,
+                &profile_fixture(),
+            )
+            .unwrap();
+            let id = csq_core::accounts::profiles::resolve_slot_to_uuid(dir.path(), account.get())
+                .unwrap();
+            let path = csq_core::accounts::identity_store::credentials_path_for(dir.path(), id);
+            let before = std::fs::read(&path).unwrap();
+            let err = complete_pending_claude_login(
+                dir.path(),
+                store.consume(&initial.state).unwrap(),
+                "fixture-code",
+                exchange_fixture,
+                &profile_fixture(),
+            )
+            .unwrap_err();
+            // 5e0a55ca replaced the raw `IdentityError` rendering with the
+            // shared `LoginCommitOutcome` vocabulary, so every surface
+            // reports the same fixed tag: a stale pending login whose slot
+            // authority moved is `IdentityChanged` — `oauth_identity_changed`
+            // with the account-specific remedy — never the internal variant
+            // name `anthropic_identity_binding_changed`.
+            assert!(
+                err.contains("login authority changed") && err.contains("(oauth_identity_changed)"),
+                "must reject browser-wait rebind: {err}"
+            );
+            assert_eq!(
+                csq_core::accounts::profiles::resolve_slot_to_uuid(dir.path(), account.get()),
+                Some(id)
+            );
+            assert_eq!(std::fs::read(path).unwrap(), before);
+        });
+    }
+    #[test]
+    fn pending_login_without_original_authority_refuses_before_exchange() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = csq_core::oauth::OAuthStateStore::new();
+        let request =
+            csq_core::oauth::login::start_login(&store, AccountNum::try_from(7).unwrap()).unwrap();
+        let profile: csq_core::daemon::usage_poller::HttpGetFn =
+            Arc::new(|_, _, _| panic!("missing authority must refuse before profile"));
+        let err = complete_pending_claude_login(
+            dir.path(),
+            store.consume(&request.state).unwrap(),
+            "fixture-code",
+            |_, _| panic!("missing authority must refuse before exchange"),
+            &profile,
+        )
+        .unwrap_err();
+        assert_eq!(err, "identity authority missing");
+    }
+    #[test]
+    fn pending_login_cannot_change_base_before_exchange() {
+        csq_core::platform::test_env::with_in_memory_secret_backend(|| {
+            let first = tempfile::TempDir::new().unwrap();
+            let second = tempfile::TempDir::new().unwrap();
+            let store = csq_core::oauth::OAuthStateStore::new();
+            let request =
+                begin_claude_login_for_base(&store, first.path(), AccountNum::try_from(7).unwrap())
+                    .unwrap();
+            let profile: csq_core::daemon::usage_poller::HttpGetFn =
+                Arc::new(|_, _, _| panic!("changed base must refuse before profile"));
+            let err = complete_pending_claude_login(
+                second.path(),
+                store.consume(&request.state).unwrap(),
+                "fixture-code",
+                |_, _| panic!("changed base must refuse before exchange"),
+                &profile,
+            )
+            .unwrap_err();
+            assert_eq!(err, "identity base changed");
+        });
+    }
 }
 
 /// Cancels a pending login by consuming its state token from the
@@ -3009,7 +3713,7 @@ pub fn set_provider_key(
         return Err("key contains control characters — check your clipboard and try again".into());
     }
 
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
@@ -3089,7 +3793,7 @@ pub fn bind_keyed_provider(
         None => None,
     };
 
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
@@ -3154,7 +3858,7 @@ pub fn bind_keyless_provider(
         None => None,
     };
 
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
@@ -3219,7 +3923,7 @@ pub fn set_slot_model_write(base_dir: String, slot: u16, model: String) -> Resul
         return Err("model must not be empty".into());
     }
 
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
@@ -3768,6 +4472,134 @@ pub(crate) fn apply_dashboard_visibility(app: &AppHandle, visible: bool) -> Resu
     Ok(())
 }
 
+/// Shared test harness for the containment resolver (R3-fix-check LOW
+/// 4/5 module-run closure): every test that calls a
+/// `resolve_csq_base_dir`-gated command points `CSQ_BASE_DIR` at its own
+/// fixture through [`BaseDirEnvGuard`], so `base_dir()` (read per call)
+/// becomes *canonical-equal* and the command's own validation paths stay
+/// reachable. The guard serializes on the SHARED
+/// `csq_core::platform::test_env` mutex — the same lock the CLI tests in
+/// this binary hold while mutating `CSQ_BASE_DIR` — so env mutation is
+/// serialized process-wide (test-hermeticity Rule 1; fixcheck2 LOW 2). A
+/// test that already holds that lock passes it via
+/// [`BaseDirEnvGuard::set_locked`].
+#[cfg(test)]
+pub(crate) mod test_base_dir_env {
+    use csq_core::platform::test_env::EnvTestGuard;
+    use std::path::Path;
+
+    /// RAII guard — restores the previous `CSQ_BASE_DIR` on drop; usable
+    /// across `await` in the current-thread tokio tests. Holds the SHARED
+    /// env-test mutex — owned when acquired by [`BaseDirEnvGuard::set`],
+    /// borrowed when the caller already holds it
+    /// ([`BaseDirEnvGuard::set_locked`]).
+    pub(crate) struct BaseDirEnvGuard<'a> {
+        prev: Option<std::ffi::OsString>,
+        _owned: Option<EnvTestGuard>,
+        _borrowed: Option<&'a EnvTestGuard>,
+    }
+
+    impl<'a> BaseDirEnvGuard<'a> {
+        /// Acquire the SHARED `test_env` lock, then point `CSQ_BASE_DIR` at
+        /// `value` until the guard drops. Use in tests that do NOT already
+        /// hold the shared lock (calling it while holding it would deadlock
+        /// the non-reentrant mutex).
+        pub(crate) fn set(value: &Path) -> BaseDirEnvGuard<'static> {
+            let lock = csq_core::platform::test_env::lock();
+            install_env_guard(value, Some(lock), None)
+        }
+
+        /// For tests that already hold the shared `test_env` lock: borrow
+        /// it (kept alive by the caller's own binding) and serialize on it.
+        pub(crate) fn set_locked(held: &'a EnvTestGuard, value: &Path) -> BaseDirEnvGuard<'a> {
+            install_env_guard(value, None, Some(held))
+        }
+    }
+
+    /// Free function (NOT a method): a fresh lifetime `'x` per call, so
+    /// `set` can return `BaseDirEnvGuard<'static>` and `set_locked` can
+    /// borrow the caller's guard with the caller's own lifetime — a method
+    /// on `impl<'a>` would force both into the impl's `'a`.
+    fn install_env_guard<'x>(
+        value: &Path,
+        owned: Option<EnvTestGuard>,
+        borrowed: Option<&'x EnvTestGuard>,
+    ) -> BaseDirEnvGuard<'x> {
+        let prev = std::env::var_os("CSQ_BASE_DIR");
+        // SAFETY: callers hold the shared env-test lock — either
+        // acquired here (`set`) or passed in (`set_locked`).
+        unsafe {
+            std::env::set_var("CSQ_BASE_DIR", value);
+        }
+        BaseDirEnvGuard {
+            prev,
+            _owned: owned,
+            _borrowed: borrowed,
+        }
+    }
+
+    impl Drop for BaseDirEnvGuard<'_> {
+        fn drop(&mut self) {
+            // SAFETY: serialized like `install` — the shared lock (owned or
+            // borrowed) is still held here.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("CSQ_BASE_DIR", v),
+                    None => std::env::remove_var("CSQ_BASE_DIR"),
+                }
+            }
+        }
+    }
+
+    /// Closure form for the sync resolver unit tests.
+    pub(crate) fn with_csq_base_dir<F: FnOnce() -> R, R>(value: &Path, f: F) -> R {
+        let _g = BaseDirEnvGuard::set(value);
+        f()
+    }
+}
+
+#[cfg(test)]
+mod claude_autocompact_status_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_autocompact_command_returns_report_from_resolved_fixture_base() {
+        let _env = csq_core::platform::test_env::lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().join("accounts");
+        let slot = base.join("config-1");
+        std::fs::create_dir_all(&slot).unwrap();
+        let settings =
+            br#"{"autoCompactWindow":123,"modelSettings":{"synthetic-model":{"autoCompactWindow":456}}}"#;
+        let path = slot.join("settings.json");
+        std::fs::write(&path, settings).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set_locked(&_env, &base);
+        let supplied = base.canonicalize().unwrap();
+
+        let report = get_claude_autocompact_status(supplied.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].location, "config-1/settings.json");
+        assert!(report.findings[0].root);
+        assert!(report.findings[0].per_model);
+        assert!(report.unreadable.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), settings);
+        assert!(!base.join("credentials").exists());
+
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let error = get_claude_autocompact_status(outside.to_string_lossy().into_owned())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "base_dir does not match the resolved csq accounts directory"
+        );
+    }
+}
+
 #[cfg(test)]
 mod resolve_csq_base_dir_tests {
     //! Direct unit tests for the S-H1 path-traversal defense.
@@ -3781,29 +4613,8 @@ mod resolve_csq_base_dir_tests {
     //!
     //! Run serially via a process-global mutex because they
     //! mutate `CSQ_BASE_DIR` and would race otherwise.
+    use super::test_base_dir_env::with_csq_base_dir;
     use super::*;
-    use std::path::Path;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn with_csq_base_dir<F: FnOnce() -> R, R>(value: &Path, f: F) -> R {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let prev = std::env::var_os("CSQ_BASE_DIR");
-        // SAFETY: Tests are serialized via ENV_LOCK; set_var is
-        // sound in this single-threaded scope.
-        unsafe {
-            std::env::set_var("CSQ_BASE_DIR", value);
-        }
-        let out = f();
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("CSQ_BASE_DIR", v),
-                None => std::env::remove_var("CSQ_BASE_DIR"),
-            }
-        }
-        out
-    }
 
     #[test]
     fn case_a_lexical_equal_and_exists_accepts() {
@@ -4018,7 +4829,7 @@ pub async fn start_codex_login(
     account: u16,
 ) -> Result<csq_core::providers::codex::desktop_login::StartLoginView, String> {
     let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
     tokio::task::spawn_blocking(move || {
         csq_core::providers::codex::desktop_login::start_login(
             &base,
@@ -4107,7 +4918,7 @@ fn codex_login_preconditions(
     account: u16,
 ) -> Result<(AccountNum, PathBuf, AccountLoginLock), String> {
     let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
-    let base = PathBuf::from(base_dir);
+    let base = resolve_csq_base_dir(base_dir)?;
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
@@ -4213,20 +5024,20 @@ pub async fn complete_codex_login(
         // User-initiated login: the Codex keychain purge in it may prompt.
         let result = csq_core::credentials::keychain::with_interactive_keychain(|| {
             csq_core::providers::codex::desktop_login::complete_login(
-            &base,
-            account_num,
-            purge_keychain,
-            csq_core::providers::codex::keychain::purge_residue,
-            |config_dir, on_code| {
-                spawn_codex_device_auth_piped(config_dir, on_code, &app_for_task, &child_slot)
-            },
-            |info| {
-                // an internal journal entry finding 4: emit_to("main") so a
-                // secondary window (tray/settings) cannot subscribe
-                // to the one-time user_code.
-                let _ = app_for_task.emit_to("main", "codex-device-code", &info);
-            },
-        )
+                &base,
+                account_num,
+                purge_keychain,
+                csq_core::providers::codex::keychain::purge_residue,
+                |config_dir, on_code| {
+                    spawn_codex_device_auth_piped(config_dir, on_code, &app_for_task, &child_slot)
+                },
+                |info| {
+                    // an internal journal entry finding 4: emit_to("main") so a
+                    // secondary window (tray/settings) cannot subscribe
+                    // to the one-time user_code.
+                    let _ = app_for_task.emit_to("main", "codex-device-code", &info);
+                },
+            )
         })
         // an internal journal entry finding M3: pass the full anyhow chain
         // through `redact_tokens` before it reaches the renderer.
@@ -4256,31 +5067,13 @@ pub async fn complete_codex_login(
 
         let result = result?;
 
-        // Best-effort: kick daemon cache invalidation so the dashboard
-        // sees the new slot immediately rather than waiting for the
-        // 5s discovery tick. an internal journal entry finding M6: the HTTP POST
-        // over the Unix socket has NO client-side timeout — a hung
-        // daemon would block the spawn_blocking thread. We wrap in
-        // a coarse 500ms deadline enforced by a worker thread. If
-        // the daemon doesn't answer in 500ms the dashboard catches
-        // up on its next 5s discovery tick.
-        #[cfg(unix)]
-        {
-            let sock = csq_core::daemon::socket_path(&base);
-            if sock.exists() {
-                // Fire-and-forget style: spawn a short-lived worker
-                // that does the blocking call; a timer on the main
-                // thread bounds the wait. Whichever finishes first
-                // wins; the other side is dropped on return.
-                let (tx, rx) = std::sync::mpsc::channel();
-                let sock_copy = sock.clone();
-                std::thread::spawn(move || {
-                    let r = csq_core::daemon::http_post_unix(&sock_copy, "/api/invalidate-cache");
-                    let _ = tx.send(r);
-                });
-                let _ = rx.recv_timeout(std::time::Duration::from_millis(500));
-            }
-        }
+        // Best-effort: kick daemon cache invalidation so the dashboard sees
+        // the new slot immediately rather than waiting for the 5s discovery
+        // tick, and wake the usage poller so the slot's quota row does not
+        // wait up to 5 minutes (twin of the CLI codex login). Already on the
+        // blocking pool; both calls are bounded by the notify transports'
+        // own timeouts and no-op silently when no daemon runs.
+        notify_after_codex_login(&base, account_num.get());
 
         Ok::<_, String>(result)
     })
@@ -4671,7 +5464,7 @@ fn spawn_codex_device_auth_piped(
 pub async fn list_codex_models(
     base_dir: String,
 ) -> Result<csq_core::providers::codex::models::CodexModelList, String> {
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
@@ -4869,7 +5662,7 @@ pub fn set_codex_slot_model(
             model.len()
         ));
     }
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
@@ -4905,8 +5698,11 @@ pub fn set_codex_slot_model(
     csq_core::providers::codex::surface::write_config_toml(&base, slot_num, Some(&model)).map_err(
         |e| {
             format!(
-                "write codex config.toml: {}",
-                csq_core::cli_deps::sanitize::redact_display(e)
+                "{}: {}",
+                csq_core::providers::codex::surface::config_write_error_context(&e),
+                csq_core::cli_deps::sanitize::redact_display(
+                    csq_core::providers::codex::surface::config_write_error_source(&e),
+                )
             )
         },
     )?;
@@ -4922,7 +5718,7 @@ pub fn set_codex_slot_model(
 /// `accounts/codex-tos-accepted.json` at 0o600. Idempotent.
 #[tauri::command]
 pub fn acknowledge_codex_tos(base_dir: String) -> Result<(), String> {
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
@@ -4957,7 +5753,7 @@ pub fn acknowledge_codex_tos(base_dir: String) -> Result<(), String> {
 /// provisioning panel. Mirrors `is_acknowledged` for Codex.
 #[tauri::command]
 pub fn is_gemini_tos_acknowledged(base_dir: String) -> Result<bool, String> {
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
@@ -4969,7 +5765,7 @@ pub fn is_gemini_tos_acknowledged(base_dir: String) -> Result<bool, String> {
 /// `accounts/gemini-tos-accepted.json` at 0o600. Idempotent.
 #[tauri::command]
 pub fn acknowledge_gemini_tos(base_dir: String) -> Result<(), String> {
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
@@ -5042,7 +5838,7 @@ pub fn gemini_provision_api_key(base_dir: String, slot: u16, key: String) -> Res
         );
     }
 
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
@@ -5093,7 +5889,7 @@ pub fn gemini_provision_vertex_sa(
         ));
     }
 
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
@@ -5202,7 +5998,7 @@ pub fn cloud_claude_provision_vertex(
         ));
     }
 
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
@@ -5258,7 +6054,7 @@ pub fn cloud_claude_provision_bedrock(
         return Err("bearer token contains control characters — paste likely truncated".into());
     }
 
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
@@ -5390,7 +6186,7 @@ pub async fn gemini_provision_oauth(base_dir: String, slot: u16) -> Result<(), S
     use csq_core::providers::gemini::oauth_login;
 
     let slot_num = AccountNum::try_from(slot).map_err(|e| format!("invalid slot: {e}"))?;
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
 
     // Validated BEFORE the lock acquire, not after: `AccountLoginLock::acquire`
     // calls `create_dir_all(base_dir)` as a convenience for a legitimately
@@ -5432,11 +6228,63 @@ pub async fn gemini_provision_oauth(base_dir: String, slot: u16) -> Result<(), S
     // variant. `redact_tokens` on top is defense-in-depth for any
     // secret material that reaches a Display string via `{0}`
     // passthrough (round-2 redteam MED; an internal ticket for the path half).
+    let base_for_notify = base.clone();
     tokio::task::spawn_blocking(move || oauth_login::perform(&base, slot_num))
         .await
         .map_err(|e| format!("internal: spawn_blocking join failed: {e}"))?
         .map_err(|e| csq_core::error::redact_tokens(&e.redacted_message()))?;
+
+    // The binding has committed: wake the usage poller so the slot's quota
+    // row does not wait up to 5 minutes (twin of the CLI gemini-oauth login).
+    let base_for_wake = base_for_notify;
+    notify_daemon_blocking(move || notify_after_gemini_login(&base_for_wake, slot_num.get())).await;
     Ok(())
+}
+
+/// Call-site notify seams for the desktop commands. Each is BLOCKING (run
+/// them on the blocking pool) and routes through the shared `notify::*`
+/// chokepoint, so the CLI and desktop use one production path on both
+/// transports; the tests drive them against a recording daemon.
+///
+/// Discovery-cache invalidation after a logout / login / native login.
+pub(crate) fn notify_daemon_cache_invalidated(base: &std::path::Path) {
+    csq_core::daemon::notify::cache_invalidation(base);
+}
+
+/// After a committed `move_account`: broad invalidation plus the targeted
+/// per-slot `slot-swap`, matching `csq move`.
+pub(crate) fn notify_after_move(base: &std::path::Path, from: u16, to: u16) {
+    csq_core::daemon::notify::cache_invalidation(base);
+    csq_core::daemon::notify::slot_swap(base, from, to);
+}
+
+/// After a committed Codex device login: invalidation plus a poller wake.
+pub(crate) fn notify_after_codex_login(base: &std::path::Path, slot: u16) {
+    csq_core::daemon::notify::cache_invalidation(base);
+    csq_core::daemon::notify::slot_rebind(base, slot);
+}
+
+/// After a committed Gemini OAuth provision: a poller wake for the slot.
+pub(crate) fn notify_after_gemini_login(base: &std::path::Path, slot: u16) {
+    csq_core::daemon::notify::slot_rebind(base, slot);
+}
+
+/// Runs a blocking daemon notification on the tokio blocking pool and
+/// awaits it. A task failure is logged under a fixed tag (never the error
+/// text) rather than dropped: the notify bodies themselves are
+/// fire-and-forget, but a panicked or cancelled task is a defect to see.
+pub(crate) async fn notify_daemon_blocking<F>(body: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    if let Err(e) = tokio::task::spawn_blocking(body).await {
+        tracing::warn!(
+            error_kind = "daemon_notify_task_failed",
+            panicked = e.is_panic(),
+            "daemon notify task did not complete; the daemon will pick the change up \
+             at its next periodic tick"
+        );
+    }
 }
 
 /// Switches the model name stored in the slot's Gemini binding
@@ -5463,7 +6311,7 @@ pub fn gemini_switch_model(
         ));
     }
 
-    let base = PathBuf::from(&base_dir);
+    let base = resolve_csq_base_dir(&base_dir)?;
     if !base.is_dir() {
         return Err(format!("base directory does not exist: {base_dir}"));
     }
@@ -5492,7 +6340,624 @@ pub fn gemini_switch_model(
 
 #[cfg(test)]
 mod tests {
+    /// A fixture base path that is ABSOLUTE on the host platform.
+    ///
+    /// `desktop::base_dir` ignores a `CSQ_BASE_DIR` override that is not
+    /// absolute, and on Windows a drive-less `/fake` is not absolute
+    /// (`Path::is_absolute` needs a prefix such as `C:`). A unix literal would
+    /// therefore make every command fail at base-dir resolution with
+    /// "csq base directory unavailable" before reaching the validation the
+    /// test names. Prefixing the drive keeps the same path shape on Windows.
+    fn abs_test_path(unix: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{unix}")
+        } else {
+            unix.to_string()
+        }
+    }
+
+    /// Windows counterpart of the unix fixture assumption: a drive-less
+    /// override is NOT absolute there, so the resolver refuses it rather than
+    /// trusting a relative-to-current-drive path.
+    #[cfg(windows)]
+    #[test]
+    fn drive_less_base_dir_override_is_refused_on_windows() {
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new("/fake"));
+        let err = rename_account("/fake".into(), 1, "name".into()).unwrap_err();
+        assert_eq!(err, "csq base directory unavailable");
+    }
+
+    #[test]
+    fn abs_test_path_is_absolute_on_this_platform() {
+        assert!(std::path::Path::new(&abs_test_path("/fake")).is_absolute());
+    }
+
+    /// F5/L3 desktop twin of the doctor line: the suppressed slot (and only it) carries the
+    /// fixed tag in `last_refresh_error`, a real broker failure tag is never overwritten, and
+    /// the tag holds no token bytes.
+    #[test]
+    fn refresh_suppression_tag_marks_only_the_suppressed_anthropic_slot() {
+        use csq_core::credentials::{AnthropicCredentialFile, CredentialFile, OAuthPayload};
+        use csq_core::types::{AccessToken, RefreshToken};
+        const SENTINEL: &str = "SENTINEL-DESKTOP-RT-3c90d7";
+        let dir = csq_core::testing::identity_fixtures::identity_only_fixture(2);
+        for slot in [1u16, 2] {
+            let uuid = csq_core::testing::identity_fixtures::fixture_uuid_for_slot(slot);
+            let path = csq_core::accounts::identity_store::credentials_path_for(dir.path(), uuid);
+            let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
+                claude_ai_oauth: OAuthPayload {
+                    access_token: AccessToken::new(format!("at-{slot}")),
+                    refresh_token: RefreshToken::new(SENTINEL.into()),
+                    expires_at: 4_102_444_800_000,
+                    scopes: vec![],
+                    subscription_type: None,
+                    rate_limit_tier: None,
+                    extra: Default::default(),
+                },
+                extra: Default::default(),
+            });
+            csq_core::credentials::save(&path, &creds).unwrap();
+        }
+        csq_core::accounts::refresh_token_audit::run_startup_audit(dir.path());
+        let sup = csq_core::accounts::refresh_token_audit::suppressed_slots(dir.path());
+        let tag = refresh_suppression_tag(&sup, 2, true, None);
+        assert_eq!(tag.as_deref(), Some("refresh_suppressed_duplicate_grant"));
+        assert!(!tag.unwrap().contains(SENTINEL));
+        assert_eq!(refresh_suppression_tag(&sup, 1, true, None), None);
+        assert_eq!(
+            refresh_suppression_tag(&sup, 2, true, Some("broker_token_invalid".into())).as_deref(),
+            Some("broker_token_invalid")
+        );
+        assert_eq!(refresh_suppression_tag(&sup, 2, false, None), None);
+    }
+
     use super::*;
+
+    /// r6 (a): the account list checks refresh suppression ONCE per call. With a corrupt
+    /// state file each check is a live audit of every canonical, so a per-account check is
+    /// N audits per poll. Three Anthropic slots share one grant: expected 1 lookup, 1 live
+    /// audit, and the two suppressed slots still carry the tag.
+    #[test]
+    fn get_accounts_checks_refresh_suppression_once_per_call_with_a_corrupt_state() {
+        use csq_core::credentials::{AnthropicCredentialFile, CredentialFile, OAuthPayload};
+        use csq_core::types::{AccessToken, RefreshToken};
+        let dir = csq_core::testing::identity_fixtures::identity_only_fixture(3);
+        for slot in [1u16, 2, 3] {
+            let uuid = csq_core::testing::identity_fixtures::fixture_uuid_for_slot(slot);
+            let path = csq_core::accounts::identity_store::credentials_path_for(dir.path(), uuid);
+            let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
+                claude_ai_oauth: OAuthPayload {
+                    access_token: AccessToken::new(format!("at-{slot}")),
+                    refresh_token: RefreshToken::new("shared-rt-once-per-call".into()),
+                    expires_at: 4_102_444_800_000,
+                    scopes: vec![],
+                    subscription_type: None,
+                    rate_limit_tier: None,
+                    extra: Default::default(),
+                },
+                extra: Default::default(),
+            });
+            csq_core::credentials::save(&path, &creds).unwrap();
+        }
+        std::fs::write(dir.path().join("refresh-suppressed.json"), b"garbage").unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(dir.path());
+        let lookups =
+            |kind| csq_core::accounts::refresh_token_audit::lookup_count_for_test(dir.path(), kind);
+        let (l0, v0) = (lookups("lookup"), lookups("live"));
+        let views = get_accounts_blocking(dir.path().to_string_lossy().into_owned()).unwrap();
+        let tag = csq_core::accounts::refresh_token_audit::SUPPRESSED_TAG;
+        for slot in [2u16, 3] {
+            let v = views.iter().find(|v| v.id == slot).expect("slot visible");
+            assert_eq!(v.last_refresh_error.as_deref(), Some(tag), "slot {slot}");
+        }
+        assert_eq!(
+            lookups("lookup") - l0,
+            1,
+            "one suppression lookup per get_accounts call, not one per account"
+        );
+        assert_eq!(lookups("live") - v0, 1, "one live audit per call");
+    }
+
+    /// Shared in-memory sink for capturing `tracing` output in a test.
+    #[derive(Clone, Default)]
+    struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+        type Writer = LogSink;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// R2 LOW-1: a PANICKED notify task must be contained AND logged under the
+    /// fixed `daemon_notify_task_failed` tag with `panicked=true` — never
+    /// dropped silently, never re-raised into the (already committed)
+    /// command. Reverting the helper to `let _ = spawn_blocking(..).await`
+    /// removes the log line and reds the content assertions.
+    #[tokio::test(flavor = "current_thread")]
+    async fn notify_daemon_blocking_logs_a_panicked_task_and_does_not_propagate() {
+        let sink = LogSink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        notify_daemon_blocking(|| panic!("notify body panic carrying SECRET-MARKER")).await;
+
+        let logged = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("daemon_notify_task_failed") && logged.contains("panicked=true"),
+            "the JoinError must be logged with the fixed tag: {logged:?}"
+        );
+        assert!(
+            !logged.contains("SECRET-MARKER"),
+            "the panic text must never be logged: {logged:?}"
+        );
+    }
+
+    /// Drives `f` against a recording daemon and returns the first `n`
+    /// request lines (order-independent callers sort).
+    #[cfg(unix)]
+    fn recorded(n: usize, f: impl FnOnce(&std::path::Path)) -> Vec<String> {
+        let daemon = crate::desktop::commands::test_recording_daemon::RecordingDaemon::new(
+            std::time::Duration::ZERO,
+        );
+        f(daemon.base_dir());
+        let mut out: Vec<String> = (0..n).map(|_| daemon.recv("a notify POST")).collect();
+        out.sort();
+        out
+    }
+
+    #[cfg(unix)]
+    fn has(reqs: &[String], prefix: &str) -> bool {
+        reqs.iter().any(|r| r.starts_with(prefix))
+    }
+
+    /// R2 LOW-2: the shared invalidation seam (used by remove_account x2,
+    /// submit/paste login, race finalize, native login) posts invalidate-cache.
+    /// Removing the call reds this (the recv times out).
+    #[cfg(unix)]
+    #[test]
+    fn desktop_cache_invalidation_seam_posts_invalidate_cache() {
+        let reqs = recorded(1, notify_daemon_cache_invalidated);
+        assert!(
+            has(&reqs, "POST /api/invalidate-cache HTTP/1.1"),
+            "{reqs:?}"
+        );
+    }
+
+    /// R2 LOW-2: a desktop move sends BOTH invalidate-cache and slot-swap
+    /// with the from/to body, matching the CLI.
+    #[cfg(unix)]
+    #[test]
+    fn desktop_move_sends_invalidate_and_slot_swap() {
+        let reqs = recorded(2, |b| notify_after_move(b, 3, 7));
+        assert!(
+            has(&reqs, "POST /api/invalidate-cache HTTP/1.1"),
+            "{reqs:?}"
+        );
+        let swap = reqs
+            .iter()
+            .find(|r| r.starts_with("POST /api/slot-swap HTTP/1.1"))
+            .unwrap_or_else(|| panic!("no slot-swap: {reqs:?}"));
+        assert!(swap.contains(r#"{"from":3,"to":7}"#), "{swap:?}");
+    }
+
+    /// R2 LOW-3: Codex login completion invalidates AND wakes the poller.
+    #[cfg(unix)]
+    #[test]
+    fn desktop_codex_login_wakes_the_poller() {
+        let reqs = recorded(2, |b| notify_after_codex_login(b, 4));
+        assert!(
+            has(&reqs, "POST /api/invalidate-cache HTTP/1.1"),
+            "{reqs:?}"
+        );
+        let wake = reqs
+            .iter()
+            .find(|r| r.starts_with("POST /api/slot-rebind HTTP/1.1"))
+            .unwrap_or_else(|| panic!("no slot-rebind: {reqs:?}"));
+        assert!(wake.contains(r#"{"slot":4}"#), "{wake:?}");
+    }
+
+    /// Negative pole of the wake: a Codex login sends exactly the two
+    /// requests (invalidate + one rebind), no third. An extra rebind or any
+    /// stray traffic in the wake path reds this.
+    #[cfg(unix)]
+    #[test]
+    fn desktop_codex_login_sends_exactly_two_requests() {
+        let daemon = crate::desktop::commands::test_recording_daemon::RecordingDaemon::new(
+            std::time::Duration::ZERO,
+        );
+        notify_after_codex_login(daemon.base_dir(), 4);
+        let first = daemon.recv("the first notify POST");
+        let second = daemon.recv("the second notify POST");
+        let mut got = [first, second];
+        got.sort();
+        assert!(
+            got[0].starts_with("POST /api/invalidate-cache HTTP/1.1"),
+            "{got:?}"
+        );
+        assert!(
+            got[1].starts_with("POST /api/slot-rebind HTTP/1.1"),
+            "{got:?}"
+        );
+        assert!(
+            daemon.nothing_within(std::time::Duration::from_millis(300)),
+            "a third request reached the daemon"
+        );
+    }
+
+    /// R2 LOW-3: Gemini OAuth provision wakes the poller for its slot.
+    #[cfg(unix)]
+    #[test]
+    fn desktop_gemini_login_wakes_the_poller() {
+        let reqs = recorded(1, |b| notify_after_gemini_login(b, 5));
+        assert!(has(&reqs, "POST /api/slot-rebind HTTP/1.1"), "{reqs:?}");
+        assert!(reqs[0].contains(r#"{"slot":5}"#), "{reqs:?}");
+    }
+
+    /// Code of fn `name` (comment lines dropped), from its signature to the
+    /// closing brace at column 0.
+    fn fn_body(src: &str, name: &str) -> String {
+        let sig = format!("fn {name}(");
+        let start = src
+            .find(&sig)
+            .unwrap_or_else(|| panic!("fn {name} not found"));
+        let rest = &src[start..];
+        let end = rest
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("fn {name} unterminated"));
+        rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// R2 LOW-2/3 structural guard. The seam tests above drive the seams, and
+    /// a Tauri command cannot be invoked without a Tauri runtime, so this
+    /// checks (lexically, on each command's own code) that every command
+    /// still routes through its seam, the exact count of times, and never
+    /// calls the `notify::*` chokepoint directly. A command that drops its
+    /// seam call, or bypasses the seam, reds here.
+    #[test]
+    fn desktop_commands_route_through_their_notify_seams() {
+        let mod_src = include_str!("mod.rs");
+        let race_src = include_str!("race.rs");
+        // (source, fn, seam, expected call count)
+        let table: &[(&str, &str, &str, usize)] = &[
+            (
+                mod_src,
+                "remove_account_blocking",
+                "notify_daemon_cache_invalidated(",
+                2,
+            ),
+            (mod_src, "move_account", "notify_after_move(", 1),
+            (
+                mod_src,
+                "complete_native_login",
+                "notify_daemon_cache_invalidated(",
+                1,
+            ),
+            (
+                mod_src,
+                "start_claude_login",
+                "notify_daemon_cache_invalidated(",
+                1,
+            ),
+            (
+                mod_src,
+                "submit_oauth_code",
+                "notify_daemon_cache_invalidated(",
+                1,
+            ),
+            (
+                mod_src,
+                "complete_codex_login",
+                "notify_after_codex_login(",
+                1,
+            ),
+            (
+                mod_src,
+                "gemini_provision_oauth",
+                "notify_after_gemini_login(",
+                1,
+            ),
+            (
+                race_src,
+                "finalize_login",
+                "notify_daemon_cache_invalidated(",
+                1,
+            ),
+        ];
+        for (src, name, seam, want) in table {
+            let body = fn_body(src, name);
+            assert_eq!(body.matches(seam).count(), *want, "{name} must call {seam}");
+            // The login commands call `slot_rebind` directly for their usage
+            // wake, so it is a bypass only where a seam owns it.
+            let seam_owns_rebind =
+                matches!(*name, "complete_codex_login" | "gemini_provision_oauth");
+            for direct in ["notify::cache_invalidation(", "notify::slot_swap("] {
+                assert!(
+                    !body.contains(direct),
+                    "{name} bypasses its seam via {direct}"
+                );
+            }
+            assert!(
+                !(seam_owns_rebind && body.contains("notify::slot_rebind(")),
+                "{name} bypasses its seam via notify::slot_rebind("
+            );
+        }
+    }
+
+    /// The healthy path: the body runs, nothing is logged as a failure.
+    #[tokio::test(flavor = "current_thread")]
+    async fn notify_daemon_blocking_runs_the_body() {
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_in = Arc::clone(&ran);
+        notify_daemon_blocking(move || ran_in.store(true, std::sync::atomic::Ordering::SeqCst))
+            .await;
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// R3 LOW 5 sweep regression: a hostile `base_dir` arriving over IPC is
+    /// refused at a representative command — the containment resolver
+    /// rejects any path that does not resolve to the csq accounts
+    /// directory, before any filesystem use.
+    #[test]
+    fn hostile_base_dir_is_refused_at_a_representative_site() {
+        // Deliberately NO `BaseDirEnvGuard`: this test proves the refusal
+        // path itself, so it must run with `CSQ_BASE_DIR` at its ambient
+        // value (the resolver must reject the hostile path lexically).
+        let err = super::get_dock_hidden("/definitely-not-the-csq-accounts-root-x9".to_string())
+            .expect_err("a hostile base_dir must be refused");
+        assert!(
+            err.contains("does not match the resolved csq accounts directory"),
+            "the refusal must name the mismatch: {err}"
+        );
+    }
+
+    /// R3 LOW 5 sweep guard (extended by fixcheck2 LOW 1): EVERY
+    /// renderer-supplied `base_dir` under `src/desktop/**` — walked
+    /// recursively, across every observed spelling (Path-constructor calls
+    /// over the borrowed, owned and `_clone` forms, the `as_str()`-to-path
+    /// forms, and the bare forms) — must pass through
+    /// `resolve_csq_base_dir` before any filesystem use; the enterprise
+    /// `policy.rs` commands and the unregistered `begin_claude_login`
+    /// included. A NEW raw conversion (outside the resolver's own body)
+    /// REDs this test — the counts are the assertion. (This doc avoids the
+    /// literal spellings so the guard's own source cannot self-match.)
+    #[test]
+    fn no_raw_base_dir_conversions_remain_in_commands() {
+        // Pattern halves are concatenated so THIS guard's own source cannot
+        // match itself: the full raw spellings must exist nowhere under
+        // src/desktop except through these compile-time-joined fragments.
+        // fixcheck2 LOW 1: the sweep is WORKSPACE-WIDE (every .rs under
+        // src/desktop, recursively) across every observed spelling, not
+        // three files with three spellings.
+        let raw_spellings = [
+            concat!("Path::new(", "&base_dir)"),
+            concat!("Path::new(", "&base_dir_clone)"),
+            concat!("Path::new(", "base_dir.as_str())"),
+            concat!("PathBuf::from(", "&base_dir)"),
+            concat!("PathBuf::from(", "&base_dir_clone)"),
+            concat!("PathBuf::from(", "base_dir.as_str())"),
+        ];
+        let bare_spellings = [
+            concat!("Path::new(", "base_dir)"),
+            concat!("PathBuf::from(", "base_dir)"),
+        ];
+        fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in
+                std::fs::read_dir(dir).unwrap_or_else(|e| panic!("sweep guard: {dir:?}: {e}"))
+            {
+                let entry = entry.expect("sweep guard: unreadable entry");
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_rs(&path, out);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = csq_core::testing::manifest_dir(env!("CARGO_MANIFEST_DIR")).join("src/desktop");
+        let mut files = Vec::new();
+        collect_rs(&root, &mut files);
+        assert!(
+            files.len() >= 5,
+            "sweep guard: the walk must actually see the desktop sources (saw {})",
+            files.len()
+        );
+        let mut raw_total = 0usize;
+        let mut bare_total = 0usize;
+        let mut raw_hits: Vec<String> = Vec::new();
+        let mut bare_hits: Vec<String> = Vec::new();
+        for path in &files {
+            let src = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("sweep guard: {path:?} unreadable: {e}"));
+            let raw_here: usize = raw_spellings.iter().map(|s| src.matches(s).count()).sum();
+            let bare_here: usize = bare_spellings.iter().map(|s| src.matches(s).count()).sum();
+            if raw_here > 0 {
+                raw_hits.push(format!("{}: {raw_here}", path.display()));
+            }
+            if bare_here > 0 {
+                bare_hits.push(format!("{}: {bare_here}", path.display()));
+            }
+            raw_total += raw_here;
+            bare_total += bare_here;
+        }
+        assert_eq!(
+            raw_total, 0,
+            "raw base_dir conversion sites must route through resolve_csq_base_dir: {raw_hits:?}"
+        );
+        assert_eq!(
+            bare_total, 1,
+            "only resolve_csq_base_dir's own body may convert base_dir directly: {bare_hits:?}"
+        );
+    }
+
+    /// fixcheck2 LOW 2: `BaseDirEnvGuard` MUST take the SHARED
+    /// `test_env::lock()` — a private module lock does not serialize
+    /// against the CLI tests in this binary that mutate `CSQ_BASE_DIR`
+    /// under the shared lock (test-hermeticity Rule 1).
+    ///
+    /// Proof: the guard is held on THIS thread and
+    /// `test_env::current_holder()` names the thread that holds the shared
+    /// mutex, so `Some(thread::current().id())` after `set()` proves the
+    /// SHARED mutex is held by this thread. `try_lock()==None` could not
+    /// prove that — a SIBLING holding the shared lock satisfies it too,
+    /// which is why the private-lock mutant previously needed a single-test
+    /// filter to show red (instrument-discipline MUST-1/2: a proof that only
+    /// discriminates when run alone is not evidence in the sign-off run).
+    /// The mutant now reddens under the full set as well: a private lock
+    /// leaves `current_holder()` at `None` (or at a sibling's id), never at
+    /// ours.
+    ///
+    /// The acquisition is deliberately NOT time-bounded: sibling tests hold
+    /// the same shared lock across their own bounded waits, and contention
+    /// must delay this test, never fail it. The previous two-thread shape
+    /// bounded its `set()` at 10 s and went red on the full set at 7d9d2d363
+    /// (`:6456:14`, `.expect("guard thread must come alive")`) while green
+    /// under a single-test filter.
+    #[test]
+    fn base_dir_env_guard_holds_the_shared_test_env_lock() {
+        let _guard = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            "/tmp/csq-env-lock-proof-x9",
+        ));
+        assert_eq!(
+            csq_core::platform::test_env::current_holder(),
+            Some(std::thread::current().id()),
+            "the guard must hold the SHARED test_env lock while alive"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn desktop_reads_release_the_async_executor_while_work_is_blocked() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let executor_thread = std::thread::current().id();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut read = Box::pin(run_desktop_read("fixture", move || {
+            let _ = started_tx.send(std::thread::current().id());
+            // Fixture cleanup bound only: no elapsed-time assertion. An inline
+            // implementation cannot receive release until it yields to this test.
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .map_err(|_| "fixture release unavailable".to_string())?;
+            Ok(41u32)
+        }));
+        std::future::poll_fn(|cx| {
+            assert!(read.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let worker_thread = tokio::time::timeout(std::time::Duration::from_secs(10), started_rx)
+            .await
+            .expect("blocking worker started")
+            .expect("worker signalled start");
+        assert_ne!(worker_thread, executor_thread);
+        // This is executed by the sole async-executor thread while the
+        // blocking worker is still waiting, rather than inferred from timing.
+        release_tx.send(()).unwrap();
+        assert_eq!(read.await.unwrap(), 41);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    // Discovery reads process environment on its blocking worker; retain the
+    // shared fixture lock until every awaited read has finished.
+    #[allow(clippy::await_holding_lock)]
+    async fn desktop_read_commands_preserve_payloads_and_validation_errors() {
+        let _env = csq_core::platform::test_env::lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        struct RestoreRuntimePaths(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreRuntimePaths {
+            fn drop(&mut self) {
+                for (key, previous) in &self.0 {
+                    match previous {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let _runtime = RestoreRuntimePaths(
+            ["XDG_RUNTIME_DIR", "LOCALAPPDATA"]
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        );
+        for key in ["XDG_RUNTIME_DIR", "LOCALAPPDATA"] {
+            std::env::set_var(key, dir.path());
+        }
+        let base = dir.path().to_string_lossy().into_owned();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set_locked(
+            &_env,
+            std::path::Path::new(&base.clone()),
+        );
+        let status = get_daemon_status(base.clone()).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            serde_json::json!({ "running": false, "pid": null }),
+        );
+        // A malformed PID file keeps the existing stopped payload, without
+        // inspecting any host process or a developer's daemon.
+        let pid_path = csq_core::daemon::pid_file_path(dir.path());
+        assert!(pid_path.starts_with(dir.path()));
+        std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+        std::fs::write(pid_path, "not-a-pid").unwrap();
+        let status = get_daemon_status(base.clone()).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            serde_json::json!({ "running": false, "pid": null }),
+        );
+        let creds = dir.path().join("credentials");
+        std::fs::create_dir_all(&creds).unwrap();
+        seed_claude_slot(&creds, 7);
+        write_quota_file(dir.path(), &[(7, "claude-code", 42.0, 18.0)]);
+        let views = get_accounts(base.clone()).await.unwrap();
+        let account = views.iter().find(|a| a.id == 7).unwrap();
+        let json = serde_json::to_value(account).unwrap();
+        assert_eq!(json["id"], 7);
+        assert_eq!(json["five_hour_pct"], 42.0);
+        assert_eq!(json["seven_day_pct"], 18.0);
+
+        let slot = AccountNum::try_from(7u16).unwrap();
+        csq_core::usage::ledger::write_all(
+            dir.path(),
+            slot,
+            &[ledger_event("2026-09-14T11:00:00Z", 123)],
+        )
+        .unwrap();
+        let summary = get_account_usage(base.clone(), 7).await.unwrap();
+        let json = serde_json::to_value(summary).unwrap();
+        assert_eq!(json["event_count"], 1);
+        assert_eq!(json["total_input_tokens"], 123);
+        let invalid = get_account_usage(base.clone(), 0).await.unwrap_err();
+        assert_eq!(invalid, get_account_usage_blocking(base, 0).unwrap_err());
+
+        let missing = dir.path().join("absent").to_string_lossy().into_owned();
+        assert_eq!(
+            get_accounts(missing.clone()).await.err().unwrap(),
+            get_accounts_blocking(missing.clone()).err().unwrap(),
+        );
+        assert_eq!(
+            list_sessions(missing.clone()).await.err().unwrap(),
+            list_sessions_blocking(missing).err().unwrap(),
+        );
+    }
 
     // ── should_emit_url_without_code_diagnostic truth table ─────
     //
@@ -5720,7 +7185,10 @@ mod tests {
 
     #[test]
     fn codex_login_preconditions_rejects_missing_base_dir() {
-        let err = match codex_login_preconditions("/nonexistent/csq-base", 1) {
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &abs_test_path("/nonexistent/csq-base"),
+        ));
+        let err = match codex_login_preconditions(&abs_test_path("/nonexistent/csq-base"), 1) {
             Err(e) => e,
             Ok(_) => panic!("must reject a nonexistent base_dir"),
         };
@@ -5730,11 +7198,15 @@ mod tests {
         // observed failure without this test's target fix is that the
         // call SUCCEEDS: `is_err()` alone would not have caught it).
         assert_eq!(
-            err, "base directory does not exist: /nonexistent/csq-base",
+            err,
+            format!(
+                "base directory does not exist: {}",
+                abs_test_path("/nonexistent/csq-base")
+            ),
             "got: {err}"
         );
         assert!(
-            !std::path::Path::new("/nonexistent/csq-base").exists(),
+            !std::path::Path::new(&abs_test_path("/nonexistent/csq-base")).exists(),
             "the bad path must NOT have been created as a side effect"
         );
     }
@@ -5742,6 +7214,9 @@ mod tests {
     #[test]
     fn codex_login_preconditions_rejects_invalid_account() {
         let dir = tempfile::TempDir::new().unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            dir.path().to_string_lossy().as_ref(),
+        ));
         let err = match codex_login_preconditions(&dir.path().to_string_lossy(), 0) {
             Err(e) => e,
             Ok(_) => panic!("must reject account 0"),
@@ -5754,6 +7229,9 @@ mod tests {
         use csq_core::accounts::login_lock::{AccountLoginLock, AcquireOutcome};
 
         let dir = tempfile::TempDir::new().unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            dir.path().to_string_lossy().as_ref(),
+        ));
         let (account_num, base, guard) =
             codex_login_preconditions(&dir.path().to_string_lossy(), 41).unwrap();
         assert_eq!(account_num.get(), 41);
@@ -5806,26 +7284,36 @@ mod tests {
 
     #[test]
     fn set_provider_key_rejects_unknown_provider() {
-        let err = set_provider_key("/fake".into(), "nonexistent".into(), "key".into()).unwrap_err();
+        let _base_env =
+            test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&abs_test_path("/fake")));
+        let err = set_provider_key(abs_test_path("/fake"), "nonexistent".into(), "key".into())
+            .unwrap_err();
         assert!(err.contains("unknown provider"));
     }
 
     #[test]
     fn set_provider_key_rejects_oauth_provider() {
-        let err = set_provider_key("/fake".into(), "claude".into(), "key".into()).unwrap_err();
+        let _base_env =
+            test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&abs_test_path("/fake")));
+        let err =
+            set_provider_key(abs_test_path("/fake"), "claude".into(), "key".into()).unwrap_err();
         assert!(err.contains("uses OAuth"));
     }
 
     #[test]
     fn set_provider_key_rejects_empty_key() {
-        let err = set_provider_key("/fake".into(), "mm".into(), "   ".into()).unwrap_err();
+        let _base_env =
+            test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&abs_test_path("/fake")));
+        let err = set_provider_key(abs_test_path("/fake"), "mm".into(), "   ".into()).unwrap_err();
         assert!(err.contains("must not be empty"));
     }
 
     #[test]
     fn set_provider_key_rejects_oversized_key() {
         let long_key = "x".repeat(5000);
-        let err = set_provider_key("/fake".into(), "mm".into(), long_key).unwrap_err();
+        let _base_env =
+            test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&abs_test_path("/fake")));
+        let err = set_provider_key(abs_test_path("/fake"), "mm".into(), long_key).unwrap_err();
         assert!(err.contains("too long"));
     }
 
@@ -5834,7 +7322,10 @@ mod tests {
         // Seven-char key passes the old "non-empty" gate but is
         // obviously not a real API key — MM JWTs are kilobytes, Z.AI
         // keys are 40+ chars. Must match the csq-core shape gate.
-        let err = set_provider_key("/fake".into(), "mm".into(), "short12".into()).unwrap_err();
+        let _base_env =
+            test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&abs_test_path("/fake")));
+        let err =
+            set_provider_key(abs_test_path("/fake"), "mm".into(), "short12".into()).unwrap_err();
         assert!(err.contains("too short"), "got: {err}");
     }
 
@@ -5843,7 +7334,9 @@ mod tests {
         // ESC (0x1b) slipping through the Bearer form's password
         // input is the desktop twin of the CLI bug in an internal journal entry
         let key = "valid-prefix\x1b-rest".to_string();
-        let err = set_provider_key("/fake".into(), "mm".into(), key).unwrap_err();
+        let _base_env =
+            test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&abs_test_path("/fake")));
+        let err = set_provider_key(abs_test_path("/fake"), "mm".into(), key).unwrap_err();
         assert!(err.contains("control characters"), "got: {err}");
     }
 
@@ -5856,7 +7349,9 @@ mod tests {
         // length ceiling is a cheaper check and a huge input is
         // almost certainly a clipboard mishap.
         let key = "x".repeat(5000);
-        let err = set_provider_key("/fake".into(), "mm".into(), key).unwrap_err();
+        let _base_env =
+            test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&abs_test_path("/fake")));
+        let err = set_provider_key(abs_test_path("/fake"), "mm".into(), key).unwrap_err();
         assert!(err.contains("too long"), "got: {err}");
     }
 
@@ -5864,26 +7359,42 @@ mod tests {
 
     #[test]
     fn bind_keyless_provider_rejects_unknown_provider() {
-        let err = bind_keyless_provider("/fake".into(), "nonexistent".into(), 1, None).unwrap_err();
+        let _base_env =
+            test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&abs_test_path("/fake")));
+        let err = bind_keyless_provider(abs_test_path("/fake"), "nonexistent".into(), 1, None)
+            .unwrap_err();
         assert!(err.contains("unknown provider"));
     }
 
     #[test]
     fn bind_keyless_provider_rejects_keyed_provider() {
-        let err = bind_keyless_provider("/fake".into(), "mm".into(), 1, None).unwrap_err();
+        let _base_env =
+            test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&abs_test_path("/fake")));
+        let err = bind_keyless_provider(abs_test_path("/fake"), "mm".into(), 1, None).unwrap_err();
         assert!(err.contains("not keyless"), "got: {err}");
     }
 
     #[test]
     fn bind_keyless_provider_rejects_invalid_slot() {
-        let err = bind_keyless_provider("/fake".into(), "ollama".into(), 0, None).unwrap_err();
+        let _base_env =
+            test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&abs_test_path("/fake")));
+        let err =
+            bind_keyless_provider(abs_test_path("/fake"), "ollama".into(), 0, None).unwrap_err();
         assert!(err.contains("invalid slot"), "got: {err}");
     }
 
     #[test]
     fn bind_keyless_provider_rejects_missing_base_dir() {
-        let err = bind_keyless_provider("/nonexistent/base/dir".into(), "ollama".into(), 5, None)
-            .unwrap_err();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &abs_test_path("/nonexistent/base/dir"),
+        ));
+        let err = bind_keyless_provider(
+            abs_test_path("/nonexistent/base/dir"),
+            "ollama".into(),
+            5,
+            None,
+        )
+        .unwrap_err();
         assert!(err.contains("does not exist"), "got: {err}");
     }
 
@@ -5910,6 +7421,9 @@ mod tests {
         pf.by_slot.insert("3".to_string(), uuid);
         save(&profiles_path(dir.path()), &pf).unwrap();
 
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         let err = bind_keyed_provider(
             dir.path().to_string_lossy().into_owned(),
             "mm".into(),
@@ -5930,8 +7444,15 @@ mod tests {
         // An all-whitespace model from the UI dropdown would silently
         // write `ANTHROPIC_MODEL=""` and make CC unusable. Reject
         // before the filesystem write.
-        let err = bind_keyless_provider("/fake".into(), "ollama".into(), 1, Some("   ".into()))
-            .unwrap_err();
+        let _base_env =
+            test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&abs_test_path("/fake")));
+        let err = bind_keyless_provider(
+            abs_test_path("/fake"),
+            "ollama".into(),
+            1,
+            Some("   ".into()),
+        )
+        .unwrap_err();
         assert!(err.contains("must not be empty"), "got: {err}");
     }
 
@@ -5941,6 +7462,9 @@ mod tests {
         // command writes the slot's settings.json with the placeholder
         // auth token and base URL.
         let dir = tempfile::TempDir::new().unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         let result = bind_keyless_provider(
             dir.path().to_string_lossy().into_owned(),
             "ollama".into(),
@@ -5960,26 +7484,36 @@ mod tests {
 
     #[test]
     fn set_slot_model_rejects_invalid_slot() {
-        let err = set_slot_model_write("/fake".into(), 0, "gemma4".into()).unwrap_err();
+        let _base_env =
+            test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&abs_test_path("/fake")));
+        let err = set_slot_model_write(abs_test_path("/fake"), 0, "gemma4".into()).unwrap_err();
         assert!(err.contains("invalid slot"), "got: {err}");
     }
 
     #[test]
     fn set_slot_model_rejects_empty_model() {
-        let err = set_slot_model_write("/fake".into(), 1, "   ".into()).unwrap_err();
+        let _base_env =
+            test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&abs_test_path("/fake")));
+        let err = set_slot_model_write(abs_test_path("/fake"), 1, "   ".into()).unwrap_err();
         assert!(err.contains("must not be empty"), "got: {err}");
     }
 
     #[test]
     fn set_slot_model_rejects_missing_base_dir() {
-        let err =
-            set_slot_model_write("/nonexistent/base/dir".into(), 1, "gemma4".into()).unwrap_err();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &abs_test_path("/nonexistent/base/dir"),
+        ));
+        let err = set_slot_model_write(abs_test_path("/nonexistent/base/dir"), 1, "gemma4".into())
+            .unwrap_err();
         assert!(err.contains("does not exist"), "got: {err}");
     }
 
     #[test]
     fn set_slot_model_errors_when_slot_not_bound() {
         let dir = tempfile::TempDir::new().unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         let err = set_slot_model_write(
             dir.path().to_string_lossy().into_owned(),
             7,
@@ -6005,6 +7539,9 @@ mod tests {
         )
         .unwrap();
 
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         set_slot_model_write(
             dir.path().to_string_lossy().into_owned(),
             5,
@@ -6038,6 +7575,9 @@ mod tests {
     #[test]
     fn bind_keyless_provider_with_model_override_writes_chosen_model() {
         let dir = tempfile::TempDir::new().unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         bind_keyless_provider(
             dir.path().to_string_lossy().into_owned(),
             "ollama".into(),
@@ -6084,40 +7624,28 @@ mod tests {
     fn provider_cli_installed_finds_kimi_and_grok_on_path() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::TempDir::new().unwrap();
-        for name in ["kimi", "grok"] {
-            let bin = dir.path().join(name);
-            std::fs::write(&bin, "#!/bin/sh").unwrap();
-            let mut perms = std::fs::metadata(&bin).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&bin, perms).unwrap();
-        }
-
-        // testing.md Rule 6: env mutation MUST hold the workspace-shared
-        // test_env lock (cargo test is multi-threaded).
         let _shared_env_guard = csq_core::platform::test_env::lock();
-        let prev_path = std::env::var_os("PATH");
-        let prev_home = std::env::var_os("HOME");
-        let empty_home = tempfile::TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("PATH", dir.path());
-            std::env::set_var("HOME", empty_home.path());
+        let dir = desktop_fixture_dir();
+        let bin_dir = dir.path().join("bin");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        for name in ["kimi", "grok"] {
+            let bin = bin_dir.join(name);
+            std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-
+        let _restore =
+            DesktopFixtureEnv::set(&[("PATH", bin_dir.as_os_str()), ("HOME", home.as_os_str())]);
+        for name in ["kimi", "grok"] {
+            assert_eq!(
+                csq_core::accounts::login::find_cli_binary(name),
+                Some(bin_dir.join(name)),
+                "the desktop probe must resolve the owned fixture binary"
+            );
+        }
         let kimi_found = provider_cli_installed("kimi".into());
         let grok_found = provider_cli_installed("grok".into());
-
-        unsafe {
-            match prev_path {
-                Some(v) => std::env::set_var("PATH", v),
-                None => std::env::remove_var("PATH"),
-            }
-            match prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-        drop(_shared_env_guard);
 
         assert!(
             kimi_found,
@@ -6144,7 +7672,8 @@ mod tests {
     fn provider_cli_installed_finds_kimi_via_known_install_dir_fallback() {
         use std::os::unix::fs::PermissionsExt;
 
-        let home = tempfile::TempDir::new().unwrap();
+        let _shared_env_guard = csq_core::platform::test_env::lock();
+        let home = desktop_fixture_dir();
         let bin_dir = home.path().join(".kimi-code").join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let bin = bin_dir.join("kimi");
@@ -6153,29 +7682,17 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
 
-        let _shared_env_guard = csq_core::platform::test_env::lock();
-        let prev_path = std::env::var_os("PATH");
-        let prev_home = std::env::var_os("HOME");
-        unsafe {
-            // Empty PATH — the walk must find nothing, forcing the
-            // known-install-dir fallback to be the ONLY path to a hit.
-            std::env::set_var("PATH", "");
-            std::env::set_var("HOME", home.path());
-        }
-
+        // Empty PATH makes the fallback resolver choose the owned install dir.
+        let _restore = DesktopFixtureEnv::set(&[
+            ("PATH", std::ffi::OsStr::new("")),
+            ("HOME", home.path().as_os_str()),
+        ]);
+        assert_eq!(
+            csq_core::cli_deps::install_path::find_in_path("kimi"),
+            Some(bin),
+            "the known-install-dir resolver must choose the owned fixture"
+        );
         let found = provider_cli_installed("kimi".into());
-
-        unsafe {
-            match prev_path {
-                Some(v) => std::env::set_var("PATH", v),
-                None => std::env::remove_var("PATH"),
-            }
-            match prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-        drop(_shared_env_guard);
 
         assert!(
             found,
@@ -6188,13 +7705,17 @@ mod tests {
 
     #[test]
     fn rename_account_rejects_invalid_account_number() {
-        let err = rename_account("/fake".into(), 0, "test".into()).unwrap_err();
+        let _base_env =
+            test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&abs_test_path("/fake")));
+        let err = rename_account(abs_test_path("/fake"), 0, "test".into()).unwrap_err();
         assert!(err.contains("invalid account"));
     }
 
     #[test]
     fn rename_account_rejects_empty_name() {
-        let err = rename_account("/fake".into(), 1, "   ".into()).unwrap_err();
+        let _base_env =
+            test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&abs_test_path("/fake")));
+        let err = rename_account(abs_test_path("/fake"), 1, "   ".into()).unwrap_err();
         assert!(err.contains("must not be empty"));
     }
 
@@ -6204,7 +7725,9 @@ mod tests {
         // Arrange: construct a 257-character label.
         let long_name = "a".repeat(257);
         // Act
-        let err = rename_account("/fake".into(), 1, long_name).unwrap_err();
+        let _base_env =
+            test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&abs_test_path("/fake")));
+        let err = rename_account(abs_test_path("/fake"), 1, long_name).unwrap_err();
         // Assert
         assert!(
             err.contains("exceeds 256"),
@@ -6218,7 +7741,10 @@ mod tests {
     fn rename_account_rejects_control_char_label() {
         for control in ["\t", "\n", "\x00", "\x1b"] {
             let name = format!("legit{control}name");
-            let err = rename_account("/fake".into(), 1, name.clone()).unwrap_err();
+            let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+                &abs_test_path("/fake"),
+            ));
+            let err = rename_account(abs_test_path("/fake"), 1, name.clone()).unwrap_err();
             assert!(
                 err.contains("control characters"),
                 "expected 'control characters' in error for input {:?}, got: {err}",
@@ -6312,6 +7838,8 @@ mod tests {
             token_status: "healthy".into(),
             expires_in_secs: None,
             last_refresh_error: None,
+            rescue_pending: None,
+            rescue_pending_message: None,
             provider_id: None,
             billing_mode: "subscription".to_string(),
             quota_kind: "utilization".to_string(),
@@ -6409,6 +7937,8 @@ mod tests {
             token_status: "healthy".into(),
             expires_in_secs: None,
             last_refresh_error: None,
+            rescue_pending: None,
+            rescue_pending_message: None,
             provider_id: Some("deepseek".into()),
             billing_mode: "api-key".to_string(),
             quota_kind: "balance".to_string(),
@@ -6546,13 +8076,19 @@ mod tests {
 
     #[tokio::test]
     async fn acknowledge_codex_tos_rejects_missing_base_dir() {
-        let err = acknowledge_codex_tos("/nonexistent/csq-base".into()).unwrap_err();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &abs_test_path("/nonexistent/csq-base"),
+        ));
+        let err = acknowledge_codex_tos(abs_test_path("/nonexistent/csq-base")).unwrap_err();
         assert!(err.contains("does not exist"), "got: {err}");
     }
 
     #[tokio::test]
     async fn acknowledge_codex_tos_writes_marker() {
         let dir = tempfile::TempDir::new().unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         acknowledge_codex_tos(dir.path().to_string_lossy().into_owned()).unwrap();
         assert!(csq_core::providers::codex::tos::is_acknowledged(dir.path()));
     }
@@ -6560,6 +8096,9 @@ mod tests {
     #[tokio::test]
     async fn acknowledge_codex_tos_is_idempotent() {
         let dir = tempfile::TempDir::new().unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         acknowledge_codex_tos(dir.path().to_string_lossy().into_owned()).unwrap();
         acknowledge_codex_tos(dir.path().to_string_lossy().into_owned()).unwrap();
         assert!(csq_core::providers::codex::tos::is_acknowledged(dir.path()));
@@ -6569,6 +8108,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_codex_login_rejects_invalid_account() {
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&"/tmp"));
         let err = start_codex_login("/tmp".into(), 0).await.unwrap_err();
         assert!(err.contains("invalid account"), "got: {err}");
     }
@@ -6576,6 +8116,9 @@ mod tests {
     #[tokio::test]
     async fn start_codex_login_returns_tos_required_when_marker_absent() {
         let dir = tempfile::TempDir::new().unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         let view = start_codex_login(dir.path().to_string_lossy().into_owned(), 2)
             .await
             .unwrap();
@@ -6589,6 +8132,9 @@ mod tests {
     #[tokio::test]
     async fn start_codex_login_returns_tos_not_required_after_acknowledge() {
         let dir = tempfile::TempDir::new().unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         acknowledge_codex_tos(dir.path().to_string_lossy().into_owned()).unwrap();
         let view = start_codex_login(dir.path().to_string_lossy().into_owned(), 2)
             .await
@@ -6612,7 +8158,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_codex_models_rejects_missing_base_dir() {
-        let err = list_codex_models("/nonexistent/csq-base".into())
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &abs_test_path("/nonexistent/csq-base"),
+        ));
+        let err = list_codex_models(abs_test_path("/nonexistent/csq-base"))
             .await
             .unwrap_err();
         assert!(err.contains("does not exist"), "got: {err}");
@@ -6628,6 +8177,9 @@ mod tests {
         // verdict satisfies the contract: the picker MUST get a
         // non-empty list with a source other than Live.
         let dir = tempfile::TempDir::new().unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         let list = list_codex_models(dir.path().to_string_lossy().into_owned())
             .await
             .unwrap();
@@ -6657,6 +8209,8 @@ mod tests {
             token_status: "healthy".into(),
             expires_in_secs: Some(7200),
             last_refresh_error: None,
+            rescue_pending: None,
+            rescue_pending_message: None,
             provider_id: None,
             billing_mode: "subscription".to_string(),
             quota_kind: "utilization".to_string(),
@@ -6669,6 +8223,75 @@ mod tests {
         let json = serde_json::to_string(&v).unwrap();
         assert!(json.contains(r#""source":"codex""#));
         assert!(json.contains(r#""surface":"codex""#));
+    }
+
+    /// The rescue fields are fixed-vocabulary scalars (state tag + shared
+    /// operator message) — audited into the IPC payload whitelist so the row
+    /// can render them. `None` (no identity / no record) keeps the wire shape
+    /// of a pre-rescue build.
+    #[test]
+    fn account_view_rescue_variant_serializes_whitelisted() {
+        let v = AccountView {
+            id: 7,
+            label: "Work".into(),
+            source: "anthropic".into(),
+            surface: "claude-code".into(),
+            has_credentials: true,
+            has_quota: false,
+            five_hour_pct: None,
+            five_hour_resets_in: None,
+            seven_day_pct: None,
+            seven_day_resets_in: None,
+            updated_at: 0.0,
+            token_status: "healthy".into(),
+            expires_in_secs: None,
+            last_refresh_error: None,
+            rescue_pending: Some("unadoptable".into()),
+            rescue_pending_message: Some(
+                "a saved login could not be restored; sign in again for this account".into(),
+            ),
+            provider_id: None,
+            billing_mode: "subscription".to_string(),
+            quota_kind: "utilization".to_string(),
+            balance_display: None,
+            gemini_counter_today: None,
+            gemini_rate_limit_reset_at: None,
+            gemini_selected_model: None,
+            gemini_effective_model: None,
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(json.contains(r#""rescue_pending":"unadoptable""#), "{json}");
+        assert!(
+            json.contains(
+                r#""rescue_pending_message":"a saved login could not be restored; sign in again for this account""#
+            ),
+            "{json}"
+        );
+        assert_ipc_keys_whitelisted(
+            &v,
+            &[
+                "id",
+                "label",
+                "source",
+                "surface",
+                "has_credentials",
+                "has_quota",
+                "five_hour_pct",
+                "five_hour_resets_in",
+                "seven_day_pct",
+                "seven_day_resets_in",
+                "updated_at",
+                "token_status",
+                "expires_in_secs",
+                "last_refresh_error",
+                "rescue_pending",
+                "rescue_pending_message",
+                "provider_id",
+                "billing_mode",
+                "quota_kind",
+                "balance_display",
+            ],
+        );
     }
 
     #[test]
@@ -6692,6 +8315,8 @@ mod tests {
             token_status: "healthy".into(),
             expires_in_secs: None,
             last_refresh_error: None,
+            rescue_pending: None,
+            rescue_pending_message: None,
             provider_id: None,
             billing_mode: "subscription".to_string(),
             quota_kind: "utilization".to_string(),
@@ -6778,7 +8403,10 @@ mod tests {
         seed_codex_slot(&creds_dir, 7);
         write_quota_file(dir.path(), &[(7, "codex", 42.0, 18.0)]);
 
-        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
+        let views = get_accounts_blocking(dir.path().to_string_lossy().into_owned()).unwrap();
         let v = views
             .iter()
             .find(|v| v.id == 7)
@@ -6822,7 +8450,10 @@ mod tests {
         )
         .unwrap();
 
-        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
+        let views = get_accounts_blocking(dir.path().to_string_lossy().into_owned()).unwrap();
         let v = views
             .iter()
             .find(|v| v.id == 7)
@@ -6866,7 +8497,10 @@ mod tests {
         });
         std::fs::write(creds_dir.join("gemini-13.json"), raw.to_string()).unwrap();
 
-        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
+        let views = get_accounts_blocking(dir.path().to_string_lossy().into_owned()).unwrap();
         let v = views
             .iter()
             .find(|v| v.id == 13)
@@ -6926,7 +8560,10 @@ mod tests {
         )
         .unwrap();
 
-        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
+        let views = get_accounts_blocking(dir.path().to_string_lossy().into_owned()).unwrap();
         let v = views
             .iter()
             .find(|v| v.id == 8)
@@ -6953,7 +8590,10 @@ mod tests {
         seed_claude_slot(&creds_dir, 4);
         write_quota_file(dir.path(), &[(4, "claude-code", 30.0, 60.0)]);
 
-        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
+        let views = get_accounts_blocking(dir.path().to_string_lossy().into_owned()).unwrap();
         let v = views
             .iter()
             .find(|v| v.id == 4)
@@ -6999,7 +8639,10 @@ mod tests {
         // ~5h left: healthy control.
         seed_with_expiry_ms(&creds_dir, 3, now_ms + 5 * 60 * 60 * 1000);
 
-        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
+        let views = get_accounts_blocking(dir.path().to_string_lossy().into_owned()).unwrap();
         let status = |id: u16| {
             views
                 .iter()
@@ -7035,7 +8678,10 @@ mod tests {
         // Prior occupant was Anthropic — stale row carries surface="claude-code".
         write_quota_file(dir.path(), &[(13, "claude-code", 80.0, 95.0)]);
 
-        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
+        let views = get_accounts_blocking(dir.path().to_string_lossy().into_owned()).unwrap();
         let v = views
             .iter()
             .find(|v| v.id == 13)
@@ -7082,7 +8728,10 @@ mod tests {
         .unwrap();
         write_quota_file(dir.path(), &[(13, "kimi", 34.0, 12.0)]);
 
-        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
+        let views = get_accounts_blocking(dir.path().to_string_lossy().into_owned()).unwrap();
         let v = views
             .iter()
             .find(|v| v.id == 13)
@@ -7119,7 +8768,10 @@ mod tests {
         .unwrap();
         write_quota_file(dir.path(), &[(14, "kimi-cli", 55.0, 20.0)]);
 
-        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
+        let views = get_accounts_blocking(dir.path().to_string_lossy().into_owned()).unwrap();
         let v = views
             .iter()
             .find(|v| v.id == 14)
@@ -7152,7 +8804,10 @@ mod tests {
         )
         .unwrap();
 
-        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
+        let views = get_accounts_blocking(dir.path().to_string_lossy().into_owned()).unwrap();
         let v = views
             .iter()
             .find(|v| v.id == 15)
@@ -7199,7 +8854,10 @@ mod tests {
         f.set(15, q);
         csq_core::quota::state::save_state(dir.path(), &f).unwrap();
 
-        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
+        let views = get_accounts_blocking(dir.path().to_string_lossy().into_owned()).unwrap();
         let v = views
             .iter()
             .find(|v| v.id == 15)
@@ -7285,7 +8943,10 @@ mod tests {
         f.set(16, q);
         csq_core::quota::state::save_state(dir.path(), &f).unwrap();
 
-        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
+        let views = get_accounts_blocking(dir.path().to_string_lossy().into_owned()).unwrap();
         let v = views
             .iter()
             .find(|v| v.id == 16)
@@ -7360,7 +9021,10 @@ mod tests {
         f.set(9, q);
         csq_core::quota::state::save_state(dir.path(), &f).unwrap();
 
-        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
+        let views = get_accounts_blocking(dir.path().to_string_lossy().into_owned()).unwrap();
         let v = views.iter().find(|v| v.id == 9).expect("slot 9 visible");
 
         assert_eq!(
@@ -7385,7 +9049,10 @@ mod tests {
         seed_claude_slot(&creds_dir, 21);
         // No quota.json written at all — the daemon hasn't polled yet.
 
-        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
+        let views = get_accounts_blocking(dir.path().to_string_lossy().into_owned()).unwrap();
         let v = views
             .iter()
             .find(|v| v.id == 21)
@@ -7624,13 +9291,19 @@ mod tests {
 
     #[test]
     fn is_gemini_tos_acknowledged_rejects_missing_base_dir() {
-        let err = is_gemini_tos_acknowledged("/nonexistent/csq-base".into()).unwrap_err();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &abs_test_path("/nonexistent/csq-base"),
+        ));
+        let err = is_gemini_tos_acknowledged(abs_test_path("/nonexistent/csq-base")).unwrap_err();
         assert!(err.contains("does not exist"), "got: {err}");
     }
 
     #[test]
     fn is_gemini_tos_acknowledged_returns_false_when_marker_absent() {
         let dir = tempfile::TempDir::new().unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         let acked = is_gemini_tos_acknowledged(dir.path().to_string_lossy().into_owned()).unwrap();
         assert!(!acked);
     }
@@ -7638,19 +9311,28 @@ mod tests {
     #[test]
     fn is_gemini_tos_acknowledged_returns_true_after_acknowledge() {
         let dir = tempfile::TempDir::new().unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         acknowledge_gemini_tos(dir.path().to_string_lossy().into_owned()).unwrap();
         assert!(is_gemini_tos_acknowledged(dir.path().to_string_lossy().into_owned()).unwrap());
     }
 
     #[test]
     fn acknowledge_gemini_tos_rejects_missing_base_dir() {
-        let err = acknowledge_gemini_tos("/nonexistent/csq-base".into()).unwrap_err();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &abs_test_path("/nonexistent/csq-base"),
+        ));
+        let err = acknowledge_gemini_tos(abs_test_path("/nonexistent/csq-base")).unwrap_err();
         assert!(err.contains("does not exist"), "got: {err}");
     }
 
     #[test]
     fn acknowledge_gemini_tos_writes_marker() {
         let dir = tempfile::TempDir::new().unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         acknowledge_gemini_tos(dir.path().to_string_lossy().into_owned()).unwrap();
         assert!(csq_core::providers::gemini::tos::is_acknowledged(
             dir.path()
@@ -7660,6 +9342,9 @@ mod tests {
     #[test]
     fn acknowledge_gemini_tos_is_idempotent() {
         let dir = tempfile::TempDir::new().unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         acknowledge_gemini_tos(dir.path().to_string_lossy().into_owned()).unwrap();
         acknowledge_gemini_tos(dir.path().to_string_lossy().into_owned()).unwrap();
         assert!(csq_core::providers::gemini::tos::is_acknowledged(
@@ -7669,6 +9354,7 @@ mod tests {
 
     #[test]
     fn gemini_provision_api_key_rejects_invalid_account() {
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&"/tmp"));
         let err = gemini_provision_api_key(
             "/tmp".into(),
             0,
@@ -7680,12 +9366,14 @@ mod tests {
 
     #[test]
     fn gemini_provision_api_key_rejects_empty_key() {
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&"/tmp"));
         let err = gemini_provision_api_key("/tmp".into(), 1, "   ".into()).unwrap_err();
         assert!(err.contains("must not be empty"), "got: {err}");
     }
 
     #[test]
     fn gemini_provision_api_key_rejects_too_short_key() {
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&"/tmp"));
         let err = gemini_provision_api_key("/tmp".into(), 1, "AIzaShort".into()).unwrap_err();
         assert!(err.contains("too short"), "got: {err}");
     }
@@ -7693,6 +9381,7 @@ mod tests {
     #[test]
     fn gemini_provision_api_key_rejects_oversized_key() {
         let long = "A".repeat(300);
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&"/tmp"));
         let err = gemini_provision_api_key("/tmp".into(), 1, long).unwrap_err();
         assert!(err.contains("too long"), "got: {err}");
     }
@@ -7702,6 +9391,7 @@ mod tests {
         // ESC byte mid-paste — same shape the Bearer form was bitten
         // by in an internal journal entry Refuse at the boundary.
         let key = "AIzaSy\x1bXX_xxxxxxxxxxxxxxxxxxxxxxxxxx".to_string();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&"/tmp"));
         let err = gemini_provision_api_key("/tmp".into(), 1, key).unwrap_err();
         assert!(err.contains("control characters"), "got: {err}");
     }
@@ -7710,14 +9400,18 @@ mod tests {
     fn gemini_provision_api_key_rejects_non_aiza_prefix() {
         // 30+ bytes so the length check passes, but no AIza prefix.
         let key = "sk-ant-XX_xxxxxxxxxxxxxxxxxxxxxxxx".to_string();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&"/tmp"));
         let err = gemini_provision_api_key("/tmp".into(), 1, key).unwrap_err();
         assert!(err.contains("AIza"), "got: {err}");
     }
 
     #[test]
     fn gemini_provision_api_key_rejects_missing_base_dir() {
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &abs_test_path("/nonexistent/csq-base"),
+        ));
         let err = gemini_provision_api_key(
-            "/nonexistent/csq-base".into(),
+            abs_test_path("/nonexistent/csq-base"),
             1,
             "AIzaFAKETESTKEYDONOTUSE0000000000000000".into(),
         )
@@ -7734,6 +9428,9 @@ mod tests {
         std::fs::create_dir_all(&creds).unwrap();
         std::fs::write(creds.join("codex-3.json"), b"{}").unwrap();
 
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         let err = gemini_provision_api_key(
             dir.path().to_string_lossy().into_owned(),
             3,
@@ -7755,6 +9452,9 @@ mod tests {
         )
         .unwrap();
 
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         let err = gemini_provision_api_key(
             dir.path().to_string_lossy().into_owned(),
             4,
@@ -7779,6 +9479,9 @@ mod tests {
         )
         .unwrap();
 
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         let err = gemini_provision_api_key(
             dir.path().to_string_lossy().into_owned(),
             5,
@@ -7792,6 +9495,9 @@ mod tests {
     #[test]
     fn gemini_provision_vertex_sa_rejects_relative_path() {
         let dir = tempfile::TempDir::new().unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         let err = gemini_provision_vertex_sa(
             dir.path().to_string_lossy().into_owned(),
             1,
@@ -7804,6 +9510,9 @@ mod tests {
     #[test]
     fn gemini_provision_vertex_sa_rejects_empty_path() {
         let dir = tempfile::TempDir::new().unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         let err =
             gemini_provision_vertex_sa(dir.path().to_string_lossy().into_owned(), 1, "  ".into())
                 .unwrap_err();
@@ -7817,28 +9526,53 @@ mod tests {
     // from csq-core and asserts the returned `Err(String)` does not
     // contain the operator's home directory.
 
-    /// Runs `f` with `$HOME` pointed at `home`, serialized against
-    /// sibling tests via the workspace-wide env-mutation mutex
-    /// (`rules/testing.md` §4/4b shared-env discipline).
-    fn with_mocked_home<R>(home: &std::path::Path, f: impl FnOnce() -> R) -> R {
-        let _shared_env_guard = csq_core::platform::test_env::lock();
-        let prev_home = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", home);
+    // Explicit absolute roots avoid ambient TMPDIR values (including relative
+    // paths) changing fixture identity. TempDir owns a private, random directory.
+    fn desktop_fixture_dir() -> tempfile::TempDir {
+        #[cfg(unix)]
+        let parent = std::path::PathBuf::from("/tmp");
+        #[cfg(not(unix))]
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        tempfile::Builder::new()
+            .prefix("csq-desktop-fixture-")
+            .tempdir_in(parent)
+            .unwrap()
+    }
+
+    // Callers hold the workspace env lock before creating any fixtures; Drop
+    // restores overrides even when an assertion panics.
+    struct DesktopFixtureEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl DesktopFixtureEnv {
+        fn set(vars: &[(&'static str, &std::ffi::OsStr)]) -> Self {
+            let restore = Self(
+                vars.iter()
+                    .map(|(key, _)| (*key, std::env::var_os(key)))
+                    .collect(),
+            );
+            for (key, value) in vars {
+                unsafe { std::env::set_var(key, value) };
+            }
+            restore
         }
-        let out = f();
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
+    }
+
+    impl Drop for DesktopFixtureEnv {
+        fn drop(&mut self) {
+            for (key, previous) in self.0.drain(..).rev() {
+                match previous {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
             }
         }
-        out
     }
 
     #[test]
     fn gemini_provision_vertex_sa_error_does_not_leak_home_path() {
-        let home = tempfile::TempDir::new().unwrap();
+        let _shared_env_guard = csq_core::platform::test_env::lock();
+        let home = desktop_fixture_dir();
+        let _restore = DesktopFixtureEnv::set(&[("HOME", home.path().as_os_str())]);
         let base = home.path().join(".claude").join("accounts");
         std::fs::create_dir_all(&base).unwrap();
         // Block `write_binding`'s `create_dir_all(parent)` by putting a
@@ -7849,14 +9583,16 @@ mod tests {
         let sa_path = home.path().join("sa.json");
         std::fs::write(&sa_path, br#"{"type":"service_account"}"#).unwrap();
 
-        let err = with_mocked_home(home.path(), || {
-            gemini_provision_vertex_sa(
-                base.to_string_lossy().into_owned(),
-                5,
-                sa_path.to_string_lossy().into_owned(),
-            )
-            .unwrap_err()
-        });
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set_locked(
+            &_shared_env_guard,
+            std::path::Path::new(&base.to_string_lossy().into_owned()),
+        );
+        let err = gemini_provision_vertex_sa(
+            base.to_string_lossy().into_owned(),
+            5,
+            sa_path.to_string_lossy().into_owned(),
+        )
+        .unwrap_err();
 
         let home_str = home.path().to_string_lossy().into_owned();
         assert!(!err.contains(&home_str), "path leaked to renderer: {err}");
@@ -7865,16 +9601,20 @@ mod tests {
 
     #[test]
     fn get_rotation_config_error_does_not_leak_home_path() {
-        let home = tempfile::TempDir::new().unwrap();
+        let _shared_env_guard = csq_core::platform::test_env::lock();
+        let home = desktop_fixture_dir();
+        let _restore = DesktopFixtureEnv::set(&[("HOME", home.path().as_os_str())]);
         let base = home.path().join(".claude").join("accounts");
         std::fs::create_dir_all(&base).unwrap();
         // Corrupt rotation.json so `rotation_config::load` returns
         // `ConfigError::InvalidJson { path: <rotation.json>, .. }`.
         std::fs::write(base.join("rotation.json"), b"{not valid json").unwrap();
 
-        let err = with_mocked_home(home.path(), || {
-            get_rotation_config(base.to_string_lossy().into_owned()).unwrap_err()
-        });
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set_locked(
+            &_shared_env_guard,
+            std::path::Path::new(&base.to_string_lossy().into_owned()),
+        );
+        let err = get_rotation_config(base.to_string_lossy().into_owned()).unwrap_err();
 
         let home_str = home.path().to_string_lossy().into_owned();
         assert!(!err.contains(&home_str), "path leaked to renderer: {err}");
@@ -7901,6 +9641,9 @@ mod tests {
         let sa_path = dir.path().join("sa.json");
         std::fs::write(&sa_path, br#"{"type":"service_account"}"#).unwrap();
 
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         let err = gemini_provision_vertex_sa(
             dir.path().to_string_lossy().into_owned(),
             2,
@@ -7922,6 +9665,7 @@ mod tests {
     #[cfg(feature = "enterprise")]
     #[test]
     fn cloud_claude_provision_vertex_rejects_invalid_account() {
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&"/tmp"));
         let err = cloud_claude_provision_vertex(
             "/tmp".into(),
             0,
@@ -7937,6 +9681,7 @@ mod tests {
     #[cfg(feature = "enterprise")]
     #[test]
     fn cloud_claude_provision_vertex_rejects_empty_project() {
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&"/tmp"));
         let err = cloud_claude_provision_vertex(
             "/tmp".into(),
             1,
@@ -7952,6 +9697,7 @@ mod tests {
     #[cfg(feature = "enterprise")]
     #[test]
     fn cloud_claude_provision_vertex_rejects_empty_region() {
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&"/tmp"));
         let err = cloud_claude_provision_vertex(
             "/tmp".into(),
             1,
@@ -7967,6 +9713,7 @@ mod tests {
     #[cfg(feature = "enterprise")]
     #[test]
     fn cloud_claude_provision_vertex_rejects_empty_sa_path() {
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&"/tmp"));
         let err = cloud_claude_provision_vertex(
             "/tmp".into(),
             1,
@@ -7982,6 +9729,7 @@ mod tests {
     #[cfg(feature = "enterprise")]
     #[test]
     fn cloud_claude_provision_vertex_rejects_relative_sa_path() {
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&"/tmp"));
         let err = cloud_claude_provision_vertex(
             "/tmp".into(),
             1,
@@ -7997,8 +9745,11 @@ mod tests {
     #[cfg(feature = "enterprise")]
     #[test]
     fn cloud_claude_provision_vertex_rejects_missing_base_dir() {
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &abs_test_path("/nonexistent/csq-base"),
+        ));
         let err = cloud_claude_provision_vertex(
-            "/nonexistent/csq-base".into(),
+            abs_test_path("/nonexistent/csq-base"),
             1,
             "my-project".into(),
             "us-east5".into(),
@@ -8012,6 +9763,7 @@ mod tests {
     #[cfg(feature = "enterprise")]
     #[test]
     fn cloud_claude_provision_bedrock_rejects_invalid_account() {
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&"/tmp"));
         let err = cloud_claude_provision_bedrock(
             "/tmp".into(),
             0,
@@ -8026,6 +9778,7 @@ mod tests {
     #[cfg(feature = "enterprise")]
     #[test]
     fn cloud_claude_provision_bedrock_rejects_empty_region() {
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&"/tmp"));
         let err = cloud_claude_provision_bedrock(
             "/tmp".into(),
             1,
@@ -8040,6 +9793,7 @@ mod tests {
     #[cfg(feature = "enterprise")]
     #[test]
     fn cloud_claude_provision_bedrock_rejects_empty_token() {
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&"/tmp"));
         let err = cloud_claude_provision_bedrock(
             "/tmp".into(),
             1,
@@ -8057,6 +9811,7 @@ mod tests {
         // ESC byte mid-paste — same truncation shape the Gemini API-key
         // path guards against. Refuse at the boundary.
         let token = "bedrock\x1btoken".to_string();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&"/tmp"));
         let err = cloud_claude_provision_bedrock("/tmp".into(), 1, "us-east-1".into(), token, None)
             .unwrap_err();
         assert!(err.contains("control characters"), "got: {err}");
@@ -8065,8 +9820,11 @@ mod tests {
     #[cfg(feature = "enterprise")]
     #[test]
     fn cloud_claude_provision_bedrock_rejects_missing_base_dir() {
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &abs_test_path("/nonexistent/csq-base"),
+        ));
         let err = cloud_claude_provision_bedrock(
-            "/nonexistent/csq-base".into(),
+            abs_test_path("/nonexistent/csq-base"),
             1,
             "us-east-1".into(),
             "bedrock-bearer-token".into(),
@@ -8099,7 +9857,14 @@ mod tests {
 
     #[test]
     fn gemini_provision_oauth_rejects_missing_base_dir() {
-        let err = block_on(gemini_provision_oauth("/nonexistent/csq-base".into(), 1)).unwrap_err();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &abs_test_path("/nonexistent/csq-base"),
+        ));
+        let err = block_on(gemini_provision_oauth(
+            abs_test_path("/nonexistent/csq-base"),
+            1,
+        ))
+        .unwrap_err();
         assert!(err.contains("does not exist"), "got: {err}");
     }
 
@@ -8110,6 +9875,9 @@ mod tests {
         std::fs::create_dir_all(&creds).unwrap();
         std::fs::write(creds.join("codex-5.json"), b"{}").unwrap();
 
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         let err = block_on(gemini_provision_oauth(
             dir.path().to_string_lossy().into_owned(),
             5,
@@ -8130,6 +9898,9 @@ mod tests {
         )
         .unwrap();
 
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         let err = block_on(gemini_provision_oauth(
             dir.path().to_string_lossy().into_owned(),
             6,
@@ -8273,6 +10044,9 @@ mod tests {
             AcquireOutcome::Held { .. } => panic!("first acquire must succeed"),
         };
 
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         let err = block_on(gemini_provision_oauth(
             dir.path().to_string_lossy().into_owned(),
             55,
@@ -8313,6 +10087,9 @@ mod tests {
             AcquireOutcome::Held { .. } => panic!("first acquire must succeed"),
         };
 
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         let err = block_on(gemini_provision_oauth(
             dir.path().to_string_lossy().into_owned(),
             58,
@@ -8399,8 +10176,11 @@ mod tests {
 
     #[test]
     fn start_native_login_rejects_missing_base_dir() {
-        let err =
-            start_native_login("/nonexistent/csq-base".into(), "kimi-cli".into(), 1).unwrap_err();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &abs_test_path("/nonexistent/csq-base"),
+        ));
+        let err = start_native_login(abs_test_path("/nonexistent/csq-base"), "kimi-cli".into(), 1)
+            .unwrap_err();
         assert!(err.contains("does not exist"), "got: {err}");
     }
 
@@ -8411,6 +10191,9 @@ mod tests {
         std::fs::create_dir_all(&creds).unwrap();
         std::fs::write(creds.join("codex-5.json"), b"{}").unwrap();
 
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         let err = start_native_login(
             dir.path().to_string_lossy().into_owned(),
             "kimi-cli".into(),
@@ -8435,6 +10218,9 @@ mod tests {
         // Same slot, different native surface (Grok) — must refuse rather
         // than silently permitting a later complete_native_login to
         // clobber the Kimi binding.
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         let err = start_native_login(dir.path().to_string_lossy().into_owned(), "grok".into(), 7)
             .unwrap_err();
         assert!(err.contains("Kimi"), "got: {err}");
@@ -8463,6 +10249,10 @@ mod tests {
         // a concurrent PATH-mutating sibling — hold the shared lock for the
         // read even though this test never sets PATH itself.
         let _shared_env_guard = csq_core::platform::test_env::lock();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set_locked(
+            &_shared_env_guard,
+            std::path::Path::new(&base),
+        );
         let view = start_native_login(base, "kimi-cli".into(), 9).unwrap();
         assert_eq!(view.native_id, "kimi-cli");
     }
@@ -8491,6 +10281,10 @@ mod tests {
             std::env::set_var("HOME", home.path());
         }
 
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set_locked(
+            &_shared_env_guard,
+            std::path::Path::new(&base_dir.path().to_string_lossy().into_owned()),
+        );
         let view = start_native_login(
             base_dir.path().to_string_lossy().into_owned(),
             "kimi-cli".into(),
@@ -8507,6 +10301,7 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
+        drop(_base_env);
         drop(_shared_env_guard);
 
         assert!(view.unwrap().cli_installed);
@@ -8716,14 +10511,28 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cancel_native_login_from_kills_registered_child() {
+        let _shared_env_guard = csq_core::platform::test_env::lock();
         use csq_core::providers::catalog::Surface;
-        // A live child registered as a Grok login is killed by cancel. Uses a
-        // harmless `sleep` child rather than a real vendor binary.
-        let child = std::process::Command::new("sleep")
+        let home = desktop_fixture_dir();
+        // Pin the platform utility, rather than resolving sleep through a
+        // sibling test's temporary vendor-only PATH. No live env is inherited.
+        let child = std::process::Command::new("/bin/sleep")
+            .env_clear()
+            .env("HOME", home.path())
+            .env("PATH", "/usr/bin:/bin")
             .arg("30")
             .spawn()
             .expect("spawn sleep");
         let handle = Arc::new(Mutex::new(child));
+        struct ReapChild(Arc<Mutex<std::process::Child>>);
+        impl Drop for ReapChild {
+            fn drop(&mut self) {
+                let mut child = self.0.lock().unwrap_or_else(|error| error.into_inner());
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        let _reap = ReapChild(handle.clone());
         let children: NativeLoginChildren = Arc::new(Mutex::new(HashMap::new()));
         children
             .lock()
@@ -8907,6 +10716,28 @@ mod tests {
     /// real OS keychain. After `remove_account` returns Ok, both the
     /// binding marker and the vault entry must be gone.
     ///
+    /// `remove_account`'s in-use refusal: a live pid keeps `ACCOUNT_IN_USE`, an unreadable
+    /// marker gets its own tag and names the dir, never a pid 0.
+    #[test]
+    fn logout_in_use_error_distinguishes_live_pid_from_unreadable_marker() {
+        let a = csq_core::types::AccountNum::try_from(5u16).unwrap();
+        let live = logout_in_use_error(a, &[99], &[]);
+        assert!(
+            live.starts_with("ACCOUNT_IN_USE: ") && live.contains("[99]"),
+            "{live}"
+        );
+        let unread = logout_in_use_error(a, &[], &["term-1234".to_string()]);
+        assert!(
+            unread.starts_with("ACCOUNT_MARKER_UNREADABLE: "),
+            "{unread}"
+        );
+        assert!(
+            unread.contains("term-1234") && !unread.contains("[0]"),
+            "{unread}"
+        );
+        assert!(!unread.contains('/'), "no path: {unread}");
+    }
+
     /// Vault emptiness after the command is verified via
     /// `delete_api_key_from_vault` returning Ok on a slot with no marker
     /// (the idempotent no-op path) — a post-hoc `vault.get` would require
@@ -8952,11 +10783,16 @@ mod tests {
         let _shared_env_guard = csq_core::platform::test_env::lock();
         let prev = std::env::var("CSQ_SECRET_BACKEND").ok();
         unsafe { std::env::set_var("CSQ_SECRET_BACKEND", "in-memory") };
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set_locked(
+            &_shared_env_guard,
+            std::path::Path::new(&base.to_string_lossy().into_owned()),
+        );
         let result = remove_account_blocking(base.to_string_lossy().into_owned(), 3);
         match prev {
             Some(v) => unsafe { std::env::set_var("CSQ_SECRET_BACKEND", v) },
             None => unsafe { std::env::remove_var("CSQ_SECRET_BACKEND") },
         }
+        drop(_base_env);
         drop(_shared_env_guard);
 
         assert!(result.is_ok(), "remove_account must succeed: {result:?}");
@@ -9000,11 +10836,16 @@ mod tests {
         let _shared_env_guard = csq_core::platform::test_env::lock();
         let prev = std::env::var("CSQ_SECRET_BACKEND").ok();
         unsafe { std::env::set_var("CSQ_SECRET_BACKEND", "in-memory") };
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set_locked(
+            &_shared_env_guard,
+            std::path::Path::new(&base.to_string_lossy().into_owned()),
+        );
         let result = remove_account_blocking(base.to_string_lossy().into_owned(), 5);
         match prev {
             Some(v) => unsafe { std::env::set_var("CSQ_SECRET_BACKEND", v) },
             None => unsafe { std::env::remove_var("CSQ_SECRET_BACKEND") },
         }
+        drop(_base_env);
         drop(_shared_env_guard);
 
         assert!(
@@ -9056,11 +10897,93 @@ mod tests {
         std::fs::write(creds_dir.join("1.json"), "{}").unwrap();
 
         // No CSQ_SECRET_BACKEND override — vault open must NOT be reached.
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &base.to_string_lossy().into_owned(),
+        ));
         let result = remove_account_blocking(base.to_string_lossy().into_owned(), 1);
         assert!(
             result.is_ok(),
             "remove_account for ClaudeCode slot must succeed: {result:?}"
         );
+    }
+
+    // ── Codex slot write status + ack (r4b item 1) ─────────────────────────
+
+    /// The desktop ack calls the same core operation as `csq doctor --ack-raced`: the sticky
+    /// flag, the leftover tmp file and the status markers are all gone afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn ack_codex_slot_raced_clears_flag_tmp_and_markers() {
+        use csq_core::providers::codex::surface::{write_status_marker, SlotWriteStatus};
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+        let slot_dir = base.join("config-3");
+        std::fs::create_dir_all(&slot_dir).unwrap();
+        std::fs::write(slot_dir.join(".csq-config-write-status"), "raced\n").unwrap();
+        std::fs::write(slot_dir.join("config.tmp.123.4"), "x").unwrap();
+        let acct = AccountNum::try_from(3u16).unwrap();
+        write_status_marker(base, acct, SlotWriteStatus::PurgeFailed).unwrap();
+        write_status_marker(base, acct, SlotWriteStatus::Raced).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(base);
+        let base_s = base.to_string_lossy().into_owned();
+
+        let before = get_codex_slot_write_status(base_s.clone()).unwrap();
+        assert_eq!(before.len(), 1, "{before:?}");
+        assert_eq!(before[0].slot, 3);
+        assert!(before[0].ackable);
+        assert!(before[0].status.contains(&"raced".to_owned()));
+        assert!(before[0].status.contains(&"purge-failed".to_owned()));
+
+        let out = ack_codex_slot_raced_blocking(&base_s, 3).unwrap();
+        assert_eq!(
+            out,
+            CodexAckView {
+                slot: 3,
+                cleared: true,
+                tmp_removed: 1,
+                markers_removed: 1
+            }
+        );
+        // the raced ack leaves the purge-failed marker: it is reported, and not ackable
+        let after = get_codex_slot_write_status(base_s.clone()).unwrap();
+        assert_eq!(after.len(), 1, "{after:?}");
+        assert_eq!(after[0].status, vec!["purge-failed".to_owned()]);
+        assert!(!after[0].ackable);
+        assert!(!slot_dir.join("config.tmp.123.4").exists());
+        // an unrecognised marker is its own fixed word, also not ackable
+        let mdir = slot_dir.join(".csq-status-markers");
+        std::fs::write(mdir.join("odd"), "future-kind\n").unwrap();
+        let odd = get_codex_slot_write_status(base_s.clone()).unwrap();
+        assert!(
+            odd[0].status.contains(&"unrecognised-marker".to_owned()),
+            "{odd:?}"
+        );
+        assert!(!odd[0].ackable);
+        assert!(!odd[0].overflow_stuck);
+        // idempotent
+        let again = ack_codex_slot_raced_blocking(&base_s, 3).unwrap();
+        assert!(!again.cleared && again.tmp_removed == 0 && again.markers_removed == 0);
+    }
+
+    /// An out-of-range slot and a foreign base dir are refused at the boundary with typed
+    /// errors (no panic); a slot with no config dir is an ACK_FAILED, nothing created.
+    #[test]
+    fn ack_codex_slot_raced_rejects_invalid_input() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(base);
+        let base_s = base.to_string_lossy().into_owned();
+        for bad in [0u16, 1000, u16::MAX] {
+            let e = ack_codex_slot_raced_blocking(&base_s, bad).unwrap_err();
+            assert!(e.starts_with("INVALID_INPUT:"), "slot {bad}: {e}");
+        }
+        let other = tempfile::TempDir::new().unwrap();
+        let e = ack_codex_slot_raced_blocking(&other.path().to_string_lossy(), 3).unwrap_err();
+        assert!(e.starts_with("INVALID_INPUT:"), "{e}");
+        let e = ack_codex_slot_raced_blocking(&base_s, 5).unwrap_err();
+        assert!(e.starts_with("ACK_FAILED:"), "{e}");
+        assert!(!base.join("config-5").exists());
+        assert!(get_codex_slot_write_status("/nonexistent/elsewhere".into()).is_err());
     }
 
     // ── move_account: validation + error mapping ──────────────────────────
@@ -9080,6 +11003,9 @@ mod tests {
         std::fs::write(config_1.join(".csq-account"), "1").unwrap();
         std::fs::write(creds_dir.join("1.json"), "{}").unwrap();
 
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &base.to_string_lossy().into_owned(),
+        ));
         let result = move_account(base.to_string_lossy().into_owned(), 1, 4);
         assert!(result.is_ok(), "move must succeed: {result:?}");
         let summary = result.unwrap();
@@ -9100,6 +11026,9 @@ mod tests {
     fn move_account_rejects_same_slot() {
         let dir = tempfile::TempDir::new().unwrap();
         let base = dir.path();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &base.to_string_lossy().into_owned(),
+        ));
         let result = move_account(base.to_string_lossy().into_owned(), 2, 2);
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -9115,6 +11044,9 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let base = dir.path();
         std::fs::create_dir_all(base.join("credentials")).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &base.to_string_lossy().into_owned(),
+        ));
         let result = move_account(base.to_string_lossy().into_owned(), 5, 6);
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -9140,6 +11072,9 @@ mod tests {
             std::fs::write(creds_dir.join(format!("{n}.json")), "{}").unwrap();
         }
 
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &base.to_string_lossy().into_owned(),
+        ));
         let result = move_account(base.to_string_lossy().into_owned(), 1, 4);
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -9172,6 +11107,9 @@ mod tests {
         let base = dir.path();
 
         // Act: desktop move_account slot 1 → slot 5.
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &base.to_string_lossy().into_owned(),
+        ));
         let result = move_account(base.to_string_lossy().into_owned(), 1, 5);
 
         // Assert: move succeeds and by_slot_swapped = true (Phase 2 ran on desktop path).
@@ -9225,6 +11163,9 @@ mod tests {
         std::fs::write(handle_dir.join(".csq-account"), "3").unwrap();
 
         // Act: desktop move slot 3 → slot 7 (live binding present).
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &base.to_string_lossy().into_owned(),
+        ));
         let result = move_account(base.to_string_lossy().into_owned(), 3, 7);
 
         // Assert: succeeds (no SLOT_IN_USE) AND live_pids_bound carries
@@ -9254,7 +11195,10 @@ mod tests {
         let base = claude_home.join("accounts");
         std::fs::create_dir_all(&base).unwrap();
 
-        let result = get_account_usage(base.to_string_lossy().into_owned(), 4);
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &base.to_string_lossy().into_owned(),
+        ));
+        let result = get_account_usage_blocking(base.to_string_lossy().into_owned(), 4);
         assert!(result.is_ok(), "empty state must not error: {result:?}");
         let s = result.unwrap();
         assert_eq!(s.event_count, 0);
@@ -9315,6 +11259,7 @@ mod tests {
         let pairs = aggregate_usage_pairs(&base, now).unwrap();
 
         // Slot 4 sees the event with the real transcript model (deepseek).
+        let pairs = csq_core::usage::aggregator::SlimLedger::from_pairs(&pairs);
         let s4 = summarize_slot(&pairs, AccountNum::try_from(4u16).unwrap(), now);
         assert_eq!(s4.event_count, 1);
         assert_eq!(s4.total_input_tokens, 10000);
@@ -9377,12 +11322,347 @@ mod tests {
             )
             .unwrap();
             let pairs = aggregate_usage_pairs(&base, now).unwrap();
-            let summary = summarize_slot(&pairs, account, now);
+            let summary = summarize_slot(
+                &csq_core::usage::aggregator::SlimLedger::from_pairs(&pairs),
+                account,
+                now,
+            );
             assert_eq!(summary.event_count, 1);
             assert_eq!(summary.total_cost_usd, price);
             assert_eq!(summary.unestimated_cost_count, 0);
         }
         assert_eq!(std::fs::read(transcript).unwrap(), original_transcript);
+    }
+
+    /// The refresh path (`refresh_usage_pairs`) returns exactly what the full
+    /// `aggregate_usage_pairs` returns: on the first pass, on an unchanged
+    /// second pass (which must REUSE, not rescan), and after a transcript grows.
+    #[test]
+    fn refresh_usage_pairs_matches_full_aggregation_and_reuses_when_unchanged() {
+        use csq_core::usage::aggregator::PassKind;
+        let _env = csq_core::platform::test_env::lock();
+        let home = tempfile::TempDir::new().unwrap();
+        let claude_home = home.path().join(".claude");
+        let base = claude_home.join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-14T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let proj = claude_home.join("projects/-repo-r");
+        std::fs::create_dir_all(&proj).unwrap();
+        let line = |i: u32| {
+            serde_json::json!({
+                "type": "assistant", "cwd": "/repo/r",
+                "timestamp": format!("2026-09-14T11:{:02}:00Z", i),
+                "sessionId": format!("s{i}"), "requestId": format!("r{i}"),
+                "message": {"id": format!("m{i}"), "model": "claude-opus-4-8",
+                    "usage": {"input_tokens": 100 + i, "output_tokens": 5}}
+            })
+            .to_string()
+        };
+        let transcript = proj.join("t.jsonl");
+        std::fs::write(&transcript, format!("{}\n{}", line(1), line(2))).unwrap();
+        csq_core::usage::launch_log::append(
+            &base,
+            &csq_core::usage::launch_log::LaunchEvent {
+                ts: "2026-09-14T10:00:00Z".into(),
+                event: "run".into(),
+                slot: 4,
+                pid: 1,
+                project_path: "/repo/r".into(),
+            },
+        )
+        .unwrap();
+
+        let mut pc = UsageRefreshState::default();
+        let (p1, k1) = refresh_usage_pairs(&mut pc, &base, now).unwrap();
+        assert_eq!(k1, PassKind::Full);
+        let full1 = aggregate_usage_pairs(&base, now).unwrap();
+        assert_eq!(
+            *p1,
+            csq_core::usage::aggregator::SlimLedger::from_pairs(&full1)
+        );
+        let slot4 = AccountNum::try_from(4u16).unwrap();
+        assert_eq!(
+            p1.summarize_slot(slot4, now),
+            csq_core::usage::ledger::summarize(
+                &full1.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>(),
+                now
+            )
+        );
+        assert_eq!(p1.len(), 2);
+
+        let (p2, k2) = refresh_usage_pairs(&mut pc, &base, now).unwrap();
+        assert_eq!(k2, PassKind::Reused);
+        assert!(std::sync::Arc::ptr_eq(&p1, &p2), "reuse must not copy");
+
+        std::fs::write(
+            &transcript,
+            format!("{}\n{}\n{}", line(1), line(2), line(3)),
+        )
+        .unwrap();
+        let (p3, k3) = refresh_usage_pairs(&mut pc, &base, now).unwrap();
+        assert_eq!(k3, PassKind::Full);
+        assert_eq!(p3.len(), 3);
+        let full3 = aggregate_usage_pairs(&base, now).unwrap();
+        assert_eq!(
+            *p3,
+            csq_core::usage::aggregator::SlimLedger::from_pairs(&full3)
+        );
+    }
+
+    /// `USAGE_ERROR_RETRY`: a failed refresh is served (and so not retried)
+    /// strictly before 30 s, and is retried at and after 30 s; a good entry is
+    /// unaffected until `USAGE_CACHE_TTL`. Clock is injected as the age.
+    #[test]
+    fn usage_error_entry_retries_only_after_30s() {
+        use std::time::Duration;
+        let s = Duration::from_secs;
+        assert!(usage_entry_is_fresh(false, s(0)));
+        assert!(usage_entry_is_fresh(false, s(29)));
+        assert!(!usage_entry_is_fresh(false, s(30)), "retry at 30s");
+        assert!(!usage_entry_is_fresh(false, s(31)));
+        // Good entries keep the long TTL; 31s must NOT trigger a rescan.
+        assert!(usage_entry_is_fresh(true, s(31)));
+        assert!(usage_entry_is_fresh(true, s(299)));
+        assert!(!usage_entry_is_fresh(true, s(300)));
+    }
+
+    fn ledger_event(ts: &str, input: u64) -> csq_core::usage::ledger::UsageEvent {
+        csq_core::usage::ledger::UsageEvent {
+            ts: ts.into(),
+            session_id: "s".into(),
+            model: "m".into(),
+            input_tokens: input,
+            output_tokens: 1,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            cost_usd_estimate: Some(0.5),
+            source: csq_core::usage::ledger::UsageSource::ProjectsJsonl,
+            project_path: None,
+            snapshots_collapsed: 0,
+            finalization_divergent: false,
+            from_subagent: false,
+            unidentified: false,
+        }
+    }
+
+    fn counted_read(
+        calls: &std::cell::Cell<u32>,
+    ) -> impl Fn(
+        &std::path::Path,
+        AccountNum,
+    ) -> std::io::Result<Vec<csq_core::usage::ledger::UsageEvent>>
+           + '_ {
+        move |b, s| {
+            calls.set(calls.get() + 1);
+            csq_core::usage::ledger::read_all(b, s).map(|r| r.events)
+        }
+    }
+
+    fn served_len(o: &LedgerOutcome) -> usize {
+        match o {
+            LedgerOutcome::Served(l) => l.len(),
+            LedgerOutcome::Absent => panic!("absent"),
+            LedgerOutcome::Empty => panic!("empty"),
+            LedgerOutcome::Unreadable(e) => panic!("unreadable: {e}"),
+        }
+    }
+
+    /// Unchanged ledger: the second read is served WITHOUT re-parsing.
+    #[test]
+    fn ledger_cache_serves_unchanged_ledger_without_reparse() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let slot = AccountNum::try_from(5u16).unwrap();
+        csq_core::usage::ledger::write_all(
+            dir.path(),
+            slot,
+            &[ledger_event("2026-09-14T11:00:00Z", 10)],
+        )
+        .unwrap();
+        let cache = std::sync::Mutex::new(LedgerCache::default());
+        let calls = std::cell::Cell::new(0);
+        for _ in 0..3 {
+            let o = read_ledger_cached(&cache, dir.path(), slot, counted_read(&calls));
+            assert_eq!(served_len(&o), 1);
+        }
+        assert_eq!(calls.get(), 1, "parsed once, served twice from cache");
+    }
+
+    /// Appended ledger: length changes, so it is re-parsed and the new event
+    /// is visible.
+    #[test]
+    fn ledger_cache_reparses_appended_ledger() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let slot = AccountNum::try_from(5u16).unwrap();
+        csq_core::usage::ledger::write_all(
+            dir.path(),
+            slot,
+            &[ledger_event("2026-09-14T11:00:00Z", 10)],
+        )
+        .unwrap();
+        let cache = std::sync::Mutex::new(LedgerCache::default());
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            served_len(&read_ledger_cached(
+                &cache,
+                dir.path(),
+                slot,
+                counted_read(&calls)
+            )),
+            1
+        );
+        csq_core::usage::ledger::append(
+            dir.path(),
+            slot,
+            &ledger_event("2026-09-14T11:05:00Z", 20),
+        )
+        .unwrap();
+        let o = read_ledger_cached(&cache, dir.path(), slot, counted_read(&calls));
+        assert_eq!(served_len(&o), 2);
+        assert_eq!(calls.get(), 2);
+    }
+
+    /// Unreadable ledger: surfaced as Unreadable, and the previously cached
+    /// parse is NOT served for it. Absent and empty stay misses and also evict.
+    #[cfg(unix)]
+    #[test]
+    fn ledger_cache_surfaces_unreadable_and_never_serves_stale() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let slot = AccountNum::try_from(5u16).unwrap();
+        let path = csq_core::usage::ledger::ledger_path(dir.path(), slot);
+        csq_core::usage::ledger::write_all(
+            dir.path(),
+            slot,
+            &[ledger_event("2026-09-14T11:00:00Z", 10)],
+        )
+        .unwrap();
+        let cache = std::sync::Mutex::new(LedgerCache::default());
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            served_len(&read_ledger_cached(
+                &cache,
+                dir.path(),
+                slot,
+                counted_read(&calls)
+            )),
+            1
+        );
+        // Make the SAME (len, mtime) file unreadable: neither changes, so a
+        // stat-keyed cache would keep serving the stale parse.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let before = calls.get();
+        let o = read_ledger_cached(&cache, dir.path(), slot, counted_read(&calls));
+        assert_eq!(calls.get(), before, "unreadable is caught before any parse");
+        assert!(
+            matches!(o, LedgerOutcome::Unreadable(_)),
+            "unreadable must be surfaced, not served from cache"
+        );
+        assert!(cache.lock().unwrap().by_slot.is_empty(), "entry evicted");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// A different file with the same length and the SAME mtime, moved into
+    /// place by rename (a new inode), must miss. Times are set explicitly.
+    #[cfg(unix)]
+    #[test]
+    fn ledger_cache_misses_on_same_len_same_mtime_replacement() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let other = tempfile::TempDir::new().unwrap();
+        let slot = AccountNum::try_from(5u16).unwrap();
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let set_mtime = |p: &std::path::Path| {
+            let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+            f.set_modified(t).unwrap();
+        };
+        let path = csq_core::usage::ledger::ledger_path(dir.path(), slot);
+        csq_core::usage::ledger::write_all(
+            dir.path(),
+            slot,
+            &[ledger_event("2026-09-14T11:00:00Z", 10)],
+        )
+        .unwrap();
+        set_mtime(&path);
+        let cache = std::sync::Mutex::new(LedgerCache::default());
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            served_len(&read_ledger_cached(
+                &cache,
+                dir.path(),
+                slot,
+                counted_read(&calls)
+            )),
+            1
+        );
+        let staged = csq_core::usage::ledger::ledger_path(other.path(), slot);
+        csq_core::usage::ledger::write_all(
+            other.path(),
+            slot,
+            &[ledger_event("2026-09-14T11:00:00Z", 11)],
+        )
+        .unwrap();
+        set_mtime(&staged);
+        assert_eq!(
+            std::fs::metadata(&staged).unwrap().len(),
+            std::fs::metadata(&path).unwrap().len(),
+            "fixture: same length"
+        );
+        std::fs::rename(&staged, &path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            t,
+            "fixture: same mtime"
+        );
+        assert_eq!(
+            served_len(&read_ledger_cached(
+                &cache,
+                dir.path(),
+                slot,
+                counted_read(&calls)
+            )),
+            1
+        );
+        assert_eq!(
+            calls.get(),
+            2,
+            "replacement must re-parse, not serve the old occupant"
+        );
+    }
+
+    /// Absent and empty stay misses (as before) and evict the slot's entry.
+    #[test]
+    fn ledger_cache_absent_and_empty_are_misses_and_evict() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let slot = AccountNum::try_from(5u16).unwrap();
+        let cache = std::sync::Mutex::new(LedgerCache::default());
+        let calls = std::cell::Cell::new(0);
+        assert!(matches!(
+            read_ledger_cached(&cache, dir.path(), slot, counted_read(&calls)),
+            LedgerOutcome::Absent
+        ));
+        assert_eq!(calls.get(), 0, "absent is not parsed");
+        csq_core::usage::ledger::write_all(
+            dir.path(),
+            slot,
+            &[ledger_event("2026-09-14T11:00:00Z", 10)],
+        )
+        .unwrap();
+        assert_eq!(
+            served_len(&read_ledger_cached(
+                &cache,
+                dir.path(),
+                slot,
+                counted_read(&calls)
+            )),
+            1
+        );
+        csq_core::usage::ledger::write_all(dir.path(), slot, &[]).unwrap();
+        assert!(matches!(
+            read_ledger_cached(&cache, dir.path(), slot, counted_read(&calls)),
+            LedgerOutcome::Empty
+        ));
+        assert!(cache.lock().unwrap().by_slot.is_empty());
     }
 
     #[test]
@@ -9392,7 +11672,12 @@ mod tests {
         let base = home.path().join(".claude/accounts");
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("model-rates.json"), "{").unwrap();
-        let error = get_account_usage(base.to_string_lossy().into_owned(), 11).unwrap_err();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set_locked(
+            &_env,
+            std::path::Path::new(&base.to_string_lossy().into_owned()),
+        );
+        let error =
+            get_account_usage_blocking(base.to_string_lossy().into_owned(), 11).unwrap_err();
         assert!(error.starts_with("MODEL_MANIFEST:"), "{error}");
         assert!(aggregate_usage_pairs(&base, chrono::Utc::now()).is_err());
     }
@@ -9401,21 +11686,45 @@ mod tests {
     /// (from cache — empty on first call) and never errors on a fresh base.
     /// The ~20s transcript scan happens on a background thread, so the first
     /// call must NOT block on it.
+    ///
+    /// Proven structurally, not by a speed bound: the test holds the scan's own
+    /// state mutex (`USAGE_REFRESH_STATE`, which the refresh thread must take
+    /// before it scans), so a scan on the call path can never finish. The call
+    /// runs on a worker thread and the test waits on a channel for it: a command
+    /// that waited on the scan never sends and fails at `HANG_GUARD`. A
+    /// wall-clock bound failed at 3.2s under load (the old `elapsed < 2s` also
+    /// counted time waiting on the shared env lock held by sibling tests). The
+    /// env guard is taken BEFORE the state mutex so no sibling can hold the env
+    /// lock while waiting on a state mutex this test holds.
     #[test]
     fn get_account_usage_command_returns_immediately() {
+        // A hang is unbounded while the scan is blocked; load only stretches a
+        // sub-millisecond call, so this is a hang detector, not a speed bound.
+        const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
         let home_dir = tempfile::TempDir::new().unwrap();
         let base = home_dir.path().join(".claude").join("accounts");
         std::fs::create_dir_all(&base).unwrap();
+        let base_str = base.to_string_lossy().into_owned();
 
-        let t0 = std::time::Instant::now();
-        let result = get_account_usage(base.to_string_lossy().into_owned(), 4);
-        let elapsed = t0.elapsed();
-        assert!(result.is_ok(), "command must not error: {result:?}");
-        // Well under any real scan time — proves the scan is off the call path.
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "command should return immediately, took {elapsed:?}"
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&base_str));
+        let scan_blocked = USAGE_REFRESH_STATE
+            .get_or_init(|| std::sync::Mutex::new(Default::default()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(get_account_usage_blocking(base_str, 4));
+        });
+        let received = rx.recv_timeout(HANG_GUARD);
+        // Release the scan before asserting so a failure cannot strand the
+        // background refresh thread (or the worker) behind this test's lock.
+        drop(scan_blocked);
+        let result = received.expect(
+            "get_account_usage must not wait on the transcript scan: no return while the scan is blocked",
         );
+        worker.join().unwrap();
+        assert!(result.is_ok(), "command must not error: {result:?}");
     }
 
     /// Ledger-first (an internal ticket): when the daemon has published a slot's ledger,
@@ -9456,14 +11765,17 @@ mod tests {
 
         // The command surfaces the ledger's numbers → it read the published
         // ledger, not the (empty) live scan.
-        let s = get_account_usage(base.to_string_lossy().into_owned(), 6).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &base.to_string_lossy().into_owned(),
+        ));
+        let s = get_account_usage_blocking(base.to_string_lossy().into_owned(), 6).unwrap();
         assert_eq!(s.event_count, 1);
         assert_eq!(s.total_input_tokens, 12_345);
         assert_eq!(s.total_output_tokens, 6_789);
         assert!((s.total_cost_usd - 0.05).abs() < 1e-9);
 
         // A sibling slot with no published ledger falls back to the empty scan.
-        let other = get_account_usage(base.to_string_lossy().into_owned(), 7).unwrap();
+        let other = get_account_usage_blocking(base.to_string_lossy().into_owned(), 7).unwrap();
         assert_eq!(other.event_count, 0);
     }
 
@@ -9483,7 +11795,10 @@ mod tests {
         csq_core::usage::ledger::write_all(&base, slot, &[]).unwrap();
         assert!(csq_core::usage::ledger::ledger_path(&base, slot).exists());
 
-        let s = get_account_usage(base.to_string_lossy().into_owned(), 5).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &base.to_string_lossy().into_owned(),
+        ));
+        let s = get_account_usage_blocking(base.to_string_lossy().into_owned(), 5).unwrap();
         assert_eq!(s.event_count, 0);
         assert_eq!(s.total_input_tokens, 0);
     }
@@ -9578,6 +11893,9 @@ mod tests {
     fn move_account_rejects_invalid_account_num() {
         let dir = tempfile::TempDir::new().unwrap();
         let base = dir.path();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &base.to_string_lossy().into_owned(),
+        ));
         let result = move_account(base.to_string_lossy().into_owned(), 0, 4);
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -9662,6 +11980,10 @@ mod tests {
             .expect("vault must contain the provisioned key");
 
         // Drive the desktop's remove path against the same base_dir.
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set_locked(
+            &_env_guard,
+            std::path::Path::new(&base.to_string_lossy().into_owned()),
+        );
         let result = remove_account_blocking(base.to_string_lossy().into_owned(), 99);
         assert!(result.is_ok(), "remove_account must succeed: {result:?}");
 
@@ -9740,6 +12062,9 @@ mod tests {
         .unwrap();
 
         // Confirm the happy path works.
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
         set_slot_model_write(
             dir.path().to_string_lossy().into_owned(),
             7,
@@ -9768,6 +12093,8 @@ mod tests {
         let base = dir.path().to_string_lossy().into_owned();
 
         // Defaults on a fresh dir.
+        let _base_env =
+            test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&base.clone()));
         let initial = get_capability_layer_toggles(base.clone()).unwrap();
         assert!(!initial.disable_capability_layer);
         assert!(!initial.disable_scaffold);
@@ -9804,7 +12131,10 @@ mod tests {
     /// `rules/tauri-commands.md` § Argument Validation.
     #[test]
     fn capability_layer_toggles_rejects_missing_base_dir() {
-        let bogus = "/nonexistent/path/that/should/never/exist".to_string();
+        // Drive-prefixed on Windows: a drive-less override is not absolute there.
+        let bogus = abs_test_path("/nonexistent/path/that/should/never/exist");
+        let _base_env =
+            test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(&bogus.clone()));
         let r = get_capability_layer_toggles(bogus.clone());
         assert!(r.is_err(), "must reject a missing base dir");
         let e = r.unwrap_err();
@@ -9859,7 +12189,10 @@ mod tests {
         write_balance_quota_file(dir.path(), 5, "USD", 196.42);
 
         // Act
-        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
+        let views = get_accounts_blocking(dir.path().to_string_lossy().into_owned()).unwrap();
         let v = views
             .iter()
             .find(|v| v.id == 5)
@@ -9883,7 +12216,10 @@ mod tests {
         write_balance_quota_file(dir.path(), 6, "CNY", 1400.50);
 
         // Act
-        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
+        let views = get_accounts_blocking(dir.path().to_string_lossy().into_owned()).unwrap();
         let v = views
             .iter()
             .find(|v| v.id == 6)
@@ -9907,7 +12243,10 @@ mod tests {
         write_quota_file(dir.path(), &[(7, "codex", 25.0, 50.0)]);
 
         // Act
-        let views = get_accounts(dir.path().to_string_lossy().into_owned()).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(std::path::Path::new(
+            &dir.path().to_string_lossy().into_owned(),
+        ));
+        let views = get_accounts_blocking(dir.path().to_string_lossy().into_owned()).unwrap();
         let v = views
             .iter()
             .find(|v| v.id == 7)
@@ -10060,5 +12399,203 @@ mod consume_prefs_recovery_tests {
         // return the descriptive error string without panicking.
         let result = consume_prefs_recovery_from(&recovery);
         assert!(matches!(result, Err(ref msg) if msg.contains("poisoned")));
+    }
+}
+
+/// Diagnostic-surface parity for the keychain orphan sweep: `csq status`,
+/// `csq doctor` and the desktop obtain the counts through the ONE accessor
+/// `orphans::read_diagnostic` and render the same `summary`.
+#[cfg(all(test, feature = "cli"))]
+mod orphan_parity_tests {
+    use super::daemon_status_view;
+    use csq_core::credentials::keychain::orphans::{
+        read_diagnostic, write_status, DiagnosticLevel, OrphanSweepStatus, ProcessTableUnknown,
+        UndeterminedReason, ORPHAN_NEEDS_ACTION_SECS,
+    };
+
+    /// A sweep whose process scan could not rule a gone terminal out for `age` seconds.
+    fn unknown_table(cause: ProcessTableUnknown, age: u64) -> OrphanSweepStatus {
+        OrphanSweepStatus {
+            checked_at_unix_secs: 100_000,
+            keychain_items: 5,
+            orphan_candidates: 2,
+            kept_process_table_unknown: 2,
+            process_table_unknown: Some(cause),
+            process_table_unknown_since_unix_secs: Some(100_000 - age),
+            ..Default::default()
+        }
+    }
+
+    fn states() -> Vec<OrphanSweepStatus> {
+        vec![
+            OrphanSweepStatus {
+                keychain_items: 7,
+                foreign_items: 3,
+                ..Default::default()
+            },
+            OrphanSweepStatus {
+                keychain_items: 9,
+                orphan_candidates: 4,
+                pending: 3,
+                deleted_total: 1,
+                kept_sole_copy: 2,
+                kept_siblings: 5,
+                kept_revived_after_read: 6,
+                kept_mint_busy: 7,
+                kept_process_table_unknown: 10,
+                process_table_unknown: Some(ProcessTableUnknown::ProcessUnreadable),
+                process_table_unknown_since_unix_secs: Some(0),
+                kept_other: 8,
+                dir_reappeared: 1,
+                already_gone: 2,
+                ..Default::default()
+            },
+            // Every cause of an unknown table, and one that has aged into "needs action".
+            unknown_table(ProcessTableUnknown::TableUnreadable, 0),
+            unknown_table(ProcessTableUnknown::LineageBroken, 0),
+            unknown_table(ProcessTableUnknown::ScanIncomplete, 0),
+            unknown_table(ProcessTableUnknown::LineageBroken, ORPHAN_NEEDS_ACTION_SECS),
+            OrphanSweepStatus {
+                checked_at_unix_secs: 100_000,
+                keychain_items: 4,
+                orphan_candidates: 2,
+                undetermined: Some(UndeterminedReason::EnumerationUnavailable),
+                counts_stale: true,
+                undetermined_since_unix_secs: Some(100_000 - ORPHAN_NEEDS_ACTION_SECS),
+                ..Default::default()
+            },
+        ]
+    }
+
+    /// For every published state the three surfaces carry the accessor's
+    /// summary and level. RED against any surface that words or reads the
+    /// counts itself.
+    #[test]
+    fn status_doctor_and_desktop_show_the_same_counts() {
+        for status in states() {
+            let base = tempfile::tempdir().unwrap();
+            write_status(base.path(), &status);
+            let diag = read_diagnostic(base.path());
+            let view = diag.view().expect("published");
+
+            let desktop = daemon_status_view(base.path())
+                .keychain_orphans
+                .expect("desktop");
+            assert_eq!(desktop, view, "desktop view");
+
+            let status_line = crate::cli::commands::status::keychain_orphans_text(&view);
+            assert!(status_line.ends_with(&view.summary), "{status_line}");
+
+            let doctor_line =
+                crate::cli::commands::doctor::keychain_orphans_line(&diag).expect("doctor");
+            assert!(doctor_line.ends_with(&view.summary), "{doctor_line}");
+            // The level shows on every surface the way that surface spells it: doctor's glyph
+            // and status's tag follow the one level the accessor computed.
+            let glyph = crate::cli::commands::doctor::keychain_orphans_glyph(view.level);
+            assert!(
+                doctor_line.starts_with(&format!("Keychain orphans: {glyph} ")),
+                "{doctor_line}"
+            );
+            let tag = match view.level {
+                DiagnosticLevel::Ok => "ok",
+                DiagnosticLevel::Info => "info",
+                DiagnosticLevel::Warn => "warn",
+                DiagnosticLevel::NeedsAction => "NEEDS ACTION",
+            };
+            assert!(
+                status_line.starts_with(&format!("Keychain orphans [{tag}]: ")),
+                "{status_line}"
+            );
+
+            // A state that keeps items because the process table could not be read whole
+            // says WHY on every surface (the shared summary), so the operator can act.
+            if let Some(cause) = status.process_table_unknown {
+                for text in [&desktop.summary, &status_line, &doctor_line] {
+                    assert!(text.contains(cause.describe()), "{text}");
+                }
+                // The level ages the same way on every surface: warn, then needs action.
+                let aged = status
+                    .process_table_unknown_since_unix_secs
+                    .is_some_and(|since| {
+                        status.checked_at_unix_secs - since >= ORPHAN_NEEDS_ACTION_SECS
+                    });
+                assert_eq!(
+                    desktop.level,
+                    if aged {
+                        DiagnosticLevel::NeedsAction
+                    } else {
+                        DiagnosticLevel::Warn
+                    },
+                    "{}",
+                    desktop.summary
+                );
+                // An aged state tells the operator what to do, on every surface.
+                if aged {
+                    for text in [&desktop.summary, &status_line, &doctor_line] {
+                        assert!(
+                            text.contains(&format!("To resume: {}", cause.remedy())),
+                            "{text}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A damaged status file is the same explicit error on all three.
+    #[test]
+    fn a_corrupt_status_file_is_the_same_error_on_all_three_surfaces() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::write(base.path().join("keychain-orphan-sweep.json"), b"{").unwrap();
+        let diag = read_diagnostic(base.path());
+        let view = diag.view().unwrap();
+        assert_eq!(view.error, Some("corrupt"));
+        assert_eq!(
+            daemon_status_view(base.path()).keychain_orphans,
+            Some(view.clone())
+        );
+        assert!(crate::cli::commands::status::keychain_orphans_text(&view).contains("corrupt"));
+        assert!(crate::cli::commands::doctor::keychain_orphans_line(&diag)
+            .unwrap()
+            .contains("corrupt"));
+    }
+
+    /// Nothing published: none of the three invents a row.
+    #[test]
+    fn nothing_published_shows_nothing_on_all_three_surfaces() {
+        let base = tempfile::tempdir().unwrap();
+        let diag = read_diagnostic(base.path());
+        assert!(diag.view().is_none());
+        assert!(daemon_status_view(base.path()).keychain_orphans.is_none());
+        assert!(crate::cli::commands::doctor::keychain_orphans_line(&diag).is_none());
+    }
+
+    /// Structural guard: none of the three surfaces reads the status file
+    /// itself; each goes through `read_diagnostic`. RED if a surface calls
+    /// `orphans::read_status` (a private reading that could word its own
+    /// counts).
+    #[test]
+    fn no_surface_reads_the_status_file_except_through_the_accessor() {
+        let surfaces = [
+            ("doctor", include_str!("../../cli/commands/doctor.rs")),
+            ("status", include_str!("../../cli/commands/status.rs")),
+            ("desktop", include_str!("mod.rs")),
+        ];
+        for (name, src) in surfaces {
+            // Everything before this very test module (so its own strings do
+            // not count); earlier test modules never touch the status file.
+            let prod = src
+                .split("/// Diagnostic-surface parity for the keychain orphan sweep")
+                .next()
+                .unwrap_or(src);
+            assert!(
+                prod.contains("orphans::read_diagnostic("),
+                "{name} must read the sweep through read_diagnostic"
+            );
+            assert!(
+                !prod.contains("orphans::read_status("),
+                "{name} must not read the status file directly"
+            );
+        }
     }
 }

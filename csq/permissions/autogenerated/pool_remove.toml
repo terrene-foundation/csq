@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pool-remove"
+description = "Enables the pool_remove command without any pre-configured scope."
+commands.allow = ["pool_remove"]
+
+[[permission]]
+identifier = "deny-pool-remove"
+description = "Denies the pool_remove command without any pre-configured scope."
+commands.deny = ["pool_remove"]

@@ -266,6 +266,11 @@ enum Command {
     /// Show the statusline string (reads CC JSON from stdin)
     Statusline,
 
+    /// Stdio MCP server for cross-CLI session messaging (spec 32 §4.2). Started by
+    /// Claude Code or Codex as a child of the session; not meant to be run by hand.
+    #[command(name = "mcp-messaging", hide = true)]
+    McpMessaging,
+
     /// Run a single non-interactive completion and print one JSON envelope
     /// (`csq.exec.v1`). Spawn-captures `claude --print --output-format json` for a
     /// Claude slot, normalizes the result, and re-emits it. Every outcome — success
@@ -490,6 +495,18 @@ enum Command {
         provider: String,
     },
 
+    /// Read-only diagnostics for an existing private gate pin
+    Gate {
+        #[command(subcommand)]
+        action: GateCmd,
+    },
+
+    /// Configure an account-independent API-key pool
+    Pool {
+        #[command(subcommand)]
+        action: commands::pool::PoolCommand,
+    },
+
     /// Model catalog operations
     Models {
         #[command(subcommand)]
@@ -543,6 +560,20 @@ enum Command {
         /// a JS runtime (Node/Bun) for the Cloudflare-safe transport. Read-only.
         #[arg(long, conflicts_with = "slot")]
         check_token_owners: bool,
+
+        /// Exact repository to diagnose against an existing private gate pin.
+        #[arg(long, requires = "gate_pin", conflicts_with_all = ["slot", "repair_identities", "check_token_owners"])]
+        gate_repo: Option<std::path::PathBuf>,
+
+        /// Existing private gate pin; diagnosis does not capture or repair it.
+        #[arg(long, requires = "gate_repo", conflicts_with_all = ["slot", "repair_identities", "check_token_owners"])]
+        gate_pin: Option<std::path::PathBuf>,
+
+        /// Acknowledge a Codex slot flagged `raced`: after re-checking that slot's hook
+        /// approvals in Codex, clears the sticky flag and removes the leftover config tmp
+        /// files a crashed or raced update kept. No csq update ever clears it by itself.
+        #[arg(long, value_name = "N", conflicts_with_all = ["slot", "repair_identities", "check_token_owners", "gate_repo", "gate_pin"])]
+        ack_raced: Option<u16>,
     },
 
     /// Live-wire `(provider × auth-mode)` contract verification per
@@ -799,6 +830,9 @@ enum CliCommand {
 /// (`csq-core::session::shared_state`).
 #[derive(Subcommand, Debug)]
 enum SessionsCommand {
+    /// Inspect stored session lifecycle evidence. All scratch decisions remain KEEP.
+    /// `--json` emits `csq.session-disk.v1`; this command never retires directories.
+    DiskReport,
     /// Migrate a surface's conversation history (rollout transcripts, the
     /// `resume` index) out of each slot's isolated vendor home into a
     /// single store shared across every slot bound to that surface, so
@@ -822,6 +856,124 @@ enum SessionsCommand {
         /// corrupt an in-flight rollout file.
         #[arg(long)]
         force: bool,
+    },
+    /// List the live Claude Code sessions on this host. Each session is
+    /// identified by its process id AND its start time (process ids are
+    /// reused). `--json` emits `csq.sessions.v1`; `--repo`/`--here` filter the rows.
+    List {
+        /// Only sessions in this repo (repeatable). Matches the `repo` column.
+        #[arg(long = "repo")]
+        repos: Vec<String>,
+        /// Only sessions in the repo of the current working directory.
+        #[arg(long)]
+        here: bool,
+    },
+    /// Queue one directive (a `csq.directive.v1` JSON object on stdin) for a
+    /// live session on this host. csq validates the target and enforces at
+    /// most one queued directive per issuer per session per hour; it never
+    /// executes the directive. Always emits `csq.directive_receipt.v1`.
+    Deliver,
+    /// Print directive receipts whose last transition is at or after
+    /// `--since` (unix seconds). Always emits `csq.directive_receipts.v1`.
+    Receipts {
+        /// Only receipts whose last transition is at or after this time.
+        /// Parsed by the handler, so a bad value is an `invalid_input`
+        /// envelope. A value that starts with `-` (or a missing one) is a
+        /// parse error, which `run()` also renders as an envelope.
+        #[arg(long)]
+        since: Option<String>,
+        /// Only this directive id.
+        #[arg(long)]
+        id: Option<String>,
+    },
+    /// Record this session's response to a directive. Always emits
+    /// `csq.directive_receipt.v1`.
+    Ack {
+        /// The directive id. A missing id is an `invalid_input` envelope,
+        /// not a clap usage error.
+        id: Option<String>,
+        /// What the session did about it: done, declined or deferred
+        /// (validated by the directive store, so a bad or missing value is
+        /// an `invalid_input` envelope).
+        #[arg(long, default_value = "")]
+        outcome: String,
+        /// A short note for the issuer (500 characters at most).
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Show directives addressed to the CALLING session (resolved from its
+    /// own `CLAUDE_CONFIG_DIR`). Always emits `csq.directive_inbox.v1`.
+    Inbox {
+        /// Only directives not yet acknowledged or expired.
+        #[arg(long)]
+        pending: bool,
+        /// Record each returned queued directive (or, with `--messages`, message) as
+        /// shown to the session.
+        #[arg(long)]
+        mark_surfaced: bool,
+        /// Show cross-CLI messages addressed to the calling session instead of
+        /// directives. Always emits `csq.message_inbox.v1`.
+        #[arg(long)]
+        messages: bool,
+        /// With `--messages`: include bodies already shown by a hook or earlier inbox.
+        #[arg(long, requires = "messages", conflicts_with = "hook")]
+        include_surfaced: bool,
+        /// With `--messages`: record each returned message's body as fetched.
+        #[arg(long, requires = "messages", conflicts_with = "mark_surfaced")]
+        mark_read: bool,
+        /// With `--messages`: print Claude Code hook JSON for this event
+        /// (`UserPromptSubmit`, `PostToolUse` or `Stop`) when messages are queued,
+        /// nothing otherwise, and exit 0 on every error.
+        #[arg(long, requires = "messages", conflicts_with_all = ["mark_surfaced", "mark_read", "pending"])]
+        hook: Option<String>,
+    },
+    /// Give the calling session a name other sessions can `send` to (1-48 characters
+    /// from A-Z a-z 0-9 . _ -, starting with a letter or digit). It always names the
+    /// session this command runs inside; there is no way to name another session.
+    Name {
+        /// The name to set.
+        #[arg(required_unless_present = "clear")]
+        name: Option<String>,
+        /// Remove the calling session's own name (the default name applies again).
+        #[arg(long, conflicts_with = "name")]
+        clear: bool,
+    },
+    /// Send a message to a live Claude Code or Codex session. The sender is always the
+    /// session this command runs inside; it cannot be chosen. Always emits
+    /// `csq.message_receipt.v1`.
+    Send {
+        /// The recipient: `<pid>:<started_at>` from `csq sessions list`, or the session's
+        /// name. A name that matches two live sessions is refused, never guessed.
+        target: String,
+        /// The message text; `-` reads it from stdin.
+        #[arg(long)]
+        message: String,
+        /// The id of a message addressed to this session that this one answers.
+        #[arg(long)]
+        reply_to: Option<String>,
+        /// Retry the same logical send with this client request token.
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        /// Store the message without waking a Claude Code recipient (progress notes, acks,
+        /// FYIs); it surfaces on that session's next natural turn. Receipt delivery:
+        /// `stored_no_wake`. A Codex recipient has no per-turn hook, so it is woken anyway and
+        /// the receipt carries `wake_override: codex_no_turn_hook`.
+        #[arg(long = "no-wake", action = clap::ArgAction::SetFalse)]
+        wake: bool,
+    },
+    /// Recover the calling session's receipt for a request token.
+    LookupMessage {
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Acknowledge a message addressed to the calling session. Always emits
+    /// `csq.message_receipt.v1`.
+    AckMessage {
+        /// The message id.
+        id: String,
+        /// One-line note for the sender (at most 500 characters).
+        #[arg(long)]
+        note: Option<String>,
     },
 }
 
@@ -1689,6 +1841,20 @@ enum SetkeyCmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum GateCmd {
+    /// Explicitly bind a reviewed registry digest to private operator state.
+    Pin(commands::gate_pin::GatePinArgs),
+    /// Verify the pin and every declared row; activation evidence is separate.
+    Status(commands::gate_status::GateStatusArgs),
+    /// Execute one authenticated hook event from bounded stdin.
+    Dispatch(commands::gate_dispatch::GateDispatchArgs),
+    /// Explicitly opt one repository into composed Gate launch settings.
+    Enable(commands::gate_launch::GateEnableArgs),
+    /// Remove one repository's explicit Gate opt-in.
+    Disable(commands::gate_launch::GateDisableArgs),
+}
+
+#[derive(Subcommand, Debug)]
 enum ModelsCmd {
     /// Inspect, validate or replace model metadata and historical prices without rebuilding
     Manifest {
@@ -1840,8 +2006,116 @@ fn ceiling_mode_for(command: &Command) -> CeilingMode {
     }
 }
 
+/// The event of a `csq sessions inbox --messages --hook <event>` invocation, else `None`.
+fn messaging_hook_event(command: &Option<Command>) -> Option<String> {
+    match command {
+        Some(Command::Sessions {
+            command:
+                SessionsCommand::Inbox {
+                    messages: true,
+                    hook: Some(event),
+                    ..
+                },
+        }) => Some(event.clone()),
+        _ => None,
+    }
+}
+
+/// Run the messaging hook so that NOTHING can make it fail: resolving the base dir, the hook
+/// body and a panic in either all end as exit code 0 with no output of this function's own.
+/// The hook body prints its JSON itself, only on success; every failure here prints
+/// nothing, because a hook that exits non-zero or prints garbage can break the user's turn
+/// and a missed notice is recoverable (the message stays queued).
+fn run_messaging_hook_failopen(
+    base_dir: impl FnOnce() -> Result<std::path::PathBuf>,
+    hook: impl FnOnce(&std::path::Path) -> Result<()>,
+) -> i32 {
+    use std::io::Write;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = base_dir().and_then(|b| hook(&b));
+    }));
+    drop(outcome);
+    let _ = std::io::stdout().flush();
+    0
+}
+
+fn is_read_only_gate_diagnostic(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Gate {
+            action: GateCmd::Pin(_) | GateCmd::Status(_),
+        } | Command::Doctor {
+            gate_repo: Some(_),
+            gate_pin: Some(_),
+            ..
+        }
+    )
+}
+
+fn is_gate_dispatch(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Gate {
+            action: GateCmd::Dispatch(_),
+        }
+    )
+}
+
+// Recognize only the direct protocol subcommand, including the two global
+// boolean flags. Never scan arbitrary command values for a hook-looking phrase.
+fn gate_dispatch_parse_error(args: &[String]) -> bool {
+    let mut command = args
+        .iter()
+        .skip(1)
+        .filter(|arg| !matches!(arg.as_str(), "--json" | "--trace"));
+    command.next().is_some_and(|arg| arg == "gate")
+        && command.next().is_some_and(|arg| arg == "dispatch")
+}
+
 pub fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            // Help and version requests are not errors; they print as usual.
+            use clap::error::ErrorKind;
+            let is_request = matches!(
+                e.kind(),
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayVersion
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            );
+            let args: Vec<String> = std::env::args_os()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            if !is_request && gate_dispatch_parse_error(&args) {
+                std::process::exit(commands::gate_dispatch::emit_parse_refusal()?);
+            }
+            use commands::sessions_messages::{parse_error_action, ParseErrorAction};
+            match (is_request, parse_error_action(&args)) {
+                // a hook must never break the session: nothing printed, exit 0
+                (false, ParseErrorAction::HookSilent) => std::process::exit(0),
+                (false, ParseErrorAction::Envelope(schema)) => {
+                    std::process::exit(commands::sessions_directives::emit_parse_error(schema)?)
+                }
+                _ => match commands::sessions_directives::parse_error_schema(&args) {
+                    Some(schema) if !is_request => {
+                        std::process::exit(commands::sessions_directives::emit_parse_error(schema)?)
+                    }
+                    _ => e.exit(),
+                },
+            }
+        }
+    };
+
+    // `sessions inbox --messages --hook <event>` runs INSIDE a Claude Code hook and must exit
+    // 0 with nothing on stdout on every path (spec 32 §5.2, INV-32-06). It therefore runs
+    // before `base_dir()?` and tracing setup, whose errors would otherwise reach `main` as
+    // `Err` and exit 1. The same early exit keeps it off the update-check thread below.
+    if let Some(event) = messaging_hook_event(&cli.command) {
+        std::process::exit(run_messaging_hook_failopen(commands::base_dir, |base| {
+            commands::sessions_messages::hook(base, &event)
+        }));
+    }
 
     // No subcommand: default to `run` (optionally with positional account)
     let command = cli.command.unwrap_or(Command::Run {
@@ -1866,6 +2140,16 @@ pub fn run() -> Result<()> {
         bench_json: false,
         rest: cli.rest,
     });
+
+    // Gate dispatch is a vendor hook protocol, not an ordinary CLI flow. Route
+    // it before base-dir discovery, tracing, update checks, or any other global
+    // startup work can write chatter or delay the bounded stdin decision.
+    if let Command::Gate {
+        action: GateCmd::Dispatch(args),
+    } = &command
+    {
+        std::process::exit(commands::gate_dispatch::handle(args)?);
+    }
 
     let json = cli.json;
     let base_dir = commands::base_dir()?;
@@ -1950,6 +2234,19 @@ pub fn run() -> Result<()> {
         // surface on every other command (`run`, `swap`, `login`, …) and via
         // the desktop app's own periodic check.
         Command::Statusline => {}
+        // `mcp-messaging` is a long-lived stdio server started once per terminal: an
+        // update-check thread (and its possible notice) on every start is the same
+        // problem, and nothing but JSON-RPC may reach its stdout.
+        Command::McpMessaging => {}
+        Command::Sessions {
+            command: SessionsCommand::DiskReport,
+        } => {}
+        // These diagnostics promise a read-only snapshot. The generic community
+        // update check can write its cache and make HTTP requests before dispatch.
+        _ if is_read_only_gate_diagnostic(&command) => {}
+        // Hook dispatch is a direct stdin/stdout protocol. Do not start update
+        // threads or emit their notices before the hook decision is parsed.
+        _ if is_gate_dispatch(&command) => {}
         // Edition independence (rules/independence.md): the background notice
         // reads the COMMUNITY latest.json and nudges toward `csq update install`
         // — itself disabled in enterprise. An enterprise binary must not query
@@ -2032,6 +2329,7 @@ pub fn run() -> Result<()> {
         Command::Status => commands::status::handle(&base_dir, json),
         Command::Suggest => commands::suggest::handle(&base_dir),
         Command::Statusline => commands::statusline::handle(&base_dir),
+        Command::McpMessaging => commands::mcp_messaging::run(&base_dir),
         Command::Exec {
             prompt,
             stdin,
@@ -2233,6 +2531,7 @@ pub fn run() -> Result<()> {
         }
         Command::Listkeys => commands::listkeys::handle(&base_dir, json),
         Command::Rmkey { provider } => commands::rmkey::handle(&base_dir, &provider),
+        Command::Pool { action } => commands::pool::handle(&base_dir, action, json),
         Command::Models { action } => {
             let action = action.unwrap_or(ModelsCmd::List {
                 provider: "all".to_string(),
@@ -2277,11 +2576,67 @@ pub fn run() -> Result<()> {
             }
         }
         Command::Install => commands::install::handle(),
+        Command::Gate { action } => {
+            let code = match action {
+                GateCmd::Pin(args) => commands::gate_pin::handle(&args, json)?,
+                GateCmd::Status(args) => commands::gate_status::handle(&args, json)?,
+                GateCmd::Dispatch(args) => commands::gate_dispatch::handle(&args)?,
+                GateCmd::Enable(args) => {
+                    commands::gate_launch::handle_enable(&base_dir, &args, json)?
+                }
+                GateCmd::Disable(args) => {
+                    commands::gate_launch::handle_disable(&base_dir, &args, json)?
+                }
+            };
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         Command::Doctor {
             slot,
             repair_identities,
             check_token_owners,
-        } => commands::doctor::handle(&base_dir, json, slot, repair_identities, check_token_owners),
+            gate_repo,
+            gate_pin,
+            ack_raced,
+        } => {
+            if let Some(n) = ack_raced {
+                return commands::doctor::handle_ack_raced(&base_dir, n, json);
+            }
+            let gate = match (gate_repo.as_deref(), gate_pin.as_deref()) {
+                (Some(repo), Some(pin)) => Some((repo, pin)),
+                (None, None) => None,
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "gate diagnosis requires both --gate-repo and --gate-pin"
+                    ))
+                }
+            };
+            let code = if gate.is_some() {
+                commands::doctor::handle_with_gate(
+                    &base_dir,
+                    json,
+                    slot,
+                    repair_identities,
+                    check_token_owners,
+                    gate,
+                )?
+            } else {
+                commands::doctor::handle(
+                    &base_dir,
+                    json,
+                    slot,
+                    repair_identities,
+                    check_token_owners,
+                )?;
+                0
+            };
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         Command::Probe { slot, all } => {
             if slot.is_none() && !all {
                 return Err(anyhow::anyhow!(
@@ -2339,11 +2694,87 @@ pub fn run() -> Result<()> {
             CliCommand::Upgrade { name } => commands::cli::handle_upgrade(&name),
         },
         Command::Sessions { command } => match command {
+            SessionsCommand::DiskReport => {
+                let code = commands::sessions_disk::handle(&base_dir, json)?;
+                if code != 0 {
+                    std::process::exit(code);
+                }
+                Ok(())
+            }
             SessionsCommand::Share {
                 surface,
                 dry_run,
                 force,
             } => commands::sessions::handle_share(&base_dir, surface.as_deref(), dry_run, force),
+            SessionsCommand::List { repos, here } => {
+                let code = commands::sessions_list::handle(&base_dir, json, &repos, here)?;
+                if code != 0 {
+                    std::process::exit(code);
+                }
+                Ok(())
+            }
+            SessionsCommand::Deliver => commands::sessions_directives::deliver(&base_dir),
+            SessionsCommand::Receipts { since, id } => {
+                commands::sessions_directives::receipts(&base_dir, since.as_deref(), id.as_deref())
+            }
+            SessionsCommand::Ack { id, outcome, note } => commands::sessions_directives::ack(
+                &base_dir,
+                id.as_deref(),
+                &outcome,
+                note.as_deref(),
+            ),
+            SessionsCommand::Inbox {
+                pending,
+                mark_surfaced,
+                messages,
+                mark_read,
+                include_surfaced,
+                hook,
+            } => {
+                if !messages {
+                    commands::sessions_directives::inbox(&base_dir, pending, mark_surfaced)
+                } else if let Some(event) = hook {
+                    commands::sessions_messages::hook(&base_dir, &event)
+                } else {
+                    let mark = if mark_read {
+                        Some(csq_core::messaging::store::Mark::Read)
+                    } else if mark_surfaced {
+                        Some(csq_core::messaging::store::Mark::Surfaced)
+                    } else {
+                        None
+                    };
+                    if include_surfaced {
+                        commands::sessions_messages::inbox_with_options(
+                            &base_dir, pending, mark, true,
+                        )
+                    } else {
+                        commands::sessions_messages::inbox(&base_dir, pending, mark)
+                    }
+                }
+            }
+            SessionsCommand::Name { name, clear } => {
+                commands::sessions_messages::name(name.as_deref(), clear)
+            }
+            SessionsCommand::Send {
+                target,
+                message,
+                reply_to,
+                idempotency_key,
+                wake,
+            } => commands::sessions_messages::send(
+                &base_dir,
+                &target,
+                &message,
+                reply_to.as_deref(),
+                idempotency_key.as_deref(),
+                wake,
+            ),
+            SessionsCommand::LookupMessage { idempotency_key } => {
+                commands::sessions_messages::lookup(&base_dir, &idempotency_key)
+            }
+            SessionsCommand::AckMessage { id, note } => {
+                commands::sessions_messages::ack(&base_dir, &id, note.as_deref())
+            }
         },
         Command::Classify {
             prompt,
@@ -2618,6 +3049,297 @@ pub fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gate_operator_pin_is_an_explicit_native_command() {
+        use super::Cli;
+        use clap::Parser;
+        assert!(
+            Cli::try_parse_from([
+                "csq",
+                "gate",
+                "pin",
+                "--repo",
+                "repo",
+                "--pin",
+                "private-pin",
+                "--expected-manifest-sha256",
+                "digest"
+            ])
+            .is_ok(),
+            "explicit operator pin must be reachable through the native CLI"
+        );
+    }
+
+    #[test]
+    fn gate_diagnostics_skip_background_update_side_effects() {
+        use super::{is_read_only_gate_diagnostic, Cli};
+        use clap::Parser;
+        for args in [
+            vec!["csq", "gate", "status", "--repo", "repo", "--pin", "pin"],
+            vec!["csq", "doctor", "--gate-repo", "repo", "--gate-pin", "pin"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(is_read_only_gate_diagnostic(cli.command.as_ref().unwrap()));
+        }
+        let ordinary = Cli::try_parse_from(["csq", "doctor"]).unwrap();
+        assert!(!is_read_only_gate_diagnostic(
+            ordinary.command.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn doctor_ack_raced_parses_and_conflicts_with_the_other_modes() {
+        use super::{Cli, Command};
+        use clap::Parser;
+        let ok = Cli::try_parse_from(["csq", "doctor", "--ack-raced", "3"]).unwrap();
+        assert!(matches!(
+            ok.command,
+            Some(Command::Doctor {
+                ack_raced: Some(3),
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["csq", "doctor", "--ack-raced", "3", "--slot", "2"]).is_err());
+        assert!(Cli::try_parse_from(["csq", "doctor", "--ack-raced", "x"]).is_err());
+    }
+
+    #[test]
+    fn malformed_gate_dispatch_uses_the_path_free_protocol_route() {
+        use clap::Parser;
+        for args in [
+            vec![
+                "csq",
+                "gate",
+                "dispatch",
+                "PreToolUse",
+                "--unexpected=/private/secret",
+            ],
+            vec!["csq", "--json", "gate", "--trace", "dispatch", "PreToolUse"],
+            vec!["csq", "gate", "dispatch", "PreToolUse", "--repo"],
+        ] {
+            assert!(super::Cli::try_parse_from(&args).is_err());
+            let args = args.into_iter().map(String::from).collect::<Vec<_>>();
+            assert!(super::gate_dispatch_parse_error(&args));
+        }
+        for args in [
+            vec!["csq", "run", "3", "--", "gate", "dispatch"],
+            vec!["csq", "gate", "enable", "--pin", "dispatch"],
+            vec!["csq", "sessions", "send", "--body", "gate", "dispatch"],
+        ] {
+            let args = args.into_iter().map(String::from).collect::<Vec<_>>();
+            assert!(!super::gate_dispatch_parse_error(&args));
+        }
+    }
+
+    #[test]
+    fn gate_dispatch_is_a_direct_protocol_route_not_a_diagnostic() {
+        use super::{is_gate_dispatch, is_read_only_gate_diagnostic, Cli};
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "csq",
+            "gate",
+            "dispatch",
+            "PreToolUse",
+            "--repo",
+            "repo",
+            "--pin",
+            "pin",
+            "--adapter-manifest",
+            "adapter",
+            "--expected-adapter-sha256",
+            "a0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])
+        .unwrap();
+        let command = cli.command.as_ref().unwrap();
+        assert!(is_gate_dispatch(command));
+        assert!(!is_read_only_gate_diagnostic(command));
+    }
+
+    /// INV-32-01 at the argument surface: `send` has no way to name a sender, so a forged
+    /// one is a parse error (an `invalid_input` envelope, exit 1), never a stored value.
+    /// `--no-wake` is the ONLY way `wake` is false: the dispatch passes the parsed field
+    /// straight to `sessions_messages::send`, so no inversion exists to get wrong.
+    #[test]
+    fn sessions_list_parses_repeatable_repo_and_here() {
+        use clap::Parser;
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["csq", "sessions", "list"];
+            args.extend_from_slice(extra);
+            match Cli::try_parse_from(args).unwrap().command {
+                Some(Command::Sessions {
+                    command: super::SessionsCommand::List { repos, here },
+                }) => (repos, here),
+                _ => panic!("not a sessions list"),
+            }
+        };
+        assert_eq!(parse(&[]), (vec![], false));
+        assert_eq!(
+            parse(&["--repo", "a", "--repo", "b", "--here", "--json"]),
+            (vec!["a".to_string(), "b".to_string()], true)
+        );
+    }
+
+    #[test]
+    fn sessions_send_wakes_by_default_and_no_wake_clears_it() {
+        use clap::Parser;
+        let wake_of = |extra: &[&str]| {
+            let mut args = vec!["csq", "sessions", "send", "12:34", "--message", "hi"];
+            args.extend_from_slice(extra);
+            match Cli::try_parse_from(args).unwrap().command {
+                Some(Command::Sessions {
+                    command: super::SessionsCommand::Send { wake, .. },
+                }) => wake,
+                other => panic!("not a sessions send: {}", other.is_some()),
+            }
+        };
+        assert!(wake_of(&[]), "default must wake");
+        assert!(!wake_of(&["--no-wake"]), "--no-wake must not wake");
+    }
+
+    /// The valid forms parse, and the hook flag is bound to `--messages`.
+    #[test]
+    fn messaging_arguments_cannot_name_a_sender() {
+        use clap::Parser;
+        let ok = |args: &[&str]| Cli::try_parse_from(args).is_ok();
+        assert!(ok(&["csq", "sessions", "send", "12:34", "--message", "hi"]));
+        assert!(ok(&[
+            "csq",
+            "sessions",
+            "send",
+            "name",
+            "--message",
+            "hi",
+            "--idempotency-key",
+            "key"
+        ]));
+        assert!(ok(&[
+            "csq",
+            "sessions",
+            "lookup-message",
+            "--idempotency-key",
+            "key"
+        ]));
+        assert!(!ok(&["csq", "sessions", "lookup-message"]));
+        assert!(!ok(&[
+            "csq",
+            "sessions",
+            "lookup-message",
+            "--idempotency-key",
+            "key",
+            "--sender",
+            "99"
+        ]));
+        assert!(ok(&[
+            "csq",
+            "sessions",
+            "send",
+            "12:34",
+            "--message",
+            "-",
+            "--reply-to",
+            "x",
+            "--json"
+        ]));
+        assert!(ok(&[
+            "csq",
+            "sessions",
+            "send",
+            "12:34",
+            "--message",
+            "hi",
+            "--no-wake"
+        ]));
+        for forged in [
+            "--from",
+            "--sender",
+            "--as",
+            "--pid",
+            "--from-pid",
+            "--surface",
+        ] {
+            assert!(
+                !ok(&[
+                    "csq",
+                    "sessions",
+                    "send",
+                    "12:34",
+                    "--message",
+                    "hi",
+                    forged,
+                    "99"
+                ]),
+                "{forged} must not parse"
+            );
+        }
+        assert!(
+            !ok(&["csq", "sessions", "send", "12:34"]),
+            "message is required"
+        );
+        assert!(
+            !ok(&["csq", "sessions", "send", "--message", "hi"]),
+            "target is required"
+        );
+        assert!(ok(&["csq", "sessions", "ack-message", "id", "--note", "n"]));
+        assert!(ok(&[
+            "csq",
+            "sessions",
+            "inbox",
+            "--messages",
+            "--pending",
+            "--mark-read"
+        ]));
+        assert!(ok(&[
+            "csq",
+            "sessions",
+            "inbox",
+            "--messages",
+            "--hook",
+            "Stop"
+        ]));
+        assert!(
+            !ok(&["csq", "sessions", "inbox", "--hook", "Stop"]),
+            "hook needs --messages"
+        );
+        assert!(
+            !ok(&["csq", "sessions", "inbox", "--mark-read"]),
+            "mark-read needs --messages"
+        );
+        assert!(!ok(&[
+            "csq",
+            "sessions",
+            "inbox",
+            "--messages",
+            "--mark-read",
+            "--mark-surfaced"
+        ]));
+        assert!(ok(&[
+            "csq",
+            "sessions",
+            "inbox",
+            "--messages",
+            "--include-surfaced",
+            "--mark-read"
+        ]));
+        assert!(!ok(&["csq", "sessions", "inbox", "--include-surfaced"]));
+        assert!(!ok(&[
+            "csq",
+            "sessions",
+            "inbox",
+            "--messages",
+            "--include-surfaced",
+            "--hook",
+            "Stop"
+        ]));
+        // the directive inbox is untouched
+        assert!(ok(&[
+            "csq",
+            "sessions",
+            "inbox",
+            "--pending",
+            "--mark-surfaced"
+        ]));
+    }
+
     #[test]
     fn model_manifest_subcommands_parse_without_session_dispatch() {
         use clap::Parser;
@@ -2983,5 +3705,63 @@ mod tests {
             Some(Command::Classify { surface, .. }) => assert_eq!(surface, "claude-code"),
             other => panic!("expected Classify subcommand, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod messaging_hook_failopen_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn a_base_dir_error_exits_zero_and_never_reaches_the_hook() {
+        let ran = Cell::new(false);
+        let code = run_messaging_hook_failopen(
+            || Err(anyhow::anyhow!("CSQ_BASE_DIR must be absolute")),
+            |_| {
+                ran.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(code, 0);
+        assert!(!ran.get(), "the hook body must not run without a base dir");
+    }
+
+    #[test]
+    fn a_hook_error_and_a_hook_panic_both_exit_zero() {
+        let base = || Ok(std::path::PathBuf::from("/nonexistent"));
+        assert_eq!(
+            run_messaging_hook_failopen(base, |_| Err(anyhow::anyhow!("boom"))),
+            0
+        );
+        assert_eq!(
+            run_messaging_hook_failopen(base, |_| -> Result<()> { panic!("hook panicked") }),
+            0
+        );
+    }
+
+    #[test]
+    fn only_the_messages_hook_form_is_detected() {
+        let parse = |args: &[&str]| {
+            let mut v = vec!["csq"];
+            v.extend_from_slice(args);
+            Cli::try_parse_from(v).unwrap().command
+        };
+        assert_eq!(
+            messaging_hook_event(&parse(&[
+                "sessions",
+                "inbox",
+                "--messages",
+                "--hook",
+                "Stop"
+            ])),
+            Some("Stop".to_string())
+        );
+        assert_eq!(
+            messaging_hook_event(&parse(&["sessions", "inbox", "--messages"])),
+            None
+        );
+        assert_eq!(messaging_hook_event(&parse(&["sessions", "inbox"])), None);
+        assert_eq!(messaging_hook_event(&parse(&["statusline"])), None);
     }
 }

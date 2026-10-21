@@ -4,8 +4,8 @@
 //!
 //! On the first daemon start after an upgrade to a v2.7.x (or later) build,
 //! this pass walks every Anthropic `config-<N>/` directory found by
-//! `accounts::discovery::discover_anthropic`, derives (or reuses) a UUID
-//! identity for each slot, writes `identities/<UUID>/identity.json`,
+//! `accounts::discovery::discover_anthropic`, derives a fresh UUID
+//! identity for each unbound slot, writes `identities/<UUID>/identity.json`,
 //! updates `profiles.json` (`by_slot` + `by_email`), and — when every slot
 //! has been processed without error — atomically writes the idempotency
 //! sentinel `store-version`.
@@ -16,8 +16,9 @@
 //! mid-mint, the next start observes the absent sentinel and retries.  The
 //! per-slot logic inside the retry is also idempotent:
 //!
-//! - If `by_email` in `profiles.json` already maps the slot's email to a
-//!   UUID, that UUID is **reused** (no churn).
+//! - If `by_slot` already binds the slot, the slot is left as it is
+//!   (`AlreadyPresent`); the display email is NEVER used to look up or reuse
+//!   a UUID, and existing legacy `by_email` rows are preserved untouched.
 //! - If `identities/<UUID>/identity.json` already exists, the write is
 //!   skipped (file existence is the per-slot sentinel).
 //!
@@ -44,12 +45,9 @@
 //! `let _ = std::fs::remove_file(&tmp);` before propagating an error.
 
 use crate::accounts::discovery::discover_anthropic;
-use crate::accounts::identity_store::{
-    identity_json_path_for, settings_path_for, store_version_path, IdentityId,
-};
+use crate::accounts::identity_store::{identity_json_path_for, store_version_path, IdentityId};
 use crate::accounts::profiles;
 use crate::accounts::profiles_lock::ProfilesFileLock;
-use crate::credentials::write_uuid_settings;
 use crate::error::{redact_tokens, ConfigError};
 use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
 use std::path::Path;
@@ -60,7 +58,8 @@ use tracing::{debug, info, warn};
 /// Outcome of a single slot's mint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotMintOutcome {
-    /// UUID was already in `by_email` → reused; no new `identity.json` written.
+    /// Retained variant: the current `mint_slot` never returns it (a bound slot
+    /// reports `AlreadyPresent`; `by_email` is never a reuse source).
     Reused(IdentityId),
     /// Fresh UUID minted and `identity.json` written.
     Fresh(IdentityId),
@@ -84,7 +83,7 @@ pub struct MintSummary {
     pub slots_seen: usize,
     /// Slots whose `identity.json` file was written fresh.
     pub slots_fresh: usize,
-    /// Slots that reused an existing UUID from `by_email`.
+    /// Slots reported as reused (always 0 today — see [`SlotMintOutcome::Reused`]).
     pub slots_reused: usize,
     /// Slots whose `identity.json` was already present.
     pub slots_already_present: usize,
@@ -185,7 +184,7 @@ pub fn run_if_unsentineled(base_dir: &Path) -> Result<MintSummary, IdentityMintE
         // class. If oauth_email is absent (pure-legacy slot with no credential
         // file or credential file lacking oauthAccount.emailAddress), skip this
         // slot entirely: the identity will be minted at login time via
-        // mint_for_login, which carries an explicit OAuth-flow email.
+        // `commit_anthropic_login`, which carries a verified profile context.
         let email_raw = match account_info.oauth_email.as_deref() {
             Some(e) => e.to_string(),
             None => {
@@ -253,192 +252,6 @@ pub fn run_if_unsentineled(base_dir: &Path) -> Result<MintSummary, IdentityMintE
     Ok(summary)
 }
 
-/// Per-login identity mint hook called from `accounts::login::finalize_login`.
-///
-/// Mints or reuses a UUID for a single slot identified by `slot` and `email`.
-/// Unlike `run_if_unsentineled`, this does NOT check for the `store-version`
-/// sentinel (a login after a fresh install might run before the daemon starts)
-/// and does NOT write the sentinel (that is the daemon Pass 0's job).
-///
-/// # Lock precondition
-///
-/// The caller **MUST** hold the exclusive [`ProfilesFileLock`] for `base_dir`
-/// and pass it as `_lock`. This ensures the caller holds the lock across both
-/// the preceding `profiles::save` call in `finalize_login` AND this
-/// `add_identity_mapping` call — making the two-step write atomic from a
-/// cross-process perspective. Re-acquiring the lock inside this function would
-/// defeat that guarantee (and risk deadlock on platforms where `flock` is
-/// process-level, not fd-level).
-///
-/// Idempotency: if `by_email` already maps `email` to a UUID, that UUID is
-/// reused. If `identities/<UUID>/identity.json` already exists, the write is
-/// skipped. Profiles mappings are always updated (safe to overwrite with the
-/// same value).
-///
-/// # Write order (R2-HIGH-1 fix — symmetric with `mint_slot`)
-///
-/// 1. Write `add_identity_mapping` FIRST (reserves `by_email[email] = uuid`).
-/// 2. Write `identity.json` SECOND (only if not already present).
-///
-/// Crash analysis: crash after step 1 but before step 2 leaves `by_email`
-/// pointing at a UUID with no `identity.json`. The next login (or daemon
-/// Pass 0 re-run) finds the `by_email` entry, reuses the UUID, then finds
-/// `identity_path` missing and writes it. Convergent, no UUID churn.
-///
-/// # Returned error strings are FIXED-VOCABULARY tags safe for logging
-///
-/// Returned `Err(reason)` strings are FIXED-VOCABULARY tags that MUST NOT
-/// contain paths, emails, tokens, or other PII. They are safe to log
-/// directly at the call site in `finalize_login`.
-///
-/// # Returns
-///
-/// `Ok(uuid)` on success or `Err(String)` with a fixed-vocabulary reason tag.
-pub fn mint_for_login(
-    _lock: &ProfilesFileLock,
-    base_dir: &Path,
-    slot: u16,
-    email: &str,
-) -> Result<IdentityId, String> {
-    // Normalize + validate the caller-supplied email (fixes B-MED-2).
-    let normalized = normalize_email(email)
-        .ok_or_else(|| "identity_mint_failed: email rejected by normalizer".to_string())?;
-
-    let current_profiles = profiles::load(&profiles::profiles_path(base_dir))
-        .map_err(|_| "identity_mint_failed: profiles load error".to_string())?;
-
-    let (uuid, outcome) =
-        if let Some(existing) = current_profiles.by_email.get(&normalized).copied() {
-            (existing, true)
-        } else {
-            (IdentityId::new_v4(), false)
-        };
-
-    // `keychain-fix-r11.md` D-5: a fresh authorization event for THIS uuid
-    // supersedes any prior logout — clear its removal tombstone (if any)
-    // now, under the SAME `_lock` this mint runs under, so
-    // `credentials::file::save_uuid_credentials` (which checks the marker
-    // before every canonical write) is unblocked before this login's own
-    // credential write reaches it. A no-op (best-effort `remove_file`,
-    // `NotFound` is the common case) for a uuid that was never removed.
-    crate::accounts::identity_store::clear_identity_removed_marker(base_dir, uuid);
-
-    // WRITE ORDER (R2-HIGH-1 fix, symmetric with mint_slot A-CRIT-1 fix):
-    // mapping FIRST, then identity.json.
-    // The _lock witness is forwarded to enforce the compile-time lock-held
-    // precondition at this inner callsite too.
-    profiles::add_identity_mapping(_lock, base_dir, slot, &normalized, uuid)
-        .map_err(|_| "identity_mint_failed: mapping write error".to_string())?;
-
-    // Write identity.json only if not already present.
-    // If identity.json already exists (e.g. mint_slot wrote it first, or a
-    // prior partial mint materialized it), preserve the existing file — do not
-    // overwrite. This matches mint_slot's AlreadyPresent branch.
-    let identity_path = identity_json_path_for(base_dir, uuid);
-    if !identity_path.exists() {
-        let created_at = now_rfc3339();
-        let json_content = identity_json_content(&normalized, &created_at);
-        write_identity_json(&identity_path, &json_content)
-            .map_err(|_| "identity_mint_failed: identity.json write error".to_string())?;
-    }
-
-    // RN1-D R2: capture a pre-existing rename label on login.
-    //
-    // A pure-legacy slot may carry a user-chosen rename label in
-    // `accounts[N].email` with no `by_slot[N]` UUID. The one-shot
-    // `label-channel-migrated` relocation pass cannot migrate it (no UUID
-    // anchor) and never re-fires once its sentinel exists, and `csq login`
-    // historically did not capture it either — so `csq doctor`'s "log in
-    // again to mint UUIDs" instruction silenced the warning (the by_slot
-    // predicate stops matching) WITHOUT preserving the label, which RN1-F's
-    // `accounts` deletion then silently dropped. This step makes that
-    // operator instruction true: now that `add_identity_mapping` has minted
-    // `by_slot[N]`, copy the rename label into the A1 `by_slot_label[N]`
-    // channel. Rename detection mirrors `relocate_labels_to_by_slot_label`'s
-    // first arm EXACTLY — a single raw inequality against the authoritative
-    // OAuth email (`email.trim()`, OAuth-sourced per RN1-D1). The reference
-    // pass compares `accounts_email == oauth_email` (one raw comparison); a
-    // second `normalized` guard here would diverge from that one canonical
-    // detector and could over-skip a cased-email rename label (data loss —
-    // the exact bug class being fixed). Over-capturing a bare un-normalized
-    // OAuth-email variant is cosmetic only (`get_email` returns the email
-    // regardless), strictly safer than over-skipping. Guarded by
-    // `by_slot_label[N]` absence so a later explicit rename is never
-    // overwritten (same precedence as the relocation pass). Malformed labels
-    // (control chars, oversize) are NOT relocated: they would land in the
-    // `by_slot_label` channel `get_email` reads FIRST and that doctor/UI
-    // render — skip them so a malformed legacy value is not promoted into
-    // the active label channel (RN1-D3 rejects the same shapes on the
-    // `rename_account` write path; this is the read-side parity, inlined
-    // because that validator lives in the `csq` crate which `csq-core`
-    // cannot depend on). `current_profiles` predates the
-    // `add_identity_mapping` save, but that call preserves `accounts` and
-    // `by_slot_label` unchanged, so the read is accurate; `set_slot_label`
-    // does its own load→mutate→save under the same `_lock`. Non-fatal: a
-    // capture failure must not block login.
-    const MAX_LABEL_LEN: usize = 256;
-    let slot_key = slot.to_string();
-    if !current_profiles.by_slot_label.contains_key(&slot_key) {
-        // M4-13: accounts struct field removed; read legacy email from
-        // extra["accounts"] via the helper. Same semantics as before.
-        let legacy_accounts = profiles::legacy_accounts_email_map(&current_profiles);
-        if let Some(raw_label) = legacy_accounts.get(&slot_key) {
-            let label = raw_label.trim();
-            let well_formed =
-                label.chars().count() <= MAX_LABEL_LEN && !label.chars().any(|c| c.is_control());
-            if !label.is_empty() && label != email.trim() && well_formed {
-                if let Err(_e) = profiles::set_slot_label(_lock, base_dir, slot, label) {
-                    // Fixed-vocabulary tag, NO error body: `ConfigError`
-                    // Display carries the `profiles.json`/tmp path (OS
-                    // username) and `redact_tokens` does not strip paths
-                    // (security.md Rule 2 — fixed tags, not `{e}` bodies).
-                    warn!(
-                        error_kind = "label_capture_failed",
-                        slot = slot,
-                        "mint_for_login: could not capture pre-existing rename label"
-                    );
-                }
-            }
-        }
-    }
-
-    // M2-3: seed identities/<UUID>/settings.json from config-<N>/settings.json
-    // within the same ProfilesFileLock window (constraint #7: resolve UUID once
-    // at section entry, never mid-section). Only write if not already present —
-    // same idempotency rule as identity.json above.
-    let uuid_settings = settings_path_for(base_dir, uuid);
-    if !uuid_settings.exists() {
-        let config_n_settings = base_dir
-            .join(format!("config-{slot}"))
-            .join("settings.json");
-        let bytes = if config_n_settings.exists() {
-            std::fs::read(&config_n_settings).unwrap_or_default()
-        } else {
-            b"{}".to_vec()
-        };
-        // Non-fatal: settings seeding failure does not block login.
-        // Fixed-vocabulary tag, NO error body (security.md Rule 2): the
-        // error Display carries a filesystem path that `redact_tokens`
-        // does not strip. Pre-existing-pattern parity fix landed with the
-        // RN1-D R2 sibling above (redteam security L1, zero-tolerance R1).
-        if let Err(_e) = write_uuid_settings(base_dir, uuid, &bytes) {
-            warn!(
-                error_kind = "settings_seed_failed",
-                slot = slot,
-                "mint_for_login: could not seed UUID settings.json"
-            );
-        }
-    }
-
-    info!(
-        slot = slot,
-        reused = outcome,
-        "identity_mint: finalize_login hook completed"
-    );
-
-    Ok(uuid)
-}
-
 /// Validates an `account_id_hint` string from a Codex auth.json for use as
 /// part of a synthetic `by_email` key.
 ///
@@ -475,10 +288,10 @@ fn validate_codex_account_id_hint(hint: &str) -> Option<&str> {
 /// (`CredentialError::NoCredentials`); this function ensures the mapping
 /// exists so the subsequent write succeeds.
 ///
-/// # Why a separate function from `mint_for_login`
+/// # Why a separate function from the verified Anthropic login commit
 ///
-/// `mint_for_login` (the Anthropic OAuth path) uses the caller-supplied OAuth
-/// `email` as the `by_email` key — every Anthropic account has a verified
+/// `accounts::anthropic_identity::commit_anthropic_login` (the Anthropic OAuth path) takes the
+/// verified profile `email` as part of the full context index — every Anthropic account has a verified
 /// email from the CC device-auth flow. Codex uses ChatGPT OAuth, which csq
 /// deliberately does NOT decode (spec 07 §7.3.3: no `id_token` claim
 /// decoding for data-minimisation). There is no email to act as the secondary
@@ -519,7 +332,7 @@ fn validate_codex_account_id_hint(hint: &str) -> Option<&str> {
 ///
 /// # Write order
 ///
-/// Symmetric with `mint_for_login` (R2-HIGH-1 fix):
+/// Symmetric with the verified Anthropic login commit (R2-HIGH-1 fix):
 /// 1. `add_identity_mapping` (profiles.json FIRST — reserves the slot→UUID
 ///    and synthetic-email→UUID rows).
 /// 2. `identity.json` SECOND — only if not already present.
@@ -527,7 +340,7 @@ fn validate_codex_account_id_hint(hint: &str) -> Option<&str> {
 /// # Lock discipline (IR-M5 fix)
 ///
 /// The caller **MUST** hold the exclusive [`ProfilesFileLock`] for `base_dir`
-/// and pass it as `_lock`. This is symmetric with `mint_for_login` and
+/// and pass it as `_lock`. This is symmetric with the verified Anthropic login commit and
 /// prevents deadlock on platforms where `flock` is process-level. The caller
 /// (`perform_with` in `providers::codex::login`) acquires the lock once and
 /// holds it across both `mint_for_codex_login` and `save_canonical_for` so
@@ -535,7 +348,7 @@ fn validate_codex_account_id_hint(hint: &str) -> Option<&str> {
 ///
 /// # Note on settings.json (IR-M6)
 ///
-/// Unlike `mint_for_login`, this fn does NOT seed
+/// Unlike the verified Anthropic login commit, this fn does NOT seed
 /// `identities/<UUID>/settings.json`. Codex provisioning uses
 /// `config-<N>/config.toml` (spec 07 §7.2.2) — there is no
 /// `config-<N>/settings.json` to copy and no Codex consumer that reads
@@ -552,6 +365,43 @@ pub fn mint_for_codex_login(
     slot: u16,
     account_id_hint: Option<&str>,
 ) -> Result<IdentityId, String> {
+    mint_for_codex_login_with_resolved_uuid(
+        _lock,
+        base_dir,
+        slot,
+        account_id_hint,
+        profiles::resolve_slot_to_uuid(base_dir, slot),
+    )
+}
+
+fn mint_for_codex_login_with_resolved_uuid(
+    _lock: &ProfilesFileLock,
+    base_dir: &Path,
+    slot: u16,
+    account_id_hint: Option<&str>,
+    fast_uuid: Option<IdentityId>,
+) -> Result<IdentityId, String> {
+    mint_for_codex_login_with_resolved_uuid_and_stat(
+        _lock,
+        base_dir,
+        slot,
+        account_id_hint,
+        fast_uuid,
+        |path| std::fs::symlink_metadata(path),
+    )
+}
+
+fn mint_for_codex_login_with_resolved_uuid_and_stat<F>(
+    _lock: &ProfilesFileLock,
+    base_dir: &Path,
+    slot: u16,
+    account_id_hint: Option<&str>,
+    fast_uuid: Option<IdentityId>,
+    stat: F,
+) -> Result<IdentityId, String>
+where
+    F: FnOnce(&Path) -> std::io::Result<std::fs::Metadata>,
+{
     // SR-M1: validate account_id_hint at the boundary. Any hint that contains
     // control chars, is empty, or exceeds 256 bytes is treated as absent — we
     // fall back to the `codex:slot-<N>` synthetic key. Symmetric with
@@ -561,7 +411,10 @@ pub fn mint_for_codex_login(
     // SR-H2: fast-path only fires when BOTH by_slot is populated AND
     // identity.json exists. A missing identity.json (partial-mint crash
     // recovery) falls through to the write path below to repair it.
-    if let Some(existing_uuid) = profiles::resolve_slot_to_uuid(base_dir, slot) {
+    if let Some(existing_uuid) = fast_uuid {
+        if crate::accounts::identity_store::is_identity_removed(base_dir, existing_uuid) {
+            return Err(format!("identity_mint_failed: bound_identity_removed; run csq logout {slot} then csq login {slot}"));
+        }
         let identity_path = identity_json_path_for(base_dir, existing_uuid);
         if identity_path.exists() {
             debug!(
@@ -589,6 +442,9 @@ pub fn mint_for_codex_login(
     // the caller holds the lock BEFORE calling us this is only a concern for
     // callers that do NOT pre-check. Guard here for defensive completeness).
     if let Some(existing_uuid) = current_profiles.by_slot.get(&slot.to_string()).copied() {
+        if crate::accounts::identity_store::is_identity_removed(base_dir, existing_uuid) {
+            return Err(format!("identity_mint_failed: bound_identity_removed; run csq logout {slot} then csq login {slot}"));
+        }
         let identity_path = identity_json_path_for(base_dir, existing_uuid);
         if identity_path.exists() {
             debug!(
@@ -619,7 +475,7 @@ pub fn mint_for_codex_login(
                     .unwrap_or_else(|| format!("codex:slot-{slot}"))
             });
         let json_content = identity_json_content_codex(&synthetic_key, &created_at);
-        write_identity_json(&identity_path, &json_content)
+        write_identity_json(base_dir, existing_uuid, &json_content)
             .map_err(|_| "identity_mint_failed: identity.json write error".to_string())?;
         info!(
             slot,
@@ -645,6 +501,21 @@ pub fn mint_for_codex_login(
     // "one slot = one identity" holds.
     let (uuid, reused) =
         if let Some(existing) = current_profiles.by_email.get(&synthetic_key).copied() {
+            // Canonical writers deliberately collapse unreadable removal into
+            // refusal. Minting must distinguish it from a present tombstone:
+            // only a real entry permits replacing this synthetic-key target.
+            let marker =
+                crate::accounts::identity_store::identity_removed_marker_path(base_dir, existing);
+            let removed = match stat(&marker) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => {
+                    return Err(format!(
+                        "identity_mint_failed: removed_marker_read_refused; \
+                     check identity store permissions and retry csq login {slot}"
+                    ));
+                }
+            };
             let already_owned_by_other = current_profiles
                 .by_slot
                 .iter()
@@ -659,6 +530,15 @@ pub fn mint_for_codex_login(
                     slot
                 );
                 (IdentityId::new_v4(), false)
+            } else if removed {
+                // This unbound synthetic-key target is stale, not current slot
+                // authority. Preserve its tombstone and mint an independent UUID.
+                warn!(
+                    slot,
+                    error_kind = "codex_email_key_removed_identity_replaced",
+                    "mint_for_codex_login: stale removed email-key target; minting fresh UUID"
+                );
+                (IdentityId::new_v4(), false)
             } else {
                 (existing, true)
             }
@@ -666,7 +546,7 @@ pub fn mint_for_codex_login(
             (IdentityId::new_v4(), false)
         };
 
-    // WRITE ORDER (symmetric with mint_for_login R2-HIGH-1 fix):
+    // WRITE ORDER (symmetric with the verified Anthropic login commit, R2-HIGH-1 fix):
     // mapping FIRST, then identity.json.
     profiles::add_identity_mapping(_lock, base_dir, slot, &synthetic_key, uuid)
         .map_err(|_| "identity_mint_failed: mapping write error".to_string())?;
@@ -676,7 +556,7 @@ pub fn mint_for_codex_login(
     if !identity_path.exists() {
         let created_at = now_rfc3339();
         let json_content = identity_json_content_codex(&synthetic_key, &created_at);
-        write_identity_json(&identity_path, &json_content)
+        write_identity_json(base_dir, uuid, &json_content)
             .map_err(|_| "identity_mint_failed: identity.json write error".to_string())?;
     }
 
@@ -690,89 +570,75 @@ pub fn mint_for_codex_login(
     Ok(uuid)
 }
 
+/// Test fixture seam through the actual pre-context legacy metadata writer.
+#[cfg(test)]
+pub(crate) fn write_legacy_anthropic_metadata_fixture(
+    base: &Path,
+    identity: IdentityId,
+    email: &str,
+) -> Result<(), ConfigError> {
+    write_identity_json(
+        base,
+        identity,
+        &identity_json_content(email, &now_rfc3339()),
+    )
+}
+
 // ─── Internal: per-slot mint ──────────────────────────────────────────────────
 
-/// Mints (or verifies) the identity for a single Anthropic slot.
-///
-/// `_lock` is the type-witness for the held [`ProfilesFileLock`]; it is
-/// forwarded to `add_identity_mapping` to satisfy the lock precondition at
-/// every callsite. The lock must have been acquired by the Pass 0 caller
-/// (`run_if_unsentineled`) before iterating slots.
-///
-/// `email` is the normalized email from `discover_anthropic`. `None` means
-/// no email was available (post-Group E, this branch is only reached if
-/// discover_anthropic returned an "unknown" label that normalized to None).
-///
-/// Write order (fixes A-CRIT-1 orphan leak):
-/// 1. Write `add_identity_mapping` FIRST (reserves `by_email[email] = uuid`).
-/// 2. Write `identity.json` SECOND.
-///
-/// Crash analysis: crash after mapping-write but before identity.json-write
-/// leaves `by_email` row pointing at a UUID with no identity.json. Next start
-/// → `mint_slot` reuses the UUID via `by_email` lookup → finds
-/// `identity_path(A)` missing → writes it. Convergent, no UUID churn.
+/// Reserve a legacy migration slot independently of its display email.
+/// Existing bound metadata must remain valid; unknown context is never promoted here.
+/// The caller holds profiles authority. New metadata is staged before slot publication;
+/// the legacy by_email index is preserved and is never a UUID reuse source.
 fn mint_slot(
-    _lock: &ProfilesFileLock,
+    lock: &ProfilesFileLock,
     base_dir: &Path,
     slot: u16,
     email: Option<&str>,
 ) -> Result<SlotMintOutcome, String> {
-    // If email is None (no credentials), skip — post-Group E, discover_anthropic
-    // only yields slots with credentials, so this is a defensive guard only.
-    let email = match email {
-        Some(e) => e,
-        None => {
-            return Err("identity_mint_failed: no email for slot".to_string());
-        }
-    };
-
-    // Load current profiles to check for reuse.
-    let current_profiles = profiles::load(&profiles::profiles_path(base_dir))
+    let email = email
+        .and_then(normalize_email)
+        .ok_or_else(|| "identity_mint_failed: no email for slot".to_string())?;
+    let current = profiles::load(&profiles::profiles_path(base_dir))
         .map_err(|_| "identity_mint_failed: profiles load error".to_string())?;
-
-    // Determine UUID: reuse if email is already mapped, else fresh.
-    let (uuid, reused) = if let Some(existing) = current_profiles.by_email.get(email).copied() {
-        (existing, true)
-    } else {
-        (IdentityId::new_v4(), false)
-    };
-
-    let identity_path = identity_json_path_for(base_dir, uuid);
-
-    // If identity.json already exists, always reconcile the mapping
-    // (fixes C-MED-9: AlreadyPresent branch now unconditionally updates
-    // the mapping, symmetric with mint_for_login's contract).
-    if identity_path.exists() {
-        // Preserve the existing created_at by re-reading the file.
-        // Always reconcile by_slot mapping (may be missing on a prior crash).
-        profiles::add_identity_mapping(_lock, base_dir, slot, email, uuid)
-            .map_err(|_| "identity_mint_failed: mapping write error".to_string())?;
+    if let Some(bound) = current.by_slot.get(&slot.to_string()).copied() {
+        let stored =
+            crate::accounts::anthropic_identity::read_stored_anthropic_context(base_dir, bound)
+                .map_err(|_| "identity_mint_failed: metadata refused".to_string())?;
+        if let Some(entry) = current
+            .anthropic_contexts
+            .iter()
+            .find(|entry| entry.identity_uuid == bound)
+        {
+            let expected = entry
+                .context()
+                .map_err(|_| "identity_mint_failed: metadata refused".to_string())?;
+            if stored
+                != crate::accounts::anthropic_identity::StoredAnthropicContext::Known(expected)
+            {
+                return Err("identity_mint_failed: metadata refused".into());
+            }
+        }
+        // Existing legacy context remains unknown; never redirect it by display email.
         return Ok(SlotMintOutcome::AlreadyPresent);
     }
-
-    // WRITE ORDER (A-CRIT-1 fix): mapping FIRST, then identity.json.
-    // A crash between these two leaves a by_email row with no identity.json —
-    // which the re-run convergence path handles (see module doc).
-    profiles::add_identity_mapping(_lock, base_dir, slot, email, uuid)
+    // An unmapped migration slot receives its own unknown-context UUID. Existing
+    // legacy by_email rows remain byte-for-byte claims of the older representation.
+    let identity = IdentityId::new_v4();
+    write_identity_json(
+        base_dir,
+        identity,
+        &identity_json_content(&email, &now_rfc3339()),
+    )
+    .map_err(|_| "identity_mint_failed: identity.json write error".to_string())?;
+    profiles::reserve_legacy_anthropic_slot(lock, base_dir, slot, identity)
         .map_err(|_| "identity_mint_failed: mapping write error".to_string())?;
-
-    // Write identity.json (§5a-compliant).
-    let created_at = now_rfc3339();
-    let json_content = identity_json_content(email, &created_at);
-    write_identity_json(&identity_path, &json_content)
-        .map_err(|_| "identity_mint_failed".to_string())?;
-
-    if reused {
-        Ok(SlotMintOutcome::Reused(uuid))
-    } else {
-        Ok(SlotMintOutcome::Fresh(uuid))
-    }
+    Ok(SlotMintOutcome::Fresh(identity))
 }
 
 // ─── Internal: email normalization ───────────────────────────────────────────
 
-/// Normalizes the OAuth-derived email for use as a HashMap key in
-/// `profiles.json.by_email`.
+/// Normalizes the legacy OAuth-derived display email; it is not an ownership key.
 ///
 /// The invariant is that the same human identity always normalizes to the
 /// same key string:
@@ -783,7 +649,7 @@ fn mint_slot(
 /// - Returns `None` if the raw email is the sentinel `"unknown"` (not a real email)
 ///   OR if it fails the above validation.
 ///
-/// Fixes B-MED-2: `mint_for_login` previously accepted raw caller-supplied
+/// Fixes B-MED-2: the retired email-only `mint_for_login` accepted raw caller-supplied
 /// email without normalization, allowing whitespace drift to produce duplicate
 /// by_email keys.
 pub fn normalize_email(raw: &str) -> Option<String> {
@@ -852,7 +718,14 @@ fn identity_json_content_codex(synthetic_key: &str, created_at: &str) -> String 
 /// Writes `identity.json` to disk using the §5a-compliant pipeline:
 /// `unique_tmp_path → write → secure_file → atomic_replace`.
 ///
-/// Creates parent directories as needed.
+/// Derives the destination from `(base_dir, id)` and creates/secures BOTH
+/// the identity dir (`identities/<UUID>/`) and the `identities/` root via
+/// the shared fail-closed `ensure_private_identity_dir` helper (SEC-2.15,
+/// R1 M1): 0o700 at creation, symlink-refusing, and a run that cannot
+/// restrict the dirs returns `Err` and writes nothing. The destination is
+/// computed here, so a mismatched base/dest pair is unrepresentable
+/// (R1 LOW: the prior prose claimed a mismatch "fails closed", which was
+/// false).
 ///
 /// §5a compliance: email is PII → secret-bearing payload.
 /// All three failure branches call `let _ = remove_file(&tmp)` before
@@ -861,20 +734,25 @@ fn identity_json_content_codex(synthetic_key: &str, created_at: &str) -> String 
 /// Production code: uses real `std::fs::write`, `secure_file`, and
 /// `atomic_replace`.  Tests inject closures via `write_identity_json_inner`
 /// to exercise each failure branch independently.
-fn write_identity_json(dest: &Path, content: &str) -> Result<(), ConfigError> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| ConfigError::InvalidJson {
-            path: parent.to_path_buf(),
-            reason: format!("create_dir_all: {e}"),
-        })?;
-    }
+fn write_identity_json(base_dir: &Path, id: IdentityId, content: &str) -> Result<(), ConfigError> {
+    // SEC-2.15 (unified, R1 M1): destination derived from the identity key —
+    // the shared fail-closed helper creates AND secures `identities/` and
+    // `identities/<UUID>/` (0o700 at creation, no window, symlink-refusing),
+    // the same helper every identity writer and the accounts root use.
+    let dest = identity_json_path_for(base_dir, id);
+    crate::accounts::identity_store::ensure_private_identity_dir(base_dir, id).map_err(|e| {
+        ConfigError::InvalidJson {
+            path: dest.clone(),
+            reason: format!("identity_dir_secure_refused: {e}"),
+        }
+    })?;
 
     // §5a: `write_new_private` creates the tmp file at 0o600 at creation;
     // `secure_file` below is now a redundant (but harmless) re-chmod, kept
     // so the three-closure injectable failure-branch test structure stays
     // unchanged for the `secure` and `replace` branches.
     write_identity_json_inner(
-        dest,
+        &dest,
         content,
         |tmp, body| {
             crate::platform::fs::write_new_private(tmp, body)
@@ -946,7 +824,7 @@ where
 /// require schema ≥ 2 to start (fail-closed gate in
 /// `startup_reconciler::phase4_gate_check`; renamed from the prior
 /// `phase3_gate` symbol and extended in M4-5).
-pub const STORE_VERSION_SCHEMA_CURRENT: u32 = 2;
+pub const STORE_VERSION_SCHEMA_CURRENT: u32 = 3;
 
 /// Reads the `schema` field from the on-disk `store-version` sentinel.
 ///
@@ -958,7 +836,7 @@ pub fn read_store_version_schema(base_dir: &Path) -> Option<u32> {
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
     json.get("schema")
         .and_then(|v| v.as_u64())
-        .map(|n| n as u32)
+        .and_then(|n| u32::try_from(n).ok())
 }
 
 /// Writes the `store-version` sentinel atomically.
@@ -980,7 +858,20 @@ pub(crate) fn write_sentinel(sentinel: &Path) -> Result<(), IdentityMintError> {
     );
 
     if let Some(parent) = sentinel.parent() {
-        std::fs::create_dir_all(parent).ok();
+        // SEC-2.15 (R2 H1 + R3 HIGH): the sentinel is `<base>/store-version`
+        // (`identity_store::store_version_path` is `base.join("store-version")`),
+        // so `parent` IS the accounts root — the one component the operator
+        // is allowed to plant as a symlink (`~/.claude/accounts` → external
+        // drive; the `case_c_symlinked_path_canonicalizes_and_accepts`
+        // contract). Route through the ROOT variant, which resolves that one
+        // leaf symlink and secures the target fd-based. The strict variant
+        // refuses the root, so on a symlinked root the mint failed
+        // (SentinelWrite) → no sentinel → `phase4_gate_check` returned
+        // StoreVersionUnset → daemon start refused → no refresher. The
+        // former comment claiming the sentinel lives under identities/<UUID>/
+        // was wrong.
+        crate::platform::fs::ensure_private_dir_root(parent)
+            .map_err(|e| IdentityMintError::SentinelWrite(format!("secure sentinel dir: {e}")))?;
     }
 
     let tmp = unique_tmp_path(sentinel);
@@ -1080,6 +971,33 @@ mod tests {
         coexisting_fixture, fixture_uuid_for_slot, identity_only_fixture, legacy_only_fixture,
     };
     use tempfile::TempDir;
+
+    // Synthetic exact-profile transport; publication/finalization remain production code.
+    fn fixture_verified_mint(base: &Path, slot: u16, email: &str) -> Result<IdentityId, String> {
+        use crate::accounts::anthropic_identity as ai;
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            let account = crate::types::AccountNum::try_from(slot).unwrap();
+            let config = base.join(format!("config-{slot}"));
+            std::fs::create_dir_all(&config).unwrap();
+            let credential: crate::credentials::CredentialFile = serde_json::from_value(serde_json::json!({"claudeAiOauth":{"accessToken":"fake-mint-at","refreshToken":"fake-mint-rt","expiresAt":4102444800000u64,"scopes":[]}})).unwrap();
+            let email_owned = email.to_owned();
+            let http: crate::daemon::usage_poller::HttpGetFn = std::sync::Arc::new(
+                move |url, token, _| {
+                    assert_eq!(url, "https://api.anthropic.com/api/oauth/profile");
+                    assert_eq!(token, "fake-mint-at");
+                    Ok((200, serde_json::to_vec(&serde_json::json!({"account":{"uuid":uuid::Uuid::from_u128(101),"email":email_owned},"organization":{"uuid":uuid::Uuid::from_u128(202)}})).unwrap()))
+                },
+            );
+            let prior = ai::capture_login_prior(base, account).map_err(|e| e.to_string())?;
+            let committed =
+                ai::commit_anthropic_login_with(base, account, &credential, &http, None, prior)
+                    .map_err(|e| e.to_string())?;
+            let identity = committed.identity();
+            crate::accounts::login::finalize_verified_login(base, account, committed)
+                .map_err(|e| e.to_string())?;
+            Ok(identity)
+        })
+    }
 
     // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -1279,20 +1197,23 @@ mod tests {
             "by_slot must contain slot 2 after mint"
         );
         assert!(
-            prof.by_email.contains_key("user-1@test.invalid"),
-            "by_email must contain slot 1's email"
+            prof.by_email.is_empty(),
+            "migration does not create email ownership claims"
         );
-        assert!(
-            prof.by_email.contains_key("user-2@test.invalid"),
-            "by_email must contain slot 2's email"
+        assert_ne!(
+            prof.by_slot["1"], prof.by_slot["2"],
+            "unknown organizations must not coalesce"
         );
-        // Verify by_slot and by_email agree on the UUID for slot 1
-        let uuid_by_slot = prof.by_slot["1"];
-        let uuid_by_email = prof.by_email["user-1@test.invalid"];
-        assert_eq!(
-            uuid_by_slot, uuid_by_email,
-            "by_slot and by_email must map to the same UUID for the same account"
-        );
+        for slot in ["1", "2"] {
+            assert!(matches!(
+                crate::accounts::anthropic_identity::read_stored_anthropic_context(
+                    base,
+                    prof.by_slot[slot]
+                )
+                .unwrap(),
+                crate::accounts::anthropic_identity::StoredAnthropicContext::LegacyUnknown
+            ));
+        }
     }
 
     // ── identity.json schema tests ─────────────────────────────────────────────
@@ -1457,12 +1378,18 @@ mod tests {
             .unwrap();
         }
 
+        write_identity_json(
+            base,
+            pre_existing_uuid,
+            &identity_json_content("user-1@test.invalid", &now_rfc3339()),
+        )
+        .unwrap();
         // Act
         let summary = run_if_unsentineled(base).expect("mint should succeed");
 
         // Assert — the pre-existing UUID was reused
         assert_eq!(
-            summary.slots_reused, 1,
+            summary.slots_already_present, 1,
             "slot 1 should reuse the pre-existing UUID"
         );
         assert_eq!(summary.slots_fresh, 0);
@@ -1509,16 +1436,30 @@ mod tests {
         // Also delete sentinel so re-run happens
         std::fs::remove_file(store_version_path(base)).unwrap();
 
+        let before = walkdir_bytes(base);
         // Act: re-run
         let summary = run_if_unsentineled(base).expect("re-mint should succeed");
 
-        // Assert: identity.json re-created with SAME UUID (no churn)
-        assert_eq!(summary.slots_reused, 1, "should reuse pre-existing UUID");
-        assert!(identity_path.exists(), "identity.json must be re-created");
-        let prof_after = profiles::load(&profiles::profiles_path(base)).unwrap();
         assert_eq!(
-            prof_after.by_slot["1"], uuid,
-            "UUID must be same after re-mint (no churn)"
+            summary.slot_errors.len(),
+            1,
+            "mapped missing metadata is refused"
+        );
+        assert_eq!(summary.slots_reused, 0);
+        assert!(
+            !identity_path.exists(),
+            "migration cannot recreate unknown published metadata"
+        );
+        assert!(
+            !store_version_path(base).exists(),
+            "failed migration must remain retryable"
+        );
+        assert_eq!(walkdir_bytes(base), before);
+        assert_eq!(
+            profiles::load(&profiles::profiles_path(base))
+                .unwrap()
+                .by_slot["1"],
+            uuid
         );
     }
 
@@ -1564,13 +1505,17 @@ mod tests {
         // Act: re-run
         run_if_unsentineled(base).expect("re-mint should succeed");
 
-        // Assert: by_slot reconciled with the correct UUID
         let prof_after = profiles::load(&profiles::profiles_path(base)).unwrap();
-        assert_eq!(
-            prof_after.by_slot.get("1").copied(),
-            Some(uuid),
-            "AlreadyPresent branch must reconcile stale by_slot entry"
+        let replacement = prof_after.by_slot["1"];
+        assert_ne!(
+            replacement, uuid,
+            "an unmapped unknown context cannot be recovered from display email"
         );
+        assert!(
+            identity_json_path_for(base, uuid).exists(),
+            "prior identity custody is preserved"
+        );
+        assert!(prof_after.by_email.is_empty());
     }
 
     // ── non-config-N dirs ignored ──────────────────────────────────────────────
@@ -1635,15 +1580,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let base = dir.path();
 
-        let sub = base
-            .join("identities")
-            .join("550e8400-e29b-41d4-a716-446655440000");
+        let uuid = IdentityId::new_v4();
+        let sub = crate::accounts::identity_store::identity_path(base, uuid);
         std::fs::create_dir_all(&sub).unwrap();
 
-        let dest = sub.join("identity.json");
+        let dest = identity_json_path_for(base, uuid);
 
         // Verify the write_identity_json pipeline succeeds on the happy path.
-        let result = write_identity_json(&dest, r#"{"email":"test@test.invalid"}"#);
+        let result = write_identity_json(base, uuid, r#"{"email":"test@test.invalid"}"#);
         assert!(
             result.is_ok(),
             "write_identity_json should succeed on happy path"
@@ -1651,6 +1595,56 @@ mod tests {
         assert!(
             dest.exists(),
             "identity.json should exist after successful write"
+        );
+    }
+
+    /// SEC-2.15: `write_identity_json` restricts BOTH the `identities/` root
+    /// and `identities/<UUID>/` to 0o700 even under a permissive 0o022
+    /// process umask — `create_dir_all` alone lands them at 0o755
+    /// (world-enumerable), exposing UUID dir names and the credential
+    /// filenames inside despite the 0o600 files.
+    ///
+    /// Mutation: dropping the `ensure_private_identity_dir` call in
+    /// `write_identity_json` REDs this with the measured 0o755 mode on the
+    /// un-secured dirs.
+    ///
+    /// The umask is pinned to a KNOWN permissive value rather than trusting
+    /// the ambient one: under an already-restrictive ambient umask (0o077)
+    /// `create_dir_all` would yield 0o700 by coincidence and the mutation
+    /// would NOT RED. `libc::umask` is process-global, so this test
+    /// serializes on the shared `platform::test_env` mutex — the same guard
+    /// `platform::fs::write_new_private_sets_mode_0o600_under_permissive_umask`
+    /// uses.
+    #[cfg(unix)]
+    #[test]
+    fn write_identity_json_secures_identity_dirs_under_umask_022() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _umask = crate::platform::test_env::UmaskGuard::pin(0o022);
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = IdentityId::new_v4();
+        let dest = identity_json_path_for(base, uuid);
+
+        let result = write_identity_json(base, uuid, r#"{"email":"umask@test.invalid"}"#);
+        result.expect("write_identity_json must succeed");
+
+        let mode_of = |p: &Path| {
+            std::fs::metadata(p)
+                .expect("identity dir must exist")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(
+            mode_of(dest.parent().unwrap()),
+            0o700,
+            "identities/<UUID>/ must be 0o700 under a permissive process umask"
+        );
+        assert_eq!(
+            mode_of(&crate::accounts::identity_store::identities_dir(base)),
+            0o700,
+            "identities/ root must be 0o700 under a permissive process umask"
         );
     }
 
@@ -1921,32 +1915,32 @@ mod tests {
         );
     }
 
-    // ── R2-HIGH-1: mint_for_login write-order fix tests ───────────────────────
+    // ── R2-HIGH-1: verified-mint write-order tests ───────────────────────
 
-    /// R2-HIGH-1: `mint_for_login` must write the mapping BEFORE identity.json.
-    /// We verify this by calling `mint_for_login` and then checking that the
-    /// mapping row and the identity.json file both exist after the call.
+    /// Verified publication leaves valid full metadata and canonical credentials behind its slot/context mapping. This success test makes no crash-order claim.
     #[test]
-    fn mint_for_login_writes_mapping_before_identity_json() {
+    fn verified_mint_writes_mapping_before_identity_json() {
         // Arrange
         let dir = TempDir::new().unwrap();
         let base = dir.path();
 
-        // Act: normal mint_for_login call
-        let lock = crate::accounts::profiles_lock::ProfilesFileLock::acquire(base)
-            .expect("acquire profiles lock");
-        let result = mint_for_login(&lock, base, 1, "alice@test.invalid");
+        // Act: normal verified mint
+
+        let result = fixture_verified_mint(base, 1, "alice@test.invalid");
 
         // Assert: call succeeded
-        let uuid = result.expect("mint_for_login must succeed");
+        let uuid = result.expect("verified mint must succeed");
 
         // Both the mapping row AND the identity.json must exist
         let prof = profiles::load(&profiles::profiles_path(base)).unwrap();
-        assert_eq!(
-            prof.by_email.get("alice@test.invalid").copied(),
-            Some(uuid),
-            "by_email mapping must be written"
+        assert!(
+            prof.by_email.is_empty(),
+            "legacy email index must not gain ownership claims"
         );
+        assert!(prof
+            .anthropic_contexts
+            .iter()
+            .any(|entry| entry.email == "alice@test.invalid" && entry.identity_uuid == uuid));
         assert_eq!(
             prof.by_slot.get("1").copied(),
             Some(uuid),
@@ -1956,148 +1950,73 @@ mod tests {
         let identity_path = identity_json_path_for(base, uuid);
         assert!(
             identity_path.exists(),
-            "identity.json must exist after mint_for_login"
+            "identity.json must exist after the verified mint"
         );
     }
 
-    /// R2-HIGH-1: Simulates the crash window for the NEW write order in
-    /// `mint_for_login`: mapping written but identity.json NOT yet materialized.
-    /// A re-call with the same email must reuse the same UUID and create the
-    /// missing identity.json without creating any orphan directory.
+    /// Missing published metadata causes verified re-login refusal, preserving mapping/credential bytes and creating no orphan.
     #[test]
-    fn mint_for_login_partial_crash_no_orphan() {
-        // Arrange: first call — completes normally
+    fn verified_mint_partial_crash_no_orphan() {
         let dir = TempDir::new().unwrap();
         let base = dir.path();
-        let uuid_a = {
-            let lock = crate::accounts::profiles_lock::ProfilesFileLock::acquire(base).unwrap();
-            mint_for_login(&lock, base, 1, "alice@test.invalid").expect("first mint")
-        };
-
-        // Simulate crash window: mapping was written (step 1 done), but
-        // identity.json was not materialized (step 2 not done).
+        let uuid_a = fixture_verified_mint(base, 1, "alice@test.invalid").unwrap();
         let identity_path = identity_json_path_for(base, uuid_a);
-        std::fs::remove_file(&identity_path).expect("remove identity.json to simulate crash");
-        assert!(!identity_path.exists(), "identity.json must be gone");
-
-        // Act: re-call after simulated crash
-        let uuid_retry = {
-            let lock = crate::accounts::profiles_lock::ProfilesFileLock::acquire(base).unwrap();
-            mint_for_login(&lock, base, 1, "alice@test.invalid").expect("retry must succeed")
-        };
-
-        // Assert: same UUID reused (no churn via by_email lookup)
-        assert_eq!(
-            uuid_a, uuid_retry,
-            "UUID must be reused from by_email — no churn"
-        );
-
-        // identity.json must now exist
+        std::fs::remove_file(&identity_path).unwrap();
+        let before = walkdir_bytes(base);
         assert!(
-            identity_path.exists(),
-            "identity.json must be re-created after retry"
+            fixture_verified_mint(base, 1, "alice@test.invalid").is_err(),
+            "missing published metadata must not be repaired by email"
         );
-
-        // No orphan UUID directory created
-        let identities_root = base.join("identities");
-        let uuid_dirs: Vec<_> = std::fs::read_dir(&identities_root)
-            .unwrap()
-            .flatten()
-            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-            .collect();
+        assert!(!identity_path.exists());
         assert_eq!(
-            uuid_dirs.len(),
-            1,
-            "exactly one UUID directory must exist (no orphan): dirs = {:?}",
-            uuid_dirs.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+            profiles::load(&profiles::profiles_path(base))
+                .unwrap()
+                .by_slot["1"],
+            uuid_a
+        );
+        assert_eq!(
+            walkdir_bytes(base),
+            before,
+            "refusal must not create a new orphan or replace existing grant bytes"
+        );
+        assert_eq!(
+            std::fs::read_dir(base.join("identities")).unwrap().count(),
+            1
         );
     }
 
-    /// R2-HIGH-1: When `mint_for_login` is called for an email whose
-    /// `identity.json` already exists (e.g. `mint_slot` wrote it first),
-    /// the file must be preserved without overwriting.
+    /// Two slots with the same verified email/account/organization tuple share one identity; email alone is insufficient.
     #[test]
-    fn mint_for_login_reuses_uuid_when_identity_path_already_exists() {
-        // Arrange: first, run the Pass-0 mint to create identity.json via mint_slot
-        let dir = make_legacy_base(1);
-        let base = dir.path();
-        run_if_unsentineled(base).expect("Pass 0 must succeed");
-
-        let prof = profiles::load(&profiles::profiles_path(base)).unwrap();
-        let uuid_from_pass0 = prof.by_slot["1"];
-        let identity_path = identity_json_path_for(base, uuid_from_pass0);
-        let content_before = std::fs::read_to_string(&identity_path).unwrap();
-        let json_before: serde_json::Value = serde_json::from_str(&content_before).unwrap();
-        let created_at_before = json_before["created_at"].as_str().unwrap().to_string();
-
-        // Delete sentinel so next Pass-0 would re-run if called, but we're
-        // calling mint_for_login directly here.
-
-        // Act: call mint_for_login for the same email+slot
-        let uuid_from_login = {
-            let lock = crate::accounts::profiles_lock::ProfilesFileLock::acquire(base).unwrap();
-            mint_for_login(&lock, base, 1, "user-1@test.invalid")
-                .expect("mint_for_login must succeed")
-        };
-
-        // Assert: same UUID, identity.json unchanged
-        assert_eq!(
-            uuid_from_pass0, uuid_from_login,
-            "mint_for_login must reuse the UUID from Pass 0"
-        );
-
-        let content_after = std::fs::read_to_string(&identity_path).unwrap();
-        let json_after: serde_json::Value = serde_json::from_str(&content_after).unwrap();
-        let created_at_after = json_after["created_at"].as_str().unwrap();
-        assert_eq!(
-            created_at_before, created_at_after,
-            "identity.json must not be overwritten — created_at must be preserved"
-        );
-    }
-
-    /// R1 H5-DA fix-wave regression: two slots that authenticate to the SAME
-    /// email MUST share a single identity (UUID). Without this invariant a
-    /// multi-slot-same-account install would write the same OAuth credentials
-    /// to two `identities/<UUID>/credentials.json` paths, doubling the daemon's
-    /// refresh fanout and producing token-ping-pong between the two siblings.
-    ///
-    /// The shared invariant is encoded structurally by `mint_for_login`'s
-    /// `by_email` lookup at :289 — the first slot mints `UUID_A` and writes
-    /// `by_email[email] = UUID_A`; the second slot reads the same email and
-    /// reuses `UUID_A` via the `current_profiles.by_email.get(...)` branch.
-    /// This test pins that behaviour so any refactor of the chokepoint must
-    /// preserve it.
-    #[test]
-    fn mint_for_login_two_slots_same_email_share_identity() {
+    fn verified_mint_two_slots_same_email_share_identity() {
         let dir = TempDir::new().unwrap();
         let base = dir.path();
 
         let uuid_a = {
-            let lock = crate::accounts::profiles_lock::ProfilesFileLock::acquire(base).unwrap();
-            mint_for_login(&lock, base, 1, "shared@test.invalid")
+            fixture_verified_mint(base, 1, "shared@test.invalid")
                 .expect("first slot mint must succeed")
         };
 
         let uuid_b = {
-            let lock = crate::accounts::profiles_lock::ProfilesFileLock::acquire(base).unwrap();
-            mint_for_login(&lock, base, 2, "shared@test.invalid")
+            fixture_verified_mint(base, 2, "shared@test.invalid")
                 .expect("second slot mint must succeed")
         };
 
         assert_eq!(
             uuid_a, uuid_b,
-            "two slots with the same email MUST share one UUID (by_email reuse)"
+            "two slots with the same verified full context MUST share one UUID"
         );
 
         // Both slot mappings point at the shared UUID.
         let prof = profiles::load(&profiles::profiles_path(base)).unwrap();
         assert_eq!(prof.by_slot.get("1").copied(), Some(uuid_a));
         assert_eq!(prof.by_slot.get("2").copied(), Some(uuid_a));
+        assert!(prof.by_email.is_empty());
         assert_eq!(
-            prof.by_email.get("shared@test.invalid").copied(),
-            Some(uuid_a),
-            "by_email mapping must resolve to the shared UUID"
+            prof.anthropic_contexts.len(),
+            1,
+            "same full context has one owner"
         );
+        assert_eq!(prof.anthropic_contexts[0].identity_uuid, uuid_a);
 
         // Exactly one identity dir on disk — no orphan from the second mint.
         let identities_root = base.join("identities");
@@ -2262,14 +2181,12 @@ mod tests {
     #[test]
     fn write_identity_json_no_tmp_remains_on_success() {
         let dir = TempDir::new().unwrap();
-        let parent = dir
-            .path()
-            .join("identities")
-            .join("550e8400-e29b-41d4-a716-000000000003");
+        let uuid = IdentityId::new_v4();
+        let parent = crate::accounts::identity_store::identity_path(dir.path(), uuid);
         std::fs::create_dir_all(&parent).unwrap();
-        let dest = parent.join("identity.json");
+        let dest = identity_json_path_for(dir.path(), uuid);
 
-        let result = write_identity_json(&dest, r#"{"email":"ok@test.invalid"}"#);
+        let result = write_identity_json(dir.path(), uuid, r#"{"email":"ok@test.invalid"}"#);
 
         assert!(
             result.is_ok(),
@@ -2408,7 +2325,6 @@ mod tests {
 
     /// Walk a directory tree and return (abs_path, bytes) for every file.
     /// Returns empty vec if the directory does not exist.
-    #[cfg(feature = "test-utils")]
     fn walkdir_bytes(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
         if !dir.exists() {
             return vec![];
@@ -2431,68 +2347,10 @@ mod tests {
         result
     }
 
-    /// R3-HIGH-1: `mint_for_login` with an unknown/sentinel email MUST return
-    /// `Err` and MUST NOT create any identity files or profile entries.
-    ///
-    /// This guards the normalizer's "unknown" sentinel rejection path inside
-    /// `mint_for_login` (line ~280). The variant "unknown" is CC's sentinel
-    /// value when `oauthAccount.emailAddress` is absent from credentials — it
-    /// is NOT a valid email and must not produce an identity record.
+    /// Verified commit plus receipt finalization copies legacy settings into the new UUID identity.
     #[test]
-    fn mint_for_login_with_unknown_email_returns_skip() {
-        // Arrange: fresh base dir with no existing profiles or identity dirs
-        let dir = TempDir::new().unwrap();
-        let base = dir.path();
-
-        // Act: call mint_for_login with the "unknown" sentinel email
-        let lock = crate::accounts::profiles_lock::ProfilesFileLock::acquire(base).unwrap();
-        let result = mint_for_login(&lock, base, 1, "unknown");
-        drop(lock);
-
-        // Assert: Err returned — normalizer rejected the sentinel email
-        assert!(
-            result.is_err(),
-            "mint_for_login must return Err for 'unknown' sentinel email"
-        );
-        let err_msg = result.unwrap_err();
-        assert!(
-            err_msg.contains("identity_mint_failed"),
-            "error must use fixed-vocabulary prefix, got: {err_msg}"
-        );
-
-        // Assert: no identities/ directory created
-        let identities_dir = base.join("identities");
-        assert!(
-            !identities_dir.exists(),
-            "identities/ dir must not be created for unknown email"
-        );
-
-        // Assert: profiles.json either absent or has empty by_slot/by_email
-        // (no partial mapping written for slot 1)
-        let profiles_path = crate::accounts::profiles::profiles_path(base);
-        if profiles_path.exists() {
-            let profiles =
-                crate::accounts::profiles::load(&profiles_path).expect("profiles must be valid");
-            assert!(
-                profiles.by_slot.is_empty() && profiles.by_email.is_empty(),
-                "no mapping must be written for unknown email, got: {:?}",
-                profiles
-            );
-        }
-        // If profiles.json doesn't exist, that's also correct (nothing was written).
-    }
-
-    // ── M2-3 acceptance test ──────────────────────────────────────────────────
-
-    /// Criterion 4: `mint_for_login` seeds `identities/<UUID>/settings.json`
-    /// from `config-<N>/settings.json` within the same `ProfilesFileLock` window.
-    ///
-    /// Arrange: a base dir with config-2/settings.json containing `{"login_key": 99}`.
-    /// After calling `mint_for_login`, the UUID's settings.json must contain that key.
-    #[test]
-    fn finalize_login_seeds_uuid_settings_for_new_account() {
+    fn verified_mint_seeds_uuid_settings_for_new_account() {
         use crate::accounts::identity_store::settings_path_for;
-        use crate::accounts::profiles_lock::ProfilesFileLock;
 
         // Arrange: create the base dir with config-2 + settings.json
         let dir = TempDir::new().unwrap();
@@ -2502,21 +2360,20 @@ mod tests {
         std::fs::create_dir_all(&config2).unwrap();
         std::fs::write(config2.join("settings.json"), r#"{"login_key": 99}"#).unwrap();
 
-        // Acquire the ProfilesFileLock (mint_for_login requires the lock witness)
+        // Acquire the ProfilesFileLock (the verified mint requires the lock witness)
         let profiles_path = crate::accounts::profiles::profiles_path(base);
         std::fs::create_dir_all(profiles_path.parent().unwrap()).unwrap();
-        let lock = ProfilesFileLock::acquire(base).expect("must acquire profiles lock");
 
         // Act
-        let result = mint_for_login(&lock, base, 2, "login-test@test.invalid");
-        assert!(result.is_ok(), "mint_for_login must succeed: {result:?}");
+        let result = fixture_verified_mint(base, 2, "login-test@test.invalid");
+        assert!(result.is_ok(), "verified mint must succeed: {result:?}");
         let uuid = result.unwrap();
 
         // Assert: identities/<UUID>/settings.json was seeded
         let uuid_settings = settings_path_for(base, uuid);
         assert!(
             uuid_settings.exists(),
-            "mint_for_login must seed identities/<UUID>/settings.json"
+            "verified mint must seed identities/<UUID>/settings.json"
         );
         let content = std::fs::read_to_string(&uuid_settings).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -2540,7 +2397,7 @@ mod tests {
     /// `by_slot` + `by_email` are now populated. This is the v2.6.x →
     /// v2.7.x upgrade compat seam — `accounts` is the read-only source
     /// for email resolution during the first Pass 0; subsequent mints
-    /// (via `mint_for_login`) source emails from `.claude.json` and
+    /// (via the verified Anthropic login commit) source emails from `.claude.json` and
     /// also do not write `accounts`.
     #[test]
     fn identity_mint_pass0_does_not_populate_v1_accounts_map() {
@@ -2581,18 +2438,16 @@ mod tests {
             "M4-9: Pass 0 must populate by_slot — that is the new identity channel"
         );
         assert!(
-            !pf.by_email.is_empty(),
-            "M4-9: Pass 0 must populate by_email — that is the new email channel"
+            pf.by_email.is_empty(),
+            "M4-9: Pass 0 must preserve the empty legacy index without treating email as ownership"
         );
     }
 
     // ── RN1-D1 tests ────────────────────────────────────────────────────────
 
-    /// RN1-D1 (Finding-3d decouple): `mint_for_login` keys `by_email` by the
-    /// caller-supplied OAuth email, not by the display label. This test
-    /// verifies the login path is correctly isolated from the rename label.
+    /// Verified profile email becomes part of the full context index; display labels cannot supply identity authority.
     #[test]
-    fn mint_for_login_email_arg_is_oauth_not_label() {
+    fn verified_mint_email_arg_is_oauth_not_label() {
         // Arrange: empty base dir
         let dir = TempDir::new().unwrap();
         let base = dir.path();
@@ -2600,21 +2455,14 @@ mod tests {
         let pf_path = profiles::profiles_path(base);
         std::fs::create_dir_all(pf_path.parent().unwrap()).unwrap();
 
-        let lock = ProfilesFileLock::acquire(base).unwrap();
-
         // Act: mint with real OAuth email "oauth@example.com"
-        let result = mint_for_login(&lock, base, 1, "oauth@example.com");
-        drop(lock);
+        let result = fixture_verified_mint(base, 1, "oauth@example.com");
 
         // Assert: succeeded and by_email contains "oauth@example.com"
-        assert!(result.is_ok(), "mint_for_login must succeed: {result:?}");
+        assert!(result.is_ok(), "verified mint must succeed: {result:?}");
         let pf = profiles::load(&pf_path).unwrap();
-        assert!(
-            pf.by_email.contains_key("oauth@example.com"),
-            "by_email must contain 'oauth@example.com' after mint_for_login; \
-             keys: {:?}",
-            pf.by_email.keys().collect::<Vec<_>>()
-        );
+        assert!(pf.by_email.is_empty());
+        assert_eq!(pf.anthropic_contexts[0].email, "oauth@example.com");
     }
 
     // ── RN1-D R2 tests: login-path rename-label capture ─────────────────────
@@ -2627,11 +2475,11 @@ mod tests {
     /// the operator to "log in again to mint UUIDs". Before this fix, that
     /// instruction silenced the warning (the `!by_slot` predicate stopped
     /// matching after mint) WITHOUT preserving the label — RN1-F's `accounts`
-    /// deletion then silently dropped it. This test pins that `mint_for_login`
+    /// deletion then silently dropped it. This test pins that the verified mint
     /// now copies the rename label into the A1 `by_slot_label[1]` channel,
     /// making the operator instruction true.
     #[test]
-    fn mint_for_login_captures_pure_legacy_rename_label() {
+    fn verified_mint_captures_pure_legacy_rename_label() {
         use crate::accounts::profiles;
 
         let dir = TempDir::new().unwrap();
@@ -2652,11 +2500,9 @@ mod tests {
         );
         profiles::save(&pf_path, &initial_pf).unwrap();
 
-        let lock = ProfilesFileLock::acquire(base).unwrap();
-        let result = mint_for_login(&lock, base, 1, "oauth@example.com");
-        drop(lock);
+        let result = fixture_verified_mint(base, 1, "oauth@example.com");
 
-        assert!(result.is_ok(), "mint_for_login must succeed: {result:?}");
+        assert!(result.is_ok(), "verified mint must succeed: {result:?}");
         let pf = profiles::load(&pf_path).unwrap();
         assert_eq!(
             pf.by_slot_label.get("1").map(String::as_str),
@@ -2674,7 +2520,7 @@ mod tests {
     /// first arm — equal to the OAuth email (raw or normalized) means "not a
     /// rename".
     #[test]
-    fn mint_for_login_does_not_capture_bare_oauth_email_as_label() {
+    fn verified_mint_does_not_capture_bare_oauth_email_as_label() {
         use crate::accounts::profiles;
 
         let dir = TempDir::new().unwrap();
@@ -2695,11 +2541,9 @@ mod tests {
         );
         profiles::save(&pf_path, &initial_pf).unwrap();
 
-        let lock = ProfilesFileLock::acquire(base).unwrap();
-        let result = mint_for_login(&lock, base, 2, "oauth2@example.com");
-        drop(lock);
+        let result = fixture_verified_mint(base, 2, "oauth2@example.com");
 
-        assert!(result.is_ok(), "mint_for_login must succeed: {result:?}");
+        assert!(result.is_ok(), "verified mint must succeed: {result:?}");
         let pf = profiles::load(&pf_path).unwrap();
         assert!(
             !pf.by_slot_label.contains_key("2"),
@@ -2714,7 +2558,7 @@ mod tests {
     /// value — same precedence rule as the relocation pass's idempotency
     /// guarantee.
     #[test]
-    fn mint_for_login_preserves_existing_by_slot_label() {
+    fn verified_mint_preserves_existing_by_slot_label() {
         use crate::accounts::profiles;
 
         let dir = TempDir::new().unwrap();
@@ -2737,11 +2581,9 @@ mod tests {
             .insert("3".into(), "User Set Later".into());
         profiles::save(&pf_path, &initial_pf).unwrap();
 
-        let lock = ProfilesFileLock::acquire(base).unwrap();
-        let result = mint_for_login(&lock, base, 3, "oauth3@example.com");
-        drop(lock);
+        let result = fixture_verified_mint(base, 3, "oauth3@example.com");
 
-        assert!(result.is_ok(), "mint_for_login must succeed: {result:?}");
+        assert!(result.is_ok(), "verified mint must succeed: {result:?}");
         let pf = profiles::load(&pf_path).unwrap();
         assert_eq!(
             pf.by_slot_label.get("3").map(String::as_str),
@@ -2759,7 +2601,7 @@ mod tests {
     /// promoted into the active label channel; same shapes RN1-D3 rejects on
     /// the `rename_account` write path.
     #[test]
-    fn mint_for_login_skips_malformed_control_char_label() {
+    fn verified_mint_skips_malformed_control_char_label() {
         use crate::accounts::profiles;
 
         let dir = TempDir::new().unwrap();
@@ -2779,11 +2621,9 @@ mod tests {
         );
         profiles::save(&pf_path, &initial_pf).unwrap();
 
-        let lock = ProfilesFileLock::acquire(base).unwrap();
-        let result = mint_for_login(&lock, base, 4, "oauth4@example.com");
-        drop(lock);
+        let result = fixture_verified_mint(base, 4, "oauth4@example.com");
 
-        assert!(result.is_ok(), "mint_for_login must succeed: {result:?}");
+        assert!(result.is_ok(), "verified mint must succeed: {result:?}");
         let pf = profiles::load(&pf_path).unwrap();
         assert!(
             !pf.by_slot_label.contains_key("4"),
@@ -2797,7 +2637,7 @@ mod tests {
     /// chars) MUST NOT be relocated — same read-side parity with RN1-D3's
     /// oversize rejection on the write path.
     #[test]
-    fn mint_for_login_skips_oversize_label() {
+    fn verified_mint_skips_oversize_label() {
         use crate::accounts::profiles;
 
         let dir = TempDir::new().unwrap();
@@ -2817,11 +2657,9 @@ mod tests {
         );
         profiles::save(&pf_path, &initial_pf).unwrap();
 
-        let lock = ProfilesFileLock::acquire(base).unwrap();
-        let result = mint_for_login(&lock, base, 5, "oauth5@example.com");
-        drop(lock);
+        let result = fixture_verified_mint(base, 5, "oauth5@example.com");
 
-        assert!(result.is_ok(), "mint_for_login must succeed: {result:?}");
+        assert!(result.is_ok(), "verified mint must succeed: {result:?}");
         let pf = profiles::load(&pf_path).unwrap();
         assert!(
             !pf.by_slot_label.contains_key("5"),
@@ -2831,19 +2669,7 @@ mod tests {
         );
     }
 
-    /// RN1-D1 (Finding-3d decouple): Pass-0 (`run_if_unsentineled`) — when
-    /// `AccountInfo.oauth_email` differs from `label`, Pass-0 MUST key
-    /// `by_email` by `oauth_email`, not by `label`.
-    ///
-    /// Setup: slot 1 has `accounts[1].email = "My Rename"` (the label),
-    /// C1+C2 fix (Finding-3d): `discover_anthropic` sources `oauth_email` from
-    /// the authenticated credential file (`oauthAccount.emailAddress`), NOT from
-    /// `by_email` reverse-lookup. This test verifies that even when
-    /// `accounts[1].email` holds a rename label, Pass-0 writes the credential
-    /// file's email to `by_email`, not the label.
-    ///
-    /// Also serves as the AC test for the C2 structural fix:
-    /// `discover_anthropic_populates_oauth_email_from_credential_file`.
+    /// Pass 0 preserves an existing legacy email index and never creates ownership from a display label.
     #[test]
     fn by_email_keyed_from_oauth_email_not_label_in_pass0() {
         use crate::accounts::identity_store::{self, IdentityId};
@@ -2887,6 +2713,12 @@ mod tests {
         );
         profiles::save(&pf_path, &initial_pf).unwrap();
 
+        write_identity_json(
+            base,
+            uuid,
+            &identity_json_content("user-1@test.invalid", &now_rfc3339()),
+        )
+        .unwrap();
         // Act: run Pass-0 (the function that processes discover_anthropic output)
         // by calling run_if_unsentineled on this prepared base dir.
         let summary = run_if_unsentineled(base);
@@ -3093,6 +2925,196 @@ mod tests {
             content.contains("\"codex\""),
             "identity.json must carry provider=\"codex\"; content: {content}"
         );
+    }
+
+    #[test]
+    fn mint_for_codex_login_locked_recheck_refuses_tombstoned_uuid() {
+        for missing_metadata in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let id = call_mint_for_codex_login(dir.path(), 12, Some("locked-fixture")).unwrap();
+            let metadata_path = identity_json_path_for(dir.path(), id);
+            let metadata = std::fs::read(&metadata_path).unwrap();
+            if missing_metadata {
+                std::fs::remove_file(&metadata_path).unwrap();
+            }
+            crate::accounts::identity_store::mark_identity_removed(dir.path(), id);
+            let before = std::fs::read(profiles::profiles_path(dir.path())).unwrap();
+            let lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+            // Model a fast resolver that could not read the snapshot. The real
+            // locked loader still reaches the bound UUID and its repair path.
+            let result = mint_for_codex_login_with_resolved_uuid(
+                &lock,
+                dir.path(),
+                12,
+                Some("locked-fixture"),
+                None,
+            );
+            assert!(
+                result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.contains("bound_identity_removed")),
+                "locked tombstone must refuse reuse, got {result:?}"
+            );
+            assert_eq!(
+                std::fs::read(profiles::profiles_path(dir.path())).unwrap(),
+                before
+            );
+            if missing_metadata {
+                assert!(!metadata_path.exists());
+            } else {
+                assert_eq!(std::fs::read(metadata_path).unwrap(), metadata);
+            }
+        }
+    }
+
+    #[test]
+    fn mint_for_codex_login_email_marker_stat_failure_preserves_identity() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let id = call_mint_for_codex_login(base, 12, Some("stat-fixture")).unwrap();
+        let sibling = call_mint_for_codex_login(base, 13, Some("sibling-fixture")).unwrap();
+        let path = profiles::profiles_path(base);
+        let metadata_path = identity_json_path_for(base, id);
+        let sibling_path = identity_json_path_for(base, sibling);
+        let canonical = crate::accounts::identity_store::credentials_codex_path_for(base, id);
+        // The mint path never parses credentials. This non-live fake payload
+        // discriminates any accidental canonical overwrite or deletion.
+        std::fs::write(&canonical, b"FAKE-CANONICAL-PRESERVE").unwrap();
+        let _lock = ProfilesFileLock::acquire(base).unwrap();
+        let mut profiles = profiles::load(&path).unwrap();
+        assert_eq!(profiles.by_slot.remove("12"), Some(id));
+        profiles::save(&path, &profiles).unwrap();
+        let profile_before = std::fs::read(&path).unwrap();
+        let metadata_before = std::fs::read(&metadata_path).unwrap();
+        let sibling_before = std::fs::read(&sibling_path).unwrap();
+        let canonical_before = std::fs::read(&canonical).unwrap();
+        let entries = || {
+            let mut paths: Vec<_> =
+                std::fs::read_dir(crate::accounts::identity_store::identities_dir(base))
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect();
+            paths.sort();
+            paths
+        };
+        let entries_before = entries();
+        let marker = crate::accounts::identity_store::identity_removed_marker_path(base, id);
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+        ] {
+            let calls = std::cell::Cell::new(0);
+            let result = mint_for_codex_login_with_resolved_uuid_and_stat(
+                &_lock,
+                base,
+                12,
+                Some("stat-fixture"),
+                None,
+                |lookup| {
+                    assert_eq!(lookup, marker.as_path());
+                    calls.set(calls.get() + 1);
+                    Err(std::io::Error::new(kind, "PRIVATE-STAT-PAYLOAD"))
+                },
+            );
+            assert_eq!(
+                calls.get(),
+                1,
+                "actual mint must reach the strict tombstone lookup"
+            );
+            let error = result
+                .expect_err("indeterminate tombstone lookup must refuse mint before publication");
+            assert!(error.contains("removed_marker_read_refused"));
+            assert!(!error.contains("PRIVATE-STAT-PAYLOAD"));
+            assert_eq!(std::fs::read(&path).unwrap(), profile_before);
+            assert_eq!(std::fs::read(&metadata_path).unwrap(), metadata_before);
+            assert_eq!(std::fs::read(&sibling_path).unwrap(), sibling_before);
+            assert_eq!(std::fs::read(&canonical).unwrap(), canonical_before);
+            assert_eq!(
+                entries(),
+                entries_before,
+                "refusal must not mint or orphan an identity"
+            );
+        }
+    }
+
+    #[test]
+    fn mint_for_codex_login_stale_email_tombstone_mints_fresh_uuid() {
+        let dir = TempDir::new().unwrap();
+        let id = call_mint_for_codex_login(dir.path(), 12, Some("email-fixture")).unwrap();
+        crate::accounts::identity_store::mark_identity_removed(dir.path(), id);
+        std::fs::remove_dir_all(crate::accounts::identity_store::identity_path(
+            dir.path(),
+            id,
+        ))
+        .unwrap();
+        let path = profiles::profiles_path(dir.path());
+        {
+            let _lock = ProfilesFileLock::acquire(dir.path()).unwrap();
+            let mut profiles = profiles::load(&path).unwrap();
+            assert_eq!(profiles.by_slot.remove("12"), Some(id));
+            assert_eq!(
+                profiles.by_email.get("codex:email-fixture").copied(),
+                Some(id)
+            );
+            profiles::save(&path, &profiles).unwrap();
+        }
+        let tombstone =
+            crate::accounts::identity_store::identity_removed_marker_path(dir.path(), id);
+        let tombstone_before = std::fs::read(&tombstone).unwrap();
+        let fresh = call_mint_for_codex_login(dir.path(), 12, Some("email-fixture"))
+            .expect("stale unbound tombstone email key must mint a fresh UUID");
+        assert_ne!(fresh, id, "removed UUID must never be resurrected");
+        let profiles = profiles::load(&path).unwrap();
+        assert_eq!(profiles.by_slot.get("12").copied(), Some(fresh));
+        assert_eq!(
+            profiles.by_email.get("codex:email-fixture").copied(),
+            Some(fresh)
+        );
+        assert_eq!(std::fs::read(&tombstone).unwrap(), tombstone_before);
+        assert!(crate::accounts::identity_store::is_identity_removed(
+            dir.path(),
+            id
+        ));
+        assert!(!crate::accounts::identity_store::identity_path(dir.path(), id).exists());
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(identity_json_path_for(dir.path(), fresh)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["provider"], "codex");
+        assert_eq!(
+            call_mint_for_codex_login(dir.path(), 12, Some("email-fixture")).unwrap(),
+            fresh
+        );
+    }
+
+    #[test]
+    fn mint_for_codex_login_refuses_tombstoned_bound_uuid_without_mutation() {
+        let dir = TempDir::new().unwrap();
+        let id = call_mint_for_codex_login(dir.path(), 12, Some("fixture-codex-account")).unwrap();
+        crate::accounts::identity_store::mark_identity_removed(dir.path(), id);
+        let metadata = std::fs::read(identity_json_path_for(dir.path(), id)).unwrap();
+        let before = std::fs::read(profiles::profiles_path(dir.path())).unwrap();
+        let result = call_mint_for_codex_login(dir.path(), 12, Some("fixture-codex-account"));
+        assert!(
+            result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.contains("bound_identity_removed")),
+            "tombstoned binding must refuse mint reuse, got {result:?}"
+        );
+        assert_eq!(
+            std::fs::read(identity_json_path_for(dir.path(), id)).unwrap(),
+            metadata
+        );
+        assert_eq!(
+            std::fs::read(profiles::profiles_path(dir.path())).unwrap(),
+            before
+        );
+        assert!(crate::accounts::identity_store::is_identity_removed(
+            dir.path(),
+            id
+        ));
     }
 
     /// Idempotency: calling `mint_for_codex_login` twice on the same slot
@@ -3369,5 +3391,54 @@ mod tests {
             "identity.json must not contain the injected portion of the malicious hint; \
              content: {content:?}"
         );
+    }
+    /// r4 LEAD: minting from legacy numbered credential files cannot, by itself, put two
+    /// identities on one pair. Two migration slots whose `credentials/N.json` hold the SAME
+    /// bytes each receive their own UUID with metadata only; no credential bytes are copied
+    /// into either identity's canonical, so there is no shared pair to race over. Whether
+    /// an older release already populated both canonicals is a property of the user's data
+    /// on disk, not of this mint.
+    #[test]
+    fn r4_lead_pass0_mint_copies_no_credentials_so_identical_numbered_files_share_nothing() {
+        let dir = make_legacy_base(2);
+        let base = dir.path();
+        let first = std::fs::read(base.join("credentials/1.json")).unwrap();
+        std::fs::write(base.join("credentials/2.json"), &first).unwrap();
+        let summary = run_if_unsentineled(base).unwrap();
+        assert_eq!(summary.slots_fresh, 2, "both slots mint");
+        let pf = profiles::load(&profiles::profiles_path(base)).unwrap();
+        let one = pf.by_slot["1"];
+        let two = pf.by_slot["2"];
+        assert_ne!(one, two, "each slot gets its own identity");
+        for id in [one, two] {
+            let canonical = crate::accounts::identity_store::credentials_path_for(base, id);
+            assert!(
+                std::fs::symlink_metadata(&canonical).is_err(),
+                "the mint must not copy a numbered credential into an identity canonical"
+            );
+        }
+    }
+
+    #[test]
+    fn org_identity_regression_pass0_never_reuses_legacy_email_uuid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+        let legacy = IdentityId::new_v4();
+        let mut pf = profiles::ProfilesFile::empty();
+        pf.by_email.insert("same@test.invalid".into(), legacy);
+        profiles::save(&profiles::profiles_path(base), &pf).unwrap();
+        let lock = ProfilesFileLock::acquire(base).unwrap();
+        assert!(matches!(
+            mint_slot(&lock, base, 1, Some("same@test.invalid")).unwrap(),
+            SlotMintOutcome::Fresh(_)
+        ));
+        assert!(matches!(
+            mint_slot(&lock, base, 2, Some("same@test.invalid")).unwrap(),
+            SlotMintOutcome::Fresh(_)
+        ));
+        let after = profiles::load(&profiles::profiles_path(base)).unwrap();
+        assert_ne!(after.by_slot.get("1"), after.by_slot.get("2"));
+        assert_ne!(after.by_slot.get("1"), Some(&legacy));
+        assert_eq!(after.by_email, pf.by_email);
     }
 }

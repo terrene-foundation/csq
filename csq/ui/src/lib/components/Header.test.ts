@@ -18,13 +18,14 @@ import { tick } from "svelte";
 // in SettingsPopover.test.ts.
 
 const mockInvoke = vi.fn();
+const mockHomeDir = vi.fn();
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => mockInvoke(...args),
 }));
 
 vi.mock("@tauri-apps/api/path", () => ({
-  homeDir: () => Promise.resolve("/home/test"),
+  homeDir: () => mockHomeDir(),
   join: (...parts: string[]) => Promise.resolve(parts.join("/")),
 }));
 
@@ -35,6 +36,24 @@ vi.mock("@tauri-apps/api/app", () => ({
 }));
 
 import Header from "./Header.svelte";
+
+async function settle() {
+  for (let i = 0; i < 8; i++) await tick();
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function statusCalls() {
+  return mockInvoke.mock.calls.filter(([cmd]) => cmd === "get_daemon_status");
+}
 
 // Defaults cover Header's own get_daemon_status call AND the child
 // SettingsPopover's fetchAll() chain so neither component throws.
@@ -60,11 +79,13 @@ function setupMocks(overrides: Record<string, unknown> = {}) {
 describe("Header", () => {
   beforeEach(() => {
     mockInvoke.mockReset();
+    mockHomeDir.mockReset().mockResolvedValue("/home/test");
     setupMocks();
   });
 
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
   });
 
   // ── Static content ────────────────────────────────────────────
@@ -91,6 +112,35 @@ describe("Header", () => {
   // The header keeps a compact dot + label ("Running"/"Stopped"). Detailed
   // daemon status info (with the longer "daemon running" phrasing) lives
   // in the SettingsPopover About section.
+
+  it("surfaces the keychain orphan sweep's warning and action-needed states", async () => {
+    setupMocks({
+      get_daemon_status: {
+        running: true,
+        pid: 42,
+        keychain_orphans: { level: "needs_action", summary: "needs action: enumeration_unavailable" },
+      },
+    });
+    const { container } = render(Header);
+    await settle();
+    const badge = container.querySelector('[data-testid="keychain-orphans"]');
+    expect(badge?.textContent?.trim()).toBe("Keychain: action needed");
+    expect(badge?.getAttribute("title")).toContain("enumeration_unavailable");
+  });
+
+  it("shows nothing for the orphan sweep when it is ok, info, or never published", async () => {
+    for (const keychain_orphans of [
+      undefined,
+      { level: "ok", summary: "none" },
+      { level: "info", summary: "siblings kept" },
+    ]) {
+      cleanup();
+      setupMocks({ get_daemon_status: { running: true, pid: 42, keychain_orphans } });
+      const { container } = render(Header);
+      await settle();
+      expect(container.querySelector('[data-testid="keychain-orphans"]')).toBeNull();
+    }
+  });
 
   it("shows 'Stopped' label when daemon is not running", async () => {
     setupMocks({ get_daemon_status: { running: false, pid: null } });
@@ -130,6 +180,79 @@ describe("Header", () => {
     await tick();
     const statusLabel = container.querySelector(".status-label");
     expect(statusLabel?.textContent).toBe("Stopped");
+  });
+
+  it("keeps one status read in flight and resumes polling after it settles", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const pending = deferred<{ running: boolean; pid: number | null }>();
+    mockInvoke.mockImplementation((cmd: string) =>
+      cmd === "get_daemon_status"
+        ? pending.promise
+        : Promise.resolve(mockResponses[cmd]),
+    );
+    const { container } = render(Header);
+    await settle();
+    expect(statusCalls()).toHaveLength(1);
+    vi.advanceTimersByTime(30000);
+    await settle();
+    expect(statusCalls()).toHaveLength(1);
+
+    pending.resolve({ running: true, pid: 42 });
+    await settle();
+    expect(container.querySelector(".status-label")?.textContent).toBe("Running");
+    vi.advanceTimersByTime(10000);
+    await settle();
+    expect(statusCalls()).toHaveLength(2);
+  });
+
+  it("resumes status polling after a pending read rejects", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const pending = deferred<unknown>();
+    mockInvoke.mockImplementation((cmd: string) =>
+      cmd === "get_daemon_status"
+        ? pending.promise
+        : Promise.resolve(mockResponses[cmd]),
+    );
+    render(Header);
+    await settle();
+    pending.reject(new Error("slow status failed"));
+    await settle();
+    setupMocks({ get_daemon_status: { running: true, pid: 42 } });
+    vi.advanceTimersByTime(10000);
+    await settle();
+    expect(statusCalls()).toHaveLength(2);
+  });
+
+  it("discards a late status reply and stops polling on unmount", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const pending = deferred<{ running: boolean; pid: number | null }>();
+    mockInvoke.mockImplementation((cmd: string) =>
+      cmd === "get_daemon_status"
+        ? pending.promise
+        : Promise.resolve(mockResponses[cmd]),
+    );
+    const { unmount } = render(Header);
+    await settle();
+    await unmount();
+    const readRunning = vi.fn(() => true);
+    pending.resolve({ get running() { return readRunning(); }, pid: 42 });
+    await settle();
+    // Reading the reply would write daemonRunning after teardown.
+    expect(readRunning).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(30000);
+    await settle();
+    expect(statusCalls()).toHaveLength(1);
+  });
+
+  it("does not start a status invocation if path lookup completes after unmount", async () => {
+    const home = deferred<string>();
+    mockHomeDir.mockReturnValue(home.promise);
+    const { unmount } = render(Header);
+    await settle();
+    await unmount();
+    home.resolve("/home/test");
+    await settle();
+    expect(statusCalls()).toHaveLength(0);
   });
 
   // ── Layout: no inline toggles in the header (post-refactor) ──

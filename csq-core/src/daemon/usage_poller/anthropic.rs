@@ -33,9 +33,36 @@ pub(crate) async fn tick(
     cooldowns: &Arc<Mutex<HashMap<u16, Instant>>>,
     backoffs: &Arc<Mutex<HashMap<u16, u32>>>,
 ) {
+    tick_filtered(base_dir, http_get, cooldowns, backoffs, None).await;
+}
+
+/// Targeted re-poll of ONE slot, used by the rebind wake path
+/// (login-followup LOW-6). It runs the exact same per-account body as
+/// [`tick`] — including the cooldown check, so a wake NEVER overrides an
+/// active 429/failure cooldown — but touches no other slot.
+pub(crate) async fn tick_slot(
+    base_dir: &std::path::Path,
+    http_get: &HttpGetWithRetryAfterFn,
+    cooldowns: &Arc<Mutex<HashMap<u16, Instant>>>,
+    backoffs: &Arc<Mutex<HashMap<u16, u32>>>,
+    slot: u16,
+) {
+    tick_filtered(base_dir, http_get, cooldowns, backoffs, Some(slot)).await;
+}
+
+async fn tick_filtered(
+    base_dir: &std::path::Path,
+    http_get: &HttpGetWithRetryAfterFn,
+    cooldowns: &Arc<Mutex<HashMap<u16, Instant>>>,
+    backoffs: &Arc<Mutex<HashMap<u16, u32>>>,
+    only_slot: Option<u16>,
+) {
     debug!("usage poller tick starting");
 
     let mut accounts = discovery::discover_anthropic(base_dir);
+    if let Some(slot) = only_slot {
+        accounts.retain(|a| a.id == slot);
+    }
     if accounts.len() > MAX_ACCOUNTS_PER_TICK {
         accounts.truncate(MAX_ACCOUNTS_PER_TICK);
     }
@@ -69,13 +96,34 @@ pub(crate) async fn tick(
             }
         };
 
+        let origin = crate::quota::origin::capture(base_dir, account);
+        if origin.stamp().is_none() {
+            // Unreadable/foreign metadata is not an unbound legacy identity.
+            warn!(
+                account = account.get(),
+                error_kind = "anthropic_poller_identity_authority_refused",
+                "usage poller retained quota after unreadable identity custody"
+            );
+            continue;
+        }
+        if matches!(origin, crate::quota::origin::SlotOrigin::Known(_)) {
+            let previous_origin = quota_state::load_state_or_skip(base_dir)
+                .ok()
+                .and_then(|q| q.get_health(account.get()).and_then(|h| h.origin));
+            if previous_origin != origin.stamp() {
+                clear_cooldown(cooldowns, info.id);
+                clear_backoff(backoffs, info.id);
+            }
+        }
+
         // Cooldown check
         if in_cooldown(cooldowns, info.id) {
             skipped += 1;
             let cooldown_until = cooldown_remaining_epoch(cooldowns, info.id);
-            if let Err(e) = record_poll_failure(
+            if let Err(e) = record_poll_failure_guarded(
                 base_dir,
                 account,
+                origin,
                 PollOutcome::SkippedCooldown,
                 cooldown_until,
             ) {
@@ -102,14 +150,34 @@ pub(crate) async fn tick(
         // mapping exists; the M3-7/M4-5 gate guarantees identity
         // credentials are seeded in production once `by_slot` is
         // populated.
-        let canonical =
-            match crate::accounts::profiles::resolve_slot_to_uuid(base_dir, account.get()) {
-                Some(uuid) => crate::accounts::identity_store::credentials_path_for(base_dir, uuid),
-                None => cred_file::canonical_path(base_dir, account),
-            };
-        let creds = match credentials::load(&canonical) {
-            Ok(c) => c,
-            Err(e) => {
+        let slot_uuid = crate::accounts::profiles::resolve_slot_to_uuid(base_dir, account.get());
+        let canonical = match slot_uuid {
+            Some(uuid) => crate::accounts::identity_store::credentials_path_for(base_dir, uuid),
+            None => cred_file::canonical_path(base_dir, account),
+        };
+        // ROOT ruling A (reader parity): adopt a pending post-commit rescue
+        // record BEFORE concluding anything about credential absence. A
+        // rescued pair is a durable credential the canonical file may not
+        // hold yet (the refresh that rotated it lost the commit lock race).
+        let creds = match read_canonical_with_rescue(base_dir, slot_uuid, &canonical) {
+            PollerCredentialRead::Loaded(creds) => creds,
+            PollerCredentialRead::RescuePending(error) => {
+                // NOT `SkippedNoCredentials`: the slot is not credential-less.
+                // The record stays pending and the next tick retries adoption,
+                // so no cooldown and no failure row are recorded for a state
+                // that heals itself. A fixed-vocabulary WARN keeps the wait
+                // visible to the operator without claiming the slot is empty.
+                warn!(
+                    account = info.id,
+                    error_kind = "anthropic_poller_rescue_pending",
+                    reason = %crate::error::redact_tokens(&error.to_string()),
+                    "usage poller: a rescued credential is pending adoption; \
+                     skipping this tick without recording no-credentials"
+                );
+                skipped += 1;
+                continue;
+            }
+            PollerCredentialRead::Unreadable(e) => {
                 warn!(
                     account = info.id,
                     error_kind = "anthropic_poller_credentials_unreadable",
@@ -120,9 +188,13 @@ pub(crate) async fn tick(
                 // here (unlike a 401/429/timeout, which back off a live
                 // upstream response). The daemon simply retries next tick
                 // on the chance credentials appear (e.g. mid-login).
-                if let Err(e) =
-                    record_poll_failure(base_dir, account, PollOutcome::SkippedNoCredentials, None)
-                {
+                if let Err(e) = record_poll_failure_guarded(
+                    base_dir,
+                    account,
+                    origin,
+                    PollOutcome::SkippedNoCredentials,
+                    None,
+                ) {
                     warn!(
                         account = info.id,
                         error_kind = "quota_health_write_failed",
@@ -133,6 +205,9 @@ pub(crate) async fn tick(
                 continue;
             }
         };
+        if crate::quota::origin::capture(base_dir, account) != origin {
+            continue;
+        }
         // Short-lived heap String passed into spawn_blocking; dropped
         // when the blocking task completes. Never logged or stored in
         // long-lived collections. Acceptable per security.md rule 8.
@@ -149,6 +224,12 @@ pub(crate) async fn tick(
         let http = Arc::clone(http_get);
         let join_handle = tokio::task::spawn_blocking(move || poll_anthropic_usage(&token, &http));
         let poll_result = tokio::time::timeout(CALL_TIMEOUT, join_handle).await;
+
+        if crate::quota::origin::capture(base_dir, account) != origin {
+            clear_cooldown(cooldowns, info.id);
+            clear_backoff(backoffs, info.id);
+            continue;
+        }
 
         // Flatten: timeout → join → poll result
         let poll_result = match poll_result {
@@ -183,9 +264,13 @@ pub(crate) async fn tick(
                 increase_backoff(backoffs, info.id);
                 set_cooldown_with_backoff(cooldowns, backoffs, info.id);
                 let cooldown_until = cooldown_remaining_epoch(cooldowns, info.id);
-                if let Err(e) =
-                    record_poll_failure(base_dir, account, PollOutcome::Timeout, cooldown_until)
-                {
+                if let Err(e) = record_poll_failure_guarded(
+                    base_dir,
+                    account,
+                    origin,
+                    PollOutcome::Timeout,
+                    cooldown_until,
+                ) {
                     warn!(
                         account = info.id,
                         error_kind = "quota_health_write_failed",
@@ -201,7 +286,7 @@ pub(crate) async fn tick(
             Ok(Ok(usage)) => {
                 // Write to quota file
                 let base = base_dir.to_path_buf();
-                if let Err(e) = write_usage_to_quota(&base, account, &usage) {
+                if let Err(e) = write_usage_to_quota_guarded(&base, account, &usage, origin) {
                     warn!(account = info.id, "usage poller: failed to write quota");
                     let _ = e;
                 }
@@ -236,6 +321,7 @@ pub(crate) async fn tick(
                 record_and_warn_on_write_failure(
                     base_dir,
                     account,
+                    origin,
                     info.id,
                     PollOutcome::RateLimited,
                     cooldown_until,
@@ -248,6 +334,7 @@ pub(crate) async fn tick(
                 record_and_warn_on_write_failure(
                     base_dir,
                     account,
+                    origin,
                     info.id,
                     PollOutcome::Unauthorized,
                     cooldown_until,
@@ -268,6 +355,7 @@ pub(crate) async fn tick(
                 if record_and_warn_on_write_failure(
                     base_dir,
                     account,
+                    origin,
                     info.id,
                     PollOutcome::Transport,
                     cooldown_until,
@@ -310,6 +398,7 @@ pub(crate) async fn tick(
                 record_and_warn_on_write_failure(
                     base_dir,
                     account,
+                    origin,
                     info.id,
                     PollOutcome::Transport,
                     cooldown_until,
@@ -324,6 +413,7 @@ pub(crate) async fn tick(
                 if record_and_warn_on_write_failure(
                     base_dir,
                     account,
+                    origin,
                     info.id,
                     PollOutcome::Parse,
                     cooldown_until,
@@ -348,6 +438,7 @@ pub(crate) async fn tick(
                 if record_and_warn_on_write_failure(
                     base_dir,
                     account,
+                    origin,
                     info.id,
                     PollOutcome::ServerError,
                     cooldown_until,
@@ -373,6 +464,7 @@ pub(crate) async fn tick(
                 record_and_warn_on_write_failure(
                     base_dir,
                     account,
+                    origin,
                     info.id,
                     PollOutcome::Panic,
                     cooldown_until,
@@ -382,6 +474,82 @@ pub(crate) async fn tick(
     }
 
     debug!(polled, skipped, "usage poller tick complete");
+}
+
+/// Outcome of reading a slot's canonical credential for one poller tick,
+/// after a pending post-commit rescue record has had its chance.
+#[derive(Debug)]
+enum PollerCredentialRead {
+    /// The canonical credential is readable (possibly just adopted).
+    /// Boxed: `CredentialFile` dwarfs the two error variants
+    /// (`clippy::large_enum_variant`), and this value is moved straight into
+    /// the poll body either way.
+    Loaded(Box<credentials::CredentialFile>),
+    /// The canonical is unreadable AND a rescue record is still PENDING: the
+    /// slot is NOT credential-less, so `SkippedNoCredentials` would be a
+    /// false verdict. The next tick retries adoption.
+    RescuePending(crate::error::CredentialError),
+    /// No usable credential and no rescue record — genuine absence.
+    Unreadable(crate::error::CredentialError),
+}
+
+/// Reads `uuid`'s canonical credential, adopting a pending post-commit
+/// rescue record first.
+///
+/// Mirrors `refresh/check.rs`'s `adopt_pending_rescue`: one record read on
+/// the normal path; the commit lock is taken only when a record actually
+/// exists. A refused adoption (live holder, unparseable record) is logged
+/// and left PENDING, and the read then classifies as
+/// [`PollerCredentialRead::RescuePending`] rather than a false "no
+/// credentials" (`guard-reader-writer-parity.md`: the reader must recognise
+/// the rescued form the writer produced).
+///
+/// Rescue records are UUID-keyed and live inside `identities/<uuid>/`, so
+/// the legacy (no `by_slot` mapping) path structurally cannot have one.
+fn read_canonical_with_rescue(
+    base_dir: &std::path::Path,
+    uuid: Option<crate::accounts::identity_store::IdentityId>,
+    canonical: &std::path::Path,
+) -> PollerCredentialRead {
+    let identity_dir = uuid.and_then(|uuid| {
+        crate::accounts::identity_store::credentials_path_for(base_dir, uuid)
+            .parent()
+            .map(std::path::Path::to_path_buf)
+    });
+    if let (Some(uuid), Some(identity_dir)) = (uuid, identity_dir.as_deref()) {
+        if crate::credentials::rescue::rescue_record_pending(identity_dir).is_some() {
+            // D237 round-2 security L3: the poller runs on the async runtime
+            // and is not the tick that must land a rotated pair; a 30 s
+            // canonical wait here would stall the poller and every sibling
+            // task. Adopt with a NON-BLOCKING attempt and keep the record
+            // PENDING on refusal (the refresher tick adopts with the full
+            // commit budget).
+            match crate::credentials::rescue::adopt_rescue_record_nonblocking(
+                base_dir,
+                &uuid.to_string(),
+            ) {
+                Ok(_) => {}
+                Err(error) => warn!(
+                    error_kind = "rescue_adopt_refused",
+                    reason = error.error_kind_tag(),
+                    "usage poller: pending rescue record could not be adopted; left pending"
+                ),
+            }
+        }
+    }
+    match credentials::load(canonical) {
+        Ok(creds) => PollerCredentialRead::Loaded(Box::new(creds)),
+        Err(error) => {
+            let still_pending = identity_dir.as_deref().is_some_and(|identity_dir| {
+                crate::credentials::rescue::rescue_record_pending(identity_dir).is_some()
+            });
+            if still_pending {
+                PollerCredentialRead::RescuePending(error)
+            } else {
+                PollerCredentialRead::Unreadable(error)
+            }
+        }
+    }
 }
 
 /// Parsed usage data from `/api/oauth/usage`.
@@ -573,13 +741,17 @@ fn is_leap_year(y: u64) -> bool {
 ///
 /// Acquires `quota.json.lock` for mutual exclusion with any other
 /// writer (see RT finding #1 — consistency with `state::update_quota`).
-pub(crate) fn write_usage_to_quota(
+pub(crate) fn write_usage_to_quota_guarded(
     base_dir: &std::path::Path,
     account: AccountNum,
     usage: &UsageData,
+    origin: crate::quota::origin::SlotOrigin,
 ) -> Result<(), crate::error::CsqError> {
     let lock_path = quota_state::quota_path(base_dir).with_extension("lock");
     let _guard = crate::platform::lock::lock_file(&lock_path)?;
+    if origin.stamp().is_none() || crate::quota::origin::capture(base_dir, account) != origin {
+        return Ok(());
+    }
     // MED-1 (an internal ticket redteam): load_state_or_skip fails closed instead of
     // falling back to QuotaFile::empty() — a load failure here must SKIP
     // the write, not persist a one-row file that wipes every sibling
@@ -605,6 +777,7 @@ pub(crate) fn write_usage_to_quota(
             five_hour: usage.five_hour.clone(),
             seven_day: usage.seven_day.clone(),
             updated_at: now,
+            extras: Some(serde_json::json!({"csq_anthropic_origin": origin.stamp()})),
             ..Default::default()
         },
     );
@@ -617,6 +790,7 @@ pub(crate) fn write_usage_to_quota(
     quota.set_health(
         account.get(),
         PollerHealth {
+            origin: origin.stamp(),
             last_attempt_at: now,
             last_outcome: PollOutcome::Ok,
             consecutive_failures: 0,
@@ -631,7 +805,7 @@ pub(crate) fn write_usage_to_quota(
 }
 
 /// Current wall-clock time as epoch seconds, `0.0` on a clock error
-/// (mirrors the existing tolerance in [`write_usage_to_quota`] and
+/// (mirrors the existing tolerance in [`write_usage_to_quota_guarded`] and
 /// [`AccountQuota::updated_at`]'s "never polled" sentinel).
 fn now_epoch() -> f64 {
     std::time::SystemTime::now()
@@ -655,7 +829,7 @@ fn cooldown_remaining_epoch(
 
 /// Persists a non-success poll outcome for `account`, merging it into
 /// `quota.json`'s `poller_health` map under the SAME lock and
-/// [`quota_state::save_state`] call pattern as [`write_usage_to_quota`]'s
+/// [`quota_state::save_state`] call pattern as [`write_usage_to_quota_guarded`]'s
 /// success path — never a second lock acquisition for the same tick.
 ///
 /// Returns `Ok(true)` when `outcome` differs from the slot's previously
@@ -670,14 +844,18 @@ fn cooldown_remaining_epoch(
 /// unchanged rather than incrementing it — see that variant's doc.
 /// Every other outcome (including `SkippedNoCredentials`, which is a
 /// genuine failed attempt to reach a usable credential) increments it.
-fn record_poll_failure(
+fn record_poll_failure_guarded(
     base_dir: &std::path::Path,
     account: AccountNum,
+    origin: crate::quota::origin::SlotOrigin,
     outcome: PollOutcome,
     cooldown_until: Option<f64>,
 ) -> Result<bool, crate::error::CsqError> {
     let lock_path = quota_state::quota_path(base_dir).with_extension("lock");
     let _guard = crate::platform::lock::lock_file(&lock_path)?;
+    if origin.stamp().is_none() || crate::quota::origin::capture(base_dir, account) != origin {
+        return Ok(false);
+    }
 
     let mut quota = match quota_state::load_state_or_skip(base_dir) {
         Ok(qf) => qf,
@@ -693,7 +871,10 @@ fn record_poll_failure(
         }
     };
 
-    let previous = quota.get_health(account.get()).copied();
+    let previous = quota
+        .get_health(account.get())
+        .copied()
+        .filter(|health| health.origin == origin.stamp());
     let changed = previous.map(|h| h.last_outcome != outcome).unwrap_or(true);
     let consecutive_failures = match outcome {
         PollOutcome::SkippedCooldown => previous.map(|h| h.consecutive_failures).unwrap_or(0),
@@ -706,6 +887,7 @@ fn record_poll_failure(
     quota.set_health(
         account.get(),
         PollerHealth {
+            origin: origin.stamp(),
             last_attempt_at: now_epoch(),
             last_outcome: outcome,
             consecutive_failures,
@@ -718,7 +900,7 @@ fn record_poll_failure(
     Ok(changed)
 }
 
-/// Convenience wrapper around [`record_poll_failure`] for `tick`'s match
+/// Convenience wrapper around [`record_poll_failure_guarded`] for `tick`'s match
 /// arms: logs (at `warn!`) if the health write itself fails, and returns
 /// the `changed` flag (`false` on write failure, so a throttled caller
 /// never suppresses its own WARN because persistence broke). Named
@@ -727,11 +909,12 @@ fn record_poll_failure(
 fn record_and_warn_on_write_failure(
     base_dir: &std::path::Path,
     account: AccountNum,
+    origin: crate::quota::origin::SlotOrigin,
     info_id: u16,
     outcome: PollOutcome,
     cooldown_until: Option<f64>,
 ) -> bool {
-    match record_poll_failure(base_dir, account, outcome, cooldown_until) {
+    match record_poll_failure_guarded(base_dir, account, origin, outcome, cooldown_until) {
         Ok(changed) => changed,
         Err(e) => {
             warn!(
@@ -743,6 +926,35 @@ fn record_and_warn_on_write_failure(
             false
         }
     }
+}
+
+#[cfg(test)]
+fn write_usage_to_quota(
+    base: &std::path::Path,
+    account: AccountNum,
+    usage: &UsageData,
+) -> Result<(), crate::error::CsqError> {
+    write_usage_to_quota_guarded(
+        base,
+        account,
+        usage,
+        crate::quota::origin::capture(base, account),
+    )
+}
+#[cfg(test)]
+fn record_poll_failure(
+    base: &std::path::Path,
+    account: AccountNum,
+    outcome: PollOutcome,
+    cooldown: Option<f64>,
+) -> Result<bool, crate::error::CsqError> {
+    record_poll_failure_guarded(
+        base,
+        account,
+        crate::quota::origin::capture(base, account),
+        outcome,
+        cooldown,
+    )
 }
 
 #[cfg(test)]
@@ -774,6 +986,97 @@ mod tests {
             extra: Default::default(),
         });
         credentials::save(&cred_file::canonical_path(base, num), &creds).unwrap();
+    }
+
+    fn install_known_account(
+        base: &std::path::Path,
+        slot: u16,
+        id: u128,
+        org: u128,
+        generation: u64,
+    ) {
+        let identity = uuid::Uuid::from_u128(id).into();
+        crate::quota::origin::fixtures::known(
+            base,
+            slot,
+            identity,
+            uuid::Uuid::from_u128(org),
+            generation,
+        );
+        install_account(base, slot);
+        let legacy = credentials::load(&cred_file::canonical_path(
+            base,
+            AccountNum::try_from(slot).unwrap(),
+        ))
+        .unwrap();
+        credentials::save(
+            &crate::accounts::identity_store::credentials_path_for(base, identity),
+            &legacy,
+        )
+        .unwrap();
+        let config = base.join(format!("config-{slot}"));
+        std::fs::create_dir_all(&config).unwrap();
+        crate::accounts::markers::write_csq_account(&config, identity).unwrap();
+    }
+
+    #[tokio::test]
+    async fn org_rebind_during_http_does_not_publish_foreign_usage_or_health() {
+        let dir = TempDir::new().unwrap();
+        install_known_account(dir.path(), 4, 41, 51, 1);
+        let initial = quota_state::load_state_or_skip(dir.path()).unwrap();
+        quota_state::save_state(dir.path(), &initial).unwrap();
+        let before = std::fs::read(quota_state::quota_path(dir.path())).unwrap();
+        let base = dir.path().to_path_buf();
+        let http: HttpGetWithRetryAfterFn = Arc::new(move |_, _, _| {
+            install_known_account(&base, 4, 42, 52, 2);
+            Ok((
+                200,
+                None,
+                br#"{"five_hour":{"utilization":42,"resets_at":"2099-01-01T00:00:00Z"}}"#.to_vec(),
+            ))
+        });
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+        tick(dir.path(), &http, &cooldowns, &backoffs).await;
+        assert_eq!(
+            std::fs::read(quota_state::quota_path(dir.path())).unwrap(),
+            before
+        );
+        assert!(quota_state::load_state(dir.path())
+            .unwrap()
+            .get(4)
+            .is_none());
+    }
+
+    #[test]
+    fn new_org_failed_attempt_does_not_relabel_old_successful_usage() {
+        let dir = TempDir::new().unwrap();
+        install_known_account(dir.path(), 4, 41, 51, 1);
+        let account = AccountNum::try_from(4).unwrap();
+        let first = crate::quota::origin::capture(dir.path(), account);
+        let usage = UsageData {
+            five_hour: Some(UsageWindow {
+                used_percentage: 42.0,
+                resets_at: 4_102_444_800,
+            }),
+            seven_day: None,
+        };
+        write_usage_to_quota_guarded(dir.path(), account, &usage, first).unwrap();
+        let old = quota_state::load_state_or_skip(dir.path())
+            .unwrap()
+            .get(4)
+            .unwrap()
+            .clone();
+        install_known_account(dir.path(), 4, 42, 52, 2);
+        let second = crate::quota::origin::capture(dir.path(), account);
+        record_poll_failure_guarded(dir.path(), account, second, PollOutcome::Transport, None)
+            .unwrap();
+        let raw = quota_state::load_state_or_skip(dir.path()).unwrap();
+        assert_eq!(raw.get(4), Some(&old));
+        assert_eq!(raw.get_health(4).unwrap().origin, second.stamp());
+        let visible = quota_state::load_state(dir.path()).unwrap();
+        assert!(visible.get(4).is_none());
+        assert!(visible.get_health(4).is_some());
     }
 
     fn mock_usage_success(counter: Arc<AtomicU32>) -> HttpGetWithRetryAfterFn {
@@ -1040,6 +1343,16 @@ mod tests {
             .unwrap();
 
         // Identity-keyed: distinctive token. This is what the poller MUST read.
+        crate::quota::origin::fixtures::known(
+            base,
+            slot,
+            uuid,
+            uuid::Uuid::from_u128(0x2000 + u128::from(slot)),
+            0,
+        );
+        let identity_dir = crate::accounts::identity_store::identity_path(base, uuid);
+        crate::platform::fs::secure_dir(&base.join("identities")).unwrap();
+        crate::platform::fs::secure_dir(&identity_dir).unwrap();
         let identity_path = crate::accounts::identity_store::credentials_path_for(base, uuid);
         let identity_creds = CredentialFile::Anthropic(AnthropicCredentialFile {
             claude_ai_oauth: OAuthPayload {
@@ -1101,6 +1414,257 @@ mod tests {
         let quota = quota_state::load_state(base).unwrap();
         let q = quota.get(slot).expect("quota for slot 1");
         assert!((q.five_hour_pct() - 42.0).abs() < 0.01);
+    }
+
+    /// ROOT ruling A reader parity: a pending rescued pair outranks the stale
+    /// canonical — `tick` adopts it BEFORE reading, so the usage call carries
+    /// the rescued token and the record is removed.
+    ///
+    /// RED: remove the adoption inside `read_canonical_with_rescue` (call
+    /// `credentials::load` directly) -> the poller sends the STALE token and
+    /// the rescue record survives.
+    #[tokio::test]
+    async fn tick_adopts_pending_rescue_before_polling() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        const SLOT: u16 = 1;
+        const ID: u128 = 41;
+        install_known_account(base, SLOT, ID, 51, 1);
+
+        let identity: crate::accounts::identity_store::IdentityId =
+            uuid::Uuid::from_u128(ID).into();
+        let identity_path = crate::accounts::identity_store::credentials_path_for(base, identity);
+        let identity_dir = identity_path.parent().unwrap().to_path_buf();
+
+        // Canonical: STALE pair (older expiry, so adoption's freshness guard
+        // installs the rescued pair rather than treating it as superseded).
+        let stale = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("sk-ant-oat01-STALE-TOKEN".into()),
+                refresh_token: RefreshToken::new("rt-stale".into()),
+                expires_at: 100,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        credentials::save(&identity_path, &stale).unwrap();
+
+        // Rescued: the fresher pair the provider actually issued.
+        let rescued = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("sk-ant-oat01-RESCUED-TOKEN".into()),
+                refresh_token: RefreshToken::new("rt-rescued".into()),
+                expires_at: 200,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        // D237 round-2 H-c: the record carries the SOURCE witness
+        // (`fixture@example.invalid` / account 17 / organization 51 is the
+        // `install_known_account` identity.json context), so adoption re-runs
+        // the writer's gate instead of an expiry comparison.
+        let witness = crate::credentials::rescue::RescueWitness::Anthropic(
+            crate::accounts::anthropic_identity::RescueLineageWitness {
+                kind: crate::accounts::anthropic_identity::RescueWitnessKind::Refresh,
+                source_version:
+                    crate::accounts::anthropic_identity::CredentialVersion::for_credentials(
+                        stale.anthropic().unwrap(),
+                    )
+                    .unwrap(),
+                result_version:
+                    crate::accounts::anthropic_identity::CredentialVersion::for_credentials(
+                        rescued.anthropic().unwrap(),
+                    )
+                    .unwrap(),
+                context: Some(crate::accounts::anthropic_identity::RescueKnownContext {
+                    email: "fixture@example.invalid".into(),
+                    account_uuid: uuid::Uuid::from_u128(17),
+                    organization_uuid: uuid::Uuid::from_u128(51),
+                }),
+                legacy_email: None,
+            },
+        );
+        crate::credentials::rescue::write_rescue_record(
+            &identity_dir,
+            "anthropic",
+            &identity.to_string(),
+            "post_commit_lock_timeout",
+            &serde_json::to_value(&rescued).unwrap(),
+            &witness,
+        )
+        .unwrap();
+
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+        let http: HttpGetWithRetryAfterFn =
+            Arc::new(move |_url: &str, token: &str, _headers: &[(&str, &str)]| {
+                *captured_clone.lock().unwrap() = Some(token.to_string());
+                Ok((
+                    200,
+                    None,
+                    br#"{"five_hour":{"utilization":42,"resets_at":"2099-01-01T00:00:00Z"}}"#
+                        .to_vec(),
+                ))
+            });
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        tick(base, &http, &cooldowns, &backoffs).await;
+
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some("sk-ant-oat01-RESCUED-TOKEN"),
+            "the poller must adopt the rescued pair before polling, not send the stale token"
+        );
+        assert!(
+            crate::credentials::rescue::rescue_record_pending(&identity_dir).is_none(),
+            "a successful adoption removes the rescue record"
+        );
+        assert!(
+            quota_state::load_state(base).unwrap().get(SLOT).is_some(),
+            "the adopted credential's usage must be recorded"
+        );
+    }
+
+    /// Ruling 3(a): an UNPARSEABLE rescue record can never install, so the
+    /// reader's adoption QUARANTINES it (bytes kept for forensics, never
+    /// deleted) and the genuinely absent canonical is classified
+    /// `Unreadable` — the record must not block every tick forever.
+    ///
+    /// RED: make adoption skip the unparseable quarantine -> the record
+    /// stays pending and the read classifies as `RescuePending` instead.
+    #[test]
+    fn unparseable_rescue_record_is_quarantined_not_left_pending() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(3);
+        let canonical = crate::accounts::identity_store::credentials_path_for(base, uuid);
+        let identity_dir = canonical.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&identity_dir).unwrap();
+        let record_path = crate::credentials::rescue::rescue_record_path(&identity_dir);
+        std::fs::write(&record_path, b"not json").unwrap();
+
+        // No canonical credential at all: adoption quarantines the
+        // unparseable record, leaving a genuine absence.
+        assert!(
+            matches!(
+                read_canonical_with_rescue(base, Some(uuid), &canonical),
+                PollerCredentialRead::Unreadable(_)
+            ),
+            "a quarantined unparseable record leaves a genuine absence"
+        );
+        assert!(
+            crate::credentials::rescue::rescue_record_pending(&identity_dir).is_none(),
+            "a quarantined record leaves the pending set"
+        );
+        assert!(
+            identity_dir
+                .join("quarantine")
+                .join(record_path.file_name().unwrap())
+                .is_file(),
+            "the unparseable record is QUARANTINED, never deleted"
+        );
+
+        // Control: the identical on-disk state with no record is also absence.
+        assert!(
+            matches!(
+                read_canonical_with_rescue(base, Some(uuid), &canonical),
+                PollerCredentialRead::Unreadable(_)
+            ),
+            "without a rescue record the same state is a genuine absence"
+        );
+    }
+
+    /// Fail-closed reader parity: a PROVABLE rescue record against an
+    /// UNREADABLE canonical cannot be re-gated by adoption (it cannot prove
+    /// the source), so the record stays PENDING and the read must classify
+    /// it as `RescuePending` — which the tick turns into a skip WITHOUT a
+    /// `SkippedNoCredentials` row.
+    ///
+    /// RED: remove the `still_pending` check -> the read classifies as
+    /// `Unreadable`, and the tick records a false no-credentials verdict
+    /// while a durable pair is pending.
+    #[test]
+    fn pending_rescue_against_unreadable_canonical_classifies_as_rescue_pending() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(3);
+        let canonical = crate::accounts::identity_store::credentials_path_for(base, uuid);
+        let identity_dir = canonical.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&identity_dir).unwrap();
+        // Corrupt, not absent: adoption refuses to install over a canonical
+        // it cannot read, so the record stays pending and the read is
+        // classified `RescuePending` rather than a no-credentials verdict.
+        std::fs::write(&canonical, b"not json").unwrap();
+
+        let stale = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("sk-ant-oat01-STALE-TOKEN".into()),
+                refresh_token: RefreshToken::new("rt-stale".into()),
+                expires_at: 100,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        let rescued = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("sk-ant-oat01-RESCUED-TOKEN".into()),
+                refresh_token: RefreshToken::new("rt-rescued".into()),
+                expires_at: 200,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        let witness = crate::credentials::rescue::RescueWitness::Anthropic(
+            crate::accounts::anthropic_identity::RescueLineageWitness {
+                kind: crate::accounts::anthropic_identity::RescueWitnessKind::Refresh,
+                source_version:
+                    crate::accounts::anthropic_identity::CredentialVersion::for_credentials(
+                        stale.anthropic().unwrap(),
+                    )
+                    .unwrap(),
+                result_version:
+                    crate::accounts::anthropic_identity::CredentialVersion::for_credentials(
+                        rescued.anthropic().unwrap(),
+                    )
+                    .unwrap(),
+                context: None,
+                legacy_email: None,
+            },
+        );
+        crate::credentials::rescue::write_rescue_record(
+            &identity_dir,
+            "anthropic",
+            &uuid.to_string(),
+            "post_commit_lock_timeout",
+            &serde_json::to_value(&rescued).unwrap(),
+            &witness,
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                read_canonical_with_rescue(base, Some(uuid), &canonical),
+                PollerCredentialRead::RescuePending(_)
+            ),
+            "a provable record against an unreadable canonical is PENDING, not absence"
+        );
+        assert!(
+            crate::credentials::rescue::rescue_record_pending(&identity_dir).is_some(),
+            "an adoption refusal leaves the record pending"
+        );
     }
 
     #[tokio::test]

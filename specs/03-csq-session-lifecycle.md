@@ -1,6 +1,6 @@
 # 03 csq Session Lifecycle
 
-Spec version: 1.4.1 | Governs: `csq run`, `csq swap`, `csq login`, `csq exit` — CLI surface and state transitions
+Spec version: 1.5.0 | Governs: `csq run`, `csq swap`, `csq login`, `csq exit` — CLI surface and state transitions
 
 ---
 
@@ -103,6 +103,78 @@ Account dirs `config-<N>/` are created on login and persist forever. Handle dirs
 
 - Create a handle dir with a name other than `term-<pid>`. The naming scheme is load-bearing for the sweep logic.
 - Write any real file content into the handle dir other than `.live-pid` and the materialized `settings.json` (step 3). Everything else csq creates is a symlink (`.claude.json` is real but Claude-Code-created).
+
+### 3.3.1 Owner-configured provider launch posture
+
+The shared admission policy covers `csq run`, `csq exec`, exec-replace swaps and
+supervised relaunch. It reads `<csq-base>/provider-session-policy.json` and, when
+an enclosing primary checkout is identified, that outermost primary owner's
+`.coc/csq.json`. A linked checkout outside a primary checkout does not supply
+repository policy. Subdirectory or nested-repository configuration cannot replace
+the outer primary owner's policy.
+
+Both files use a `provider_session` object. `primary_checkout` selects `allow`,
+`warn` or `refuse`; absence defaults to `allow`. The global posture is a floor:
+repository policy may tighten it, but cannot weaken a restrictive global posture,
+add trusted destinations or re-enable loopback trust. The global-only
+`allow_repo_relax: true` explicitly permits those relaxations. When the global
+posture is `allow` or absent, a repository may tighten it and choose its own trusted
+origins. Repository trust lists replace rather than union with the global list;
+under a restrictive floor, entries outside the global exemptions are removed.
+
+`trusted_endpoints` contains credential-free HTTP(S) origins. Trust compares
+scheme, host and effective port, never a model/provider label. The HTTPS Anthropic
+API origin is admitted. Loopback trust is a removable default: an explicit trust
+list removes it unless `trust_loopback: true` explicitly restores it;
+`trust_loopback: false` disables it. Exact loopback origins can still be listed
+individually. A loopback proxy can forward data elsewhere; trusting its origin
+is an owner decision, not a data-residency or filesystem-isolation guarantee.
+
+Admission classifies the effective start directory from supported directory
+argument forms, including Codex `-C`/`--cd` and `--work-dir`/`--cwd` forms handled
+by the shared guard. Malformed start-directory input is unresolved. The actual
+Codex `csq exec` cwd is its supplied Claude-home directory. Discovery and project
+settings walks use canonical paths; an enclosing primary checkout remains
+protected even when the nearest Git marker belongs to a nested checkout. Linked
+worktree registration/backlinks must agree. Admission governs where a session
+starts and does not restrict its subsequent filesystem access.
+
+Claude admission checks global/UUID/legacy inputs and materialized settings.
+It composes project settings from the canonical project root toward the effective
+start directory, applying `settings.json` before `settings.local.json` at each
+directory, then managed settings and sorted managed fragments. Admission evaluates
+each cumulative environment, so transport selection in one file cannot hide an
+untrusted endpoint supplied by another. Trusted project candidates are admitted
+without an additional precedence warning. Managed settings use the
+vendor's system locations and bounded `managed-settings.d/*.json` fragments.
+These are candidate checks; non-file managed policy and later vendor changes are
+not certified. CLI settings overrides remain unresolved. Bedrock, Vertex and
+Foundry candidates can be trusted using their explicit documented
+`ANTHROPIC_BEDROCK_BASE_URL`, `ANTHROPIC_VERTEX_BASE_URL` and
+`ANTHROPIC_FOUNDRY_BASE_URL` origins. Cloud routing without such a base URL, or
+with conflicting transport selectors, remains unresolved; csq does not inspect
+SDK profiles or probe endpoints to infer it. The direct native harness checks its
+actual catalog endpoint; other vendor destinations remain unresolved.
+
+Invalid launch settings or endpoint decoding use the selected `warn`/`refuse`
+unknown-destination posture. Selected malformed, oversized, symlinked or
+nonregular policy files refuse because their posture cannot be trusted. Default
+`allow` retains existing launch behavior. Diagnostics name
+`provider_session.primary_checkout` and sanitized origins without credentials,
+query strings or raw settings. Early checks precede handle creation and swap
+teardown; terminal checks emit warnings once per spawn. `csq exec` returns
+admission failures through its `SdkError` envelope before handle/keychain work.
+
+Implementation: `run.rs::{provider_session_repository_context,admit_exec_provider_session,
+admit_swap_provider_session}`;
+`provider_session_policy.rs::{load_policy,check_claude_launch,
+check_unknown_launch_with_args,effective_start_directory}`;
+`exec.rs::run_exec`; `swap.rs::admit_materialized_claude_swap`.
+Vendor references: [settings precedence](https://code.claude.com/docs/en/settings),
+[managed settings](https://code.claude.com/docs/en/managed-settings),
+[Bedrock](https://code.claude.com/docs/en/amazon-bedrock),
+[Vertex](https://code.claude.com/docs/en/google-vertex-ai), and
+[Foundry](https://code.claude.com/docs/en/microsoft-foundry).
 
 ## 3.4 `csq swap M`
 
@@ -228,3 +300,13 @@ A user or harness inspecting `echo $?` after `csq run` can distinguish a csq-CLI
 - `csq/src/cli/commands/run.rs`, `csq/src/cli/commands/swap.rs`, `csq/src/cli/commands/login.rs` — the implementation sites that MUST match this spec.
 - `csq/src/cli/commands/run.rs` — `EXIT_CODE_AUDIT_WRITE_FAILED` (code 3) constant and `fail_loud_on_audit_write_failure` materialize the §3.9 code-3 row in code.
 - `specs/12-audit-trail.md` §12.4 — the fail-loud audit-write contract that owns exit code 3.
+
+
+## Revisions
+
+- 2026-10-07 — 1.5.0 — Corrected §3.3.1 owner policy: SDK admission before
+  handle/keychain work, effective CLI cwd, removable loopback trust, trusted project
+  candidates, launch-decode unknown posture, restrictive global grant floor, outer
+  owner retention, managed-file checks, canonical project walk and cumulative
+  documented cloud routing. This revision does not certify installed native/vendor
+  destinations, non-file managed modes, later vendor versions or Windows runtime.

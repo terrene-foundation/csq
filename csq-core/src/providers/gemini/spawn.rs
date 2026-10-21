@@ -452,6 +452,23 @@ fn build_spawn_plan_inner(
     })
 }
 
+impl SpawnPlan {
+    /// Put the launch's messaging decision in the child's env as
+    /// `CSQ_MESSAGING_DECISION=on|off`, replacing any existing entry. The env is an
+    /// allowlist built from nothing the parent exported, so this is the ONLY way the variable
+    /// reaches the child: a value in the parent shell never does. A swap run from inside the
+    /// session reads it when the marker file is missing
+    /// (`messaging::register::existing_decision_in_session`).
+    #[must_use]
+    pub fn with_messaging_decision(mut self, on: bool) -> Self {
+        use crate::messaging::register::{decision_env_value, DECISION_ENV};
+        self.envs.retain(|(k, _)| k != DECISION_ENV);
+        self.envs
+            .push((DECISION_ENV.to_string(), decision_env_value(on).to_string()));
+        self
+    }
+}
+
 /// Executes a [`SpawnPlan`]. On Unix this calls `exec(2)` so the
 /// `gemini-cli` process replaces csq-cli; on Windows this spawns a
 /// child and waits.
@@ -634,10 +651,13 @@ pub fn spawn_gemini(
     slot: AccountNum,
     args: Vec<String>,
     vault: &dyn Vault,
+    messaging_on: bool,
 ) -> Result<std::convert::Infallible, SpawnError> {
     let parent_env: HashMap<String, String> = std::env::vars().collect();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    // The shared home resolver (`HOME` is usually unset on Windows), the same one the
+    // gemini OAuth writer, the usage poller and the headless check use.
+    let home = crate::platform::home::home_dir();
 
     let plan = build_spawn_plan(
         base_dir,
@@ -648,7 +668,8 @@ pub fn spawn_gemini(
         home.as_deref(),
         vault,
         args,
-    )?;
+    )?
+    .with_messaging_decision(messaging_on);
 
     // execute_plan returns Infallible on success path (exec or
     // exit). Map io::Error to a synthesized Vault-shaped error so
@@ -656,7 +677,10 @@ pub fn spawn_gemini(
     // branch returns Err(io_error) only when exec failed (binary
     // missing, etc.).
     match execute_plan(plan) {
-        Ok(never) => Ok(never),
+        // `never` is `Infallible`: no value of it exists, so this arm cannot run.
+        // An empty `match` says so directly; rebuilding `Ok(never)` instead made
+        // rustc flag the constructor call as unreachable (`unreachable_code`).
+        Ok(never) => match never {},
         Err(e) => Err(SpawnError::Provision(ProvisionError::Io {
             path: PathBuf::from(GEMINI_CLI_BINARY),
             source: e,
@@ -779,6 +803,44 @@ mod tests {
         let result = pre_spawn_dotenv_scan(&cwd, Some(&home));
         // Outer hit is above HOME → not reached.
         assert_eq!(result, DotenvScanResult::Clean);
+    }
+
+    /// A Gemini launch carries its messaging decision in the child's env, explicitly, on or
+    /// off, replacing any entry already present; a parent-shell value never reaches the child
+    /// (the env is an allowlist). Falsifier: without `with_messaging_decision` the plan's env
+    /// has no `CSQ_MESSAGING_DECISION` at all.
+    #[test]
+    fn plan_carries_the_messaging_decision_and_ignores_the_parent_shell() {
+        let dir = TempDir::new().unwrap();
+        let handle = dir.path().join("term-9");
+        std::fs::create_dir_all(&handle).unwrap();
+        let mut parent = empty_parent_env();
+        parent.insert("CSQ_MESSAGING_DECISION".into(), "on".into());
+        let vault = InMemoryVault::new();
+        provision_api_key(dir.path(), &vault, 4, "auto", "AIzaSy_csq_xxxxx");
+        let plan = build_spawn_plan(
+            dir.path(),
+            &handle,
+            slot(4),
+            &parent,
+            dir.path(),
+            Some(dir.path()),
+            &vault,
+            vec![],
+        )
+        .unwrap();
+        let get = |p: &SpawnPlan| -> Vec<String> {
+            p.envs
+                .iter()
+                .filter(|(k, _)| k == "CSQ_MESSAGING_DECISION")
+                .map(|(_, v)| v.clone())
+                .collect()
+        };
+        assert!(get(&plan).is_empty(), "the allowlist forwards nothing");
+        let off = plan.clone().with_messaging_decision(false);
+        assert_eq!(get(&off), vec!["off"]);
+        let on = off.with_messaging_decision(true);
+        assert_eq!(get(&on), vec!["on"], "replaced, never duplicated");
     }
 
     #[test]

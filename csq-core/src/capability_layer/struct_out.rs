@@ -151,20 +151,18 @@ pub fn extract_citation_envelopes(raw: &str) -> Vec<CitationEnvelope> {
                     }
                     depth += 1;
                 }
-                b'}' => {
-                    if depth > 0 {
-                        depth -= 1;
-                        if depth == 0 {
-                            // A complete top-level object spans [start, i].
-                            if let Ok(slice) = std::str::from_utf8(&bytes[start..=i]) {
-                                if let Ok(env) = serde_json::from_str::<CitationEnvelope>(slice) {
-                                    out.push(env);
-                                }
+                b'}' if depth > 0 => {
+                    depth -= 1;
+                    if depth == 0 {
+                        // A complete top-level object spans [start, i].
+                        if let Ok(slice) = std::str::from_utf8(&bytes[start..=i]) {
+                            if let Ok(env) = serde_json::from_str::<CitationEnvelope>(slice) {
+                                out.push(env);
                             }
                         }
                     }
-                    // A `}` at depth 0 is a stray close — ignore it.
                 }
+                // A `}` at depth 0 is a stray close — ignore it.
                 _ => {}
             }
         }

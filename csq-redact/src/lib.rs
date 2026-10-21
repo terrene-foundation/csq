@@ -18,6 +18,9 @@
 //! `crate::audit::types::RedactedString`) so the ~540 existing callsites are
 //! unchanged. New code — notably `csq-sdk` — depends on this crate directly.
 
+mod chat;
+pub use chat::redact_chat;
+
 use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};

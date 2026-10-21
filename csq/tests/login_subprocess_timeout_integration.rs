@@ -16,7 +16,8 @@
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Command, Stdio};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
@@ -25,18 +26,138 @@ use tempfile::TempDir;
 mod common;
 use common::csq_bin;
 
+/// Unique argv marker carried by the stub's `sleep`, so a surviving hung
+/// stub can be found with `pgrep -f` after a failed run.
+const STUB_MARKER: &str = "120.0731";
+
+/// Owns the spawned `csq` and its whole process group (csq, the fake
+/// `claude`, its `sleep`). On drop — normal return, assertion panic, or the
+/// deadline path — it SIGKILLs the group so a regressed watchdog can never
+/// leave `sleep` orphaned. ESRCH (already gone) and EPERM (zombie group,
+/// Darwin) are tolerated.
+///
+/// Ordering invariant: the group is signalled only while the leader is still
+/// UNREAPED. An unreaped (zombie) leader pins its pid as the pgid, so
+/// `killpg(pgid)` can only reach our group. Once the leader is reaped the
+/// kernel may hand that pid (hence pgid) to an unrelated process group, so
+/// `reaped` makes every later `kill_group` a no-op. Exit is therefore
+/// detected with `waitid(WNOWAIT)` (observe, do not reap), never `try_wait`.
+struct GroupGuard {
+    child: Child,
+    reaped: bool,
+    /// Number of `killpg` syscalls actually issued (asserted by the ordering test).
+    kills: u32,
+    /// Whether the leader was still unreaped (waitid found it) at the moment
+    /// of the last `killpg` — i.e. whether the pgid was still pinned to us.
+    pinned_at_last_kill: bool,
+}
+
+impl GroupGuard {
+    fn new(child: Child) -> Self {
+        GroupGuard {
+            child,
+            reaped: false,
+            kills: 0,
+            pinned_at_last_kill: false,
+        }
+    }
+
+    /// `waitid(WNOWAIT)` on the leader: `(rc, info)`. rc 0 = the child still
+    /// exists (running or an unreaped zombie); rc -1 (ECHILD) = already reaped.
+    fn peek(&self) -> (libc::c_int, libc::siginfo_t) {
+        // SAFETY: `siginfo_t` is plain-old-data; all-zero is a valid value.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: waitid writes only into `info`, which outlives the call; the
+        // id is our own direct child.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        (rc, info)
+    }
+
+    /// True once the leader has exited. Does NOT reap it: with `WNOWAIT` the
+    /// zombie stays, so the pgid stays pinned to our group.
+    fn exited_unreaped(&self) -> bool {
+        let (rc, info) = self.peek();
+        assert_eq!(
+            rc,
+            0,
+            "waitid(WNOWAIT) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        // WNOHANG with nothing to report leaves the zeroed struct (si_signo 0);
+        // an exited child reports SIGCHLD.
+        info.si_signo == libc::SIGCHLD
+    }
+
+    /// Poll for exit. On exit: SIGKILL the group while the zombie still pins
+    /// the pgid, THEN reap and return the status.
+    fn poll_exit(&mut self) -> Option<std::process::ExitStatus> {
+        if self.reaped || !self.exited_unreaped() {
+            return None;
+        }
+        self.kill_group();
+        let status = self.child.wait().expect("reap csq login");
+        self.reaped = true;
+        Some(status)
+    }
+
+    fn kill_group(&mut self) {
+        if self.reaped {
+            // The pgid may already belong to someone else.
+            return;
+        }
+        let pgid = self.child.id() as libc::pid_t;
+        self.kills += 1;
+        self.pinned_at_last_kill = self.peek().0 == 0;
+        // SAFETY: plain syscall on a pgid we created via `process_group(0)`
+        // and whose leader is still unreaped (see the ordering invariant);
+        // no memory is touched.
+        let rc = unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::ESRCH) | Some(libc::EPERM) => {}
+                _ => eprintln!("killpg({pgid}) failed unexpectedly: {err}"),
+            }
+        }
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        self.kill_group();
+        if !self.reaped {
+            let _ = self.child.wait();
+            self.reaped = true;
+        }
+    }
+}
+
 /// Write an executable fake `claude` at `<dir>/claude` that hangs on any
 /// invocation — mimicking `claude auth login` stuck waiting for a browser
 /// callback that never arrives.
-fn write_hanging_claude(dir: &std::path::Path) {
+///
+/// It first records `$CLAUDE_CONFIG_DIR` to `record`, so a test can prove which config
+/// directory csq pointed the subprocess at (the per-slot isolation `handle_direct` owes it).
+fn write_hanging_claude(dir: &std::path::Path, record: &std::path::Path) {
     let path = dir.join("claude");
     // `exec sleep` so the script process BECOMES sleep (same PID) instead of
     // forking a child: the watchdog's `child.kill()` then terminates the actual
     // sleeping process, leaving no orphan holding the inherited stdout pipe open
-    // (an orphan would block the test's `cmd.output()` on pipe-EOF).
+    // (an orphan would hold the stdout pipe open past the child's exit).
     std::fs::write(
         &path,
-        "#!/bin/sh\n# fake claude: hang like a stuck OAuth callback\nexec sleep 600\n",
+        format!(
+            "#!/bin/sh\n# fake claude: hang like a stuck OAuth callback\nprintf '%s' \"$CLAUDE_CONFIG_DIR\" > '{}'\nexec sleep {}\n",
+            record.display(),
+            STUB_MARKER
+        ),
     )
     .unwrap();
     let mut perm = std::fs::metadata(&path).unwrap().permissions();
@@ -50,10 +171,12 @@ fn login_direct_times_out_on_hung_claude_auth_login() {
     let base = home.path().join(".claude").join("accounts");
     std::fs::create_dir_all(&base).unwrap();
     let stub = TempDir::new().unwrap();
-    write_hanging_claude(stub.path());
+    let record = stub.path().join("config-dir.txt");
+    write_hanging_claude(stub.path(), &record);
 
     let mut cmd = Command::new(csq_bin());
     cmd.env_clear();
+    common::strip_ci_env(&mut cmd);
     cmd.env("HOME", home.path());
     // CSQ_HOME: `dirs::home_dir()` ignores `HOME` on Windows; the
     // test-utils-gated override is what actually sandboxes it there.
@@ -86,16 +209,56 @@ fn login_direct_times_out_on_hung_claude_auth_login() {
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    // Own process group: the guard can SIGKILL csq + the fake claude + its
+    // `sleep` together on the deadline or any panic path.
+    cmd.process_group(0);
 
     let start = Instant::now();
-    let out = cmd.output().expect("spawn csq login");
-    let elapsed = start.elapsed();
+    let mut guard = GroupGuard::new(cmd.spawn().expect("spawn csq login"));
+    // Drain the pipes on threads so a chatty child can never block on a full
+    // pipe while this thread polls `try_wait`.
+    let mut so = guard.child.stdout.take().unwrap();
+    let mut se = guard.child.stderr.take().unwrap();
+    let t_out = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut so, &mut b);
+        b
+    });
+    let t_err = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut se, &mut b);
+        b
+    });
 
     // The watchdog (1s) must terminate the hung child; the command must finish
-    // far short of the fake's 600s sleep. Generous slack for CI/build load.
+    // far short of the fake's 120s sleep. A hard 60s deadline bounds the test;
+    // generous slack for CI/build load.
+    let deadline = Duration::from_secs(60);
+    let status = loop {
+        if let Some(st) = guard.poll_exit() {
+            break st;
+        }
+        if start.elapsed() >= deadline {
+            // Kill the group now (also what Drop does) so the reader threads
+            // reach EOF, then fail loudly.
+            drop(guard);
+            let _ = t_out.join();
+            let _ = t_err.join();
+            panic!("login did not time out within {deadline:?} (watchdog never fired)");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let elapsed = start.elapsed();
+    // csq has exited and `poll_exit` already SIGKILLed any straggler in its
+    // group (before reaping), so the reader threads reach EOF.
+    let out = std::process::Output {
+        status,
+        stdout: t_out.join().unwrap_or_default(),
+        stderr: t_err.join().unwrap_or_default(),
+    };
     assert!(
-        elapsed < Duration::from_secs(60),
-        "login did not time out — it hung for {elapsed:?} (watchdog never fired)"
+        elapsed < deadline,
+        "login took {elapsed:?}, past the {deadline:?} deadline"
     );
     assert!(
         !out.status.success(),
@@ -105,6 +268,14 @@ fn login_direct_times_out_on_hung_claude_auth_login() {
     assert!(
         stderr.contains("did not complete within") || stderr.contains("was terminated"),
         "expected an actionable timeout message; got stderr:\n{stderr}"
+    );
+
+    // The subprocess must run against the slot's own config dir, not the caller's.
+    let recorded = std::fs::read_to_string(&record).expect("the stub claude must have run");
+    assert_eq!(
+        std::fs::canonicalize(&recorded).unwrap(),
+        std::fs::canonicalize(base.join("config-1")).unwrap(),
+        "claude auth login must be pointed at base/config-1"
     );
 
     // The lock must be released on return (guard drop). A second attempt must
@@ -121,4 +292,41 @@ fn login_direct_times_out_on_hung_claude_auth_login() {
             );
         }
     }
+}
+
+/// Ordering guard for `GroupGuard`: the group is killed while the exited
+/// leader is still an unreaped zombie, and never again once it is reaped
+/// (a reused pgid could belong to an unrelated group).
+#[test]
+fn group_guard_kills_before_reaping_and_never_after() {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", "exit 0"]).process_group(0);
+    let mut guard = GroupGuard::new(cmd.spawn().expect("spawn sh"));
+
+    // Observe exit WITHOUT reaping: the child is still reapable afterwards.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !guard.exited_unreaped() {
+        assert!(Instant::now() < deadline, "sh never exited");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!guard.reaped, "exit detection must not reap the leader");
+    assert_eq!(guard.kills, 0);
+
+    let status = guard.poll_exit().expect("exited leader must be reported");
+    assert!(status.success());
+    assert!(guard.reaped);
+    assert_eq!(
+        guard.kills, 1,
+        "poll_exit must killpg exactly once, before the reap"
+    );
+    assert!(
+        guard.pinned_at_last_kill,
+        "killpg ran AFTER the leader was reaped: the pgid was no longer pinned"
+    );
+
+    // After the reap neither an explicit kill nor Drop may signal the pgid.
+    guard.kill_group();
+    assert_eq!(guard.kills, 1, "kill_group after the reap must be a no-op");
+    assert!(guard.poll_exit().is_none());
+    assert_eq!(guard.kills, 1);
 }

@@ -28,6 +28,7 @@ Specs here are:
 | 15  | [LedgerSink Trait and Reference-Impl Catalog](15-ledgersink-trait-and-sinks.md) | `LedgerSink` trait, cfg-gating discipline, reference-impl catalog (Rekor/S3/Azure/GCP/csq-ledger), operator config, conformance harness, `csq doctor` surface                                                                        |
 | 16  | [Audit Export Bundle](16-audit-export-bundle.md)                                | `csq audit export` verifiable-bundle producer — bundle shape, `BUNDLE.lock`/`BUNDLE.sig` discipline, embedded stdlib-only `verify` script (pure-Python Ed25519), canonical-form vectors, cross-org verifiability                     |
 | 17  | [csq-ledger Transparency-Log Protocol](17-csq-ledger-protocol.md)               | Foundation-owned transparency-log server: HTTP routes, RFC 6962 inclusion/consistency proofs, signed checkpoint contract, fsync-before-200 + storage-no-delete invariants, WORM-storage threat model, Docker deploy, `CsqLedgerSink` |
+| 32  | [Cross-CLI Session Messaging](32-cross-cli-messaging.md) (+ [32a](32a-cross-cli-messaging-surfaces-delivery.md)) | Mid-task messaging between csq-launched Claude Code and Codex sessions on one host: caller-proven sender, session registry and names, message store and limits, CLI + MCP surfaces, Codex wake and Claude per-turn hooks, untrusted-data framing, launch registration and `CSQ_MESSAGING=off` |
 
 ## How to use
 

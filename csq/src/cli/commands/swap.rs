@@ -107,6 +107,39 @@ impl SourceHandle {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn provider_session_test_exec_replace(
+    base_dir: &Path,
+    source: PathBuf,
+    target: AccountNum,
+    surface: Surface,
+) -> Result<()> {
+    exec_replace_swap(
+        base_dir,
+        SourceHandle::ClaudeCode(source),
+        target,
+        surface,
+        true,
+        None,
+        RouteKind::CrossSurface,
+    )
+}
+
+#[cfg(any(unix, test))]
+pub(crate) fn admit_materialized_claude_swap(
+    base_dir: &Path,
+    target: AccountNum,
+    handle_dir: &Path,
+) -> Result<()> {
+    super::run::admit_swap_provider_session(
+        base_dir,
+        target,
+        Surface::ClaudeCode,
+        Some(&handle_dir.join("settings.json")),
+        true,
+    )
+}
+
 /// Whether a RUNNING process of a given surface can adopt a credential
 /// change made beneath it — a repointed symlink, a rewritten auth file —
 /// without being replaced.
@@ -560,6 +593,13 @@ pub fn handle(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
 }
 
 fn handle_inner(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
+    // orgident r7 item 9: refuse to swap INTO a slot whose sign-in is shared with another
+    // slot. This is the first statement, so a refusal happens before the launch log, any
+    // keychain or credential write, any marker or symlink change. No override exists; the
+    // only exit is `csq login N`. The terminal being swapped keeps running on its current
+    // slot, because nothing is touched.
+    csq_core::accounts::launch_block::check_launch(base_dir, target.get())
+        .map_err(|message| anyhow::anyhow!(message))?;
     let source = detect_source_handle(base_dir, target)?;
     let target_surface = resolve_target_surface(base_dir, target)?;
 
@@ -652,6 +692,33 @@ fn handle_inner(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
     let mut _swap_target_creds_for_reconcile: Option<
         csq_core::accounts::identity_store::TargetToken,
     > = None;
+    let swap_target_binding = if route_is_same_surface_claude_code {
+        // Capture the exact selected UUID and credential version. Legacy local
+        // custody permits its own canonical bytes, never organization trust.
+        let target_binding =
+            csq_core::accounts::anthropic_identity::capture_anthropic_binding(base_dir, target)
+                .map_err(|error| {
+                    if error == csq_core::accounts::anthropic_identity::IdentityError::BindingBusy {
+                        anyhow::anyhow!("csq swap: identity_binding_busy; nothing changed — retry the swap")
+                    } else {
+                        anyhow::anyhow!("csq swap: organization_identity_unconfirmed; run `csq login {target}` and retry the swap")
+                    }
+                })?;
+        if matches!(
+            target_binding.context(),
+            csq_core::accounts::anthropic_identity::StoredAnthropicContext::LegacyUnknown
+        ) {
+            tracing::info!(
+                error_kind = "swap_legacy_context_unconfirmed",
+                account = target.get(),
+                "swap uses only the selected legacy UUID's own canonical credentials; daemon organization verification remains pending"
+            );
+        }
+        Some(target_binding)
+    } else {
+        None
+    };
+    let mut swap_native_capture = None;
     let _swap_guard = if matches!(route_kind, RouteKind::SameSurfaceClaudeCode) {
         let (abs, keychain_write_allowed) =
             csq_core::credentials::keychain::canonicalize_for_keychain_sync(&handle_dir_path);
@@ -687,6 +754,16 @@ fn handle_inner(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
                         );
                     }
                 };
+            // Preserve the complete source context under the existing swap lock
+            // before selecting canonical target bytes or mutating the keychain.
+            swap_native_capture = Some(handle_dir::capture_native_swap(base_dir, &abs).map_err(
+                |error| match profiles_busy_operator_line(Some(&error), "") {
+                    Some(_) => anyhow::anyhow!(
+                        "csq swap: profiles lock busy; nothing changed — retry the swap"
+                    ),
+                    None => anyhow::Error::from(error),
+                },
+            )?);
             _swap_abs_for_hint = Some(abs.clone());
             // M3-7/guard-reader-writer-parity.md MUST-1/F5: source the
             // target's token via the shared `target_token_for_forced_write`
@@ -719,11 +796,19 @@ fn handle_inner(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
             // three-way classification) is carried forward below so the
             // post-repoint reconcile can classify X by IDENTITY against
             // exactly what THIS call attempted to write.
-            if let Err(msg) = csq_core::credentials::keychain::force_swap_write_before_repoint(
-                base_dir,
-                &abs,
-                target_creds.as_valid_str(),
-            ) {
+            if let Err(msg) =
+                csq_core::credentials::keychain::force_swap_write_before_repoint_guarded(
+                    base_dir,
+                    &abs,
+                    target_creds.as_valid_str(),
+                    swap_target_binding
+                        .as_ref()
+                        .expect("same-surface target captured"),
+                    swap_native_capture
+                        .as_ref()
+                        .expect("same-surface native context captured"),
+                )
+            {
                 anyhow::bail!("csq swap: {msg}");
             }
             _swap_target_creds_for_reconcile = Some(target_creds);
@@ -745,9 +830,18 @@ fn handle_inner(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
     };
 
     let mut result = match route_kind {
-        RouteKind::SameSurfaceClaudeCode => {
-            same_surface_claude_code_audited(base_dir, source.path(), target, from_slot)
-        }
+        RouteKind::SameSurfaceClaudeCode => same_surface_claude_code_audited(
+            base_dir,
+            source.path(),
+            target,
+            from_slot,
+            swap_target_binding
+                .as_ref()
+                .expect("same-surface target captured"),
+            swap_native_capture
+                .as_ref()
+                .expect("same-surface native context captured"),
+        ),
         RouteKind::SameSurfaceCodex => {
             same_surface_codex_audited(base_dir, source.path(), target, from_slot)
         }
@@ -838,7 +932,11 @@ fn handle_inner(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
         // non-zero exit carrying the reconcile line, so the operator is
         // never told "Swapped" while the keychain disagrees.
         if result.is_err() {
-            let operator_line = if let Some(item) = refused_item {
+            let operator_line = if let Some(line) =
+                profiles_busy_operator_line(credential_error, &reconcile_line)
+            {
+                line
+            } else if let Some(item) = refused_item {
                 csq_core::credentials::keychain::repoint_refused_real_file_operator_line(
                     item,
                     &reconcile_line,
@@ -891,6 +989,19 @@ fn handle_inner(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
     // `_swap_guard` drops here.
 
     result
+}
+
+/// N5: a held profiles lock is contention, not an identity problem — the
+/// operator is told to retry, never to `csq login`. `None` for every other error.
+fn profiles_busy_operator_line(
+    error: Option<&csq_core::error::CredentialError>,
+    reconcile_line: &str,
+) -> Option<String> {
+    error.filter(|e| handle_dir::is_profiles_lock_busy(e)).map(|_| {
+        format!(
+            "csq swap: profiles lock busy; the repoint did not run — retry the swap. {reconcile_line}"
+        )
+    })
 }
 
 // ─── M13b audit helpers ──────────────────────────────────────────────
@@ -1165,17 +1276,25 @@ fn same_surface_claude_code_audited(
     source_dir: &Path,
     target: AccountNum,
     from_slot: Option<AccountNum>,
+    target_binding: &csq_core::accounts::anthropic_identity::CapturedBinding,
+    native_capture: &handle_dir::NativeSwapCapture,
 ) -> Result<()> {
     match begin_swap_audit(base_dir, from_slot, target)? {
         Some(ctx) => {
             // INTENT committed. Run side effect, then emit OUTCOME.
-            let result = same_surface_claude_code(base_dir, source_dir, target);
+            let result = same_surface_claude_code(
+                base_dir,
+                source_dir,
+                target,
+                target_binding,
+                native_capture,
+            );
             finish_swap_audit(base_dir, ctx, &result);
             result
         }
         None => {
             // Marker absent → audit skipped, swap proceeds (not fail-closed).
-            same_surface_claude_code(base_dir, source_dir, target)
+            same_surface_claude_code(base_dir, source_dir, target, target_binding, native_capture)
         }
     }
 }
@@ -1215,7 +1334,13 @@ fn decide_ok_repoint_disposition(
     }
 }
 
-fn same_surface_claude_code(base_dir: &Path, source_dir: &Path, target: AccountNum) -> Result<()> {
+fn same_surface_claude_code(
+    base_dir: &Path,
+    source_dir: &Path,
+    target: AccountNum,
+    target_binding: &csq_core::accounts::anthropic_identity::CapturedBinding,
+    native_capture: &handle_dir::NativeSwapCapture,
+) -> Result<()> {
     // M4-8 (Phase 4 an internal ticket): the only valid same-surface ClaudeCode
     // swap path is the handle-dir model. `detect_source_handle` already
     // refuses legacy `config-N` sources with the spec 02 §2.6 message,
@@ -1236,7 +1361,13 @@ fn same_surface_claude_code(base_dir: &Path, source_dir: &Path, target: AccountN
     }
 
     let claude_home = super::claude_home()?;
-    handle_dir::repoint_handle_dir(base_dir, &claude_home, source_dir, target)?;
+    handle_dir::repoint_handle_dir_guarded(
+        base_dir,
+        &claude_home,
+        source_dir,
+        target_binding,
+        native_capture,
+    )?;
     refresh_current_account_cache(base_dir, target);
     notify_daemon_cache_invalidation(base_dir);
     // S-H-A/D-F1: the success line is printed by the caller, AFTER
@@ -2378,6 +2509,14 @@ fn handoff_to_supervisor_write_and_signal(
 /// 5. exec() the target binary. Replaces the process on success; returns
 ///    an error on failure.
 ///
+/// The source terminal's messaging decision for an exec-replace swap. The swap runs INSIDE the
+/// source session, so after the marker it reads the session's own `CSQ_MESSAGING_DECISION`
+/// (set by every launch): a failed launch-time marker write then still reads the launch's
+/// decision instead of `off`.
+fn source_messaging_decision(source: &std::path::Path) -> bool {
+    csq_core::messaging::register::existing_decision_in_session(source)
+}
+
 /// exec(2) replaces the process so code after exec is unreachable on success.
 /// OUTCOME therefore MUST precede exec.
 fn exec_replace_swap(
@@ -2390,6 +2529,8 @@ fn exec_replace_swap(
     route_kind: RouteKind,
 ) -> Result<()> {
     let source_surface = source.surface();
+    // Refuse before handoff, tombstoning or target-handle writes.
+    super::run::admit_swap_provider_session(base_dir, target, target_surface, None, false)?;
 
     // ── Live-codex-ancestor refusal / supervised handoff (issue: "unable to
     // csq swap between codex sessions") ───────────────────────────────────
@@ -2435,7 +2576,7 @@ fn exec_replace_swap(
     // — before Step 2's tombstone rename further down. A Block/Escalate
     // verdict therefore returns `Err` here with NOTHING tombstoned and
     // NOTHING created; the alternative (moving the tombstone to after the
-    // gate, inside `exec_codex_after_binding`) would still work but would
+    // gate, inside `supervise_codex_after_binding`) would still work but would
     // put the refusal after the cross-surface confirmation prompt below,
     // making the user answer "Continue? [y/N]" for a swap that governance
     // was always going to refuse. Gating first also means `Err` here never
@@ -2447,26 +2588,14 @@ fn exec_replace_swap(
     // unaffected. Uses the SAME `evaluate_codex_spawn_gate` /
     // `resolve_codex_mcp_rewrite` functions `launch_codex` calls, so the two
     // spawn surfaces cannot drift apart again.
-    #[cfg(feature = "enterprise")]
-    let (codex_spawn_scope_env, codex_gate_env): (
-        Vec<(String, String)>,
-        Option<Box<csq_trust_contract::OperatingEnvelope>>,
-    ) = if target_surface == Surface::Codex {
-        let start_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let mut audit_emitter = super::run::build_audit_emitter(
-            base_dir,
-            csq_core::cli_deps::SurfaceCli::Codex.audit_surface(),
-            format!("csq swap account {target}"),
-            start_ts,
-        );
-        super::run::evaluate_codex_spawn_gate(base_dir, &mut audit_emitter)?
-    } else {
-        (Vec::new(), None)
-    };
-    #[cfg(not(feature = "enterprise"))]
-    let codex_spawn_scope_env: Vec<(String, String)> = Vec::new();
-
-    // S-F5: token-freshness check MOVED here from `exec_codex_after_binding`
+    //
+    // The session a Codex-target swap supervises carries EXACTLY the audit
+    // emitter and capability-layer settings `csq run` builds for that slot
+    // (`codex_swap_session_inputs`). The gate is evaluated against THAT
+    // emitter — as `launch_codex` evaluates it against `csq run`'s — so the
+    // supervised session emits one run record carrying the gate verdict,
+    // never a second, separate one.
+    // S-F5: token-freshness check MOVED here from `supervise_codex_after_binding`
     // (which ran it via the just-created TARGET handle dir's `auth.json`
     // symlink, well after Step 2's tombstone and Step 3's target-dir
     // creation). Read directly through the canonical credential path
@@ -2474,7 +2603,7 @@ fn exec_replace_swap(
     // `verify_codex_target_ready_for_handoff` uses for the supervised
     // handoff — since neither the source tombstone nor the target handle
     // dir exists yet at this point, so there is no symlink to read
-    // through. Gated the same way as the M6 gate above (Codex target
+    // through. Gated the same way as the M6 gate below (Codex target
     // only), and — like that gate — runs BEFORE any tombstone: an expired
     // token now refuses with NOTHING tombstoned and NOTHING created.
     if target_surface == Surface::Codex {
@@ -2485,6 +2614,48 @@ fn exec_replace_swap(
         let canonical_path = codex_canonical_auth_path(base_dir, target);
         super::run::check_codex_token_freshness(&canonical_path, target, now_secs)?;
     }
+
+    // H1 (R3): the codex share lock is taken HERE, beside the spawn gate and
+    // before Step 1's INTENT, Step 2's tombstone, Step 3's target handle dir
+    // and Step 4's OUTCOME, so a routine contention with a running
+    // `csq sessions share` refuses (`CodexShareLockContended`) with NOTHING
+    // changed. The guard is moved into `supervise_codex_after_binding`, which
+    // hands it to the SAME supervised-launch helper `launch_codex` uses
+    // (`run::supervise_codex_holding_share_lock`): csq holds it — never
+    // released and re-acquired, and never inherited by codex or a tool
+    // subprocess (`FD_CLOEXEC` stays set) — while csq lives (on Linux the
+    // codex child is armed with `PR_SET_PDEATHSIG`, so it does not outlive
+    // csq; macOS has no equivalent, and a SIGKILLed csq drops the lock while
+    // an orphaned codex runs on). Only a Codex target opens the shared
+    // session store.
+    //
+    // T1: the freshness check above and this lock run BEFORE the run's audit
+    // emitter is built (below), so neither refusal can leave a codex-run
+    // record behind.
+    let codex_share_lock = if target_surface == Surface::Codex {
+        Some(acquire_swap_codex_share_lock(base_dir)?)
+    } else {
+        None
+    };
+
+    #[cfg_attr(not(feature = "enterprise"), allow(unused_mut))]
+    let mut codex_session = if target_surface == Surface::Codex {
+        Some(codex_swap_session_inputs(base_dir, target))
+    } else {
+        None
+    };
+    #[cfg(feature = "enterprise")]
+    let (codex_spawn_scope_env, codex_gate_env): (
+        Vec<(String, String)>,
+        Option<Box<csq_trust_contract::OperatingEnvelope>>,
+    ) = match codex_session.as_mut() {
+        Some((_, pre_spawn)) => {
+            super::run::evaluate_codex_spawn_gate(base_dir, pre_spawn.emitter_mut())?
+        }
+        None => (Vec::new(), None),
+    };
+    #[cfg(not(feature = "enterprise"))]
+    let codex_spawn_scope_env: Vec<(String, String)> = Vec::new();
 
     let is_cross_surface = source_surface != target_surface;
 
@@ -2566,6 +2737,13 @@ fn exec_replace_swap(
         // starts fresh for Gemini/Kimi/Grok).
         confirm_surface_switch(source_surface, target_surface, resume_conversation)?;
     }
+
+    // Spec 32b section 6: the source terminal's messaging decision, read BEFORE the tombstone
+    // moves its handle dir. The target inherits it; `CSQ_MESSAGING` is not read on any swap.
+    // This process runs inside the source session, so after the marker it reads the
+    // session's own `CSQ_MESSAGING_DECISION` (set by every launch), which survives a failed
+    // marker write.
+    let messaging_on = source_messaging_decision(source.path());
 
     // ── Step 1: emit INTENT (before any destructive operation) ──────────────
     //
@@ -2666,6 +2844,22 @@ fn exec_replace_swap(
         )
     })?;
 
+    // Hand the source's decision to the target (every surface: a later swap out of a Gemini or
+    // native terminal must still know it). A failed write is logged with a fixed tag; every
+    // exec below (Claude, Codex, Gemini, and Kimi/Grok via `build_swap_native_command`) carries
+    // `messaging_on` explicitly and sets `CSQ_MESSAGING_DECISION`, so none falls back to the
+    // parent shell's `CSQ_MESSAGING`.
+    if let Err(e) = csq_core::messaging::register::record_decision(
+        &base_dir.join(format!("term-{pid}")),
+        messaging_on,
+    ) {
+        tracing::warn!(
+            error_kind = csq_core::messaging::register::LOG_TAG_FAILED,
+            reason = e.tag(),
+            "swap target launch decision not recorded"
+        );
+    }
+
     // M6 T6.2 Shard 3a MCP-proxy rewrite resolution (parity fix, item 1):
     // consumes the SAME resolved envelope the gate above already validated
     // (`codex_gate_env`) — no second `load_spawn_envelope` read (redteam R1
@@ -2706,25 +2900,43 @@ fn exec_replace_swap(
     let codex_mcp_rewrite: Option<(String, PathBuf)> = None;
 
     match target_surface {
-        Surface::Codex => exec_codex_after_binding(
+        // T4 (S-F3 parity with the old exec path): every failure from here on
+        // is reached with the source handle dir already tombstoned and the
+        // swap's OUTCOME already written `Ok`, so it carries the recovery
+        // hint, and its text passes through `redact_tokens`.
+        Surface::Codex => supervise_codex_after_binding(
             base_dir,
             target,
-            pid,
             resume_conversation,
             &codex_spawn_scope_env,
             codex_mcp_rewrite,
-        ),
+            messaging_on,
+            codex_share_lock,
+            codex_session,
+        )
+        .map_err(|e| swap_codex_post_tombstone_error(&e, target)),
         Surface::ClaudeCode => {
-            exec_claude_code_after_binding(base_dir, target, pid, resume_conversation)
+            exec_claude_code_after_binding(base_dir, target, pid, resume_conversation, messaging_on)
         }
-        Surface::Gemini => exec_gemini_after_binding(base_dir, target, pid),
+        Surface::Gemini => exec_gemini_after_binding(base_dir, target, pid, messaging_on),
         // W3-4 (an internal journal entry): native-CLI swap exec. Mirrors
         // exec_gemini_after_binding — no resume flag (native CLIs have no
         // resume concept csq drives).
         Surface::Kimi | Surface::Grok => {
-            exec_native_after_binding(base_dir, target, target_surface, pid)
+            exec_native_after_binding(base_dir, target, target_surface, pid, messaging_on)
         }
     }
+}
+
+/// The error a Codex-target swap returns once its source handle dir is
+/// tombstoned: the cause, passed through `redact_tokens` (security.md
+/// MUST-2/8), plus the recovery hint the exec path always carried.
+fn swap_codex_post_tombstone_error(e: &anyhow::Error, target: AccountNum) -> anyhow::Error {
+    anyhow!(
+        "{} — source handle dir was already tombstoned; \
+         re-run `csq run {target}` to start a new session",
+        csq_core::error::redact_tokens(&format!("{e:#}"))
+    )
 }
 
 /// Create the target handle dir for a cross-surface swap.
@@ -2820,35 +3032,148 @@ fn confirm_surface_switch(source: Surface, target: Surface, target_resumes: bool
     );
     eprint!("Continue? [y/N]: ");
     std::io::stderr().flush().ok();
-    let stdin = std::io::stdin();
     let mut line = String::new();
-    stdin.lock().read_line(&mut line)?;
+    #[cfg(test)]
+    let forced = tests::FORCE_CONFIRM_ANSWER.with(|a| a.borrow().clone());
+    #[cfg(not(test))]
+    let forced: Option<String> = None;
+    match forced {
+        Some(answer) => line = answer,
+        None => {
+            let stdin = std::io::stdin();
+            stdin.lock().read_line(&mut line)?;
+        }
+    }
     if !line.trim().eq_ignore_ascii_case("y") {
         return Err(anyhow!("swap cancelled"));
     }
     Ok(())
 }
 
-/// Exec the Codex binary after the target handle dir has already been created
-/// by `create_target_handle_dir`. The handle dir path is re-derived from the PID.
+/// The Codex command a swap-exec launches: the SAME builder `launch_codex` uses, handed the
+/// resolved MCP-proxy rewrite so the messaging server registers through `csq mcp-proxy`
+/// under an envelope `mcp` policy instead of direct (spec 32 section 6).
+#[cfg(unix)]
+fn build_swap_codex_command(
+    base_dir: &Path,
+    target: AccountNum,
+    handle_dir: &Path,
+    rest: &[String],
+    mcp_wrap: Option<(&str, &Path)>,
+    messaging_on: bool,
+) -> Result<std::process::Command> {
+    // `None` (no envelope `mcp` policy) is the plain, unwrapped command. The messaging
+    // decision is the SOURCE terminal's, never the environment's (spec 32b section 6).
+    super::run::build_codex_exec_command_with(
+        base_dir,
+        target,
+        handle_dir,
+        rest,
+        mcp_wrap,
+        Some(messaging_on),
+    )
+}
+
+/// The Claude Code command a swap-exec launches: `claude` in the fresh handle dir, with the
+/// messaging registration the SOURCE terminal had (spec 32b section 6) added BEFORE the resume
+/// flag, exactly as `csq run` adds it before the user's arguments. Without it a Claude session
+/// started by a swap would have no messaging tools and no hooks.
+#[cfg(unix)]
+fn build_swap_claude_command(
+    handle_dir_abs: &Path,
+    resume: bool,
+    messaging_on: bool,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new("claude");
+    cmd.env("CLAUDE_CONFIG_DIR", handle_dir_abs);
+    cmd.env_remove(codex_surface::HOME_ENV_VAR);
+    super::run::attach_messaging_claude_as(&mut cmd, handle_dir_abs, messaging_on);
+    if resume {
+        // `-c/--continue`: re-attach to the most recent conversation in the CWD.
+        cmd.arg("--continue");
+    }
+    cmd
+}
+
+/// The audit emitter and capability-layer settings the codex session a
+/// Codex-target swap supervises carries: what `csq run <target>` (no flags)
+/// builds for that slot — `run::run_audit_emitter` for the Codex surface, and
+/// `run::CodexLaunchSettings::for_plain_run` (persisted toggles included) —
+/// with `start_ts` captured here, before any spawn step.
+fn codex_swap_session_inputs(
+    base_dir: &Path,
+    target: AccountNum,
+) -> (
+    super::run::CodexLaunchSettings<'static>,
+    super::run::PreSpawnCodexRun,
+) {
+    let start_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    (
+        super::run::CodexLaunchSettings::for_plain_run(base_dir),
+        super::run::PreSpawnCodexRun::new(super::run::run_audit_emitter(
+            base_dir,
+            csq_core::cli_deps::SurfaceCli::Codex,
+            target,
+            start_ts,
+        )),
+    )
+}
+
+/// The codex share lock a swap into a codex slot holds while csq supervises
+/// the codex session (Linux: the child dies with csq via `PR_SET_PDEATHSIG`;
+/// macOS: a SIGKILLed csq drops it while an orphaned codex runs on): SHARED, bounded (`acquire_codex_share_lock_shared`, as `launch_codex`), so a
+/// running `csq sessions share` refuses the swap with `CodexShareLockContended`.
+fn acquire_swap_codex_share_lock(
+    base_dir: &Path,
+) -> Result<csq_core::session::shared_state::CodexShareLockGuard> {
+    csq_core::session::shared_state::acquire_codex_share_lock_shared(base_dir)
+        .map_err(|e| anyhow!("{e}"))
+}
+
+/// Supervise the Codex binary as a child — through the SAME helper
+/// `launch_codex` uses (`run::supervise_codex_holding_share_lock`), never an
+/// exec-replace — after the target handle dir has already been created by
+/// `create_target_handle_dir`. The handle dir path is re-derived from the PID.
+/// csq holds `share_lock` (taken before the swap changed anything) until
+/// codex exits, and exits with codex's status (a non-zero exit leaves via the
+/// supervisor's `process::exit`). A swap requested from inside this session
+/// relaunches through `launch_codex`, which takes its own fresh SHARED guard.
 ///
-/// When `resume` is true (a swap INTO a Codex slot), exec `codex resume --last`
+/// When `resume` is true (a swap INTO a Codex slot), launch `codex resume --last`
 /// to ASK codex to re-attach to its most-recent session. The store it reads IS the
 /// tombstoned source's: the fresh handle dir's `sessions` link resolves to
 /// `config-<target>/codex-sessions`, a symlink into the shared codex state
 /// (`CODEX_SHARED.shared`, linked before vendor login by design), so the earlier
 /// store-isolation suspect is REFUTED. Whether the resume actually re-attaches
-/// remains UNVERIFIED (see `exec_replace_swap`). Otherwise exec bare `codex`.
+/// remains UNVERIFIED (see `exec_replace_swap`). Otherwise launch bare `codex`.
 #[cfg(unix)]
-fn exec_codex_after_binding(
+#[allow(clippy::too_many_arguments)]
+fn supervise_codex_after_binding(
     base_dir: &Path,
     target: AccountNum,
-    pid: u32,
     resume: bool,
     codex_spawn_scope_env: &[(String, String)],
     codex_mcp_rewrite: Option<(String, PathBuf)>,
+    messaging_on: bool,
+    share_lock: Option<csq_core::session::shared_state::CodexShareLockGuard>,
+    session: Option<(
+        super::run::CodexLaunchSettings<'static>,
+        super::run::PreSpawnCodexRun,
+    )>,
 ) -> Result<()> {
-    use std::os::unix::process::CommandExt;
+    // `term-<pid>` is THIS process's handle dir: `exec_replace_swap` created it
+    // under `std::process::id()`, and this process supervises codex in it.
+    let pid = std::process::id();
+    // H1: `exec_replace_swap` took the SHARED share lock before any step of
+    // the swap changed anything; it is held until the supervised codex exits
+    // (`run::supervise_codex_holding_share_lock`). A Codex target reaching
+    // here without it, or without the session's audit emitter and settings,
+    // is refused (fail closed).
+    let codex_share_lock =
+        share_lock.ok_or_else(|| anyhow!("csq swap: codex share lock not held"))?;
+    let (settings, mut pre_spawn) =
+        session.ok_or_else(|| anyhow!("csq swap: codex session audit emitter not built"))?;
+    super::run::admit_swap_provider_session(base_dir, target, Surface::Codex, None, true)?;
     // Re-derive the handle dir path — do NOT call `create_handle_dir_codex` again.
     // `create_target_handle_dir` (step 3) already created `term-<pid>` and wrote its
     // live `.live-pid`; a second create with the same pid trips the live-PID guard and
@@ -2892,7 +3217,19 @@ fn exec_codex_after_binding(
     } else {
         Vec::new()
     };
-    let mut cmd = super::run::build_codex_exec_command(base_dir, target, &handle_dir, &rest)?;
+    let mcp_wrap = codex_mcp_rewrite
+        .as_ref()
+        .map(|(bin, path)| (bin.as_str(), path.as_path()));
+    #[cfg(test)]
+    let forced_cmd = tests::SWAP_CODEX_COMMAND_OVERRIDE.with(|o| o.borrow().as_ref().map(|f| f()));
+    #[cfg(not(test))]
+    let forced_cmd: Option<std::process::Command> = None;
+    let mut cmd = match forced_cmd {
+        Some(cmd) => cmd,
+        None => {
+            build_swap_codex_command(base_dir, target, &handle_dir, &rest, mcp_wrap, messaging_on)?
+        }
+    };
 
     // M6 T6.4: inject the advisory path-scope env (empty unless the gate
     // returned Conditional with a declared path-scope). Mirrors
@@ -2906,9 +3243,6 @@ fn exec_codex_after_binding(
     // Inherit symlink `create_target_handle_dir` planted only when an MCP
     // rewrite is actually staged; a session with no MCP policy keeps the
     // v2.3.1 symlink path verbatim.
-    let mcp_wrap = codex_mcp_rewrite
-        .as_ref()
-        .map(|(bin, path)| (bin.as_str(), path.as_path()));
     if mcp_wrap.is_some() {
         let skipped = super::run::materialize_handle_config_toml(
             base_dir,
@@ -2923,20 +3257,39 @@ fn exec_codex_after_binding(
         super::run::verify_codex_handle_config_toml_is_regular_file(&handle_dir)?;
     }
 
-    // S-F3 (this file's instance): `err` is `std::io::Error` from a failed
-    // `exec()` and is not expected to carry secrets, but this whole module
-    // is OAuth-adjacent (`security.md` MUST-2/Rule 8) — route every
-    // operator-facing error through the same redaction the rest of this
-    // exec-error family in this file now uses, rather than trusting each
-    // call site's `{e}`/`{err}` interpolation to stay harmless as the
-    // underlying error type evolves.
-    let err = cmd.exec();
-    Err(anyhow!(
-        "exec `{}` failed after source handle dir was removed — \
-         re-run `csq run {target}` to relaunch. Error: {}",
-        codex_surface::CLI_BINARY,
-        csq_core::error::redact_tokens(&err.to_string())
-    ))
+    // `launch_codex`'s `LayerControl::Inherit` arm records the session as
+    // Degraded/Bypass before supervising; so does this (the same arm's
+    // command and MCP materialization are what this function reproduces).
+    {
+        use csq_core::audit::{Decision, ResultState};
+        pre_spawn
+            .emitter_mut()
+            .set_result(ResultState::Degraded, Decision::Bypass);
+    }
+    let embedded_native_fallback = super::codex_supervise::requires_embedded_native(&rest);
+    // T1: the emitter leaves the pre-spawn guard only here, at the
+    // supervised-spawn call; the supervisor ends it on its own pre-spawn
+    // exits (`run::end_codex_run_before_spawn`).
+    let mut audit_emitter = pre_spawn.into_spawning();
+    // `swap_correlation` is `None`: this swap already wrote its correlated
+    // OUTCOME (Step 4, before this call). Handing the correlation to the
+    // supervisor would make it write a SECOND OUTCOME for the same INTENT on
+    // spawn — the double-write `scan_orphan_intents`' 1:1 pairing forbids.
+    // `is_relaunch` is `false`: this is this process's first codex launch,
+    // as for `csq run`.
+    super::run::supervise_codex_holding_share_lock(
+        codex_share_lock,
+        cmd,
+        &handle_dir,
+        base_dir,
+        settings,
+        &rest,
+        /* is_relaunch */ false,
+        /* swap_correlation */ None,
+        &mut audit_emitter,
+        messaging_on,
+        embedded_native_fallback,
+    )
 }
 
 /// Exec the ClaudeCode binary after the target handle dir has already been
@@ -2954,6 +3307,7 @@ fn exec_claude_code_after_binding(
     target: AccountNum,
     pid: u32,
     resume: bool,
+    messaging_on: bool,
 ) -> Result<()> {
     use std::os::unix::process::CommandExt;
     // Re-derive the handle dir path — do NOT call `create_handle_dir` again.
@@ -2964,6 +3318,7 @@ fn exec_claude_code_after_binding(
     // names the dir `term-<pid>` (see its impl), so deriving the path here is exact.
     // Mirrors `exec_gemini_after_binding`, which already re-derives rather than recreates.
     let handle_dir = base_dir.join(format!("term-{pid}"));
+    admit_materialized_claude_swap(base_dir, target, &handle_dir)?;
 
     // Security review 1386 M4 (sibling instance): the usual non-canonical
     // fallback stays for `handle_dir_abs` (still the right `CLAUDE_CONFIG_DIR`
@@ -2994,16 +3349,10 @@ fn exec_claude_code_after_binding(
         ));
     }
 
-    let mut cmd = std::process::Command::new("claude");
-    cmd.env("CLAUDE_CONFIG_DIR", &handle_dir_abs);
-    cmd.env_remove(codex_surface::HOME_ENV_VAR);
-    if resume {
-        // `-c/--continue`: re-attach to the most recent conversation in the CWD.
-        // The transcript is shared across handle dirs (SHARED_ITEMS `projects`), so
-        // the conversation data stays reachable from the fresh dir — but the actual
-        // re-attach is UNVERIFIED, and `--continue` resolves against the CWD.
-        cmd.arg("--continue");
-    }
+    // `--continue` re-attaches to the most recent conversation in the CWD. The transcript is
+    // shared across handle dirs (SHARED_ITEMS `projects`), so the data stays reachable from the
+    // fresh dir — but the actual re-attach is UNVERIFIED, and it resolves against the CWD.
+    let mut cmd = build_swap_claude_command(&handle_dir_abs, resume, messaging_on);
 
     // S-F3 (this file's instance): see the codex exec arm's identical note.
     let err = cmd.exec();
@@ -3015,13 +3364,19 @@ fn exec_claude_code_after_binding(
 }
 
 #[cfg(not(unix))]
-fn exec_codex_after_binding(
+#[allow(clippy::too_many_arguments)]
+fn supervise_codex_after_binding(
     _base_dir: &Path,
     _target: AccountNum,
-    _pid: u32,
     _resume: bool,
     _codex_spawn_scope_env: &[(String, String)],
     _codex_mcp_rewrite: Option<(String, PathBuf)>,
+    _messaging_on: bool,
+    _share_lock: Option<csq_core::session::shared_state::CodexShareLockGuard>,
+    _session: Option<(
+        super::run::CodexLaunchSettings<'static>,
+        super::run::PreSpawnCodexRun,
+    )>,
 ) -> Result<()> {
     Err(anyhow!(
         "cross-surface csq swap is Unix-only today. \
@@ -3035,6 +3390,7 @@ fn exec_claude_code_after_binding(
     _target: AccountNum,
     _pid: u32,
     _resume: bool,
+    _messaging_on: bool,
 ) -> Result<()> {
     Err(anyhow!(
         "cross-surface csq swap is Unix-only today. \
@@ -3103,9 +3459,15 @@ fn create_gemini_handle_dir(_base_dir: &Path, _target: AccountNum, _pid: u32) ->
 /// csq-core requires a new `gemini::session` module + typed error enum;
 /// deferred until PR-G5 (desktop) becomes the third caller.
 #[cfg(unix)]
-fn exec_gemini_after_binding(base_dir: &Path, target: AccountNum, pid: u32) -> Result<()> {
+fn exec_gemini_after_binding(
+    base_dir: &Path,
+    target: AccountNum,
+    pid: u32,
+    messaging_on: bool,
+) -> Result<()> {
     use csq_core::platform::secret;
     use csq_core::providers::gemini::spawn::spawn_gemini;
+    super::run::admit_swap_provider_session(base_dir, target, Surface::Gemini, None, true)?;
 
     let handle_dir = base_dir.join(format!("term-{pid}"));
     let handle_dir_abs = std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
@@ -3126,6 +3488,7 @@ fn exec_gemini_after_binding(base_dir: &Path, target: AccountNum, pid: u32) -> R
         target,
         Vec::new(),
         vault.as_ref(),
+        messaging_on,
     ) {
         Ok(_never) => unreachable!("spawn_gemini returns Infallible on success"),
         Err(e) => {
@@ -3141,7 +3504,12 @@ fn exec_gemini_after_binding(base_dir: &Path, target: AccountNum, pid: u32) -> R
 }
 
 #[cfg(not(unix))]
-fn exec_gemini_after_binding(_base_dir: &Path, _target: AccountNum, _pid: u32) -> Result<()> {
+fn exec_gemini_after_binding(
+    _base_dir: &Path,
+    _target: AccountNum,
+    _pid: u32,
+    _messaging_on: bool,
+) -> Result<()> {
     Err(anyhow!(
         "cross-surface csq swap is Unix-only today. \
          On Windows, exit the current surface and run `csq run <N>`."
@@ -3228,7 +3596,7 @@ fn create_native_handle_dir(
 /// W3-4 (an internal journal entry): Exec the native vendor binary (`kimi`/`grok`) after
 /// the target handle dir has already been created by
 /// `create_native_handle_dir`. The handle dir path is re-derived from the
-/// PID (mirrors `exec_codex_after_binding`/`exec_claude_code_after_binding`
+/// PID (mirrors `supervise_codex_after_binding`/`exec_claude_code_after_binding`
 /// — a second `create_*_handle_dir` call with the same pid would trip the
 /// live-PID guard).
 ///
@@ -3237,17 +3605,15 @@ fn create_native_handle_dir(
 /// `exec_replace_swap` is already `false` for `Surface::Kimi | Surface::Grok`.
 #[cfg(unix)]
 fn exec_native_after_binding(
-    // Unused: unlike Codex/Gemini, native CLIs have no HOME-equivalent env
-    // var to redirect — the handle dir written by `create_native_handle_dir`
-    // exists only for `.csq-account` bookkeeping, and the vendor binary
-    // execs directly in the caller's inherited cwd.
-    _base_dir: &Path,
+    base_dir: &Path,
     target: AccountNum,
     target_surface: Surface,
     pid: u32,
+    messaging_on: bool,
 ) -> Result<()> {
     use csq_core::providers::native;
     use std::os::unix::process::CommandExt;
+    super::run::admit_swap_provider_session(base_dir, target, target_surface, None, true)?;
 
     let descriptor = native::descriptor(target_surface).ok_or_else(|| {
         anyhow!("swap target surface {target_surface} is not a native-CLI surface")
@@ -3269,14 +3635,7 @@ fn exec_native_after_binding(
         descriptor.display_name, target, pid
     );
 
-    let mut cmd = std::process::Command::new(&binary_path);
-    // Scrub csq-session-dir env so the native CLI never accidentally
-    // resolves a stale csq-managed config dir from the source surface
-    // (mirrors exec_codex_after_binding / exec_claude_code_after_binding's
-    // identical scrub posture).
-    cmd.env_remove("CLAUDE_CONFIG_DIR");
-    cmd.env_remove("CLAUDE_HOME");
-    cmd.env_remove(codex_surface::HOME_ENV_VAR);
+    let mut cmd = build_swap_native_command(&binary_path, messaging_on);
 
     // S-F3 (this file's instance): see the codex exec arm's identical note.
     let err = cmd.exec();
@@ -3288,12 +3647,28 @@ fn exec_native_after_binding(
     ))
 }
 
+/// The Kimi/Grok swap-exec command: the vendor binary with the csq session-dir env scrubbed
+/// (so it never resolves a stale csq-managed config dir from the source surface, mirroring
+/// `supervise_codex_after_binding` / `exec_claude_code_after_binding`) and the source terminal's
+/// messaging decision in its environment (`run::set_decision_env`), so a later swap out of
+/// this terminal reads the decision even when no marker survived.
+#[cfg(unix)]
+fn build_swap_native_command(binary: &Path, messaging_on: bool) -> std::process::Command {
+    let mut cmd = std::process::Command::new(binary);
+    cmd.env_remove("CLAUDE_CONFIG_DIR");
+    cmd.env_remove("CLAUDE_HOME");
+    cmd.env_remove(codex_surface::HOME_ENV_VAR);
+    super::run::set_decision_env(&mut cmd, messaging_on);
+    cmd
+}
+
 #[cfg(not(unix))]
 fn exec_native_after_binding(
     _base_dir: &Path,
     _target: AccountNum,
     _target_surface: Surface,
     _pid: u32,
+    _messaging_on: bool,
 ) -> Result<()> {
     Err(anyhow!(
         "cross-surface csq swap is Unix-only today. \
@@ -3330,6 +3705,504 @@ fn notify_daemon_cache_invalidation(base_dir: &Path) {
 mod tests {
     use super::*;
 
+    /// H1 (R3): a swap into a codex slot refuses while `csq sessions share`
+    /// holds the share lock EXCLUSIVE, with NOTHING changed: no source
+    /// tombstone, no target `term-<pid>`, no audit record (neither INTENT nor
+    /// OUTCOME). Falsifying result with the lock taken only inside
+    /// `supervise_codex_after_binding`: INTENT is written, the source is
+    /// tombstoned and the target dir created before any refusal.
+    #[cfg(unix)]
+    #[test]
+    fn exec_replace_swap_into_codex_refuses_with_nothing_changed_while_a_share_holds_the_lock() {
+        use std::os::fd::AsRawFd;
+        let _cc_guard = force_find_cc_pid(None);
+        let base = tempfile::TempDir::new().expect("tempdir");
+        let source_dir = base.path().join("term-4000001");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(source_dir.join("marker"), b"source").unwrap();
+        std::fs::create_dir_all(base.path().join("shared-state/codex")).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(base.path().join("shared-state/codex/.share.lock"))
+            .unwrap();
+        // SAFETY: `lock` owns a live descriptor; flock changes only this
+        // private fixture's advisory lock.
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let result = exec_replace_swap(
+            base.path(),
+            SourceHandle::ClaudeCode(source_dir.clone()),
+            AccountNum::try_from(9u16).unwrap(),
+            Surface::Codex,
+            true,
+            Some(AccountNum::try_from(3u16).unwrap()),
+            RouteKind::CrossSurface,
+        );
+        drop(lock);
+        let expected =
+            csq_core::session::shared_state::ShareError::CodexShareLockContended.to_string();
+        let err = result.expect_err("a swap must not proceed under an exclusive share lock");
+        assert_eq!(err.to_string(), expected);
+        assert!(
+            source_dir.join("marker").exists(),
+            "the source handle dir was tombstoned"
+        );
+        let names: Vec<String> = std::fs::read_dir(base.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.starts_with(".sweep-tombstone-")),
+            "a tombstone was created: {names:?}"
+        );
+        assert!(
+            !base
+                .path()
+                .join(format!("term-{}", std::process::id()))
+                .exists(),
+            "a target handle dir was created"
+        );
+        assert_eq!(
+            count_chain_records(base.path()),
+            0,
+            "an audit record was written before the refusal"
+        );
+        // T1: neither may a run record be parked in `csq-runs/.pending/`
+        // (cbd962e73 built the run emitter before this refusal; its `Drop`
+        // parked a default `Bypass` record there).
+        let records = run_records_including_pending(base.path());
+        assert_eq!(
+            bypass_records(&records),
+            0,
+            "a Bypass run record: {records:?}"
+        );
+        assert!(records.is_empty(), "a run record was written: {records:?}");
+    }
+
+    /// Reporter half of
+    /// `swap_supervised_codex_child_holds_no_share_lock_descriptor`, run
+    /// INSIDE the supervised child: which of its own descriptors (fds
+    /// 0..1024, `fstat`) name the share lock file's `(dev, ino)`, and whether
+    /// an EXCLUSIVE try-lock on a fresh descriptor is refused. Never panics
+    /// (a non-zero child exit makes the supervisor `process::exit` the test
+    /// binary); a failure is written into the report instead.
+    #[cfg(unix)]
+    #[allow(clippy::unnecessary_cast)] // `st_dev`/`st_ino` widths differ by platform
+    fn swap_lock_fd_report(lock_path: &std::path::Path) -> String {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let meta = match std::fs::metadata(lock_path) {
+            Ok(m) => m,
+            Err(e) => return format!("error=metadata:{e}\n"),
+        };
+        let (dev, ino) = (meta.dev(), meta.ino());
+        let mut lock_fds = Vec::new();
+        for fd in 0..1024 {
+            // SAFETY: a zeroed `stat` is a valid out-parameter; fstat only
+            // reads descriptor metadata (EBADF for a closed fd).
+            let named_lock = unsafe {
+                let mut st: libc::stat = std::mem::zeroed();
+                libc::fstat(fd, &mut st) == 0 && st.st_dev as u64 == dev && st.st_ino as u64 == ino
+            };
+            if named_lock {
+                lock_fds.push(fd);
+            }
+        }
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+        {
+            Ok(f) => f,
+            Err(e) => return format!("error=open:{e}\n"),
+        };
+        // SAFETY: `file` owns a live descriptor; a non-blocking flock on the
+        // fixture's lock file, released when `file` drops.
+        let refused = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0;
+        format!("lock_fds={lock_fds:?} exclusive_refused={refused}\n")
+    }
+
+    /// While a swap-supervised codex child runs, NONE of its descriptors
+    /// names the codex share lock file's inode, and another process's
+    /// EXCLUSIVE try-lock is refused (csq holds the SHARED lock); after the
+    /// supervised run returns, an EXCLUSIVE try-lock is granted. Driven
+    /// through the swap's own entry (`supervise_codex_after_binding`, with
+    /// the guard `acquire_swap_codex_share_lock` takes and the session
+    /// `codex_swap_session_inputs` builds) in a DRIVER subprocess of this
+    /// test binary, whose codex command is replaced (test seam
+    /// `SWAP_CODEX_COMMAND_OVERRIDE`) by this binary re-invoked as a
+    /// REPORTER. Falsifying results: an exec-replace back in swap.rs either
+    /// leaks the lock descriptor into the reporter (`lock_fds` non-empty,
+    /// b78b71c71's `exec_keeping_share_lock`) or drops the lock at `exec`
+    /// (`exclusive_refused=false`); the driver runs in its own process so an
+    /// exec cannot replace the test harness itself.
+    #[cfg(unix)]
+    #[test]
+    fn swap_supervised_codex_child_holds_no_share_lock_descriptor() {
+        const REPORT: &str = "CSQ_SWAP_LOCK_FD_REPORT";
+        const LOCK: &str = "CSQ_SWAP_LOCK_FD_LOCK_PATH";
+        const DRIVER: &str = "CSQ_SWAP_LOCK_FD_DRIVER_BASE";
+        let name = format!(
+            "{}::swap_supervised_codex_child_holds_no_share_lock_descriptor",
+            module_path!()
+                .split_once("::")
+                .expect("crate-qualified path")
+                .1
+        );
+        if let (Some(report), Some(lock_path)) = (std::env::var_os(REPORT), std::env::var_os(LOCK))
+        {
+            let text = swap_lock_fd_report(std::path::Path::new(&lock_path));
+            let _ = std::fs::write(report, text);
+            return;
+        }
+        if let Some(base) = std::env::var_os(DRIVER) {
+            swap_lock_fd_driver(std::path::Path::new(&base), &name, REPORT, LOCK);
+            return;
+        }
+        let base = tempfile::TempDir::new().expect("tempdir");
+        let report = base.path().join("fd-report.txt");
+        let after = base.path().join("after-return.txt");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env(DRIVER, base.path())
+            .env_remove(REPORT)
+            .env_remove(LOCK)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("spawn the driver");
+        let driver_out = String::from_utf8_lossy(&status.stdout).into_owned()
+            + &String::from_utf8_lossy(&status.stderr);
+        let text = std::fs::read_to_string(&report)
+            .unwrap_or_else(|e| panic!("the reporter wrote no report ({e}); driver: {driver_out}"));
+        assert_eq!(
+            text, "lock_fds=[] exclusive_refused=true\n",
+            "the supervised child held a share-lock descriptor, or the lock was free while it ran"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&after).unwrap_or_default(),
+            "result=ok granted_after_return=true\n",
+            "the swap entry failed, or the share lock stayed held after it returned; driver: {driver_out}"
+        );
+        assert!(status.status.success(), "driver failed: {driver_out}");
+    }
+
+    /// Driver half of `swap_supervised_codex_child_holds_no_share_lock_descriptor`:
+    /// runs the swap's supervised-codex entry against a fixture under `base`.
+    #[cfg(unix)]
+    fn swap_lock_fd_driver(base: &std::path::Path, name: &str, report_env: &str, lock_env: &str) {
+        use std::os::fd::AsRawFd;
+        let target = AccountNum::try_from(9u16).unwrap();
+        let handle_dir = base.join(format!("term-{}", std::process::id()));
+        std::fs::create_dir_all(&handle_dir).unwrap();
+        let lock_path = base.join("shared-state/codex/.share.lock");
+        let report = base.join("fd-report.txt");
+        let lock = acquire_swap_codex_share_lock(base).expect("swap share lock");
+        let (exe, name, report_env, lock_env) = (
+            std::env::current_exe().unwrap(),
+            name.to_owned(),
+            report_env.to_owned(),
+            lock_env.to_owned(),
+        );
+        let lock_for_child = lock_path.clone();
+        SWAP_CODEX_COMMAND_OVERRIDE.with(|o| {
+            *o.borrow_mut() = Some(Box::new(move || {
+                let mut cmd = std::process::Command::new(&exe);
+                cmd.args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                    .env(&report_env, &report)
+                    .env(&lock_env, &lock_for_child)
+                    .env_remove("CSQ_SWAP_LOCK_FD_DRIVER_BASE")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                cmd
+            }));
+        });
+        let result = supervise_codex_after_binding(
+            base,
+            target,
+            /* resume */ false,
+            &[],
+            None,
+            /* messaging_on */ false,
+            Some(lock),
+            Some(codex_swap_session_inputs(base, target)),
+        );
+        let after = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        // SAFETY: `after` owns a live descriptor; a non-blocking flock on
+        // this private fixture, released when `after` drops.
+        let granted = unsafe { libc::flock(after.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        let verdict = match &result {
+            Ok(()) => "ok".to_owned(),
+            Err(e) => format!("err:{e:#}"),
+        };
+        std::fs::write(
+            base.join("after-return.txt"),
+            format!("result={verdict} granted_after_return={granted}\n"),
+        )
+        .unwrap();
+    }
+
+    /// A swap into a codex slot supervises a session carrying EXACTLY the
+    /// audit emitter and capability-layer settings `csq run <N>` (no flags)
+    /// builds for that slot — the inputs `supervise_codex_after_binding`
+    /// hands `run::supervise_codex_holding_share_lock`. The persisted toggles
+    /// are non-default, so `CapabilityLayerToggles::default()` (or no load)
+    /// fails; a `csq swap …` operation label or a non-Codex surface fails the
+    /// emitter half.
+    #[test]
+    fn swap_into_codex_session_carries_the_emitter_and_settings_csq_run_builds() {
+        let base = tempfile::TempDir::new().expect("tempdir");
+        let toggles = csq_core::capability_layer::CapabilityLayerToggles {
+            disable_scaffold: true,
+            disable_post_validate: true,
+            ..Default::default()
+        };
+        assert_ne!(toggles, Default::default());
+        csq_core::capability_layer::save_capability_layer_toggles(base.path(), &toggles).unwrap();
+        let target = AccountNum::try_from(7u16).unwrap();
+
+        let (settings, pre_spawn) = codex_swap_session_inputs(base.path(), target);
+        let emitter = pre_spawn.emitter_for_test().expect("a held emitter");
+
+        let run_settings = super::super::run::CodexLaunchSettings::from_run_flags(
+            crate::cli::LayerIntent::from_flags(false, false),
+            csq_core::capability_layer::load_capability_layer_toggles(base.path()),
+            /* debug */ false,
+            /* bench_mode */ None,
+            /* coc_cache_enabled */ true,
+        );
+        assert_eq!(settings, run_settings);
+        assert_eq!(settings.toggles, toggles);
+
+        let record = emitter
+            .record_for_test()
+            .expect("an enabled emitter")
+            .clone();
+        let run_emitter = super::super::run::run_audit_emitter(
+            base.path(),
+            csq_core::cli_deps::SurfaceCli::Codex,
+            target,
+            record.start_ts.clone(),
+        );
+        let mut run_record = run_emitter.record_for_test().expect("run emitter").clone();
+        assert_eq!(
+            emitter.operation_for_test(),
+            run_emitter.operation_for_test()
+        );
+        assert_eq!(emitter.operation_for_test(), "csq run account 7");
+        assert!(matches!(record.surface, csq_core::audit::Surface::Codex));
+        // `run_id` is random per emitter; every other field must match.
+        run_record.run_id = record.run_id.clone();
+        assert_eq!(
+            serde_json::to_value(&record).unwrap(),
+            serde_json::to_value(&run_record).unwrap()
+        );
+
+        // T5: the comparison above is parity only if `csq run` builds its
+        // codex session through those SAME two constructors. `run::handle`'s
+        // body must build its emitter with `run_audit_emitter(` and its codex
+        // settings with `CodexLaunchSettings::from_run_flags(`, and must not
+        // assemble an emitter or settings another way (`build_audit_emitter(`
+        // or a `CodexLaunchSettings {` literal). Falsifying result: `handle`
+        // switches to any other constructor and this span check fails.
+        let run_src = include_str!("run.rs");
+        let start = run_src.find("\npub fn handle(").expect("run::handle");
+        let len = run_src[start + 1..]
+            .find("\n}\n")
+            .expect("end of run::handle");
+        let handle_body = &run_src[start..start + 1 + len];
+        assert_eq!(handle_body.matches("run_audit_emitter(").count(), 1);
+        assert_eq!(
+            handle_body
+                .matches("CodexLaunchSettings::from_run_flags(")
+                .count(),
+            1
+        );
+        assert!(!handle_body.contains("build_audit_emitter("));
+        assert!(!handle_body.contains("CodexLaunchSettings {"));
+        drop(run_emitter);
+        drop(pre_spawn);
+        // Both emitters drop here; any record they flush lands under `base`
+        // (a tempdir with no daemon socket), never outside this test.
+    }
+
+    /// Records of the run chain under `base`: every JSON line of
+    /// `csq-runs/*.jsonl` AND every record parked in `csq-runs/.pending/`
+    /// (where an emitter with no reachable daemon writes — the place
+    /// `count_chain_records` never looks).
+    fn run_records_including_pending(base: &std::path::Path) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        for dir in [
+            base.join("csq-runs"),
+            base.join("csq-runs").join(".pending"),
+        ] {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if !entry.path().is_file() {
+                    continue;
+                }
+                let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+                match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(v) => out.push(v),
+                    Err(_) => out.extend(
+                        text.lines()
+                            .filter(|l| !l.trim().is_empty())
+                            .map(|l| serde_json::from_str(l).unwrap_or(serde_json::Value::Null)),
+                    ),
+                }
+            }
+        }
+        out
+    }
+
+    fn bypass_records(records: &[serde_json::Value]) -> usize {
+        records
+            .iter()
+            .filter(|r| {
+                r.get("decision").and_then(|d| d.as_str()) == Some("bypass")
+                    || r.pointer("/record/decision").and_then(|d| d.as_str()) == Some("bypass")
+                    || r.to_string().contains("\"decision\":\"bypass\"")
+            })
+            .count()
+    }
+
+    /// T1: a cross-surface swap into a codex slot whose prompt is DECLINED
+    /// leaves no run record at all — in particular none with `Bypass`, in
+    /// `csq-runs/` or `csq-runs/.pending/`. Falsifying result (cbd962e73):
+    /// the run emitter, built before the prompt, drops on `swap cancelled`
+    /// and parks its default `Degraded`/`Bypass` record in `.pending/`.
+    #[cfg(unix)]
+    #[test]
+    fn declined_swap_into_codex_leaves_no_bypass_run_record() {
+        let _cc_guard = force_find_cc_pid(None);
+        let _answer = force_confirm_answer("n\n");
+        let base = tempfile::TempDir::new().expect("tempdir");
+        let source_dir = base.path().join("term-4000003");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(source_dir.join("marker"), b"source").unwrap();
+        let result = exec_replace_swap(
+            base.path(),
+            SourceHandle::ClaudeCode(source_dir.clone()),
+            AccountNum::try_from(9u16).unwrap(),
+            Surface::Codex,
+            /* yes */ false,
+            Some(AccountNum::try_from(3u16).unwrap()),
+            RouteKind::CrossSurface,
+        );
+        let err = result.expect_err("a declined prompt must not proceed");
+        assert_eq!(err.to_string(), "swap cancelled");
+        assert!(
+            source_dir.join("marker").exists(),
+            "the source was tombstoned"
+        );
+        let records = run_records_including_pending(base.path());
+        assert_eq!(
+            bypass_records(&records),
+            0,
+            "a Bypass run record: {records:?}"
+        );
+        assert!(records.is_empty(), "a run record was written: {records:?}");
+    }
+
+    thread_local! {
+        pub(super) static FORCE_CONFIRM_ANSWER: std::cell::RefCell<Option<String>> =
+            const { std::cell::RefCell::new(None) };
+        #[allow(clippy::type_complexity)]
+        pub(super) static SWAP_CODEX_COMMAND_OVERRIDE: std::cell::RefCell<
+            Option<Box<dyn Fn() -> std::process::Command>>,
+        > = const { std::cell::RefCell::new(None) };
+    }
+
+    struct ConfirmAnswerGuard;
+    impl Drop for ConfirmAnswerGuard {
+        fn drop(&mut self) {
+            FORCE_CONFIRM_ANSWER.with(|a| *a.borrow_mut() = None);
+        }
+    }
+    fn force_confirm_answer(answer: &str) -> ConfirmAnswerGuard {
+        FORCE_CONFIRM_ANSWER.with(|a| *a.borrow_mut() = Some(answer.to_owned()));
+        ConfirmAnswerGuard
+    }
+
+    #[cfg(unix)]
+    fn fixture_shell(home: &std::path::Path) -> std::process::Command {
+        // Neither executable lookup nor the shell utilities may inherit a
+        // sibling test's transient PATH. The child gets only fixture state.
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", home)
+            .env("CSQ_BASE_DIR", home)
+            .env("TMPDIR", home);
+        cmd
+    }
+
+    #[cfg(unix)]
+    fn fixture_test_command(executable: &Path, home: &Path) -> std::process::Command {
+        let mut cmd = std::process::Command::new(executable);
+        cmd.env_clear()
+            .env("HOME", home)
+            .env("CSQ_BASE_DIR", home)
+            .env("TMPDIR", home)
+            .env("TMP", home)
+            .env("TEMP", home)
+            .env("PATH", format!("{}:/usr/bin:/bin", home.display()))
+            .env("LANG", "C")
+            .env("LC_ALL", "C");
+        cmd
+    }
+
+    /// N5: busy is "retry", never "run csq login"; an identity refusal is not busy.
+    #[test]
+    fn profiles_busy_operator_line_says_retry_not_login() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let handle = dir.path().join("term-1");
+        std::fs::create_dir_all(&handle).unwrap();
+        // Hold the lock on ANOTHER thread. The Windows lock is a named mutex,
+        // which is re-entrant for its owning thread (`platform::lock`), so a
+        // same-thread hold would not contend there; cross-thread contention
+        // refuses on every platform, as a concurrent operator would see it.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let base = dir.path().to_path_buf();
+        let holder = std::thread::spawn(move || {
+            let held = csq_core::accounts::profiles_lock::ProfilesFileLock::acquire(&base).unwrap();
+            held_tx.send(()).unwrap();
+            // Err means the test thread is gone; release either way.
+            let _ = release_rx.recv();
+            drop(held);
+        });
+        held_rx.recv().expect("holder thread acquired the lock");
+        let busy = handle_dir::capture_native_swap(dir.path(), &handle)
+            .err()
+            .expect("held lock must refuse");
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let line = profiles_busy_operator_line(Some(&busy), "R").expect("busy is recognised");
+        assert!(line.contains("busy") && line.contains("retry"), "{line}");
+        assert!(!line.contains("csq login"), "{line}");
+        let refusal = csq_core::error::CredentialError::Corrupt {
+            path: "anthropic-identity".into(),
+            reason: "identity_authority_refused".into(),
+        };
+        assert!(profiles_busy_operator_line(Some(&refusal), "R").is_none());
+        assert!(profiles_busy_operator_line(None, "R").is_none());
+    }
+
     /// Wait (bounded, 10s) until `path` holds a complete pid. Polling for
     /// mere EXISTENCE races the shell's `echo $! > file`, which creates the
     /// file before writing it: the enterprise CI leg read it empty
@@ -3363,6 +4236,31 @@ mod tests {
     /// S-H-A/D-F1: repoint succeeded, and the keychain genuinely agrees
     /// with the marker (`AlreadyCurrent`/`Reconciled`) — success, printing
     /// the account the MARKER resolved to.
+    /// BUG 3: the Kimi/Grok swap exec carries the source terminal's decision in its env, on AND
+    /// off, and a value exported in the parent shell is overridden. Falsifier: without the
+    /// `set_decision_env` call in `build_swap_native_command` the variable is absent.
+    #[cfg(unix)]
+    #[test]
+    fn native_swap_exec_carries_the_messaging_decision_in_its_env() {
+        let env_of = |on: bool| {
+            let cmd = build_swap_native_command(Path::new("/bin/true"), on);
+            let found: Vec<_> = cmd
+                .get_envs()
+                .filter(|(k, _)| *k == "CSQ_MESSAGING_DECISION")
+                .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+                .collect();
+            let removed = cmd
+                .get_envs()
+                .filter(|(k, v)| (*k == "CLAUDE_CONFIG_DIR") && v.is_none())
+                .count();
+            (found, removed)
+        };
+        let (on, scrub) = env_of(true);
+        assert_eq!(on, vec![Some("on".to_string())]);
+        assert_eq!(scrub, 1, "the csq session-dir scrub is still there");
+        assert_eq!(env_of(false).0, vec![Some("off".to_string())]);
+    }
+
     #[test]
     fn decide_ok_repoint_disposition_success_on_already_current_or_reconciled() {
         let acct = AccountNum::try_from(4u16).unwrap();
@@ -3550,7 +4448,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn refuses_before_any_tombstone_when_a_live_codex_ancestor_is_detected() {
-        use std::process::{Command, Stdio};
+        use std::process::Stdio;
         use std::time::{Duration, Instant};
 
         const RESULT_ENV: &str = "CSQ_TEST_SWAP_ANCESTOR_REFUSAL_RESULT_FILE";
@@ -3569,12 +4467,12 @@ mod tests {
             dst
         }
 
-        let dir = tempfile::TempDir::new().expect("tempdir");
+        let dir = tempfile::TempDir::new_in("/tmp").expect("tempdir");
         let result_path = dir.path().join("result.txt");
         let codex_bin = copy_self_to(dir.path(), "codex");
         let child_bin = copy_self_to(dir.path(), "csq-test-swap-child-probe");
 
-        let mut parent = Command::new(&codex_bin)
+        let mut parent = fixture_test_command(&codex_bin, dir.path())
             .args(["--ignored", "--exact", PARENT_TEST])
             .env(RESULT_ENV, &result_path)
             .env(CHILD_EXE_ENV, &child_bin)
@@ -3630,8 +4528,12 @@ mod tests {
             .expect("child exe env var set");
         let child_test = std::env::var("CSQ_TEST_SWAP_ANCESTOR_REFUSAL_CHILD_TEST")
             .expect("child test name env var set");
-        let status = std::process::Command::new(&child_exe)
+        let home = std::env::var_os("HOME").expect("parent fixture sandbox HOME");
+        let result_path = std::env::var_os("CSQ_TEST_SWAP_ANCESTOR_REFUSAL_RESULT_FILE")
+            .expect("parent fixture result path");
+        let status = fixture_test_command(Path::new(&child_exe), Path::new(&home))
             .args(["--ignored", "--exact", &child_test])
+            .env("CSQ_TEST_SWAP_ANCESTOR_REFUSAL_RESULT_FILE", result_path)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::inherit())
@@ -3694,7 +4596,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn refuses_before_any_tombstone_when_a_live_cc_ancestor_is_detected() {
-        use std::process::{Command, Stdio};
+        use std::process::Stdio;
         use std::time::{Duration, Instant};
 
         const RESULT_ENV: &str = "CSQ_TEST_SWAP_CC_ANCESTOR_REFUSAL_RESULT_FILE";
@@ -3714,12 +4616,12 @@ mod tests {
             dst
         }
 
-        let dir = tempfile::TempDir::new().expect("tempdir");
+        let dir = tempfile::TempDir::new_in("/tmp").expect("tempdir");
         let result_path = dir.path().join("result.txt");
         let claude_bin = copy_self_to(dir.path(), "claude");
         let child_bin = copy_self_to(dir.path(), "csq-test-swap-cc-child-probe");
 
-        let mut parent = Command::new(&claude_bin)
+        let mut parent = fixture_test_command(&claude_bin, dir.path())
             .args(["--ignored", "--exact", PARENT_TEST])
             .env(RESULT_ENV, &result_path)
             .env(CHILD_EXE_ENV, &child_bin)
@@ -3783,7 +4685,11 @@ mod tests {
             .expect("child exe env var set");
         let child_test = std::env::var("CSQ_TEST_SWAP_CC_ANCESTOR_REFUSAL_CHILD_TEST")
             .expect("child test name env var set");
-        let status = std::process::Command::new(&child_exe)
+        let home = PathBuf::from(std::env::var_os("HOME").expect("fixture HOME"));
+        let result = std::env::var_os("CSQ_TEST_SWAP_CC_ANCESTOR_REFUSAL_RESULT_FILE")
+            .expect("result file env var set");
+        let status = fixture_test_command(Path::new(&child_exe), &home)
+            .env("CSQ_TEST_SWAP_CC_ANCESTOR_REFUSAL_RESULT_FILE", result)
             .args(["--ignored", "--exact", &child_test])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -3821,7 +4727,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn same_surface_claude_code_route_is_unaffected_by_cc_ancestor_check() {
-        use std::process::{Command, Stdio};
+        use std::process::Stdio;
         use std::time::{Duration, Instant};
 
         const RESULT_ENV: &str = "CSQ_TEST_SWAP_SAME_SURFACE_CC_RESULT_FILE";
@@ -3840,12 +4746,12 @@ mod tests {
             dst
         }
 
-        let dir = tempfile::TempDir::new().expect("tempdir");
+        let dir = tempfile::TempDir::new_in("/tmp").expect("tempdir");
         let result_path = dir.path().join("result.txt");
         let claude_bin = copy_self_to(dir.path(), "claude");
         let child_bin = copy_self_to(dir.path(), "csq-test-swap-same-surface-cc-child-probe");
 
-        let mut parent = Command::new(&claude_bin)
+        let mut parent = fixture_test_command(&claude_bin, dir.path())
             .args(["--ignored", "--exact", PARENT_TEST])
             .env(RESULT_ENV, &result_path)
             .env(CHILD_EXE_ENV, &child_bin)
@@ -3895,8 +4801,12 @@ mod tests {
             .expect("child exe env var set");
         let child_test = std::env::var("CSQ_TEST_SWAP_SAME_SURFACE_CC_CHILD_TEST")
             .expect("child test name env var set");
-        let status = std::process::Command::new(&child_exe)
+        let home = std::env::var_os("HOME").expect("parent fixture sandbox HOME");
+        let result_path = std::env::var_os("CSQ_TEST_SWAP_SAME_SURFACE_CC_RESULT_FILE")
+            .expect("parent fixture result path");
+        let status = fixture_test_command(Path::new(&child_exe), Path::new(&home))
             .args(["--ignored", "--exact", &child_test])
+            .env("CSQ_TEST_SWAP_SAME_SURFACE_CC_RESULT_FILE", result_path)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::inherit())
@@ -3916,8 +4826,43 @@ mod tests {
         let bogus_source = base.path().join("not-a-handle-dir");
         std::fs::create_dir_all(&bogus_source).unwrap();
         let target = AccountNum::try_from(5u16).unwrap();
-        let line = match same_surface_claude_code_audited(base.path(), &bogus_source, target, None)
-        {
+        // A real synthetic witness preserves the original invalid-source oracle.
+        let binding = csq_core::platform::test_env::with_in_memory_secret_backend(|| {
+            use csq_core::accounts::anthropic_identity as ai;
+            let credential: csq_core::credentials::CredentialFile = serde_json::from_value(
+                serde_json::json!({"claudeAiOauth": {"accessToken": "fixture-swap-token",
+                    "refreshToken": "fixture-swap-refresh", "expiresAt": 4102444800000_u64,
+                    "scopes": ["user:profile", "user:inference"]}}),
+            )
+            .unwrap();
+            let profile: csq_core::daemon::usage_poller::HttpGetFn = std::sync::Arc::new(
+                |_, token, _| {
+                    assert_eq!(token, "fixture-swap-token");
+                    Ok((200, br#"{"account":{"uuid":"11111111-1111-4111-8111-111111111111","email":"swap-probe@test.invalid"},"organization":{"uuid":"22222222-2222-4222-8222-222222222222"}}"#.to_vec()))
+                },
+            );
+            ai::commit_anthropic_login_with(
+                base.path(),
+                target,
+                &credential,
+                &profile,
+                None,
+                ai::capture_login_prior(base.path(), target).unwrap(),
+            )
+            .unwrap();
+            ai::capture_anthropic_binding(base.path(), target).unwrap()
+        });
+        let _source_lock =
+            csq_core::platform::lock::lock_file(&bogus_source.join(".swap-lock")).unwrap();
+        let native_capture = handle_dir::capture_native_swap(base.path(), &bogus_source).unwrap();
+        let line = match same_surface_claude_code_audited(
+            base.path(),
+            &bogus_source,
+            target,
+            None,
+            &binding,
+            &native_capture,
+        ) {
             Ok(()) => "ok\n".to_string(),
             Err(e) => format!("err:{e}\n"),
         };
@@ -3929,7 +4874,7 @@ mod tests {
     // governing task: "governance bypass") ──────────────────────────────
 
     /// A Block-verdict operating envelope refuses the swap BEFORE any
-    /// tombstone — the fix for `exec_codex_after_binding` previously
+    /// tombstone — the fix for `supervise_codex_after_binding` previously
     /// skipping the M6 T6.1 gate entirely (swap's call site carried no
     /// `AuditEmitter`/`OperatingEnvelope`). This calls `exec_replace_swap`
     /// directly, which is the SAME function `route()` dispatches into for
@@ -4066,7 +5011,7 @@ mod tests {
 
     /// S-F5: an expired Codex access token at the TARGET refuses BEFORE any
     /// tombstone — the freshness check used to run inside
-    /// `exec_codex_after_binding`, well after both Step 2 (tombstone) and
+    /// `supervise_codex_after_binding`, well after both Step 2 (tombstone) and
     /// Step 3 (target handle dir creation) had already mutated disk state.
     /// It now runs directly in `exec_replace_swap`, reading the target's
     /// canonical credential path (no handle-dir symlink involved, since
@@ -4137,6 +5082,11 @@ mod tests {
 
     // ── Supervised handoff (`handoff_to_supervisor`, shard S3) ──────────
 
+    // Each root below is independent of process TMPDIR: the Linux daemon
+    // helper takes env custody only AFTER fixture creation, so an ambient
+    // sibling-owned temp root could disappear while these tests wait for it.
+    // Linux daemon/no-daemon guards hold shared env custody; on other Unix
+    // platforms each test holds it explicitly, without nesting that mutex.
     // C-R4-3: `handoff_to_supervisor` now checks daemon health up front
     // (before any request is written), so every one of this section's
     // fixtures must make `daemon::detect_daemon(base_dir)` report `Healthy`
@@ -4158,8 +5108,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_refuses_when_daemon_is_not_healthy() {
-        let handle_dir = tempfile::TempDir::new().expect("tempdir");
-        let base = tempfile::TempDir::new().expect("tempdir");
+        #[cfg(not(target_os = "linux"))]
+        let _env_guard = csq_core::platform::test_env::lock();
+        let handle_dir = tempfile::TempDir::new_in("/tmp").expect("owned handoff fixture root");
+        let base = csq_core::testing::socket_fixture::short_root("csq-swap-")
+            .expect("owned handoff fixture root");
         // Deliberately NO spawn_fake_healthy_daemon(base.path()) call — but
         // STILL needs the env guard: on Linux, detect_daemon prefers
         // $XDG_RUNTIME_DIR over base_dir whenever that var is set, so
@@ -4192,8 +5145,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_refuses_when_swap_request_already_pending() {
-        let handle_dir = tempfile::TempDir::new().expect("tempdir");
-        let base = tempfile::TempDir::new().expect("tempdir");
+        #[cfg(not(target_os = "linux"))]
+        let _env_guard = csq_core::platform::test_env::lock();
+        let handle_dir = tempfile::TempDir::new_in("/tmp").expect("owned handoff fixture root");
+        let base = csq_core::testing::socket_fixture::short_root("csq-swap-")
+            .expect("owned handoff fixture root");
         let _daemon = spawn_fake_healthy_daemon(base.path());
         let target = AccountNum::try_from(9u16).unwrap();
         write_codex_creds_fixture(base.path(), 9, "acct-9", false);
@@ -4245,8 +5201,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_refuses_and_writes_nothing_when_target_has_no_codex_credentials() {
-        let handle_dir = tempfile::TempDir::new().expect("tempdir");
-        let base = tempfile::TempDir::new().expect("tempdir");
+        #[cfg(not(target_os = "linux"))]
+        let _env_guard = csq_core::platform::test_env::lock();
+        let handle_dir = tempfile::TempDir::new_in("/tmp").expect("owned handoff fixture root");
+        let base = csq_core::testing::socket_fixture::short_root("csq-swap-")
+            .expect("owned handoff fixture root");
         let _daemon = spawn_fake_healthy_daemon(base.path());
         // No `write_codex_creds_fixture` call — slot 12 has no credentials.
         let target = AccountNum::try_from(12u16).unwrap();
@@ -4299,8 +5258,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_refuses_and_clears_inflight_when_supervisor_record_is_absent() {
-        let handle_dir = tempfile::TempDir::new().expect("tempdir");
-        let base = tempfile::TempDir::new().expect("tempdir");
+        #[cfg(not(target_os = "linux"))]
+        let _env_guard = csq_core::platform::test_env::lock();
+        let handle_dir = tempfile::TempDir::new_in("/tmp").expect("owned handoff fixture root");
+        let base = csq_core::testing::socket_fixture::short_root("csq-swap-")
+            .expect("owned handoff fixture root");
         let _daemon = spawn_fake_healthy_daemon(base.path());
         let target = AccountNum::try_from(9u16).unwrap();
         write_codex_creds_fixture(base.path(), 9, "acct-9", false);
@@ -4331,13 +5293,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_refuses_and_withdraws_request_when_recorded_supervisor_is_dead() {
-        let handle_dir = tempfile::TempDir::new().expect("tempdir");
-        let base = tempfile::TempDir::new().expect("tempdir");
+        #[cfg(not(target_os = "linux"))]
+        let _env_guard = csq_core::platform::test_env::lock();
+        let handle_dir = tempfile::TempDir::new_in("/tmp").expect("owned handoff fixture root");
+        let base = csq_core::testing::socket_fixture::short_root("csq-swap-")
+            .expect("owned handoff fixture root");
         let _daemon = spawn_fake_healthy_daemon(base.path());
         let target = AccountNum::try_from(9u16).unwrap();
         write_codex_creds_fixture(base.path(), 9, "acct-9", false);
 
-        let mut child = std::process::Command::new("true")
+        let mut child = fixture_test_command(Path::new("/usr/bin/true"), handle_dir.path())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -4390,14 +5355,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_writes_failed_outcome_when_refused_before_any_signal_is_sent() {
-        let handle_dir = tempfile::TempDir::new().expect("tempdir");
-        let base = tempfile::TempDir::new().expect("tempdir");
+        #[cfg(not(target_os = "linux"))]
+        let _env_guard = csq_core::platform::test_env::lock();
+        let handle_dir = tempfile::TempDir::new_in("/tmp").expect("owned handoff fixture root");
+        let base = csq_core::testing::socket_fixture::short_root("csq-swap-")
+            .expect("owned handoff fixture root");
         let _daemon = spawn_fake_healthy_daemon(base.path());
         let target = AccountNum::try_from(9u16).unwrap();
         write_codex_creds_fixture(base.path(), 9, "acct-9", false);
         let from_slot = Some(AccountNum::try_from(3u16).unwrap());
 
-        let mut child = std::process::Command::new("true")
+        let mut child = fixture_test_command(Path::new("/usr/bin/true"), handle_dir.path())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -4490,10 +5458,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_writes_request_with_thread_id_and_signals_supervisor() {
-        use std::process::{Command, Stdio};
+        #[cfg(not(target_os = "linux"))]
+        let _env_guard = csq_core::platform::test_env::lock();
+        use std::process::Stdio;
         use std::time::{Duration, Instant};
 
-        let handle_dir = tempfile::TempDir::new().expect("tempdir");
+        let handle_dir = tempfile::TempDir::new_in("/tmp").expect("owned handoff fixture root");
+        // Take daemon env custody before starting the finite-lived supervisor
+        // stand-in: waiting for a sibling's lock must not consume its lifetime.
+        let base = csq_core::testing::socket_fixture::short_root("csq-swap-")
+            .expect("owned handoff fixture root");
+        let _daemon = spawn_fake_healthy_daemon(base.path());
+        let target = AccountNum::try_from(9u16).unwrap();
+        write_codex_creds_fixture(base.path(), 9, "acct-9", false);
         let uuid = "0123abcd-0123-4abc-8def-0123456789ab";
 
         let sessions_real = handle_dir.path().join("sessions_real");
@@ -4528,7 +5505,7 @@ mod tests {
         // stand-in AS ITS OWN CHILD via a backgrounded subshell — `$!`
         // captures that child's pid, written out before the parent blocks
         // in `wait` so the test can read it.
-        let mut supervisor = Command::new("sh")
+        let mut supervisor = fixture_shell(handle_dir.path())
             .arg("-c")
             .arg(format!(
                 "trap 'nonce=$(sed -n 4p \"{}\"); \
@@ -4576,14 +5553,15 @@ mod tests {
         .unwrap();
         assert!(sup::verify_supervisor_alive(handle_dir.path()));
 
-        let base = tempfile::TempDir::new().expect("tempdir");
-        let _daemon = spawn_fake_healthy_daemon(base.path());
-        let target = AccountNum::try_from(9u16).unwrap();
-        write_codex_creds_fixture(base.path(), 9, "acct-9", false);
-
         let result =
             handoff_to_supervisor(base.path(), handle_dir.path(), target, ancestor_pid, None);
         assert!(result.is_ok(), "{result:?}");
+        // Env custody is done: every fixture child (the supervisor stand-in,
+        // the launcher and the ancestor) already inherited this process's
+        // environment at spawn, and nothing below reads process env — the
+        // wait is a deadline-bounded poll for the stand-in's SIGUSR1.
+        #[cfg(not(target_os = "linux"))]
+        drop(_env_guard);
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while !mark.exists() && Instant::now() < deadline {
@@ -4618,10 +5596,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_accepts_a_supervisor_two_hops_above_the_ancestor_npm_launcher_shape() {
-        use std::process::{Command, Stdio};
+        #[cfg(not(target_os = "linux"))]
+        let _env_guard = csq_core::platform::test_env::lock();
+        use std::process::Stdio;
         use std::time::{Duration, Instant};
 
-        let handle_dir = tempfile::TempDir::new().expect("tempdir");
+        let handle_dir = tempfile::TempDir::new_in("/tmp").expect("owned handoff fixture root");
+        // Take daemon env custody before starting the finite-lived supervisor
+        // stand-in: waiting for a sibling's lock must not consume its lifetime.
+        let base = csq_core::testing::socket_fixture::short_root("csq-swap-")
+            .expect("owned handoff fixture root");
+        let _daemon = spawn_fake_healthy_daemon(base.path());
+        let target = AccountNum::try_from(9u16).unwrap();
+        write_codex_creds_fixture(base.path(), 9, "acct-9", false);
         let uuid = "0123abcd-0123-4abc-8def-0123456789ab";
 
         let sessions_real = handle_dir.path().join("sessions_real");
@@ -4653,7 +5640,7 @@ mod tests {
         // waiting on it. The supervisor never directly parents the
         // ancestor; the launcher sits between them, matching the npm
         // shape exactly.
-        let mut supervisor = Command::new("sh")
+        let mut supervisor = fixture_shell(handle_dir.path())
             .arg("-c")
             .arg(format!(
                 "trap 'nonce=$(sed -n 4p \"{}\"); \
@@ -4731,11 +5718,6 @@ mod tests {
         .unwrap();
         assert!(sup::verify_supervisor_alive(handle_dir.path()));
 
-        let base = tempfile::TempDir::new().expect("tempdir");
-        let _daemon = spawn_fake_healthy_daemon(base.path());
-        let target = AccountNum::try_from(9u16).unwrap();
-        write_codex_creds_fixture(base.path(), 9, "acct-9", false);
-
         let result =
             handoff_to_supervisor(base.path(), handle_dir.path(), target, ancestor_pid, None);
         assert!(
@@ -4743,6 +5725,12 @@ mod tests {
             "must accept a supervisor two hops above the ancestor (npm-launcher \
              shape); got {result:?}"
         );
+        // Env custody is done: every fixture child (the supervisor stand-in,
+        // the launcher and the ancestor) already inherited this process's
+        // environment at spawn, and nothing below reads process env — the
+        // wait is a deadline-bounded poll for the stand-in's SIGUSR1.
+        #[cfg(not(target_os = "linux"))]
+        drop(_env_guard);
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while !mark.exists() && Instant::now() < deadline {
@@ -4765,18 +5753,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_refuses_and_does_not_signal_when_record_pid_is_not_the_ancestors_parent() {
-        use std::process::{Command, Stdio};
+        #[cfg(not(target_os = "linux"))]
+        let _env_guard = csq_core::platform::test_env::lock();
+        use std::process::Stdio;
         use std::time::{Duration, Instant};
 
-        let handle_dir = tempfile::TempDir::new().expect("tempdir");
-        let base = tempfile::TempDir::new().expect("tempdir");
+        let handle_dir = tempfile::TempDir::new_in("/tmp").expect("owned handoff fixture root");
+        let base = csq_core::testing::socket_fixture::short_root("csq-swap-")
+            .expect("owned handoff fixture root");
         let _daemon = spawn_fake_healthy_daemon(base.path());
         let target = AccountNum::try_from(9u16).unwrap();
         write_codex_creds_fixture(base.path(), 9, "acct-9", false);
 
         // A live, unrelated "ancestor" stand-in — its real parent is THIS
         // test process, not the "supervisor" stand-in below.
-        let mut unrelated_ancestor = Command::new("sh")
+        let mut unrelated_ancestor = fixture_shell(handle_dir.path())
             .arg("-c")
             .arg("sleep 30")
             .stdin(Stdio::null())
@@ -4791,7 +5782,7 @@ mod tests {
         // absent or wrong this test would observe a FALSE success (mark
         // exists) instead of the correct refusal.
         let mark = handle_dir.path().join("signalled");
-        let mut unrelated_supervisor = Command::new("sh")
+        let mut unrelated_supervisor = fixture_shell(handle_dir.path())
             .arg("-c")
             .arg(format!(
                 "trap 'touch \"{}\"; exit 0' USR1; while true; do sleep 0.05; done",
@@ -4867,11 +5858,14 @@ mod tests {
     #[test]
     fn handoff_refuses_and_does_not_signal_when_more_than_one_codex_is_between_shell_and_supervisor(
     ) {
-        use std::process::{Command, Stdio};
+        #[cfg(not(target_os = "linux"))]
+        let _env_guard = csq_core::platform::test_env::lock();
+        use std::process::Stdio;
         use std::time::{Duration, Instant};
 
-        let handle_dir = tempfile::TempDir::new().expect("tempdir");
-        let base = tempfile::TempDir::new().expect("tempdir");
+        let handle_dir = tempfile::TempDir::new_in("/tmp").expect("owned handoff fixture root");
+        let base = csq_core::testing::socket_fixture::short_root("csq-swap-")
+            .expect("owned handoff fixture root");
         let _daemon = spawn_fake_healthy_daemon(base.path());
         let target = AccountNum::try_from(9u16).unwrap();
         write_codex_creds_fixture(base.path(), 9, "acct-9", false);
@@ -4882,7 +5876,7 @@ mod tests {
         // stand-in AS ITS OWN CHILD, and writes that child's pid out before
         // blocking in `wait` — a genuine, directly-related parent/child
         // pair, so the chain-containment check passes without any override.
-        let mut supervisor = Command::new("sh")
+        let mut supervisor = fixture_shell(handle_dir.path())
             .arg("-c")
             .arg(format!(
                 "trap 'touch \"{}\"; exit 0' USR1; \
@@ -4958,18 +5952,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_refuses_and_does_not_signal_when_the_ancestor_chain_is_unreadable() {
-        use std::process::{Command, Stdio};
+        #[cfg(not(target_os = "linux"))]
+        let _env_guard = csq_core::platform::test_env::lock();
+        use std::process::Stdio;
         use std::time::{Duration, Instant};
 
-        let handle_dir = tempfile::TempDir::new().expect("tempdir");
-        let base = tempfile::TempDir::new().expect("tempdir");
+        let handle_dir = tempfile::TempDir::new_in("/tmp").expect("owned handoff fixture root");
+        let base = csq_core::testing::socket_fixture::short_root("csq-swap-")
+            .expect("owned handoff fixture root");
         let _daemon = spawn_fake_healthy_daemon(base.path());
         let target = AccountNum::try_from(9u16).unwrap();
         write_codex_creds_fixture(base.path(), 9, "acct-9", false);
 
         let mark = handle_dir.path().join("signalled");
         let child_pid_file = handle_dir.path().join("child_pid");
-        let mut supervisor = Command::new("sh")
+        let mut supervisor = fixture_shell(handle_dir.path())
             .arg("-c")
             .arg(format!(
                 "trap 'touch \"{}\"; exit 0' USR1; \
@@ -5047,11 +6044,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_reports_undetermined_and_writes_no_outcome_when_no_verdict_ever_arrives() {
-        use std::process::{Command, Stdio};
+        #[cfg(not(target_os = "linux"))]
+        let _env_guard = csq_core::platform::test_env::lock();
+        use std::process::Stdio;
         use std::time::{Duration, Instant};
 
-        let handle_dir = tempfile::TempDir::new().expect("tempdir");
-        let base = tempfile::TempDir::new().expect("tempdir");
+        let handle_dir = tempfile::TempDir::new_in("/tmp").expect("owned handoff fixture root");
+        let base = csq_core::testing::socket_fixture::short_root("csq-swap-")
+            .expect("owned handoff fixture root");
         let _daemon = spawn_fake_healthy_daemon(base.path());
         let target = AccountNum::try_from(9u16).unwrap();
         write_codex_creds_fixture(base.path(), 9, "acct-9", false);
@@ -5064,7 +6064,7 @@ mod tests {
         let child_pid_file = handle_dir.path().join("child_pid");
         // Traps SIGUSR1 (proves delivery via `mark`) but writes NO verdict —
         // the exact "waiter never gets an answer" shape this test covers.
-        let mut supervisor = Command::new("sh")
+        let mut supervisor = fixture_shell(handle_dir.path())
             .arg("-c")
             .arg(format!(
                 "trap 'touch \"{}\"' USR1; \
@@ -5110,6 +6110,12 @@ mod tests {
         );
         let err = result.expect_err("no verdict ever arrives -> must be Err, never a guess");
         assert!(err.to_string().contains("undetermined"), "got: {err}");
+        // Env custody is done: every fixture child (the supervisor stand-in,
+        // the launcher and the ancestor) already inherited this process's
+        // environment at spawn, and nothing below reads process env — the
+        // wait is a deadline-bounded poll for the stand-in's SIGUSR1.
+        #[cfg(not(target_os = "linux"))]
+        drop(_env_guard);
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while !mark.exists() && Instant::now() < deadline {
@@ -5153,11 +6159,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_reports_the_refusal_reason_and_writes_no_outcome_itself() {
-        use std::process::{Command, Stdio};
+        #[cfg(not(target_os = "linux"))]
+        let _env_guard = csq_core::platform::test_env::lock();
+        use std::process::Stdio;
         use std::time::{Duration, Instant};
 
-        let handle_dir = tempfile::TempDir::new().expect("tempdir");
-        let base = tempfile::TempDir::new().expect("tempdir");
+        let handle_dir = tempfile::TempDir::new_in("/tmp").expect("owned handoff fixture root");
+        let base = csq_core::testing::socket_fixture::short_root("csq-swap-")
+            .expect("owned handoff fixture root");
         let _daemon = spawn_fake_healthy_daemon(base.path());
         let target = AccountNum::try_from(9u16).unwrap();
         write_codex_creds_fixture(base.path(), 9, "acct-9", false);
@@ -5170,7 +6179,7 @@ mod tests {
         let refusal_reason = "account 9 has stale credentials";
         // Traps SIGUSR1: reads the request's nonce (4th line —
         // `SwapRequest::to_line`) and writes a REFUSED verdict bound to it.
-        let mut supervisor = Command::new("sh")
+        let mut supervisor = fixture_shell(handle_dir.path())
             .arg("-c")
             .arg(format!(
                 "trap 'nonce=$(sed -n 4p \"{}\"); \
@@ -5222,6 +6231,12 @@ mod tests {
         );
         let err = result.expect_err("a refused verdict must surface as Err");
         assert!(err.to_string().contains(refusal_reason), "got: {err}");
+        // Env custody is done: every fixture child (the supervisor stand-in,
+        // the launcher and the ancestor) already inherited this process's
+        // environment at spawn, and nothing below reads process env — the
+        // wait is a deadline-bounded poll for the stand-in's SIGUSR1.
+        #[cfg(not(target_os = "linux"))]
+        drop(_env_guard);
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while !mark.exists() && Instant::now() < deadline {
@@ -5822,7 +6837,7 @@ mod tests {
     /// read the same env vars (e.g. surface.rs tests mutating
     /// `CODEX_USER_CONFIG`). The shared lock subsumes the local-only
     /// serialization need.
-    fn env_swap_guard() -> std::sync::MutexGuard<'static, ()> {
+    fn env_swap_guard() -> csq_core::platform::test_env::EnvTestGuard {
         csq_core::platform::test_env::lock()
     }
 
@@ -6582,16 +7597,16 @@ mod tests {
     #[cfg(target_os = "macos")]
     mod handle_e2e {
         use super::*;
-        use csq_core::accounts::identity_store::{self, IdentityId};
+        use csq_core::accounts::identity_store;
         use csq_core::credentials::keychain::{
             clear_test_keychain_executor, set_test_keychain_executor, RawContentClassification,
             ScriptedKeychainExecutor,
         };
         use csq_core::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
         use csq_core::session::handle_dir::create_handle_dir;
-        use csq_core::testing::identity_fixtures::write_uuid_account_marker;
         use csq_core::types::{AccessToken, RefreshToken};
         use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
         use std::os::unix::net::UnixListener;
         use std::rc::Rc;
 
@@ -6641,26 +7656,144 @@ mod tests {
             serde_json::to_string(cf).expect("fixture: serialize CredentialFile")
         }
 
-        /// Mirrors production's mint path (`csq login` / the daemon's
-        /// first-start mint pass): `config-<slot>/` on disk, a UUID-content
-        /// `.csq-account` marker (`markers::write_csq_account` shape, via
-        /// the shared `write_uuid_account_marker` fixture helper per
-        /// `feedback_test_fixtures_mirror_real_csq_state`), `profiles.json`
-        /// `by_slot[slot]`, and `identities/<uuid>/credentials.json` — the
-        /// identity-keyed file `target_token_for_forced_write` reads.
+        /// Lays down ONE slot's legacy-shaped artifacts — `config-<slot>/`
+        /// with CC's own `.credentials.json` and `.claude.json`, plus the
+        /// retired numeric canonical `credentials/<slot>.json` — the disk
+        /// shape a live install has BEFORE its first daemon start, minus the
+        /// per-slot `.csq-account` marker and identity-store files. No identity
+        /// is minted here; [`mint_provisioned_accounts`] runs the real legacy
+        /// migration writer ONCE over every provisioned slot, the same way a
+        /// live install mints all of them in its single first-start pass.
         fn provision_account(
             base: &Path,
             slot: u16,
             access: &str,
             refresh: &str,
             expires_at_ms: u64,
-        ) -> IdentityId {
+        ) {
             let config_dir = base.join(format!("config-{slot}"));
             std::fs::create_dir_all(&config_dir).unwrap();
-            let uuid = write_uuid_account_marker(base, &config_dir, slot);
-            let cf = make_creds(access, refresh, expires_at_ms);
-            credentials::save(&identity_store::credentials_path_for(base, uuid), &cf).unwrap();
-            uuid
+            let profile_path = csq_core::accounts::profiles::profiles_path(base);
+            if !profile_path.exists() {
+                csq_core::accounts::profiles::save(
+                    &profile_path,
+                    &csq_core::accounts::profiles::ProfilesFile::empty(),
+                )
+                .unwrap();
+            }
+            let email = format!("swap-{slot}@example.test");
+            let mut cf = make_creds(access, refresh, expires_at_ms);
+            if let CredentialFile::Anthropic(ref mut anthropic) = cf {
+                anthropic.extra.insert(
+                    "oauthAccount".into(),
+                    serde_json::json!({"emailAddress":email}),
+                );
+            }
+            let account = AccountNum::try_from(slot).unwrap();
+            credentials::save(&credentials::file::canonical_path(base, account), &cf).unwrap();
+            credentials::save(&config_dir.join(".credentials.json"), &cf).unwrap();
+            csq_core::platform::fs::write_new_private(
+                &config_dir.join(".claude.json"),
+                &serde_json::to_vec(&serde_json::json!({"oauthAccount":{"emailAddress":email}}))
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+
+        /// Runs the actual legacy migration writer (`run_if_unsentineled`)
+        /// ONCE over every slot [`provision_account`] has laid down, then
+        /// publishes each slot's UUID marker and identity-store credentials.
+        /// This is the established legacy path these compatibility tests must
+        /// retain.
+        ///
+        /// One pass for ALL provisioned slots, never one pass per slot:
+        /// `accounts::discovery::discover_anthropic` reads
+        /// `credentials/<N>.json` only while `profiles.json::by_slot` is
+        /// EMPTY; the moment any binding exists it returns through the UUID
+        /// branch and never re-consults the legacy channel. A re-run on an
+        /// already-adopted store therefore rediscovers only the already-bound
+        /// slot and can never bind a second one — which is also why a live
+        /// install mints every legacy slot in the single first-start pass.
+        fn mint_provisioned_accounts(base: &Path) {
+            let profile_path = csq_core::accounts::profiles::profiles_path(base);
+            let sentinel = identity_store::store_version_path(base);
+            if sentinel.exists() {
+                std::fs::remove_file(sentinel).unwrap();
+            }
+            let minted = csq_core::daemon::identity_mint::run_if_unsentineled(base).unwrap();
+            assert!(minted.slot_errors.is_empty());
+            // Every `credentials/<N>.json` a provision laid down is one legacy
+            // slot, and the migration pass must produce exactly one fresh
+            // identity for each — the non-vacuity check that the pass really
+            // ran over the provisioned fixture.
+            let mut provisioned: Vec<u16> = std::fs::read_dir(base.join("credentials"))
+                .expect("fixture: provisioned credentials dir exists")
+                .flatten()
+                .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("json"))
+                .filter_map(|entry| {
+                    entry
+                        .path()
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .and_then(|stem| stem.parse::<u16>().ok())
+                })
+                .filter(|slot| (1..=999).contains(slot))
+                .collect();
+            provisioned.sort_unstable();
+            assert_eq!(
+                minted.slots_fresh,
+                provisioned.len(),
+                "one fresh identity per provisioned legacy slot: {minted:?}"
+            );
+            assert_eq!(
+                minted.slots_reused, 0,
+                "a fresh provisioning must mint, never reuse: {minted:?}"
+            );
+            for slot in provisioned {
+                let account = AccountNum::try_from(slot).unwrap();
+                let uuid = csq_core::accounts::profiles::resolve_slot_to_uuid(base, slot)
+                    .unwrap_or_else(|| panic!("slot {slot} must be bound by the migration pass"));
+                // Each slot must bind ITS OWN identity: a cross-slot mix-up in
+                // the migration pass would still satisfy slots_fresh above.
+                let identity_json: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(identity_store::identity_json_path_for(base, uuid)).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    identity_json["email"],
+                    serde_json::json!(format!("swap-{slot}@example.test")),
+                    "slot {slot} must bind its own provisioned email"
+                );
+                let config_dir = base.join(format!("config-{slot}"));
+                let cf = credentials::load(&credentials::file::canonical_path(base, account))
+                    .expect("fixture: canonical legacy credentials");
+                credentials::save(&identity_store::credentials_path_for(base, uuid), &cf).unwrap();
+                csq_core::accounts::markers::write_csq_account(&config_dir, uuid).unwrap();
+                // Legacy manifest shape: a umask-022 install left the
+                // identities dirs 0o755; production repairs exactly this shape
+                // to 0o700 (prepare_anthropic_refresh_directory -> secure_dir).
+                // The tests below exercise the pre-repair shape.
+                use std::os::unix::fs::PermissionsExt;
+                for directory in [
+                    base.join("identities"),
+                    identity_store::identity_path(base, uuid),
+                ] {
+                    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                }
+                assert!(matches!(
+                    csq_core::accounts::anthropic_identity::capture_anthropic_binding(
+                        base, account
+                    )
+                    .unwrap()
+                    .context(),
+                    csq_core::accounts::anthropic_identity::StoredAnthropicContext::LegacyUnknown
+                ));
+            }
+            assert!(csq_core::accounts::profiles::load(&profile_path)
+                .unwrap()
+                .anthropic_contexts
+                .is_empty());
         }
 
         const FAR_FUTURE_EXPIRY_MS: u64 = 4_102_444_800_000; // year 2100 (feedback_no_test_timebombs)
@@ -6691,10 +7824,65 @@ mod tests {
         ) -> std::thread::JoinHandle<()> {
             let sock = csq_core::daemon::socket_path(base);
             let listener = UnixListener::bind(&sock).expect("fixture: bind fake harvest socket");
+            listener.set_nonblocking(true).unwrap();
             std::thread::spawn(move || {
-                if let Ok((mut stream, _)) = listener.accept() {
+                // A refusal before harvest must fail this test, not wedge join()
+                // while retaining the workspace-wide environment mutex.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            let remaining =
+                                deadline.saturating_duration_since(std::time::Instant::now());
+                            assert!(!remaining.is_zero(), "harvest was never called");
+                            let mut readiness = libc::pollfd {
+                                fd: listener.as_raw_fd(),
+                                events: libc::POLLIN,
+                                revents: 0,
+                            };
+                            let timeout_ms =
+                                remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+                            // SAFETY: readiness points to one writable pollfd for
+                            // the duration of poll; listener retains its live fd.
+                            let ready = unsafe { libc::poll(&mut readiness, 1, timeout_ms) };
+                            if ready < 0 {
+                                let error = std::io::Error::last_os_error();
+                                if error.kind() == std::io::ErrorKind::Interrupted {
+                                    continue;
+                                }
+                                panic!("fake harvest readiness failed: {error}");
+                            }
+                            if ready > 0 {
+                                assert_ne!(
+                                    readiness.revents & libc::POLLIN,
+                                    0,
+                                    "fake harvest listener is unavailable"
+                                );
+                            }
+                        }
+                        Err(error) => panic!("fake harvest accept failed: {error}"),
+                    }
+                };
+                // The listener is bound nonblocking; on macOS/BSD an accepted
+                // stream inherits O_NONBLOCK (Linux clears it), so a read on
+                // the accepted stream fails instantly with WouldBlock (os
+                // error 35) instead of waiting for the request. This fixture
+                // wants a waiting peer — clear the inherited flag before
+                // arming the real timeouts.
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                {
                     let mut buf = [0u8; 4096];
-                    let _ = stream.read(&mut buf);
+                    let read = stream
+                        .read(&mut buf)
+                        .expect("read the actual harvest request");
+                    assert!(read > 0, "harvest connection must contain a request");
                     let body = format!("{{\"outcome\":\"{outcome}\"}}");
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -6727,6 +7915,7 @@ mod tests {
             let claude_home = tempfile::TempDir::new().unwrap();
             provision_account(base.path(), 1, "at-1", "rt-1", FAR_FUTURE_EXPIRY_MS);
             provision_account(base.path(), 2, "at-2", "rt-2", FAR_FUTURE_EXPIRY_MS);
+            mint_provisioned_accounts(base.path());
             let handle_dir = make_source_handle_dir(base.path(), claude_home.path(), 90000, 1);
 
             // Break the repoint's own pre-flight guard: the target config
@@ -6791,6 +7980,7 @@ mod tests {
             let claude_home = tempfile::TempDir::new().unwrap();
             provision_account(base.path(), 1, "at-1", "rt-1", FAR_FUTURE_EXPIRY_MS);
             provision_account(base.path(), 2, "at-2", "rt-2", FAR_FUTURE_EXPIRY_MS);
+            mint_provisioned_accounts(base.path());
             let handle_dir = make_source_handle_dir(base.path(), claude_home.path(), 90007, 1);
 
             // Same repoint-precondition failure as (a) — Corrupt, not
@@ -6849,6 +8039,7 @@ mod tests {
             let claude_home = tempfile::TempDir::new().unwrap();
             provision_account(base.path(), 1, "at-1", "rt-1", FAR_FUTURE_EXPIRY_MS);
             provision_account(base.path(), 2, "at-2", "rt-2", FAR_FUTURE_EXPIRY_MS);
+            mint_provisioned_accounts(base.path());
             let handle_dir = make_source_handle_dir(base.path(), claude_home.path(), 90008, 1);
 
             // Replace the `.credentials.json` symlink with a REAL regular
@@ -6912,6 +8103,7 @@ mod tests {
             let claude_home = tempfile::TempDir::new().unwrap();
             provision_account(base.path(), 1, "at-1", "rt-1", FAR_FUTURE_EXPIRY_MS);
             provision_account(base.path(), 2, "at-2", "rt-2", FAR_FUTURE_EXPIRY_MS);
+            mint_provisioned_accounts(base.path());
             let source_cf = make_creds("at-1", "rt-1", FAR_FUTURE_EXPIRY_MS);
             let handle_dir = make_source_handle_dir(base.path(), claude_home.path(), 90001, 1);
 
@@ -6920,9 +8112,9 @@ mod tests {
             // apply_cc_keychain_write's write branch, whose scripted add()
             // is set to fail: WriteFailedUnknown, not Unreadable/Absent.
             let (_exec, _guard) = install_scripted(
-                ScriptedKeychainExecutor::scripted(RawContentClassification::Content(creds_json(
-                    &source_cf,
-                )))
+                ScriptedKeychainExecutor::scripted(RawContentClassification::Content(
+                    (creds_json(&source_cf)).into(),
+                ))
                 .with_add_failing(),
             );
 
@@ -6959,15 +8151,19 @@ mod tests {
         #[test]
         fn t_d_unmatched_token_harvest_ownership_unknown_refuses_no_mutation() {
             let _env_lock = csq_core::platform::test_env::lock();
-            let base = tempfile::TempDir::new().unwrap();
+            // The fake harvest daemon's socket derives from `base`; a deep
+            // runner TMPDIR would push its pathname past `sun_path`.
+            let base = csq_core::testing::socket_fixture::short_root("csq-harvest-").unwrap();
             let claude_home = tempfile::TempDir::new().unwrap();
             provision_account(base.path(), 1, "at-1", "rt-1", FAR_FUTURE_EXPIRY_MS);
             provision_account(base.path(), 2, "at-2", "rt-2", FAR_FUTURE_EXPIRY_MS);
+            mint_provisioned_accounts(base.path());
             let handle_dir = make_source_handle_dir(base.path(), claude_home.path(), 90002, 1);
 
             let foreign = make_creds("at-FOREIGN", "rt-FOREIGN", FAR_FUTURE_EXPIRY_MS);
-            let (exec, _guard) =
-                install_executor(RawContentClassification::Content(creds_json(&foreign)));
+            let (exec, _guard) = install_executor(RawContentClassification::Content(
+                (creds_json(&foreign)).into(),
+            ));
 
             let server = spawn_fake_harvest_server(base.path(), "ownership_unknown");
 
@@ -6986,7 +8182,7 @@ mod tests {
             );
             let msg = format!("{:#}", result.unwrap_err());
             assert!(
-                msg.contains("csq could not identify as this account's own"),
+                msg.contains("holds a login csq has not identified"),
                 "refusal must use the fixed ForeignLoginUnharvested message: {msg}"
             );
             assert!(
@@ -7014,11 +8210,13 @@ mod tests {
             let claude_home = tempfile::TempDir::new().unwrap();
             provision_account(base.path(), 1, "at-1", "rt-1", FAR_FUTURE_EXPIRY_MS);
             provision_account(base.path(), 2, "at-2", "rt-2", FAR_FUTURE_EXPIRY_MS);
+            mint_provisioned_accounts(base.path());
             let handle_dir = make_source_handle_dir(base.path(), claude_home.path(), 90003, 1);
 
             let foreign = make_creds("at-FOREIGN", "rt-FOREIGN", FAR_FUTURE_EXPIRY_MS);
-            let (_exec, _guard) =
-                install_executor(RawContentClassification::Content(creds_json(&foreign)));
+            let (_exec, _guard) = install_executor(RawContentClassification::Content(
+                (creds_json(&foreign)).into(),
+            ));
             // No spawn_fake_harvest_server call: socket absent -> Unavailable.
             assert!(
                 !csq_core::daemon::socket_path(base.path()).exists(),
@@ -7039,7 +8237,7 @@ mod tests {
             );
             let msg = format!("{:#}", result.unwrap_err());
             assert!(
-                msg.contains("csq could not identify as this account's own"),
+                msg.contains("holds a login csq has not identified"),
                 "an unreachable daemon must not change the refusal wording: {msg}"
             );
         }
@@ -7056,11 +8254,13 @@ mod tests {
             let claude_home = tempfile::TempDir::new().unwrap();
             provision_account(base.path(), 1, "at-1", "rt-1", FAR_FUTURE_EXPIRY_MS);
             provision_account(base.path(), 2, "at-2", "rt-2", FAR_FUTURE_EXPIRY_MS);
+            mint_provisioned_accounts(base.path());
             let handle_dir = make_source_handle_dir(base.path(), claude_home.path(), 90004, 1);
 
             let source_cf = make_creds("at-1", "rt-1", FAR_FUTURE_EXPIRY_MS);
-            let (_exec, _guard) =
-                install_executor(RawContentClassification::Content(creds_json(&source_cf)));
+            let (_exec, _guard) = install_executor(RawContentClassification::Content(
+                (creds_json(&source_cf)).into(),
+            ));
 
             let saved = std::env::var("CLAUDE_CONFIG_DIR").ok();
             std::env::set_var("CLAUDE_CONFIG_DIR", &handle_dir);
@@ -7089,11 +8289,13 @@ mod tests {
             provision_account(base.path(), 1, "at-1", "rt-1", FAR_FUTURE_EXPIRY_MS);
             // Target's own token is EXPIRED.
             provision_account(base.path(), 2, "at-2", "rt-2", PAST_EXPIRY_MS);
+            mint_provisioned_accounts(base.path());
             let handle_dir = make_source_handle_dir(base.path(), claude_home.path(), 90005, 1);
 
             let source_cf = make_creds("at-1", "rt-1", FAR_FUTURE_EXPIRY_MS);
-            let (exec, _guard) =
-                install_executor(RawContentClassification::Content(creds_json(&source_cf)));
+            let (exec, _guard) = install_executor(RawContentClassification::Content(
+                (creds_json(&source_cf)).into(),
+            ));
 
             let saved = std::env::var("CLAUDE_CONFIG_DIR").ok();
             std::env::set_var("CLAUDE_CONFIG_DIR", &handle_dir);
@@ -7129,11 +8331,13 @@ mod tests {
             let base = tempfile::TempDir::new().unwrap();
             let claude_home = tempfile::TempDir::new().unwrap();
             provision_account(base.path(), 1, "at-1", "rt-1", FAR_FUTURE_EXPIRY_MS);
+            mint_provisioned_accounts(base.path());
             let handle_dir = make_source_handle_dir(base.path(), claude_home.path(), 90006, 1);
 
             let source_cf = make_creds("at-1", "rt-1", FAR_FUTURE_EXPIRY_MS);
-            let (exec, _guard) =
-                install_executor(RawContentClassification::Content(creds_json(&source_cf)));
+            let (exec, _guard) = install_executor(RawContentClassification::Content(
+                (creds_json(&source_cf)).into(),
+            ));
 
             let saved = std::env::var("CLAUDE_CONFIG_DIR").ok();
             std::env::set_var("CLAUDE_CONFIG_DIR", &handle_dir);
@@ -7153,5 +8357,241 @@ mod tests {
                 exec.calls()
             );
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod swap_codex_messaging_proxy_tests {
+    use super::*;
+    use csq_core::types::AccountNum;
+
+    fn args_of(cmd: &std::process::Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// G3: a swap-exec'd Codex under an envelope `mcp` policy registers the messaging server
+    /// THROUGH `csq mcp-proxy`. Falsifier: the old `build_codex_exec_command` call (no wrap)
+    /// yields the direct form `args=["mcp-messaging"]`, so the proxy assertion fails.
+    #[test]
+    fn swap_exec_codex_registers_messaging_through_the_mcp_proxy_when_wrapped() {
+        let _env_lock = csq_core::platform::test_env::lock();
+        let prev = std::env::var_os("CSQ_MESSAGING");
+        std::env::remove_var("CSQ_MESSAGING");
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let acct = AccountNum::try_from(12u16).unwrap();
+        let handle = dir.path().join("term-123");
+        std::fs::create_dir_all(dir.path().join("config-12")).unwrap();
+        std::fs::create_dir(&handle).unwrap();
+        let envelope = handle.join(".pact-mcp-envelope.json");
+
+        let wrapped = build_swap_codex_command(
+            dir.path(),
+            acct,
+            &handle,
+            &[],
+            Some(("/opt/csq", envelope.as_path())),
+            true,
+        )
+        .unwrap();
+        let direct = build_swap_codex_command(dir.path(), acct, &handle, &[], None, true).unwrap();
+
+        match prev {
+            Some(v) => std::env::set_var("CSQ_MESSAGING", v),
+            None => std::env::remove_var("CSQ_MESSAGING"),
+        }
+
+        let w = args_of(&wrapped).join("\n");
+        assert!(
+            w.contains("\"mcp-proxy\", \"--envelope\"") && w.contains("\"--cli\", \"codex\""),
+            "wrapped swap codex must route messaging through mcp-proxy: {w}"
+        );
+        assert!(w.contains("mcp_servers.csq-messaging.command=\"/opt/csq\""));
+        let d = args_of(&direct).join("\n");
+        assert!(
+            d.contains("args=[\"mcp-messaging\"]") && !d.contains("mcp-proxy"),
+            "unwrapped stays direct: {d}"
+        );
+    }
+
+    fn with_env<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
+        let _env_lock = csq_core::platform::test_env::lock();
+        let prev = std::env::var_os("CSQ_MESSAGING");
+        match value {
+            Some(v) => std::env::set_var("CSQ_MESSAGING", v),
+            None => std::env::remove_var("CSQ_MESSAGING"),
+        }
+        let r = f();
+        match prev {
+            Some(v) => std::env::set_var("CSQ_MESSAGING", v),
+            None => std::env::remove_var("CSQ_MESSAGING"),
+        }
+        r
+    }
+
+    fn claude_handle() -> (tempfile::TempDir, std::path::PathBuf) {
+        // Stable root, never `new()`: the outlives regression transiently
+        // points TMPDIR at a directory it deletes, and a fixture born inside
+        // that window dies with it (CI argv drift shape). Inside the
+        // regression's CHILD process a parent-owned sandbox root is handed
+        // down, so kill+reap is followed by exact owned cleanup. Precedent:
+        // codex_supervise's `tmp_handle_dir` ("private stable tempdir").
+        let root =
+            std::env::var_os(crate::cli::commands::tmpdir_outlives_test_support::SANDBOX_ENV)
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+        let dir = tempfile::TempDir::new_in(root).expect("private stable tempdir");
+        let handle = dir.path().join("term-77");
+        std::fs::create_dir(&handle).unwrap();
+        std::fs::write(handle.join("settings.json"), "{}").unwrap();
+        (dir, handle)
+    }
+
+    /// The fixture must own a root independent of the ambient TMPDIR: the test
+    /// transiently points TMPDIR at a directory it deletes. PARENT/CHILD
+    /// dispatch (one test name; see
+    /// `tmpdir_outlives_test_support`): without the marker the parent
+    /// re-executes THIS test in a bounded, hermetic child process and never
+    /// mutates TMPDIR itself; with the marker the child runs the original
+    /// mutation/deletion/assertion (falsifier preserved: the assert fails if
+    /// `claude_handle` reverts to ambient `TempDir::new()`).
+    #[test]
+    fn claude_fixture_outlives_a_transient_process_tmpdir() {
+        if std::env::var_os(crate::cli::commands::tmpdir_outlives_test_support::CHILD_ENV).is_some()
+        {
+            // Witness: proves to the parent that THIS body ran (see
+            // `spawn_outlives_child` on why the selector alone cannot).
+            println!("outlives-witness:swap-claude-handle");
+            let sandbox = std::path::PathBuf::from(
+                std::env::var_os(crate::cli::commands::tmpdir_outlives_test_support::SANDBOX_ENV)
+                    .expect("sandbox env set by the parent dispatch"),
+            );
+            let _env = csq_core::platform::test_env::lock();
+            let transient =
+                tempfile::TempDir::new_in(&sandbox).expect("child transient under the sandbox");
+            let previous = std::env::var_os("TMPDIR");
+            std::env::set_var("TMPDIR", transient.path());
+            let (_d, handle) = claude_handle();
+            match previous {
+                Some(value) => std::env::set_var("TMPDIR", value),
+                None => std::env::remove_var("TMPDIR"),
+            }
+            drop(transient);
+            assert!(
+                handle.join("settings.json").is_file(),
+                "claude fixture must outlive a transient process TMPDIR: {handle:?}"
+            );
+            return;
+        }
+        crate::cli::commands::tmpdir_outlives_test_support::spawn_outlives_child(
+            "cli::commands::swap::swap_codex_messaging_proxy_tests::claude_fixture_outlives_a_transient_process_tmpdir",
+            "outlives-witness:swap-claude-handle",
+        );
+    }
+
+    /// F1: a Claude session started by a swap exec carries the messaging server and hooks.
+    /// Falsifier: the old exec arm built `claude` with no `--mcp-config`, so argv held
+    /// neither the flag nor a hook in the handle dir's settings.
+    #[test]
+    fn swap_exec_claude_registers_messaging_before_the_resume_flag() {
+        let (_d, handle) = claude_handle();
+        let cmd = with_env(None, || build_swap_claude_command(&handle, true, true));
+        let a = args_of(&cmd);
+        assert_eq!(a[0], "--mcp-config", "{a:?}");
+        assert_eq!(a.last().map(String::as_str), Some("--continue"), "{a:?}");
+        let s: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(handle.join("settings.json")).unwrap()).unwrap();
+        assert!(csq_core::messaging::register::has_registration(&s), "{s}");
+    }
+
+    /// M1: a terminal launched with messaging off stays off through the swap-exec of either CLI
+    /// even though the swapping process's environment says on. Falsifier: the old Codex path
+    /// re-read `CSQ_MESSAGING` through `register::enabled()` and added the server.
+    #[test]
+    fn swap_exec_keeps_a_launch_time_off_decision_for_claude_and_codex() {
+        use csq_core::messaging::register;
+        let (_d, handle) = claude_handle();
+        let claude = with_env(None, || build_swap_claude_command(&handle, false, false));
+        assert!(args_of(&claude).is_empty(), "{:?}", args_of(&claude));
+        let s: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(handle.join("settings.json")).unwrap()).unwrap();
+        assert!(!register::has_registration(&s));
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let acct = AccountNum::try_from(12u16).unwrap();
+        std::fs::create_dir_all(dir.path().join("config-12")).unwrap();
+        let ch = dir.path().join("term-5");
+        std::fs::create_dir(&ch).unwrap();
+        let codex = with_env(None, || {
+            build_swap_codex_command(dir.path(), acct, &ch, &[], None, false).unwrap()
+        });
+        let c = args_of(&codex).join("\n");
+        assert!(!c.contains("csq-messaging"), "{c}");
+        assert_eq!(
+            register::read_decision(&ch),
+            None,
+            "explicit decision writes nothing"
+        );
+    }
+
+    fn with_decision_env<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
+        let _env_lock = csq_core::platform::test_env::lock();
+        let var = csq_core::messaging::register::DECISION_ENV;
+        let prev = std::env::var_os(var);
+        match value {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match prev {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+        r.unwrap_or_else(|p| std::panic::resume_unwind(p))
+    }
+
+    /// F3: a Codex/Gemini/native source terminal whose launch-time marker write FAILED has no
+    /// marker and no csq hook, so the old read said `off`. The session's own
+    /// `CSQ_MESSAGING_DECISION` carries the launch decision. Outcomes: fixed -> `on` from the
+    /// env; regression (`existing_decision` without the env) -> `off`. A marker still wins, and
+    /// no env falls back to `off`.
+    #[test]
+    fn an_exec_swap_reads_the_launch_decision_from_the_session_env_when_the_marker_is_missing() {
+        use csq_core::messaging::register;
+        // The fixture must not be nested in another test's transient TMPDIR:
+        // its deletion while with_decision_env waits would remove our marker root.
+        let dir = tempfile::TempDir::new_in("/tmp").unwrap();
+        let handle = dir.path().join("term-91");
+        std::fs::create_dir(&handle).unwrap();
+        assert!(with_decision_env(Some("on"), || source_messaging_decision(
+            &handle
+        )));
+        assert!(!with_decision_env(Some("off"), || {
+            source_messaging_decision(&handle)
+        }));
+        assert!(!with_decision_env(None, || source_messaging_decision(
+            &handle
+        )));
+        register::record_decision(&handle, false).unwrap();
+        assert!(
+            !with_decision_env(Some("on"), || source_messaging_decision(&handle)),
+            "the marker outranks the env"
+        );
+    }
+
+    /// The decision a cross-surface swap reads from the source before its tombstone.
+    #[test]
+    fn a_source_terminal_launched_off_reads_off_whatever_the_environment_says() {
+        use csq_core::messaging::register;
+        let (_d, handle) = claude_handle();
+        register::register_handle_settings(&handle, "/bin/csq").unwrap();
+        register::record_decision(&handle, false).unwrap();
+        assert!(!with_env(None, || register::existing_decision(&handle)));
+        register::record_decision(&handle, true).unwrap();
+        assert!(with_env(Some("off"), || register::existing_decision(
+            &handle
+        )));
     }
 }

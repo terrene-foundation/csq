@@ -38,7 +38,8 @@ fn extract_oauth_error(body: &[u8]) -> Option<String> {
             Some(msg) => format!("{err_type}: {msg}"),
             None => err_type.to_string(),
         }
-    } else if let Some(err_str) = error_val.as_str() {
+    } else {
+        let err_str = error_val.as_str()?;
         // Standard OAuth error string: {"error": "invalid_grant", ...}
         //
         // Use extract_oauth_error_type to get a &'static str for allowlisted
@@ -50,8 +51,6 @@ fn extract_oauth_error(body: &[u8]) -> Option<String> {
             Some(desc) => format!("{category}: {desc}"),
             None => category.to_string(),
         }
-    } else {
-        return None;
     };
 
     Some(redact_tokens(&detail))

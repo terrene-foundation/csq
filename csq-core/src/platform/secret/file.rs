@@ -67,7 +67,7 @@
 //! re-reads the file and performs a fresh AEAD decrypt. The cached
 //! key is wiped on `Drop` via `zeroize`.
 
-use super::{SecretError, SlotKey, Vault};
+use super::{NamedKey, SecretError, SlotKey, Vault};
 use crate::platform::fs::{atomic_replace, unique_tmp_path, write_new_private};
 use crate::types::AccountNum;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -113,6 +113,8 @@ const VAULT_FILE_NAME: &str = "vault-store.json";
 /// for the lifetime of the process; never holds cleartext secrets
 /// across calls.
 pub struct FileVault {
+    pool_path: std::path::PathBuf,
+    pool_kdf: KdfParams,
     path: PathBuf,
     /// Argon2id-derived 32-byte master key. `ZeroizeOnDrop` wipes it
     /// when the vault is dropped (process shutdown / live reload).
@@ -150,9 +152,18 @@ struct VaultFile {
     version: u32,
     kdf: KdfParams,
     entries: Vec<EncryptedEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    named_entries: Vec<NamedEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct NamedEntry {
+    name: String,
+    nonce: String,
+    ciphertext: String,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct KdfParams {
     /// Currently always `"argon2id"`. Parsed back to enforce
     /// algorithm match — a future change to the KDF would bump
@@ -236,13 +247,61 @@ impl FileVault {
                 version: CURRENT_VERSION,
                 kdf: clone_kdf(&kdf),
                 entries: Vec::new(),
+                named_entries: Vec::new(),
             };
             write_file(&path, &empty)?;
             kdf
         };
 
         let master_key = derive_key(passphrase.expose_secret(), &kdf_params)?;
-        Ok(Self { path, master_key })
+        let pool_path = base_dir.join("pool-vault-store.json");
+        // Separate file prevents ordinary slot writers from losing pool updates.
+        // The pool caller holds its custody lock across these read/modify/writes.
+        // Named storage has its own file and domain-separated AAD, but shares
+        // this vault's derived key. Opening a legacy slot vault never reads or
+        // creates pool data. Named operations verify the pinned KDF header.
+        let pool_kdf = clone_kdf(&kdf_params);
+        Ok(Self {
+            path,
+            master_key,
+            pool_path,
+            pool_kdf,
+        })
+    }
+
+    /// Fixture-only constructor. Never selects a host credential backend.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn open_test(base_dir: &Path) -> Result<Self, SecretError> {
+        std::fs::create_dir_all(base_dir).map_err(|source| SecretError::Io {
+            path: base_dir.into(),
+            source,
+        })?;
+        let path = base_dir.join(VAULT_FILE_NAME);
+        let pool_path = base_dir.join("pool-vault-store.json");
+        for p in [&path, &pool_path] {
+            if !p.exists() {
+                let header = VaultFile {
+                    version: CURRENT_VERSION,
+                    kdf: KdfParams {
+                        algo: "argon2id".into(),
+                        salt: B64.encode([0u8; KDF_SALT_LEN]),
+                        m_kib: 8,
+                        t_cost: 1,
+                        p_cost: 1,
+                    },
+                    entries: Vec::new(),
+                    named_entries: Vec::new(),
+                };
+                write_file(p, &header)?;
+            }
+        }
+        let pool_kdf = read_file(&path)?.kdf;
+        Ok(Self {
+            path,
+            pool_path,
+            master_key: SecretBytes(vec![0x42; AEAD_KEY_LEN]),
+            pool_kdf,
+        })
     }
 
     /// Path of the underlying vault file. Test-only — production code
@@ -254,6 +313,108 @@ impl FileVault {
 }
 
 impl Vault for FileVault {
+    fn set_named(&self, key: &NamedKey, secret: &SecretString) -> Result<(), SecretError> {
+        if secret.expose_secret().is_empty() {
+            return Err(SecretError::InvalidKey {
+                reason: "secret must not be empty".into(),
+            });
+        }
+        let mut file = if self.pool_path.exists() {
+            read_file(&self.pool_path)?
+        } else {
+            VaultFile {
+                version: CURRENT_VERSION,
+                kdf: clone_kdf(&self.pool_kdf),
+                entries: Vec::new(),
+                named_entries: Vec::new(),
+            }
+        };
+        let mut nonce = [0u8; AEAD_NONCE_LEN];
+        getrandom::getrandom(&mut nonce).map_err(|_| SecretError::EncryptionFailed {
+            reason: "nonce rng failed".into(),
+        })?;
+        if file.kdf != self.pool_kdf {
+            return Err(SecretError::DecryptionFailed);
+        }
+        let aad = format!("v1:{}", key.native_name());
+        let ciphertext = build_cipher(self.master_key.as_slice())?
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: secret.expose_secret().as_bytes(),
+                    aad: aad.as_bytes(),
+                },
+            )
+            .map_err(|_| SecretError::EncryptionFailed {
+                reason: "aead encrypt failed".into(),
+            })?;
+        let entry = NamedEntry {
+            name: key.name().to_owned(),
+            nonce: B64.encode(nonce),
+            ciphertext: B64.encode(ciphertext),
+        };
+        if let Some(old) = file.named_entries.iter_mut().find(|e| e.name == key.name()) {
+            *old = entry;
+        } else {
+            file.named_entries.push(entry);
+        }
+        write_file(&self.pool_path, &file)
+    }
+    fn get_named(&self, key: &NamedKey) -> Result<SecretString, SecretError> {
+        if !self.pool_path.exists() {
+            return Err(SecretError::NamedNotFound);
+        }
+        let file = read_file(&self.pool_path)?;
+        if file.kdf != self.pool_kdf {
+            return Err(SecretError::DecryptionFailed);
+        }
+        let e = file
+            .named_entries
+            .iter()
+            .find(|e| e.name == key.name())
+            .ok_or(SecretError::NamedNotFound)?;
+        let nonce = B64
+            .decode(&e.nonce)
+            .map_err(|_| SecretError::DecryptionFailed)?;
+        if nonce.len() != AEAD_NONCE_LEN {
+            return Err(SecretError::DecryptionFailed);
+        }
+        let ciphertext = B64
+            .decode(&e.ciphertext)
+            .map_err(|_| SecretError::DecryptionFailed)?;
+        let aad = format!("v1:{}", key.native_name());
+        let clear = zeroize::Zeroizing::new(
+            build_cipher(self.master_key.as_slice())?
+                .decrypt(
+                    Nonce::from_slice(&nonce),
+                    Payload {
+                        msg: &ciphertext,
+                        aad: aad.as_bytes(),
+                    },
+                )
+                .map_err(|_| SecretError::DecryptionFailed)?,
+        );
+        let value = std::str::from_utf8(&clear).map_err(|_| SecretError::DecryptionFailed)?;
+        Ok(SecretString::new(value.to_owned().into()))
+    }
+    fn delete_named(&self, key: &NamedKey) -> Result<(), SecretError> {
+        if !self.pool_path.exists() {
+            return Ok(());
+        }
+        let mut file = read_file(&self.pool_path)?;
+        if file.kdf != self.pool_kdf {
+            return Err(SecretError::DecryptionFailed);
+        }
+        file.named_entries.retain(|e| e.name != key.name());
+        write_file(&self.pool_path, &file)
+    }
+    fn contains_named(&self, key: &NamedKey) -> Result<bool, SecretError> {
+        Ok(read_file_or_empty(&self.pool_path)?
+            .named_entries
+            .iter()
+            .any(|e| e.name == key.name()))
+    }
+
     fn set(&self, slot: SlotKey, secret: &SecretString) -> Result<(), SecretError> {
         if secret.expose_secret().is_empty() {
             return Err(SecretError::InvalidKey {
@@ -525,6 +686,7 @@ fn read_file_or_empty(path: &Path) -> Result<VaultFile, SecretError> {
                 p_cost: KDF_P_COST,
             },
             entries: Vec::new(),
+            named_entries: Vec::new(),
         }),
         Err(other) => Err(other),
     }
@@ -665,15 +827,131 @@ mod tests {
                     p_cost: 1,
                 },
                 entries: Vec::new(),
+                named_entries: Vec::new(),
             };
             write_file(&path, &header).unwrap();
         }
+        let pool_path = dir.join("pool-vault-store.json");
+        if !pool_path.exists() {
+            let mut header = read_file(&path).unwrap();
+            header.entries.clear();
+            write_file(&pool_path, &header).unwrap();
+        }
+        let pool_kdf = read_file(&path).unwrap().kdf;
         FileVault {
+            pool_kdf,
+            pool_path,
             path,
             // Deterministic test key — NOT a real passphrase derive.
             // Production opens go through `derive_key`.
             master_key: SecretBytes(vec![0x42; AEAD_KEY_LEN]),
         }
+    }
+
+    #[test]
+    fn legacy_open_does_not_read_corrupt_pool_store() {
+        let _shared = crate::platform::test_env::lock();
+        let _local = ENV_LOCK.lock().unwrap();
+        let _restore = EnvGuard::capture();
+        std::env::set_var(ENV_PASSPHRASE, "fixture-passphrase");
+        std::env::remove_var(ENV_PASSPHRASE_FILE);
+        let dir = TempDir::new().unwrap();
+        let vault = fast_open(dir.path());
+        vault
+            .set(slot(3), &SecretString::new("fixture-slot-value".into()))
+            .unwrap();
+        std::fs::write(&vault.pool_path, b"invalid-json").unwrap();
+        let slot_before = std::fs::read(&vault.path).unwrap();
+        let reopened = FileVault::open(dir.path()).unwrap();
+        assert_eq!(reopened.list_slots(GEMINI).unwrap(), vec![slot(3).account]);
+        assert_eq!(std::fs::read(&vault.path).unwrap(), slot_before);
+        assert!(reopened
+            .contains_named(&NamedKey::pool("fixture").unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn named_file_roundtrip_isolated_from_slot_writers() {
+        let dir = TempDir::new().unwrap();
+        let vault = FileVault::open_test(dir.path()).unwrap();
+        let key = NamedKey::pool("generation.01").unwrap();
+        vault
+            .set_named(&key, &SecretString::new("fixture-pool-value".into()))
+            .unwrap();
+        let pool_before = std::fs::read(&vault.pool_path).unwrap();
+        vault
+            .set(slot(1), &SecretString::new("fixture-slot-value".into()))
+            .unwrap();
+        assert_eq!(std::fs::read(&vault.pool_path).unwrap(), pool_before);
+        assert_eq!(
+            vault.get_named(&key).unwrap().expose_secret(),
+            "fixture-pool-value"
+        );
+        assert!(vault.contains_named(&key).unwrap());
+        vault.delete_named(&key).unwrap();
+        vault.delete_named(&key).unwrap();
+        assert!(!vault.contains_named(&key).unwrap());
+        assert!(matches!(
+            vault.get_named(&key),
+            Err(SecretError::NamedNotFound)
+        ));
+        assert_eq!(
+            vault.get(slot(1)).unwrap().expose_secret(),
+            "fixture-slot-value"
+        );
+    }
+
+    #[test]
+    fn named_presence_does_not_decode_or_decrypt_payload() {
+        let dir = TempDir::new().unwrap();
+        let vault = FileVault::open_test(dir.path()).unwrap();
+        let key = NamedKey::pool("fixture").unwrap();
+        vault
+            .set_named(&key, &SecretString::new("fixture-value".into()))
+            .unwrap();
+        let mut file = read_file(&vault.pool_path).unwrap();
+        file.named_entries[0].nonce = "invalid-base64".into();
+        file.named_entries[0].ciphertext = "invalid-base64".into();
+        write_file(&vault.pool_path, &file).unwrap();
+        assert!(vault.contains_named(&key).unwrap());
+        assert!(matches!(
+            vault.get_named(&key),
+            Err(SecretError::DecryptionFailed)
+        ));
+    }
+
+    #[test]
+    fn legacy_slot_name_aad_and_layout_are_pinned() {
+        assert_eq!(slot(3).native_name(), "csq.gemini.3");
+        assert_eq!(aad_for(slot(3)), "v1:gemini:3");
+        let dir = TempDir::new().unwrap();
+        let vault = FileVault::open_test(dir.path()).unwrap();
+        vault
+            .set(slot(3), &SecretString::new("fixture-slot-value".into()))
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(vault.path()).unwrap()).unwrap();
+        assert!(json.get("named_entries").is_none());
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["entries"][0]["account"], 3);
+        assert_eq!(json["entries"][0]["surface"], "gemini");
+    }
+
+    #[test]
+    fn named_aad_refuses_ciphertext_readdressing() {
+        let dir = TempDir::new().unwrap();
+        let vault = FileVault::open_test(dir.path()).unwrap();
+        let key = NamedKey::pool("original").unwrap();
+        vault
+            .set_named(&key, &SecretString::new("fixture-value".into()))
+            .unwrap();
+        let mut file = read_file(&vault.pool_path).unwrap();
+        file.named_entries[0].name = "replacement".into();
+        write_file(&vault.pool_path, &file).unwrap();
+        assert!(matches!(
+            vault.get_named(&NamedKey::pool("replacement").unwrap()),
+            Err(SecretError::DecryptionFailed)
+        ));
     }
 
     #[test]
@@ -845,6 +1123,8 @@ mod tests {
 
         // Open a "different process" view — same path, different key.
         let v_reader = FileVault {
+            pool_path: v_writer.pool_path.clone(),
+            pool_kdf: clone_kdf(&v_writer.pool_kdf),
             path: v_writer.path().to_path_buf(),
             master_key: SecretBytes(vec![0x99; AEAD_KEY_LEN]),
         };

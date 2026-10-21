@@ -57,6 +57,15 @@
 //! cargo-tree dep-edge check is the real defense if csq-core ever gains a kailash dep.
 //! The live, fireable catches are `csq_trust_contract`, `csq_audit_kailash`, `phase2b`.
 
+// The scan resolves its root through the `test-utils`-gated
+// `csq_core::testing::manifest_dir`. Gated here rather than with
+// `required-features` (same convention as `auto_rotate_integration.rs`) so a
+// plain `cargo test -p csq-core` builds this as an empty test binary instead of
+// failing to compile on an unresolved import, and so the manifest never names a
+// file the community extraction might remove. CI and the local sign-off always
+// pass `csq-core/test-utils`, so the test still runs in both editions.
+#![cfg(feature = "test-utils")]
+
 use std::path::{Path, PathBuf};
 
 /// Tokens whose appearance in capability-layer IMPORT/PATH context means the
@@ -174,7 +183,8 @@ fn rs_files(dir: &Path, acc: &mut Vec<PathBuf>) {
 /// scope and the authoritative cargo-tree / community-compile backstops.
 #[test]
 fn capability_layer_source_references_no_kailash_symbol() {
-    let root = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/src/capability_layer"));
+    let root =
+        csq_core::testing::manifest_dir(env!("CARGO_MANIFEST_DIR")).join("src/capability_layer");
     assert!(
         root.is_dir(),
         "capability_layer source dir must exist at {}",
@@ -229,10 +239,8 @@ fn mcp_gate_stage_present_and_kailash_free() {
     // Present.
     assert_eq!(csq_core::capability_layer::mcp_gate::STAGE, "mcp_gate");
     // Kailash-free — assert the mcp_gate source itself, independent of the sibling.
-    let mcp_gate_rs = PathBuf::from(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/capability_layer/mcp_gate.rs"
-    ));
+    let mcp_gate_rs = csq_core::testing::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+        .join("src/capability_layer/mcp_gate.rs");
     let src = std::fs::read_to_string(&mcp_gate_rs)
         .unwrap_or_else(|e| panic!("read {}: {e}", mcp_gate_rs.display()));
     let hits = forbidden_hits(&src);

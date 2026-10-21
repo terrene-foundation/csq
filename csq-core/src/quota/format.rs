@@ -272,6 +272,17 @@ pub struct StatuslineContext {
     /// `cost.total_cost_usd`. Rendered as `$0.12` alongside the
     /// context tokens.
     pub session_cost_usd: Option<f64>,
+    /// True when the session cost could not be priced from csq's manifest
+    /// (non-Anthropic slot whose model has no rate, unreadable transcript or
+    /// invalid manifest). Rendered as `$?`; CC's own figure is NEVER shown in
+    /// its place because CC prices every model at Anthropic rates. Set only by
+    /// the CLI (`usage::session_cost`), never by [`parse_cc_stdin`].
+    pub session_cost_unknown: bool,
+    /// `transcript_path` from the CC stdin JSON: the session transcript the CLI
+    /// prices from for non-Anthropic slots. Not rendered.
+    pub transcript_path: Option<String>,
+    /// `session_id` from the CC stdin JSON. Not rendered.
+    pub session_id: Option<String>,
     /// Git branch + dirty flag resolved in `workspace.current_dir`.
     /// `None` when the project isn't under version control or the
     /// git probe fails.
@@ -345,13 +356,14 @@ pub fn rich_statusline(
                 Some(w) if w > 0 => ((total as f64 / w as f64) * 100.0).min(100.0),
                 _ => ctx.ctx_used_pct.unwrap_or(0.0),
             };
-            let cost = ctx.session_cost_usd.unwrap_or(0.0);
-            parts.push(format!(
-                "ctx:{} {:.0}% | ${:.2}",
-                fmt_tokens(total),
-                pct,
-                cost
-            ));
+            // `$?` is the honest outcome when csq could not price the session;
+            // `session_cost_unknown` wins over any CC-reported number.
+            let cost = if ctx.session_cost_unknown {
+                "$?".to_string()
+            } else {
+                format!("${:.2}", ctx.session_cost_usd.unwrap_or(0.0))
+            };
+            parts.push(format!("ctx:{} {:.0}% | {}", fmt_tokens(total), pct, cost));
         }
     }
 
@@ -407,6 +419,10 @@ pub fn parse_cc_stdin(raw: &str) -> StatuslineContext {
         context_window: Option<ContextWindow>,
         #[serde(default)]
         cost: Option<Cost>,
+        #[serde(default)]
+        transcript_path: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
     }
 
     #[derive(Deserialize, Default)]
@@ -470,6 +486,9 @@ pub fn parse_cc_stdin(raw: &str) -> StatuslineContext {
         // parse_cc_stdin leaves it None.
         ctx_window_true: None,
         session_cost_usd: parsed.cost.and_then(|c| c.total_cost_usd),
+        session_cost_unknown: false,
+        transcript_path: parsed.transcript_path.filter(|p| !p.is_empty()),
+        session_id: parsed.session_id.filter(|p| !p.is_empty()),
         git: None,
         is_csq_terminal: false,
     }
@@ -637,6 +656,9 @@ mod tests {
             ctx_used_pct: Some(30.0),
             ctx_window_true: None,
             session_cost_usd: Some(0.1234),
+            session_cost_unknown: false,
+            transcript_path: None,
+            session_id: None,
             git: Some(GitStatus {
                 branch: "main".into(),
                 dirty: Some(true),
@@ -666,6 +688,9 @@ mod tests {
             ctx_used_pct: Some(89.0), // CC's wrong number — must be ignored
             ctx_window_true: Some(1_000_000),
             session_cost_usd: Some(0.0),
+            session_cost_unknown: false,
+            transcript_path: None,
+            session_id: None,
             ..Default::default()
         };
         let s = rich_statusline(
@@ -835,6 +860,9 @@ mod tests {
             ctx_used_pct: Some(75.0), // CC's number against 200k — ignored
             ctx_window_true: Some(128_000), // 200k/128k = 156% before clamp
             session_cost_usd: Some(0.0),
+            session_cost_unknown: false,
+            transcript_path: None,
+            session_id: None,
             ..Default::default()
         };
         let s = rich_statusline(
@@ -876,6 +904,9 @@ mod tests {
             ctx_used_pct: Some(0.0),
             ctx_window_true: None,
             session_cost_usd: Some(0.0),
+            session_cost_unknown: false,
+            transcript_path: None,
+            session_id: None,
             is_csq_terminal: true,
             ..Default::default()
         };
@@ -1057,5 +1088,26 @@ mod tests {
             !rendered.bytes().any(|b| b < 0x20),
             "statusline output must contain no control chars after sanitization"
         );
+    }
+
+    #[test]
+    fn unknown_session_cost_renders_question_mark_never_cc_number() {
+        let ctx = StatuslineContext {
+            ctx_total_tokens: Some(45_000),
+            ctx_used_pct: Some(30.0),
+            session_cost_usd: Some(9.99),
+            session_cost_unknown: true,
+            ..Default::default()
+        };
+        let out = rich_statusline(AccountNum::try_from(1u16).unwrap(), "a", None, false, &ctx);
+        assert!(out.contains("| $?"), "{out}");
+        assert!(!out.contains("9.99"), "{out}");
+    }
+
+    #[test]
+    fn stdin_transcript_path_and_session_id_are_parsed() {
+        let ctx = parse_cc_stdin(r#"{"transcript_path":"/t/s.jsonl","session_id":"abc"}"#);
+        assert_eq!(ctx.transcript_path.as_deref(), Some("/t/s.jsonl"));
+        assert_eq!(ctx.session_id.as_deref(), Some("abc"));
     }
 }

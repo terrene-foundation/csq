@@ -3,6 +3,7 @@
   import { getVersion } from '@tauri-apps/api/app';
   import { homeDir, join } from '@tauri-apps/api/path';
   import { tick } from 'svelte';
+  import ApiKeyPoolPanel from './ApiKeyPoolPanel.svelte';
 
   let { daemonRunning = false }: { daemonRunning?: boolean } = $props();
 
@@ -278,6 +279,8 @@
         </section>
       {/if}
 
+      <ApiKeyPoolPanel />
+
       <section>
         <h3>About</h3>
         <p class="about">
@@ -322,7 +325,9 @@
     position: absolute;
     top: calc(100% + 6px);
     right: 0;
-    min-width: 280px;
+    width: min(420px, calc(100vw - 24px));
+    max-height: calc(100vh - 80px);
+    overflow-y: auto;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: 8px;

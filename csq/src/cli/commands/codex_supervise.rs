@@ -152,7 +152,7 @@ enum Outcome {
 /// invocation — capability-layer intent, `toggles`, `debug`,
 /// `coc_cache_enabled` (item 3 of the governing task — cross-slot
 /// swap-resume shard S2 follow-up; F2, round 5) — and is forwarded to
-/// [`drive_child`], which calls it on every `SIGUSR1` with a pending
+/// [`drive_child_inner`], which calls it on every `SIGUSR1` with a pending
 /// request instead of re-deriving those values (a fresh
 /// `load_capability_layer_toggles(base_dir)` disk read plus hardcoded
 /// `debug=false, coc_cache_enabled=true`, the shape this replaced). So a
@@ -160,8 +160,15 @@ enum Outcome {
 /// original launch resolved, never an approximation that could refuse (or
 /// wrongly admit) a swap the real, flag-respecting relaunch would have
 /// decided differently.
+///
+/// `carried_messaging` is the terminal's launch-time messaging decision as the launching
+/// process holds it IN MEMORY (`launch_codex`). A supervised swap relaunch hands it on rather
+/// than re-reading the `.csq-messaging` marker: the supervisor IS the original process, so
+/// the marker is only a fallback for processes whose memory does not survive (an exec-replace
+/// swap), and a failed or missing marker write cannot turn messaging off here. `None` reads
+/// the marker, then the handle dir's own registration (`register::existing_decision`).
 #[allow(clippy::too_many_arguments)]
-pub fn run_supervised(
+pub fn run_supervised_carrying(
     cmd: Command,
     handle_dir: &Path,
     base_dir: &Path,
@@ -199,7 +206,10 @@ pub fn run_supervised(
         Option<&str>,
         Option<sup::SwapAuditCorrelation>,
         &mut crate::cli::audit_emit::AuditEmitter,
+        bool,
     ) -> Result<()>,
+    carried_messaging: Option<bool>,
+    embedded_native_fallback: bool,
 ) -> Result<()> {
     let handle_dir_abs =
         std::fs::canonicalize(handle_dir).unwrap_or_else(|_| handle_dir.to_path_buf());
@@ -223,10 +233,14 @@ pub fn run_supervised(
             swap_correlation,
             audit_emitter,
             relaunch,
+            carried_messaging,
+            embedded_native_fallback,
         )
     }
     #[cfg(not(unix))]
     {
+        let _ = carried_messaging; // only a swap relaunch consults it, and that is unix-only.
+        let _ = embedded_native_fallback;
         let _ = relaunch; // no swap handling on non-unix; see module + fn doc.
         let _ = base_dir; // swap-target validation is unix-only (SIGUSR1 has no non-unix analog).
         let _ = validate; // only consulted on the unix relaunch-validation path.
@@ -239,6 +253,41 @@ pub fn run_supervised(
             audit_emitter,
         )
     }
+}
+
+/// [`run_supervised_carrying`] with no in-memory decision (the marker is read).
+/// Supervision fixtures use embedded mode: stub-cli has no app-server RPC
+/// protocol. Decision propagation still runs through the production supervisor.
+#[cfg(all(test, unix))]
+#[allow(clippy::too_many_arguments)]
+pub fn run_supervised(
+    cmd: Command,
+    handle_dir: &Path,
+    base_dir: &Path,
+    validate: impl Fn(u16) -> Result<csq_core::types::AccountNum> + Send + Sync + 'static,
+    is_relaunch: bool,
+    swap_correlation: Option<sup::SwapAuditCorrelation>,
+    audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+    relaunch: impl FnOnce(
+        u16,
+        Option<&str>,
+        Option<sup::SwapAuditCorrelation>,
+        &mut crate::cli::audit_emit::AuditEmitter,
+        bool,
+    ) -> Result<()>,
+) -> Result<()> {
+    run_supervised_carrying(
+        cmd,
+        handle_dir,
+        base_dir,
+        validate,
+        is_relaunch,
+        swap_correlation,
+        audit_emitter,
+        relaunch,
+        None,
+        true,
+    )
 }
 
 /// Shared "no supervision, just spawn+wait" path — used on non-Unix, and
@@ -266,10 +315,12 @@ fn run_unsupervised(
                 );
             }
             let _ = std::fs::remove_dir_all(handle_dir_abs);
-            let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-            audit_emitter.set_end_ts(end_ts);
+            end_codex_spawn_failed(audit_emitter);
             fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
-            return Err(anyhow!("failed to launch codex: {e}"));
+            return Err(anyhow!(
+                "failed to launch codex: {}",
+                csq_core::error::redact_tokens(&e.to_string())
+            ));
         }
     };
     // PRIMARY DIRECTIVE (round 6): the relaunch's spawn succeeded — this IS
@@ -354,8 +405,10 @@ fn write_terminal_reset_if_tty() {
 /// it, in the same shape every other "supervisor asked to go away before
 /// starting a session" outcome uses.
 ///
-/// On the FIRST launch (`is_relaunch = false`) this call's `audit_emitter`
-/// is discarded instead: `AuditEmitter`'s `Drop`/`try_flush_now` always
+/// On the FIRST launch (`is_relaunch = false`) a record carrying a
+/// spawn-gate verdict is finalised and flushed the same way (M-1: the
+/// governed verdict must not be dropped); an ungoverned first-launch
+/// `audit_emitter` is discarded instead: `AuditEmitter`'s `Drop`/`try_flush_now` always
 /// flush whatever record they hold, so this calls
 /// [`crate::cli::audit_emit::AuditEmitter::discard`] to take the record
 /// without a live-IPC POST or a `.pending/` fallback write — the emitter
@@ -404,21 +457,1102 @@ fn exit_cleanly_if_terminating_before_spawn(
     }
     let _ = std::fs::remove_file(handle_dir_abs.join(sup::SUPERVISOR_FILE));
     let _ = std::fs::remove_dir_all(handle_dir_abs);
-    if is_relaunch {
-        use csq_core::audit::{Decision, ResultState};
-        let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        audit_emitter.set_end_ts(end_ts);
-        audit_emitter.set_result(ResultState::Fail, Decision::Reject);
-        fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
-    } else {
-        audit_emitter.discard();
-    }
+    // M-1: ONE disposition for both launch kinds. A relaunch's record, or a
+    // first launch's record that already carries a spawn-gate verdict (an
+    // enterprise `Proceed` evaluated before this signal arrived), is
+    // finalised `Fail`/`Reject` and flushed fail-loud — dropping it would
+    // lose the governed verdict; an ungoverned first launch is discarded.
+    super::run::end_codex_run_before_spawn(audit_emitter, is_relaunch);
     write_terminal_reset_if_tty();
     eprintln!(
         "csq: a termination signal arrived before the codex relaunch could \
          start — exiting without starting a new session."
     );
     std::process::exit(code);
+}
+
+/// Capture polls every 2 s until the native state row identifies a held CLI MAIN.
+/// Each poll reads process/lock and id/source metadata; no transcript content is opened.
+#[cfg(unix)]
+const CAPTURE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[cfg(unix)]
+struct ThreadCapture {
+    stopped: std::sync::Arc<std::sync::Mutex<bool>>,
+    /// The child-completion watcher, when this capture owns one. Joined on
+    /// stop so the watcher never outlives the handle dir it watches.
+    watcher: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+#[cfg(unix)]
+impl ThreadCapture {
+    /// The cancellation gate, shared with the child-completion watcher: it
+    /// stops when the supervised child exits, exactly like the capture loop.
+    fn flag(&self) -> std::sync::Arc<std::sync::Mutex<bool>> {
+        self.stopped.clone()
+    }
+
+    fn stop(&self) {
+        // Cancellation and publication share this gate. Lifecycle replacement occurs
+        // only after stop returns, so an in-flight publication finishes first.
+        *self.stopped.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+
+    /// Join the child-completion watcher within `bound`. Called AFTER the
+    /// native backend stops, so its socket is already gone and a read cannot
+    /// be held open by a streaming server. The wait is still bounded: if the
+    /// watcher does not finish in time, the caller returns anyway (the thread
+    /// is detached and the process is exiting) and the timeout is warned.
+    fn join_watcher(&self, bound: std::time::Duration) {
+        let Some(handle) = self
+            .watcher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + bound;
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        } else {
+            tracing::warn!(event = "child_wake", outcome = "join_timeout");
+        }
+    }
+
+    /// Hand the managed child-completion watcher to this capture.
+    fn set_watcher(&self, watcher: std::thread::JoinHandle<()>) {
+        *self.watcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(watcher);
+    }
+}
+
+#[cfg(unix)]
+fn publish_captured_main(
+    stopped: &std::sync::Mutex<bool>,
+    handle: &HandleIncarnation,
+    expected_child: u32,
+    id: &str,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let stop = stopped.lock().unwrap_or_else(|e| e.into_inner());
+    if *stop {
+        return false;
+    }
+    let (Ok(owned), Ok(current)) = (
+        handle.directory.metadata(),
+        std::fs::symlink_metadata(&handle.path),
+    ) else {
+        return false;
+    };
+    if !current.is_dir()
+        || owned.dev() != current.dev()
+        || owned.ino() != current.ino()
+        || markers::read_live_cc_pid(&handle.path) != Some(expected_child)
+    {
+        return false;
+    }
+    csq_core::providers::codex::thread_id::write_captured_thread_id(&handle.path, id).is_ok()
+}
+
+/// Capture the held top-level thread using native source metadata and explicit resume argv.
+/// A resumed MAIN can predate launch; newly-created subagent rollouts never qualify.
+/// A stale record from the previous child is removed before capturing this child.
+#[cfg(unix)]
+fn start_thread_capture(
+    handle_dir_abs: &Path,
+    codex_pid: u32,
+    from_launch: Option<String>,
+    sqlite_home: std::path::PathBuf,
+) -> ThreadCapture {
+    use csq_core::providers::codex::thread_id as tid;
+    let stop = ThreadCapture {
+        stopped: std::sync::Arc::new(std::sync::Mutex::new(false)),
+        watcher: std::sync::Mutex::new(None),
+    };
+    let Some(handle) = HandleIncarnation::capture(handle_dir_abs) else {
+        return stop;
+    };
+    let _ = std::fs::remove_file(handle_dir_abs.join(tid::CAPTURED_THREAD_FILE));
+    let flag = stop.stopped.clone();
+    let dir = handle_dir_abs.to_path_buf();
+    let _ = std::thread::Builder::new()
+        .name("csq-thread-capture".into())
+        .spawn(move || {
+            while !*flag.lock().unwrap_or_else(|e| e.into_inner()) {
+                if let Ok(locks) = std::fs::canonicalize(dir.join("thread-writer-locks")) {
+                    if let Some(id) = tid::capture_main_thread_id(
+                        codex_pid,
+                        &locks,
+                        &sqlite_home,
+                        from_launch.as_deref(),
+                    ) {
+                        // Err means the handle dir is gone: nothing left to record into.
+                        let _ = publish_captured_main(&flag, &handle, codex_pid, &id);
+                        return;
+                    }
+                }
+                std::thread::sleep(CAPTURE_POLL);
+            }
+        });
+    stop
+}
+
+/// The native manager has the writer locks in a remote TUI launch. Read loaded
+/// metadata on its authenticated endpoint instead of looking at the TUI PID.
+#[cfg(unix)]
+fn start_managed_thread_capture(
+    handle_dir: &Path,
+    recipient: csq_core::providers::codex::managed_backend::LauncherIdentity,
+    tui_launcher_pid: u32,
+    expected_resume: Option<String>,
+    sqlite_home: std::path::PathBuf,
+) -> ThreadCapture {
+    use csq_core::providers::codex::{managed_backend as backend, thread_id as tid};
+    let stop = ThreadCapture {
+        stopped: std::sync::Arc::new(std::sync::Mutex::new(false)),
+        watcher: std::sync::Mutex::new(None),
+    };
+    let Some(handle) = HandleIncarnation::capture(handle_dir) else {
+        return stop;
+    };
+    let _ = std::fs::remove_file(handle_dir.join(tid::CAPTURED_THREAD_FILE));
+    let flag = stop.stopped.clone();
+    let dir = handle_dir.to_path_buf();
+    let _ = std::thread::Builder::new()
+        .name("csq-native-main-capture".into())
+        .spawn(move || {
+            while !*flag.lock().unwrap_or_else(|e| e.into_inner()) {
+                if recipient.verify().is_err() {
+                    return;
+                }
+                if let Ok(threads) = backend::loaded_thread_metadata(
+                    &dir,
+                    &sqlite_home,
+                    &recipient,
+                    Duration::from_secs(2),
+                ) {
+                    if let Ok(id) = backend::unique_loaded_cli_thread(&threads) {
+                        if expected_resume
+                            .as_ref()
+                            .is_none_or(|expected| expected == &id)
+                        {
+                            let _ = publish_captured_main(&flag, &handle, tui_launcher_pid, &id);
+                            return;
+                        }
+                    }
+                }
+                std::thread::sleep(CAPTURE_POLL);
+            }
+        });
+    stop
+}
+
+/// One notification read waits at most this slice before the stop flag is
+/// re-checked. The app-server pushes, so this is not a state poll: no RPC is
+/// sent until a notification names a thread.
+#[cfg(unix)]
+const CHILD_WAKE_SLICE: std::time::Duration = std::time::Duration::from_millis(250);
+/// Supervisor-lifetime bound for the watcher's single socket.
+#[cfg(unix)]
+const CHILD_WAKE_TOTAL: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+/// Bound on the watcher's join at teardown, after the backend socket closes.
+#[cfg(unix)]
+const CHILD_WAKE_JOIN_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Watch the owning native app-server's pushed thread/turn notifications and
+/// start a queued notice when a subagent thread finishes while the main thread
+/// is idle. Fail-closed: unknown state, a foreign thread or a busy main thread
+/// starts nothing. The start runs under the shared wake lock.
+#[cfg(unix)]
+fn start_managed_child_watch(
+    handle_dir_abs: &Path,
+    recipient: csq_core::providers::codex::managed_backend::LauncherIdentity,
+    sqlite_home: std::path::PathBuf,
+    stopped: std::sync::Arc<std::sync::Mutex<bool>>,
+) -> Option<std::thread::JoinHandle<()>> {
+    use csq_core::providers::codex::{managed_backend as backend, thread_id as tid};
+    let dir = handle_dir_abs.to_path_buf();
+    let spawned = std::thread::Builder::new()
+        .name("csq-child-wake".into())
+        .spawn(move || {
+            // Bounded, no-follow read: a planted symlink or an oversized file
+            // must not be followed from the watcher thread.
+            let main_of = || tid::read_captured_thread_id(&dir);
+            let queued_item = || csq_core::messaging::wake::recorded_item_id(&dir);
+            let start = |thread: &str, item: &str| {
+                csq_core::messaging::wake::start_queued_notice_native(
+                    &dir,
+                    &sqlite_home,
+                    &recipient,
+                    thread,
+                    item,
+                    std::time::Duration::from_secs(5),
+                )
+            };
+            let stop = || *stopped.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(error) = backend::watch_child_completions(
+                &dir,
+                &sqlite_home,
+                &recipient,
+                &main_of,
+                &queued_item,
+                &start,
+                &stop,
+                CHILD_WAKE_TOTAL,
+                CHILD_WAKE_SLICE,
+            ) {
+                // Fixed vocabulary only: no path, thread or message text.
+                tracing::warn!(
+                    event = "child_wake",
+                    outcome = "watcher_stopped",
+                    error_kind = %error.kind()
+                );
+            }
+        });
+    match spawned {
+        Ok(handle) => Some(handle),
+        Err(error) => {
+            // Never silent: a watcher that could not start means child
+            // completions will only surface at the parent's next turn.
+            tracing::warn!(
+                event = "child_wake",
+                outcome = "spawn_failed",
+                error_kind = %error.kind()
+            );
+            None
+        }
+    }
+}
+
+/// Derive the native server and TUI from this known interactive launch. The
+fn native_permission_config(value: &str) -> bool {
+    let key = value.split_once('=').map_or(value, |(key, _)| key).trim();
+    matches!(
+        key.split('.').next().unwrap_or(key),
+        "approval_policy"
+            | "approvals_reviewer"
+            | "sandbox_mode"
+            | "default_permissions"
+            | "permissions"
+            | "network"
+            | "sandbox_workspace_write"
+    )
+}
+
+/// Classify ORIGINAL caller arguments before csq adds its default permission flags.
+/// Values of other options and text after `--` cannot impersonate a resume or override.
+#[cfg(all(test, unix))]
+pub(super) fn explicit_resume_permissions(rest: &[String]) -> bool {
+    let (resume, permissions, _) = resume_permission_selection(rest);
+    resume && permissions
+}
+
+/// Native resume selection ignores option values and literal prompt text.
+pub(super) fn is_native_resume(rest: &[String]) -> bool {
+    resume_permission_selection(rest).0
+}
+
+/// Options native remote mode cannot represent retain their original embedded launch.
+pub(super) fn requires_embedded_native(rest: &[String]) -> bool {
+    let (resume, permissions, unsupported_remote) = resume_permission_selection(rest);
+    (resume && permissions) || unsupported_remote
+}
+
+fn native_writable_roots_config(value: &str) -> bool {
+    let key = value.split_once('=').map_or(value, |(key, _)| key).trim();
+    key == "sandbox_workspace_write.writable_roots"
+        || (key == "sandbox_workspace_write"
+            && toml::from_str::<toml::Value>(value)
+                .ok()
+                .and_then(|value| value.get("sandbox_workspace_write").cloned())
+                .is_some_and(|value| value.get("writable_roots").is_some()))
+}
+
+fn resume_permission_selection(rest: &[String]) -> (bool, bool, bool) {
+    let mut resume = false;
+    let mut command_seen = false;
+    let mut permissions = false;
+    let mut unsupported_remote = false;
+    let mut i = 0;
+    while i < rest.len() {
+        let token = rest[i].as_str();
+        if token == "--" {
+            break;
+        }
+        let (name, joined) = token
+            .split_once('=')
+            .map_or((token, None), |(name, value)| (name, Some(value)));
+        if name == "-c" || name == "--config" {
+            let value = joined.or_else(|| rest.get(i + 1).map(String::as_str));
+            permissions |= value.is_some_and(native_permission_config);
+            unsupported_remote |= value.is_some_and(native_writable_roots_config);
+            i += if joined.is_some() { 1 } else { 2 };
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("-c").filter(|value| !value.is_empty()) {
+            permissions |= native_permission_config(value);
+            unsupported_remote |= native_writable_roots_config(value);
+            i += 1;
+            continue;
+        }
+        unsupported_remote |= matches!(
+            name,
+            "-C" | "--cd" | "--add-dir" | "--worktree" | "--no-daemon"
+        ) || (token.starts_with("-C") && token.len() > 2);
+        let permission_value = matches!(
+            name,
+            "-a" | "--ask-for-approval"
+                | "--approval"
+                | "-s"
+                | "--sandbox"
+                | "-C"
+                | "--cd"
+                | "--add-dir"
+                | "-p"
+                | "--profile"
+        );
+        let attached_permission = ["-a", "-s", "-C", "-p"]
+            .iter()
+            .any(|prefix| token.starts_with(prefix) && token.len() > prefix.len());
+        let permission_bool = matches!(
+            name,
+            "--yolo"
+                | "--dangerously-bypass-approvals-and-sandbox"
+                | "--approve-for-me"
+                | "--not-so-yolo"
+                | "--full-auto"
+        );
+        if permission_value || attached_permission || permission_bool {
+            permissions = true;
+        }
+        let value_option = permission_value
+            || matches!(
+                name,
+                "-m" | "--model"
+                    | "--local-provider"
+                    | "--enable"
+                    | "--disable"
+                    | "--remote"
+                    | "--remote-auth-token-env"
+            );
+        if name == "-i" || name == "--image" {
+            i += 1;
+            // Consume the first explicit image value even when it looks like
+            // a flag, then its variadic values. Values never grant authority.
+            if joined.is_none() && i < rest.len() {
+                i += 1;
+            }
+            while i < rest.len() && !rest[i].starts_with('-') {
+                i += 1;
+            }
+            continue;
+        }
+        if value_option && joined.is_none() {
+            i += 2;
+            continue;
+        }
+        if !token.starts_with('-') && !command_seen {
+            command_seen = true;
+            resume = token == "resume";
+        }
+        i += 1;
+    }
+    (resume, permissions, unsupported_remote)
+}
+
+/// Preserve account environment, safe option values and prompt bytes. Fresh
+/// permission choices stay on the TUI; resumed defaults belong on the backend.
+#[cfg(unix)]
+fn managed_commands(
+    source: &Command,
+    plan: &csq_core::providers::codex::managed_backend::ManagedBackendPlan,
+) -> std::io::Result<(Command, Command)> {
+    use std::ffi::OsString;
+    let args: Vec<OsString> = source.get_args().map(ToOwned::to_owned).collect();
+    let is_resume = resume_permission_selection(
+        &args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+    )
+    .0;
+    let mut config = Vec::new();
+    let mut tui_config = Vec::new();
+    let server_only = |value: &std::ffi::OsStr| -> std::io::Result<bool> {
+        let value = value.to_string_lossy();
+        if is_resume {
+            return Ok(native_permission_config(&value));
+        }
+        let roots = native_writable_roots_config(&value);
+        if roots {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "explicit writable-root config is unsupported with the private remote launch",
+            ));
+        }
+        Ok(false)
+    };
+    let mut permission_flags = Vec::new();
+    let mut bypass = false;
+    let mut tui_args = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            tui_args.extend_from_slice(&args[index..]);
+            break;
+        }
+        if arg == "--remote"
+            || arg.to_string_lossy().starts_with("--remote=")
+            || arg == "--remote-auth-token-env"
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "messaging requires the terminal's private native endpoint",
+            ));
+        }
+        if [
+            "-m",
+            "--model",
+            "-p",
+            "--profile",
+            "-i",
+            "--image",
+            "--local-provider",
+            "--enable",
+            "--disable",
+        ]
+        .iter()
+        .any(|flag| arg == flag)
+        {
+            let value = args.get(index + 1).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "native option value missing",
+                )
+            })?;
+            tui_args.extend([arg.clone(), value.clone()]);
+            index += 2;
+            continue;
+        }
+        if arg == "-c" || arg == "--config" {
+            let value = args
+                .get(index + 1)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "native configuration value missing",
+                    )
+                })?;
+            config.extend([OsString::from("-c"), value.clone()]);
+            if !server_only(value)? {
+                tui_config.extend([OsString::from("-c"), value.clone()]);
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.to_str().and_then(|value| {
+            value
+                .strip_prefix("--config=")
+                .or_else(|| value.strip_prefix("-c="))
+        }) {
+            config.extend([OsString::from("-c"), OsString::from(value)]);
+            if !server_only(std::ffi::OsStr::new(value))? {
+                tui_config.extend([OsString::from("-c"), OsString::from(value)]);
+            }
+            index += 1;
+            continue;
+        }
+        if arg == "--dangerously-bypass-approvals-and-sandbox" || arg == "--yolo" {
+            // Native typed CLI overrides outrank -c values regardless of argv
+            // position. Apply their equivalent backend overrides after all -c.
+            bypass = true;
+            if !is_resume {
+                tui_args.push(arg.clone());
+            }
+            index += 1;
+            continue;
+        }
+        let text = arg.to_string_lossy();
+        let name = text.split_once('=').map_or(text.as_ref(), |(name, _)| name);
+        if matches!(name, "--cd" | "-C" | "--add-dir") || text.starts_with("-C") {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "explicit working-directory/add-dir flags are unsupported with the private remote launch"));
+        }
+        let key = if matches!(name, "-a" | "--ask-for-approval")
+            || (text.starts_with("-a") && !text.starts_with("--"))
+        {
+            Some("approval_policy")
+        } else if matches!(name, "-s" | "--sandbox")
+            || (text.starts_with("-s") && !text.starts_with("--"))
+        {
+            Some("sandbox_mode")
+        } else {
+            None
+        };
+        if let Some(key) = key {
+            let joined = text.split_once('=').map(|(_, value)| value).or_else(|| {
+                if text.starts_with('-') && !text.starts_with("--") && text.len() > 2 {
+                    Some(&text[2..])
+                } else {
+                    None
+                }
+            });
+            let value = joined
+                .map(ToOwned::to_owned)
+                .or_else(|| {
+                    args.get(index + 1)
+                        .and_then(|value| value.to_str())
+                        .map(ToOwned::to_owned)
+                })
+                .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "native permission option value missing",
+                    )
+                })?;
+            permission_flags.extend([
+                OsString::from("-c"),
+                OsString::from(format!("{key}={}", serde_json::json!(value))),
+            ]);
+            let consumed = if joined.is_some() { 1 } else { 2 };
+            if !is_resume {
+                tui_args.extend_from_slice(&args[index..index + consumed]);
+            }
+            index += consumed;
+            continue;
+        }
+        if matches!(name, "--approve-for-me" | "--not-so-yolo") {
+            permission_flags.extend([
+                OsString::from("-c"),
+                OsString::from("approvals_reviewer=\"auto_review\""),
+                OsString::from("-c"),
+                OsString::from("approval_policy=\"on-request\""),
+                OsString::from("-c"),
+                OsString::from("sandbox_mode=\"workspace-write\""),
+            ]);
+            if !is_resume {
+                tui_args.push(arg.clone());
+            }
+            index += 1;
+            continue;
+        }
+        tui_args.push(arg.clone());
+        index += 1;
+    }
+    if bypass {
+        // Native bypass dominates an explicit -s choice in BOTH argv orders.
+        permission_flags.extend([
+            OsString::from("-c"),
+            OsString::from("approval_policy=\"never\""),
+            OsString::from("-c"),
+            OsString::from("sandbox_mode=\"danger-full-access\""),
+        ]);
+    }
+    config.extend(permission_flags);
+    let clone_base = || {
+        let mut command = Command::new(source.get_program());
+        for (key, value) in source.get_envs() {
+            if let Some(value) = value {
+                command.env(key, value);
+            } else {
+                command.env_remove(key);
+            }
+        }
+        if let Some(cwd) = source.get_current_dir() {
+            command.current_dir(cwd);
+        }
+        command
+    };
+    let mut server = clone_base();
+    server.args(plan.backend_argv(&config)?);
+    server
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut tui = clone_base();
+    tui.arg("--remote")
+        .arg(plan.endpoint_url())
+        .args(tui_config)
+        .arg("-c")
+        .arg(format!(
+            "sqlite_home={}",
+            serde_json::json!(plan
+                .sqlite_home()
+                .to_str()
+                .ok_or_else(|| std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "native state path is not UTF-8"
+                ))?)
+        ))
+        .args(tui_args);
+    // Interactive run.rs commands use inherited stdio. Rebuilding is limited
+    // to that launch path, never the piped one-shot csq exec path.
+    tui.stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    Ok((server, tui))
+}
+
+/// Find the actual native TUI image, including Codex's npm launcher shape.
+/// Existing wake-target proof validates the exact own-launch ancestry and the
+/// handle's supervisor/child records, excluding nested CLI tool processes.
+#[cfg(unix)]
+fn managed_recipient(
+    child: &mut std::process::Child,
+    handle: &Path,
+) -> std::io::Result<csq_core::providers::codex::managed_backend::LauncherIdentity> {
+    use csq_core::{providers::codex::managed_backend::LauncherIdentity, sessions};
+    let launcher = LauncherIdentity::capture(child.id())?;
+    let accounts = handle.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "native handle has no account root",
+        )
+    })?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        launcher.verify()?;
+        if !matches!(child.try_wait(), Ok(None)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "Codex TUI exited before binding",
+            ));
+        }
+        let mut pids = vec![child.id()];
+        pids.extend(collect_descendant_pids(child.id()));
+        if pids.len() > 128 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "native launch descendants exceed bound",
+            ));
+        }
+        let mut selected = None;
+        let mut unresolved = Vec::new();
+        for pid in pids {
+            let (info, exact) =
+                match sessions::session_info_exact_for_pid_kind(sessions::CliKind::Codex, pid) {
+                    Ok(Some(candidate)) => candidate,
+                    Ok(None) => continue,
+                    Err(_) => {
+                        unresolved.push(pid);
+                        continue;
+                    }
+                };
+            let Some(started) = info.started_at else {
+                unresolved.push(pid);
+                continue;
+            };
+            if info.config_dir != handle {
+                continue;
+            }
+            let Some(launch) = sessions::codex_launch_for_session(pid, started, exact) else {
+                unresolved.push(pid);
+                continue;
+            };
+            let Some(target) = sessions::wake_target_ok(accounts, pid, handle, &launch) else {
+                unresolved.push(pid);
+                continue;
+            };
+            if !target.still_live() {
+                unresolved.push(pid);
+                continue;
+            }
+            let identity = LauncherIdentity {
+                pid,
+                started_exact: exact,
+            };
+            if selected.replace(identity).is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "native TUI launch is ambiguous",
+                ));
+            }
+        }
+        if let Some(identity) = selected {
+            // A tool process below the already-proven native TUI is not a
+            // second launch candidate. Unknown siblings/launcher branches must
+            // be retried; no unreadable branch is treated as absent.
+            let only_nested = unresolved.iter().all(|pid| {
+                sessions::is_ancestor_with(
+                    identity.pid,
+                    *pid,
+                    &sessions::parent_pid,
+                    &sessions::ancestor_start,
+                ) == Some(true)
+            });
+            if only_nested {
+                launcher.verify()?;
+                identity.verify()?;
+                return Ok(identity);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "native TUI binding deadline elapsed",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(POLL_MS));
+    }
+}
+
+/// Owned native server process group. Cleanup runs before handle removal/swap,
+/// and Drop covers every startup failure after the server has spawned.
+#[cfg(unix)]
+struct OwnedNativeBackend {
+    child: Option<std::process::Child>,
+    launcher: csq_core::providers::codex::managed_backend::LauncherIdentity,
+    binding: Option<csq_core::providers::codex::managed_backend::BackendBinding>,
+}
+
+#[cfg(unix)]
+impl OwnedNativeBackend {
+    fn spawn(mut cmd: Command) -> std::io::Result<Self> {
+        use std::os::unix::process::CommandExt;
+        reset_signal_dispositions_before_exec(&mut cmd);
+        // SAFETY: umask is async-signal-safe and accesses no allocation/lock.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::umask(0o077);
+                // A backend owns no terminal. setsid also creates its private
+                // process group, keeping it out of TUI session discovery.
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn()?;
+        let launcher = match csq_core::providers::codex::managed_backend::LauncherIdentity::capture(
+            child.id(),
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                // SAFETY: this unreaped child is the group leader we spawned;
+                // its PID cannot be recycled until wait completes below.
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            child: Some(child),
+            launcher,
+            binding: None,
+        })
+    }
+
+    fn connect(
+        &mut self,
+        plan: &csq_core::providers::codex::managed_backend::ManagedBackendPlan,
+    ) -> std::io::Result<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            self.launcher.verify()?;
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "native backend startup deadline elapsed",
+                    )
+                })?;
+            match plan.publish_binding(&self.launcher, remaining.min(Duration::from_secs(2))) {
+                Ok(binding) => {
+                    self.binding = Some(binding);
+                    return Ok(());
+                }
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(POLL_MS))
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn is_alive(&mut self) -> bool {
+        self.child
+            .as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(None)))
+            && self
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.native.verify().is_ok())
+    }
+
+    fn stop(&mut self) -> std::io::Result<()> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        // An auto-reaped child can have a recycled PID. Never enumerate or
+        // signal that numeric PID unless its exact launch still matches.
+        let mut descendant_pids = if self.launcher.verify().is_ok() {
+            collect_descendant_pids(child.id())
+        } else {
+            Vec::new()
+        };
+        if let Some(binding) = self.binding.as_ref() {
+            if binding.native.pid != child.id() && binding.native.verify().is_ok() {
+                descendant_pids.push(binding.native.pid);
+                descendant_pids.extend(collect_descendant_pids(binding.native.pid));
+            }
+        }
+        descendant_pids.sort_unstable();
+        descendant_pids.dedup();
+        let descendants: Vec<_> = descendant_pids
+            .into_iter()
+            .filter_map(|pid| {
+                csq_core::providers::codex::managed_backend::LauncherIdentity::capture(pid).ok()
+            })
+            .collect();
+        let group_member = if self.launcher.verify().is_ok() {
+            Some(child.id())
+        } else {
+            self.binding
+                .as_ref()
+                .filter(|binding| binding.native.verify().is_ok())
+                .map(|binding| binding.native.pid)
+        };
+        if let Some(group_member) = group_member {
+            // SAFETY: exact live launch incarnation and our own group leader.
+            if unsafe { libc::getpgid(group_member as i32) } == child.id() as i32 {
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGTERM);
+                }
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_millis(GRACEFUL_STOP_MS);
+        loop {
+            let parent_done = matches!(child.try_wait(), Ok(Some(_)) | Err(_));
+            let remaining: Vec<_> = descendants
+                .iter()
+                .filter(|identity| identity.verify().is_ok())
+                .map(|identity| identity.pid)
+                .collect();
+            if parent_done && remaining.is_empty() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                for pid in remaining {
+                    let _ = sup::signal_supervisor(pid, libc::SIGKILL);
+                }
+                if !parent_done {
+                    self.launcher.verify()?;
+                    let _ = child.kill();
+                    let reap_deadline = std::time::Instant::now() + Duration::from_secs(1);
+                    while matches!(child.try_wait(), Ok(None)) {
+                        if std::time::Instant::now() >= reap_deadline {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "native backend did not exit after termination",
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(POLL_MS));
+                    }
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(POLL_MS));
+        }
+        if let Some(binding) = self.binding.take() {
+            binding.retire_after_exit()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OwnedNativeBackend {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+/// How often the supervisor looks for an armed deferred wake. An idle check is one `stat`
+/// of the handle dir's record file; the retry cadence itself is the record's own backoff.
+#[cfg(unix)]
+const WAKE_RETRY_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The deferred-wake retry thread of one supervised session.
+#[cfg(unix)]
+struct WakeRetry {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+    handle: Option<HandleIncarnation>,
+}
+
+/// An open directory pins its inode, so a later incarnation cannot reuse its identity.
+#[cfg(unix)]
+struct HandleIncarnation {
+    path: std::path::PathBuf,
+    directory: std::fs::File,
+}
+
+#[cfg(unix)]
+impl HandleIncarnation {
+    /// Called on the supervisor lifecycle thread before relaunch can replace the handle.
+    /// Failure never authorizes a later removal through the original live pathname.
+    fn isolate(mut self) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let owned = self.directory.metadata().ok()?;
+        let current = std::fs::symlink_metadata(&self.path).ok()?;
+        if !current.is_dir() || owned.dev() != current.dev() || owned.ino() != current.ino() {
+            return None;
+        }
+        // csq already depends on getrandom; construct a UUIDv4 naming nonce without
+        // adding a dependency solely for this private tombstone name.
+        let mut bytes = [0u8; 16];
+        getrandom::getrandom(&mut bytes).ok()?;
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        let nonce = format!(
+            "{}-{}-{}-{}-{}",
+            &hex[..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..]
+        );
+        let isolated = self.path.parent()?.join(format!(
+            ".sweep-tombstone-wake-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::rename(&self.path, &isolated).ok()?;
+        self.path = isolated;
+        let moved = std::fs::symlink_metadata(&self.path).ok()?;
+        if !moved.is_dir() || owned.dev() != moved.dev() || owned.ino() != moved.ino() {
+            return None;
+        }
+        Some(self)
+    }
+
+    fn capture(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+            .ok()?;
+        Some(Self {
+            path: path.to_path_buf(),
+            directory,
+        })
+    }
+
+    /// The original handle has already been isolated before a relaunch can recreate it.
+    /// This comparison and deletion of the tombstone are not an atomic compare/delete
+    /// against arbitrary concurrent replacement of that private tombstone pathname.
+    fn cleanup_if_same(&self) {
+        self.cleanup_if_same_with(|| {});
+    }
+
+    fn cleanup_if_same_with(&self, before_remove: impl FnOnce()) {
+        use std::os::unix::fs::MetadataExt;
+        let (Ok(owned), Ok(current)) = (
+            self.directory.metadata(),
+            std::fs::symlink_metadata(&self.path),
+        ) else {
+            return;
+        };
+        if current.is_dir() && owned.dev() == current.dev() && owned.ino() == current.ino() {
+            before_remove();
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl WakeRetry {
+    /// Budget for polling retry completion before detaching a cleanup waiter. Stop is
+    /// checked by the actual wake and before persistence, but an already-running filesystem
+    /// operation and thread scheduling have no wall-clock bound. This is not a bound on
+    /// thread completion or cleanup; an in-flight wake may also outlive this budget.
+    const JOIN_BOUND: std::time::Duration = std::time::Duration::from_secs(3);
+
+    /// Stop and wait up to the polling budget. On timeout, one detached waiter joins the
+    /// thread and retries cleanup of the original directory isolated synchronously into
+    /// a private tombstone before relaunch. The waiter never removes the live handle path.
+    fn stop_and_wait(self) {
+        let _ = self.stop_and_wait_with(Self::JOIN_BOUND);
+    }
+
+    fn stop_and_wait_with(
+        mut self,
+        join_bound: std::time::Duration,
+    ) -> Option<std::sync::mpsc::Receiver<()>> {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let h = self.join.take()?;
+        let end = std::time::Instant::now() + join_bound;
+        while !h.is_finished() && std::time::Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if h.is_finished() {
+            let _ = h.join();
+            None
+        } else {
+            tracing::debug!(event = "deferred_wake", outcome = "join_timeout");
+            let (done, receipt) = std::sync::mpsc::channel();
+            let handle = self.handle.take().and_then(HandleIncarnation::isolate);
+            std::thread::spawn(move || {
+                let _ = h.join();
+                if let Some(handle) = handle {
+                    handle.cleanup_if_same();
+                }
+                let _ = done.send(());
+            });
+            Some(receipt)
+        }
+    }
+}
+
+/// Drive the deferred wake (`messaging::deferred`) for this session until stopped. The handle
+/// dir disappears with the session, which ends the record with it.
+#[cfg(unix)]
+fn start_wake_retry(handle_dir_abs: &Path, base_dir: &Path) -> WakeRetry {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = stop.clone();
+    let (dir, base) = (handle_dir_abs.to_path_buf(), base_dir.to_path_buf());
+    let handle = HandleIncarnation::capture(handle_dir_abs);
+    let join = std::thread::Builder::new()
+        .name("csq-wake-retry".into())
+        .spawn(move || wake_retry_loop(&base, &dir, &flag))
+        .ok();
+    WakeRetry { stop, join, handle }
+}
+
+/// The retry loop: one tick per [`WAKE_RETRY_POLL`] until `flag` is set.
+#[cfg(unix)]
+fn wake_retry_loop(base: &Path, dir: &Path, flag: &std::sync::atomic::AtomicBool) {
+    let stopped = || flag.load(std::sync::atomic::Ordering::SeqCst);
+    let slice = std::time::Duration::from_millis(250);
+    while !stopped() {
+        let _ = super::sessions_messages::deferred_wake_tick(base, dir, &stopped);
+        let mut waited = std::time::Duration::ZERO;
+        while waited < WAKE_RETRY_POLL && !stopped() {
+            std::thread::sleep(slice);
+            waited += slice;
+        }
+    }
+}
+
+/// Carry the swap's messaging decision across retry teardown, which may remove its marker.
+#[cfg(unix)]
+fn stop_retry_preserving_messaging(
+    carried: Option<bool>,
+    swapping: bool,
+    persisted: &dyn Fn() -> bool,
+    stop: impl FnOnce(),
+) -> bool {
+    let messaging = swapping && carried.unwrap_or_else(persisted);
+    stop();
+    messaging
 }
 
 #[cfg(unix)]
@@ -439,7 +1573,10 @@ fn run_supervised_unix(
         Option<&str>,
         Option<sup::SwapAuditCorrelation>,
         &mut crate::cli::audit_emit::AuditEmitter,
+        bool,
     ) -> Result<()>,
+    carried_messaging: Option<bool>,
+    embedded_native_fallback: bool,
 ) -> Result<()> {
     // C-R4-2: applied BEFORE the `write_supervisor_record` check/branch
     // below, so BOTH the supervised path AND the `run_unsupervised`
@@ -474,6 +1611,12 @@ fn run_supervised_unix(
     // produces) — fail open to "no supervision" rather than press on
     // with a swap contract nobody can complete.
     if sup::write_supervisor_record(handle_dir_abs).is_err() {
+        if carried_messaging
+            .unwrap_or_else(|| csq_core::messaging::register::existing_decision(handle_dir_abs))
+        {
+            super::run::end_codex_run_before_spawn(audit_emitter, is_relaunch);
+            return Err(anyhow!("could not record the managed Codex supervisor"));
+        }
         eprintln!(
             "warning: could not record codex supervisor state — `csq swap` \
              from inside this session will not be able to hand back a swap"
@@ -520,16 +1663,82 @@ fn run_supervised_unix(
     // request is silently lost rather than merely delayed.
     ensure_signal_handlers_installed();
 
-    // C-F1: the SIGINT/SIGQUIT ignore MUST be installed AFTER `cmd.spawn()`,
-    // never before. `signal(2)` dispositions set to `SIG_IGN` are INHERITED
-    // across `exec` (only a caught/handled disposition resets to default) —
-    // so ignoring these signals before spawning the child would leak
-    // `SIG_IGN` into the codex child (and every descendant it execs: `!`
-    // shell-outs, MCP servers), making the whole process TREE
-    // uninterruptible by Ctrl-C/Ctrl-\ for the rest of its life. Spawning
-    // FIRST means the child inherits whatever the default disposition was
-    // at fork/exec time (untouched), and only the supervisor's OWN,
-    // strictly-later disposition becomes `SIG_IGN`.
+    // C-F1 (revised, T6): the supervisor's own SIGINT/SIGQUIT ignore is
+    // installed BEFORE any spawn (below). `SIG_IGN` is inherited across
+    // fork+exec, so this is sound only because every child's `pre_exec`
+    // resets both signals to `SIG_DFL` (`reset_signal_dispositions_before_exec`)
+    // — the codex TUI, its embedded app-server, and every RELAUNCH child.
+    let capture_argv: Vec<String> = std::iter::once(cmd.get_program())
+        .chain(cmd.get_args())
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
+    let capture_launch = csq_core::sessions::parse_codex_launch(&capture_argv);
+    let sqlite_home = capture_launch
+        .sqlite_home
+        .clone()
+        .unwrap_or_else(|| handle_dir_abs.to_path_buf());
+    let messaging_on = carried_messaging
+        .unwrap_or_else(|| csq_core::messaging::register::existing_decision(handle_dir_abs));
+    if messaging_on && embedded_native_fallback {
+        eprintln!("csq: preserving your native options; automatic message wake is unavailable for this launch.");
+    }
+    // T6: SIGINT/SIGQUIT are ignored HERE, before the first child (the
+    // embedded app-server, or codex itself) is spawned, so a Ctrl-C in the
+    // spawn window cannot kill csq and orphan a just-spawned child. Safe for
+    // the children: every `Command` this supervisor spawns carries
+    // `reset_signal_dispositions_before_exec` (applied at the top of this
+    // function, to `managed_commands`' TUI command below, and inside
+    // `OwnedNativeBackend::spawn`), which restores `SIG_DFL` in the forked
+    // child before `exec`.
+    ignore_signal(libc::SIGINT);
+    ignore_signal(libc::SIGQUIT);
+    let backend_start = if messaging_on && !embedded_native_fallback {
+        (|| -> Result<(OwnedNativeBackend, Command)> {
+            let plan = csq_core::providers::codex::managed_backend::ManagedBackendPlan::prepare(
+                handle_dir_abs,
+                &sqlite_home,
+            )?;
+            let (server_cmd, mut tui_cmd) = managed_commands(&cmd, &plan)?;
+            let mut owned = OwnedNativeBackend::spawn(server_cmd)?;
+            owned.connect(&plan)?;
+            reset_signal_dispositions_before_exec(&mut tui_cmd);
+            Ok((owned, tui_cmd))
+        })()
+        .map(Some)
+    } else {
+        Ok(None)
+    };
+    let mut backend = match backend_start {
+        Ok(Some((owned, tui_cmd))) => {
+            cmd = tui_cmd;
+            Some(owned)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            // T1: codex was never spawned — end the run record instead of
+            // flushing its default `Bypass` state.
+            super::run::end_codex_run_before_spawn(audit_emitter, is_relaunch);
+            return Err(e);
+        }
+    };
+    if backend.is_some()
+        && (SIGTERM_FLAG.load(std::sync::atomic::Ordering::SeqCst)
+            || SIGHUP_FLAG.load(std::sync::atomic::Ordering::SeqCst))
+    {
+        if let Some(backend) = backend.as_mut() {
+            if let Err(e) = backend.stop() {
+                super::run::end_codex_run_before_spawn(audit_emitter, is_relaunch);
+                return Err(e.into());
+            }
+        }
+        exit_cleanly_if_terminating_before_spawn(
+            handle_dir_abs,
+            base_dir,
+            is_relaunch,
+            swap_correlation.as_ref(),
+            audit_emitter,
+        );
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -541,12 +1750,21 @@ fn run_supervised_unix(
                     },
                 );
             }
+            if let Some(backend) = backend.as_mut() {
+                if let Err(stop_err) = backend.stop() {
+                    end_codex_spawn_failed(audit_emitter);
+                    fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+                    return Err(stop_err.into());
+                }
+            }
             let _ = std::fs::remove_file(handle_dir_abs.join(sup::SUPERVISOR_FILE));
             let _ = std::fs::remove_dir_all(handle_dir_abs);
-            let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-            audit_emitter.set_end_ts(end_ts);
+            end_codex_spawn_failed(audit_emitter);
             fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
-            return Err(anyhow!("failed to launch codex: {e}"));
+            return Err(anyhow!(
+                "failed to launch codex: {}",
+                csq_core::error::redact_tokens(&e.to_string())
+            ));
         }
     };
     // PRIMARY DIRECTIVE (round 6): the relaunch's spawn succeeded — write
@@ -559,15 +1777,75 @@ fn run_supervised_unix(
         corr.write_outcome_once(base_dir, csq_core::audit::OpOutcome::Ok);
     }
 
-    ignore_signal(libc::SIGINT);
-    ignore_signal(libc::SIGQUIT);
-
     let child_pid = child.id();
     if let Err(e) = markers::write_live_cc_pid(handle_dir_abs, child_pid) {
         eprintln!("warning: could not record codex child PID: {e}");
     }
 
-    let outcome = drive_child(&mut child, handle_dir_abs, base_dir, validate, tty_state);
+    let capture_stop = if let Some(backend) = backend.as_mut() {
+        let binding = (|| {
+            let recipient = managed_recipient(&mut child, handle_dir_abs)?;
+            backend
+                .binding
+                .as_mut()
+                .expect("ready backend has binding")
+                .publish_recipient(&recipient)?;
+            Ok::<_, std::io::Error>(recipient)
+        })();
+        let recipient = match binding {
+            Ok(recipient) => recipient,
+            Err(error) => {
+                let _ = graceful_stop(&mut child);
+                backend.stop()?;
+                return Err(error.into());
+            }
+        };
+        let capture = start_managed_thread_capture(
+            handle_dir_abs,
+            recipient.clone(),
+            child_pid,
+            capture_launch.thread_id,
+            sqlite_home.clone(),
+        );
+        if let Some(watcher) =
+            start_managed_child_watch(handle_dir_abs, recipient, sqlite_home, capture.flag())
+        {
+            capture.set_watcher(watcher);
+        }
+        capture
+    } else {
+        start_thread_capture(
+            handle_dir_abs,
+            child_pid,
+            capture_launch.thread_id,
+            sqlite_home,
+        )
+    };
+    let retry = start_wake_retry(handle_dir_abs, base_dir);
+    let outcome = drive_child_inner(
+        &mut child,
+        handle_dir_abs,
+        base_dir,
+        validate,
+        tty_state,
+        backend.as_mut(),
+    );
+    capture_stop.stop();
+    let messaging = stop_retry_preserving_messaging(
+        carried_messaging,
+        matches!(&outcome, Outcome::SwapRequested(_)),
+        &|| csq_core::messaging::register::existing_decision(handle_dir_abs),
+        || retry.stop_and_wait(),
+    );
+
+    // Stop the writer-owning native server before the handle can be removed or
+    // tombstoned. process::exit branches below do not execute destructors.
+    if let Some(backend) = backend.as_mut() {
+        backend.stop()?;
+    }
+    // Only now: the backend socket is closed, so the watcher's reads cannot be
+    // held open by the server. Bounded, so teardown never blocks on it.
+    capture_stop.join_watcher(CHILD_WAKE_JOIN_BOUND);
 
     match outcome {
         Outcome::Exited(status) => {
@@ -610,7 +1888,10 @@ fn run_supervised_unix(
             // (the initial `cmd.spawn()` already succeeded by this point,
             // above — this is a later, rarer OS-level failure).
             let _ = std::fs::remove_dir_all(handle_dir_abs);
-            Err(anyhow!("failed to wait for codex: {e}"))
+            Err(anyhow!(
+                "failed to wait for codex: {}",
+                csq_core::error::redact_tokens(&e.to_string())
+            ))
         }
         Outcome::TerminatedBeforeRelaunch(code) => {
             // FM-4: a SIGHUP/SIGTERM arrived after the outgoing child was
@@ -638,6 +1919,12 @@ fn run_supervised_unix(
         }
         Outcome::SwapRequested(req) => {
             println!("Switching this terminal to account {}…", req.target_slot);
+            // The terminal's messaging decision was made ONCE at launch. The launching process
+            // carries it in memory (`carried_messaging`); only without one is the handle dir's
+            // record consulted. That value was snapshotted BEFORE retry teardown or the
+            // tombstone can destroy it. Either way the relaunch is
+            // handed a value and never re-reads `CSQ_MESSAGING`, which could turn an "off"
+            // terminal on.
             tombstone_handle_dir(handle_dir_abs);
 
             // PRIMARY DIRECTIVE (round 6): this correlation is shared (via
@@ -678,6 +1965,7 @@ fn run_supervised_unix(
                 req.thread_id.as_deref(),
                 correlation.clone(),
                 &mut relaunch_emitter,
+                messaging,
             ) {
                 Ok(()) => Ok(()),
                 Err(e) => {
@@ -751,7 +2039,7 @@ fn run_supervised_unix(
 /// validation call is outstanding. See the `SIGUSR1` branch below for the
 /// worker-thread mechanism.
 #[cfg(unix)]
-fn drive_child(
+fn drive_child_inner(
     child: &mut std::process::Child,
     handle_dir_abs: &Path,
     base_dir: &Path,
@@ -772,6 +2060,7 @@ fn drive_child(
     // `Timeout` branch and dropped its receiver.
     validate: &std::sync::Arc<dyn Fn(u16) -> Result<csq_core::types::AccountNum> + Send + Sync>,
     tty_state: Option<&TtyRawState>,
+    mut backend: Option<&mut OwnedNativeBackend>,
 ) -> Outcome {
     // C-(f): handler installation now happens in `run_supervised_unix`,
     // BEFORE `cmd.spawn()` — not here. Calling it again is a harmless no-op
@@ -781,6 +2070,16 @@ fn drive_child(
     ensure_signal_handlers_installed();
 
     loop {
+        if backend
+            .as_deref_mut()
+            .is_some_and(|backend| !backend.is_alive())
+        {
+            let _ = graceful_stop(child);
+            return Outcome::SpawnFailed(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "native backend exited",
+            ));
+        }
         match child.try_wait() {
             Ok(Some(status)) => return Outcome::Exited(status),
             Ok(None) => {}
@@ -1537,21 +2836,60 @@ fn ensure_signal_handlers_installed() {
 /// via `pre_exec`. Applied to every `Command` this supervisor ever spawns —
 /// see the call site's doc comment (`run_supervised_unix`) for why this
 /// must be unconditional rather than gated on "is this a relaunch".
+///
+/// T3 (Linux): the same `pre_exec` also arms `PR_SET_PDEATHSIG(SIGTERM)`, so
+/// a codex child (or its embedded app-server) is signalled when the csq
+/// thread that spawned it dies — including a SIGKILLed csq, which otherwise
+/// drops the codex share lock while codex runs on orphaned. A parent that
+/// died before `prctl` armed the signal is caught by the `getppid`
+/// re-check: the child exits instead of running orphaned (the pattern
+/// `csq_core::session::shared_state`'s writer runners use). macOS has no
+/// parent-death signal; there csq holds the share lock only while csq lives.
+/// The supervisor spawns, waits and relaunches on one thread, so the
+/// forking thread's lifetime is csq's.
 #[cfg(unix)]
 fn reset_signal_dispositions_before_exec(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let parent = std::process::id() as libc::pid_t;
     // SAFETY: `pre_exec`'s closure runs in the forked child between `fork`
-    // and `exec`, where only async-signal-safe operations are sound. `signal(2)`
-    // with a `SIG_DFL` sentinel touches no allocator, no lock, and no
-    // non-async-signal-safe state — it is exactly the kind of call `pre_exec`
-    // exists to allow.
+    // and `exec`, where only async-signal-safe operations are sound.
+    // `signal(2)` with a `SIG_DFL` sentinel, `prctl`, `getppid` and `_exit`
+    // touch no allocator, no lock, and no non-async-signal-safe state; the
+    // error path builds an `io::Error` from a raw OS code (no allocation).
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             libc::signal(libc::SIGINT, libc::SIG_DFL);
             libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                if libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGTERM as libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                ) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    libc::_exit(127);
+                }
+            }
             Ok(())
         });
     }
+}
+
+/// Ends the run record when `cmd.spawn()` itself failed: codex never ran, so
+/// the record is `Fail`/`Reject` with `end_ts`, never the default `Bypass`.
+/// Platform-neutral: the Windows spawn path ends its record the same way.
+fn end_codex_spawn_failed(audit_emitter: &mut crate::cli::audit_emit::AuditEmitter) {
+    use csq_core::audit::{Decision, ResultState};
+    let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    audit_emitter.set_end_ts(end_ts);
+    audit_emitter.set_result(ResultState::Fail, Decision::Reject);
 }
 
 /// Async-signal-safe handler body: set the flag, nothing else. Installed
@@ -1756,12 +3094,252 @@ fn relaunch_recovery_hint(target_slot: u16, thread_id: Option<&str>) -> String {
     }
 }
 
+/// Runs only in the bridge regression's owned subprocess. Exercise the real
+/// handler and pre-spawn exit guard around the bridge, rather than model a flag.
+#[cfg(all(test, unix, feature = "desktop"))]
+pub(crate) fn bridge_signal_ordering_probe(bridge: impl FnOnce()) {
+    ensure_signal_handlers_installed();
+    assert!(!SIGTERM_FLAG.load(std::sync::atomic::Ordering::SeqCst));
+    bridge();
+    let dir = tempfile::TempDir::new().expect("bridge ordering handle");
+    let mut audit = crate::cli::audit_emit::AuditEmitter::disabled();
+    exit_cleanly_if_terminating_before_spawn(dir.path(), dir.path(), false, None, &mut audit);
+    assert!(!SIGTERM_FLAG.load(std::sync::atomic::Ordering::SeqCst));
+    println!("bridge-ordering:supervisor-pre-spawn-survived");
+}
+
 #[cfg(all(test, unix))]
-mod tests {
+pub(crate) mod tests {
+    #[test]
+    fn code_red_delayed_capture_cannot_publish_into_replacement_handle() {
+        let root = tempfile::TempDir::new().unwrap();
+        let dir = root.path().join("handle");
+        std::fs::create_dir(&dir).unwrap();
+        markers::write_live_cc_pid(&dir, 42).unwrap();
+        let handle = HandleIncarnation::capture(&dir).unwrap();
+        let capture = ThreadCapture {
+            stopped: std::sync::Arc::new(std::sync::Mutex::new(false)),
+            watcher: std::sync::Mutex::new(None),
+        };
+        let (ready, wait_ready) = std::sync::mpsc::channel();
+        let (release, wait_release) = std::sync::mpsc::channel();
+        let gate = capture.stopped.clone();
+        let worker = std::thread::spawn(move || {
+            ready.send(()).unwrap();
+            wait_release.recv_timeout(Duration::from_secs(3)).unwrap();
+            publish_captured_main(&gate, &handle, 42, "0198f1a2-3b4c-7d5e-8f9a-0b1c2d3e4f5c")
+        });
+        wait_ready.recv_timeout(Duration::from_secs(3)).unwrap();
+        capture.stop();
+        std::fs::rename(&dir, root.path().join("tombstone")).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        markers::write_live_cc_pid(&dir, 43).unwrap();
+        release.send(()).unwrap();
+        assert!(
+            !worker.join().unwrap(),
+            "cancelled old worker must not publish"
+        );
+        assert!(
+            !dir.join(csq_core::providers::codex::thread_id::CAPTURED_THREAD_FILE)
+                .exists(),
+            "replacement handle must not inherit old MAIN"
+        );
+        let handle = HandleIncarnation::capture(&dir).unwrap();
+        let gate = std::sync::Mutex::new(false);
+        assert!(
+            !publish_captured_main(&gate, &handle, 42, "0198f1a2-3b4c-7d5e-8f9a-0b1c2d3e4f5c"),
+            "wrong child marker refuses publication"
+        );
+        assert!(
+            publish_captured_main(&gate, &handle, 43, "0198f1a2-3b4c-7d5e-8f9a-0b1c2d3e4f5c"),
+            "same child and inode allow publication"
+        );
+    }
+
+    #[test]
+    fn late_cleanup_isolated_path_cannot_delete_relaunch_between_check_and_remove() {
+        let root = tempfile::TempDir::new().unwrap();
+        let original = root.path().join("handle");
+        std::fs::create_dir(&original).unwrap();
+        let owned = HandleIncarnation::capture(&original)
+            .unwrap()
+            .isolate()
+            .unwrap();
+        owned.cleanup_if_same_with(|| {
+            // Deterministic interleaving after the identity check and before deletion.
+            if original.exists() {
+                std::fs::rename(&original, root.path().join("previous-handle")).unwrap();
+            }
+            std::fs::create_dir(&original).unwrap();
+            std::fs::write(original.join("new-session"), b"must survive").unwrap();
+        });
+        assert!(
+            original.join("new-session").exists(),
+            "late cleanup must not delete the relaunch"
+        );
+    }
+
+    #[test]
+    fn swap_snapshots_persisted_messaging_before_retry_cleanup_removes_the_marker() {
+        let root = tempfile::TempDir::new().unwrap();
+        let handle = root.path().join("handle");
+        std::fs::create_dir(&handle).unwrap();
+        csq_core::messaging::register::record_decision(&handle, true).unwrap();
+        let (read, observed) = std::sync::mpsc::channel();
+        let (cleaned, cleanup) = std::sync::mpsc::channel();
+        let messaging = stop_retry_preserving_messaging(
+            None,
+            true,
+            &|| {
+                let decision = csq_core::messaging::register::existing_decision(&handle);
+                read.send(decision).unwrap();
+                decision
+            },
+            || {
+                std::fs::remove_dir_all(&handle).unwrap();
+                cleaned.send(()).unwrap();
+            },
+        );
+        cleanup.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(
+            observed.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "the fallback must observe the persisted decision before cleanup"
+        );
+        assert!(
+            messaging,
+            "cleanup must not turn messaging off for the relaunch"
+        );
+        assert!(!handle.exists());
+    }
+
+    #[test]
+    fn swap_preserves_carried_messaging_without_rereading_the_removed_handle() {
+        for carried in [false, true] {
+            let root = tempfile::TempDir::new().unwrap();
+            let handle = root.path().join("handle");
+            std::fs::create_dir(&handle).unwrap();
+            let messaging = stop_retry_preserving_messaging(
+                Some(carried),
+                true,
+                &|| panic!("a carried decision must not consult the handle"),
+                || std::fs::remove_dir_all(&handle).unwrap(),
+            );
+            assert_eq!(messaging, carried);
+            assert!(!handle.exists());
+        }
+    }
+
+    fn blocked_wake_retry(path: &Path) -> (WakeRetry, std::sync::mpsc::Sender<()>) {
+        let handle = HandleIncarnation::capture(path).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (release, released) = std::sync::mpsc::channel();
+        let (started, ready) = std::sync::mpsc::channel();
+        let mut file = std::fs::File::create(path.join("late-record")).unwrap();
+        let join = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(10)).unwrap();
+            file.write_all(b"delayed fixture write").unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        (
+            WakeRetry {
+                stop,
+                join: Some(join),
+                handle: Some(handle),
+            },
+            release,
+        )
+    }
+
+    #[test]
+    fn timed_out_wake_retry_cleans_up_after_its_delayed_write_finishes() {
+        let root = tempfile::TempDir::new().unwrap();
+        let handle = root.path().join("handle");
+        std::fs::create_dir(&handle).unwrap();
+        let (retry, release) = blocked_wake_retry(&handle);
+        let stop = retry.stop.clone();
+        let cleanup = retry.stop_and_wait_with(Duration::ZERO).unwrap();
+        assert!(stop.load(Ordering::SeqCst));
+        assert!(
+            !handle.exists(),
+            "the old handle is isolated before teardown returns"
+        );
+        let isolated = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".sweep-tombstone-wake-")
+            })
+            .unwrap();
+        assert!(isolated.exists(), "cleanup waits for the in-flight write");
+        release.send(()).unwrap();
+        cleanup.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(
+            !isolated.exists(),
+            "late completion must retry handle cleanup"
+        );
+    }
+
+    #[test]
+    fn timed_out_wake_retry_preserves_a_recreated_handle_incarnation() {
+        let root = tempfile::TempDir::new().unwrap();
+        let handle = root.path().join("handle");
+        std::fs::create_dir(&handle).unwrap();
+        let (retry, release) = blocked_wake_retry(&handle);
+        let cleanup = retry.stop_and_wait_with(Duration::ZERO).unwrap();
+        std::fs::create_dir(&handle).unwrap();
+        std::fs::write(handle.join("new-session"), b"must survive").unwrap();
+        release.send(()).unwrap();
+        cleanup.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(handle.join("new-session").exists());
+        assert!(
+            !handle.join("late-record").exists(),
+            "the delayed fd write belongs to the isolated inode"
+        );
+    }
+
+    #[test]
+    fn timed_out_wake_retry_never_deletes_the_live_path_when_isolation_is_refused() {
+        let root = tempfile::TempDir::new().unwrap();
+        let handle = root.path().join("handle");
+        std::fs::create_dir(&handle).unwrap();
+        let (retry, release) = blocked_wake_retry(&handle);
+        std::fs::rename(&handle, root.path().join("previous-handle")).unwrap();
+        std::fs::create_dir(&handle).unwrap();
+        std::fs::write(handle.join("new-session"), b"must survive").unwrap();
+        let cleanup = retry.stop_and_wait_with(Duration::ZERO).unwrap();
+        release.send(()).unwrap();
+        cleanup.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(handle.join("new-session").exists());
+        assert!(root.path().join("previous-handle/late-record").exists());
+    }
+
+    /// The retry thread stops on its flag: set before the first tick it never ticks; set
+    /// during the wait it exits within one slice, so teardown is not held up.
+    #[cfg(unix)]
+    #[test]
+    fn wake_retry_loop_stops_on_its_flag() {
+        let d = tempfile::TempDir::new().unwrap();
+        let flag = std::sync::atomic::AtomicBool::new(true);
+        wake_retry_loop(d.path(), d.path(), &flag); // returns at once
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (f2, p) = (flag.clone(), d.path().to_path_buf());
+        let h = std::thread::spawn(move || wake_retry_loop(&p, &p, &f2));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!h.is_finished(), "still polling");
+        let t0 = std::time::Instant::now();
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        h.join().unwrap();
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+    }
+
     use super::*;
     use crate::cli::audit_emit::AuditEmitter;
     use crate::cli::commands::fake_daemon_test_support::{
-        spawn_fake_healthy_daemon, FakeHealthyDaemon,
+        spawn_fake_healthy_daemon, spawn_no_daemon_env_guard, FakeHealthyDaemon,
     };
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
@@ -1776,24 +3354,20 @@ mod tests {
     /// test (`test(common): fail loudly when the stub-cli helper binary
     /// is not built`, this branch's own prior commit).
     fn stub_cli_path() -> PathBuf {
-        let target_dir = std::env::var("CARGO_TARGET_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .parent()
-                    .expect("workspace root")
-                    .join("target")
-            });
-        for profile in ["debug", "release"] {
-            let p = target_dir.join(profile).join("stub-cli");
-            if p.exists() {
-                return p;
-            }
-        }
-        panic!(
-            "stub-cli fixture binary not found under {target_dir:?}/{{debug,release}} — \
-             build it first: cargo build -p csq-core --bin stub-cli --features test-utils"
+        // Bind to the test executable's actual target/profile, including an
+        // external CARGO_TARGET_DIR or target triple, without reading ambient env.
+        let exe = std::env::current_exe().expect("current test executable");
+        let path = exe
+            .parent()
+            .and_then(Path::parent)
+            .expect("Cargo test executable beneath profile/deps")
+            .join("stub-cli");
+        assert!(
+            path.is_file(),
+            "stub-cli fixture not found at {path:?}; build it first: \
+            cargo build -p csq-core --bin stub-cli --features test-utils"
         );
+        path
     }
 
     fn test_audit_emitter(_tmp: &Path) -> AuditEmitter {
@@ -1804,7 +3378,59 @@ mod tests {
     }
 
     fn tmp_handle_dir() -> tempfile::TempDir {
-        tempfile::TempDir::new().expect("tempdir")
+        // These signal tests cannot hold the env lock across daemon fixtures.
+        // A transient-TMPDIR test deletes its own root; inside that test's
+        // CHILD process a parent-owned sandbox root is handed down so
+        // kill+reap is followed by exact owned cleanup. That handed-down root
+        // is used as-is; when none is supplied, the shared short-root fixture
+        // creates the private 0700 directory the fake daemon's socket lives
+        // under, independent of the ambient TMPDIR.
+        match std::env::var_os(crate::cli::commands::tmpdir_outlives_test_support::SANDBOX_ENV) {
+            Some(root) => tempfile::TempDir::new_in(root).expect("private stable tempdir"),
+            None => csq_core::testing::socket_fixture::short_root("csq-supervise-")
+                .expect("private short tempdir"),
+        }
+    }
+
+    /// The handle root must be independent of the ambient TMPDIR: the test
+    /// transiently points TMPDIR at a directory it deletes. PARENT/CHILD
+    /// dispatch (one test name; see `tmpdir_outlives_test_support`): without
+    /// the marker the parent re-executes THIS test in a bounded, hermetic
+    /// child and never mutates TMPDIR itself; with the marker the child runs
+    /// the original mutation/deletion/assertion (falsifier preserved: the
+    /// assert fails if `tmp_handle_dir` reverts to ambient `TempDir::new()`).
+    #[test]
+    fn supervisor_handle_fixture_outlives_a_transient_process_tmpdir() {
+        if std::env::var_os(crate::cli::commands::tmpdir_outlives_test_support::CHILD_ENV).is_some()
+        {
+            // Witness: proves to the parent that THIS body ran (see
+            // `spawn_outlives_child` on why the selector alone cannot).
+            println!("outlives-witness:supervise-handle");
+            let sandbox = std::path::PathBuf::from(
+                std::env::var_os(crate::cli::commands::tmpdir_outlives_test_support::SANDBOX_ENV)
+                    .expect("sandbox env set by the parent dispatch"),
+            );
+            let _env = csq_core::platform::test_env::lock();
+            let transient =
+                tempfile::TempDir::new_in(&sandbox).expect("child transient under the sandbox");
+            let previous = std::env::var_os("TMPDIR");
+            std::env::set_var("TMPDIR", transient.path());
+            let handle = tmp_handle_dir();
+            match previous {
+                Some(value) => std::env::set_var("TMPDIR", value),
+                None => std::env::remove_var("TMPDIR"),
+            }
+            drop(transient);
+            assert!(
+                handle.path().is_dir(),
+                "supervisor must own its handle root"
+            );
+            return;
+        }
+        crate::cli::commands::tmpdir_outlives_test_support::spawn_outlives_child(
+            "cli::commands::codex_supervise::tests::supervisor_handle_fixture_outlives_a_transient_process_tmpdir",
+            "outlives-witness:supervise-handle",
+        );
     }
 
     /// A `base_dir` fixture satisfying `validate_codex_relaunch_target`'s
@@ -1822,7 +3448,7 @@ mod tests {
     /// while `validate_codex_relaunch_target`'s FM-5 daemon-health check
     /// still needs it.
     fn valid_swap_target_base_dir(slot: u16) -> (tempfile::TempDir, FakeHealthyDaemon) {
-        let dir = tempfile::TempDir::new().expect("tempdir");
+        let dir = tmp_handle_dir();
         provision_codex_config_and_credentials(dir.path(), slot);
         let daemon = spawn_fake_healthy_daemon(dir.path());
         (dir, daemon)
@@ -1871,20 +3497,18 @@ mod tests {
     /// they lived in different crates — `signal_lock` is what closes that
     /// gap.
     ///
-    /// Also installs the handlers HERE, synchronously, before returning —
-    /// see [`ensure_signal_handlers_installed`]'s call below. Every test
-    /// in this module acquires this guard and then immediately spawns a
-    /// thread that sleeps ~100ms before raising a signal against this
-    /// process; production code (`run_supervised_unix`) also calls
-    /// `ensure_signal_handlers_installed` before spawning the child, but a
-    /// test does not enter `run_supervised` until AFTER its writer thread
-    /// is already spawned and sleeping. Installing here, first, removes
-    /// that ordering as a race entirely rather than relying on the
-    /// `Once`'s install being fast enough to win it in practice.
+    /// Installs handlers synchronously before returning, so a test's sender
+    /// cannot beat production startup to their installation. Reset flags at
+    /// this serialized test boundary too: a prior test may panic after setting
+    /// one, before its drive loop consumes it. Production handlers and exit
+    /// guards keep their genuine termination behavior.
     #[cfg(unix)]
-    fn lock_signal_state() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn lock_signal_state() -> std::sync::MutexGuard<'static, ()> {
         let guard = csq_core::platform::test_env::signal_lock();
         ensure_signal_handlers_installed();
+        SIGTERM_FLAG.store(false, Ordering::SeqCst);
+        SIGHUP_FLAG.store(false, Ordering::SeqCst);
+        SIGUSR1_FLAG.store(false, Ordering::SeqCst);
         // Item 3 (S-LOW-1/D-F2) test hermeticity: `VALIDATION_IN_FLIGHT` is
         // a process-wide static, and several sibling tests in this module
         // deliberately leave a validate worker running FOREVER (a validate
@@ -1902,6 +3526,73 @@ mod tests {
         // observe or mutate.
         VALIDATION_IN_FLIGHT.store(false, Ordering::SeqCst);
         guard
+    }
+
+    #[test]
+    fn signal_state_lock_recovers_flags_after_panicking_test() {
+        const PARENT_ENV: &str = "CSQ_SIGNAL_RESET_PROBE_PARENT";
+        let owned_child = std::env::var(PARENT_ENV)
+            .ok()
+            .and_then(|value| value.parse::<libc::pid_t>().ok())
+            .is_some_and(|parent| parent == unsafe { libc::getppid() });
+        if owned_child {
+            // This owned helper cannot outlive a killed/failed harness forever.
+            unsafe {
+                libc::signal(libc::SIGALRM, libc::SIG_DFL);
+                libc::alarm(10);
+            }
+            let dir = tmp_handle_dir();
+            let mut audit = crate::cli::audit_emit::AuditEmitter::disabled();
+            // TERM first: without the reset, the real guard exits this child143.
+            for flag in [&SIGTERM_FLAG, &SIGHUP_FLAG, &SIGUSR1_FLAG] {
+                let poisoned = std::panic::catch_unwind(|| {
+                    let _guard = lock_signal_state();
+                    flag.store(true, Ordering::SeqCst);
+                    panic!("signal-reset fixture deliberately poisons its guard");
+                });
+                assert!(poisoned.is_err());
+                let _next_test = lock_signal_state();
+                exit_cleanly_if_terminating_before_spawn(
+                    dir.path(),
+                    dir.path(),
+                    false,
+                    None,
+                    &mut audit,
+                );
+                assert!(
+                    !flag.load(Ordering::SeqCst),
+                    "next test must clear its inherited flag"
+                );
+            }
+            println!("signal-reset:actual-pre-spawn-guard-survived");
+            return;
+        }
+
+        let sandbox = tmp_handle_dir();
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "cli::commands::codex_supervise::tests::signal_state_lock_recovers_flags_after_panicking_test",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", sandbox.path())
+            .env("CSQ_BASE_DIR", sandbox.path())
+            .env("TMPDIR", sandbox.path())
+            .env(PARENT_ENV, std::process::id().to_string())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run owned stale-signal regression child");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "poisoned signal state must not terminate the next real guard; stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(String::from_utf8_lossy(&output.stdout)
+            .contains("signal-reset:actual-pre-spawn-guard-survived"));
     }
 
     /// C-(f)/PRIMARY DIRECTIVE: blocks (bounded by `timeout`) until BOTH
@@ -1942,6 +3633,7 @@ mod tests {
         req: &sup::SwapRequest,
         timeout: Duration,
     ) {
+        ensure_signal_handlers_installed();
         sup::write_swap_request(handle_dir, req).expect("write swap request");
         let request_path = handle_dir.join(sup::SWAP_REQUEST_FILE);
         let deadline = std::time::Instant::now() + timeout;
@@ -1969,6 +3661,12 @@ mod tests {
     /// was spawned.
     fn stub_cmd(argv_capture: &Path, extra: &[&str]) -> Command {
         let mut cmd = Command::new(stub_cli_path());
+        let root = argv_capture.parent().expect("private capture directory");
+        cmd.env_clear()
+            .env("HOME", root)
+            .env("CSQ_BASE_DIR", root)
+            .env("TMPDIR", root)
+            .env("PATH", "/usr/bin:/bin");
         cmd.arg("--capture-argv").arg(argv_capture);
         cmd.args(extra);
         cmd
@@ -2040,7 +3738,7 @@ mod tests {
             /* is_relaunch */ false,
             None,
             &mut audit,
-            |_, _, _, _| panic!("relaunch must not be invoked when no swap request arrives"),
+            |_, _, _, _, _| panic!("relaunch must not be invoked when no swap request arrives"),
         );
         assert!(
             result.is_ok(),
@@ -2086,23 +3784,35 @@ mod tests {
         let cmd = stub_cmd(&capture, &["--hang-ms", "400", "--exit-code", "0"]);
         let mut audit = test_audit_emitter(dir.path());
 
-        let supervisor_pid = Arc::new(AtomicBool::new(false));
-        let started = supervisor_pid.clone();
-
         // We can't send SIGINT to a specific "supervisor" without a
         // separate process — this test instead asserts the mechanism
         // `run_supervised_unix` relies on: after `ignore_signal(SIGINT)`
         // is installed, raising SIGINT against THIS test process must
         // not terminate it, and the eventual child wait must still
         // observe a clean exit. Raise SIGINT against our own pid mid-run
-        // by spawning a tiny helper thread that fires it once the child
-        // is very likely running.
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
+        // after the production readiness markers, written AFTER SIG_IGN.
+        // Check the actual disposition too: a regression fails this thread
+        // before it can deliver a default-action SIGINT to the test binary.
+        let handle_dir = dir.path().to_path_buf();
+        let sender = std::thread::spawn(move || {
+            assert!(wait_for_supervisor_ready(
+                &handle_dir,
+                Duration::from_secs(2)
+            ));
+            // Read-only query under the shared signal lock; no sibling test
+            // can change this disposition between the check and delivery.
+            let mut disposition = unsafe { std::mem::zeroed::<libc::sigaction>() };
+            assert_eq!(
+                unsafe { libc::sigaction(libc::SIGINT, std::ptr::null(), &mut disposition) },
+                0
+            );
+            assert_eq!(disposition.sa_sigaction, libc::SIG_IGN);
             unsafe {
-                libc::kill(std::process::id() as libc::pid_t, libc::SIGINT);
+                assert_eq!(
+                    libc::kill(std::process::id() as libc::pid_t, libc::SIGINT),
+                    0
+                );
             }
-            started.store(true, Ordering::SeqCst);
         });
 
         let result = run_supervised(
@@ -2113,8 +3823,9 @@ mod tests {
             /* is_relaunch */ false,
             None,
             &mut audit,
-            |_, _, _, _| panic!("relaunch must not be invoked"),
+            |_, _, _, _, _| panic!("relaunch must not be invoked"),
         );
+        sender.join().expect("ordered SIGINT sender");
         assert!(
             result.is_ok(),
             "supervisor (and this test process) must survive SIGINT while a child is running: {result:?}"
@@ -2174,7 +3885,7 @@ mod tests {
             /* is_relaunch */ false,
             None,
             &mut audit,
-            move |slot, thread_id, _, _| {
+            move |slot, thread_id, _, _, _| {
                 called_clone.store(true, Ordering::SeqCst);
                 assert_eq!(slot, 7, "relaunch must receive the requested target slot");
                 let rest = relaunch_rest(slot, thread_id, &[]);
@@ -2243,7 +3954,7 @@ mod tests {
             /* is_relaunch */ false,
             None,
             &mut audit,
-            |_, _, _, _| panic!("relaunch must NOT be invoked when no request is pending"),
+            |_, _, _, _, _| panic!("relaunch must NOT be invoked when no request is pending"),
         );
         assert!(
             result.is_ok(),
@@ -2428,7 +4139,7 @@ mod tests {
             /* is_relaunch */ false,
             None,
             &mut audit,
-            |_, _, _, _| {
+            |_, _, _, _, _| {
                 Err(anyhow!(
                     "simulated relaunch failure: target slot not provisioned"
                 ))
@@ -2440,6 +4151,10 @@ mod tests {
     #[test]
     fn relaunch_parity_shares_flags_with_the_initial_launch() {
         let _guard = lock_signal_state();
+        // Match sibling supervisor tests' signal-then-env lock order.
+        // Linux's FakeHealthyDaemon holds the env lock for its lifetime.
+        #[cfg(not(target_os = "linux"))]
+        let _env = csq_core::platform::test_env::lock();
         // Drives the PRODUCTION relaunch path: both the initial spawn and
         // the relaunch build their argv through the REAL
         // `run::build_codex_exec_command` — the SAME helper `launch_codex`
@@ -2453,6 +4168,11 @@ mod tests {
         // ran for real.
         fn to_stub(prod_cmd: &Command, capture: &Path, extra: &[&str]) -> Command {
             let mut cmd = Command::new(stub_cli_path());
+            let root = capture.parent().expect("private capture directory");
+            cmd.env_clear()
+                .env("HOME", root)
+                .env("CSQ_BASE_DIR", root)
+                .current_dir(root);
             cmd.arg("--capture-argv").arg(capture);
             cmd.args(prod_cmd.get_args());
             cmd.args(extra);
@@ -2462,6 +4182,35 @@ mod tests {
 
         let (base_dir, _daemon) = valid_swap_target_base_dir(3);
         let account = csq_core::types::AccountNum::try_from(3u16).unwrap();
+
+        // The production builder admits explicit resume targets. Provide a
+        // real private row and transcript so parity reaches command generation.
+        let slot = base_dir.path().join("config-3");
+        let rollout = slot.join("codex-sessions/2026/10/08/rollout-parity.jsonl");
+        std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        std::fs::write(&rollout, b"private parity rollout fixture").unwrap();
+        let sqlite = csq_core::session::shared_state::codex_sqlite::resolve_sqlite3()
+            .expect("resume parity requires actual sqlite3");
+        let fixture_home = base_dir.path().join("fixture-home");
+        std::fs::create_dir(&fixture_home).unwrap();
+        let sql = format!(
+            "PRAGMA trusted_schema=OFF; CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT); INSERT INTO threads VALUES ('0198f1a2-3b4c-7d5e-8f9a-0b1c2d3e4f5d', '{}');",
+            rollout.to_str().unwrap().replace('\'', "''")
+        );
+        let output = Command::new(sqlite)
+            .env_clear()
+            .env("HOME", fixture_home)
+            .current_dir(base_dir.path())
+            .arg("-init")
+            .arg("/dev/null")
+            .arg(slot.join("state_5.sqlite"))
+            .arg(sql)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "private SQLite fixture failed: {output:?}"
+        );
 
         let dir = tmp_handle_dir();
         // The handle dir is TOMBSTONED (renamed away, taking any file
@@ -2517,7 +4266,7 @@ mod tests {
             /* is_relaunch */ false,
             None,
             &mut audit,
-            move |slot, thread_id, _, _| {
+            move |slot, thread_id, _, _, _| {
                 let rest = relaunch_rest(slot, thread_id, &[]);
                 let relaunch_prod_cmd = crate::cli::commands::run::build_codex_exec_command(
                     &base_dir_path,
@@ -2573,7 +4322,7 @@ mod tests {
             /* is_relaunch */ false,
             None,
             &mut audit,
-            |_, _, _, _| panic!("no relaunch expected"),
+            |_, _, _, _, _| panic!("no relaunch expected"),
         );
         assert!(result.is_ok());
         assert!(
@@ -2585,6 +4334,9 @@ mod tests {
 
     #[test]
     fn graceful_stop_bound_documents_two_named_outcomes() {
+        // A bare program name resolves through the process PATH, which sibling tests swap
+        // under the shared env lock; hold it so the spawn cannot see a mid-swap PATH.
+        let _env_lock = csq_core::platform::test_env::lock();
         // `tooling-self-verification.md` Rule 3: the constant is verified
         // by NAMING both outcomes, never by a single passing probe, and by
         // calling the REAL `graceful_stop` function — not merely reasoning
@@ -2647,6 +4399,9 @@ mod tests {
 
     #[test]
     fn graceful_stop_kills_a_grandchild_descendant_too() {
+        // A bare program name resolves through the process PATH, which sibling tests swap
+        // under the shared env lock; hold it so the spawn cannot see a mid-swap PATH.
+        let _env_lock = csq_core::platform::test_env::lock();
         // A SIGTERM-ignoring shell that backgrounds a `sleep 30` grandchild
         // and then waits — mirrors the real npm-installed-codex shape
         // (`node` launcher -> real codex process) that C-R4-6 exists for:
@@ -2708,6 +4463,9 @@ mod tests {
     /// A genuinely matching snapshot must be kept.
     #[test]
     fn descendants_still_matching_snapshot_filters_out_a_mismatched_start_time() {
+        // A bare program name resolves through the process PATH, which sibling tests swap
+        // under the shared env lock; hold it so the spawn cannot see a mid-swap PATH.
+        let _env_lock = csq_core::platform::test_env::lock();
         let mut child = std::process::Command::new("sh")
             .args(["-c", "sleep 30"])
             .stdin(std::process::Stdio::null())
@@ -2805,7 +4563,7 @@ mod tests {
             /* is_relaunch */ false,
             None,
             &mut audit,
-            |_, _, _, _| panic!("relaunch must not be invoked"),
+            |_, _, _, _, _| panic!("relaunch must not be invoked"),
         );
         panic!("run_supervised must have called process::exit before returning");
     }
@@ -2886,7 +4644,7 @@ mod tests {
             /* is_relaunch */ false,
             None,
             &mut audit,
-            |_, _, _, _| panic!("relaunch must not be invoked"),
+            |_, _, _, _, _| panic!("relaunch must not be invoked"),
         );
         panic!("run_supervised must have called process::exit before returning");
     }
@@ -3056,6 +4814,108 @@ mod tests {
             dir.path(),
             dir.path(),
             /* is_relaunch */ true,
+            None,
+            &mut audit,
+        );
+        panic!("exit_cleanly_if_terminating_before_spawn must have called process::exit before returning");
+    }
+
+    /// M-1: on a FIRST launch whose record already carries a spawn-gate
+    /// verdict (an enterprise `Proceed` evaluated before a SIGTERM/SIGHUP
+    /// landed ahead of the spawn), the record MUST be finalised `Fail`/
+    /// `Reject` with that verdict and flushed — not discarded. Falsifying
+    /// result (pre-M-1, the else branch calling `discard()`): `.pending/`
+    /// stays empty and the file-existence assertion fails.
+    #[test]
+    fn first_launch_with_spawn_gate_verdict_terminating_writes_reject_record() {
+        let exe = std::env::current_exe().expect("current test exe");
+        let pending_dir = tempfile::TempDir::new().expect("tempdir");
+        let output = std::process::Command::new(exe)
+            .arg(
+                "cli::commands::codex_supervise::tests::\
+                 first_launch_with_spawn_gate_verdict_terminating_helper",
+            )
+            .arg("--exact")
+            .arg("--nocapture")
+            .arg("--ignored")
+            .env("CSQ_TEST_PENDING_DIR", pending_dir.path())
+            .output()
+            .expect("spawn self as first-launch spawn-gate helper");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(EXIT_CODE_SIGTERM_DURING_SWAP),
+            "stdout={:?} stderr={stderr:?}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        assert!(
+            stderr.contains("m1-probe: first-launch governed record reached"),
+            "the helper must have reached the call under test: {stderr}"
+        );
+        let pending_path = pending_dir.path().join("m1-first-launch-gated.jsonl");
+        assert!(
+            pending_path.exists(),
+            "a governed first-launch record must be finalised and flushed, not discarded"
+        );
+        let body = std::fs::read_to_string(&pending_path).unwrap();
+        // Re-serialised through `Value` (sorted keys) so the checks hold
+        // whether the pending line is the bare record or an envelope.
+        let flat = serde_json::from_str::<serde_json::Value>(body.trim())
+            .expect("one JSON record")
+            .to_string();
+        assert!(flat.contains("\"decision\":\"reject\""), "{body}");
+        assert!(flat.contains("\"result_state\":\"fail\""), "{body}");
+        assert!(
+            flat.contains("\"spawn_gate\":{\"action\":\"spawn_codex\",\"cli\":\"codex\",\"verdict\":\"pass\"}"),
+            "the spawn-gate verdict must survive: {body}"
+        );
+    }
+
+    /// Not run by the normal test harness (`#[ignore]`) — invoked ONLY as a
+    /// subprocess by
+    /// `first_launch_with_spawn_gate_verdict_terminating_writes_reject_record`.
+    #[test]
+    #[ignore]
+    fn first_launch_with_spawn_gate_verdict_terminating_helper() {
+        use csq_core::audit::{Decision, ResultState};
+
+        SIGTERM_FLAG.store(true, Ordering::SeqCst);
+        let dir = tmp_handle_dir();
+        sup::write_supervisor_record(dir.path()).expect("write supervisor record");
+        let pending_dir =
+            PathBuf::from(std::env::var("CSQ_TEST_PENDING_DIR").expect("CSQ_TEST_PENDING_DIR set"));
+        let mut audit = crate::cli::audit_emit::AuditEmitter::new(
+            csq_core::audit::AuditRecord {
+                schema_version: "1".to_string(),
+                run_id: "m1-first-launch-gated".to_string(),
+                fixture_sha256: "0".repeat(64),
+                coc_sha256: "0".repeat(64),
+                csq_version: env!("CARGO_PKG_VERSION").to_string(),
+                cli_version: "unknown".to_string(),
+                surface: csq_core::audit::Surface::Codex,
+                model: "unknown".to_string(),
+                start_ts: "2026-09-26T00:00:00Z".to_string(),
+                end_ts: "2026-09-26T00:00:00Z".to_string(),
+                result_state: ResultState::Degraded,
+                score_delta_vs_baseline: None,
+                rule_ids_cited_original: vec![],
+                rule_ids_cited_after_repair: vec![],
+                rule_ids_dropped_invalid_format: 0,
+                decision: Decision::Bypass,
+                spawn_gate: None,
+            },
+            dir.path().join("csq.sock"), // never bound — forces the .pending/ fallback
+            pending_dir,
+            "csq run account 9".to_string(),
+        );
+        // The seam `evaluate_codex_spawn_gate`'s Proceed arm uses.
+        audit.set_spawn_gate("codex", "spawn_codex", "pass");
+        assert!(audit.spawn_gate_recorded());
+        eprintln!("m1-probe: first-launch governed record reached");
+        exit_cleanly_if_terminating_before_spawn(
+            dir.path(),
+            dir.path(),
+            /* is_relaunch */ false,
             None,
             &mut audit,
         );
@@ -3238,7 +5098,7 @@ mod tests {
             /* is_relaunch */ false,
             None,
             &mut audit,
-            |_slot, _thread_id, _swap_correlation, relaunch_emitter| {
+            |_slot, _thread_id, _swap_correlation, relaunch_emitter, _messaging| {
                 let inner_dir = tmp_handle_dir();
                 let mut relaunch_cmd = std::process::Command::new("sh");
                 relaunch_cmd.arg("-c").arg("kill -INT $$; sleep 5");
@@ -3250,7 +5110,7 @@ mod tests {
                     /* is_relaunch */ true,
                     None,
                     relaunch_emitter,
-                    |_, _, _, _| panic!("no further relaunch expected"),
+                    |_, _, _, _, _| panic!("no further relaunch expected"),
                 )
             },
         );
@@ -3301,6 +5161,8 @@ mod tests {
     #[test]
     #[ignore]
     fn sighup_during_graceful_stop_helper() {
+        // Establish HUP/TERM/USR1 dispositions before either sender starts.
+        ensure_signal_handlers_installed();
         let dir = tmp_handle_dir();
         let base_dir = valid_swap_target_base_dir(11);
         let mut cmd = std::process::Command::new("sh");
@@ -3350,7 +5212,7 @@ mod tests {
             /* is_relaunch */ false,
             None,
             &mut audit,
-            |_, _, _, _| {
+            |_, _, _, _, _| {
                 panic!("relaunch must NOT be invoked when SIGHUP arrived during graceful_stop")
             },
         );
@@ -3517,13 +5379,28 @@ mod tests {
     /// function actually takes is to make fd 0 a real tty for the duration
     /// of the test.
     ///
-    /// Serialized by `lock_signal_state()`: this test temporarily
-    /// repoints the WHOLE PROCESS's fd 0, which is exactly the shared,
-    /// process-global resource that mutex already exists to protect other
-    /// tests in this file from racing on.
+    /// Serialized by TWO locks in this file's documented order — the signal
+    /// lock FIRST, then the shared env-test lock (see
+    /// `drive_child_forwards_sigterm_promptly_while_validation_is_blocked`:
+    /// the reverse order is an ABBA deadlock of the whole bin-test process):
+    ///
+    /// - `lock_signal_state()` — the in-module serializer for the signal and
+    ///   validation statics this file shares.
+    /// - `test_env::lock()` — this test repoints the WHOLE PROCESS's fd 0.
+    ///   CROSS-FILE readers sample it through `std::io::stdin().is_terminal()`,
+    ///   most importantly the login drivability guard whose
+    ///   `handle_{codex,claude}_*_refuses_fast_without_a_tty` tests hold this
+    ///   same lock while they require fd 0 NOT to be a tty. Without it a
+    ///   concurrent run makes the guard pass mid-test: on a host with the
+    ///   vendor CLI installed `handle` then spawns a real login and blocks on
+    ///   the Enter read; on a host without it the refusal test fails with
+    ///   "claude binary not found…" instead of the attended-session message.
+    ///   That is the observed darwin preflight flake.
     #[test]
     fn flush_typed_ahead_stdin_discards_queued_pty_input() {
         let _guard = lock_signal_state();
+        // Shared, process-global fd 0 — this must exclude the login TTY tests.
+        let _env_guard = csq_core::platform::test_env::lock();
 
         // Open a POSIX pty pair. `posix_openpt`/`grantpt`/`unlockpt`/`ptsname`
         // are POSIX (not BSD-only), so this is portable across the unix
@@ -3572,6 +5449,15 @@ mod tests {
             unsafe { libc::isatty(0) },
             1,
             "fd 0 must be a tty after dup2 for this test to exercise the real branch"
+        );
+        // The shared lock is what excludes every cross-file fd 0 reader for
+        // the whole swap window. Assert we actually hold it rather than
+        // trusting the acquisition above: deleting that acquisition reds this
+        // line deterministically, before any timing-dependent flake can.
+        assert_eq!(
+            csq_core::platform::test_env::current_holder(),
+            Some(std::thread::current().id()),
+            "the fd 0 swap must run under the shared env-test lock"
         );
 
         // Write "typed-ahead" keystrokes into the master side and give the
@@ -3704,7 +5590,7 @@ mod tests {
             /* is_relaunch */ false,
             None,
             &mut audit,
-            |_, _, _, _| panic!("relaunch must not be invoked"),
+            |_, _, _, _, _| panic!("relaunch must not be invoked"),
         );
         panic!("run_supervised must have called process::exit(3) before returning");
     }
@@ -3770,7 +5656,7 @@ mod tests {
             /* is_relaunch */ false,
             None,
             &mut audit,
-            |_, _, _, emitter| {
+            |_, _, _, emitter, _| {
                 // The closure receives the FRESH emitter — assert it is not the
                 // disabled/no-op kind by setting a field and letting Drop flush
                 // it at the end of this scope.
@@ -3863,7 +5749,7 @@ mod tests {
             /* is_relaunch */ false,
             None,
             &mut audit,
-            |_, _, _, _| panic!("relaunch must NOT be invoked for a refused swap target"),
+            |_, _, _, _, _| panic!("relaunch must NOT be invoked for a refused swap target"),
         );
         assert!(
             result.is_ok(),
@@ -3884,7 +5770,11 @@ mod tests {
         // — isolating the daemon-health check as the sole refusal cause.
         // NOT `valid_swap_target_base_dir`, which stands up a fake healthy
         // daemon; this test needs the opposite.
-        let base_dir = tempfile::TempDir::new().expect("tempdir");
+        let base_dir = tmp_handle_dir();
+        // Linux resolves daemon paths through XDG_RUNTIME_DIR before base_dir.
+        // Hold the shared env guard so a healthy ambient or sibling fixture
+        // cannot satisfy this test's deliberately absent daemon.
+        let _no_daemon = spawn_no_daemon_env_guard(base_dir.path());
         std::fs::create_dir_all(base_dir.path().join("config-8")).unwrap();
         std::fs::write(base_dir.path().join("config-8").join("config.toml"), b"").unwrap(); // CI-ALLOW-fs-write-config-toml (test fixture)
         std::fs::create_dir_all(base_dir.path().join("credentials")).unwrap();
@@ -3930,7 +5820,7 @@ mod tests {
             /* is_relaunch */ false,
             None,
             &mut audit,
-            |_, _, _, _| panic!("relaunch must NOT be invoked when the daemon is down"),
+            |_, _, _, _, _| panic!("relaunch must NOT be invoked when the daemon is down"),
         );
         assert!(
             result.is_ok(),
@@ -4239,7 +6129,7 @@ mod tests {
             /* is_relaunch */ false,
             None,
             &mut audit,
-            move |slot, _, _, _| {
+            move |slot, _, _, _, _| {
                 relaunch_called_clone.store(true, Ordering::SeqCst);
                 assert_eq!(slot, 4);
                 Ok(())
@@ -4298,7 +6188,9 @@ mod tests {
             /* is_relaunch */ false,
             None,
             &mut audit,
-            |_, _, _, _| panic!("relaunch must NOT be invoked when the injected closure refuses"),
+            |_, _, _, _, _| {
+                panic!("relaunch must NOT be invoked when the injected closure refuses")
+            },
         );
         assert!(
             result.is_ok(),
@@ -4307,127 +6199,104 @@ mod tests {
         );
     }
 
-    // ── D-F6 (round 7): a validation that overruns the DYNAMIC, per-request
-    //    budget is downgraded to a refusal, even when it eventually returns
-    //    Ok ─────────────────────────────────────────────────────────────────
-    //
-    // C-B7 (round 8b): the original version of this test used an 8.0s-aged
-    // request against a 700ms validation sleep — `remaining_validation_budget`
-    // = 10s wire − 1.5s margin − 8.0s age ≈ 500ms, so the validation closure
-    // exceeded ITS budget by only ~200ms. That margin is thin enough for a
-    // loaded CI host's scheduler jitter to flip the outcome (the closure
-    // finishing just UNDER budget would make this test wrongly expect a
-    // refusal that never happens). Widened to a 6.0s-aged request (budget ≈
-    // 2.5s) against a 3.5s validation sleep — a full 1.0s of margin — and the
-    // child now hangs 6.0s (was 3.0s) so it comfortably outlives the ~3.6s
-    // point at which validation actually returns, per the poll-window
-    // comment below. RED against code with the D-F6 budget check removed
-    // (or reverted to a fixed deadline ≥ 3.5s): the injected closure below
-    // always returns `Ok`, so removing the budget check would ACCEPT it and
-    // the relaunch closure's `panic!` would fire.
+    // Exercise the real per-request budget with an accepting validator that
+    // returns after that budget. Child exit is released by verdict observation,
+    // so scheduler delay cannot remove the verdict before its reader runs.
     #[test]
     fn drive_child_refuses_when_validation_exceeds_the_dynamic_budget_even_though_it_returns_ok() {
         let _guard = lock_signal_state();
         let dir = tmp_handle_dir();
-        let capture = dir.path().join("argv.json");
-        // Child hangs long enough to observe it SURVIVE the (budget-)
-        // refused swap — comfortably past the ~3.6s point (100ms signal
-        // delay + 3.5s validation sleep) at which the refusal is written.
-        let cmd = stub_cmd(&capture, &["--hang-ms", "6000", "--exit-code", "0"]);
+        let (child_release, mut release) = std::os::unix::net::UnixStream::pair().unwrap();
+        release
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.env_clear()
+            .env("HOME", dir.path())
+            .env("CSQ_BASE_DIR", dir.path())
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(dir.path())
+            .args(["-c", "read release"])
+            .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(
+                child_release,
+            )));
         let mut audit = test_audit_emitter(dir.path());
-
         let nonce = sup::gen_swap_nonce();
-        let nonce_for_writer = nonce.clone();
-        let handle_dir_for_writer = dir.path().to_path_buf();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
-            let aged_requested_at = (chrono::Utc::now() - chrono::Duration::milliseconds(6_000))
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-            sup::write_swap_request(
-                &handle_dir_for_writer,
-                &sup::SwapRequest {
-                    target_slot: 4,
-                    thread_id: None,
-                    requested_at: aged_requested_at,
-                    nonce: nonce_for_writer,
-                    ..Default::default()
-                },
-            )
-            .expect("write swap request");
-            // Install the supervisor's SIGUSR1 handler (idempotent, process-wide)
-            // first: a signal raised before `run_supervised` installs it would
-            // otherwise take the default action and kill the test process.
-            ensure_signal_handlers_installed();
-            unsafe {
-                libc::kill(std::process::id() as libc::pid_t, libc::SIGUSR1);
-            }
-        });
-
-        // The verdict must be read WHILE the child is still alive: once it
-        // exits naturally (its `--hang-ms 6000` elapses), `run_supervised`'s
-        // `Outcome::Exited` branch removes the WHOLE handle dir — verdict
-        // file included. Poll for it from a separate thread, well inside
-        // that window (request signalled at ~100ms, the 3.5s-sleeping
-        // closure resolves at ~3.6s, comfortably before the child's own
-        // 6.0s natural exit — a ~2.4s margin, versus the original test's
-        // ~200ms).
-        let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
-        let handle_dir_for_reader = dir.path().to_path_buf();
-        let nonce_for_reader = nonce.clone();
-        std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_millis(5_000);
-            loop {
-                if let Some(v) = sup::take_swap_verdict(&handle_dir_for_reader, &nonce_for_reader) {
-                    let _ = verdict_tx.send(Some(v));
-                    return;
+        let handle = dir.path().to_path_buf();
+        let reader = std::thread::spawn(move || {
+            assert!(
+                wait_for_supervisor_ready(&handle, Duration::from_secs(10)),
+                "supervisor and child must be ready before requesting the swap"
+            );
+            let request = sup::SwapRequest {
+                target_slot: 4,
+                requested_at: (chrono::Utc::now() - chrono::Duration::milliseconds(6_000))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                nonce: nonce.clone(),
+                ..Default::default()
+            };
+            write_request_and_signal_until_consumed(
+                &handle,
+                std::process::id(),
+                &request,
+                Duration::from_secs(5),
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let verdict = loop {
+                if let Some(verdict) = sup::take_swap_verdict(&handle, &nonce) {
+                    let pid = csq_core::accounts::markers::read_live_cc_pid(&handle)
+                        .expect("the original child must still be present at refusal");
+                    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, 0);
+                    break Some(verdict);
                 }
                 if std::time::Instant::now() >= deadline {
-                    let _ = verdict_tx.send(None);
-                    return;
+                    break None;
                 }
                 std::thread::sleep(Duration::from_millis(10));
-            }
+            };
+            // Release even when the assertion will fail: fixture failures must
+            // not leave a child blocked or a supervisor test hanging.
+            release
+                .write_all(b"done\n")
+                .expect("release live fixture child");
+            verdict
         });
-
+        let (validated_tx, validated_rx) = std::sync::mpsc::channel();
         let result = run_supervised(
             cmd,
             dir.path(),
             dir.path(),
-            // Always accepts — but takes far longer (3.5s) than the ~2.5s
-            // dynamic budget this aged (6.0s) request leaves, so D-F6 must
-            // downgrade this to a refusal anyway.
-            |slot: u16| -> Result<csq_core::types::AccountNum> {
+            move |slot: u16| -> Result<csq_core::types::AccountNum> {
                 std::thread::sleep(Duration::from_millis(3_500));
-                csq_core::types::AccountNum::try_from(slot).map_err(|e| anyhow!("{e}"))
+                let account =
+                    csq_core::types::AccountNum::try_from(slot).map_err(|e| anyhow!("{e}"))?;
+                let _ = validated_tx.send(account);
+                Ok(account)
             },
-            /* is_relaunch */ false,
+            false,
             None,
             &mut audit,
-            |_, _, _, _| {
-                panic!(
-                    "relaunch must NOT be invoked when validation exceeded \
-                     the dynamic budget, even though it would have returned Ok"
-                )
-            },
+            |_, _, _, _, _| panic!("validation exceeding its dynamic budget must never relaunch"),
         );
         assert!(
             result.is_ok(),
-            "the child must run to its natural exit when validation exceeds \
-             the dynamic budget: {result:?}"
+            "the refused swap preserves the original child: {result:?}"
         );
-
-        let verdict = verdict_rx
-            .recv_timeout(Duration::from_secs(6))
-            .expect("reader thread must report")
-            .expect(
-                "a Refused verdict must have been written (and observed before \
-                 the child's natural exit removed the handle dir) for the \
-                 budget-exceeded swap",
-            );
+        let verdict = reader
+            .join()
+            .expect("verdict reader must finish")
+            .expect("a Refused verdict must be observed before child release");
         assert_eq!(
             verdict.outcome,
-            sup::SwapOutcome::Refused("validation timed out".to_string()),
-            "the verdict must name the timeout as the refusal reason"
+            sup::SwapOutcome::Refused("validation timed out".into())
+        );
+        assert_eq!(
+            validated_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .get(),
+            4,
+            "the timed-out validator eventually accepted the target"
         );
     }
 
@@ -4528,7 +6397,7 @@ mod tests {
             /* is_relaunch */ false,
             None,
             &mut audit,
-            |_, _, _, _| Ok(()),
+            |_, _, _, _, _| Ok(()),
         );
 
         writer.join().expect("writer thread");
@@ -4548,6 +6417,132 @@ mod tests {
              consumed_at={consumed_at:?} died_at={died_at:?} — a still-running \
              waiter observed teardown before consumption"
         );
+    }
+
+    /// A terminal launched with messaging OFF stays off across a supervised swap relaunch:
+    /// the decision recorded in the SOURCE handle dir is read before the tombstone and handed
+    /// to `relaunch`, even though `CSQ_MESSAGING` would now say on. Falsifier: handing the
+    /// relaunch `true` (or re-reading the env) makes the recorded `false` assertion fail; the
+    /// control run with an ON terminal proves the value actually flows through.
+    #[test]
+    fn a_messaging_off_terminal_stays_off_across_a_supervised_relaunch() {
+        for recorded in [false, true] {
+            let _guard = lock_signal_state();
+            let _env_guard = csq_core::platform::test_env::lock();
+            std::env::remove_var("CSQ_AUDIT_EDITION");
+            std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+            // the environment would turn messaging on for a fresh launch
+            std::env::set_var("CSQ_MESSAGING", if recorded { "off" } else { "on" });
+            let dir = tmp_handle_dir();
+            csq_core::messaging::register::record_decision(dir.path(), recorded).unwrap();
+            let capture = dir.path().join("argv.json");
+            let cmd = stub_cmd(&capture, &["--hang-ms", "5000", "--exit-code", "0"]);
+            let mut audit = test_audit_emitter(dir.path());
+            let req = sup::SwapRequest {
+                target_slot: 4,
+                requested_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                ..Default::default()
+            };
+            let hd = dir.path().to_path_buf();
+            let writer = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                sup::write_swap_request(&hd, &req).expect("write swap request");
+                ensure_signal_handlers_installed();
+                unsafe {
+                    libc::kill(std::process::id() as libc::pid_t, libc::SIGUSR1);
+                }
+            });
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(None::<bool>));
+            let seen2 = seen.clone();
+            let _ = run_supervised(
+                cmd,
+                dir.path(),
+                dir.path(),
+                |slot: u16| -> Result<csq_core::types::AccountNum> {
+                    csq_core::types::AccountNum::try_from(slot).map_err(|e| anyhow!("{e}"))
+                },
+                /* is_relaunch */ false,
+                None,
+                &mut audit,
+                move |_, _, _, _, messaging| {
+                    *seen2.lock().unwrap() = Some(messaging);
+                    Ok(())
+                },
+            );
+            writer.join().expect("writer thread");
+            std::env::remove_var("CSQ_MESSAGING");
+            assert_eq!(
+                *seen.lock().unwrap(),
+                Some(recorded),
+                "the relaunch must carry the source terminal's recorded decision"
+            );
+        }
+    }
+
+    /// B2: a terminal whose `.csq-messaging` marker was never written (a failed write, or a
+    /// terminal launched before the marker existed) keeps its launch decision across a
+    /// SUPERVISED swap, because the launching process carries it in memory. Falsifier: reading
+    /// the handle dir instead (`existing_decision`: no marker, no hook in a Codex
+    /// `settings.json`) hands the relaunch `false` for a terminal launched ON, which is the
+    /// loss this fixes; the OFF row proves the carried value, not a constant, flows through.
+    #[test]
+    fn a_carried_decision_survives_a_supervised_swap_when_no_marker_was_written() {
+        for carried in [true, false] {
+            let _guard = lock_signal_state();
+            let _env_guard = csq_core::platform::test_env::lock();
+            std::env::remove_var("CSQ_AUDIT_EDITION");
+            std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+            // the environment says the opposite of what the terminal was launched with
+            std::env::set_var("CSQ_MESSAGING", if carried { "off" } else { "on" });
+            let dir = tmp_handle_dir();
+            assert_eq!(
+                csq_core::messaging::register::read_decision(dir.path()),
+                None
+            );
+            let capture = dir.path().join("argv.json");
+            let cmd = stub_cmd(&capture, &["--hang-ms", "5000", "--exit-code", "0"]);
+            let mut audit = test_audit_emitter(dir.path());
+            let req = sup::SwapRequest {
+                target_slot: 4,
+                requested_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                ..Default::default()
+            };
+            let hd = dir.path().to_path_buf();
+            let writer = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                sup::write_swap_request(&hd, &req).expect("write swap request");
+                ensure_signal_handlers_installed();
+                unsafe {
+                    libc::kill(std::process::id() as libc::pid_t, libc::SIGUSR1);
+                }
+            });
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(None::<bool>));
+            let seen2 = seen.clone();
+            let _ = run_supervised_carrying(
+                cmd,
+                dir.path(),
+                dir.path(),
+                |slot: u16| -> Result<csq_core::types::AccountNum> {
+                    csq_core::types::AccountNum::try_from(slot).map_err(|e| anyhow!("{e}"))
+                },
+                /* is_relaunch */ false,
+                None,
+                &mut audit,
+                move |_, _, _, _, messaging| {
+                    *seen2.lock().unwrap() = Some(messaging);
+                    Ok(())
+                },
+                Some(carried),
+                true,
+            );
+            writer.join().expect("writer thread");
+            std::env::remove_var("CSQ_MESSAGING");
+            assert_eq!(
+                *seen.lock().unwrap(),
+                Some(carried),
+                "the relaunch must carry the launching process's in-memory decision"
+            );
+        }
     }
 
     // ── round 8, D-F6 close-out item (a): a validate seam that never
@@ -4677,7 +6672,7 @@ mod tests {
             /* is_relaunch */ false,
             None,
             &mut audit,
-            |_, _, _, _| {
+            |_, _, _, _, _| {
                 panic!(
                     "relaunch must NOT be invoked when validation never returns \
                      within budget"
@@ -4689,6 +6684,10 @@ mod tests {
             "the child must run to its natural exit when validation never \
              returns within budget: {result:?}"
         );
+        // The code under test has returned; env custody is done. The wait
+        // below only reads the verdict channel — release the shared lock
+        // instead of holding it across the 4s bound.
+        drop(_env_guard);
 
         let verdict = verdict_rx
             .recv_timeout(Duration::from_secs(4))
@@ -4804,7 +6803,7 @@ mod tests {
             /* is_relaunch */ false,
             None,
             &mut audit,
-            |_, _, _, _| {
+            |_, _, _, _, _| {
                 panic!("relaunch must NOT be invoked when the swap was refused on contention")
             },
         );
@@ -4907,7 +6906,7 @@ mod tests {
             /* is_relaunch */ false,
             None,
             &mut audit,
-            |_, _, _, _| {
+            |_, _, _, _, _| {
                 panic!("relaunch must not be invoked; validate always refuses in this test")
             },
         );
@@ -4940,7 +6939,17 @@ mod tests {
     // worker-thread dispatch restored: same command, `ok`.
     #[test]
     fn drive_child_forwards_sigterm_promptly_while_validation_is_blocked() {
+        // Lock order: lock_signal_state BEFORE the shared env lock, matching
+        // every sibling that takes both (a_messaging_off_terminal_stays_off…,
+        // a_carried_decision_survives_…, drive_child_refuses_within_budget…).
+        // The reverse order is an ABBA deadlock of the whole bin-test process:
+        // this test holds env and waits for the signal guard while a signal-first
+        // sibling holds the guard and waits for env. It needs both to run
+        // concurrently, which the default parallel harness does.
         let _guard = lock_signal_state();
+        // A bare program name resolves through the process PATH, which sibling tests swap
+        // under the shared env lock; hold it so the spawn cannot see a mid-swap PATH.
+        let _env_lock = csq_core::platform::test_env::lock();
         let dir = tmp_handle_dir();
         // A SIGTERM-trapping child that exits 0 on receipt — same pattern as
         // `signal_supervisor_delivers_to_a_real_child`, above. NOT `stub_cmd`:
@@ -5054,7 +7063,7 @@ mod tests {
             /* is_relaunch */ false,
             None,
             &mut audit,
-            |_, _, _, _| panic!("relaunch must not be invoked — this swap is never validated"),
+            |_, _, _, _, _| panic!("relaunch must not be invoked — this swap is never validated"),
         );
 
         writer.join().expect("writer thread");
@@ -5088,5 +7097,685 @@ mod tests {
         );
 
         watcher.join().expect("watcher thread");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod managed_backend_tests {
+    use super::*;
+    use csq_core::providers::codex::managed_backend::ManagedBackendPlan;
+
+    fn socket_fixture_dir() -> tempfile::TempDir {
+        // The fixture must fit Unix socket path limits even when TMPDIR is a
+        // long CI workspace directory. TempDir retains private ownership.
+        tempfile::Builder::new()
+            .prefix("csq")
+            .tempdir_in("/tmp")
+            .unwrap()
+    }
+
+    #[test]
+    fn managed_launch_preserves_resume_prompt_account_and_backend_config() {
+        let temp = socket_fixture_dir();
+        let state = temp.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let plan = ManagedBackendPlan::prepare(temp.path(), &state).unwrap();
+        let mut source = Command::new("native-codex-test");
+        source
+            .current_dir(temp.path())
+            .env("CODEX_HOME", temp.path())
+            .env_remove("OPENAI_API_KEY");
+        source.args([
+            "-c",
+            "sqlite_home=\"wrong\"",
+            "--config=sandbox_workspace_write.writable_roots=[\"/tmp\"]",
+            "-c",
+            "model=\"chosen\"",
+            "--config=model_reasoning_effort=\"high\"",
+            "--model",
+            "test-model",
+            "resume",
+            "01a0f6f5-1ba8-7202-94c4-bb7233a1f783",
+            "--",
+            "-c literal prompt",
+        ]);
+        let (server, tui) = managed_commands(&source, &plan).unwrap();
+        let server_args: Vec<_> = server.get_args().collect();
+        assert!(server_args.contains(&std::ffi::OsStr::new("app-server")));
+        assert!(!server_args.contains(&std::ffi::OsStr::new("resume")));
+        assert!(!server_args.contains(&std::ffi::OsStr::new("--model")));
+        assert!(server_args
+            .iter()
+            .any(|arg| arg.to_string_lossy().contains("writable_roots")));
+        let args: Vec<_> = tui.get_args().collect();
+        assert_eq!(args[0], "--remote");
+        assert_eq!(
+            args[args
+                .iter()
+                .position(|arg| *arg == std::ffi::OsStr::new("--model"))
+                .unwrap()..],
+            [
+                "--model",
+                "test-model",
+                "resume",
+                "01a0f6f5-1ba8-7202-94c4-bb7233a1f783",
+                "--",
+                "-c literal prompt"
+            ]
+        );
+        assert!(args.contains(&std::ffi::OsStr::new("model=\"chosen\"")));
+        assert!(args.contains(&std::ffi::OsStr::new("model_reasoning_effort=\"high\"")));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.to_string_lossy().contains("writable_roots")));
+        let argv: Vec<_> = std::iter::once(tui.get_program())
+            .chain(tui.get_args())
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            csq_core::sessions::parse_codex_launch(&argv).sqlite_home,
+            Some(state.canonicalize().unwrap())
+        );
+        let server_argv: Vec<_> = std::iter::once(server.get_program())
+            .chain(server.get_args())
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            csq_core::sessions::parse_codex_launch(&server_argv).sqlite_home,
+            Some(state.canonicalize().unwrap())
+        );
+        assert_eq!(server.get_current_dir(), source.get_current_dir());
+        assert_eq!(tui.get_current_dir(), source.get_current_dir());
+        assert_eq!(
+            server.get_envs().collect::<Vec<_>>(),
+            source.get_envs().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            tui.get_envs().collect::<Vec<_>>(),
+            source.get_envs().collect::<Vec<_>>()
+        );
+        source.arg("--remote=unix:///unowned");
+        // After -- it is literal prompt text. An actual conflicting flag before
+        // the delimiter is refused rather than silently commandeered.
+        let mut conflict = Command::new("native-codex-test");
+        conflict.arg("--remote=unix:///unowned");
+        assert!(managed_commands(&conflict, &plan).is_err());
+    }
+
+    #[test]
+    fn managed_permission_defaults_route_to_backend_for_fresh_id_and_last() {
+        let temp = socket_fixture_dir();
+        let state = temp.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let plan = ManagedBackendPlan::prepare(temp.path(), &state).unwrap();
+        for selection in [
+            Vec::<&str>::new(),
+            vec!["resume", "01a0f6f5-1ba8-7202-94c4-bb7233a1f783"],
+            vec!["resume", "--last"],
+        ] {
+            for flag in ["--yolo", "--dangerously-bypass-approvals-and-sandbox"] {
+                let mut source = Command::new("native-codex-test");
+                source.args([flag, "-c", "sandbox_mode=\"read-only\"", "--no-alt-screen"]);
+                source
+                    .args(&selection)
+                    .args(["--", "--yolo", "-c", "approval_policy=never"]);
+                let (server, tui) = managed_commands(&source, &plan).unwrap();
+                let backend: Vec<_> = server.get_args().collect();
+                let readonly = backend
+                    .iter()
+                    .position(|arg| *arg == "sandbox_mode=\"read-only\"")
+                    .unwrap();
+                let dangerous = backend
+                    .iter()
+                    .position(|arg| *arg == "sandbox_mode=\"danger-full-access\"")
+                    .unwrap();
+                assert!(
+                    dangerous > readonly,
+                    "typed native flags outrank raw config irrespective of argv position"
+                );
+                assert!(backend.contains(&std::ffi::OsStr::new("approval_policy=\"never\"")));
+                let client: Vec<_> = tui.get_args().collect();
+                let delimiter = client.iter().position(|arg| *arg == "--").unwrap();
+                let is_resume = !selection.is_empty();
+                assert_eq!(
+                    client[..delimiter].contains(&std::ffi::OsStr::new(flag)),
+                    !is_resume,
+                    "fresh permission intent stays on TUI; resume defaults belong on backend"
+                );
+                assert_eq!(
+                    client[..delimiter]
+                        .iter()
+                        .any(|arg| arg.to_string_lossy().contains("sandbox_mode")),
+                    !is_resume
+                );
+                assert_eq!(
+                    &client[delimiter..],
+                    ["--", "--yolo", "-c", "approval_policy=never"]
+                );
+                let safe = client
+                    .iter()
+                    .position(|arg| *arg == "--no-alt-screen")
+                    .unwrap();
+                assert_eq!(
+                    &client[safe + 1..delimiter],
+                    selection
+                        .iter()
+                        .map(std::ffi::OsStr::new)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_native_resume_permission_config_family_is_server_only() {
+        let temp = socket_fixture_dir();
+        let state = temp.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let plan = ManagedBackendPlan::prepare(temp.path(), &state).unwrap();
+        let values = [
+            "approval_policy=\"never\"",
+            "approvals_reviewer=\"user\"",
+            "sandbox_mode=\"read-only\"",
+            "default_permissions=\"read-only\"",
+            "permissions.read-only={}",
+            "network.enabled=false",
+            "sandbox_workspace_write.network_access=false",
+            "sandbox_workspace_write={writable_roots=[\"/tmp\"],network_access=true}",
+        ];
+        let mut source = Command::new("native-codex-test");
+        for value in values {
+            source.args(["-c", value]);
+        }
+        source.args([
+            "--config=model_reasoning_effort=\"medium\"",
+            "resume",
+            "--last",
+        ]);
+        let (server, tui) = managed_commands(&source, &plan).unwrap();
+        let backend: Vec<_> = server.get_args().collect();
+        let client: Vec<_> = tui.get_args().collect();
+        for value in values {
+            assert!(backend.contains(&std::ffi::OsStr::new(value)));
+            assert!(
+                !client.contains(&std::ffi::OsStr::new(value)),
+                "permission config must never mark a remote resume override: {value}"
+            );
+        }
+        assert!(client.contains(&std::ffi::OsStr::new("model_reasoning_effort=\"medium\"")));
+        assert_eq!(&client[client.len() - 2..], ["resume", "--last"]);
+    }
+
+    #[test]
+    fn native_resume_selection_ignores_option_values_and_prompt_delimiters() {
+        let cases: &[(&[&str], bool)] = &[
+            (&["resume", "--last"], true),
+            (&["resume", "01a0f6f5-1ba8-7202-94c4-bb7233a1f783"], true),
+            (&["--model", "chosen", "resume", "--last"], true),
+            (&["resume", "thread", "-i", "image.png"], true),
+            (&["--model", "resume"], false),
+            (&["-i", "one.png", "resume", "thread", "--yolo"], false),
+            (&["--", "resume", "--last"], false),
+            (&["-c", "model=resume", "hello"], false),
+            (&["hello", "resume", "--last"], false),
+        ];
+        for (args, expected) in cases {
+            let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+            assert_eq!(
+                is_native_resume(&args),
+                *expected,
+                "native command selection: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn original_resume_permissions_are_distinguished_from_defaults_and_literal_values() {
+        let cases: &[(&[&str], bool)] = &[
+            (&["resume", "--last"], false),
+            (&["--yolo", "resume", "--last"], true),
+            (&["resume", "thread", "-a", "on-request"], true),
+            (&["resume", "thread", "--sandbox=read-only"], true),
+            (&["-sread-only", "resume", "thread"], true),
+            (&["resume", "thread", "--cd", "/tmp"], true),
+            (&["resume", "thread", "-C/tmp"], true),
+            (&["resume", "thread", "--add-dir=/tmp"], true),
+            (&["resume", "--last", "--approve-for-me"], true),
+            (&["resume", "--last", "--not-so-yolo"], true),
+            (&["--profile", "custom", "resume", "--last"], true),
+            (&["--model", "resume", "--yolo"], false),
+            (&["--model", "--yolo", "resume", "--last"], false),
+            (&["-i", "resume", "--yolo"], false),
+            (&["-i", "--yolo", "resume", "--last"], false),
+            (&["--image=resume", "other.png", "--yolo"], false),
+            (&["hello", "--yolo"], false),
+            (&["--yolo", "--", "resume"], false),
+            (&["resume", "thread", "--", "--yolo"], false),
+            (
+                &["resume", "thread", "--", "-c", "network.enabled=true"],
+                false,
+            ),
+            (&["-c", "model=resume", "resume", "--last"], false),
+            (
+                &["--config=approval_policy=never", "resume", "--last"],
+                true,
+            ),
+            (&["-cnetwork.enabled=true", "resume", "--last"], true),
+        ];
+        for (args, expected) in cases {
+            let args: Vec<_> = args.iter().map(|arg| arg.to_string()).collect();
+            assert_eq!(
+                explicit_resume_permissions(&args),
+                *expected,
+                "original caller argv: {args:?}"
+            );
+        }
+        for key in [
+            "approval_policy",
+            "approvals_reviewer",
+            "sandbox_mode",
+            "default_permissions",
+            "permissions.x",
+            "network.enabled",
+            "sandbox_workspace_write.network_access",
+        ] {
+            let args = vec![
+                "resume".into(),
+                "--last".into(),
+                "-c".into(),
+                format!("{key}=false"),
+            ];
+            assert!(
+                explicit_resume_permissions(&args),
+                "explicit configuration family: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_approval_and_sandbox_flags_preserve_fresh_native_intent() {
+        let temp = socket_fixture_dir();
+        let state = temp.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let plan = ManagedBackendPlan::prepare(temp.path(), &state).unwrap();
+        for flags in [
+            vec!["-a", "on-request", "-s", "read-only"],
+            vec!["--ask-for-approval=never", "--sandbox=workspace-write"],
+            vec!["-anever", "-sread-only"],
+            vec!["--approve-for-me"],
+            vec!["--not-so-yolo"],
+        ] {
+            let mut source = Command::new("native-codex-test");
+            source.args(&flags);
+            let (server, tui) = managed_commands(&source, &plan).unwrap();
+            let client: Vec<_> = tui.get_args().collect();
+            assert_eq!(
+                &client[client.len() - flags.len()..],
+                flags.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>()
+            );
+            assert!(server
+                .get_args()
+                .any(|arg| arg.to_string_lossy().starts_with("approval_policy=")));
+            assert!(server
+                .get_args()
+                .any(|arg| arg.to_string_lossy().starts_with("sandbox_mode=")));
+        }
+        for unsupported in [
+            vec!["--cd", "/tmp"],
+            vec!["-C/tmp"],
+            vec!["--add-dir=/tmp"],
+            vec!["-a"],
+            vec!["--sandbox="],
+        ] {
+            let mut source = Command::new("native-codex-test");
+            source.args(&unsupported);
+            assert!(
+                managed_commands(&source, &plan).is_err(),
+                "unsupported/malformed intent must refuse visibly: {unsupported:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_unsupported_options_request_embedded_mode_without_confusing_values() {
+        for args in [
+            vec!["--cd", "/tmp"],
+            vec!["-C/tmp"],
+            vec!["--add-dir=/tmp"],
+            vec!["--worktree"],
+            vec!["--no-daemon"],
+            vec!["-c", "sandbox_workspace_write.writable_roots=[\"/tmp\"]"],
+            vec![
+                "--config=sandbox_workspace_write={writable_roots=[\"/tmp\"],network_access=true}",
+            ],
+            vec!["resume", "--last", "--yolo"],
+        ] {
+            let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+            assert!(
+                requires_embedded_native(&args),
+                "unsupported native remote option: {args:?}"
+            );
+        }
+        for args in [
+            vec!["--yolo"],
+            vec!["--model", "--cd", "resume", "--last"],
+            vec!["--image", "--add-dir=/tmp", "resume", "--last"],
+            vec!["--", "--cd", "/tmp"],
+            vec!["resume", "--last"],
+        ] {
+            let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+            assert!(
+                !requires_embedded_native(&args),
+                "ordinary/literal native option: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bypass_dominates_sandbox_in_both_orders_and_option_values_are_literal() {
+        let temp = socket_fixture_dir();
+        let state = temp.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let plan = ManagedBackendPlan::prepare(temp.path(), &state).unwrap();
+        for flags in [
+            vec!["--yolo", "-s", "read-only"],
+            vec!["-s", "read-only", "--yolo"],
+        ] {
+            let mut source = Command::new("native-codex-test");
+            source.args(&flags);
+            let (server, tui) = managed_commands(&source, &plan).unwrap();
+            let sandbox = server
+                .get_args()
+                .filter_map(|arg| arg.to_str())
+                .filter(|arg| arg.starts_with("sandbox_mode="))
+                .last()
+                .unwrap();
+            assert_eq!(
+                sandbox, "sandbox_mode=\"danger-full-access\"",
+                "native bypass dominates every typed sandbox choice"
+            );
+            let client: Vec<_> = tui.get_args().collect();
+            assert_eq!(
+                &client[client.len() - flags.len()..],
+                flags.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>()
+            );
+        }
+        for flag in ["-m", "--model", "-p", "--profile", "-i", "--image"] {
+            let mut source = Command::new("native-codex-test");
+            source.args([flag, "--yolo", "resume", "--last"]);
+            let (server, tui) = managed_commands(&source, &plan).unwrap();
+            assert!(
+                !server
+                    .get_args()
+                    .any(|arg| arg.to_string_lossy().contains("danger-full-access")),
+                "option values must not become permission flags"
+            );
+            let client: Vec<_> = tui.get_args().collect();
+            assert_eq!(
+                &client[client.len() - 4..],
+                [flag, "--yolo", "resume", "--last"]
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_override_launch_runs_original_command_and_reports_wake_unavailable() {
+        const CHILD: &str = "CSQ_CR7_EMBEDDED_TEST_CHILD";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = std::path::PathBuf::from(root);
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "exit 0"]).current_dir(&root);
+            let mut audit = crate::cli::audit_emit::AuditEmitter::disabled();
+            let result = run_supervised_carrying(
+                command,
+                &root,
+                &root,
+                |_| panic!("no swap requested"),
+                false,
+                None,
+                &mut audit,
+                |_, _, _, _, _| panic!("no relaunch requested"),
+                Some(true),
+                true,
+            );
+            assert!(
+                result.is_ok(),
+                "explicit native options must execute the original command: {result:?}"
+            );
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["cli::commands::codex_supervise::managed_backend_tests::embedded_override_launch_runs_original_command_and_reports_wake_unavailable", "--exact", "--nocapture"])
+            .env_clear().env("PATH", "/usr/bin:/bin")
+            .env("HOME", temp.path()).env("CODEX_HOME", temp.path())
+            .env("CSQ_BASE_DIR", temp.path()).env(CHILD, temp.path())
+            .current_dir(temp.path()).output().unwrap();
+        assert!(
+            output.status.success(),
+            "embedded fallback must preserve the original command; child stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr
+                .matches("automatic message wake is unavailable for this launch")
+                .count(),
+            1
+        );
+    }
+
+    /// T2 (embedded app-server path): a child spawned through
+    /// `OwnedNativeBackend::spawn` — the helper the managed launch starts
+    /// codex's app-server with — holds no descriptor naming the codex share
+    /// lock while csq holds it SHARED, and another EXCLUSIVE try-lock is
+    /// refused. The child is this binary re-invoked as a reporter that then
+    /// stays alive until `stop()`. Falsifying result: a lock descriptor with
+    /// `FD_CLOEXEC` cleared appears in `lock_fds`.
+    #[test]
+    fn embedded_app_server_child_holds_no_share_lock_descriptor() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        const REPORT: &str = "CSQ_APP_SERVER_LOCK_FD_REPORT";
+        const LOCK: &str = "CSQ_APP_SERVER_LOCK_FD_LOCK_PATH";
+        if let (Some(report), Some(lock_path)) = (std::env::var_os(REPORT), std::env::var_os(LOCK))
+        {
+            let lock_path = std::path::PathBuf::from(lock_path);
+            let text = match std::fs::metadata(&lock_path) {
+                Err(e) => format!("error=metadata:{e}\n"),
+                Ok(meta) => {
+                    let mut lock_fds = Vec::new();
+                    for fd in 0..1024 {
+                        // SAFETY: a zeroed `stat` is a valid out-parameter;
+                        // fstat only reads descriptor metadata.
+                        #[allow(clippy::unnecessary_cast)]
+                        let named = unsafe {
+                            let mut st: libc::stat = std::mem::zeroed();
+                            libc::fstat(fd, &mut st) == 0
+                                && st.st_dev as u64 == meta.dev()
+                                && st.st_ino as u64 == meta.ino()
+                        };
+                        if named {
+                            lock_fds.push(fd);
+                        }
+                    }
+                    let refused = match std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&lock_path)
+                    {
+                        // SAFETY: `f` owns a live descriptor; non-blocking
+                        // flock on the private fixture, released on drop.
+                        Ok(f) => unsafe {
+                            libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0
+                        },
+                        Err(_) => false,
+                    };
+                    format!("lock_fds={lock_fds:?} exclusive_refused={refused}\n")
+                }
+            };
+            let _ = std::fs::write(report, text);
+            std::thread::sleep(Duration::from_secs(30));
+            return;
+        }
+        let base = tempfile::TempDir::new().expect("tempdir");
+        let lock = csq_core::session::shared_state::acquire_codex_share_lock_shared(base.path())
+            .expect("shared share lock");
+        let lock_path = base.path().join("shared-state/codex/.share.lock");
+        let report = base.path().join("app-server-report.txt");
+        let name = format!(
+            "{}::embedded_app_server_child_holds_no_share_lock_descriptor",
+            module_path!()
+                .split_once("::")
+                .expect("crate-qualified path")
+                .1
+        );
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env(REPORT, &report)
+            .env(LOCK, &lock_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut backend = OwnedNativeBackend::spawn(command).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let text = loop {
+            match std::fs::read_to_string(&report) {
+                Ok(t) if t.ends_with('\n') => break t,
+                _ if std::time::Instant::now() > deadline => {
+                    backend.stop().unwrap();
+                    panic!("the app-server reporter wrote no report");
+                }
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        backend.stop().unwrap();
+        drop(lock);
+        assert_eq!(text, "lock_fds=[] exclusive_refused=true\n");
+    }
+
+    /// T3 (Linux): a child whose `Command` carries
+    /// `reset_signal_dispositions_before_exec` is sent SIGTERM when the
+    /// thread that spawned it dies (`PR_SET_PDEATHSIG`), so a SIGKILLed csq
+    /// cannot leave codex running on without the share lock. Falsifying
+    /// result: without the `prctl` the `sleep 30` child outlives its
+    /// spawning thread and is still running at the deadline.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervised_child_is_terminated_when_its_spawning_thread_dies() {
+        let pid = std::thread::spawn(|| {
+            let mut command = Command::new("/bin/sleep");
+            command.arg("30");
+            reset_signal_dispositions_before_exec(&mut command);
+            // Reaped below by `waitpid` on the returned pid (the `Child`
+            // handle cannot cross the thread boundary that is under test).
+            #[allow(clippy::zombie_processes)]
+            let child = command.spawn().expect("spawn sleep");
+            child.id() as libc::pid_t
+            // `child` drops without a kill; the thread then exits.
+        })
+        .join()
+        .expect("spawner thread");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut status: libc::c_int = 0;
+        loop {
+            // SAFETY: `pid` is our own unreaped child; WNOHANG never blocks.
+            let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if r == pid {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                // SAFETY: our own child; reap it before failing.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, &mut status, 0);
+                }
+                panic!("the child outlived its spawning thread");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(libc::WIFSIGNALED(status), "status {status}");
+        assert_eq!(libc::WTERMSIG(status), libc::SIGTERM);
+    }
+
+    #[test]
+    fn backend_guard_stops_spawned_process_without_a_tui_or_ready_socket() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exec sleep 30"]);
+        let mut backend = OwnedNativeBackend::spawn(command).unwrap();
+        let identity = backend.launcher.clone();
+        assert!(identity.verify().is_ok());
+        backend.stop().unwrap();
+        assert!(identity.verify().is_err());
+        assert!(backend.child.is_none());
+        backend.stop().unwrap();
+    }
+
+    #[test]
+    fn startup_error_drop_cleans_the_owned_backend_group() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exec sleep 30"]);
+        let backend = OwnedNativeBackend::spawn(command).unwrap();
+        let identity = backend.launcher.clone();
+        drop(backend);
+        assert!(identity.verify().is_err());
+    }
+    #[test]
+    fn backend_session_and_group_cleanup_include_its_descendants() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "trap 'wait; exit 0' TERM; sleep 30 & wait"]);
+        let mut backend = OwnedNativeBackend::spawn(command).unwrap();
+        let pid = backend.launcher.pid;
+        // SAFETY: read-only session/group queries on our exact live child.
+        assert_eq!(unsafe { libc::getsid(pid as i32) }, pid as i32);
+        assert_eq!(unsafe { libc::getpgid(pid as i32) }, pid as i32);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let descendant = loop {
+            if let Some(pid) = collect_descendant_pids(pid).into_iter().next() {
+                break csq_core::providers::codex::managed_backend::LauncherIdentity::capture(pid)
+                    .unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture must spawn a real descendant"
+            );
+            std::thread::sleep(Duration::from_millis(POLL_MS));
+        };
+        backend.stop().unwrap();
+        assert!(
+            descendant.verify().is_err(),
+            "owned backend descendant must be reaped"
+        );
+    }
+    #[test]
+    fn sandbox_tables_remain_entirely_on_the_backend_without_dropping_settings() {
+        let temp = socket_fixture_dir();
+        let state = temp.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let plan = ManagedBackendPlan::prepare(temp.path(), &state).unwrap();
+        let mut source = Command::new("native-codex-test");
+        let safe = "sandbox_workspace_write={network_access=true,exclude_slash_tmp=true}";
+        source.args(["-c", safe]);
+        let (server, tui) = managed_commands(&source, &plan).unwrap();
+        assert!(server.get_args().any(|arg| arg == safe));
+        assert!(tui.get_args().any(|arg| arg == safe));
+        let mut mixed = Command::new("native-codex-test");
+        mixed.args([
+            "-c",
+            "sandbox_workspace_write={writable_roots=[\"/tmp\"],network_access=true}",
+        ]);
+        assert!(
+            managed_commands(&mixed, &plan).is_err(),
+            "fresh writable-root overrides cannot silently lose TUI intent"
+        );
+        mixed.args(["resume", "--last"]);
+        let (server, tui) = managed_commands(&mixed, &plan).unwrap();
+        assert!(server
+            .get_args()
+            .any(|arg| arg.to_string_lossy().contains("writable_roots")));
+        assert!(!tui
+            .get_args()
+            .any(|arg| arg.to_string_lossy().contains("sandbox_workspace_write")));
     }
 }

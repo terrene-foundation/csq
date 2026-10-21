@@ -17,6 +17,7 @@ use csq_core::cli_deps::{
     SurfaceCli, WrongBinaryReason,
 };
 use csq_core::daemon::coc_cache_sweeper;
+use csq_core::messaging::store::{retained_archive_count, ARCHIVE_CAPACITY};
 #[cfg(unix)]
 use csq_core::platform::process::is_pid_alive;
 use csq_core::refresh::sentinel as fanout;
@@ -26,19 +27,6 @@ use std::path::Path;
 
 #[derive(Serialize)]
 struct DoctorReport {
-    /// Top-level doctor JSON schema version. Both editions report `23` as of
-    /// this field's v23 addition (`stale_quota_slots`) — it is NOT
-    /// `cfg`-gated (the community build computes and emits it too), so per
-    /// the shared-monotonic-counter contract it raises the community
-    /// ceiling PAST every intervening enterprise-only version (v20-v22,
-    /// including v22 `audit_bundle_floor_anchor` an internal ticket b2b), exactly as v19
-    /// (`mcp_partial_coverage`) jumped it from 16 straight to 19 past
-    /// v17-v18. The full per-version history (which version introduced
-    /// which field, and which fields are
-    /// `specs/13-multi-cli-detection-contract.md` §9 — the single source of
-    /// truth. Do NOT re-enumerate it here: the prior inline history drifted
-    /// (it stalled at v7 while fields landed through v18), which is exactly the
-    /// drift §9 exists to prevent.
     schema_version: u32,
     /// `csq.doctor.vN` (an internal ticket Track B), derived from [`DOCTOR_SCHEMA_VERSION`]
     /// via [`doctor_schema_string`] — never hand-written a second time. Additive
@@ -47,6 +35,14 @@ struct DoctorReport {
     /// instead of parsing the bare numeric `schema_version` itself.
     schema: String,
     version: String,
+    /// Explicit private-pin diagnosis; omitted unless both gate inputs are given.
+    /// This is the same read-only report emitted by `csq gate status`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gate_status: Option<csq_core::gate::status::GateStatusReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_archive_records: Option<usize>,
+    message_archive_capacity: usize,
+    message_archive_state: &'static str,
     platform: PlatformInfo,
     /// Claude Code CLI status.  Populated when at least one Anthropic slot
     /// has authenticated credentials; **omitted entirely** (not null) when
@@ -89,9 +85,19 @@ struct DoctorReport {
     /// (an internal ticket).
     #[serde(skip)]
     codex_wrong_variant_slots: Vec<u16>,
+    /// Native Kimi/Grok slots holding a vendor credential file but no binding
+    /// marker (a login that wrote its credential then exited non-zero or was
+    /// cancelled, an internal ticket), leftover homes of rebound slots, and untrustworthy
+    /// homes/container (symlink, unreadable). NOT serialized (mirrors
+    /// `codex_wrong_variant_slots`).
+    #[serde(skip)]
+    native_homes: csq_core::providers::native::NativeHomesScan,
     js_runtime: JsRuntimeInfo,
     settings: SettingsInfo,
     daemon: DaemonInfo,
+    /// Live CLI-shim verification plus the last desktop refresh attempt (v26).
+    cli_shim: CliShimInfo,
+    mcp_images: super::mcp_image::Images,
     accounts: AccountsInfo,
     /// v23: slots whose quota poll has gone stale — sourced from the SAME
     /// channel `csq status` reads
@@ -109,6 +115,16 @@ struct DoctorReport {
     /// `pass0_skipped_slots`'s convention.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     stale_quota_slots: Vec<StaleQuotaSlotJson>,
+    /// Slots whose identity holds a pending post-commit rescue record.
+    ///
+    /// A pending record makes the refresher SKIP the provider request (the
+    /// canonical may hold a refresh token the provider already consumed), so
+    /// it must be visible here rather than staying a log-only state. The
+    /// state distinguishes a transient block (adoption retries on the next
+    /// tick) from a record adoption can never install, which needs the user
+    /// to sign in again. Fixed vocabulary; no paths, no credential material.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    rescue_pending_slots: Vec<csq_core::credentials::rescue::PendingRescue>,
     /// Handle-dir state that is NOT shared across terminals (v24).
     ///
     /// A handle dir symlinks a hand-maintained allowlist of items back to `config-N`;
@@ -127,7 +143,70 @@ struct DoctorReport {
     /// `failed to start embedded app server`. Omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     codex_shared_shape_mismatches: Vec<CodexSharedShapeJson>,
+    /// v30: canonical owner project trust drift or an undetermined source.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    codex_project_trust: Vec<csq_core::providers::codex::trust::ProjectTrustDiagnostic>,
+    /// True when a Codex slot exists but the user-global Codex `hooks.json` is absent, so
+    /// Codex terminals run without global hooks. Omitted when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    codex_hooks_global_missing: bool,
+    /// Per-Codex-handle state of `hooks.json` against the user-global hooks file. Omitted
+    /// when there are no Codex handles.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    codex_hooks_handles: Vec<CodexHooksHandleJson>,
+    /// Codex slots whose `config.toml` carries a `hooks` value that is not a table; the next
+    /// regeneration drops and regenerates it. Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    codex_slots_hooks_not_a_table: Vec<u16>,
+    /// Codex slots whose config writes recorded a condition (raced exchange, no atomic
+    /// exchange, incomplete purge of stale hook approvals). Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    codex_slot_write_status: Vec<CodexSlotWriteStatusJson>,
+    /// True on a platform without an atomic exchange while a Codex slot config exists: a
+    /// Codex write landing between csq's compare and rename can still be overwritten.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    codex_config_exchange_unavailable: bool,
+    /// Slots whose settings overlay carries `disableAllHooks`. The materializer strips the
+    /// key (a slot cannot disable global hooks); the row tells the owner it is ignored.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    slots_disable_all_hooks: Vec<u16>,
+    /// Shared, read-only Claude settings diagnostic. Contains only typed relative labels.
+    claude_autocompact_status: csq_core::session::settings_diagnostics::AutoCompactSettingsReport,
+    /// True when the user-global Claude settings file exists but cannot be used, so Claude
+    /// handles keep their previously materialized hooks instead of merging the global ones.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    global_settings_unusable: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    session_logins: Vec<csq_core::credentials::session_login::SessionLogin>,
+    sessions_undetermined: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keychain_mirror_age_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keychain_mirror: Option<csq_core::credentials::keychain::MirrorSyncStatus>,
+    /// v34: counts of csq-minted `Claude Code-credentials-<hash>` keychain items
+    /// whose `term-<pid>` terminal is gone, as last published by the daemon's
+    /// orphan sweep. Omitted when the daemon has never published a status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keychain_orphans: Option<csq_core::credentials::keychain::orphans::OrphanSweepStatus>,
+    /// v34: present (instead of `keychain_orphans`) when the status file EXISTS
+    /// but cannot be read: `"unreadable"`, `"oversized"` or `"corrupt"`. A
+    /// damaged status file is never reported as "never published".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keychain_orphans_error: Option<&'static str>,
+    /// v34: `ok` | `info` | `warn` | `needs_action`, from the same accessor as
+    /// the text line, `csq status` and the desktop. Omitted with the counts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keychain_orphans_level: Option<csq_core::credentials::keychain::orphans::DiagnosticLevel>,
+    /// Age of the sweep's last report when the diagnostic was read. Not part of
+    /// the wire shape (the level already reflects it); the text line rebuilds
+    /// the same diagnostic from it so a stale report reads stale there too.
+    #[serde(skip)]
+    keychain_orphans_age_secs: Option<u64>,
     broker_failed: BrokerFailedInfo,
+    /// F5/L3 duplicate-refresh-token audit: one fixed-vocabulary line per finding, from the
+    /// same core function the daemon's startup audit uses. Empty when nothing is shared.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    refresh_audit: Vec<String>,
     mixed_state_slots: MixedStateInfo,
     terminals: TerminalInfo,
     resurrections: ResurrectionInfo,
@@ -189,18 +268,37 @@ struct DoctorReport {
     /// `oauthAccount.emailAddress` — the warn-log path at
     /// `csq-core/src/daemon/identity_mint.rs:188-195`. These slots remain
     /// functional but have no UUID anchor in `profiles.json::by_slot`; the
-    /// next `csq login N` will mint the identity via `mint_for_login`,
+    /// next `csq login N` will mint the identity via `commit_anthropic_login`,
     /// which carries an explicit OAuth-flow email.
     ///
     /// Only populated AFTER the `store-version` sentinel exists (Pass-0 has
     /// run on this host). Slots whose `by_slot[N]` is now present are
     /// excluded — those have already been remediated by a later
-    /// `mint_for_login`. Omitted entirely when empty.
+    /// `commit_anthropic_login`. Omitted entirely when empty.
     ///
     /// JSON shape: `[{ "slot": N, "reason": "oauth_email_unresolved" }, ...]`.
     /// Text mode: `Pass-0 skip: ⚠ N slot(s) skipped (oauth_email unresolved): slot 3, slot 5`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pass0_skipped_slots: Vec<Pass0SkippedSlot>,
+
+    /// orgident r7 item 9 (doctor v32): slots whose sign-in is shared with another slot.
+    /// `csq run N`, `csq swap N` and the desktop launch REFUSE these slots, and the
+    /// status line of a terminal on one shows a warning; the list comes from the very
+    /// gate those surfaces call (`launch_block::blocked_slots`), so the diagnostic cannot
+    /// disagree with the refusal. Already-open sessions are not killed. Omitted when empty.
+    ///
+    /// JSON shape: `[{ "slot": N, "holder": H }, ...]` (`holder` keeps the grant).
+    /// Text mode: one line per slot, ending with the instruction to run csq login N.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    launch_blocked_slots: Vec<LaunchBlockedSlot>,
+
+    /// orgident r7 item 9 (doctor v32): `true` only while the suppression record is damaged
+    /// (or refused / old-format) with no usable last-good copy, so every Anthropic slot not
+    /// re-verified by a `csq login` is refused (fail closed). An absent record (fresh
+    /// install) is NOT this state. Omitted when `false`. The damaged file itself is
+    /// described by `refresh_audit`; this only reports the launch consequence.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    launch_blocked_unknown_state: bool,
 
     /// M04 (an internal workspace): signing key presence status.
     ///
@@ -823,6 +921,13 @@ struct Pass0SkippedSlot {
     reason: &'static str,
 }
 
+/// One slot whose launches are refused because its sign-in is shared (doctor v32).
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+struct LaunchBlockedSlot {
+    slot: u16,
+    holder: u16,
+}
+
 /// an internal journal entry: top-level "phase-4 incomplete" alarm payload. Renders
 /// near the top of the text-mode doctor report and emits as a structured
 /// JSON object when at least one UUID-mapped slot has a missing
@@ -886,7 +991,7 @@ enum LegacyCompatKind {
     LegacyCanonicalCodexCredentialsFileStillWritten,
     /// At least one `config-<N>/.csq-account` marker still carries a
     /// decimal slot id rather than the slot's UUID.
-    /// Pure-legacy install where `mint_for_login` has not yet run.
+    /// Pure-legacy install where `commit_anthropic_login` has not yet run.
     /// Retires when a future shard makes `phase4_gate_check` refuse
     /// pure-legacy installs.
     DecimalMarkerContentPresent,
@@ -1154,6 +1259,278 @@ struct DaemonInfo {
     version_drift: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct CliShimInfo {
+    /// Redacted diagnostic path, so text/JSON never disclose the host's home.
+    path: Option<String>,
+    /// Current, stale, unverifiable, or not_checked (a symlink is not executed).
+    check_status: &'static str,
+    stale_or_unverifiable: bool,
+    verified_version_line: Option<String>,
+    /// On-disk plist presence, not evidence that launchd loaded the job.
+    /// Null on platforms without a managed launchd plist.
+    managed_plist_installed: Option<bool>,
+    managed_plist_allowed: bool,
+    /// Fresh native managed-service observation, never inferred from a receipt.
+    /// Text-only: historical decisions remain in last_refresh without a wire change.
+    #[serde(skip)]
+    managed_daemon_dormant: Option<bool>,
+    /// Current bounded native job probe; None means unknown or not queried.
+    #[serde(skip)]
+    managed_job_loaded: Option<bool>,
+    /// Current native launchd observation (v26 additive); historical receipts do
+    /// not supply it. Omitted when unqueried or no managed plist is installed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    managed_service_state: Option<&'static str>,
+    /// Matching desktop receipt or an existing managed launchd plist.
+    desktop_managed: bool,
+    receipt_status: &'static str,
+    last_refresh: Option<CliShimLastRefresh>,
+}
+
+#[derive(Debug, Serialize)]
+struct CliShimLastRefresh {
+    outcome: String,
+    plist_decision: String,
+    stale_plist_decision: String,
+    expected_version_line: String,
+    timestamp: u64,
+}
+
+#[cfg(unix)]
+struct InstalledImageAdmission {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+    identity: csq_core::messaging::image_report::FileIdentity,
+}
+#[cfg(not(unix))]
+struct InstalledImageAdmission;
+impl InstalledImageAdmission {
+    fn open(path: &Path) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                .open(path)
+                .ok()?;
+            let identity = super::mcp_image::file_identity(&file.metadata().ok()?)?;
+            let value = Self {
+                path: path.into(),
+                file,
+                identity,
+            };
+            value.stable()?;
+            Some(value)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            None
+        }
+    }
+    fn stable(&self) -> Option<csq_core::messaging::image_report::FileIdentity> {
+        #[cfg(unix)]
+        {
+            let fd = super::mcp_image::file_identity(&self.file.metadata().ok()?)?;
+            let named =
+                super::mcp_image::file_identity(&std::fs::symlink_metadata(&self.path).ok()?)?;
+            (fd == self.identity && named == self.identity).then_some(fd)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+}
+fn check_cli_shim(base_dir: &Path) -> (CliShimInfo, Option<InstalledImageAdmission>) {
+    use csq_core::cli_deps::cli_shim::{self, SignerPolicy};
+    let policy = if crate::BUILD_EDITION == "enterprise" {
+        SignerPolicy::PinTrustedTeam
+    } else {
+        SignerPolicy::AnySignature
+    };
+    #[cfg(target_os = "macos")]
+    let plist_installed = Some(super::daemon::managed_daemon_plist_exists());
+    #[cfg(not(target_os = "macos"))]
+    let plist_installed = None;
+    let target = cli_shim::resolve_shim_target();
+    let (result, admission) = check_cli_shim_with_image(
+        base_dir,
+        target.as_deref(),
+        crate::VERSION_LINE,
+        plist_installed,
+        |target| cli_shim::installed_verified_version_line(target, &policy),
+    );
+    #[cfg(target_os = "macos")]
+    let result = {
+        let mut result = result;
+        // Query the current canonical job only for an installed managed plist.
+        // Historical receipt evidence alone is not a live service observation.
+        if result.managed_plist_installed == Some(true) {
+            observe_managed_service(
+                &mut result,
+                super::daemon::managed_launchd_job_state(),
+                super::daemon::managed_daemon_dormant,
+            );
+        }
+        result
+    };
+    (result, admission)
+}
+
+fn check_cli_shim_with_image(
+    base_dir: &Path,
+    target: Option<&Path>,
+    expected: &str,
+    plist: Option<bool>,
+    verify: impl FnOnce(&Path) -> Option<String>,
+) -> (CliShimInfo, Option<InstalledImageAdmission>) {
+    let mut admission = None;
+    let result = check_cli_shim_with(base_dir, target, expected, plist, |target| {
+        let opened = InstalledImageAdmission::open(target);
+        let verified = verify(target);
+        if verified.is_some() {
+            admission = opened.filter(|value| value.stable().is_some());
+        }
+        verified
+    });
+    if !result.managed_plist_allowed || result.check_status != "current" {
+        admission = None;
+    }
+    (result, admission)
+}
+
+/// The receipt is historical; even a successful receipt cannot suppress the
+/// current signature/exec check. A receipt never chooses which path to execute.
+fn check_cli_shim_with(
+    base_dir: &Path,
+    target: Option<&Path>,
+    expected: &str,
+    plist_installed: Option<bool>,
+    verify: impl FnOnce(&Path) -> Option<String>,
+) -> CliShimInfo {
+    use csq_core::cli_deps::cli_shim_refresh::{
+        cli_shim_is_current, managed_plist_rejection, read_refresh_receipt,
+    };
+    let (receipt_status, receipt) = match read_refresh_receipt(base_dir) {
+        Ok(Some(r)) => ("present", Some(r)),
+        Ok(None) => ("absent", None),
+        Err(_) => ("unreadable", None),
+    };
+    let matching_receipt = receipt
+        .as_ref()
+        .filter(|r| target.is_some() && r.target_path.as_deref() == target);
+    let desktop_managed = matching_receipt.is_some() || plist_installed == Some(true);
+    let expected = matching_receipt
+        .map(|r| r.expected_version_line.as_str())
+        .unwrap_or(expected);
+    let symlink_target = target
+        .is_some_and(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()));
+    // A package manager's symlink is not evidence of a broken installation.
+    // Preserve the trust boundary: report the omitted check instead of following
+    // the link or treating a historical receipt as permission to execute it.
+    let verified = if symlink_target {
+        None
+    } else {
+        target.and_then(verify)
+    };
+    let check_status = if symlink_target {
+        "not_checked"
+    } else if cli_shim_is_current(verified.as_deref(), expected) {
+        "current"
+    } else if verified.is_some() {
+        "stale"
+    } else {
+        "unverifiable"
+    };
+    let allowed = managed_plist_rejection(
+        target.is_some_and(Path::exists),
+        true,
+        verified.as_deref(),
+        expected,
+    )
+    .is_none();
+    CliShimInfo {
+        path: target.map(csq_core::cli_deps::sanitize::redact_path),
+        check_status,
+        stale_or_unverifiable: matches!(check_status, "stale" | "unverifiable"),
+        verified_version_line: verified.map(|l| sanitize_for_display(&l)),
+        managed_plist_installed: plist_installed,
+        managed_plist_allowed: allowed,
+        managed_daemon_dormant: None,
+        managed_job_loaded: None,
+        managed_service_state: None,
+        desktop_managed,
+        receipt_status,
+        last_refresh: receipt.map(|r| CliShimLastRefresh {
+            outcome: sanitize_for_display(&r.outcome),
+            plist_decision: sanitize_for_display(&r.plist_decision),
+            stale_plist_decision: sanitize_for_display(&r.stale_plist_decision),
+            expected_version_line: sanitize_for_display(&r.expected_version_line),
+            timestamp: r.timestamp,
+        }),
+    }
+}
+
+/// Only a current definite native observation can report an unloaded service.
+/// An installed plist or historical receipt alone never proves the job state.
+#[cfg(any(target_os = "macos", test))]
+fn observe_managed_service(
+    info: &mut CliShimInfo,
+    state: super::daemon::ManagedJobState,
+    dormant: impl FnOnce() -> Option<bool>,
+) {
+    use super::daemon::ManagedJobState;
+    if info.managed_plist_installed != Some(true) {
+        return;
+    }
+    let service_state = match state {
+        ManagedJobState::Loaded => {
+            info.managed_job_loaded = Some(true);
+            info.managed_daemon_dormant = dormant();
+            match info.managed_daemon_dormant {
+                Some(false) => "running",
+                Some(true) => "dormant",
+                None => "unknown",
+            }
+        }
+        ManagedJobState::Unloaded => {
+            info.managed_job_loaded = Some(false);
+            "not_loaded"
+        }
+        ManagedJobState::Unknown => "unknown",
+    };
+    info.managed_service_state = Some(service_state);
+}
+
+const MANAGED_SERVICE_NOT_LOADED_WARNING: &str = "managed service not loaded — the installed managed daemon plist is not registered with launchd; rerun the desktop CLI refresh to register the managed service";
+
+const MANAGED_DAEMON_DORMANT_WARNING: &str = "managed daemon is loaded but stopped — token refresh for this managed service is not running; start it with `launchctl kickstart gui/$(id -u)/foundation.terrene.csq`";
+
+fn cli_shim_warnings(info: &CliShimInfo) -> Vec<&'static str> {
+    let mut warnings = Vec::new();
+    if info.managed_plist_installed == Some(true) && info.managed_job_loaded == Some(false) {
+        warnings.push(MANAGED_SERVICE_NOT_LOADED_WARNING);
+    }
+    if info.managed_daemon_dormant == Some(true) {
+        warnings.push(MANAGED_DAEMON_DORMANT_WARNING);
+    }
+    if info.stale_or_unverifiable {
+        warnings.push("CLI shim stale or unverifiable");
+    }
+    // A matching historical receipt does not make a symlink manageable;
+    // retrying desktop refresh cannot install a plist for a rejected target.
+    if info.check_status != "not_checked"
+        && info.desktop_managed
+        && info.managed_plist_installed == Some(false)
+    {
+        warnings.push("managed daemon plist not installed");
+    }
+    warnings
+}
+
 /// One account whose broker has set the LOGIN-NEEDED sentinel.
 #[derive(Serialize)]
 struct BrokerFailedEntry {
@@ -1185,12 +1562,37 @@ pub fn handle(
     repair_identities: bool,
     check_token_owners: bool,
 ) -> Result<()> {
+    handle_with_gate(
+        base_dir,
+        json,
+        slot,
+        repair_identities,
+        check_token_owners,
+        None,
+    )
+    .map(|_| ())
+}
+
+/// Add explicit gate diagnosis without changing the existing handle contract.
+pub fn handle_with_gate(
+    base_dir: &Path,
+    json: bool,
+    slot: Option<u16>,
+    repair_identities: bool,
+    check_token_owners: bool,
+    gate: Option<(&Path, &Path)>,
+) -> Result<i32> {
+    if gate.is_some() && (slot.is_some() || repair_identities || check_token_owners) {
+        anyhow::bail!("gate diagnosis cannot be combined with slot, repair or token-owner checks");
+    }
     if repair_identities {
-        return run_repair_identities(base_dir, json);
+        run_repair_identities(base_dir, json)?;
+        return Ok(0);
     }
 
     if check_token_owners {
-        return run_token_owner_check(base_dir, json);
+        run_token_owner_check(base_dir, json)?;
+        return Ok(0);
     }
 
     if let Some(n) = slot {
@@ -1200,18 +1602,27 @@ pub fn handle(
         } else {
             print_per_slot_report(&report);
         }
-        return Ok(());
+        return Ok(0);
     }
 
-    let report = build_report(base_dir);
+    let mut report = build_report(base_dir);
+    report.gate_status = gate.map(|(repo, pin)| csq_core::gate::status::build_report(repo, pin));
+    let exit_code = report
+        .gate_status
+        .as_ref()
+        .map_or(0, |gate| gate.exit_code());
 
     if json {
         println!("{}", serde_json::to_string(&report)?);
-        return Ok(());
+        return Ok(exit_code);
     }
 
     print_report(&report);
-    Ok(())
+    if let Some(gate) = &report.gate_status {
+        let stdout = std::io::stdout();
+        super::gate_status::write_report(gate, false, &mut stdout.lock())?;
+    }
+    Ok(exit_code)
 }
 
 /// `csq doctor --repair-identities` — one-shot legacy→identity migration.
@@ -1638,6 +2049,54 @@ fn codex_wrong_variant_slots(base_dir: &Path) -> Vec<u16> {
         .collect()
 }
 
+/// Native-home findings via the shared `native::scan_native_homes` (same path
+/// the login writer uses; fail-visible on symlink/unreadable).
+fn native_homes_scan(base_dir: &Path) -> csq_core::providers::native::NativeHomesScan {
+    csq_core::providers::native::scan_native_homes(base_dir)
+}
+
+/// Rows for the native-home scan (no paths, no file contents). Only an UNBOUND
+/// slot is told to finish its login; a rebound slot's leftover home is
+/// informational and names no login/logout remedy (`login` refuses it and
+/// `logout` would delete the working account).
+fn render_native_home_lines(scan: &csq_core::providers::native::NativeHomesScan) -> Vec<String> {
+    use csq_core::providers::native::NativeFindingKind;
+    let mut out = Vec::new();
+    if let Some(a) = scan.container {
+        out.push(format!(
+            "  Native bind:  {} the native-homes directory {} \u{2014} native credential state could not be checked",
+            warn(),
+            a.describe()
+        ));
+    }
+    for f in &scan.findings {
+        let (slot, name) = (f.slot.get(), f.cli.display_name);
+        out.push(match &f.kind {
+            NativeFindingKind::Orphan => format!(
+                "  Native bind:  {} native credential present without binding marker (slot {slot}, {name}) \u{2014} finish with: csq login {slot} --provider {}",
+                warn(),
+                f.cli.id
+            ),
+            NativeFindingKind::Leftover(b) => format!(
+                "  Native bind:  {} leftover {name} files from a previous binding (slot {slot} now bound to {})",
+                info(),
+                b.label()
+            ),
+            NativeFindingKind::DualBound(b) => format!(
+                "  Native bind:  {} slot {slot} is bound to both {name} and {} \u{2014} resolve the double binding manually",
+                warn(),
+                b.label()
+            ),
+            NativeFindingKind::Anomalous(a) => format!(
+                "  Native bind:  {} native home for slot {slot} ({name}) {} \u{2014} csq did not follow it; inspect that slot's entry under native-homes/",
+                warn(),
+                a.describe()
+            ),
+        });
+    }
+    out
+}
+
 /// `csq doctor --json` schema version. Per the shared monotonic counter
 /// (spec/13 §9), `schema_version` is the highest field-version an edition
 /// actually emits. v17 (`audit_trust_plane_grade`) and v18
@@ -1679,18 +2138,42 @@ struct UnsharedHandleStateJson {
     total_bytes: u64,
 }
 
-// v24 adds `unshared_handle_state`. Both ceilings move together, as v23 did.
 #[cfg(feature = "enterprise")]
-const DOCTOR_SCHEMA_VERSION: u32 = 25;
+const DOCTOR_SCHEMA_VERSION: u32 = 34;
 #[cfg(not(feature = "enterprise"))]
-const DOCTOR_SCHEMA_VERSION: u32 = 25;
+const DOCTOR_SCHEMA_VERSION: u32 = 34;
+
+/// One text line for the daemon's keychain orphan sweep, or `None` when it has
+/// never published and nothing is wrong. The wording and the severity both come
+/// from `csq_core::credentials::keychain::orphans::OrphanDiagnostic` (the one
+/// accessor `csq status` and the desktop use too); this adds only the glyph.
+pub(crate) fn keychain_orphans_line(
+    diag: &csq_core::credentials::keychain::orphans::OrphanDiagnostic,
+) -> Option<String> {
+    let glyph = keychain_orphans_glyph(diag.level()?);
+    Some(format!("Keychain orphans: {glyph} {}", diag.summary()?))
+}
+
+/// The glyph `csq doctor` shows for an orphan-sweep level: the one place the level is
+/// mapped, so a parity test can assert the glyph a given level gets.
+pub(crate) fn keychain_orphans_glyph(
+    level: csq_core::credentials::keychain::orphans::DiagnosticLevel,
+) -> &'static str {
+    use csq_core::credentials::keychain::orphans::DiagnosticLevel;
+    match level {
+        DiagnosticLevel::Ok => ok(),
+        DiagnosticLevel::Info => info(),
+        DiagnosticLevel::Warn => warn(),
+        DiagnosticLevel::NeedsAction => fail(),
+    }
+}
 
 /// Derive the `schema` string from [`DOCTOR_SCHEMA_VERSION`] — the ONLY place
 /// `"csq.doctor.v"` + the version number are concatenated (an internal ticket Track B: a
 /// contract-change policy for this field lives here, next to the constant it
-/// derives from). Additive-only within a major: a new field may be added under the
-/// same `schema` value; a rename, removal, or retype of an EXISTING field requires
-/// bumping [`DOCTOR_SCHEMA_VERSION`] (and therefore this string) to a new major.
+/// derives from). Additive fields advance this shared diagnostic field-version
+/// counter per spec 13 §9. A rename, removal or retype additionally requires an
+/// explicit consumer compatibility plan; it is not an additive change.
 /// Hosts detect the contract via presence of `schema` + a `starts_with` match on
 /// the major (`"csq.doctor.v23"` matches `"csq.doctor.v23"`, never `"csq.doctor.v24"`).
 fn doctor_schema_string() -> String {
@@ -1776,7 +2259,28 @@ fn doctor_bundle_floor_anchor(_base_dir: &Path) -> Option<String> {
     None
 }
 
+fn message_archive_snapshot(base_dir: &Path) -> (Option<usize>, &'static str) {
+    let records = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|now| retained_archive_count(base_dir, now.as_secs()).ok());
+    let state = match records {
+        None => "UND",
+        Some(n) if n >= ARCHIVE_CAPACITY => "FULL",
+        _ => "OK",
+    };
+    (records, state)
+}
 fn build_report(base_dir: &Path) -> DoctorReport {
+    let (cli_shim, installed) = check_cli_shim(base_dir);
+    let mcp_images =
+        super::mcp_image::collect(&|| installed.as_ref().and_then(InstalledImageAdmission::stable));
+    let (message_archive_records, message_archive_state) = message_archive_snapshot(base_dir);
+    let login_diagnostics = csq_core::credentials::session_login::read_diagnostics(base_dir);
+    let orphan_diag = csq_core::credentials::keychain::orphans::read_diagnostic(base_dir);
+    let keychain_orphans_level = orphan_diag.level();
+    let keychain_orphans_age_secs = orphan_diag.age_secs;
+    let (keychain_orphans, keychain_orphans_error) = (orphan_diag.status, orphan_diag.error);
     // Compute authenticated slot counts once — used both for suppression
     // and for the stale-slot rendering variant.
     let claude_auth_slots = count_authenticated_slots(base_dir, SurfaceCli::Claude);
@@ -1852,6 +2356,10 @@ fn build_report(base_dir: &Path) -> DoctorReport {
         schema_version: DOCTOR_SCHEMA_VERSION,
         schema: doctor_schema_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        gate_status: None,
+        message_archive_records,
+        message_archive_capacity: ARCHIVE_CAPACITY,
+        message_archive_state,
         platform: check_platform(),
         claude_code,
         codex_cli,
@@ -1861,12 +2369,35 @@ fn build_report(base_dir: &Path) -> DoctorReport {
         gemini_auth_slots,
         gemini_unreadable_slots: gemini_unreadable_slots(base_dir),
         codex_wrong_variant_slots: codex_wrong_variant_slots(base_dir),
+        native_homes: native_homes_scan(base_dir),
         js_runtime: check_js_runtime(),
         settings: check_settings(),
         daemon: check_daemon(base_dir),
+        cli_shim,
+        mcp_images,
         accounts: check_accounts(base_dir),
         stale_quota_slots: check_stale_quota_polls(base_dir),
+        rescue_pending_slots: csq_core::credentials::rescue::pending_rescues(base_dir),
         codex_shared_shape_mismatches: check_codex_shared_shapes(base_dir),
+        codex_project_trust: check_codex_project_trust(base_dir),
+        codex_hooks_global_missing: check_codex_hooks_global_missing(
+            base_dir,
+            csq_core::session::handle_dir::codex_global_hooks_path().as_deref(),
+        ),
+        codex_hooks_handles: check_codex_hooks_handles(
+            base_dir,
+            csq_core::session::handle_dir::codex_global_hooks_path().as_deref(),
+        ),
+        codex_slots_hooks_not_a_table: check_codex_slots_hooks_not_a_table(base_dir),
+        codex_slot_write_status: check_codex_slot_write_status(base_dir),
+        codex_config_exchange_unavailable:
+            !csq_core::providers::codex::surface::atomic_exchange_available()
+                && (1..=csq_core::types::MAX_ACCOUNTS)
+                    .any(|n| base_dir.join(format!("config-{n}/config.toml")).is_file()),
+        slots_disable_all_hooks: check_slots_disable_all_hooks(base_dir),
+        claude_autocompact_status:
+            csq_core::session::settings_diagnostics::collect_autocompact_settings(base_dir),
+        global_settings_unusable: check_global_settings_unusable(),
         unshared_handle_state: csq_core::session::share_audit::unshared_state_by_name(base_dir)
             .into_iter()
             .map(|(name, hits)| UnsharedHandleStateJson {
@@ -1875,7 +2406,16 @@ fn build_report(base_dir: &Path) -> DoctorReport {
                 handle_dirs: hits.into_iter().map(|h| h.handle_dir).collect(),
             })
             .collect(),
+        session_logins: login_diagnostics.session_logins,
+        sessions_undetermined: login_diagnostics.sessions_undetermined,
+        keychain_mirror_age_secs: login_diagnostics.snapshot_age_secs,
+        keychain_mirror: login_diagnostics.keychain_mirror,
+        keychain_orphans,
+        keychain_orphans_error,
+        keychain_orphans_level,
+        keychain_orphans_age_secs,
         broker_failed: check_broker_failed(base_dir),
+        refresh_audit: csq_core::accounts::refresh_token_audit::operator_lines(base_dir),
         mixed_state_slots: check_mixed_state_slots(base_dir),
         terminals: check_terminals(base_dir),
         resurrections: check_resurrections(base_dir),
@@ -1886,6 +2426,10 @@ fn build_report(base_dir: &Path) -> DoctorReport {
         phase4_incomplete,
         unrecoverable_label_relocations: check_unrecoverable_label_relocations(base_dir),
         pass0_skipped_slots: check_pass0_skipped_slots(base_dir),
+        launch_blocked_slots: check_launch_blocked_slots(base_dir),
+        launch_blocked_unknown_state: csq_core::accounts::launch_block::state_undetermined(
+            base_dir,
+        ),
         signing_key: check_signing_key_m04(base_dir),
         audit_sink: check_audit_sink_m07(base_dir),
         audit_orphan_intents: check_audit_orphan_intents_m13(base_dir),
@@ -2423,7 +2967,7 @@ fn check_unrecoverable_label_relocations(base_dir: &Path) -> Vec<UnrecoverableSl
 /// "skip" framing would be premature noise.
 ///
 /// Slots whose `by_slot[N]` IS present are excluded — those have already
-/// been minted (most commonly via `mint_for_login` after the operator
+/// been minted (most commonly via `commit_anthropic_login` after the operator
 /// re-OAuth'd) and are no longer in an operator-actionable "skipped"
 /// state.
 ///
@@ -2443,6 +2987,23 @@ fn check_pass0_skipped_slots(base_dir: &Path) -> Vec<Pass0SkippedSlot> {
             slot: info.id,
             reason: "oauth_email_unresolved",
         })
+        .collect()
+}
+
+/// orgident r7 item 9: the slots `csq run` / `csq swap` / the desktop launch refuse.
+/// Read-only: local state files only, no keychain, no network.
+fn check_launch_blocked_slots(base_dir: &Path) -> Vec<LaunchBlockedSlot> {
+    csq_core::accounts::launch_block::blocked_slots(base_dir)
+        .into_iter()
+        .map(|(slot, holder)| LaunchBlockedSlot { slot, holder })
+        .collect()
+}
+
+/// The text-mode lines for [`LaunchBlockedSlot`] rows, one per slot.
+fn launch_blocked_lines(slots: &[LaunchBlockedSlot]) -> Vec<String> {
+    slots
+        .iter()
+        .map(|s| csq_core::accounts::launch_block::doctor_line(s.slot, s.holder))
         .collect()
 }
 
@@ -3909,6 +4470,378 @@ fn check_accounts(base_dir: &Path) -> AccountsInfo {
     }
 }
 
+/// True when at least one Codex slot is bound AND the user-global Codex `hooks.json`
+/// (`global`, `None` when the home cannot be resolved) is not an existing file. Pure over
+/// its inputs so a test never touches the real `~/.codex`.
+fn check_codex_hooks_global_missing(base_dir: &Path, global: Option<&Path>) -> bool {
+    let has_codex_slot = (1..=csq_core::types::MAX_ACCOUNTS)
+        .filter_map(|n| AccountNum::try_from(n).ok())
+        .any(|slot| {
+            csq_core::accounts::identity_store::is_codex_bound_slot_identity_aware(base_dir, slot)
+        });
+    has_codex_slot && !global.is_some_and(csq_core::session::handle_dir::codex_global_hooks_usable)
+}
+
+/// One Codex handle's `hooks.json` state (name only, never a path or content).
+#[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
+struct CodexHooksHandleJson {
+    handle: String,
+    state: csq_core::session::handle_dir::CodexHooksLinkState,
+    /// The handle's resolved Codex config sets `features.hooks = false` (or the legacy
+    /// `codex_hooks = false` when no `hooks` key is set): Codex runs no hooks for it whatever
+    /// the link says.
+    hooks_disabled_by_config: bool,
+    /// The full hooks-config state: `enabled`, `disabled`, `unknown` (unparseable, oversize
+    /// or unreadable config: never read as "not disabled") or `legacy-profile-key`.
+    hooks_config: csq_core::session::handle_dir::CodexHooksConfigState,
+    /// `<name>.config.toml` profile files that would disable hooks under `--profile <name>`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    profile_disabled: Vec<String>,
+    /// Foreign `hooks.json` entries csq moved aside (names only; content kept).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    preserved_foreign: Vec<String>,
+    /// Per-handle hook approval status (read-only; Codex owns the approvals).
+    hook_trust: CodexHookTrustRow,
+}
+
+/// The hooks state of EVERY Codex handle dir under `base_dir` against `global`, from the
+/// same predicate and link logic the link path uses. Read-only.
+fn check_codex_hooks_handles(base_dir: &Path, global: Option<&Path>) -> Vec<CodexHooksHandleJson> {
+    use csq_core::session::handle_dir as hd;
+    hd::codex_handle_dirs(base_dir)
+        .into_iter()
+        .filter_map(|dir| {
+            let handle = dir.file_name()?.to_str()?.to_owned();
+            let state = hd::codex_hooks_link_state(&dir, global);
+            let config = hd::codex_hooks_config(&dir);
+            let config_state = config.state;
+            Some(CodexHooksHandleJson {
+                handle,
+                state,
+                hooks_disabled_by_config: config.state == hd::CodexHooksConfigState::Disabled,
+                hooks_config: config.state,
+                profile_disabled: config.profile_disabled,
+                preserved_foreign: hd::codex_hooks_preserved_foreign(&dir),
+                hook_trust: codex_hook_trust_row(&dir, global, state, config_state),
+            })
+        })
+        .collect()
+}
+
+/// One Codex slot's recorded config-write conditions.
+#[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
+struct CodexSlotWriteStatusJson {
+    slot: u16,
+    status: Vec<csq_core::providers::codex::surface::SlotWriteStatus>,
+    /// The slot's overflow marker recorded a non-raced kind (or is unrecognised): the raced
+    /// ack does not clear it, it is removed by hand. Omitted when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    overflow_stuck: bool,
+}
+
+/// Slots with a recorded config-write condition. Read-only.
+fn check_codex_slot_write_status(base_dir: &Path) -> Vec<CodexSlotWriteStatusJson> {
+    (1..=csq_core::types::MAX_ACCOUNTS)
+        .filter_map(|n| {
+            let account = AccountNum::try_from(n).ok()?;
+            let status =
+                csq_core::providers::codex::surface::slot_write_statuses(base_dir, account);
+            (!status.is_empty()).then(|| CodexSlotWriteStatusJson {
+                slot: n,
+                overflow_stuck: csq_core::providers::codex::surface::slot_overflow_stuck(
+                    base_dir, account,
+                ),
+                status,
+            })
+        })
+        .collect()
+}
+
+/// Codex slots (`config-N`) whose `config.toml` has a non-table `hooks`. Read-only.
+fn check_codex_slots_hooks_not_a_table(base_dir: &Path) -> Vec<u16> {
+    (1..=csq_core::types::MAX_ACCOUNTS)
+        .filter(|n| {
+            csq_core::providers::codex::surface::slot_config_hooks_not_a_table(
+                &base_dir.join(format!("config-{n}")).join("config.toml"),
+            )
+        })
+        .collect()
+}
+
+// ---- Codex hook trust row (N1) -- one self-contained section ------------------------------
+
+/// What Codex's own approval state says about one handle's hooks.
+#[derive(serde::Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum CodexHookTrustStatus {
+    /// Every hook is approved at its current content.
+    Trusted,
+    /// At least one hook has no approval for this handle.
+    Untrusted,
+    /// At least one approval is for different content than the hook has now.
+    Modified,
+    /// `features.hooks = false`: Codex runs no hooks.
+    Disabled,
+    /// At least one hook is approved at its current content but its entry says
+    /// `enabled = false`: the user (or a copied decision) turned it off and Codex runs none
+    /// of those hooks. Never OK.
+    DisabledByUser,
+    /// csq cannot establish the hook list or read the slot config (the global hooks file is
+    /// unreadable, oversize or malformed; Codex would reject it as a whole): no verdict
+    /// is claimed, never OK, never "no hooks".
+    Unknown,
+    /// The slot config is unparseable/unreadable or has a legacy `profile` key: whether
+    /// hooks run is not established (the base config row says why).
+    ConfigUnusable,
+    /// A hook csq cannot hash (shape not verified): no verdict claimed.
+    Unverifiable,
+    /// The global hooks file defines no hooks (or is missing): nothing to approve.
+    NoHooks,
+}
+
+/// One handle's trust row: the counts, the derived status, and whether the whole hooks row
+/// is OK. `ok` is true ONLY when the handle is linked to the global hooks AND every hook is
+/// trusted.
+#[derive(serde::Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+struct CodexHookTrustRow {
+    counts: csq_core::session::codex_hook_trust::HookTrustCounts,
+    status: CodexHookTrustStatus,
+    ok: bool,
+    /// The handle's slot config is within a quarter of the 1 MiB bound past which csq's
+    /// readers give up; the carry stops adding approvals to it.
+    config_near_limit: bool,
+    /// The handle's slot config is OVER the 1 MiB bound: csq will not read or rewrite it, and
+    /// every launch on the slot is refused until it is trimmed.
+    config_oversize: bool,
+}
+
+/// Status from the counts and the config state. Precedence: disabled (feature off),
+/// config-unusable, unknown, disabled-by-user, modified, untrusted, unverifiable, trusted,
+/// no-hooks.
+fn codex_hook_trust_status(
+    c: csq_core::session::codex_hook_trust::HookTrustCounts,
+    config: csq_core::session::handle_dir::CodexHooksConfigState,
+) -> CodexHookTrustStatus {
+    use csq_core::session::handle_dir::CodexHooksConfigState as C;
+    use CodexHookTrustStatus as T;
+    if config == C::Disabled {
+        T::Disabled
+    } else if config != C::Enabled {
+        T::ConfigUnusable
+    } else if c.unknown {
+        T::Unknown
+    } else if c.disabled > 0 {
+        T::DisabledByUser
+    } else if c.modified > 0 {
+        T::Modified
+    } else if c.untrusted > 0 {
+        T::Untrusted
+    } else if c.unverifiable > 0 {
+        T::Unverifiable
+    } else if c.trusted > 0 {
+        T::Trusted
+    } else {
+        T::NoHooks
+    }
+}
+
+/// The ONE rule for an OK hooks row: linked (a symlink to the global, or a csq copy that
+/// still equals it) AND every hook trusted.
+fn codex_hooks_row_ok(
+    link: csq_core::session::handle_dir::CodexHooksLinkState,
+    status: CodexHookTrustStatus,
+) -> bool {
+    use csq_core::session::handle_dir::CodexHooksLinkState as L;
+    matches!(link, L::Ok | L::CopyCurrent) && status == CodexHookTrustStatus::Trusted
+}
+
+/// Read-only trust row for one handle.
+fn codex_hook_trust_row(
+    handle_dir: &Path,
+    global: Option<&Path>,
+    link: csq_core::session::handle_dir::CodexHooksLinkState,
+    config: csq_core::session::handle_dir::CodexHooksConfigState,
+) -> CodexHookTrustRow {
+    let counts = csq_core::session::codex_hook_trust::hook_trust_counts(handle_dir, global);
+    let status = codex_hook_trust_status(counts, config);
+    // Linked = a symlink to the global, or a csq copy that still equals it (a host without
+    // symlink privilege). A stale copy, a foreign file, a wrong/dangling link or a missing
+    // global is never OK.
+    let ok = codex_hooks_row_ok(link, status);
+    let config_near_limit = csq_core::session::codex_hook_trust::slot_config_near_limit(handle_dir);
+    let config_oversize = csq_core::session::codex_hook_trust::slot_config_oversize(handle_dir);
+    CodexHookTrustRow {
+        counts,
+        status,
+        ok,
+        config_near_limit,
+        config_oversize,
+    }
+}
+
+/// The actionable text for a non-OK trust status (`None`: the status needs no trust row).
+fn codex_hook_trust_message(status: CodexHookTrustStatus) -> Option<&'static str> {
+    use CodexHookTrustStatus as T;
+    match status {
+        T::Untrusted => Some("hooks not approved yet: approve the hooks in this terminal's Codex"),
+        T::Modified => Some(
+            "a hook changed since it was approved: re-approve the hooks in this terminal's Codex",
+        ),
+        T::Unverifiable => {
+            Some("a hook's approval cannot be checked by csq: confirm it in this terminal's Codex")
+        }
+        T::DisabledByUser => Some(
+            "a hook is turned off (enabled = false): Codex runs none of it; re-enable it in this terminal's Codex",
+        ),
+        T::Unknown => Some(
+            "csq cannot establish this terminal's hook approvals (the hooks file or the slot config is unreadable, oversize or malformed): fix the file",
+        ),
+        T::ConfigUnusable => Some(
+            "this terminal's Codex config cannot be read, so its hook approvals are unknown: fix the config",
+        ),
+        T::Trusted | T::Disabled | T::NoHooks => None,
+    }
+}
+
+/// The warning `csq doctor` prints when the installed Codex CLI is not the version the
+/// slot-config publish guarantee was verified against
+/// ([`csq_core::providers::codex::surface::CODEX_EXCHANGE_VERIFIED_VERSION`]): csq's atomic
+/// exchange only sees every Codex write because Codex writes the config by same-directory
+/// rename, which was read from the 0.162.1 source. `None` when Codex is not installed (there
+/// is nothing to verify) or the version matches. The version is the one `build_surface_info`
+/// already read: a `<codex> --version` probe cached for the life of the process and bounded by
+/// a 6 s timeout, and only `csq doctor` runs it, so no launch or statusline waits on it. An
+/// installed Codex whose version could not be read is unverified too.
+fn codex_exchange_version_warning(cli: Option<&CliSurfaceInfo>) -> Option<String> {
+    use csq_core::providers::codex::surface::CODEX_EXCHANGE_VERIFIED_VERSION as VERIFIED;
+    let cli = cli.filter(|c| c.found)?;
+    (cli.version.as_deref() != Some(VERIFIED)).then(|| {
+        format!(
+            "the guarantee that csq's slot config.toml updates see every Codex write (Codex writes by same-directory rename) was verified only for codex-cli {VERIFIED}; this install differs or its version could not be read"
+        )
+    })
+}
+
+/// `csq doctor --ack-raced <N>`: the owner's acknowledgement of a `raced` Codex slot (see
+/// `ack_slot_raced`). Prints a fixed-vocabulary result.
+pub fn handle_ack_raced(base_dir: &Path, slot: u16, json: bool) -> Result<()> {
+    let account = AccountNum::try_from(slot)
+        .map_err(|_| anyhow::anyhow!("slot {slot} is not a valid account number"))?;
+    let outcome =
+        csq_core::providers::codex::surface::ack_slot_raced(base_dir, account).map_err(|e| {
+            anyhow::anyhow!(
+                "could not acknowledge slot {slot}: {}",
+                csq_core::providers::codex::surface::describe_slot_error(&e)
+            )
+        })?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "slot": slot,
+                "cleared": outcome.cleared,
+                "tmp_removed": outcome.tmp_removed,
+                "markers_removed": outcome.markers_removed,
+            })
+        );
+    } else if outcome.cleared || outcome.tmp_removed > 0 || outcome.markers_removed > 0 {
+        println!(
+            "slot {slot}: raced flag cleared, {} leftover config tmp file(s) and {} status marker(s) removed",
+            outcome.tmp_removed, outcome.markers_removed
+        );
+    } else {
+        println!("slot {slot}: no raced flag was recorded");
+    }
+    Ok(())
+}
+
+/// Prints the per-handle trust rows: an OK row only when `ok`, a warning for each
+/// actionable non-OK status.
+fn write_codex_hook_trust_rows(
+    rows: &[CodexHooksHandleJson],
+    out: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    for h in rows {
+        let c = h.hook_trust.counts;
+        if h.hook_trust.ok {
+            writeln!(
+                out,
+                "  Codex hooks: {} {}: linked and trusted ({} hooks approved)",
+                ok(),
+                h.handle,
+                c.trusted
+            )?;
+        } else if let Some(msg) = codex_hook_trust_message(h.hook_trust.status) {
+            writeln!(
+                out,
+                "  Codex hooks: {} {}: {msg} ({} trusted, {} untrusted, {} modified, {} unverifiable, {} disabled)",
+                warn(),
+                h.handle,
+                c.trusted,
+                c.untrusted,
+                c.modified,
+                c.unverifiable,
+                c.disabled
+            )?;
+        }
+        if h.hook_trust.config_oversize {
+            writeln!(
+                out,
+                "  Codex hooks: {} {}: the slot config.toml EXCEEDS the 1 MiB limit; csq will not read or rewrite it and refuses to launch on this slot until it is trimmed",
+                warn(),
+                h.handle
+            )?;
+        } else if h.hook_trust.config_near_limit {
+            writeln!(
+                out,
+                "  Codex hooks: {} {}: the slot config.toml is nearing the 1 MiB read limit; csq stops adding hook approvals to it. Remove stale entries or trim the file",
+                warn(),
+                h.handle
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Slots whose settings overlay (`config-N`, or the identity-keyed overlay) carries the
+/// global-only `disableAllHooks` key. Read-only.
+fn check_slots_disable_all_hooks(base_dir: &Path) -> Vec<u16> {
+    use csq_core::session::handle_dir::settings_file_has_disable_all_hooks as has;
+    (1..=csq_core::types::MAX_ACCOUNTS)
+        .filter(|n| base_dir.join(format!("config-{n}")).is_dir())
+        .filter(|n| {
+            has(&base_dir.join(format!("config-{n}")).join("settings.json"))
+                || csq_core::accounts::profiles::resolve_slot_to_uuid(base_dir, *n).is_some_and(
+                    |uuid| {
+                        has(&csq_core::accounts::identity_store::settings_path_for(
+                            base_dir, uuid,
+                        ))
+                    },
+                )
+        })
+        .collect()
+}
+
+/// Whether the user-global Claude settings file exists but is unusable.
+fn check_global_settings_unusable() -> bool {
+    super::claude_home()
+        .ok()
+        .is_some_and(|h| csq_core::session::handle_dir::global_claude_settings_unusable(&h))
+}
+
+/// Project trust diagnostics use the same canonical owner source as launch.
+fn check_codex_project_trust(
+    base_dir: &Path,
+) -> Vec<csq_core::providers::codex::trust::ProjectTrustDiagnostic> {
+    let slots: Vec<AccountNum> = (1..=csq_core::types::MAX_ACCOUNTS)
+        .filter_map(|n| AccountNum::try_from(n).ok())
+        .filter(|slot| {
+            csq_core::accounts::identity_store::is_codex_bound_slot_identity_aware(base_dir, *slot)
+        })
+        .collect();
+    csq_core::providers::codex::trust::diagnose_project_trust(base_dir, &slots)
+}
+
 /// Builds the `codex_shared_shape_mismatches` rows (v25).
 ///
 /// Delegates to `csq_core::session::handle_dir::shared_codex_shape_mismatches`,
@@ -4923,16 +5856,200 @@ fn daemon_operator_detail(info: &DaemonInfo) -> (&'static str, String) {
     }
 }
 
+/// Writes the Codex hooks rows (global, per-handle link and config states, preserved foreign
+/// files, non-table slot `hooks`) of `r` to `out`. MissingGlobal is ONE row, never one per
+/// handle.
+fn write_codex_hooks_rows(r: &DoctorReport, out: &mut impl std::io::Write) -> std::io::Result<()> {
+    if r.codex_hooks_global_missing {
+        writeln!(
+            out,
+            "  Codex hooks: {} {}",
+            warn(),
+            csq_core::session::handle_dir::CODEX_HOOKS_GLOBAL_MISSING_MESSAGE
+        )?;
+    }
+
+    // MissingGlobal is ONE row (the global row above), never one per handle.
+    for h in r.codex_hooks_handles.iter().filter(|h| {
+        h.state.is_problem()
+            && !(r.codex_hooks_global_missing
+                && h.state == csq_core::session::handle_dir::CodexHooksLinkState::MissingGlobal)
+    }) {
+        writeln!(
+            out,
+            "  Codex hooks: {} {}: {}",
+            warn(),
+            h.handle,
+            h.state.message()
+        )?;
+    }
+    for h in &r.codex_hooks_handles {
+        use csq_core::session::handle_dir::CodexHooksConfigState as C;
+        match h.hooks_config {
+            C::Disabled => writeln!(
+                out,
+                "  Codex hooks: {} {}: codex hooks disabled by config (features.hooks = false in the slot config.toml)",
+                warn(),
+                h.handle
+            )?,
+            C::Unknown => writeln!(
+                out,
+                "  Codex hooks: {} {}: config.toml is unparseable, oversize or unreadable; whether hooks are disabled is UNKNOWN",
+                warn(),
+                h.handle
+            )?,
+            C::LegacyProfileKey => writeln!(
+                out,
+                "  Codex hooks: {} {}: config.toml has a top-level `profile` key; Codex fails every command on it (remove the key)",
+                warn(),
+                h.handle
+            )?,
+            C::Enabled => {}
+        }
+        for profile in &h.profile_disabled {
+            writeln!(
+                out,
+                "  Codex hooks: {} {}: may be disabled under profile {profile} ({profile}.config.toml sets hooks off; the base config does not)",
+                warn(),
+                h.handle
+            )?;
+        }
+        for kept in &h.preserved_foreign {
+            writeln!(
+                out,
+                "  Codex hooks: {} {}: a foreign hooks file was moved aside and kept as {kept}; review it, then delete it",
+                warn(),
+                h.handle
+            )?;
+        }
+    }
+    for slot in &r.codex_slots_hooks_not_a_table {
+        writeln!(
+            out,
+            "  Codex hooks: {} slot {slot} config.toml has a `hooks` value that is not a table; the next launch drops and regenerates it",
+            warn()
+        )?;
+    }
+    for row in &r.codex_slot_write_status {
+        use csq_core::providers::codex::surface::SlotWriteStatus as W;
+        for st in &row.status {
+            let msg: std::borrow::Cow<'_, str> = match st {
+                W::Raced => "a concurrent write raced csq's config update or a leftover tmp file was kept: csq's update may be in place over a concurrent Codex write; re-check this slot's hook approvals, then run `csq doctor --ack-raced <slot>`".into(),
+                W::ExchangeUnsupported => "this filesystem has no atomic exchange; a Codex write landing during a csq config update can still be overwritten".into(),
+                W::CarrySkipped => "carry skipped: hook approvals were not copied to a terminal (the config raced or could not be used); approve them in Codex or relaunch".into(),
+                W::PurgeFailed => "csq could not clear stale hook approvals from this slot (a reused terminal id may inherit them); a swap re-approves, run `csq doctor` after fixing the config".into(),
+                W::UnrecognisedMarker => format!(
+                    "unrecognised marker; inspect and remove manually: config-{}/.csq-status-markers/<name>",
+                    row.slot
+                )
+                .into(),
+            };
+            writeln!(
+                out,
+                "  Codex hooks: {} slot {} config.toml: {msg}",
+                warn(),
+                row.slot
+            )?;
+        }
+        if row.overflow_stuck {
+            writeln!(
+                out,
+                "  Codex hooks: {} slot {} config.toml: events past the marker cap were folded into an overflow marker the acknowledgement does not clear; after re-checking this slot, remove config-{}/.csq-status-markers/overflow",
+                warn(),
+                row.slot,
+                row.slot
+            )?;
+        }
+    }
+    if r.codex_config_exchange_unavailable {
+        writeln!(
+            out,
+            "  Codex hooks: {} this platform has no atomic file exchange; csq compares before it renames, but a Codex write in that instant can still be overwritten",
+            warn()
+        )?;
+    }
+    if let Some(msg) = codex_exchange_version_warning(r.codex_cli.as_ref()) {
+        writeln!(out, "  Codex hooks: {} {msg}", warn())?;
+    }
+    write_codex_hook_trust_rows(&r.codex_hooks_handles, out)?;
+    if r.codex_hooks_handles
+        .iter()
+        .any(|h| h.state == csq_core::session::handle_dir::CodexHooksLinkState::Ok)
+    {
+        writeln!(
+            out,
+            "  Codex hooks: note: {}",
+            csq_core::session::handle_dir::CODEX_HOOKS_WRITE_THROUGH_NOTE
+        )?;
+    }
+    Ok(())
+}
+
+/// Locations are generated by the shared collector from validated numeric/UUID names.
+fn write_claude_autocompact_rows(
+    report: &csq_core::session::settings_diagnostics::AutoCompactSettingsReport,
+    out: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    for finding in &report.findings {
+        let forms: Vec<&str> = [
+            (finding.root, "autoCompactWindow"),
+            (finding.per_model, "modelSettings.*.autoCompactWindow"),
+            (finding.pct_override, "env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"),
+            (
+                finding.provider_window,
+                "env.CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(present, key)| present.then_some(key))
+        .collect();
+        if forms.is_empty() {
+            continue;
+        }
+        let forms = forms.join(" and ");
+        writeln!(
+            out,
+            "  Claude auto-compact: {} {} carries {forms}; {}",
+            warn(),
+            finding.location,
+            report.guidance
+        )?;
+    }
+    for location in &report.unreadable {
+        writeln!(
+            out,
+            "  Claude auto-compact: {} {location} unreadable; settings status unknown",
+            warn()
+        )?;
+    }
+    Ok(())
+}
+
 /// All user-supplied or third-party-supplied strings that flow into
 /// `println!` calls MUST pass through `sanitize_for_display` before
-/// being written to the terminal.  This defends against terminal
+/// being written to the terminal. This defends against terminal
 /// injection via malicious `--version` output, daemon strings, or
 /// env-var names embedded in diagnostic output (spec/13 §10).
 fn print_report(r: &DoctorReport) {
+    match super::mcp_image::text_lines(&r.mcp_images) {
+        Ok(lines) => {
+            for line in lines {
+                println!("{line}");
+            }
+        }
+        Err(_) => println!("MCP executable-file identity: undetermined (render unavailable)"),
+    }
     println!();
     println!("csq doctor — v{}", r.version);
     println!();
 
+    let count = r
+        .message_archive_records
+        .map_or_else(|| "unknown".into(), |n| n.to_string());
+    println!(
+        "  Message archive: {} ({count}/{} records)",
+        r.message_archive_state, r.message_archive_capacity
+    );
     // Platform
     println!("  Platform:    {} / {}", r.platform.os, r.platform.arch);
     // Build edition (compile-time const from the `enterprise` Cargo feature;
@@ -4940,6 +6057,32 @@ fn print_report(r: &DoctorReport) {
     // injection-safe (no user input). Distinct from the runtime audit dialect.
     println!("  Edition:     {}", crate::edition_label());
     println!();
+
+    for warning in cli_shim_warnings(&r.cli_shim) {
+        println!("  CLI shim:    {} {warning}", warn());
+        if warning != MANAGED_DAEMON_DORMANT_WARNING {
+            println!("               → launch a coherent desktop build to retry CLI refresh and managed-daemon installation.");
+        }
+    }
+    if r.cli_shim.check_status == "not_checked" {
+        println!(
+            "  CLI shim:    {} not checked — csq at {} is a symlink; the desktop does not manage it",
+            info(),
+            sanitize_for_display(r.cli_shim.path.as_deref().unwrap_or("unavailable"))
+        );
+    }
+    if r.cli_shim.receipt_status == "unreadable" {
+        println!(
+            "  CLI shim:    {} last desktop refresh receipt unreadable",
+            warn()
+        );
+    }
+    if let Some(last) = &r.cli_shim.last_refresh {
+        println!(
+            "  CLI refresh: {} / plist {} (Unix {})",
+            last.outcome, last.plist_decision, last.timestamp
+        );
+    }
 
     // an internal journal entry: top-level phase-4-incomplete alarm. Rendered BEFORE
     // the CLI surface rows so an operator scanning the report sees the
@@ -5017,6 +6160,13 @@ fn print_report(r: &DoctorReport) {
     }
     println!("  Accounts:    {acct_icon} {acct_detail}");
 
+    // Pending post-commit rescue records: named per slot with the action.
+    // A pass row means the block is transient (adoption retries on the next
+    // refresh tick); a warn row means only a fresh sign-in can clear it.
+    for rescue in &r.rescue_pending_slots {
+        println!("{}", rescue_doctor_line(rescue));
+    }
+
     // v23: stale quota polls — same channel `csq status` reads. Named per
     // slot (not a bare count) so the operator does not have to cross-run
     // `csq status` to find out WHICH slot is frozen — closes the gap where
@@ -5025,6 +6175,32 @@ fn print_report(r: &DoctorReport) {
     // v25: the cause of codex's `failed to start embedded app server`. Printed
     // even when it self-heals — an operator looking at a broken slot should see
     // WHY now, not be told to try again and hope.
+    for state in &r.codex_project_trust {
+        println!("  Codex trust: {} slot {} drift={} warning={:?}; launch synchronizes canonical owner projects when readable",
+            warn(), state.slot, state.drift, state.warning);
+    }
+
+    if let Err(e) = write_codex_hooks_rows(r, &mut std::io::stdout().lock()) {
+        eprintln!("  Codex hooks: could not write the hooks rows: {e}");
+    }
+    for slot in &r.slots_disable_all_hooks {
+        println!(
+            "  Hooks: {} slot {slot} settings carry disableAllHooks; ignored (a slot cannot disable global hooks)",
+            warn()
+        );
+    }
+    if let Err(e) =
+        write_claude_autocompact_rows(&r.claude_autocompact_status, &mut std::io::stdout().lock())
+    {
+        eprintln!("  Claude auto-compact: could not write diagnostic rows: {e}");
+    }
+    if r.global_settings_unusable {
+        println!(
+            "  Hooks: {} the global Claude settings file is unreadable or not a JSON object; terminals keep their previously materialized hooks",
+            warn()
+        );
+    }
+
     for m in &r.codex_shared_shape_mismatches {
         println!(
             "  Codex state: {} slot {} \"{}\" is a {} but codex-cli needs a {} — {}",
@@ -5075,6 +6251,29 @@ fn print_report(r: &DoctorReport) {
         }
     }
 
+    for login in &r.session_logins {
+        if let Some(line) = csq_core::credentials::session_login::finding_line(login) {
+            println!("  {line}");
+        }
+    }
+    println!(
+        "  {}",
+        csq_core::credentials::session_login::snapshot_line(
+            r.keychain_mirror.as_ref(),
+            r.keychain_mirror_age_secs,
+            r.sessions_undetermined
+        )
+    );
+    if let Some(line) = keychain_orphans_line(
+        &csq_core::credentials::keychain::orphans::OrphanDiagnostic {
+            status: r.keychain_orphans.clone(),
+            error: r.keychain_orphans_error,
+            age_secs: r.keychain_orphans_age_secs,
+        },
+    ) {
+        println!("  {line}");
+    }
+
     // Broker-failed sentinels
     if r.broker_failed.count > 0 {
         for entry in &r.broker_failed.entries {
@@ -5089,6 +6288,10 @@ fn print_report(r: &DoctorReport) {
                 entry.account,
             );
         }
+    }
+
+    for line in render_refresh_audit_lines(&r.refresh_audit) {
+        println!("{line}");
     }
 
     // Daemon refresh posture. Printed only when it is NOT the plain leader
@@ -5269,6 +6472,10 @@ fn print_report(r: &DoctorReport) {
         );
     }
 
+    for line in render_native_home_lines(&r.native_homes) {
+        println!("{line}");
+    }
+
     // Resurrection forensics — only printed when the daemon has had
     // to rebuild a canonical credential file at least once. Non-zero
     // is always a WARN because it implies a broken write path that
@@ -5305,6 +6512,18 @@ fn print_report(r: &DoctorReport) {
     // RN1-D R1: Pass-0 skipped slots warning (post-sentinel only).
     if !r.pass0_skipped_slots.is_empty() {
         render_pass0_skipped_slots(&r.pass0_skipped_slots);
+    }
+
+    // orgident r7 item 9: slots refused for new launches (shared sign-in).
+    for line in launch_blocked_lines(&r.launch_blocked_slots) {
+        println!("  Launch block:  {} {line}", warn());
+    }
+    if r.launch_blocked_unknown_state {
+        println!(
+            "  Launch block:  {} {}",
+            warn(),
+            csq_core::accounts::launch_block::doctor_damaged_line()
+        );
     }
 
     // M04 signing key status.
@@ -5814,6 +7033,45 @@ fn warn() -> &'static str {
     "\x1b[33m⚠\x1b[0m"
 }
 
+/// One doctor check row for a pending rescue record.
+///
+/// `Warn` (`⚠`) for EVERY pending state (R3 corr M-1 / 3e): an Adoptable
+/// record is a BLOCKED refresh, not a healthy one — the next tick retries it,
+/// but until it installs or is superseded the account cannot refresh. `Warn`
+/// also covers a record adoption can never install and the explicit UNKNOWN
+/// state, with the fixed-vocabulary action from `csq-core`. Pure so a test
+/// reads the exact bytes; names the slot (and label when known) or the
+/// identity UUID, never a path.
+fn rescue_doctor_line(rescue: &csq_core::credentials::rescue::PendingRescue) -> String {
+    use csq_core::credentials::rescue::RescuePendingState;
+    let icon = match rescue.state {
+        RescuePendingState::Unadoptable
+        | RescuePendingState::Unknown
+        | RescuePendingState::Adoptable => warn(),
+    };
+    if rescue.state == RescuePendingState::Unknown {
+        // The fixed message is the whole row: there is no subject to name.
+        return format!("  Rescue:      {icon} {}", rescue.state.message());
+    }
+    let name = match rescue.slot {
+        Some(slot) if rescue.label.is_empty() => format!("slot {slot}"),
+        Some(slot) => format!("slot {} \"{}\"", slot, sanitize_for_display(&rescue.label)),
+        None => match rescue.identity_uuid.as_deref() {
+            Some(uuid) => format!("identity {uuid}"),
+            None => "identity unknown".to_string(),
+        },
+    };
+    format!("  Rescue:      {icon} {name} — {}", rescue.state.message())
+}
+
+/// Doctor text for the duplicate-refresh-token audit. Pure so a test reads the exact bytes.
+fn render_refresh_audit_lines(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|l| format!("  Refresh:     {} {}", fail(), sanitize_for_display(l)))
+        .collect()
+}
+
 fn fail() -> &'static str {
     "\x1b[31m✗\x1b[0m"
 }
@@ -5824,7 +7082,555 @@ fn info() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    /// F5/L3: two slots holding one refresh grant. Writes the SAME sentinel refresh token
+    /// into both identities' canonical credentials.
+    fn shared_grant_fixture(sentinel: &str) -> tempfile::TempDir {
+        use csq_core::credentials::{AnthropicCredentialFile, CredentialFile, OAuthPayload};
+        use csq_core::types::{AccessToken, RefreshToken};
+        let dir = csq_core::testing::identity_fixtures::identity_only_fixture(2);
+        for slot in [1u16, 2] {
+            let uuid = csq_core::testing::identity_fixtures::fixture_uuid_for_slot(slot);
+            let path = csq_core::accounts::identity_store::credentials_path_for(dir.path(), uuid);
+            let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
+                claude_ai_oauth: OAuthPayload {
+                    access_token: AccessToken::new(format!("at-{slot}")),
+                    refresh_token: RefreshToken::new(sentinel.into()),
+                    expires_at: 4_102_444_800_000,
+                    scopes: vec![],
+                    subscription_type: None,
+                    rate_limit_tier: None,
+                    extra: Default::default(),
+                },
+                extra: Default::default(),
+            });
+            csq_core::credentials::save(&path, &creds).unwrap();
+        }
+        dir
+    }
+
+    /// F5/L3 doctor twin: the CLI doctor report carries the audit's text, names both slots,
+    /// tells the user to `csq login`, and holds no token bytes in text or JSON.
+    #[test]
+    fn doctor_reports_duplicate_refresh_grant_without_token_bytes() {
+        const SENTINEL: &str = "SENTINEL-DOCTOR-RT-5e1b88";
+        let dir = shared_grant_fixture(SENTINEL);
+        let report = build_report(dir.path());
+        let text = render_refresh_audit_lines(&report.refresh_audit).join("\n");
+        assert!(text.contains("slots 1 and 2"), "{text}");
+        assert!(text.contains("csq login 2"), "{text}");
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("refresh_audit"));
+        assert!(!text.contains(SENTINEL) && !json.contains(SENTINEL));
+        let clean = csq_core::testing::identity_fixtures::identity_only_fixture(2);
+        assert!(build_report(clean.path()).refresh_audit.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn image_admission_preserves_entire_projection_and_single_verifier() {
+        let _lock = csq_core::platform::test_env::lock();
+        use std::cell::Cell;
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("target");
+        let expected = crate::VERSION_LINE;
+        for case in 0..5 {
+            let _ = std::fs::remove_file(&target);
+            if case == 1 {
+                std::os::unix::fs::symlink(base.path().join("unused"), &target).unwrap();
+            } else if case > 1 {
+                std::fs::write(&target, b"regular fixture target").unwrap();
+            }
+            let path = if case == 0 {
+                None
+            } else {
+                Some(target.as_path())
+            };
+            let reply = match case {
+                3 => Some("stale fixture version".to_string()),
+                4 => None,
+                _ => Some(expected.to_string()),
+            };
+            let old_count = Cell::new(0);
+            let old = check_cli_shim_with(base.path(), path, expected, None, |_| {
+                old_count.set(old_count.get() + 1);
+                reply.clone()
+            });
+            let count = Cell::new(0);
+            let (new, admitted) =
+                check_cli_shim_with_image(base.path(), path, expected, None, |_| {
+                    count.set(count.get() + 1);
+                    reply.clone()
+                });
+            assert_eq!(
+                serde_json::to_value(&new).unwrap(),
+                serde_json::to_value(&old).unwrap(),
+                "image admission must preserve the complete legacy projection"
+            );
+            assert_eq!(count.get(), old_count.get());
+            assert_eq!(
+                count.get(),
+                usize::from(case > 1),
+                "image admission must retain exactly one existing verification"
+            );
+            assert_eq!(admitted.is_some(), case == 2);
+        }
+        std::fs::write(&target, b"old target").unwrap();
+        let replacement = base.path().join("replacement");
+        std::fs::write(&replacement, b"replacement target").unwrap();
+        let count = Cell::new(0);
+        let (new, admitted) =
+            check_cli_shim_with_image(base.path(), Some(&target), expected, None, |_| {
+                count.set(count.get() + 1);
+                std::fs::rename(&replacement, &target).unwrap();
+                Some(expected.to_string())
+            });
+        assert_eq!(count.get(), 1);
+        assert!(
+            admitted.is_none(),
+            "target replacement must invalidate retained image admission"
+        );
+        let old = check_cli_shim_with(base.path(), Some(&target), expected, None, |_| {
+            Some(expected.to_string())
+        });
+        assert_eq!(
+            serde_json::to_value(new).unwrap(),
+            serde_json::to_value(old).unwrap()
+        );
+        std::fs::remove_file(&target).unwrap();
+        let count = Cell::new(0);
+        let (new, admitted) =
+            check_cli_shim_with_image(base.path(), Some(&target), expected, None, |_| {
+                count.set(count.get() + 1);
+                Some(expected.to_string())
+            });
+        assert_eq!(count.get(), 1);
+        assert!(admitted.is_none());
+        let old = check_cli_shim_with(base.path(), Some(&target), expected, None, |_| {
+            Some(expected.to_string())
+        });
+        assert_eq!(
+            serde_json::to_value(new).unwrap(),
+            serde_json::to_value(old).unwrap()
+        );
+    }
     use super::*;
+
+    #[test]
+    fn message_archive_doctor_absent_is_known_empty_without_creating_store() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(message_archive_snapshot(dir.path()), (Some(0), "OK"));
+        assert!(!dir.path().join("messages").exists());
+    }
+
+    #[test]
+    fn message_archive_doctor_full_state_comes_from_actual_capacity_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("messages/archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for i in 0..ARCHIVE_CAPACITY {
+            let id = format!("00000000-0000-4000-8000-{i:012}");
+            let row = serde_json::json!({
+                "schema": "csq.message.v1", "id": id, "thread": id,
+                "from": {"pid": 21, "started_at": 1, "surface": "claude-code",
+                    "handle_dir_hash": "abc", "handle_dir": "/private/handle"},
+                "to": {"pid": 22, "started_at": 1, "surface": "codex"},
+                "body": "PRIVATE-ARCHIVE-BODY", "created_at": now - 100, "read_at": now - 100
+            });
+            std::fs::write(
+                archive.join(format!("{id}.json")),
+                serde_json::to_vec(&row).unwrap(),
+            )
+            .unwrap();
+        }
+        let mut report = make_report(TerminalInfo {
+            modern_count: 0,
+            legacy_count: 0,
+            check_available: false,
+        });
+        (report.message_archive_records, report.message_archive_state) =
+            message_archive_snapshot(dir.path());
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["message_archive_records"], 8000);
+        assert_eq!(json["message_archive_state"], "FULL");
+        assert_eq!(
+            std::fs::read_dir(&archive).unwrap().count(),
+            ARCHIVE_CAPACITY
+        );
+        assert!(!dir.path().join("messages/.lock").exists());
+    }
+
+    #[test]
+    fn message_archive_doctor_counts_retained_history_and_fails_closed_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("messages/archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let retained_id = "00000000-0000-4000-8000-000000000001";
+        let expired_id = "00000000-0000-4000-8000-000000000002";
+        let fixture = |id: &str, time: u64| {
+            serde_json::to_vec(&serde_json::json!({
+            "schema": "csq.message.v1", "id": id, "thread": id,
+            "from": {"pid": 21, "started_at": 1, "surface": "claude-code",
+                "handle_dir_hash": "abc", "handle_dir": "/private/handle", "name": "privatepeer"},
+            "to": {"pid": 22, "started_at": 1, "surface": "codex"},
+            "body": "PRIVATE-ARCHIVE-BODY", "created_at": time, "read_at": time
+        })).unwrap()
+        };
+        let retained = archive.join(format!("{retained_id}.json"));
+        let expired = archive.join(format!("{expired_id}.json"));
+        let bytes = fixture(retained_id, now - 100);
+        let expired_bytes = fixture(
+            expired_id,
+            now - csq_core::messaging::limits::RETENTION_SECS - 100,
+        );
+        std::fs::write(&retained, &bytes).unwrap();
+        std::fs::write(&expired, &expired_bytes).unwrap();
+        let mut report = make_report(TerminalInfo {
+            modern_count: 0,
+            legacy_count: 0,
+            check_available: false,
+        });
+        (report.message_archive_records, report.message_archive_state) =
+            message_archive_snapshot(dir.path());
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["schema_version"], DOCTOR_SCHEMA_VERSION);
+        assert_eq!(json["schema"], doctor_schema_string());
+        assert_eq!(json["message_archive_records"], 1);
+        assert_eq!(json["message_archive_capacity"], 8000);
+        assert_eq!(json["message_archive_state"], "OK");
+        let wire = json.to_string();
+        for private in [
+            retained_id,
+            expired_id,
+            "PRIVATE-ARCHIVE-BODY",
+            "/private/handle",
+            "privatepeer",
+        ] {
+            assert!(!wire.contains(private));
+        }
+        assert_eq!(std::fs::read(&retained).unwrap(), bytes);
+        assert_eq!(std::fs::read(&expired).unwrap(), expired_bytes);
+        assert_eq!(std::fs::read_dir(&archive).unwrap().count(), 2);
+        assert!(!dir.path().join("messages/.lock").exists());
+
+        std::fs::write(&retained, b"bad archive record").unwrap();
+        (report.message_archive_records, report.message_archive_state) =
+            message_archive_snapshot(dir.path());
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json.get("message_archive_records").is_none());
+        assert_eq!(json["message_archive_state"], "UND");
+        assert_eq!(json["message_archive_capacity"], 8000);
+        assert_eq!(std::fs::read(&retained).unwrap(), b"bad archive record");
+        assert_eq!(std::fs::read(&expired).unwrap(), expired_bytes);
+        assert_eq!(std::fs::read_dir(&archive).unwrap().count(), 2);
+        assert!(!dir.path().join("messages/rejected").exists());
+    }
+
+    #[test]
+    fn r0_m4_doctor_service_state_serializes_nine_current_observation_cases() {
+        let _env = csq_core::platform::test_env::lock();
+        use super::super::daemon::ManagedJobState::{Loaded, Unknown, Unloaded};
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("csq");
+        std::fs::write(&target, b"fixture").unwrap();
+        let expected = "csq 2.21.0 (community)";
+        let cases = [
+            (Some(true), Some(Loaded), Some(false), Some("running")),
+            (Some(true), Some(Loaded), Some(true), Some("dormant")),
+            (Some(true), Some(Loaded), None, Some("unknown")),
+            (Some(true), Some(Unloaded), None, Some("not_loaded")),
+            (Some(true), Some(Unknown), None, Some("unknown")),
+            (Some(true), None, None, None),
+            (Some(false), Some(Loaded), Some(true), None),
+            (None, Some(Loaded), Some(false), None),
+            (Some(false), Some(Unloaded), None, None),
+        ];
+        for (installed, observed, dormant, wanted) in cases {
+            let mut info =
+                check_cli_shim_with(dir.path(), Some(&target), expected, installed, |_| {
+                    Some(expected.into())
+                });
+            let queried = std::cell::Cell::new(false);
+            if let Some(observed) = observed {
+                observe_managed_service(&mut info, observed, || {
+                    queried.set(true);
+                    dormant
+                });
+            }
+            assert_eq!(
+                queried.get(),
+                installed == Some(true) && observed == Some(Loaded)
+            );
+            let json = serde_json::to_value(&info).unwrap();
+            assert_eq!(
+                json.get("managed_service_state")
+                    .and_then(serde_json::Value::as_str),
+                wanted,
+                "installed={installed:?}, observed={observed:?}, dormant={dormant:?}"
+            );
+            assert_eq!(
+                json.get("managed_service_state").is_none(),
+                wanted.is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn r0_m3_doctor_not_loaded_warning_requires_fresh_definite_native_state() {
+        assert!(MANAGED_SERVICE_NOT_LOADED_WARNING
+            .contains("rerun the desktop CLI refresh to register the managed service"));
+        let _env = csq_core::platform::test_env::lock();
+        use super::super::daemon::ManagedJobState;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("csq");
+        std::fs::write(&target, b"fixture").unwrap();
+        let expected = "csq 2.21.0 (community)";
+        for installed in [None, Some(false), Some(true)] {
+            for state in [
+                ManagedJobState::Loaded,
+                ManagedJobState::Unloaded,
+                ManagedJobState::Unknown,
+            ] {
+                let mut info =
+                    check_cli_shim_with(dir.path(), Some(&target), expected, installed, |_| {
+                        Some(expected.into())
+                    });
+                observe_managed_service(&mut info, state, || Some(false));
+                assert_eq!(
+                    cli_shim_warnings(&info),
+                    if installed == Some(true) && state == ManagedJobState::Unloaded {
+                        vec![MANAGED_SERVICE_NOT_LOADED_WARNING]
+                    } else {
+                        vec![]
+                    },
+                    "installed={installed:?}, state={state:?}"
+                );
+                let json = serde_json::to_value(&info).unwrap();
+                assert!(json.get("managed_job_loaded").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn cli_shim_doctor_only_requires_a_plist_with_desktop_management_evidence() {
+        let _env = csq_core::platform::test_env::lock();
+        use csq_core::cli_deps::cli_shim_refresh::{write_refresh_receipt, ShimRefreshReceipt};
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("csq");
+        std::fs::write(&target, b"binary").unwrap();
+        let expected = "csq 2.21.0 (enterprise)";
+        let cli_only =
+            check_cli_shim_with(dir.path(), Some(&target), expected, Some(false), |_| {
+                Some(expected.to_owned())
+            });
+        assert_eq!(cli_only.check_status, "current");
+        assert!(!cli_only.desktop_managed);
+        assert!(!cli_only.stale_or_unverifiable);
+        assert!(cli_shim_warnings(&cli_only).is_empty());
+        let existing_plist =
+            check_cli_shim_with(dir.path(), Some(&target), expected, Some(true), |_| {
+                Some(expected.to_owned())
+            });
+        assert!(existing_plist.desktop_managed);
+        assert!(cli_shim_warnings(&existing_plist).is_empty());
+        let mut receipt = ShimRefreshReceipt {
+            outcome: "updated".into(),
+            target_path: Some(dir.path().join("another-csq")),
+            expected_version_line: expected.into(),
+            verified_version_line: Some(expected.into()),
+            plist_decision: "repaired".into(),
+            stale_plist_decision: "retained_verified".into(),
+            timestamp: 10,
+        };
+        write_refresh_receipt(dir.path(), &receipt).unwrap();
+        let unrelated =
+            check_cli_shim_with(dir.path(), Some(&target), expected, Some(false), |_| {
+                Some(expected.to_owned())
+            });
+        assert!(!unrelated.desktop_managed);
+        assert!(cli_shim_warnings(&unrelated).is_empty());
+        receipt.target_path = Some(target.clone());
+        write_refresh_receipt(dir.path(), &receipt).unwrap();
+        let desktop = check_cli_shim_with(dir.path(), Some(&target), expected, Some(false), |_| {
+            Some(expected.to_owned())
+        });
+        assert!(desktop.desktop_managed);
+        assert_eq!(
+            cli_shim_warnings(&desktop),
+            vec!["managed daemon plist not installed"]
+        );
+    }
+
+    #[test]
+    fn cli_shim_doctor_dormancy_warning_uses_fresh_state_not_historical_receipt() {
+        let _env = csq_core::platform::test_env::lock();
+        use csq_core::cli_deps::cli_shim_refresh::{write_refresh_receipt, ShimRefreshReceipt};
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("csq");
+        std::fs::write(&target, b"binary").unwrap();
+        let expected = "csq 2.21.0 (community)";
+        let warning = "managed daemon is loaded but stopped — token refresh for this managed service is not running; start it with `launchctl kickstart gui/$(id -u)/foundation.terrene.csq`";
+        for historical_decision in ["daemon_dormant", "already_current"] {
+            write_refresh_receipt(
+                dir.path(),
+                &ShimRefreshReceipt {
+                    outcome: "current".into(),
+                    target_path: Some(target.clone()),
+                    expected_version_line: expected.into(),
+                    verified_version_line: Some(expected.into()),
+                    plist_decision: historical_decision.into(),
+                    stale_plist_decision: "retained_verified".into(),
+                    timestamp: 42,
+                },
+            )
+            .unwrap();
+            for fresh_dormant in [None, Some(false), Some(true)] {
+                // _with never queries the host. Inject only the current read-only
+                // native observation, independently of the historical receipt.
+                let mut info =
+                    check_cli_shim_with(dir.path(), Some(&target), expected, Some(true), |_| {
+                        Some(expected.into())
+                    });
+                info.managed_daemon_dormant = fresh_dormant;
+                let expected_warnings = if fresh_dormant == Some(true) {
+                    vec![warning]
+                } else {
+                    vec![]
+                };
+                assert_eq!(
+                    cli_shim_warnings(&info),
+                    expected_warnings,
+                    "fresh={fresh_dormant:?}, historical={historical_decision}"
+                );
+                let json = serde_json::to_value(&info).unwrap();
+                assert!(json.get("managed_daemon_dormant").is_none());
+                assert_eq!(json["last_refresh"]["plist_decision"], historical_decision);
+                assert_eq!(json["check_status"], "current");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_shim_doctor_does_not_verify_or_mark_a_symlink_stale() {
+        let _env = csq_core::platform::test_env::lock();
+        let dir = tempfile::tempdir().unwrap();
+        let cellar = dir.path().join("cellar-csq");
+        let target = dir.path().join("csq");
+        std::fs::write(&cellar, b"binary").unwrap();
+        std::os::unix::fs::symlink(&cellar, &target).unwrap();
+        let link = check_cli_shim_with(
+            dir.path(),
+            Some(&target),
+            "csq 2.21.0 (community)",
+            Some(false),
+            |_| panic!("an unverified symlink must not reach the verification/exec callback"),
+        );
+        assert_eq!(link.check_status, "not_checked");
+        assert!(!link.stale_or_unverifiable);
+        assert!(!link.desktop_managed);
+        assert!(!link.managed_plist_allowed);
+        assert!(cli_shim_warnings(&link).is_empty());
+    }
+
+    #[test]
+    fn cli_shim_doctor_rechecks_live_binary_even_after_a_successful_receipt() {
+        let _env = csq_core::platform::test_env::lock();
+        use csq_core::cli_deps::cli_shim_refresh::{write_refresh_receipt, ShimRefreshReceipt};
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("csq");
+        std::fs::write(&target, b"binary").unwrap();
+        let receipt = ShimRefreshReceipt {
+            outcome: "updated".into(),
+            target_path: Some(target.clone()),
+            expected_version_line: "csq 2.21.0 (enterprise)".into(),
+            verified_version_line: Some("csq 2.21.0 (enterprise)".into()),
+            plist_decision: "repaired".into(),
+            stale_plist_decision: "retained_verified".into(),
+            timestamp: 10,
+        };
+        write_refresh_receipt(dir.path(), &receipt).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let broken = check_cli_shim_with(
+            dir.path(),
+            Some(&target),
+            "csq 2.20.0 (enterprise)",
+            Some(false),
+            |_| {
+                calls.set(calls.get() + 1);
+                None
+            },
+        );
+        assert_eq!(calls.get(), 1);
+        assert!(broken.stale_or_unverifiable);
+        assert!(!broken.managed_plist_allowed);
+        assert_eq!(
+            broken.last_refresh.as_ref().unwrap().plist_decision,
+            "repaired"
+        );
+        assert_eq!(
+            cli_shim_warnings(&broken),
+            vec![
+                "CLI shim stale or unverifiable",
+                "managed daemon plist not installed"
+            ]
+        );
+        let stale = check_cli_shim_with(
+            dir.path(),
+            Some(&target),
+            "csq 2.20.0 (enterprise)",
+            Some(true),
+            |_| Some("csq 2.20.0 (enterprise)".into()),
+        );
+        assert!(
+            stale.stale_or_unverifiable,
+            "desktop receipt supplies newer expected identity"
+        );
+        let repaired = check_cli_shim_with(
+            dir.path(),
+            Some(&target),
+            "csq 2.20.0 (enterprise)",
+            Some(true),
+            |_| receipt.verified_version_line.clone(),
+        );
+        assert!(!repaired.stale_or_unverifiable);
+        assert!(repaired.managed_plist_allowed);
+        assert!(cli_shim_warnings(&repaired).is_empty());
+        let json = serde_json::to_value(repaired).unwrap();
+        assert_eq!(json["last_refresh"]["outcome"], "updated");
+        assert_eq!(json["last_refresh"]["timestamp"], 10);
+        assert_eq!(json["managed_plist_installed"], true);
+    }
+
+    #[test]
+    fn cli_shim_doctor_reports_receipt_corruption_without_skipping_the_live_check() {
+        let _env = csq_core::platform::test_env::lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path()
+                .join(csq_core::cli_deps::cli_shim_refresh::RECEIPT_FILENAME),
+            b"corrupt",
+        )
+        .unwrap();
+        let missing = check_cli_shim_with(dir.path(), None, "csq 2.21.0 (community)", None, |_| {
+            panic!("no target to execute")
+        });
+        assert_eq!(missing.receipt_status, "unreadable");
+        assert!(missing.stale_or_unverifiable);
+        assert_eq!(missing.managed_plist_installed, None);
+        assert_eq!(
+            cli_shim_warnings(&missing),
+            vec!["CLI shim stale or unverifiable"]
+        );
+    }
+
     use tempfile::TempDir;
 
     // ── stale-quota remedy: doctor must not contradict `csq status` ───────
@@ -5845,6 +7651,7 @@ mod tests {
     /// rot into a time-bomb (`feedback_no_test_timebombs`).
     fn health_with(outcome: csq_core::quota::PollOutcome) -> csq_core::quota::PollerHealth {
         csq_core::quota::PollerHealth {
+            origin: None,
             last_attempt_at: 1_700_000_000.0,
             last_outcome: outcome,
             consecutive_failures: 3,
@@ -6140,6 +7947,147 @@ mod tests {
         // surface (`non_native_stale_remedy_still_prescribes_an_action`).
         let r = stale_quota_remedy(13, Surface::ClaudeCode, "api_key", &kimi_bearer, None);
         assert!(r.contains("csq daemon status"), "{r}");
+    }
+
+    /// A pending rescue record is a doctor CHECK ROW naming the slot: Warn in
+    /// EVERY state (R3 3e) — an Adoptable record still BLOCKS the refresh
+    /// until it installs. The unadoptable row carries the sign-in action; the
+    /// adoptable row must not prescribe a sign-in. Sourced from the SAME
+    /// `pending_rescues` accessor `csq status` uses, so the two surfaces
+    /// cannot disagree.
+    ///
+    /// RED on the pre-fix code: the old renderer returned Pass for Adoptable,
+    /// so the `adoptable is a Warn row` assertion below fails (✓ is present,
+    /// ⚠ is absent) with no other change.
+    #[test]
+    fn rescue_pending_rows_render_warn_in_every_state() {
+        use csq_core::credentials::rescue::{PendingRescue, RescuePendingState};
+
+        let unadoptable = PendingRescue {
+            slot: Some(3),
+            label: "user@example.test".into(),
+            state: RescuePendingState::Unadoptable,
+            identity_uuid: None,
+        };
+        let line = rescue_doctor_line(&unadoptable);
+        assert!(line.contains("slot 3"), "names the slot: {line}");
+        assert!(
+            line.contains("a saved login could not be restored; sign in again for this account"),
+            "unadoptable row must state the action: {line}"
+        );
+        assert!(line.contains('⚠'), "unadoptable is a Warn row: {line}");
+        assert!(
+            !line.contains('✓'),
+            "unadoptable is never a Pass row: {line}"
+        );
+
+        let adoptable = PendingRescue {
+            slot: Some(4),
+            label: String::new(),
+            state: RescuePendingState::Adoptable,
+            identity_uuid: None,
+        };
+        let line = rescue_doctor_line(&adoptable);
+        assert!(line.contains("slot 4"), "names the slot: {line}");
+        assert!(
+            line.contains('⚠'),
+            "an adoptable record still blocks the refresh — Warn row: {line}"
+        );
+        assert!(
+            !line.contains('✓'),
+            "a pending rescue is never a Pass row: {line}"
+        );
+        assert!(
+            !line.contains("sign in again"),
+            "a transient block must not prescribe a sign-in: {line}"
+        );
+    }
+
+    /// The doctor row is driven by the real on-disk record: an unparseable
+    /// record in a bound slot's identity directory produces the Warn row.
+    #[test]
+    fn rescue_pending_row_reads_the_on_disk_record() {
+        use csq_core::credentials::rescue::RescuePendingState;
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = csq_core::testing::identity_fixtures::fixture_uuid_for_slot(5);
+        let mut profiles = csq_core::accounts::profiles::ProfilesFile::empty();
+        profiles.by_slot.insert("5".to_string(), uuid);
+        csq_core::accounts::profiles::save(
+            &csq_core::accounts::profiles::profiles_path(base),
+            &profiles,
+        )
+        .unwrap();
+        let identity_dir = csq_core::accounts::identity_store::credentials_path_for(base, uuid)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::fs::create_dir_all(&identity_dir).unwrap();
+        std::fs::write(
+            csq_core::credentials::rescue::rescue_record_path(&identity_dir),
+            b"not json",
+        )
+        .unwrap();
+
+        let rows = csq_core::credentials::rescue::pending_rescues(base);
+        assert_eq!(rows.len(), 1, "the bound slot must be named: {rows:?}");
+        assert_eq!(rows[0].slot, Some(5));
+        assert_eq!(rows[0].state, RescuePendingState::Unadoptable);
+        assert!(rescue_doctor_line(&rows[0])
+            .contains("a saved login could not be restored; sign in again for this account"));
+    }
+
+    /// The profiles-unreadable fallback names the IDENTITY: the doctor row
+    /// carries the canonical UUID and the sign-in action.
+    ///
+    /// RED mutation: render a no-slot row as `slot 0` — the `identity <uuid>`
+    /// assertion fails.
+    #[test]
+    fn rescue_pending_uuid_row_names_the_identity() {
+        use csq_core::credentials::rescue::{PendingRescue, RescuePendingState};
+
+        let uuid = csq_core::testing::identity_fixtures::fixture_uuid_for_slot(12);
+        let row = PendingRescue {
+            slot: None,
+            label: String::new(),
+            state: RescuePendingState::Unadoptable,
+            identity_uuid: Some(uuid.to_canonical_string()),
+        };
+        let line = rescue_doctor_line(&row);
+        assert!(
+            line.contains(&format!("identity {uuid}")),
+            "names the identity UUID: {line}"
+        );
+        assert!(line.contains('⚠'), "unadoptable is a Warn row: {line}");
+        assert!(
+            line.contains("a saved login could not be restored; sign in again for this account"),
+            "carries the shared action text: {line}"
+        );
+        assert!(!line.contains("slot "), "no invented slot: {line}");
+    }
+
+    /// The explicit UNKNOWN state is a Warn row carrying the fixed message,
+    /// exactly as `csq status` renders it.
+    #[test]
+    fn rescue_pending_unknown_row_is_a_warn_with_the_fixed_message() {
+        use csq_core::credentials::rescue::{PendingRescue, RescuePendingState};
+
+        let line = rescue_doctor_line(&PendingRescue {
+            slot: None,
+            label: String::new(),
+            state: RescuePendingState::Unknown,
+            identity_uuid: None,
+        });
+        assert!(
+            line.contains("rescue status unknown: profiles unreadable"),
+            "carries the fixed message: {line}"
+        );
+        assert!(line.contains('⚠'), "unknown is a Warn row: {line}");
+        assert!(!line.contains('✓'), "unknown is never a Pass row: {line}");
+        assert!(
+            !line.contains("sign in again"),
+            "unknown must not prescribe a sign-in it cannot justify: {line}"
+        );
     }
 
     /// W3-3 (an internal journal entry): `count_authenticated_slots` for native Kimi/Grok
@@ -6825,9 +8773,267 @@ mod tests {
         assert!(!daemon_line.contains("daemon not running"), "{daemon_line}");
     }
 
+    #[test]
+    fn claude_autocompact_doctor_json_and_human_rows_share_report() {
+        use csq_core::session::settings_diagnostics::{
+            AutoCompactSettingsFinding, AutoCompactSettingsReport,
+        };
+        let mut report = make_report(TerminalInfo {
+            modern_count: 0,
+            legacy_count: 0,
+            check_available: true,
+        });
+        report.claude_autocompact_status = AutoCompactSettingsReport {
+            findings: vec![AutoCompactSettingsFinding {
+                location: "config-1/settings.json".into(),
+                root: true,
+                per_model: true,
+                pct_override: false,
+                provider_window: false,
+            }],
+            unreadable: vec!["config-2/settings.json".into()],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["claude_autocompact_status"]["findings"][0]["root"],
+            true
+        );
+        assert_eq!(
+            json["claude_autocompact_status"]["findings"][0]["per_model"],
+            true
+        );
+        assert_eq!(
+            json["claude_autocompact_status"]["unreadable"][0],
+            "config-2/settings.json"
+        );
+        let mut bytes = Vec::new();
+        write_claude_autocompact_rows(&report.claude_autocompact_status, &mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("config-1/settings.json carries autoCompactWindow and modelSettings.*.autoCompactWindow"));
+        assert!(text.contains("config-2/settings.json unreadable; settings status unknown"));
+        assert!(text
+            .lines()
+            .all(|line| line.starts_with(&format!("  Claude auto-compact: {} ", warn()))));
+        bytes = Vec::new();
+        write_claude_autocompact_rows(&Default::default(), &mut bytes).unwrap();
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn claude_autocompact_doctor_env_flags_render_independently() {
+        use csq_core::session::settings_diagnostics::{
+            AutoCompactSettingsFinding, AutoCompactSettingsReport,
+        };
+        for (pct_override, provider_window, expected) in [
+            (true, false, "env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"),
+            (false, true, "env.CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
+            (
+                true,
+                true,
+                "env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE and env.CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+            ),
+        ] {
+            let report = AutoCompactSettingsReport {
+                findings: vec![AutoCompactSettingsFinding {
+                    location: "config-3/settings.json".into(),
+                    root: false,
+                    per_model: false,
+                    pct_override,
+                    provider_window,
+                }],
+                unreadable: Vec::new(),
+                ..Default::default()
+            };
+            let json = serde_json::to_value(&report).unwrap();
+            assert_eq!(json["findings"][0]["pct_override"], pct_override);
+            assert_eq!(json["findings"][0]["provider_window"], provider_window);
+            let mut bytes = Vec::new();
+            write_claude_autocompact_rows(&report, &mut bytes).unwrap();
+            assert_eq!(
+                String::from_utf8(bytes).unwrap(),
+                format!(
+                    "  Claude auto-compact: {} config-3/settings.json carries {expected}; {}\n",
+                    warn(),
+                    report.guidance
+                )
+            );
+        }
+    }
+
+    fn orphan_status() -> csq_core::credentials::keychain::orphans::OrphanSweepStatus {
+        csq_core::credentials::keychain::orphans::OrphanSweepStatus {
+            keychain_items: 9,
+            foreign_items: 2,
+            orphan_candidates: 4,
+            pending: 3,
+            deleted_total: 1,
+            kept_sole_copy: 2,
+            kept_pid_in_use: 5,
+            kept_revived_after_read: 6,
+            kept_mint_busy: 7,
+            kept_process_table_unknown: 10,
+            process_table_unknown: Some(
+                csq_core::credentials::keychain::orphans::ProcessTableUnknown::ProcessUnreadable,
+            ),
+            kept_other: 8,
+            kept_siblings: 9,
+            ..Default::default()
+        }
+    }
+
+    fn no_terminals() -> TerminalInfo {
+        TerminalInfo {
+            modern_count: 0,
+            legacy_count: 0,
+            check_available: false,
+        }
+    }
+
+    /// The text line is `None` only when nothing was ever published and nothing
+    /// is wrong; every other state says something distinct.
+    #[test]
+    fn keychain_orphans_line_distinguishes_absent_none_orphans_undetermined_and_error() {
+        use csq_core::credentials::keychain::orphans::{
+            OrphanDiagnostic, OrphanSweepStatus, UndeterminedReason,
+        };
+        let diag = |status: Option<OrphanSweepStatus>, error| OrphanDiagnostic {
+            status,
+            error,
+            age_secs: Some(0),
+        };
+        assert_eq!(keychain_orphans_line(&diag(None, None)), None);
+
+        let clean = OrphanSweepStatus {
+            keychain_items: 7,
+            foreign_items: 3,
+            ..Default::default()
+        };
+        let none = keychain_orphans_line(&diag(Some(clean.clone()), None)).unwrap();
+        assert!(
+            none.contains("none (7 per-terminal items, 3 not minted by csq"),
+            "{none}"
+        );
+
+        let orphans = keychain_orphans_line(&diag(Some(orphan_status()), None)).unwrap();
+        for part in [
+            "4 of 9",
+            "3 still queued",
+            "1 deleted",
+            "2 kept as possibly the only copy",
+            "5 kept because a live process still runs as the terminal",
+            "6 kept because the terminal reappeared or the item changed after the read",
+            "7 kept because a terminal was being created",
+            "10 kept because the sweep could not rule out a live process",
+            "some process's environment or identity could not be read",
+            "cleanup of these items is paused",
+            "8 kept for other reasons",
+            "9 kept because they hold non-login data",
+        ] {
+            assert!(orphans.contains(part), "{part:?} missing from {orphans}");
+        }
+
+        let undetermined = OrphanSweepStatus {
+            undetermined: Some(UndeterminedReason::EnumerationUnavailable),
+            counts_stale: true,
+            ..orphan_status()
+        };
+        let line = keychain_orphans_line(&diag(Some(undetermined), None)).unwrap();
+        assert!(line.contains("enumeration_unavailable"), "{line}");
+        assert!(line.contains("nothing was deleted"), "{line}");
+        assert!(line.contains("STALE"), "{line}");
+
+        let err = keychain_orphans_line(&diag(None, Some("corrupt"))).unwrap();
+        assert!(err.contains("keychain-orphan-sweep.json"), "{err}");
+        assert!(err.contains("corrupt"), "{err}");
+        // An error wins over a stale parsed status.
+        let both = keychain_orphans_line(&diag(Some(clean), Some("oversized"))).unwrap();
+        assert!(both.contains("oversized"), "{both}");
+    }
+
+    /// Each sweep level gets its own glyph, and the doctor line starts with the glyph of the
+    /// level the accessor reports: `ok` for a clean sweep, `warn` for a paused one, `fail`
+    /// once it has been paused long enough to need the operator (RED against a line that
+    /// shows the aged state with the paused state's glyph).
+    #[test]
+    fn keychain_orphans_line_shows_the_glyph_of_its_level() {
+        use csq_core::credentials::keychain::orphans::{
+            DiagnosticLevel, OrphanDiagnostic, OrphanSweepStatus, ProcessTableUnknown,
+            ORPHAN_NEEDS_ACTION_SECS,
+        };
+        let glyphs = [
+            keychain_orphans_glyph(DiagnosticLevel::Ok),
+            keychain_orphans_glyph(DiagnosticLevel::Info),
+            keychain_orphans_glyph(DiagnosticLevel::Warn),
+            keychain_orphans_glyph(DiagnosticLevel::NeedsAction),
+        ];
+        for (i, a) in glyphs.iter().enumerate() {
+            for b in &glyphs[i + 1..] {
+                assert_ne!(a, b, "two levels share a glyph");
+            }
+        }
+        assert_eq!(keychain_orphans_glyph(DiagnosticLevel::NeedsAction), fail());
+        let paused = |age: u64| OrphanDiagnostic {
+            status: Some(OrphanSweepStatus {
+                checked_at_unix_secs: 100_000,
+                keychain_items: 5,
+                orphan_candidates: 2,
+                kept_process_table_unknown: 2,
+                process_table_unknown: Some(ProcessTableUnknown::LineageBroken),
+                process_table_unknown_since_unix_secs: Some(100_000 - age),
+                ..Default::default()
+            }),
+            error: None,
+            age_secs: Some(0),
+        };
+        let fresh = keychain_orphans_line(&paused(0)).unwrap();
+        assert!(
+            fresh.starts_with(&format!("Keychain orphans: {} ", warn())),
+            "{fresh}"
+        );
+        let aged = keychain_orphans_line(&paused(ORPHAN_NEEDS_ACTION_SECS)).unwrap();
+        assert!(
+            aged.starts_with(&format!("Keychain orphans: {} ", fail())),
+            "{aged}"
+        );
+        // The aged line names a concrete step, not only the symptom.
+        assert!(aged.contains("To resume: restart the Mac"), "{aged}");
+    }
+
+    /// JSON: the status is serialised under `keychain_orphans`, the error under
+    /// `keychain_orphans_error`, and an absent state serialises neither key.
+    #[test]
+    fn keychain_orphans_json_present_error_and_absent() {
+        let mut report = make_report(no_terminals());
+        let absent = serde_json::to_value(&report).unwrap();
+        assert!(absent.get("keychain_orphans").is_none(), "{absent}");
+        assert!(absent.get("keychain_orphans_error").is_none(), "{absent}");
+
+        report.keychain_orphans = Some(orphan_status());
+        let present = serde_json::to_value(&report).unwrap();
+        assert_eq!(present["keychain_orphans"]["orphan_candidates"], 4);
+        assert_eq!(present["keychain_orphans"]["kept_pid_in_use"], 5);
+        assert_eq!(
+            present["keychain_orphans"]["kept_process_table_unknown"],
+            10
+        );
+        assert_eq!(
+            present["keychain_orphans"]["undetermined"],
+            serde_json::Value::Null
+        );
+        assert!(present.get("keychain_orphans_error").is_none(), "{present}");
+
+        report.keychain_orphans = None;
+        report.keychain_orphans_error = Some("corrupt");
+        let errored = serde_json::to_value(&report).unwrap();
+        assert_eq!(errored["keychain_orphans_error"], "corrupt");
+        assert!(errored.get("keychain_orphans").is_none(), "{errored}");
+    }
+
     /// Helper: build a minimal DoctorReport with specific terminal info.
     fn make_report(terminals: TerminalInfo) -> DoctorReport {
         DoctorReport {
+            mcp_images: super::super::mcp_image::empty_fixture(),
             schema_version: DOCTOR_SCHEMA_VERSION,
             schema: doctor_schema_string(),
             audit_records_unverified: 0,
@@ -6836,7 +9042,20 @@ mod tests {
             },
             unshared_handle_state: Vec::new(),
             codex_shared_shape_mismatches: Vec::new(),
+            codex_project_trust: Vec::new(),
+            codex_hooks_global_missing: false,
+            codex_hooks_handles: Vec::new(),
+            codex_slots_hooks_not_a_table: Vec::new(),
+            codex_slot_write_status: Vec::new(),
+            codex_config_exchange_unavailable: false,
+            slots_disable_all_hooks: Vec::new(),
+            claude_autocompact_status: Default::default(),
+            global_settings_unusable: false,
             version: "0.0.0".into(),
+            gate_status: None,
+            message_archive_records: Some(0),
+            message_archive_capacity: ARCHIVE_CAPACITY,
+            message_archive_state: "OK",
             platform: PlatformInfo {
                 os: "test".into(),
                 arch: "x86_64".into(),
@@ -6849,6 +9068,7 @@ mod tests {
             gemini_auth_slots: 0,
             gemini_unreadable_slots: Vec::new(),
             codex_wrong_variant_slots: Vec::new(),
+            native_homes: Default::default(),
             js_runtime: JsRuntimeInfo {
                 found: false,
                 path: None,
@@ -6864,16 +9084,40 @@ mod tests {
                 socket_healthy: None,
                 version_drift: None,
             },
+            cli_shim: CliShimInfo {
+                path: None,
+                check_status: "current",
+                stale_or_unverifiable: false,
+                verified_version_line: None,
+                managed_plist_installed: None,
+                managed_plist_allowed: false,
+                managed_daemon_dormant: None,
+                managed_job_loaded: None,
+                managed_service_state: None,
+                desktop_managed: false,
+                receipt_status: "absent",
+                last_refresh: None,
+            },
             accounts: AccountsInfo {
                 total: 0,
                 with_credentials: 0,
                 expired: 0,
             },
             stale_quota_slots: Vec::new(),
+            rescue_pending_slots: Vec::new(),
+            session_logins: Vec::new(),
+            sessions_undetermined: true,
+            keychain_mirror_age_secs: None,
+            keychain_mirror: None,
+            keychain_orphans: None,
+            keychain_orphans_error: None,
+            keychain_orphans_level: None,
+            keychain_orphans_age_secs: None,
             broker_failed: BrokerFailedInfo {
                 count: 0,
                 entries: Vec::new(),
             },
+            refresh_audit: Vec::new(),
             mixed_state_slots: MixedStateInfo {
                 count: 0,
                 entries: Vec::new(),
@@ -6912,6 +9156,8 @@ mod tests {
             phase4_incomplete: None,
             unrecoverable_label_relocations: Vec::new(),
             pass0_skipped_slots: Vec::new(),
+            launch_blocked_slots: Vec::new(),
+            launch_blocked_unknown_state: false,
             signing_key: SigningKeyStatus::Absent,
             audit_sink: None,
             audit_orphan_intents: Vec::new(),
@@ -10381,6 +12627,78 @@ mod tests {
         );
     }
 
+    /// orgident r7 item 9: `csq doctor` lists every slot whose launches are refused,
+    /// from the same gate `csq run` / `csq swap` consult, and lists none once the
+    /// suppression is cleared.
+    #[test]
+    fn doctor_lists_launch_blocked_slots_and_clears_after_login() {
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+        csq_core::accounts::launch_block::fixture::seed_shared_grant(base, 1, 2);
+
+        let json = serde_json::to_value(build_report(base)).unwrap();
+        let rows = json["launch_blocked_slots"]
+            .as_array()
+            .expect("launch_blocked_slots must be present while a slot is suppressed");
+        assert_eq!(rows.len(), 1, "{json}");
+        assert_eq!(rows[0]["slot"], 2);
+        assert_eq!(rows[0]["holder"], 1);
+
+        csq_core::accounts::launch_block::fixture::simulate_login(base, 2);
+        let json = serde_json::to_value(build_report(base)).unwrap();
+        assert!(
+            json.get("launch_blocked_slots").is_none(),
+            "omitted once nothing is blocked: {json}"
+        );
+    }
+
+    /// orgident r7 item 9: a damaged suppression record with no last-good copy is reported as
+    /// the launch consequence (`launch_blocked_unknown_state`), a fresh install is not, and
+    /// building the report never removes or rewrites the damaged file.
+    #[test]
+    fn doctor_reports_the_unknown_state_launch_block_and_leaves_the_file_alone() {
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+        let json = serde_json::to_value(build_report(base)).unwrap();
+        assert!(
+            json.get("launch_blocked_unknown_state").is_none(),
+            "a fresh install (no record) is not the unknown state: {json}"
+        );
+        csq_core::accounts::launch_block::fixture::seed_shared_grant(base, 1, 2);
+        csq_core::accounts::launch_block::fixture::destroy_suppression_state(base);
+        let json = serde_json::to_value(build_report(base)).unwrap();
+        assert_eq!(json["launch_blocked_unknown_state"], true, "{json}");
+        let text = csq_core::accounts::launch_block::doctor_damaged_line();
+        assert!(
+            text.contains("csq login N") && text.contains("never deletes"),
+            "{text}"
+        );
+        assert_eq!(
+            std::fs::read(base.join("refresh-suppressed.json")).unwrap(),
+            b"garbage"
+        );
+    }
+
+    /// orgident r7 item 9: the text line names the slot, the holder and the instruction,
+    /// and carries nothing but slot numbers and fixed words.
+    #[test]
+    fn doctor_launch_block_text_names_the_slot_and_the_login_instruction() {
+        let lines = launch_blocked_lines(&[LaunchBlockedSlot { slot: 2, holder: 1 }]);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("slot 2 shares its sign-in with slot 1"),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("run `csq login 2`"), "{lines:?}");
+        assert!(launch_blocked_lines(&[]).is_empty());
+    }
+
     /// RN1-D R1 complement: pre-sentinel state returns no warning.
     /// Without the `store-version` sentinel Pass-0 has not yet run on
     /// this host, so a "skip" framing would be premature noise.
@@ -10407,7 +12725,7 @@ mod tests {
     /// MUST be excluded from `pass0_skipped_slots` even if its
     /// `oauth_email` is currently absent. The presence of a UUID means
     /// the slot has already been remediated (most commonly by
-    /// `mint_for_login` after the operator re-OAuth'd) — keeping it in
+    /// `commit_anthropic_login` after the operator re-OAuth'd) — keeping it in
     /// the warning list would be a stale signal.
     #[test]
     fn doctor_pass0_skip_excludes_slot_already_minted() {
@@ -10683,5 +13001,1082 @@ mod tests {
             summary.get("AUTO_APPROVED").copied().unwrap_or(0) >= 1,
             "summary must count the AUTO_APPROVED record(s): {summary:?}"
         );
+    }
+    #[test]
+    fn codex_hooks_global_missing_flags_only_codex_hosts_without_the_global_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global-codex").join("hooks.json");
+        // No Codex slot: nothing to report whatever the global file is.
+        assert!(!check_codex_hooks_global_missing(dir.path(), Some(&global)));
+        std::fs::create_dir(dir.path().join("credentials")).unwrap();
+        std::fs::write(dir.path().join("credentials/codex-3.json"), "{}").unwrap();
+        // Codex slot + absent global file, or no resolvable home: reported.
+        assert!(check_codex_hooks_global_missing(dir.path(), Some(&global)));
+        assert!(check_codex_hooks_global_missing(dir.path(), None));
+        // Present global file: silent.
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "{}").unwrap();
+        assert!(!check_codex_hooks_global_missing(dir.path(), Some(&global)));
+        // JSON field is omitted when false and present when true.
+        let mut report = make_report(TerminalInfo {
+            modern_count: 0,
+            legacy_count: 0,
+            check_available: false,
+        });
+        assert!(serde_json::to_value(&report)
+            .unwrap()
+            .get("codex_hooks_global_missing")
+            .is_none());
+        report.codex_hooks_global_missing = true;
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["codex_hooks_global_missing"],
+            true
+        );
+        assert!(
+            csq_core::session::handle_dir::CODEX_HOOKS_GLOBAL_MISSING_MESSAGE
+                .starts_with("global hooks.json missing")
+        );
+    }
+
+    #[cfg(unix)]
+    fn doctor_codex_handle(base: &Path, pid: &str, slot: u16, cfg: &str) -> std::path::PathBuf {
+        let config_dir = base.join(format!("config-{slot}"));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("config.toml"), cfg).unwrap(); // CI-ALLOW-fs-write-config-toml
+        let handle = base.join(format!("term-{pid}"));
+        std::fs::create_dir_all(&handle).unwrap();
+        std::os::unix::fs::symlink(config_dir.join("config.toml"), handle.join("config.toml"))
+            .unwrap();
+        std::os::unix::fs::symlink(config_dir.join("auth.json"), handle.join("auth.json")).unwrap();
+        handle
+    }
+
+    /// A capability-layer (`WithLayer`) Codex handle: `config.toml` is a REGULAR file the
+    /// launch materialized in place of the symlink; `auth.json` is still the credential link.
+    #[cfg(unix)]
+    fn doctor_layered_codex_handle(
+        base: &Path,
+        pid: &str,
+        slot: u16,
+        cfg: &str,
+    ) -> std::path::PathBuf {
+        let handle = doctor_codex_handle(base, pid, slot, "model = \"m\"\n");
+        std::fs::remove_file(handle.join("config.toml")).unwrap();
+        std::fs::write(handle.join("config.toml"), cfg).unwrap(); // CI-ALLOW-fs-write-config-toml
+        handle
+    }
+
+    /// The per-handle trust row: trusted / untrusted / modified counts, read-only.
+    #[cfg(unix)]
+    #[test]
+    fn codex_hooks_handles_report_hook_trust_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let canon = dir.path().canonicalize().unwrap();
+        let base = canon.as_path();
+        let global = base.join("global-hooks.json");
+        // Stop "true" hashes to the Codex-produced H_TRUE; "echo two" to H_TWO.
+        std::fs::write(
+            &global,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"},{"type":"command","command":"echo two"}]}]}}"#,
+        )
+        .unwrap();
+        let h_true = "sha256:2ba34c7a02841fada06b868a093d041fd3d9de81883c789a321916b0aa118851";
+        let h = |pid: &str| base.join(format!("term-{pid}"));
+        let key = |pid: &str, j: usize| format!("{}/hooks.json:stop:0:{j}", h(pid).display());
+        let cfg = format!(
+            "[hooks.state.\"{}\"]\ntrusted_hash = \"{h_true}\"\n\n[hooks.state.\"{}\"]\ntrusted_hash = \"{h_true}\"\n",
+            key("1", 0),
+            key("1", 1),
+        );
+        doctor_codex_handle(base, "1", 1, &cfg);
+        doctor_codex_handle(base, "2", 1, &cfg);
+        let rows = check_codex_hooks_handles(base, Some(&global));
+        let t = |name: &str| {
+            rows.iter()
+                .find(|r| r.handle == name)
+                .unwrap()
+                .hook_trust
+                .counts
+        };
+        // term-1: stop:0:0 trusted (hash equals), stop:0:1 modified (hash of another hook).
+        assert_eq!(
+            (
+                t("term-1").trusted,
+                t("term-1").modified,
+                t("term-1").untrusted
+            ),
+            (1, 1, 0)
+        );
+        // term-2 shares the slot config but has no entries under its own key.
+        assert_eq!(
+            (
+                t("term-2").trusted,
+                t("term-2").modified,
+                t("term-2").untrusted
+            ),
+            (0, 0, 2)
+        );
+        let json = serde_json::to_value(&rows).unwrap();
+        assert_eq!(json[0]["hook_trust"]["counts"]["trusted"], 1);
+    }
+
+    /// Item 1 / 7 / 9 (doctor): a hook turned off, an unusable hooks file, an unreadable slot
+    /// config and a config near the size bound are never OK and each says so.
+    #[cfg(unix)]
+    #[test]
+    fn hooks_row_is_never_ok_for_disabled_unknown_unreadable_or_near_limit() {
+        use CodexHookTrustStatus as T;
+        let dir = tempfile::tempdir().unwrap();
+        let canon = dir.path().canonicalize().unwrap();
+        let base = canon.as_path();
+        let global = base.join("global-hooks.json");
+        std::fs::write(
+            &global,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}"#,
+        )
+        .unwrap();
+        let h_true = "sha256:2ba34c7a02841fada06b868a093d041fd3d9de81883c789a321916b0aa118851";
+        let key = |pid: &str| format!("{}/term-{pid}/hooks.json:stop:0:0", base.display());
+        let entry = |pid: &str, en: bool| {
+            format!(
+                "[hooks.state.\"{}\"]\ntrusted_hash = \"{h_true}\"\nenabled = {en}\n",
+                key(pid)
+            )
+        };
+        let linked = |pid: &str, slot: u16, cfg: &str| {
+            let h = doctor_codex_handle(base, pid, slot, cfg);
+            std::os::unix::fs::symlink(&global, h.join("hooks.json")).unwrap();
+        };
+        linked("1", 1, &entry("1", true));
+        linked("2", 2, &entry("2", false));
+        linked("3", 3, "x = [");
+        linked(
+            "4",
+            4,
+            &(format!("# {}\n", "p".repeat(800_000)) + &entry("4", true)),
+        );
+
+        let rows = check_codex_hooks_handles(base, Some(&global));
+        let row = |n: &str| rows.iter().find(|r| r.handle == n).unwrap().hook_trust;
+        assert_eq!((row("term-1").status, row("term-1").ok), (T::Trusted, true));
+        assert_eq!(
+            (row("term-2").status, row("term-2").ok),
+            (T::DisabledByUser, false)
+        );
+        assert_eq!(row("term-2").counts.disabled, 1);
+        assert_eq!(row("term-2").counts.trusted, 0);
+        assert!(
+            !row("term-3").ok && matches!(row("term-3").status, T::ConfigUnusable | T::Unknown)
+        );
+        assert!(row("term-4").config_near_limit && !row("term-1").config_near_limit);
+        let json = serde_json::to_value(&rows).unwrap();
+        let st = |n: &str| {
+            json.as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["handle"] == n)
+                .unwrap()["hook_trust"]["status"]
+                .clone()
+        };
+        assert_eq!(st("term-2"), "disabled-by-user");
+
+        let mut out = Vec::new();
+        write_codex_hook_trust_rows(&rows, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("term-2: a hook is turned off"), "{text}");
+        assert!(
+            text.contains("term-3: this terminal's Codex config cannot be read"),
+            "{text}"
+        );
+        assert!(
+            text.contains("term-4: the slot config.toml is nearing"),
+            "{text}"
+        );
+
+        // an unusable global hooks file: UNKNOWN, never "no hooks", never OK
+        std::fs::write(
+            &global,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"bogus"}]}]}}"#,
+        )
+        .unwrap();
+        let rows = check_codex_hooks_handles(base, Some(&global));
+        let r1 = rows
+            .iter()
+            .find(|r| r.handle == "term-1")
+            .unwrap()
+            .hook_trust;
+        assert_eq!((r1.status, r1.ok), (T::Unknown, false));
+        let mut out = Vec::new();
+        write_codex_hook_trust_rows(&rows, &mut out).unwrap();
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .contains("term-1: csq cannot establish"));
+    }
+
+    /// Item 1 (JSON surface only): a hook approved at its current hash with `enabled = false`
+    /// is its own `disabled-by-user` status, counted per hook, and never OK.
+    #[cfg(unix)]
+    #[test]
+    fn hooks_row_json_reports_a_disabled_hook_as_disabled_by_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let canon = dir.path().canonicalize().unwrap();
+        let base = canon.as_path();
+        let global = base.join("global-hooks.json");
+        std::fs::write(
+            &global,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}"#,
+        )
+        .unwrap();
+        let h_true = "sha256:2ba34c7a02841fada06b868a093d041fd3d9de81883c789a321916b0aa118851";
+        let cfg = format!(
+            "[hooks.state.\"{}/term-1/hooks.json:stop:0:0\"]\ntrusted_hash = \"{h_true}\"\nenabled = false\n",
+            base.display()
+        );
+        let h = doctor_codex_handle(base, "1", 1, &cfg);
+        std::os::unix::fs::symlink(&global, h.join("hooks.json")).unwrap();
+        let rows = check_codex_hooks_handles(base, Some(&global));
+        let json = serde_json::to_value(&rows).unwrap();
+        assert_eq!(json[0]["hook_trust"]["status"], "disabled-by-user");
+        assert_eq!(json[0]["hook_trust"]["ok"], false);
+        assert_eq!(json[0]["hook_trust"]["counts"]["disabled"], 1);
+        assert_eq!(json[0]["hook_trust"]["counts"]["trusted"], 0);
+    }
+
+    /// R3: recorded slot config-write conditions are reported (JSON and text); a clean slot
+    /// reports nothing.
+    #[test]
+    fn slot_write_status_is_reported_per_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join("config-3")).unwrap();
+        std::fs::create_dir_all(base.join("config-4")).unwrap();
+        std::fs::write(
+            base.join("config-3/.csq-config-write-status"),
+            "raced\npurge-failed\n",
+        )
+        .unwrap();
+        let rows = check_codex_slot_write_status(base);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].slot, 3);
+        let json = serde_json::to_value(&rows).unwrap();
+        assert_eq!(
+            json[0]["status"],
+            serde_json::json!(["raced", "purge-failed"])
+        );
+        let mut report = make_report(TerminalInfo {
+            modern_count: 0,
+            legacy_count: 0,
+            check_available: false,
+        });
+        report.codex_slot_write_status = rows;
+        let mut out = Vec::new();
+        write_codex_hooks_rows(&report, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("slot 3 config.toml: a concurrent write raced"),
+            "{text}"
+        );
+        assert!(
+            text.contains("slot 3 config.toml: csq could not clear stale hook approvals"),
+            "{text}"
+        );
+    }
+
+    /// N1 x base link states: a csq copy that still equals the global (no symlink privilege)
+    /// plus trusted is OK; a stale copy, a foreign file, a wrong/dangling link, an unlinked
+    /// handle or a missing global is never OK, trusted or not.
+    #[test]
+    fn n1_row_ok_composes_with_every_base_link_state() {
+        use csq_core::session::handle_dir::CodexHooksLinkState as L;
+        use CodexHookTrustStatus as T;
+        let all = [
+            L::Ok,
+            L::Unlinked,
+            L::ForeignFile,
+            L::Dangling,
+            L::WrongTarget,
+            L::MissingGlobal,
+            L::SwapTmpBlocked,
+            L::CopyCurrent,
+            L::CopyStale,
+        ];
+        for link in all {
+            let want = matches!(link, L::Ok | L::CopyCurrent);
+            assert_eq!(
+                codex_hooks_row_ok(link, T::Trusted),
+                want,
+                "{link:?} + trusted"
+            );
+            for status in [
+                T::Untrusted,
+                T::Modified,
+                T::Disabled,
+                T::DisabledByUser,
+                T::Unknown,
+                T::ConfigUnusable,
+                T::Unverifiable,
+                T::NoHooks,
+            ] {
+                assert!(!codex_hooks_row_ok(link, status), "{link:?} + {status:?}");
+            }
+        }
+    }
+
+    /// N1: the row is OK only when linked AND every hook is trusted; untrusted, modified,
+    /// unlinked and disabled handles are all non-OK, with an actionable message where the
+    /// operator can act.
+    #[cfg(unix)]
+    #[test]
+    fn n1_hooks_row_is_ok_only_when_linked_and_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let canon = dir.path().canonicalize().unwrap();
+        let base = canon.as_path();
+        let global = base.join("global-hooks.json");
+        std::fs::write(
+            &global,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"},{"type":"command","command":"echo two"}]}]}}"#,
+        )
+        .unwrap();
+        let h_true = "sha256:2ba34c7a02841fada06b868a093d041fd3d9de81883c789a321916b0aa118851";
+        let h_two = "sha256:2dca0e87ac3670e9fe795624588c8944512bf53bdb123ceb110cadaee80911ae";
+        let key =
+            |pid: &str, j: usize| format!("{}/term-{pid}/hooks.json:stop:0:{j}", base.display());
+        let approve = |pid: &str, a: &str, b: &str| {
+            format!(
+                "[hooks.state.\"{}\"]\ntrusted_hash = \"{a}\"\n\n[hooks.state.\"{}\"]\ntrusted_hash = \"{b}\"\n",
+                key(pid, 0),
+                key(pid, 1)
+            )
+        };
+        // slot 1: term-3 trusted+linked, term-4 has no entries (untrusted), term-5 trusted
+        // but NOT linked, term-6 modified (stale hash).
+        let cfg1 = approve("3", h_true, h_two)
+            + &approve("5", h_true, h_two)
+            + &approve("6", h_true, "sha256:stale");
+        let linked = |pid: &str, slot: u16, cfg: &str| {
+            let h = doctor_codex_handle(base, pid, slot, cfg);
+            std::os::unix::fs::symlink(&global, h.join("hooks.json")).unwrap();
+        };
+        linked("3", 1, &cfg1);
+        linked("4", 1, &cfg1);
+        doctor_codex_handle(base, "5", 1, &cfg1);
+        linked("6", 1, &cfg1);
+        // slot 2: features.hooks = false, otherwise fully trusted
+        let cfg2 = format!(
+            "[features]\nhooks = false\n\n{}",
+            approve("7", h_true, h_two)
+        );
+        linked("7", 2, &cfg2);
+
+        let rows = check_codex_hooks_handles(base, Some(&global));
+        let row = |n: &str| rows.iter().find(|r| r.handle == n).unwrap().hook_trust;
+        use CodexHookTrustStatus as T;
+        assert_eq!((row("term-3").status, row("term-3").ok), (T::Trusted, true));
+        assert_eq!(
+            (row("term-4").status, row("term-4").ok),
+            (T::Untrusted, false)
+        );
+        assert_eq!(
+            (row("term-5").status, row("term-5").ok),
+            (T::Trusted, false),
+            "unlinked is never OK"
+        );
+        assert_eq!(
+            (row("term-6").status, row("term-6").ok),
+            (T::Modified, false)
+        );
+        assert_eq!(
+            (row("term-7").status, row("term-7").ok),
+            (T::Disabled, false)
+        );
+        assert!(codex_hook_trust_message(T::Untrusted)
+            .unwrap()
+            .contains("approve the hooks in this terminal's Codex"));
+        assert!(codex_hook_trust_message(T::Modified).is_some());
+        assert!(codex_hook_trust_message(T::Trusted).is_none());
+        let json = serde_json::to_value(&rows).unwrap();
+        assert_eq!(json[0]["hook_trust"]["status"], "trusted");
+        assert_eq!(json[0]["hook_trust"]["ok"], true);
+    }
+
+    /// Per-handle doctor parity: EVERY Codex handle is reported with its own state, and
+    /// `features.hooks = false` in the resolved slot config is flagged (F3a).
+    #[cfg(unix)]
+    #[test]
+    fn codex_hooks_handles_report_every_handle_state_and_disabled_config() {
+        use csq_core::session::handle_dir::CodexHooksLinkState as S;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let global = base.join("global-codex").join("hooks.json");
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "{}").unwrap();
+
+        let ok = doctor_codex_handle(base, "1", 1, "model = \"m\"\n");
+        std::os::unix::fs::symlink(&global, ok.join("hooks.json")).unwrap();
+        let _unlinked = doctor_codex_handle(base, "2", 1, "model = \"m\"\n");
+        let foreign = doctor_codex_handle(base, "3", 1, "model = \"m\"\n");
+        std::fs::write(foreign.join("hooks.json"), "{}").unwrap();
+        let disabled = doctor_codex_handle(base, "4", 2, "[features]\nhooks = false\n");
+        std::os::unix::fs::symlink(&global, disabled.join("hooks.json")).unwrap();
+        // A non-Codex term dir (no config.toml link) is not a Codex handle.
+        std::fs::create_dir_all(base.join("term-5")).unwrap();
+        // A Claude Code handle (credentials file, settings, no `auth.json`) is not one either.
+        let cc = base.join("term-6");
+        std::fs::create_dir_all(&cc).unwrap();
+        std::fs::write(cc.join("settings.json"), "{}").unwrap();
+        std::fs::write(cc.join("config.toml"), "[features]\nhooks = false\n").unwrap(); // CI-ALLOW-fs-write-config-toml
+
+        // A layered launch replaced `config.toml` with a regular file: still a Codex handle,
+        // and its `features.hooks = false` is still reported.
+        let layered = doctor_layered_codex_handle(base, "7", 3, "[features]\nhooks = false\n");
+        std::os::unix::fs::symlink(&global, layered.join("hooks.json")).unwrap();
+
+        let rows = check_codex_hooks_handles(base, Some(&global));
+        let got: Vec<(&str, S, bool)> = rows
+            .iter()
+            .map(|r| (r.handle.as_str(), r.state, r.hooks_disabled_by_config))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("term-1", S::Ok, false),
+                ("term-2", S::Unlinked, false),
+                ("term-3", S::ForeignFile, false),
+                ("term-4", S::Ok, true),
+                ("term-7", S::Ok, true),
+            ]
+        );
+        let none = check_codex_hooks_handles(base, None);
+        assert!(
+            none.iter().all(|r| r.state != S::Ok),
+            "no global: nothing is ok"
+        );
+
+        let mut report = make_report(TerminalInfo {
+            modern_count: 0,
+            legacy_count: 0,
+            check_available: false,
+        });
+        assert!(serde_json::to_value(&report)
+            .unwrap()
+            .get("codex_hooks_handles")
+            .is_none());
+        report.codex_hooks_handles = rows;
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["codex_hooks_handles"][2]["state"], "foreign-file");
+        assert_eq!(
+            json["codex_hooks_handles"][3]["hooks_disabled_by_config"],
+            true
+        );
+    }
+
+    fn handle_row(
+        handle: &str,
+        state: csq_core::session::handle_dir::CodexHooksLinkState,
+    ) -> CodexHooksHandleJson {
+        CodexHooksHandleJson {
+            handle: handle.into(),
+            state,
+            hooks_disabled_by_config: false,
+            hooks_config: csq_core::session::handle_dir::CodexHooksConfigState::Enabled,
+            profile_disabled: Vec::new(),
+            preserved_foreign: Vec::new(),
+            hook_trust: CodexHookTrustRow {
+                counts: Default::default(),
+                status: CodexHookTrustStatus::NoHooks,
+                ok: false,
+                config_near_limit: false,
+                config_oversize: false,
+            },
+        }
+    }
+
+    fn hooks_rows(report: &DoctorReport) -> String {
+        let mut out = Vec::new();
+        write_codex_hooks_rows(report, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    fn cli_info(found: bool, version: Option<&str>) -> CliSurfaceInfo {
+        CliSurfaceInfo {
+            found,
+            path: None,
+            version: version.map(str::to_owned),
+            min_version: "0.0.0".into(),
+            status: "ok".into(),
+            manager: "unknown".into(),
+            wrong_binary_reason: None,
+        }
+    }
+
+    /// r4 item 9: the exchange guarantee was verified for codex-cli 0.162.1 only; any other
+    /// installed version (older, newer, or unreadable) gets the fixed warning, the verified
+    /// one and an absent Codex get none.
+    #[test]
+    fn codex_exchange_version_warning_fires_for_every_version_but_the_verified_one() {
+        let w = |c: Option<CliSurfaceInfo>| codex_exchange_version_warning(c.as_ref());
+        assert!(w(None).is_none(), "no Codex slots, nothing to verify");
+        assert!(w(Some(cli_info(false, None))).is_none(), "Codex not found");
+        assert!(w(Some(cli_info(true, Some("0.162.1")))).is_none());
+        for v in [
+            Some("0.163.0"),
+            Some("0.162.0"),
+            Some("0.161.9"),
+            Some("1.0.0"),
+            None,
+        ] {
+            let msg = w(Some(cli_info(true, v))).unwrap_or_default();
+            assert!(
+                msg.contains("verified only for codex-cli 0.162.1"),
+                "{v:?}: {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hooks_rows_print_the_version_warning_only_for_an_unverified_codex() {
+        let mut report = make_report(TerminalInfo {
+            modern_count: 0,
+            legacy_count: 0,
+            check_available: false,
+        });
+        report.codex_cli = Some(cli_info(true, Some("0.170.0")));
+        assert!(
+            hooks_rows(&report).contains("verified only for codex-cli 0.162.1"),
+            "{}",
+            hooks_rows(&report)
+        );
+        report.codex_cli = Some(cli_info(true, Some("0.162.1")));
+        assert!(!hooks_rows(&report).contains("verified only for"));
+    }
+
+    /// r4 items 1 and 2: the raced row says csq's update MAY be in place and names the
+    /// acknowledgement; an oversize config has its own row.
+    #[test]
+    fn raced_and_oversize_rows_say_what_is_true() {
+        use csq_core::providers::codex::surface::SlotWriteStatus as W;
+        let mut report = make_report(TerminalInfo {
+            modern_count: 0,
+            legacy_count: 0,
+            check_available: false,
+        });
+        report.codex_slot_write_status = vec![CodexSlotWriteStatusJson {
+            overflow_stuck: false,
+            slot: 6,
+            status: vec![W::Raced],
+        }];
+        let mut big = handle_row(
+            "term-9",
+            csq_core::session::handle_dir::CodexHooksLinkState::Ok,
+        );
+        big.hook_trust.config_oversize = true;
+        report.codex_hooks_handles = vec![big];
+        let text = hooks_rows(&report);
+        assert!(
+            text.contains("may be in place over a concurrent Codex write"),
+            "{text}"
+        );
+        assert!(!text.contains("did not publish"), "{text}");
+        assert!(text.contains("csq doctor --ack-raced"), "{text}");
+        assert!(text.contains("EXCEEDS the 1 MiB limit"), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_oversize_slot_config_sets_the_row_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let canon = dir.path().canonicalize().unwrap();
+        let base = canon.as_path();
+        let global = base.join("global-hooks.json");
+        std::fs::write(&global, r#"{"hooks":{}}"#).unwrap();
+        let h = doctor_codex_handle(base, "5", 5, &format!("# {}\n", "p".repeat(1_100_000)));
+        std::os::unix::fs::symlink(&global, h.join("hooks.json")).unwrap();
+        doctor_codex_handle(base, "6", 6, "x = 1\n");
+        let rows = check_codex_hooks_handles(base, Some(&global));
+        let row = |n: &str| rows.iter().find(|r| r.handle == n).unwrap().hook_trust;
+        assert!(row("term-5").config_oversize);
+        assert!(!row("term-6").config_oversize);
+    }
+
+    /// r4 item 2: `--ack-raced` clears the flag through the CLI entry point.
+    #[cfg(unix)]
+    #[test]
+    fn ack_raced_clears_the_flag_and_rejects_a_bad_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join("config-3")).unwrap();
+        std::fs::write(base.join("config-3/.csq-config-write-status"), "raced\n").unwrap();
+        std::fs::write(base.join("config-3/config.tmp.123.4"), "x").unwrap();
+        handle_ack_raced(base, 3, true).unwrap();
+        assert!(check_codex_slot_write_status(base).is_empty());
+        assert!(!base.join("config-3/config.tmp.123.4").exists());
+        assert!(handle_ack_raced(base, 0, true).is_err());
+        assert!(handle_ack_raced(base, 8, true).is_err(), "no such slot dir");
+    }
+
+    /// r4b item 2: a lock-free status marker (written when a status-file update timed out on
+    /// the slot lock) is reported by doctor's JSON and text rows, never as a clean slot, and
+    /// the CLI ack clears it.
+    #[cfg(unix)]
+    #[test]
+    fn a_status_marker_is_reported_and_the_ack_clears_it() {
+        use csq_core::providers::codex::surface::{write_status_marker, SlotWriteStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join("config-3")).unwrap();
+        assert!(check_codex_slot_write_status(base).is_empty());
+        let acct = AccountNum::try_from(3u16).unwrap();
+        write_status_marker(base, acct, SlotWriteStatus::PurgeFailed).unwrap();
+        write_status_marker(base, acct, SlotWriteStatus::Raced).unwrap();
+        let rows = check_codex_slot_write_status(base);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            serde_json::to_value(&rows[0].status).unwrap(),
+            serde_json::json!(["raced", "purge-failed"])
+        );
+        let mut report = make_report(TerminalInfo {
+            modern_count: 0,
+            legacy_count: 0,
+            check_available: false,
+        });
+        report.codex_slot_write_status = rows;
+        let mut out = Vec::new();
+        write_codex_hooks_rows(&report, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("slot 3 config.toml: a concurrent write raced"),
+            "{text}"
+        );
+        assert!(
+            text.contains("slot 3 config.toml: csq could not clear stale hook approvals"),
+            "{text}"
+        );
+        // the raced ack clears the raced marker only; the purge-failed marker stays
+        handle_ack_raced(base, 3, true).unwrap();
+        let rows = check_codex_slot_write_status(base);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            serde_json::to_value(&rows[0].status).unwrap(),
+            serde_json::json!(["purge-failed"])
+        );
+    }
+
+    /// r4c: an unrecognised marker is a not-clean row with the fixed line, and the raced
+    /// ack does not clear it.
+    #[cfg(unix)]
+    #[test]
+    fn an_unrecognised_marker_row_says_inspect_and_remove_manually() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let mdir = base.join("config-3/.csq-status-markers");
+        std::fs::create_dir_all(&mdir).unwrap();
+        std::fs::write(mdir.join("m"), "future-kind\n").unwrap();
+        let rows = check_codex_slot_write_status(base);
+        assert_eq!(
+            serde_json::to_value(&rows[0].status).unwrap(),
+            serde_json::json!(["unrecognised-marker"])
+        );
+        let mut report = make_report(TerminalInfo {
+            modern_count: 0,
+            legacy_count: 0,
+            check_available: false,
+        });
+        report.codex_slot_write_status = rows;
+        let mut out = Vec::new();
+        write_codex_hooks_rows(&report, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(
+                "slot 3 config.toml: unrecognised marker; inspect and remove manually: config-3/.csq-status-markers/<name>"
+            ),
+            "{text}"
+        );
+        handle_ack_raced(base, 3, true).unwrap();
+        assert_eq!(check_codex_slot_write_status(base).len(), 1);
+    }
+
+    /// r4d: an overflow marker that dropped a non-raced event survives the ack and the row
+    /// names its file (relative path only).
+    #[cfg(unix)]
+    #[test]
+    fn a_stuck_overflow_row_names_the_overflow_file() {
+        use csq_core::providers::codex::surface::{write_status_marker, SlotWriteStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join("config-3")).unwrap();
+        let acct = AccountNum::try_from(3u16).unwrap();
+        for _ in 0..32 {
+            write_status_marker(base, acct, SlotWriteStatus::Raced).unwrap();
+        }
+        write_status_marker(base, acct, SlotWriteStatus::PurgeFailed).unwrap();
+        handle_ack_raced(base, 3, true).unwrap();
+        let rows = check_codex_slot_write_status(base);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].overflow_stuck);
+        assert_eq!(
+            serde_json::to_value(&rows[0]).unwrap()["overflow_stuck"],
+            serde_json::json!(true)
+        );
+        let mut report = make_report(TerminalInfo {
+            modern_count: 0,
+            legacy_count: 0,
+            check_available: false,
+        });
+        report.codex_slot_write_status = rows;
+        let mut out = Vec::new();
+        write_codex_hooks_rows(&report, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("remove config-3/.csq-status-markers/overflow"),
+            "{text}"
+        );
+        assert!(
+            !text.contains(base.to_string_lossy().as_ref()),
+            "an absolute path leaked: {text}"
+        );
+    }
+
+    /// MissingGlobal is ONE row (the global row), not one per handle; every other state keeps
+    /// its per-handle row.
+    #[test]
+    fn missing_global_is_reported_once_not_per_handle() {
+        use csq_core::session::handle_dir::CodexHooksLinkState as S;
+        let mut report = make_report(TerminalInfo {
+            modern_count: 0,
+            legacy_count: 0,
+            check_available: false,
+        });
+        report.codex_hooks_global_missing = true;
+        report.codex_hooks_handles = vec![
+            handle_row("term-1", S::MissingGlobal),
+            handle_row("term-2", S::MissingGlobal),
+            handle_row("term-3", S::Unlinked),
+        ];
+        let rows = hooks_rows(&report);
+        assert_eq!(
+            rows.matches("global hooks.json missing").count(),
+            1,
+            "{rows}"
+        );
+        assert!(rows.contains("term-3"), "{rows}");
+        assert!(!rows.contains("term-1"), "{rows}");
+    }
+
+    /// The config-state rows: UNKNOWN, legacy profile key, profile note, preserved file, and
+    /// a non-table slot `hooks`.
+    #[test]
+    fn hooks_config_unknown_profile_and_preserved_rows_are_printed() {
+        use csq_core::session::handle_dir::{CodexHooksConfigState as C, CodexHooksLinkState as S};
+        let mut report = make_report(TerminalInfo {
+            modern_count: 0,
+            legacy_count: 0,
+            check_available: false,
+        });
+        let mut unknown = handle_row("term-1", S::Ok);
+        unknown.hooks_config = C::Unknown;
+        let mut legacy = handle_row("term-2", S::Ok);
+        legacy.hooks_config = C::LegacyProfileKey;
+        let mut notes = handle_row("term-3", S::Ok);
+        notes.profile_disabled = vec!["off".into()];
+        notes.preserved_foreign = vec!["hooks.json.csq-foreign-1".into()];
+        report.codex_hooks_handles = vec![unknown, legacy, notes, handle_row("term-4", S::Ok)];
+        report.codex_slots_hooks_not_a_table = vec![5];
+        let rows = hooks_rows(&report);
+        assert!(
+            rows.contains("term-1: config.toml is unparseable"),
+            "{rows}"
+        );
+        assert!(rows.contains("UNKNOWN"), "{rows}");
+        assert!(
+            rows.contains("term-2: config.toml has a top-level `profile` key"),
+            "{rows}"
+        );
+        assert!(
+            rows.contains("term-3: may be disabled under profile off"),
+            "{rows}"
+        );
+        assert!(rows.contains("hooks.json.csq-foreign-1"), "{rows}");
+        assert!(
+            rows.contains("slot 5 config.toml has a `hooks` value"),
+            "{rows}"
+        );
+        assert!(!rows.contains("term-4"), "{rows}");
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["codex_hooks_handles"][0]["hooks_config"], "unknown");
+        assert_eq!(
+            json["codex_hooks_handles"][1]["hooks_config"],
+            "legacy-profile-key"
+        );
+    }
+
+    #[test]
+    fn slots_with_a_non_table_hooks_in_config_toml_are_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        for (n, body) in [
+            (3u16, "hooks = 5\n"),
+            (4, "[hooks]\nx = 1\n"),
+            (5, "model = \"m\"\n"),
+        ] {
+            let c = dir.path().join(format!("config-{n}"));
+            std::fs::create_dir_all(&c).unwrap();
+            std::fs::write(c.join("config.toml"), body).unwrap(); // CI-ALLOW-fs-write-config-toml
+        }
+        assert_eq!(check_codex_slots_hooks_not_a_table(dir.path()), vec![3u16]);
+    }
+
+    #[test]
+    fn slots_carrying_disable_all_hooks_are_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        for (n, body) in [(3u16, r#"{"disableAllHooks":true}"#), (4, r#"{"x":1}"#)] {
+            let c = dir.path().join(format!("config-{n}"));
+            std::fs::create_dir_all(&c).unwrap();
+            std::fs::write(c.join("settings.json"), body).unwrap();
+        }
+        assert_eq!(check_slots_disable_all_hooks(dir.path()), vec![3u16]);
+        let mut report = make_report(TerminalInfo {
+            modern_count: 0,
+            legacy_count: 0,
+            check_available: false,
+        });
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json.get("slots_disable_all_hooks").is_none());
+        assert!(json.get("global_settings_unusable").is_none());
+        report.slots_disable_all_hooks = vec![3];
+        report.global_settings_unusable = true;
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["slots_disable_all_hooks"][0], 3);
+        assert_eq!(json["global_settings_unusable"], true);
+    }
+
+    #[test]
+    fn project_trust_collector_filters_slots_and_serializes_typed_rows_read_only() {
+        let _lock = csq_core::platform::test_env::lock();
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: the outer workspace environment guard is still held.
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var("CSQ_TEST_CODEX_TRUST_CONFIG", value),
+                        None => std::env::remove_var("CSQ_TEST_CODEX_TRUST_CONFIG"),
+                    }
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let owner = dir.path().join("owner.toml");
+        let projects = "[projects.\"/owner\"]\ntrust_level=\"trusted\"\n";
+        std::fs::write(&owner, projects).unwrap();
+        let _restore = Restore(std::env::var_os("CSQ_TEST_CODEX_TRUST_CONFIG"));
+        // SAFETY: the workspace environment mutex remains held through Restore.
+        unsafe {
+            std::env::set_var("CSQ_TEST_CODEX_TRUST_CONFIG", &owner);
+        }
+        std::fs::create_dir(dir.path().join("credentials")).unwrap();
+        for slot in [12u16, 13, 14] {
+            let config = dir.path().join(format!("config-{slot}"));
+            std::fs::create_dir(&config).unwrap();
+            std::fs::write(
+                config.join("config.toml"),
+                if slot == 13 {
+                    projects
+                } else {
+                    "sandbox_mode=\"read-only\"\n"
+                },
+            )
+            .unwrap();
+            if slot != 14 {
+                std::fs::write(
+                    dir.path().join(format!("credentials/codex-{slot}.json")),
+                    "{}",
+                )
+                .unwrap();
+            }
+        }
+        let uuid: csq_core::accounts::identity_store::IdentityId =
+            "11111111-2222-3333-4444-555555555555".parse().unwrap();
+        let mut profiles = csq_core::accounts::profiles::ProfilesFile::empty();
+        profiles.by_slot.insert("15".into(), uuid);
+        csq_core::accounts::profiles::save(
+            &csq_core::accounts::profiles::profiles_path(dir.path()),
+            &profiles,
+        )
+        .unwrap();
+        let credential =
+            csq_core::accounts::identity_store::credentials_codex_path_for(dir.path(), uuid);
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(&credential, "{}").unwrap();
+        let uuid_config = dir.path().join("config-15");
+        std::fs::create_dir(&uuid_config).unwrap();
+        std::fs::write(
+            uuid_config.join("config.toml"),
+            "sandbox_mode=\"read-only\"\n",
+        )
+        .unwrap();
+        assert!(!dir.path().join("credentials/codex-15.json").exists());
+        let config = dir.path().join("config-12/config.toml");
+        let before = std::fs::read(&config).unwrap();
+        let mut report = make_report(TerminalInfo {
+            modern_count: 0,
+            legacy_count: 0,
+            check_available: false,
+        });
+        report.codex_project_trust = check_codex_project_trust(dir.path());
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["codex_project_trust"],
+            serde_json::json!([{ "slot":12,"drift":true }, { "slot":15,"drift":true }]),
+            "doctor collector must include UUID-only Codex bindings and filter matched/unbound slots"
+        );
+        assert_eq!(
+            std::fs::read(&config).unwrap(),
+            before,
+            "doctor must not synchronize config"
+        );
+        std::fs::write(&owner, "broken=[").unwrap();
+        report.codex_project_trust = check_codex_project_trust(dir.path());
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["codex_project_trust"][0]["warning"],
+            "unparseable_source"
+        );
+        assert_eq!(json["codex_project_trust"][0]["drift"], false);
+        report.codex_project_trust.clear();
+        assert!(
+            serde_json::to_value(&report)
+                .unwrap()
+                .get("codex_project_trust")
+                .is_none(),
+            "empty trust diagnostics must be omitted"
+        );
+    }
+
+    #[test]
+    fn doctor_native_orphan_row_names_slot_provider_and_no_path() {
+        use csq_core::providers::catalog::Surface;
+        use csq_core::providers::native;
+        let base = tempfile::TempDir::new().unwrap();
+        let slot = AccountNum::try_from(5u16).unwrap();
+        let p = native::native_home_path(base.path(), slot, Surface::Kimi)
+            .join("credentials/kimi-code.json");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"x").unwrap();
+        let lines = render_native_home_lines(&native_homes_scan(base.path()));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains(
+            "native credential present without binding marker (slot 5, Kimi (native CLI))"
+        ));
+        assert!(lines[0].contains("csq login 5 --provider kimi-cli"));
+        assert!(!lines[0].contains(base.path().to_str().unwrap()));
+        native::write_binding(base.path(), slot, Surface::Kimi).unwrap();
+        assert!(render_native_home_lines(&native_homes_scan(base.path())).is_empty());
+    }
+
+    #[test]
+    fn doctor_native_leftover_row_is_informational_without_login_or_logout() {
+        use csq_core::providers::catalog::Surface;
+        use csq_core::providers::native;
+        let base = tempfile::TempDir::new().unwrap();
+        let slot = AccountNum::try_from(7u16).unwrap();
+        std::fs::create_dir_all(base.path().join("credentials")).unwrap();
+        std::fs::write(base.path().join("credentials/7.json"), b"{}").unwrap();
+        let p = native::native_home_path(base.path(), slot, Surface::Kimi)
+            .join("credentials/kimi-code.json");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"x").unwrap();
+        let g = AccountNum::try_from(8u16).unwrap();
+        let p2 = native::native_home_path(base.path(), g, Surface::Kimi)
+            .join("credentials/kimi-code.json");
+        std::fs::create_dir_all(p2.parent().unwrap()).unwrap();
+        std::fs::write(&p2, b"x").unwrap();
+        native::write_binding(base.path(), g, Surface::Grok).unwrap();
+        let lines = render_native_home_lines(&native_homes_scan(base.path()));
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains(
+            "leftover Kimi (native CLI) files from a previous binding (slot 7 now bound to Claude (Anthropic OAuth))"
+        ));
+        assert!(lines[1].contains("(slot 8 now bound to Grok (native CLI))"));
+        for l in &lines {
+            assert!(!l.contains("finish with"), "{l}");
+            assert!(!l.contains("csq login") && !l.contains("csq logout"), "{l}");
+        }
+    }
+
+    #[test]
+    fn doctor_native_dual_bound_row_is_warn_without_login_logout_or_leftover() {
+        use csq_core::providers::catalog::Surface;
+        use csq_core::providers::native;
+        let base = tempfile::TempDir::new().unwrap();
+        let slot = AccountNum::try_from(7u16).unwrap();
+        let p = native::native_home_path(base.path(), slot, Surface::Kimi)
+            .join("credentials/kimi-code.json");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"x").unwrap();
+        native::write_binding(base.path(), slot, Surface::Kimi).unwrap();
+        std::fs::write(base.path().join("credentials/7.json"), b"{}").unwrap();
+        let lines = render_native_home_lines(&native_homes_scan(base.path()));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0]
+            .contains("slot 7 is bound to both Kimi (native CLI) and Claude (Anthropic OAuth)"));
+        assert!(lines[0].contains(warn()));
+        assert!(!lines[0].contains("leftover"), "{}", lines[0]);
+        assert!(!lines[0].contains("csq login") && !lines[0].contains("csq logout"));
+    }
+
+    #[test]
+    fn doctor_native_kimi_and_grok_markers_render_dual_bound_not_leftover() {
+        use csq_core::providers::catalog::Surface;
+        use csq_core::providers::native;
+        let base = tempfile::TempDir::new().unwrap();
+        let slot = AccountNum::try_from(9u16).unwrap();
+        for surface in [Surface::Kimi, Surface::Grok] {
+            let cred = native::descriptor(surface).unwrap().cred_relpath;
+            let p = native::native_home_path(base.path(), slot, surface).join(cred);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"x").unwrap();
+            native::write_binding(base.path(), slot, surface).unwrap();
+        }
+        let lines = render_native_home_lines(&native_homes_scan(base.path()));
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].contains("slot 9 is bound to both Kimi (native CLI) and Grok (native CLI)")
+        );
+        assert!(
+            lines[1].contains("slot 9 is bound to both Grok (native CLI) and Kimi (native CLI)")
+        );
+        for l in &lines {
+            assert!(l.contains(warn()), "{l}");
+            assert!(!l.contains("leftover"), "{l}");
+            assert!(!l.contains("csq login") && !l.contains("csq logout"), "{l}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_native_anomalies_render_warn_rows_without_paths() {
+        use csq_core::providers::catalog::Surface;
+        use csq_core::providers::native;
+        let base = tempfile::TempDir::new().unwrap();
+        let slot = AccountNum::try_from(4u16).unwrap();
+        let p = native::native_home_path(base.path(), slot, Surface::Grok).join("auth.json");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let target = base.path().join("elsewhere");
+        std::fs::write(&target, b"x").unwrap();
+        std::os::unix::fs::symlink(&target, &p).unwrap();
+        let lines = render_native_home_lines(&native_homes_scan(base.path()));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0]
+            .contains("native home for slot 4 (Grok (native CLI)) is a symlink (not followed)"));
+        assert!(lines[0].contains(warn()));
+        assert!(!lines[0].contains(base.path().to_str().unwrap()));
+
+        let c = tempfile::TempDir::new().unwrap();
+        let real = c.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, c.path().join("native-homes")).unwrap();
+        let lines = render_native_home_lines(&native_homes_scan(c.path()));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("the native-homes directory is a symlink (not followed)"));
+        assert!(lines[0].contains(warn()));
     }
 }

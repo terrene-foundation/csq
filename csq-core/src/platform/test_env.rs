@@ -37,6 +37,15 @@
 //! becoming a problem (all env-mutating tests together take < 1s in
 //! a normal run).
 //!
+//! The same mutex also serializes tests that temporarily repoint the
+//! process-global stdin (fd 0). Readers such as the login drivability guard
+//! sample `stdin().is_terminal()` process-wide, so a concurrent fd-0 swap can
+//! flip a sibling test's verdict mid-body (the darwin preflight's login-TTY
+//! flake). A test that swaps fd 0 takes this lock TOO, but AFTER the shared
+//! signal mutex: between these two SHARED mutexes the established order is
+//! signal-first, then env (the opposite order is an ABBA deadlock of the
+//! test process — see `codex_supervise`'s documented lock order).
+//!
 //! Lock ordering: when a test holds both this shared mutex AND an
 //! in-module mutex, the shared mutex MUST be acquired FIRST. Otherwise
 //! pairs of tests that consistently choose opposite orders deadlock.
@@ -92,10 +101,41 @@ static ENV_TEST_MUTEX: Mutex<()> = Mutex::new(());
 /// the workspace, is what closes that gap.
 static SIGNAL_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
+thread_local! {
+    /// True while THIS thread holds the shared env-test mutex. [`signal_lock`]
+    /// consults it to refuse the one order that ABBA-deadlocks the whole test
+    /// binary: taking the signal lock while the env lock is already held.
+    /// The established order between these two SHARED mutexes is SIGNAL
+    /// first, then ENV (`codex_supervise`'s dual-lock tests document it).
+    static ENV_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn mark_env_held() {
+    ENV_HELD.with(|held| held.set(true));
+}
+
 /// Acquires the shared signal-test mutex. See `SIGNAL_TEST_MUTEX`'s doc
 /// for the full set of call sites this MUST serialize against. Poisoning
 /// is recovered silently, same rationale as [`lock`].
+///
+/// PANICS on the one forbidden acquisition order: the signal lock taken
+/// while THIS thread already holds the shared env-test lock. Two tests
+/// choosing opposite orders deadlock the whole bin under the default
+/// parallel harness, and the deadlock is silent — every later test piles up
+/// behind whichever lock the two are holding. This check turns that into an
+/// immediate, named failure at the offending site. Taking the signal lock
+/// FIRST and the env lock second is the established, allowed order.
 pub fn signal_lock() -> MutexGuard<'static, ()> {
+    ENV_HELD.with(|held| {
+        assert!(
+            !held.get(),
+            "test lock-order violation: the signal lock was acquired while this \
+             thread holds the shared env-test lock. The established order between \
+             these two shared mutexes is SIGNAL first, then ENV; the reverse is an \
+             ABBA deadlock of the whole test binary (see codex_supervise's \
+             documented lock order). Swap the acquisitions."
+        );
+    });
     match SIGNAL_TEST_MUTEX.lock() {
         Ok(g) => g,
         Err(poisoned) => {
@@ -105,20 +145,160 @@ pub fn signal_lock() -> MutexGuard<'static, ()> {
     }
 }
 
+/// The `ThreadId` of the thread holding the shared env-test mutex, as of the
+/// most recent acquisition that has not yet been released. Written by the
+/// acquiring thread while it holds the mutex ([`record_holder`]), cleared by
+/// [`EnvTestGuard`]'s drop BEFORE the mutex is released — so a reader never
+/// sees a stale holder.
+///
+/// Why the record exists: `try_lock()==None` cannot say WHO holds the shared
+/// lock. Under a full `cargo test` run a SIBLING holding it makes that
+/// observation true as well, so the `BaseDirEnvGuard` serialization proof
+/// (fixcheck2 LOW 2) could only discriminate against a private-lock guard
+/// under a single-test filter. `current_holder() == thread::current().id()` is
+/// the discriminating form: it is true only when THIS thread holds it, in the
+/// sign-off run as much as when run alone.
+static ENV_TEST_HOLDER: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+
+/// The shared env-test mutex's guard: a [`MutexGuard`] that records its
+/// holder's `ThreadId` on acquire and clears the record on drop.
+///
+/// The record is written under the env-test mutex (the acquirer holds it) and
+/// cleared by the releaser BEFORE its inner guard unlocks (struct fields drop
+/// after the `Drop` body), so the two mutexes are only ever taken in the order
+/// env-test → holder and the record never names a thread that has released.
+pub struct EnvTestGuard {
+    _inner: MutexGuard<'static, ()>,
+}
+
+impl Drop for EnvTestGuard {
+    fn drop(&mut self) {
+        clear_holder_if_mine();
+        ENV_HELD.with(|held| held.set(false));
+    }
+}
+
+/// The `ThreadId` recorded as the shared env-test mutex's current holder, or
+/// `None` when it is free (see `ENV_TEST_HOLDER`). `Some(id)` names a thread
+/// that holds the mutex at the moment of the read, so
+/// `current_holder() == Some(thread::current().id())` proves the CALLER holds
+/// it — unlike `try_lock()==None`, which a sibling holder satisfies too.
+pub fn current_holder() -> Option<std::thread::ThreadId> {
+    *holder_record()
+}
+
+fn holder_record() -> MutexGuard<'static, Option<std::thread::ThreadId>> {
+    match ENV_TEST_HOLDER.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            ENV_TEST_HOLDER.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn record_holder() {
+    *holder_record() = Some(std::thread::current().id());
+}
+
+/// Clears the record only when it is this thread's. While this thread holds
+/// the env-test mutex no other thread can have recorded (recording requires
+/// the mutex), so the condition holds on every real release path; it is a
+/// guard against a future recording path that does not hold the mutex.
+fn clear_holder_if_mine() {
+    let mut record = holder_record();
+    if *record == Some(std::thread::current().id()) {
+        *record = None;
+    }
+}
+
 /// Acquires the shared env-test mutex. Blocks until any other test
 /// mutating process-global env releases it. Returns a guard that
-/// auto-releases on drop — hold it for the entire test body.
+/// auto-releases on drop — hold it for the entire test body. The guard
+/// records its holder for [`current_holder`].
 ///
 /// Poisoning is recovered silently: if a previous test panicked
 /// while holding the guard, we clear the poison and proceed. The
 /// env mutations the panicked test made might still be present,
 /// but the next test will save+restore its own variables anyway.
-pub fn lock() -> MutexGuard<'static, ()> {
-    match ENV_TEST_MUTEX.lock() {
+pub fn lock() -> EnvTestGuard {
+    let inner = match ENV_TEST_MUTEX.lock() {
         Ok(g) => g,
         Err(poisoned) => {
             ENV_TEST_MUTEX.clear_poison();
             poisoned.into_inner()
+        }
+    };
+    record_holder();
+    mark_env_held();
+    EnvTestGuard { _inner: inner }
+}
+
+/// Non-blocking variant of [`lock`]: `Some` when the shared env-test mutex
+/// was free, `None` when it is currently held. A successful acquisition
+/// records its holder exactly as [`lock`] does.
+pub fn try_lock() -> Option<EnvTestGuard> {
+    match ENV_TEST_MUTEX.try_lock() {
+        Ok(g) => {
+            record_holder();
+            mark_env_held();
+            Some(EnvTestGuard { _inner: g })
+        }
+        Err(std::sync::TryLockError::Poisoned(p)) => {
+            ENV_TEST_MUTEX.clear_poison();
+            record_holder();
+            mark_env_held();
+            Some(EnvTestGuard {
+                _inner: p.into_inner(),
+            })
+        }
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// Pins the process-global umask for a test and restores the previous mask
+/// on `Drop` — including on panic — while holding [`lock`] for the guard's
+/// whole lifetime.
+///
+/// `libc::umask` is process-global (the same hazard class as signal
+/// disposition), so every test that exercises a umask window serializes on
+/// the shared env-test mutex. The Drop restore is what the manual
+/// save/restore pairs it replaces offered only on the success path: a
+/// failing assertion inside the window would otherwise leak the temporary
+/// mask into every test that runs afterwards (review round 1 LOW: umask
+/// restore was not panic-safe).
+#[cfg(unix)]
+#[cfg(any(test, feature = "test-utils"))]
+pub struct UmaskGuard {
+    previous: libc::mode_t,
+    _lock: EnvTestGuard,
+}
+
+#[cfg(unix)]
+#[cfg(any(test, feature = "test-utils"))]
+impl UmaskGuard {
+    /// Sets the process umask to `mask` until the guard is dropped. Holds
+    /// the shared lock for the whole window, so no other umask test can run
+    /// concurrently.
+    pub fn pin(mask: libc::mode_t) -> Self {
+        let lock = lock();
+        // SAFETY: libc::umask is always safe to call; the previous value is
+        // restored in Drop.
+        let previous = unsafe { libc::umask(mask) };
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(unix)]
+#[cfg(any(test, feature = "test-utils"))]
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        // SAFETY: same as pin — restoring the saved mask.
+        unsafe {
+            libc::umask(self.previous);
         }
     }
 }
@@ -147,9 +327,21 @@ pub fn lock() -> MutexGuard<'static, ()> {
 /// fails — while passing on macOS and Windows, whose vaults always open.
 /// Pinning `in-memory` makes the branch identical everywhere AND keeps the
 /// suite off the developer's real Keychain (`feedback_no_security_w_on_cc_keychain`).
-#[cfg(test)]
-pub(crate) fn with_in_memory_secret_backend<R>(f: impl FnOnce() -> R) -> R {
-    with_secret_backend("in-memory", f)
+#[cfg(any(test, feature = "test-utils"))]
+pub fn with_in_memory_secret_backend<R>(f: impl FnOnce() -> R) -> R {
+    with_secret_backend("in-memory", || {
+        // Fail closed: if the pin did not select the in-memory vault (the
+        // `secret-in-memory` feature is off), `open_default_vault` would fall
+        // through to the platform vault, e.g. the real macOS Keychain.
+        let vault = crate::platform::secret::open_default_vault()
+            .expect("in-memory secret backend must open under the in-memory pin");
+        assert_eq!(
+            vault.backend_id(),
+            "in-memory",
+            "with_in_memory_secret_backend must never run against a real vault"
+        );
+        f()
+    })
 }
 
 /// Runs `f` with `CSQ_SECRET_BACKEND` set to `value`, holding [`lock`] for
@@ -166,7 +358,7 @@ pub(crate) fn with_in_memory_secret_backend<R>(f: impl FnOnce() -> R) -> R {
 /// credential manager) always open — a `file` pin does not: it is Linux-only
 /// and errors on macOS, while SUCCEEDING on the very Linux hosts the arm is
 /// about. an internal ticket.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn with_secret_backend<R>(value: &str, f: impl FnOnce() -> R) -> R {
     let guard = lock();
     with_secret_backend_locked(&guard, value, f)
@@ -176,10 +368,7 @@ pub(crate) fn with_secret_backend<R>(value: &str, f: impl FnOnce() -> R) -> R {
 /// case of [`with_secret_backend_locked`], kept as a named wrapper because
 /// this module's own self-tests call it directly.
 #[cfg(test)]
-fn with_in_memory_secret_backend_locked<R>(
-    lock: &MutexGuard<'static, ()>,
-    f: impl FnOnce() -> R,
-) -> R {
+fn with_in_memory_secret_backend_locked<R>(lock: &EnvTestGuard, f: impl FnOnce() -> R) -> R {
     with_secret_backend_locked(lock, "in-memory", f)
 }
 
@@ -195,12 +384,8 @@ fn with_in_memory_secret_backend_locked<R>(
 /// is not hypothetical either: the first version of those self-tests read
 /// the ambient value outside the lock and went RED on the full-suite run
 /// while passing under a module filter.
-#[cfg(test)]
-fn with_secret_backend_locked<R>(
-    _lock: &MutexGuard<'static, ()>,
-    value: &str,
-    f: impl FnOnce() -> R,
-) -> R {
+#[cfg(any(test, feature = "test-utils"))]
+fn with_secret_backend_locked<R>(_lock: &EnvTestGuard, value: &str, f: impl FnOnce() -> R) -> R {
     /// Restores `CSQ_SECRET_BACKEND` in `Drop` — i.e. on the panicking
     /// path too, so a failing assertion inside `f` cannot leak the
     /// override into the rest of the suite.
@@ -229,6 +414,41 @@ fn with_secret_backend_locked<R>(
 mod tests {
     use super::*;
     use std::thread;
+
+    /// The helper's whole promise is that `f` runs against the in-memory vault,
+    /// never a platform one; assert the vault the code under test would open.
+    #[test]
+    fn with_in_memory_secret_backend_opens_the_in_memory_vault() {
+        let id = with_in_memory_secret_backend(|| {
+            crate::platform::secret::open_default_vault()
+                .unwrap()
+                .backend_id()
+        });
+        assert_eq!(id, "in-memory");
+    }
+
+    /// The holder record's RELEASE half: after a guard drops, the record must
+    /// never name that thread again. Asserted as `ne` (not `None`) so a
+    /// sibling holding the shared lock concurrently cannot make it flake —
+    /// `None` would be true only when the lock is free, which a full-set run
+    /// does not guarantee, while "not this thread" is true in both cases.
+    #[test]
+    fn holder_record_never_names_a_releaser() {
+        {
+            let g = lock();
+            assert_eq!(
+                current_holder(),
+                Some(std::thread::current().id()),
+                "a held guard's acquirer is the recorded holder"
+            );
+            drop(g);
+        }
+        assert_ne!(
+            current_holder(),
+            Some(std::thread::current().id()),
+            "the record must be cleared when the guard drops"
+        );
+    }
 
     /// Two threads each acquiring the guard MUST serialize — no
     /// parallel execution inside the guarded block. We prove this
@@ -332,5 +552,37 @@ mod tests {
 
         // Second acquirer should not block / fail.
         let _g = lock();
+    }
+
+    /// RED row for the structural order guard: env-then-signal is the ONLY
+    /// forbidden order, and it must fail immediately with the rule named.
+    /// (RED-first: removing the check in `signal_lock` makes this test fail —
+    /// no panic is raised, and the production outcome is a silent deadlock.)
+    #[test]
+    fn signal_lock_after_env_lock_panics_with_the_order_rule() {
+        let env = lock();
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = signal_lock();
+        }))
+        .expect_err("signal_lock must refuse env-then-signal");
+        let msg = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            msg.contains("lock-order violation"),
+            "message must name the rule, got: {msg:?}"
+        );
+        drop(env);
+    }
+
+    /// The allowed order: signal first, env second.
+    #[test]
+    fn signal_then_env_is_the_allowed_order() {
+        let signal = signal_lock();
+        let env = lock();
+        drop(env);
+        drop(signal);
     }
 }

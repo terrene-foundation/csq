@@ -48,7 +48,7 @@ use crate::credentials::file as cred_file;
 use crate::credentials::mutex::AccountMutexTable;
 use crate::credentials::write_uuid_settings;
 use crate::daemon::identity_mint::{self, MintSummary};
-use crate::platform::fs::{atomic_replace, secure_dir, secure_file_readonly};
+use crate::platform::fs::{atomic_replace, secure_file_readonly};
 use crate::providers::catalog::Surface;
 use crate::providers::codex::surface as codex_surface;
 use crate::types::AccountNum;
@@ -65,6 +65,14 @@ pub struct ReconcileSummary {
     pub codex_credentials_already_ok: usize,
     /// Number of Codex canonicals flipped from 0o600 → 0o400.
     pub codex_credentials_repaired: usize,
+    /// SEC-2.15 delta (R1 verdict item 2): number of account dirs whose
+    /// mode the startup repair pass tightened to 0o700.
+    pub sec_dir_modes_repaired: usize,
+    /// R2 LOW 8/10: repair-pass targets SKIPPED — absent (the pass never
+    /// conjures), symlinked, foreign-owned, or beyond the enumeration cap.
+    /// The count makes the pass's skip behaviour observable, so a test can
+    /// discriminate a skip from a follow.
+    pub sec_dir_modes_skipped: usize,
     /// Number of `config-<N>/config.toml` files inspected.
     pub config_tomls_seen: usize,
     /// Number of `config.toml` files whose `cli_auth_credentials_store`
@@ -180,16 +188,52 @@ pub struct ReconcileSummary {
     /// found. Idempotent — 0 on every start after the file is gone.
     /// See `rules/reconciler-cleanup-parity.md` Rule 6.
     pub coc_trust_orphans_removed: usize,
+    /// Windows: counts from the integrity-label upgrade pass over csq's own secret
+    /// files (`platform::label_upgrade`). `None` on non-Windows (no-op).
+    pub label_upgrade: Option<crate::platform::label_upgrade::LabelUpgradeReport>,
 }
 
-/// Runs the reconciler synchronously. Safe to call before
-/// [`crate::daemon::spawn_refresher`] because both writers
-/// (reconciler + refresher) coordinate via the same per-account
-/// mutex table.
+/// The fixed error text both daemon entry points return when the startup reconciler
+/// task could not be joined.
+pub const RECONCILER_TASK_FAILED: &str = "startup reconciler task failed";
+
+/// Logs a failed join of the `spawn_blocking(run_reconciler)` task and returns the fixed
+/// error string the daemon entry points propagate. The `JoinError` is NEVER formatted: a
+/// panic payload is carried in its `Display`, and the reconciler walks credential files, so
+/// a payload could echo secret material into the rolling daemon log or the returned error
+/// (`security.md` §2/§8). Only the fixed tag and whether it was a panic are recorded.
+pub fn reconciler_join_failure(error: &tokio::task::JoinError) -> String {
+    tracing::error!(
+        error_kind = "reconciler_task_failed",
+        is_panic = error.is_panic(),
+        "startup reconciler task failed"
+    );
+    RECONCILER_TASK_FAILED.to_string()
+}
+
+/// Runs the reconciler synchronously (callers on an async runtime wrap it in
+/// `spawn_blocking`). The Codex passes (1, 2) are safe to run before
+/// [`crate::daemon::spawn_refresher`] because both writers (reconciler + refresher)
+/// coordinate via the same per-account mutex table. The Windows integrity-label
+/// sweep (`platform::label_upgrade`) does NOT take that mutex: it holds each file
+/// handle only for the inspect-and-stamp and relies on `atomic_replace`'s bounded
+/// retry for a replace that races it; its background continuation never walks
+/// `credentials/` or `identities/`. It may leave a bounded background thread running
+/// after this returns; `platform::label_upgrade::stop_label_upgrade` ends it.
 ///
 /// Returns a [`ReconcileSummary`] with per-pass counters.
 pub fn run_reconciler(base_dir: &Path) -> ReconcileSummary {
     let mut summary = ReconcileSummary::default();
+
+    // SEC-2.15 delta (R1 verdict item 2): idempotent dir-mode repair FIRST —
+    // tighten a pre-existing 0o755 accounts root / identities/ / <UUID>
+    // child dir (and credentials/ when it already exists) before any pass
+    // writes into them. Never follows a symlink; non-fatal.
+    pass_sec_2_15_dir_modes(base_dir, &mut summary);
+
+    // Windows: stamp the private integrity label on secret files older csq wrote
+    // without it (idempotent, bounded, background continuation; no-op elsewhere).
+    summary.label_upgrade = crate::platform::label_upgrade::run_label_upgrade(base_dir);
 
     // Pass 0 — A++ identity minting (M1-4, an internal ticket Phase 1).
     // Non-fatal: a mint error logs a warning and lets daemon continue.
@@ -352,6 +396,8 @@ pub fn run_reconciler(base_dir: &Path) -> ReconcileSummary {
     info!(
         codex_credentials_seen = summary.codex_credentials_seen,
         codex_credentials_repaired = summary.codex_credentials_repaired,
+        sec_dir_modes_repaired = summary.sec_dir_modes_repaired,
+        sec_dir_modes_skipped = summary.sec_dir_modes_skipped,
         config_tomls_seen = summary.config_tomls_seen,
         config_tomls_repaired = summary.config_tomls_repaired,
         quota_migrated = ?summary.quota_migrated,
@@ -895,23 +941,20 @@ pub fn phase4_gate_self_heal(base_dir: &Path) -> Phase4HealReport {
                 .unwrap_or(false)
                 && !identity_dir.join("credentials-codex.json").exists());
         if any_target_missing {
-            if let Err(e) = std::fs::create_dir_all(&identity_dir) {
+            // SEC-2.15 (unified, R1 M1): the shared fail-closed helper
+            // creates AND secures `identities/` + this UUID dir (0o700 at
+            // creation, symlink-refusing). A failure warns and skips the
+            // slot — this pass's per-slot non-fatal idiom.
+            if let Err(e) =
+                crate::accounts::identity_store::ensure_private_identity_dir(base_dir, *uuid)
+            {
                 warn!(
                     error_kind = "heal_identity_dir_create_failed",
                     slot = slot,
-                    "phase4 self-heal: cannot create identity dir; skipping slot: {}",
+                    "phase4 self-heal: cannot create/secure identity dir; skipping slot: {}",
                     crate::error::redact_tokens(&e.to_string())
                 );
                 continue;
-            }
-            if let Err(e) = secure_dir(&identity_dir) {
-                // Non-fatal — file-level 0o600 still protects content.
-                warn!(
-                    error_kind = "heal_identity_dir_secure_failed",
-                    slot = slot,
-                    "phase4 self-heal: secure_dir on identity dir failed: {}",
-                    crate::error::redact_tokens(&e.to_string())
-                );
             }
         }
 
@@ -1696,6 +1739,377 @@ fn pass3_quota_v1_to_v2(base_dir: &Path, summary: &mut ReconcileSummary) {
     }
 }
 
+/// Best-effort observed mode of `path` (0o777 mask) for repair accounting.
+#[cfg(unix)]
+fn dir_mode_masked(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|m| m.permissions().mode() & 0o777)
+}
+
+/// SEC-2.15 startup repair (R1 verdict item 2).
+///
+/// Tightens pre-existing world-enumerable account dirs to 0o700: the
+/// accounts root (only when it already exists — the pass never conjures it,
+/// R2 LOW 11), the `identities/` root, each REAL directory directly under
+/// `identities/`, `credentials/`, `keychain-quarantine/` and each real
+/// `native-homes/<surface>-<N>/` when they already exist (R2 M3: both
+/// content-bearing dirs are on the repair surface).
+///
+/// Symlinks are never followed: the accounts root resolves a leaf symlink
+/// through `ensure_private_dir_root` (R2 H1 — the supported external-drive
+/// setup), while every identity-level target goes through the strict
+/// `ensure_private_dir`, which refuses a non-directory (including a
+/// symlink) rather than chmod-ing through it. The `identities/` and
+/// `native-homes/` roots are additionally checked BEFORE `read_dir` (R2
+/// M1): each must be a REAL directory owned by `geteuid`, or the whole
+/// subtree is skipped — a symlinked root must never enumerate (and then
+/// tighten) real subdirectories of whatever it points at.
+///
+/// R3 LOW 2/3 (fd-relative form): a repair target is either the accounts
+/// root (path-based — its leaf symlink is the supported external-drive
+/// setup, resolved ONCE by the root variant), a handled root whose fd is
+/// HELD from enumeration, or a child NAMED relative to one of those held
+/// fds — so no repair ever re-resolves a path to reach its chmod target.
+enum RepairTarget {
+    AccountsRoot(std::path::PathBuf),
+    Root {
+        tag: TargetTag,
+        root_idx: usize,
+    },
+    Child {
+        tag: TargetTag,
+        root_idx: usize,
+        name: std::ffi::OsString,
+        expected: Option<(u64, u64)>,
+    },
+}
+
+/// R3 LOW 2/3: module scope so the repair test can call the enumeration
+/// directly. `TargetTag` labels repair targets for the fixed log tags.
+#[derive(Clone, Copy)]
+pub(crate) enum TargetTag {
+    AccountsRoot,
+    IdentitiesRoot,
+    UuidDir,
+    Credentials,
+    KeychainQuarantine,
+    NativeHome,
+}
+impl TargetTag {
+    fn as_str(self) -> &'static str {
+        match self {
+            TargetTag::AccountsRoot => "accounts_root",
+            TargetTag::IdentitiesRoot => "identities_root",
+            TargetTag::UuidDir => "uuid_dir",
+            TargetTag::Credentials => "credentials",
+            TargetTag::KeychainQuarantine => "keychain_quarantine",
+            TargetTag::NativeHome => "native_home",
+        }
+    }
+}
+
+/// Observed identity of an enumerated directory: the `(dev, ino)` the
+/// repair pass verifies at tighten time (R3 LOW 2). `None` off unix
+/// (no `MetadataExt`; the mode-bit model does not apply there).
+#[cfg(unix)]
+fn dev_ino(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some((meta.dev(), meta.ino()))
+}
+#[cfg(not(unix))]
+fn dev_ino(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+/// Enumerate real directories directly under a root. `symlink_metadata`
+/// is the no-follow read: a link reports itself, not its target, so a
+/// linked entry is skipped and never tightened-through. R2 M1: the root
+/// itself must be a real, euid-owned directory before we enumerate — a
+/// symlinked root is skipped wholesale, never followed (the caller holds
+/// its [`crate::platform::fs::DirFd`] from that same open). The read_dir
+/// here supplies NAMES only; every repair opens the child RELATIVE to the
+/// held root fd, so a swap of the root path after enumeration cannot
+/// redirect a tighten.
+fn enumerate_real_subdirs(
+    root: &Path,
+    root_idx: usize,
+    tag: TargetTag,
+    cap: usize,
+    targets: &mut Vec<RepairTarget>,
+    truncated: &mut bool,
+    summary: &mut ReconcileSummary,
+) {
+    // R3 LOW 3: the cap counts VISITED entries, not only pushed
+    // directories — a root full of non-directory entries can no longer
+    // consume the whole budget invisibly. Every read_dir / entry error
+    // is counted AND logged (fixed tag, path-free) rather than silently
+    // dropped (`zero-tolerance.md` Rule 3).
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(_) => {
+            summary.sec_dir_modes_skipped += 1;
+            warn!(
+                error_kind = "sec_2_15_repair_root_unreadable",
+                "SEC-2.15 startup repair: a repair root could not be enumerated; its entries are not visited this start"
+            );
+            return;
+        }
+    };
+    let mut visited = 0usize;
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => {
+                summary.sec_dir_modes_skipped += 1;
+                warn!(
+                    error_kind = "sec_2_15_repair_entry_unreadable",
+                    "SEC-2.15 startup repair: a directory entry could not be read; not visited"
+                );
+                continue;
+            }
+        };
+        if visited >= cap {
+            *truncated = true;
+            break;
+        }
+        visited += 1;
+        let path = entry.path();
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_dir() => targets.push(RepairTarget::Child {
+                tag,
+                root_idx,
+                name: entry.file_name(),
+                expected: dev_ino(&meta),
+            }),
+            _ => summary.sec_dir_modes_skipped += 1,
+        }
+    }
+}
+
+/// A `DirFd::open` failure that means "the root does not exist" — the
+/// normal fresh-install state, kept SILENT (parity with the missing
+/// `credentials/`/quarantine arms above). Every OTHER failure — foreign
+/// owner, EACCES, a racing symlink swap — is a refusal: counted AND warned
+/// with the fixed `sec_2_15_repair_root_refused` tag (fixcheck2 LOW 4).
+fn dir_open_is_missing(e: &crate::error::PlatformError) -> bool {
+    matches!(
+        e,
+        crate::error::PlatformError::Io(io) if io.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// Idempotent: a dir already at 0o700 counts nothing and changes nothing.
+/// Bounded: at most `MAX_REPAIR_TARGETS` VISITED entries per root per
+/// start (R2 LOW 7 as tightened by R3 LOW 3 — the cap counts every entry
+/// visited, not only pushed directories), with the truncation logged. Non-fatal: a failed target logs
+/// `sec_2_15_dir_secure_failed` with a fixed `target` tag (R2 LOW 8; the
+/// message is redacted) and the walk continues — the reconciler never
+/// blocks daemon start on repair. Skips (absent, symlinked, foreign-owned,
+/// capped) are counted in `summary.sec_dir_modes_skipped` (R2 LOW 10).
+fn pass_sec_2_15_dir_modes(base_dir: &Path, summary: &mut ReconcileSummary) {
+    /// R2 LOW 7: bound the enumeration so a hostile or wedged directory
+    /// tree cannot stall daemon start before the refresher spawns.
+    const MAX_REPAIR_TARGETS: usize = 1024;
+
+    // R3 LOW 2 full fix: each handled root is opened ONCE here, with
+    // `O_DIRECTORY | O_NOFOLLOW` + the euid check — the R2 M1 precheck and
+    // the fd the repair later acts through are now the SAME operation: a
+    // symlinked or foreign-owned root fails at open and its subtree is
+    // skipped, never enumerated — and every child repair below opens
+    // RELATIVE to a held fd (`openat`), so no path is re-resolved between
+    // enumerate and chmod.
+    fn open_repair_root(
+        path: &Path,
+        roots: &mut Vec<crate::platform::fs::DirFd>,
+        summary: &mut ReconcileSummary,
+    ) -> Option<usize> {
+        match crate::platform::fs::DirFd::open(path) {
+            Ok(fd) => {
+                roots.push(fd);
+                Some(roots.len() - 1)
+            }
+            Err(e) => {
+                summary.sec_dir_modes_skipped += 1;
+                // fixcheck2 LOW 4: a REFUSED root (foreign owner, EACCES, a
+                // racing swap) is warned again with the fixed tag; only a
+                // plain missing root stays silent (it is counted either way).
+                if !dir_open_is_missing(&e) {
+                    warn!(
+                        error_kind = "sec_2_15_repair_root_refused",
+                        "SEC-2.15 startup repair: a repair root was refused and its subtree is not visited this start: {}",
+                        crate::error::redact_tokens(&e.to_string())
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    let mut roots: Vec<crate::platform::fs::DirFd> = Vec::new();
+    let mut targets: Vec<RepairTarget> = Vec::new();
+    let mut truncated = false;
+
+    // R2 LOW 11: the accounts root is repaired only when it EXISTS. A leaf
+    // symlink here is the supported external-drive setup (R2 H1) and is
+    // resolved by the root variant below.
+    match std::fs::symlink_metadata(base_dir) {
+        Ok(_) => targets.push(RepairTarget::AccountsRoot(base_dir.to_path_buf())),
+        Err(_) => summary.sec_dir_modes_skipped += 1,
+    }
+
+    let identities_root = crate::accounts::identity_store::identities_dir(base_dir);
+    if let Some(root_idx) = open_repair_root(&identities_root, &mut roots, summary) {
+        targets.push(RepairTarget::Root {
+            tag: TargetTag::IdentitiesRoot,
+            root_idx,
+        });
+        enumerate_real_subdirs(
+            &identities_root,
+            root_idx,
+            TargetTag::UuidDir,
+            MAX_REPAIR_TARGETS,
+            &mut targets,
+            &mut truncated,
+            summary,
+        );
+    }
+
+    // R2 M3: content-bearing dirs on the repair surface, existing-only.
+    let quarantine_root = base_dir.join("keychain-quarantine");
+    match std::fs::symlink_metadata(&quarantine_root) {
+        Ok(meta) if meta.is_dir() => {
+            if let Some(root_idx) = open_repair_root(&quarantine_root, &mut roots, summary) {
+                targets.push(RepairTarget::Root {
+                    tag: TargetTag::KeychainQuarantine,
+                    root_idx,
+                });
+            }
+        }
+        Ok(_) => summary.sec_dir_modes_skipped += 1,
+        // Missing stays UNCOUNTED — parity with the pre-fd pass.
+        Err(_) => {}
+    }
+    let native_homes_root = base_dir.join("native-homes");
+    match crate::platform::fs::DirFd::open(&native_homes_root) {
+        Ok(fd) => {
+            let root_idx = roots.len();
+            roots.push(fd);
+            enumerate_real_subdirs(
+                &native_homes_root,
+                root_idx,
+                TargetTag::NativeHome,
+                MAX_REPAIR_TARGETS,
+                &mut targets,
+                &mut truncated,
+                summary,
+            );
+        }
+        // fixcheck2 LOW 4: a missing native-homes/ is the normal state on a
+        // machine with no native logins — silent and uncounted (parity with
+        // the missing credentials//quarantine arms). A REFUSED root is
+        // counted AND warned like every other refusal; the former
+        // `if let Ok(fd)` swallowed it entirely.
+        Err(e) => {
+            if !dir_open_is_missing(&e) {
+                summary.sec_dir_modes_skipped += 1;
+                warn!(
+                    error_kind = "sec_2_15_repair_root_refused",
+                    "SEC-2.15 startup repair: a repair root was refused and its subtree is not visited this start: {}",
+                    crate::error::redact_tokens(&e.to_string())
+                );
+            }
+        }
+    }
+
+    // `credentials/` is repaired only when it already exists — the pass
+    // must not conjure an empty credentials dir on a machine that has none.
+    let credentials_root = base_dir.join("credentials");
+    match std::fs::symlink_metadata(&credentials_root) {
+        Ok(meta) if meta.is_dir() => {
+            if let Some(root_idx) = open_repair_root(&credentials_root, &mut roots, summary) {
+                targets.push(RepairTarget::Root {
+                    tag: TargetTag::Credentials,
+                    root_idx,
+                });
+            }
+        }
+        Ok(_) => summary.sec_dir_modes_skipped += 1,
+        // Missing stays UNCOUNTED — parity with the pre-fd pass.
+        Err(_) => {}
+    }
+
+    if truncated {
+        summary.sec_dir_modes_skipped += 1;
+        warn!(
+            error_kind = "sec_2_15_repair_capped",
+            "SEC-2.15 startup repair: target enumeration capped at {MAX_REPAIR_TARGETS}; entries beyond the cap are NOT visited this start (enumeration order is stable - the same first entries are visited every start, so raise MAX_REPAIR_TARGETS or shrink the roots; this is not automatic deferral)"
+        );
+    }
+
+    for target in targets {
+        // Repair accounting: the fd-relative handles report `Ok(true)` only
+        // when the mode ACTUALLY changed, so no racy path re-read is needed
+        // for them; the path-based accounts-root arm keeps the observed
+        // before/after read. A dir the helper leaves untouched (deliberately
+        // read-only, or already 0o700) does not count.
+        let (tag, result) = match target {
+            RepairTarget::AccountsRoot(target) => {
+                #[cfg(unix)]
+                let mode_before = dir_mode_masked(&target);
+                // R2 H1: the accounts root may legitimately be a leaf symlink
+                // and is resolved ONCE by the root variant — the one target
+                // intentionally kept path-based.
+                let result = match crate::platform::fs::ensure_private_dir_root(&target) {
+                    Ok(()) => {
+                        #[cfg(unix)]
+                        {
+                            let mode_after = dir_mode_masked(&target);
+                            Ok(mode_before != mode_after)
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            Ok(false)
+                        }
+                    }
+                    Err(e) => Err(e),
+                };
+                (TargetTag::AccountsRoot, result)
+            }
+            // R3 LOW 2 full fix: the tighten runs on the fd HELD since
+            // enumeration — a path swap above the target cannot redirect
+            // it, and repair never creates (fd-based `fchmod` only).
+            RepairTarget::Root { tag, root_idx } => (tag, roots[root_idx].tighten_self(None)),
+            RepairTarget::Child {
+                tag,
+                root_idx,
+                name,
+                expected,
+            } => (tag, roots[root_idx].tighten_child(&name, expected)),
+        };
+        match result {
+            Ok(true) => {
+                summary.sec_dir_modes_repaired += 1;
+                info!(
+                    error_kind = "sec_2_15_dir_mode_repaired",
+                    target = tag.as_str(),
+                    "SEC-2.15 startup repair: account dir tightened to 0o700"
+                );
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(
+                    error_kind = "sec_2_15_dir_secure_failed",
+                    target = tag.as_str(),
+                    "SEC-2.15 startup repair failed for a target (non-fatal): {}",
+                    crate::error::redact_tokens(&e.to_string())
+                );
+            }
+        }
+    }
+}
+
 /// Pass 0 Phase 2 (M2-5): rename legacy `usage-{slot}.ndjson` ledger files
 /// to `identities/<UUID>/usage.ndjson` for slots whose UUID is already in
 /// `profiles.json`.
@@ -1710,7 +2124,7 @@ fn pass3_quota_v1_to_v2(base_dir: &Path, summary: &mut ReconcileSummary) {
 ///
 /// Non-fatal: any per-slot error is logged and the walk continues.
 fn pass0_phase2_ledger_catchup(base_dir: &Path, summary: &mut ReconcileSummary) {
-    use crate::accounts::identity_store::{identity_path, usage_ledger_path_for};
+    use crate::accounts::identity_store::usage_ledger_path_for;
 
     let profiles_path = profiles::profiles_path(base_dir);
     let current_profiles = match profiles::load(&profiles_path) {
@@ -1744,13 +2158,21 @@ fn pass0_phase2_ledger_catchup(base_dir: &Path, summary: &mut ReconcileSummary) 
             continue;
         }
 
-        // Ensure the identity dir exists before rename.
-        let id_dir = identity_path(base_dir, uuid);
-        if let Err(e) = std::fs::create_dir_all(&id_dir) {
+        // R2 LOW 5: one shared call — the `identities/` ROOT is secured
+        // BEFORE `identities/<uuid>/` is created beneath it, and a bad
+        // (symlinked, foreign) root is refused before anything is created
+        // inside it. A failure warns (`ledger_catchup_secure_failed`) and
+        // SKIPS the rename for this slot — the legacy ledger stays in place
+        // and the next pass retries, so nothing is lost. Warn-and-skip
+        // matches this pass's per-slot non-fatal idiom (see
+        // `phase4_gate_self_heal`).
+        if let Err(e) = crate::accounts::identity_store::ensure_private_identity_dir(base_dir, uuid)
+        {
             warn!(
-                error_kind = "ledger_catchup_mkdir_failed",
+                error_kind = "ledger_catchup_secure_failed",
                 slot = %slot_key,
-                "pass0 M2-5 ledger catchup: could not create identities/<uuid> dir: {e}"
+                "pass0 M2-5 ledger catchup: securing identities dirs failed: {}",
+                crate::error::redact_tokens(&e.to_string())
             );
             continue;
         }
@@ -1777,7 +2199,7 @@ fn pass0_phase2_ledger_catchup(base_dir: &Path, summary: &mut ReconcileSummary) 
 /// Pass 0 Phase 2 (M2-3): catch up existing slots whose UUID is already in
 /// `profiles.json` but whose `identities/<UUID>/settings.json` was not yet
 /// seeded (accounts that existed before M2-3 was deployed, or accounts where
-/// `mint_for_login` ran on a pre-M2-3 binary).
+/// `commit_anthropic_login` ran on a pre-M2-3 binary).
 ///
 /// Walks `profiles.json` `by_slot` entries, resolves UUID per slot, checks
 /// whether `identities/<UUID>/settings.json` already exists (skip if present
@@ -3751,7 +4173,7 @@ mod tests {
     /// `rules/testing.md` MUST Rule 6 (shared mutex BEFORE any
     /// per-test state).
     struct CodexUserConfigIsolated {
-        _shared: std::sync::MutexGuard<'static, ()>,
+        _shared: crate::platform::test_env::EnvTestGuard,
         prev: Option<std::ffi::OsString>,
     }
 
@@ -3801,6 +4223,8 @@ mod tests {
         // M4-12: provision UUID mapping in profiles.json::by_slot BEFORE
         // calling save_canonical_for, which is now fail-closed (returns
         // Err(NoCredentials) when no UUID mapping exists).
+        let profiles_lock =
+            crate::accounts::profiles_lock::ProfilesFileLock::acquire(base).unwrap();
         let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(id);
         let profiles_path = crate::accounts::profiles::profiles_path(base);
         let mut profiles = if profiles_path.exists() {
@@ -3811,6 +4235,17 @@ mod tests {
         };
         profiles.by_slot.insert(id.to_string(), uuid);
         crate::accounts::profiles::save(&profiles_path, &profiles).unwrap();
+        // Match production login: mint metadata and the directory under profiles
+        // authority before asking the canonical writer to persist credentials.
+        let minted = crate::daemon::identity_mint::mint_for_codex_login(
+            &profiles_lock,
+            base,
+            id,
+            Some("acct-test"),
+        )
+        .unwrap();
+        assert_eq!(minted, uuid);
+        assert!(crate::accounts::identity_store::identity_json_path_for(base, uuid).is_file());
         // Use save_canonical_for so the UUID-keyed path (identities/<UUID>/
         // credentials-codex.json) lands at 0o400 (the INV-P08 steady state).
         cred_file::save_canonical_for(base, num, &creds).unwrap();
@@ -4971,6 +5406,368 @@ mod tests {
         assert!(
             content.contains("sess-1"),
             "ledger content must survive the rename: {content}"
+        );
+
+        // SEC-2.15 mode discrimination lives in
+        // `ledger_catchup_directly_secures_pre_existing_permissive_dirs`
+        // (R1 M4): through the full pipeline the settings catchup and the
+        // SEC-2.15 repair pass secure these dirs BEFORE the ledger catchup
+        // runs, which masked the catchup's own ensures — asserting modes
+        // here again would reproduce that non-discriminating shape.
+    }
+
+    // ── SEC-2.15 (R1 M4): discriminating direct tests of the dir secures ──
+
+    /// V3 (R1 verdict item 3): the pipeline test above cannot discriminate
+    /// the ledger catchup's own ensures — through `run_reconciler` the
+    /// settings catchup AND the SEC-2.15 repair pass secure these dirs
+    /// first, so the catchup could lose either ensure and the pipeline
+    /// assertions would stay green. This test calls
+    /// `pass0_phase2_ledger_catchup` DIRECTLY with both dirs pre-seeded at
+    /// 0o755 under a pinned permissive umask: dropping either ensure in the
+    /// pass leaves the pre-seeded mode and REDs the matching assertion.
+    /// Executed-line marker: the rename assertions prove the pass ran and
+    /// processed the slot before the mode assertions are read.
+    #[cfg(unix)]
+    #[test]
+    fn ledger_catchup_directly_secures_pre_existing_permissive_dirs() {
+        use crate::accounts::identity_store::{identities_dir, IdentityId};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _umask = crate::platform::test_env::UmaskGuard::pin(0o022);
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = IdentityId::new_v4();
+
+        let mut pf = crate::accounts::profiles::ProfilesFile::empty();
+        pf.by_slot.insert("1".to_string(), uuid);
+        crate::accounts::profiles::save(&crate::accounts::profiles::profiles_path(base), &pf)
+            .unwrap();
+
+        let identity_dir = identities_dir(base).join(uuid.to_canonical_string());
+        std::fs::create_dir_all(&identity_dir).unwrap();
+        // Pre-seed PERMISSIVE modes AFTER the profiles write (whose own save
+        // secures the root): under the pinned 0o022 umask, nothing in this
+        // test can silently produce 0o700 from here on.
+        let ids_root = identities_dir(base);
+        std::fs::set_permissions(base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&ids_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&identity_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        std::fs::write(
+            base.join("usage-1.ndjson"),
+            b"{\"ts\":\"2026-10-12T00:00:00Z\"}\n",
+        )
+        .unwrap();
+
+        let mut summary = ReconcileSummary::default();
+        super::pass0_phase2_ledger_catchup(base, &mut summary);
+
+        // Executed-line markers: the pass renamed the legacy ledger.
+        assert_eq!(
+            summary.ledger_files_renamed, 1,
+            "the direct catchup must process and rename the legacy ledger"
+        );
+        assert!(
+            identity_dir.join("usage.ndjson").exists(),
+            "UUID-keyed ledger must exist after the direct catchup"
+        );
+
+        let mode_of =
+            |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode_of(&identity_dir),
+            0o700,
+            "identities/<UUID>/ must be tightened to 0o700 by the catchup itself"
+        );
+        assert_eq!(
+            mode_of(&ids_root),
+            0o700,
+            "identities/ root must be tightened to 0o700 by the catchup itself"
+        );
+        // Negative control: the catchup must not chmod the accounts root —
+        // pre-pinned 0o755, so a stray base ensure would RED this.
+        assert_eq!(
+            mode_of(base),
+            0o755,
+            "the catchup must touch only identities/ and the UUID dir, never base_dir"
+        );
+    }
+
+    /// R2 M1 regression: a symlinked `identities/` root is skipped WHOLESALE
+    /// — `read_dir` must never enumerate the link's target, or the pass
+    /// would tighten real subdirectories of whatever the link points at
+    /// (the operator's HOME, ~/Public, ...). The skip counter makes the
+    /// skip discriminating (R2 LOW 10): a mutation that removes the guard
+    /// enumerates and chmods `outside/child` and drops the counter.
+    #[cfg(unix)]
+    #[test]
+    fn sec_2_15_repair_skips_symlinked_identities_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _umask = crate::platform::test_env::UmaskGuard::pin(0o022);
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("accounts");
+        std::fs::create_dir(&base).unwrap();
+        let outside = dir.path().join("outside");
+        let outside_child = outside.join("child");
+        std::fs::create_dir_all(&outside_child).unwrap();
+        std::os::unix::fs::symlink(
+            &outside,
+            crate::accounts::identity_store::identities_dir(&base),
+        )
+        .unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&outside_child, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut summary = ReconcileSummary::default();
+        super::pass_sec_2_15_dir_modes(&base, &mut summary);
+
+        let mode_of =
+            |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode_of(&base),
+            0o700,
+            "the real accounts root still tightens"
+        );
+        assert_eq!(
+            mode_of(&outside_child),
+            0o755,
+            "a real subdirectory of the symlinked identities/ target must NEVER be touched"
+        );
+        assert_eq!(
+            summary.sec_dir_modes_skipped, 1,
+            "the symlinked identities/ root must count as ONE skip"
+        );
+        assert_eq!(
+            summary.sec_dir_modes_repaired, 1,
+            "only the real accounts root tightens"
+        );
+    }
+
+    /// R3 HIGH regression, END-TO-END (methodological directive): on an
+    /// operator-SYMLINKED accounts root, the identity mint writes the
+    /// sentinel THROUGH the root symlink and the phase-4 gate does NOT
+    /// refuse the daemon start. The H1 `handle_start` test stops at the PID
+    /// file before the reconciler, so it cannot catch this: pre-fix,
+    /// `write_sentinel` routed the sentinel parent (== the accounts root)
+    /// through the STRICT helper, refused the symlink, mint failed with
+    /// SentinelWrite, and `phase4_gate_check` returned StoreVersionUnset —
+    /// no refresher on every fresh install / schema bump over a symlinked
+    /// root.
+    #[cfg(unix)]
+    #[test]
+    fn e2e_symlinked_root_mint_writes_sentinel_and_phase4_gate_passes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _umask = crate::platform::test_env::UmaskGuard::pin(0o022);
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real-accounts");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = dir.path().join("accounts");
+        std::os::unix::fs::symlink(&real, &root).unwrap();
+
+        // Control: with no sentinel the gate refuses — the assertion below
+        // is discriminating only because this arm refuses first.
+        assert!(
+            matches!(
+                phase4_gate_check(&root),
+                Err(Phase4GateError::StoreVersionUnset)
+            ),
+            "control: without a sentinel the phase-4 gate must refuse"
+        );
+
+        // (1) Identity mint through the SYMLINK path writes the sentinel.
+        identity_mint::run_if_unsentineled(&root).expect("mint on a symlinked root");
+
+        // (2) The sentinel is observable BOTH ways and the REAL root was
+        //     secured (the root variant resolves the leaf symlink).
+        assert!(
+            identity_mint::read_store_version_schema(&root).is_some(),
+            "sentinel must be readable through the symlinked root"
+        );
+        assert!(
+            real.join("store-version").is_file(),
+            "sentinel must land at the symlink TARGET"
+        );
+        let mode_of =
+            |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode_of(&real),
+            0o700,
+            "the resolved root must be tightened to 0o700"
+        );
+        assert!(
+            std::fs::symlink_metadata(&root)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the root symlink itself must survive"
+        );
+
+        // (3) The daemon-start gate passes (StoreVersionUnset absent).
+        phase4_gate_check(&root).expect("phase-4 gate must pass after the mint");
+
+        // (4) Schema N-1 bump arm through the same symlinked root.
+        std::fs::write(
+            real.join("store-version"),
+            b"{\"schema\":2,\"minted_at\":\"2026-01-01T00:00:00Z\",\"source\":\"fixture\"}\n",
+        )
+        .unwrap();
+        let _ = run_reconciler(&root);
+        assert_eq!(
+            identity_mint::read_store_version_schema(&real),
+            Some(identity_mint::STORE_VERSION_SCHEMA_CURRENT),
+            "pass0 must bump the schema through the symlinked root"
+        );
+        phase4_gate_check(&root).expect("phase-4 gate must pass after the bump");
+    }
+
+    /// R3 LOW 3 regression: the cap counts VISITED entries — a root holding
+    /// only non-directory entries trips the truncation flag after `cap`
+    /// visits instead of scanning the whole root for free, and the skipped
+    /// accounting stays honest.
+    #[cfg(unix)]
+    #[test]
+    fn enumerate_counts_visited_entries_against_the_cap() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        for name in ["a-file", "b-file", "c-file"] {
+            std::fs::write(root.join(name), b"x").unwrap();
+        }
+
+        let mut targets = Vec::new();
+        let mut truncated = false;
+        let mut summary = ReconcileSummary::default();
+        super::enumerate_real_subdirs(
+            &root,
+            0,
+            super::TargetTag::UuidDir,
+            1,
+            &mut targets,
+            &mut truncated,
+            &mut summary,
+        );
+
+        assert!(
+            targets.is_empty(),
+            "no directory entries exist, so nothing is pushed"
+        );
+        assert!(
+            truncated,
+            "the cap must trip on VISITED entries, not only on pushed dirs"
+        );
+        assert_eq!(
+            summary.sec_dir_modes_skipped, 1,
+            "exactly the first (visited) non-dir entry is counted; the rest are beyond the cap"
+        );
+    }
+
+    /// SEC-2.15 repair pass (R1 verdict item 2): tightens pre-existing
+    /// permissive dirs idempotently and never follows a symlink. RED if
+    /// the pass body is dropped: the seeded 0o755 modes would survive.
+    #[cfg(unix)]
+    #[test]
+    fn sec_2_15_repair_tightens_permissive_dirs_and_never_follows_symlinks() {
+        use crate::accounts::identity_store::IdentityId;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _umask = crate::platform::test_env::UmaskGuard::pin(0o022);
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = IdentityId::new_v4();
+
+        let ids_root = crate::accounts::identity_store::identities_dir(base);
+        let uuid_dir = crate::accounts::identity_store::identity_path(base, uuid);
+        let creds_root = base.join("credentials");
+        std::fs::create_dir_all(&uuid_dir).unwrap();
+        std::fs::create_dir_all(&creds_root).unwrap();
+        std::fs::create_dir_all(ids_root.join("not-a-uuid-dir-marker")).unwrap();
+
+        // A symlinked child under identities/ must be skipped, never
+        // followed: the OUTSIDE target stays 0o755.
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(
+            &outside,
+            ids_root.join("55555555-5555-5555-5555-555555555555"),
+        )
+        .unwrap();
+
+        // Pre-seed every real target permissive, AFTER all creates.
+        for p in [
+            base,
+            ids_root.as_path(),
+            uuid_dir.as_path(),
+            creds_root.as_path(),
+        ] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut summary = ReconcileSummary::default();
+        super::pass_sec_2_15_dir_modes(base, &mut summary);
+
+        let mode_of =
+            |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode_of(base), 0o700, "accounts root must be tightened");
+        assert_eq!(
+            mode_of(&ids_root),
+            0o700,
+            "identities/ root must be tightened"
+        );
+        assert_eq!(
+            mode_of(&uuid_dir),
+            0o700,
+            "identities/<UUID>/ must be tightened"
+        );
+        assert_eq!(
+            mode_of(&creds_root),
+            0o700,
+            "existing credentials/ must be tightened"
+        );
+        assert_eq!(
+            mode_of(&outside),
+            0o755,
+            "a symlinked child must be skipped, never tightened-through"
+        );
+        assert_eq!(
+            summary.sec_dir_modes_repaired, 5,
+            "exactly the five real permissive dirs count as repaired"
+        );
+
+        // Idempotent: a second pass repairs nothing and changes nothing.
+        let mut summary2 = ReconcileSummary::default();
+        super::pass_sec_2_15_dir_modes(base, &mut summary2);
+        assert_eq!(summary2.sec_dir_modes_repaired, 0, "second pass is a no-op");
+    }
+
+    /// SEC-2.15 delta wiring: `run_reconciler` runs the repair pass FIRST —
+    /// a permissive accounts root is tightened by the full pipeline even on
+    /// a bare fixture. RED if the `pass_sec_2_15_dir_modes` call is dropped
+    /// from `run_reconciler`: base would stay 0o755 and the count 0.
+    #[cfg(unix)]
+    #[test]
+    fn run_reconciler_wires_the_sec_2_15_repair_pass() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _umask = crate::platform::test_env::UmaskGuard::pin(0o022);
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        std::fs::set_permissions(base, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let summary = run_reconciler(base);
+
+        assert_eq!(
+            std::fs::metadata(base).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "run_reconciler must tighten the accounts root via the repair pass"
+        );
+        assert!(
+            summary.sec_dir_modes_repaired >= 1,
+            "the repair must be counted in the summary"
         );
     }
 
@@ -6496,5 +7293,147 @@ mod tests {
             summary.coc_trust_orphans_removed, 0,
             "no orphan present → counter stays at zero"
         );
+    }
+
+    // ── fixcheck2 LOW 4: refusal warns + counts ──────────────────────────
+
+    /// Captures every tracing event as `name=value` text (mirrors the
+    /// crate's other capture subscribers; serialized on the shared
+    /// `TRACING_CAPTURE_LOCK`).
+    struct TextCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    struct FieldText(String);
+
+    impl tracing::field::Visit for FieldText {
+        fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, "{}={:?} ", f.name(), v);
+        }
+    }
+
+    impl tracing::Subscriber for TextCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, e: &tracing::Event<'_>) {
+            let mut v = FieldText(String::new());
+            e.record(&mut v);
+            self.0.lock().unwrap().push(v.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    impl TextCapture {
+        fn capture<T>(run: impl FnOnce() -> T) -> (T, Vec<String>) {
+            let _g = crate::testing::TRACING_CAPTURE_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let out = tracing::subscriber::with_default(TextCapture(events.clone()), run);
+            let got = events.lock().unwrap().clone();
+            (out, got)
+        }
+    }
+
+    /// fixcheck2 LOW 4 (a): an EACCES-refused `credentials/` root is counted
+    /// AND warned again with the fixed tag — the fd refactor had made the
+    /// refusal silent.
+    #[cfg(unix)]
+    #[test]
+    fn repair_refusal_of_an_unreadable_credentials_root_warns_and_counts() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("accounts");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::create_dir(crate::accounts::identity_store::identities_dir(&base)).unwrap();
+        let creds = base.join("credentials");
+        std::fs::create_dir(&creds).unwrap();
+        std::fs::set_permissions(&creds, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut summary = ReconcileSummary::default();
+        let ((), logs) = TextCapture::capture(|| {
+            super::pass_sec_2_15_dir_modes(&base, &mut summary);
+        });
+        std::fs::set_permissions(&creds, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(
+            summary.sec_dir_modes_skipped, 1,
+            "exactly the refused credentials/ root is skipped"
+        );
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("sec_2_15_repair_root_refused")),
+            "the refusal must be warned with the fixed tag: {logs:?}"
+        );
+    }
+
+    /// fixcheck2 LOW 4 (b): a refused `native-homes/` root is now BOTH
+    /// counted and warned; the former `if let Ok(fd)` swallowed it
+    /// entirely. A MISSING native-homes/ stays silent and uncounted.
+    #[cfg(unix)]
+    #[test]
+    fn repair_refusal_of_an_unreadable_native_homes_root_warns_and_counts() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("accounts");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::create_dir(crate::accounts::identity_store::identities_dir(&base)).unwrap();
+        let homes = base.join("native-homes");
+        std::fs::create_dir(&homes).unwrap();
+        std::fs::set_permissions(&homes, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut summary = ReconcileSummary::default();
+        let ((), logs) = TextCapture::capture(|| {
+            super::pass_sec_2_15_dir_modes(&base, &mut summary);
+        });
+        std::fs::set_permissions(&homes, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(
+            summary.sec_dir_modes_skipped, 1,
+            "exactly the refused native-homes/ root is skipped (0 before the fix)"
+        );
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("sec_2_15_repair_root_refused")),
+            "the refusal must be warned with the fixed tag: {logs:?}"
+        );
+    }
+
+    /// A join failure never reaches the log or the returned error as the panic payload.
+    /// Reds if `reconciler_join_failure` formatted the `JoinError` (`{e}`): tokio's Display
+    /// for a panicked task carries the payload, so the canary below would appear in both.
+    #[test]
+    fn a_reconciler_join_failure_never_echoes_the_panic_payload() {
+        const CANARY: &str = "sk-ant-oat01-CANARY-reconciler-payload";
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(async {
+                tokio::task::spawn_blocking(|| {
+                    // The default hook prints this to stderr; the join is what matters.
+                    panic!("{CANARY}");
+                })
+                .await
+            })
+            .unwrap_err();
+        assert!(error.is_panic());
+        assert!(
+            error.to_string().contains(CANARY),
+            "premise: the JoinError Display carries the payload, so formatting it would leak"
+        );
+        let (returned, logs) = TextCapture::capture(|| reconciler_join_failure(&error));
+        assert_eq!(returned, RECONCILER_TASK_FAILED);
+        let joined = logs.join("\n");
+        assert!(!joined.contains(CANARY), "{joined}");
+        assert!(joined.contains("reconciler_task_failed"), "{joined}");
+        assert!(joined.contains("is_panic=true"), "{joined}");
     }
 }

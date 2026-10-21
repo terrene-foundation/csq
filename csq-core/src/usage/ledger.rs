@@ -43,8 +43,11 @@ use std::path::{Path, PathBuf};
 /// `<base_dir>/usage-{slot}.ndjson`
 ///
 /// The branch is determined by `profiles::resolve_slot_to_uuid`. Callers
-/// that need the parent directory to exist MUST call `fs::create_dir_all`
-/// before writing.
+/// that need the parent directory to exist route through
+/// [`crate::accounts::identity_store::ensure_private_identity_dir`] or
+/// [`crate::platform::fs::ensure_private_dir`] (created at 0o700,
+/// fail-closed); the legacy parent is `base_dir`, which callers must not
+/// create from here.
 pub fn ledger_path(base_dir: &Path, slot: AccountNum) -> PathBuf {
     match profiles::resolve_slot_to_uuid(base_dir, slot.get()) {
         Some(uuid) => usage_ledger_path_for(base_dir, uuid),
@@ -169,9 +172,30 @@ pub struct UsageEvent {
 /// daemon aggregator.
 pub fn append(base_dir: &Path, slot: AccountNum, event: &UsageEvent) -> Result<(), LedgerError> {
     let path = ledger_path(base_dir, slot);
-    // Ensure the parent directory exists (needed for identities/<UUID>/ paths).
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(LedgerError::Io)?;
+    // SEC-2.15 (unified, R1 M1) + R2 LOW 4: a UUID-routed ledger lives at
+    // identities/<UUID>/usage.ndjson and routes through the single
+    // `ensure_private_identity_dir` entry point — `identities/` root FIRST,
+    // then the UUID dir, both created at 0o700 (no umask window; the former
+    // `create_dir_all(parent)` here reopened a 0o755 window ahead of the
+    // ensure, and its best-effort contract tolerates the Err). The legacy
+    // `usage-<N>.ndjson` path's parent IS base_dir, which must NOT be
+    // created or chmod'd here — hence the routing check.
+    if path.starts_with(crate::accounts::identity_store::identities_dir(base_dir)) {
+        let id = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|name| name.to_str())
+            .and_then(|name| {
+                name.parse::<crate::accounts::identity_store::IdentityId>()
+                    .ok()
+            })
+            .ok_or_else(|| {
+                LedgerError::Io(std::io::Error::other(
+                    "uuid-routed ledger path is not identity-parented",
+                ))
+            })?;
+        crate::accounts::identity_store::ensure_private_identity_dir(base_dir, id)
+            .map_err(LedgerError::Platform)?;
     }
     let mut line = serde_json::to_string(event).map_err(LedgerError::Serialize)?;
     line.push('\n');
@@ -218,8 +242,27 @@ pub fn write_all(
     events: &[UsageEvent],
 ) -> Result<(), LedgerError> {
     let path = ledger_path(base_dir, slot);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(LedgerError::Io)?;
+    // SEC-2.15 (unified, R1 M1) + R2 LOW 4: same routing as `append` — a
+    // UUID-routed ledger goes through `ensure_private_identity_dir` (root
+    // first, then the UUID dir; creation at 0o700, no `create_dir_all`
+    // umask window ahead of it); base_dir is never created or chmod'd on
+    // the legacy path.
+    if path.starts_with(crate::accounts::identity_store::identities_dir(base_dir)) {
+        let id = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|name| name.to_str())
+            .and_then(|name| {
+                name.parse::<crate::accounts::identity_store::IdentityId>()
+                    .ok()
+            })
+            .ok_or_else(|| {
+                LedgerError::Io(std::io::Error::other(
+                    "uuid-routed ledger path is not identity-parented",
+                ))
+            })?;
+        crate::accounts::identity_store::ensure_private_identity_dir(base_dir, id)
+            .map_err(LedgerError::Platform)?;
     }
 
     let mut content = String::new();
@@ -663,6 +706,83 @@ mod tests {
         }
     }
 
+    /// SEC-2.15: a UUID-routed ledger write restricts BOTH
+    /// `identities/<UUID>/` and the `identities/` root to 0o700 under a
+    /// permissive 0o022 umask. Mutation: dropping either `secure_dir` call
+    /// REDs this with the measured 0o755 mode. The umask is pinned +
+    /// serialized on the shared `platform::test_env` lock (same guard as
+    /// `platform::fs`'s `write_new_private` umask test).
+    #[cfg(unix)]
+    #[test]
+    fn routed_ledger_write_secures_identity_dirs_under_umask_022() {
+        use crate::accounts::identity_store::{identities_dir, IdentityId};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let uuid = IdentityId::new_v4();
+        let mut pf = profiles::ProfilesFile::empty();
+        pf.by_slot.insert("2".to_string(), uuid);
+        profiles::save(&profiles::profiles_path(base), &pf).unwrap();
+
+        let e = ev("2026-10-12T00:00:00Z", "deepseek-chat", 10, 5, Some(0.001));
+        // LOW-7 (R1): UmaskGuard pins the permissive mask and restores it in
+        // Drop under the shared test_env lock — the panic-safe replacement
+        // for the manual save/restore pair.
+        let _umask = crate::platform::test_env::UmaskGuard::pin(0o022);
+        append(base, slot(2), &e).expect("routed ledger append must succeed");
+
+        let mode_of = |p: &Path| {
+            std::fs::metadata(p)
+                .expect("identity dir must exist")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(
+            mode_of(&identities_dir(base).join(uuid.to_canonical_string())),
+            0o700,
+            "identities/<UUID>/ must be 0o700 under a permissive umask"
+        );
+        assert_eq!(
+            mode_of(&identities_dir(base)),
+            0o700,
+            "identities/ root must be 0o700 under a permissive umask"
+        );
+    }
+
+    /// SEC-2.15 negative control: the LEGACY (`usage-<N>.ndjson` at the base
+    /// root) ledger path must keep working with an absent `identities/` root
+    /// and must NEVER chmod base_dir — the routing check in `append` gates
+    /// the secure pair.
+    #[cfg(unix)]
+    #[test]
+    fn legacy_ledger_write_does_not_chmod_base_dir() {
+        use crate::accounts::identity_store::identities_dir;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        // LOW-6 (R1): TempDir bases are already 0o700, so comparing a
+        // before/after reading of the ambient mode is vacuous — pin base to
+        // 0o755 first, making any chmod to 0o700 by the legacy path
+        // OBSERVABLE, then assert it is untouched.
+        std::fs::set_permissions(base, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let e = ev("2026-10-12T00:00:00Z", "deepseek-chat", 10, 5, Some(0.001));
+        append(base, slot(1), &e).expect("legacy ledger append must succeed");
+
+        assert_eq!(
+            std::fs::metadata(base).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "legacy ledger path must not chmod base_dir"
+        );
+        assert!(
+            !identities_dir(base).exists(),
+            "legacy write must not create the identities/ root"
+        );
+    }
+
     #[test]
     fn summarize_buckets_correctly() {
         let now = chrono::Utc.with_ymd_and_hms(2026, 5, 6, 12, 0, 0).unwrap();
@@ -929,13 +1049,13 @@ not-json
     // ── M2-5 acceptance-criteria tests ──────────────────────────────────────
 
     /// Structural guard: the `save_state`/`save_quota` callsite count in
-    /// csq-core/src (excluding `quota/state.rs` itself) MUST stay at 32
+    /// csq-core/src (excluding `quota/state.rs` itself) MUST stay at 42
     /// (cross-phase invariant — `rules/account-terminal-separation.md`
     /// MUST Rule 1). This test enforces that no new callsite was added
     /// accidentally; any intentional change re-runs the Rule 1 channel
     /// classification and updates the expected count here.
     ///
-    /// COUNT COMPOSITION, re-enumerated 2026-09-16 (the line-level scan does
+    /// COUNT COMPOSITION, re-enumerated 2026-10-10 (the line-level scan does
     /// NOT exclude `#[cfg(test)]` modules — the `#[cfg(test)]` check below only
     /// skips lines carrying the attribute text themselves):
     ///
@@ -951,17 +1071,19 @@ not-json
     ///   `accounts::logout` and `accounts::move_slot`. None derives its slot id
     ///   from a marker read, a `CLAUDE_CONFIG_DIR` parse, or CC's per-terminal
     ///   `rate_limits` JSON, so none is terminal-attribution.
-    /// - **15 test-module callsites** — fixtures in
+    /// - **25 test-module callsites** — the original fifteen fixtures in
     ///   `providers::gemini::provisioning`, `daemon::startup_reconciler`,
     ///   `daemon::auto_rotate`, `usage_poller::{third_party,codex,gemini}`,
     ///   `accounts::{logout,third_party}` (two), `quota::status` (three),
-    ///   `quota` (two) and `rotation::picker`. Each seeds a quota row with a
+    ///   `quota` (two) and `rotation::picker`, plus eight organization-origin
+    ///   calls, one fake Anthropic HTTP-rebind call, and one auto-rotation
+    ///   Known-origin setup call. Each seeds a quota row with a
     ///   hardcoded literal slot id in a tempdir; no Rule 1 channel
     ///   classification applies to test fixtures.
     /// - **1 self-referential match** — this test's own
     ///   `contains("save_state(")` line.
     ///
-    /// 16 + 15 + 1 = 32. The tripwire value is the invariant; the per-channel
+    /// 16 + 25 + 1 = 42. The tripwire value is the invariant; the per-channel
     /// audit lives in the rule's grep primitive, which is what produced the
     /// enumeration above rather than a reading of this comment.
     ///
@@ -980,11 +1102,11 @@ not-json
     #[test]
     fn ledger_no_quota_writer_touched() {
         // Locate the csq-core source root from the Cargo manifest dir.
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let src_root = std::path::PathBuf::from(manifest_dir).join("src");
+        let manifest_dir = crate::testing::manifest_dir(env!("CARGO_MANIFEST_DIR"));
+        let src_root = manifest_dir.join("src");
 
-        // Grep for save_state/save_quota callsites in production code
-        // (exclude the state.rs definition itself and test code).
+        // Count source call lines, including fixture calls and this tripwire
+        // literal; exclude state.rs and full-line comments as documented.
         let mut count = 0usize;
         fn walk_and_count(dir: &std::path::Path, count: &mut usize) {
             let rd = match std::fs::read_dir(dir) {
@@ -1025,8 +1147,8 @@ not-json
         walk_and_count(&src_root, &mut count);
 
         assert_eq!(
-            count, 32,
-            "save_state production callsite count changed: expected 32, got {count}. \
+            count, 42,
+            "quota writer source call count changed: expected 42, got {count}. \
              A new quota writer MUST source its slot id from an authoritative channel \
              (per-slot poller state / IPC event / slot-lifecycle param) per \
              rules/account-terminal-separation.md MUST Rule 1 — classify the channel \

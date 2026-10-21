@@ -6,6 +6,22 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+/// A spawned binary must reach its verdict or readiness inside this budget.
+/// Positive AND refusal rows fail FAST on the wrong outcome (a wrong exit code
+/// fails at `try_wait`, a refusal row that starts listening fails at the
+/// per-poll readiness check, a dead child fails the loop assert); the deadline
+/// exists only so a wedged child cannot hang the suite. It is therefore
+/// deliberately generous: 60 s is ~1000x the observed startup on an idle host,
+/// and this suite runs beside a dozen concurrent build legs in the fleet
+/// (measured 2026-10-19: a 5 s bound reddened four positive rows on a loaded
+/// host while the identical tree passed on an idle one).
+const STARTUP_BUDGET: Duration = Duration::from_secs(60);
+/// Post-readiness loopback I/O bound. The server has already logged its
+/// readiness line, so this measures ONE local round-trip: a deadlocked server
+/// still fails in seconds, while a heavily loaded host gets ~1000x the observed
+/// RTT instead of a 2 s coin-flip.
+const LOOPBACK_IO_TIMEOUT: Duration = Duration::from_secs(10);
+
 struct Server {
     child: Child,
     dir: TempDir,
@@ -76,23 +92,31 @@ impl Server {
         );
     }
     fn assert_exit(&mut self, code: i32, detail: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + STARTUP_BUDGET;
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
                 assert_eq!(status.code(), Some(code), "{}", self.output());
                 assert!(self.output().contains(detail), "{}", self.output());
                 return;
             }
+            // A refusal row must never reach readiness. Checking the readiness
+            // line on every poll makes the wrong outcome fail in one poll
+            // (~20 ms), not at the 60 s hang guard above.
+            let output = self.output();
+            assert!(
+                !output.contains("csq-ledger authority listener"),
+                "listener became ready on a refusal row: {output}"
+            );
             assert!(
                 Instant::now() < deadline,
                 "server accepted forbidden config: {}",
-                self.output()
+                output
             );
             std::thread::sleep(Duration::from_millis(20));
         }
     }
     fn assert_serving(&mut self, expected_ip: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + STARTUP_BUDGET;
         let output = loop {
             let output = self.output();
             assert!(self.child.try_wait().unwrap().is_none(), "{output}");
@@ -119,10 +143,8 @@ impl Server {
             .parse()
             .unwrap();
         assert_eq!(addr.ip().to_string(), expected_ip);
-        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
+        let mut stream = TcpStream::connect_timeout(&addr, LOOPBACK_IO_TIMEOUT).unwrap();
+        stream.set_read_timeout(Some(LOOPBACK_IO_TIMEOUT)).unwrap();
         stream
             .write_all(b"GET /v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             .unwrap();

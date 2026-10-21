@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pool-list"
+description = "Enables the pool_list command without any pre-configured scope."
+commands.allow = ["pool_list"]
+
+[[permission]]
+identifier = "deny-pool-list"
+description = "Denies the pool_list command without any pre-configured scope."
+commands.deny = ["pool_list"]

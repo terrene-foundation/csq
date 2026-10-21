@@ -36,6 +36,10 @@ pub enum SdkErrorCode {
     /// Caller passed malformed / conflicting arguments (both prompt sources,
     /// both `--provider` and `--slot`, neither, an empty prompt, …).
     InvalidInput,
+    /// A supplied request key without retained positive evidence is invalid at admission.
+    /// This attempt was rejected before admission; do not retry this key as uncertainty.
+    /// An expired key without retained positive evidence cannot recover its prior outcome.
+    InvalidIdempotencyKey,
     /// A `--provider` was named but no healthy slot serves it.
     NoHealthySlot,
     /// The named provider / slot does not resolve to a known surface.
@@ -116,6 +120,67 @@ pub enum SdkErrorCode {
     /// state and retry rather than to fix its arguments. A mutation refused with this
     /// code produces NO receipt — nothing was applied to attest to.
     RevisionConflict,
+    /// A session-directive delivery was refused because the issuer already queued
+    /// one for the same `(pid, started_at)` session inside the rolling hour
+    /// (`csq.directive_receipt.v1`, contract INV-31-03). The refusal payload carries
+    /// `next_allowed_at`, so the consumer's recovery is to wait, not to re-shape.
+    RateLimited,
+    /// A session-directive named a host or a `(pid, started_at)` session that is not a
+    /// live listed session on this host. Distinct from [`Self::InvalidInput`]: the
+    /// directive is well-formed and addresses something that is not here.
+    TargetMismatch,
+    /// A session-directive (or an acknowledgement of one) arrived after its
+    /// `expires_at`. Distinct from [`Self::InvalidInput`]: the shape is valid and only
+    /// the clock refuses it, so the issuer re-issues rather than repairs.
+    Expired,
+    /// The op could not DETERMINE its answer (store unreadable, lock failed,
+    /// enumeration failed). A third outcome, never folded into success or refusal: the
+    /// consumer must not read it as "nothing there" nor as "denied".
+    Undetermined,
+    /// A session-registry name (spec 32a §4.3) matched no live session. Distinct from
+    /// [`Self::TargetMismatch`], which is for a `(pid, started_at)` pair: a name is a
+    /// label the caller can look up again with `list_sessions`.
+    NotFound,
+    /// A session-registry name matched two or more live sessions. Nothing was sent; the
+    /// caller picks one by `(pid, started_at)`. Never resolved by csq choosing.
+    Ambiguous,
+    /// The caller is not authorized for this session-input operation (spec 34 §34.3): not the pinned server, not a granted controller, or not the registered hook chain.
+    NotAuthorized,
+    /// The target session is not at an idle input prompt, so the Enter rule (spec 34a §34a.1) refuses to write a `\r`. Transient: retry or defer.
+    NotIdle,
+    /// Bracketed-paste mode has not been observed `on` for the target at write time (spec 34 §34.4.1).
+    PasteModeUnknown,
+    /// The target CLI's per-CLI table cell is not measured, so the primitive is refused (spec 34 §34.4.3).
+    CliUnmeasured,
+    /// Injected text failed the input alphabet or content checks (spec 34 §34.4.1).
+    InputRejected,
+    /// Injected text exceeds the size bound (spec 34 §34.4.1).
+    TooLarge,
+    /// The deferred-input queue of the target is full (spec 34a §34a.2).
+    QueueFull,
+    /// The CLI is no longer the foreground process group of its PTY, so no Enter is written (spec 34a §34a.1).
+    ForegroundChanged,
+    /// Human input held during the inject transaction overflowed the 4 KiB hold queue (spec 34
+    /// §34.4.4). A human Key since the transaction began is `not_idle` instead (spec 34a §34a.1).
+    BusyInput,
+    /// The idle signal the Enter rule needs (turn and permission hooks) is not registered for the target (spec 34a §34a.1).
+    IdleSignalUnavailable,
+    /// The target's hook chain cannot be trusted for Enter, for example a non-csq Stop hook is present (spec 34a §34a.1).
+    ChainUnsupported,
+    /// The operator set the kill switch on the target relay (spec 34 §34.3.3).
+    DisabledByOperator,
+    /// The operator denied the control request (spec 34 §34.3.3).
+    OperatorDenied,
+    /// A session-input control request lapsed before the operator answered (spec 34
+    /// §34.3.3, 60 s). Distinct from [`Self::Expired`], which is a directive or lease
+    /// whose `expires_at` passed: the caller re-requests control, it does not re-issue.
+    RequestExpired,
+    /// The audit record for the inject could not be written, so nothing was delivered (spec 34 §34.5.3).
+    AuditUnavailable,
+    /// The session relay is `cfg(unix)` only; this platform cannot host it (spec 34 §34.9).
+    UnsupportedPlatform,
+    /// The delivered-inject notice could not be drawn, so the inject is refused rather than delivered silently (spec 34 §34.3.3).
+    NoticeUnavailable,
 }
 
 impl SdkErrorCode {
@@ -124,6 +189,7 @@ impl SdkErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidInput => "invalid_input",
+            Self::InvalidIdempotencyKey => "invalid_idempotency_key",
             Self::NoHealthySlot => "no_healthy_slot",
             Self::ProviderNotFound => "provider_not_found",
             Self::Unsupported => "unsupported",
@@ -141,6 +207,29 @@ impl SdkErrorCode {
             Self::UtteranceAltered => "utterance_altered",
             Self::InferenceUnsupported => "inference_unsupported",
             Self::RevisionConflict => "revision_conflict",
+            Self::RateLimited => "rate_limited",
+            Self::TargetMismatch => "target_mismatch",
+            Self::Expired => "expired",
+            Self::Undetermined => "undetermined",
+            Self::NotFound => "not_found",
+            Self::Ambiguous => "ambiguous",
+            Self::NotAuthorized => "not_authorized",
+            Self::NotIdle => "not_idle",
+            Self::PasteModeUnknown => "paste_mode_unknown",
+            Self::CliUnmeasured => "cli_unmeasured",
+            Self::InputRejected => "input_rejected",
+            Self::TooLarge => "too_large",
+            Self::QueueFull => "queue_full",
+            Self::ForegroundChanged => "foreground_changed",
+            Self::BusyInput => "busy_input",
+            Self::IdleSignalUnavailable => "idle_signal_unavailable",
+            Self::ChainUnsupported => "chain_unsupported",
+            Self::DisabledByOperator => "disabled_by_operator",
+            Self::OperatorDenied => "operator_denied",
+            Self::RequestExpired => "request_expired",
+            Self::AuditUnavailable => "audit_unavailable",
+            Self::UnsupportedPlatform => "unsupported_platform",
+            Self::NoticeUnavailable => "notice_unavailable",
         }
     }
 }
@@ -212,6 +301,10 @@ mod tests {
     fn error_code_wire_strings_are_snake_case_and_match_serialize() {
         for (code, wire) in [
             (SdkErrorCode::InvalidInput, "invalid_input"),
+            (
+                SdkErrorCode::InvalidIdempotencyKey,
+                "invalid_idempotency_key",
+            ),
             (SdkErrorCode::NoHealthySlot, "no_healthy_slot"),
             (SdkErrorCode::ProviderNotFound, "provider_not_found"),
             (SdkErrorCode::Unsupported, "unsupported"),
@@ -229,6 +322,32 @@ mod tests {
             (SdkErrorCode::UtteranceAltered, "utterance_altered"),
             (SdkErrorCode::InferenceUnsupported, "inference_unsupported"),
             (SdkErrorCode::RevisionConflict, "revision_conflict"),
+            (SdkErrorCode::RateLimited, "rate_limited"),
+            (SdkErrorCode::TargetMismatch, "target_mismatch"),
+            (SdkErrorCode::Expired, "expired"),
+            (SdkErrorCode::Undetermined, "undetermined"),
+            (SdkErrorCode::NotFound, "not_found"),
+            (SdkErrorCode::Ambiguous, "ambiguous"),
+            (SdkErrorCode::NotAuthorized, "not_authorized"),
+            (SdkErrorCode::NotIdle, "not_idle"),
+            (SdkErrorCode::PasteModeUnknown, "paste_mode_unknown"),
+            (SdkErrorCode::CliUnmeasured, "cli_unmeasured"),
+            (SdkErrorCode::InputRejected, "input_rejected"),
+            (SdkErrorCode::TooLarge, "too_large"),
+            (SdkErrorCode::QueueFull, "queue_full"),
+            (SdkErrorCode::ForegroundChanged, "foreground_changed"),
+            (SdkErrorCode::BusyInput, "busy_input"),
+            (
+                SdkErrorCode::IdleSignalUnavailable,
+                "idle_signal_unavailable",
+            ),
+            (SdkErrorCode::ChainUnsupported, "chain_unsupported"),
+            (SdkErrorCode::DisabledByOperator, "disabled_by_operator"),
+            (SdkErrorCode::OperatorDenied, "operator_denied"),
+            (SdkErrorCode::RequestExpired, "request_expired"),
+            (SdkErrorCode::AuditUnavailable, "audit_unavailable"),
+            (SdkErrorCode::UnsupportedPlatform, "unsupported_platform"),
+            (SdkErrorCode::NoticeUnavailable, "notice_unavailable"),
         ] {
             assert_eq!(code.as_str(), wire);
             let json = serde_json::to_string(&code).unwrap();
@@ -272,5 +391,25 @@ mod tests {
         let rendered = serde_json::to_value(&err).unwrap();
         assert_eq!(rendered["known"], serde_json::json!(["claude", "grok"]));
         assert_eq!(rendered["code"], "provider_not_found");
+    }
+}
+
+#[cfg(test)]
+mod directive_code_tests {
+    use super::*;
+
+    #[test]
+    fn directive_codes_serialize_to_their_snake_case_wire_strings() {
+        for (code, wire) in [
+            (SdkErrorCode::RateLimited, "rate_limited"),
+            (SdkErrorCode::TargetMismatch, "target_mismatch"),
+            (SdkErrorCode::Expired, "expired"),
+            (SdkErrorCode::Undetermined, "undetermined"),
+            (SdkErrorCode::NotFound, "not_found"),
+            (SdkErrorCode::Ambiguous, "ambiguous"),
+        ] {
+            assert_eq!(code.as_str(), wire);
+            assert_eq!(serde_json::to_string(&code).unwrap(), format!("\"{wire}\""));
+        }
     }
 }

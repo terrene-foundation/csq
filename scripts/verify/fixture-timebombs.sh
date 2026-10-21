@@ -90,7 +90,7 @@ fi
 # ENTIRE verdict is the decoder's output, so a stub yields an empty scan that
 # prints CLEAN. An unverifiable interpreter is UNDETERMINED (2), never 0.
 # shellcheck source=/dev/null
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/resolve-python.sh" || die "cannot source scripts/lib/resolve-python.sh — no verified python3 can be resolved"
+. "$(cd "${BASH_SOURCE[0]%/*}" && pwd)/../lib/resolve-python.sh" || die "cannot source scripts/lib/resolve-python.sh — no verified python3 can be resolved"
 PY="$(resolve_python3)" || die "no working python3 (needed to decode epochs)"
 
 # Horizon: `testing.md` Rule 1's own bar — "reject any value that decodes to a

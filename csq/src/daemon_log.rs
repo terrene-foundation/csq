@@ -58,3 +58,7 @@ pub fn make_writer(base_dir: &Path) -> Option<(NonBlocking, WorkerGuard)> {
 pub fn store_guard(guard: WorkerGuard) {
     let _ = GUARD.set(guard);
 }
+
+#[cfg(all(test, feature = "test-utils"))]
+#[path = "daemon_log_mirror_tests.rs"]
+mod mirror_sink_tests;

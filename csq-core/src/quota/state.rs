@@ -58,6 +58,7 @@ pub fn cursor_path(config_dir: &Path) -> PathBuf {
 /// [`load_state_or_skip`], which fails closed instead of persisting a
 /// salvaged/partial file over sibling rows it cannot see.
 pub fn load_state_salvage(base_dir: &Path) -> QuotaFile {
+    let before = super::origin::OriginSnapshot::capture(base_dir);
     let path = quota_path(base_dir);
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
@@ -187,6 +188,8 @@ pub fn load_state_salvage(base_dir: &Path) -> QuotaFile {
         quota.clear_expired(now_secs);
     }
 
+    let after = super::origin::OriginSnapshot::capture(base_dir);
+    super::origin::filter_visible(&mut quota_file, &before, &after);
     quota_file
 }
 
@@ -240,7 +243,7 @@ pub fn load_state_or_skip(base_dir: &Path) -> Result<QuotaFile, ConfigError> {
             });
         }
     }
-    load_state(base_dir)
+    load_state_raw(base_dir)
 }
 
 /// Loads quota state from disk, auto-clearing expired windows.
@@ -259,6 +262,16 @@ pub fn load_state_or_skip(base_dir: &Path) -> Result<QuotaFile, ConfigError> {
 /// display consumers that want one bad row to degrade gracefully instead
 /// of blanking every account should call [`load_state_salvage`].
 pub fn load_state(base_dir: &Path) -> Result<QuotaFile, ConfigError> {
+    let before = super::origin::OriginSnapshot::capture(base_dir);
+    let mut quota = load_state_raw(base_dir)?;
+    let after = super::origin::OriginSnapshot::capture(base_dir);
+    super::origin::filter_visible(&mut quota, &before, &after);
+    Ok(quota)
+}
+
+/// Unfiltered parser for write legs. Never persist a filtered reader view:
+/// doing so would erase a sibling's temporarily unavailable quota row.
+fn load_state_raw(base_dir: &Path) -> Result<QuotaFile, ConfigError> {
     let path = quota_path(base_dir);
     let mut quota_file = match std::fs::read_to_string(&path) {
         Ok(content) if !content.trim().is_empty() => {
@@ -338,7 +351,16 @@ pub fn save_state(base_dir: &Path, quota_file: &QuotaFile) -> Result<(), ConfigE
     })?;
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
+        // SEC-2.15 (unified, R2 M3): quota.json's parent IS the accounts
+        // root — route through the shared fail-closed helper (0o700 at
+        // creation; leaf-symlink-resolving for the operator root) and
+        // surface failure instead of the former silent `.ok()` discard.
+        crate::platform::fs::ensure_private_dir_root(parent).map_err(|e| {
+            ConfigError::InvalidJson {
+                path: path.clone(),
+                reason: format!("quota_dir_secure_refused: {e}"),
+            }
+        })?;
     }
 
     let tmp = crate::platform::fs::unique_tmp_path(&path);
@@ -436,7 +458,7 @@ pub fn migrate_v1_to_v2_if_needed(base_dir: &Path) -> Result<MigrationOutcome, C
 
     // load_state fills `surface` / `kind` defaults for every account and
     // drops expired windows; save_state writes v2 atomically.
-    let parsed = load_state(base_dir)?;
+    let parsed = load_state_or_skip(base_dir)?;
     let account_count = parsed.accounts.len();
     save_state(base_dir, &parsed)?;
 
@@ -510,7 +532,7 @@ pub fn update_quota(
     let _guard = lock::lock_file(&lock_path)?;
 
     // Re-read inside lock to prevent races
-    let mut quota_file = load_state(base_dir)?;
+    let mut quota_file = load_state_or_skip(base_dir)?;
 
     let five_hour = parse_window(rate_limits, "five_hour");
     let seven_day = parse_window(rate_limits, "seven_day");

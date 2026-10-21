@@ -39,6 +39,7 @@
 //!
 //! [`csq run`]: https://github.com/terrene-foundation/csq/blob/main/csq-cli/src/commands/run.rs
 
+use crate::accounts::profiles_lock::ProfilesFileLock;
 use crate::credentials::file::canonical_path_for;
 use crate::error::PlatformError;
 use crate::platform::fs::{atomic_replace, unique_tmp_path, write_new_private};
@@ -255,16 +256,32 @@ impl ProvisionError {
 mod redacted_message_tests {
     use super::*;
 
+    struct FixtureEnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl FixtureEnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self(
+                keys.iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            )
+        }
+    }
+    impl Drop for FixtureEnvRestore {
+        fn drop(&mut self) {
+            for (key, previous) in self.0.drain(..).rev() {
+                match previous {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     fn with_home<R>(home: &str, f: impl FnOnce() -> R) -> R {
         let _g = crate::platform::test_env::lock();
-        let prior = std::env::var_os("HOME");
+        let _restore = FixtureEnvRestore::capture(&["HOME"]);
         std::env::set_var("HOME", home);
-        let out = f();
-        match prior {
-            Some(p) => std::env::set_var("HOME", p),
-            None => std::env::remove_var("HOME"),
-        }
-        out
+        f()
     }
 
     #[test]
@@ -344,7 +361,7 @@ pub fn gemini_mode_class(auth: &AuthMode) -> &'static str {
 /// `gemini-<N>/<mode-class>` (e.g. `gemini-13/apikey`).
 ///
 /// This is the SINGLE producer consumed by BOTH the synchronous
-/// provision write (`write_gemini_identity`) AND the daemon backfill
+/// provision write (`write_gemini_identity_locked`) AND the daemon backfill
 /// pass, so the two paths emit byte-identical literals (FM-3a). It fills
 /// the reserved `<id>` position of spec 02 §INV-07's `gemini-<N>/<id>`
 /// convention with the only marker-derivable `<id>`-shaped fact csq owns
@@ -356,48 +373,40 @@ pub fn gemini_identity_label(slot: AccountNum, auth: &AuthMode) -> String {
     format!("gemini-{}/{}", slot.get(), gemini_mode_class(auth))
 }
 
-/// Writes `by_slot_identity[N]` for a freshly provisioned Gemini slot
-/// under `ProfilesFileLock`.
-///
-/// Lock ordering (security review F1 / an internal journal entry D3): the caller MUST
-/// NOT already hold `ProfilesFileLock` — this helper acquires it. The
-/// daemon backfill holds the lock and only *reads* binding markers; it
-/// never calls a `provision_*` path, so acquiring here introduces no
-/// inversion. Mirrors the M7 `bind_provider_to_slot` shape
-/// (`accounts/third_party.rs`): one lock window, identity written through
-/// the existing `set_slot_identity` type-witness (no new tmp-write path,
-/// no new §5a surface — security review F3).
-///
-/// Call ordering (FM-8 / security F1 rollback-order): callers invoke this
-/// AFTER `write_binding` (marker FIRST, identity LAST). A crash between
-/// leaves the slot *bound-but-unidentified* (daemon backfill re-derives
-/// the literal from the live marker) — NEVER *identified-but-unbound* (a
-/// phantom launchable-looking identity for an unbound slot).
-fn write_gemini_identity(
+/// Publish the display identity LAST, under the same profiles witness as
+/// vault/marker publication. Never reacquire profiles inside that transaction.
+fn write_gemini_identity_locked(
+    lock: &ProfilesFileLock,
     base_dir: &Path,
     slot: AccountNum,
     auth: &AuthMode,
 ) -> Result<(), ProvisionError> {
-    // Fixed-vocabulary `reason` ONLY — never `{e}`. The lock error and
-    // `ConfigError`'s Display both carry the absolute profiles.json path
-    // (`/Users/<user>/.claude/accounts/.profiles.json`), which would leak
-    // the OS username + home-dir layout into CLI stderr and into the
-    // `profiles.json` round-trip. security.md §2 + round-0 security review
-    // F4 (the error variant is deliberately path-free; do not defeat it by
-    // interpolating a path-bearing inner error here). The structured log
-    // discriminant is `error_kind_tag()` = "gemini_provision_profiles_identity".
-    let lock =
-        crate::accounts::profiles_lock::ProfilesFileLock::acquire(base_dir).map_err(|_e| {
-            ProvisionError::ProfilesIdentity {
-                reason: "profiles lock unavailable".into(),
-            }
-        })?;
+    if !lock.protects(base_dir) {
+        return Err(ProvisionError::ProfilesIdentity {
+            reason: "profiles lock unavailable".into(),
+        });
+    }
     let label = gemini_identity_label(slot, auth);
-    crate::accounts::profiles::set_slot_identity(&lock, base_dir, slot.get(), &label).map_err(
-        |_e| ProvisionError::ProfilesIdentity {
+    crate::accounts::profiles::set_slot_identity(lock, base_dir, slot.get(), &label).map_err(|_e| {
+        ProvisionError::ProfilesIdentity {
             reason: "profiles.json write failed".into(),
-        },
-    )
+        }
+    })
+}
+
+/// Reserve custody before changing either the vault secret or marker. This
+/// distinguishes same-second rekeys with identical marker/label bytes. A failed
+/// attempt may invalidate older receipts; it never publishes a false winner.
+fn publication_lock(base_dir: &Path, slot: AccountNum) -> Result<ProfilesFileLock, ProvisionError> {
+    let lock =
+        ProfilesFileLock::acquire(base_dir).map_err(|_| ProvisionError::ProfilesIdentity {
+            reason: "profiles lock unavailable".into(),
+        })?;
+    crate::accounts::profiles::advance_independent_binding_generation(&lock, base_dir, slot)
+        .map_err(|_| ProvisionError::ProfilesIdentity {
+            reason: "binding generation unavailable".into(),
+        })?;
+    Ok(lock)
 }
 
 impl From<PlatformError> for ProvisionError {
@@ -529,12 +538,30 @@ pub fn write_binding(
     slot: AccountNum,
     binding: &GeminiBinding,
 ) -> Result<(), ProvisionError> {
+    // Callers do not hold profiles; order is profiles -> binding -> quota.
+    let lock = publication_lock(base_dir, slot)?;
+    write_binding_locked(&lock, base_dir, slot, binding)
+}
+
+fn write_binding_locked(
+    lock: &ProfilesFileLock,
+    base_dir: &Path,
+    slot: AccountNum,
+    binding: &GeminiBinding,
+) -> Result<(), ProvisionError> {
+    if !lock.protects(base_dir) {
+        return Err(ProvisionError::ProfilesIdentity {
+            reason: "profiles lock unavailable".into(),
+        });
+    }
     let path = binding_path(base_dir, slot);
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| ProvisionError::Io {
+        // SEC-2.15 (unified, R1 M1): the binding lives in credentials/ —
+        // create AND secure that dir fail-closed via the shared helper.
+        crate::platform::fs::ensure_private_dir(parent).map_err(|e| ProvisionError::Io {
             path: parent.to_path_buf(),
-            source,
+            source: std::io::Error::other(format!("credentials_dir_refused: {e}")),
         })?;
     }
 
@@ -548,7 +575,7 @@ pub fn write_binding(
     // transition required — leaving the stale row this function exists to
     // remove.
     //
-    // Lock ORDER is binding -> quota, and only ever that way:
+    // Lock ORDER is profiles -> binding -> quota, and only ever that way:
     // `remove_quota_entry` acquires the quota lock inside the region guarded
     // here and releases it before returning, and no path takes the quota lock
     // and then a binding lock (the OAuth poller reads this marker without
@@ -557,12 +584,28 @@ pub fn write_binding(
     // suffix is also invisible to `enumerate_oauth_mode_slots`, which matches
     // only `gemini-<N>.json`.
     let lock_path = path.with_extension("lock");
-    let _binding_guard = crate::platform::lock::lock_file(&lock_path).map_err(|e| {
-        ProvisionError::AtomicReplace {
-            path: lock_path.clone(),
-            reason: format!("binding lock: {e}"),
+    // Bounded credential lock: the guarded section is a marker read, a
+    // serialize and an atomic replace (no network, no user input), so a live
+    // holder finishes in milliseconds; a wedged one must not pin setkey.
+    let _binding_guard = match crate::platform::lock::lock_credential_file(&lock_path) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            return Err(ProvisionError::AtomicReplace {
+                path: lock_path,
+                reason: format!(
+                    "binding lock: timed out after {}ms — another process holds it; \
+                     refusing to write the binding without the lock",
+                    crate::platform::lock::CREDENTIAL_LOCK_BUDGET_MS
+                ),
+            })
         }
-    })?;
+        Err(e) => {
+            return Err(ProvisionError::AtomicReplace {
+                path: lock_path,
+                reason: format!("binding lock: {e}"),
+            })
+        }
+    };
 
     // Read the PRIOR regime before the marker is overwritten — after
     // the write there is no way to tell what it used to be. An absent
@@ -777,6 +820,8 @@ pub fn provision_api_key_via_vault(
     key: &SecretString,
     vault: &dyn Vault,
 ) -> Result<(), ProvisionError> {
+    // Authority spans the secret change, marker, and display publication.
+    let lock = publication_lock(base_dir, slot)?;
     let slot_key = SlotKey {
         surface: SURFACE_GEMINI,
         account: slot,
@@ -784,7 +829,7 @@ pub fn provision_api_key_via_vault(
     vault.set(slot_key, key)?;
 
     let binding = GeminiBinding::new(AuthMode::ApiKey, "auto");
-    if let Err(e) = write_binding(base_dir, slot, &binding) {
+    if let Err(e) = write_binding_locked(&lock, base_dir, slot, &binding) {
         let _ = vault.delete(slot_key);
         return Err(e);
     }
@@ -793,7 +838,7 @@ pub fn provision_api_key_via_vault(
     // re-derives by_slot_identity from the live marker. Rolling back the
     // marker/vault on an identity-write failure would destroy a usable
     // binding to fix a lagging recovery label — the wrong trade.
-    write_gemini_identity(base_dir, slot, &binding.auth)?;
+    write_gemini_identity_locked(&lock, base_dir, slot, &binding.auth)?;
     Ok(())
 }
 
@@ -815,10 +860,11 @@ pub fn provision_code_assist_oauth(
     base_dir: &Path,
     slot: AccountNum,
 ) -> Result<(), ProvisionError> {
+    let lock = publication_lock(base_dir, slot)?;
     let binding = GeminiBinding::new(AuthMode::CodeAssistOAuth, "auto");
-    write_binding(base_dir, slot, &binding)?;
-    // Marker FIRST, identity LAST (FM-8).
-    write_gemini_identity(base_dir, slot, &binding.auth)
+    write_binding_locked(&lock, base_dir, slot, &binding)?;
+    // Marker FIRST, identity LAST (FM-8), within one authority window.
+    write_gemini_identity_locked(&lock, base_dir, slot, &binding.auth)
 }
 
 /// Orchestrates Vertex SA provisioning. Validates the path
@@ -838,9 +884,10 @@ pub fn provision_vertex_sa(
         },
         "auto",
     );
-    write_binding(base_dir, slot, &binding)?;
-    // Marker FIRST, identity LAST (FM-8).
-    write_gemini_identity(base_dir, slot, &binding.auth)?;
+    let lock = publication_lock(base_dir, slot)?;
+    write_binding_locked(&lock, base_dir, slot, &binding)?;
+    // Marker FIRST, identity LAST (FM-8), within one authority window.
+    write_gemini_identity_locked(&lock, base_dir, slot, &binding.auth)?;
     Ok(canon)
 }
 
@@ -1704,42 +1751,77 @@ mod tests {
         );
     }
 
-    /// G3/AC-5 (FM-8 marker-FIRST / identity-LAST): when the identity
-    /// write fails, the binding marker MUST still exist (the slot is
-    /// bound-but-unidentified; the daemon backfill heals it) and the
-    /// error MUST be the distinct `ProfilesIdentity` variant — NEVER a
-    /// state where the identity exists but the marker does not.
-    ///
-    /// Deterministic failure injection (NOT a chmod-permission trick per
-    /// the redteam-discipline closure-injection directive): make
-    /// `profiles.json` a DIRECTORY so the identity-write branch
-    /// (`set_slot_identity` → `load` reads the path; a directory yields an
-    /// IO error before `save` is reached) fails — the branch under test —
-    /// while `write_binding` (which writes `credentials/gemini-N.json`,
-    /// an unrelated path) succeeds first. The exact failing inner call
-    /// (load vs save) is irrelevant to the invariant; what matters is
-    /// that the failure lands AFTER the marker commit.
+    /// A failed custody-epoch reservation precedes vault/marker mutation. This
+    /// replaces the old directory fixture's post-marker identity failure: that
+    /// same malformed profiles path is now detected before publication begins.
     #[test]
     fn provision_identity_failure_leaves_marker_bound_not_phantom() {
+        use crate::platform::secret::in_memory::InMemoryVault;
+        use secrecy::ExposeSecret;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingVault {
+            inner: InMemoryVault,
+            mutations: AtomicUsize,
+        }
+        impl Vault for CountingVault {
+            fn set(&self, address: SlotKey, value: &SecretString) -> Result<(), SecretError> {
+                self.mutations.fetch_add(1, Ordering::SeqCst);
+                self.inner.set(address, value)
+            }
+            fn get(&self, address: SlotKey) -> Result<SecretString, SecretError> {
+                self.inner.get(address)
+            }
+            fn delete(&self, address: SlotKey) -> Result<(), SecretError> {
+                self.mutations.fetch_add(1, Ordering::SeqCst);
+                self.inner.delete(address)
+            }
+            fn list_slots(&self, surface: &'static str) -> Result<Vec<AccountNum>, SecretError> {
+                self.inner.list_slots(surface)
+            }
+            fn backend_id(&self) -> &'static str {
+                "in-memory"
+            }
+        }
         let dir = TempDir::new().unwrap();
-        // Occupy profiles.json with a directory → set_slot_identity
-        // cannot read/write the file → ProfilesIdentity error, AFTER
-        // the marker is committed.
-        std::fs::create_dir_all(crate::accounts::profiles::profiles_path(dir.path())).unwrap();
-
-        let err = provision_code_assist_oauth(dir.path(), slot(5)).unwrap_err();
-        assert!(
-            matches!(err, ProvisionError::ProfilesIdentity { .. }),
-            "expected ProfilesIdentity, got {err:?}"
+        let base = dir.path();
+        let binding = GeminiBinding::new(AuthMode::ApiKey, "prior-model");
+        write_binding(base, slot(5), &binding).unwrap();
+        let marker = binding_path(base, slot(5));
+        let marker_before = std::fs::read(&marker).unwrap();
+        let address = SlotKey {
+            surface: SURFACE_GEMINI,
+            account: slot(5),
+        };
+        let vault = CountingVault {
+            inner: InMemoryVault::new(),
+            mutations: AtomicUsize::new(0),
+        };
+        vault
+            .inner
+            .set(address, &SecretString::new("fake-prior-key".into()))
+            .unwrap();
+        let profiles = crate::accounts::profiles::profiles_path(base);
+        std::fs::remove_file(&profiles).unwrap();
+        std::fs::create_dir(&profiles).unwrap();
+        let err = provision_api_key_via_vault(
+            base,
+            slot(5),
+            &SecretString::new("fake-replacement-key".into()),
+            &vault,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ProvisionError::ProfilesIdentity { .. }));
+        assert_eq!(
+            vault.mutations.load(Ordering::SeqCst),
+            0,
+            "no vault mutation before reserved custody"
         );
-        // FM-8: marker committed (bound-but-unidentified is the safe
-        // residue; a daemon backfill re-derives the label). The inverse
-        // (identity present, marker absent — a phantom) is the failure
-        // this asserts against.
-        assert!(
-            is_gemini_bound_slot(dir.path(), slot(5)),
-            "marker MUST exist after identity-write failure (bound-but-unidentified, never phantom)"
+        assert_eq!(
+            vault.get(address).unwrap().expose_secret(),
+            "fake-prior-key"
         );
+        assert_eq!(std::fs::read(&marker).unwrap(), marker_before);
+        assert!(profiles.is_dir());
     }
 
     #[test]

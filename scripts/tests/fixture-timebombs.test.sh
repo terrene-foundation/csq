@@ -12,6 +12,11 @@
 #
 # Deliberately no `set -e` — most cases expect a non-zero exit.
 set -uo pipefail
+# shellcheck source=/dev/null
+. "$(cd "${BASH_SOURCE[0]%/*}" && pwd)/../lib/strmatch.sh" || {
+    echo "FATAL: cannot source scripts/lib/strmatch.sh — membership tests would be unmeasurable" >&2
+    exit 64
+}
 
 SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/verify/fixture-timebombs.sh"
 [ -f "$SCRIPT" ] || { echo "FATAL: $SCRIPT not found"; exit 2; }
@@ -97,7 +102,7 @@ fi
 
 # ── 10. Non-quiet DOES report, and names the file and line ──────────────────
 out="$("$SCRIPT" "$root" 2>/dev/null)"
-if printf '%s' "$out" | grep -q 'thing.rs:1' && printf '%s' "$out" | grep -q '4_102_444_800'; then
+if strmatch_regex "$out" 'thing.rs:1' && strmatch_contains "$out" '4_102_444_800'; then
   printf '  PASS  report names the site and the remedy\n'; PASS=$((PASS+1))
 else
   printf '  FAIL  report missing site or remedy: %s\n' "${out:0:120}"; FAIL=$((FAIL+1))

@@ -19,6 +19,7 @@
 
 pub mod auto_update;
 pub mod cli_shim;
+pub mod cli_shim_refresh;
 pub mod install_path;
 pub mod minimum;
 pub mod probe;

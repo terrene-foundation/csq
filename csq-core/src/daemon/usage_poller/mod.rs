@@ -100,6 +100,66 @@ pub const MAX_ACCOUNTS_PER_TICK: usize = 64;
 /// Default interval between 3P poller ticks: 15 minutes.
 pub const POLL_INTERVAL_3P: Duration = Duration::from_secs(900);
 
+/// Minimum gap between two WAKE-driven polls of the SAME slot
+/// (login-followup LOW-6).
+///
+/// Basis: this is a DECLARED bound, not a measured 429 threshold — no
+/// measurement of the usage endpoint's throttle exists for this poller
+/// (`csq-artifact-evidence.md`: a number is not derived from an unmeasured
+/// limit). It is chosen so that, however many `POST /api/slot-rebind`
+/// requests arrive for one slot, that slot costs the usage endpoint at most
+/// ONE extra request per minute (against the normal 0.2/min), and a wake
+/// that lands inside the window is DEFERRED to the window's end rather than
+/// dropped — the last wake always buys its poll. Distinct slots do not
+/// delay each other (the floor is per slot), and a wake never triggers a
+/// full all-provider sweep nor overrides an active cooldown (see
+/// [`WakeChannel`]).
+pub const WAKE_FLOOR: Duration = Duration::from_secs(60);
+
+/// Rebind wake channel: a per-slot pending SET plus the [`tokio::sync::Notify`]
+/// the run loop blocks on (login-followup LOW-6).
+///
+/// [`WakeChannel::wake_slot`] inserts the slot into the set and stores a
+/// notify permit. Repeated wakes for the same slot before the loop drains
+/// the set are one entry, so a flood of N wakes for a slot is ONE targeted
+/// re-poll of that slot — never N, and never a sweep of every account.
+/// Derefs to the inner `Notify` so the run loop and tests can `.notified()`.
+#[derive(Debug, Default)]
+pub struct WakeChannel {
+    notify: tokio::sync::Notify,
+    pending: Mutex<std::collections::BTreeSet<u16>>,
+}
+
+impl WakeChannel {
+    /// Fresh channel with nothing pending.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records `slot` as needing a re-poll and wakes the poller. Idempotent
+    /// per slot until the poller drains the set.
+    pub fn wake_slot(&self, slot: u16) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(slot);
+        self.notify.notify_one();
+    }
+
+    /// Takes every pending slot, leaving the set empty.
+    fn drain(&self) -> Vec<u16> {
+        let mut guard = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        std::mem::take(&mut *guard).into_iter().collect()
+    }
+}
+
+impl std::ops::Deref for WakeChannel {
+    type Target = tokio::sync::Notify;
+    fn deref(&self) -> &Self::Target {
+        &self.notify
+    }
+}
+
 /// Rate-limit header prefix. All 3P rate-limit headers start with this.
 pub(crate) const RATELIMIT_PREFIX: &str = "anthropic-ratelimit-";
 
@@ -158,6 +218,13 @@ pub struct PollerHandle {
 /// 15 minutes, using separate transport closures for each. Drains
 /// Gemini NDJSON event logs every Anthropic-tick (single shared
 /// state with the live IPC route — spec 05 §5.8.1).
+///
+/// `wake` is the rebind wake channel: the SAME `Arc<WakeChannel>` the
+/// daemon's `POST /api/slot-rebind` route (`server.rs`) holds, so a
+/// successful Anthropic login/rebind ticks the loop immediately
+/// instead of waiting up to [`POLL_INTERVAL`]. `notify_one` stores a
+/// permit, so a wake arriving mid-tick is consumed by the next
+/// `select!` rather than lost.
 pub fn spawn(
     base_dir: PathBuf,
     http_get: HttpGetFn,
@@ -165,6 +232,7 @@ pub fn spawn(
     http_post_probe: HttpPostProbeFn,
     gemini_consumer: gemini::GeminiConsumerState,
     shutdown: CancellationToken,
+    wake: Arc<WakeChannel>,
 ) -> PollerHandle {
     spawn_with_config(
         base_dir,
@@ -173,13 +241,16 @@ pub fn spawn(
         http_post_probe,
         gemini_consumer,
         shutdown,
+        wake,
         POLL_INTERVAL,
         POLL_INTERVAL_3P,
         STARTUP_DELAY,
+        WAKE_FLOOR,
     )
 }
 
-/// Like [`spawn`] but with explicit intervals + startup delay for testing.
+/// Like [`spawn`] but with explicit intervals, startup delay and wake
+/// floor for testing.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_with_config(
     base_dir: PathBuf,
@@ -188,9 +259,11 @@ pub fn spawn_with_config(
     http_post_probe: HttpPostProbeFn,
     gemini_consumer: gemini::GeminiConsumerState,
     shutdown: CancellationToken,
+    wake: Arc<WakeChannel>,
     interval: Duration,
     interval_3p: Duration,
     mut startup_delay: Duration,
+    wake_floor: Duration,
 ) -> PollerHandle {
     let cooldowns: Arc<Mutex<HashMap<u16, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
     let backoffs: Arc<Mutex<HashMap<u16, u32>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -262,9 +335,11 @@ pub fn spawn_with_config(
                 gemini_consumer: gemini_consumer.clone(),
                 gemini_oauth_project_cache: Arc::clone(&gemini_oauth_project_cache),
                 shutdown: shutdown.clone(),
+                wake: Arc::clone(&wake),
                 interval,
                 interval_3p,
                 startup_delay,
+                wake_floor,
             };
 
             let result = tokio::spawn(run_loop(cfg)).await;
@@ -286,6 +361,11 @@ pub fn spawn_with_config(
                         "usage poller panicked — restarting"
                     );
                     tokio::select! {
+                        // Biased, shutdown first (same class as the run
+                        // loop's select): a cancellation must not lose a
+                        // coin flip to the restart backoff and buy one more
+                        // run-loop spawn on the way out.
+                        biased;
                         _ = shutdown.cancelled() => return,
                         _ = tokio::time::sleep(restart_delay) => {}
                     }
@@ -332,9 +412,18 @@ struct RunLoopConfig {
     /// only on 401/403 from `:retrieveUserQuota`).
     gemini_oauth_project_cache: gemini_oauth::ProjectCache,
     shutdown: CancellationToken,
+    /// Rebind wake channel — shared with the daemon's
+    /// `POST /api/slot-rebind` route via `RouterState::usage_poller_wake`.
+    /// `notify_one()` stores a permit, so a wake that lands while a tick
+    /// is running is consumed by the very next `select!` instead of
+    /// being dropped.
+    wake: Arc<WakeChannel>,
     interval: Duration,
     interval_3p: Duration,
     startup_delay: Duration,
+    /// Minimum gap since the previous tick START before a wake-triggered
+    /// tick may start — see [`WAKE_FLOOR`].
+    wake_floor: Duration,
 }
 
 async fn run_loop(cfg: RunLoopConfig) {
@@ -345,6 +434,10 @@ async fn run_loop(cfg: RunLoopConfig) {
     );
 
     tokio::select! {
+        // Biased, shutdown first: with startup_delay = 0 the sleep arm is
+        // ready on the first poll, and an un-biased select would run a
+        // whole tick off a coin flip against an already-cancelled poller.
+        biased;
         _ = cfg.shutdown.cancelled() => {
             info!("usage poller cancelled during startup delay");
             return;
@@ -355,6 +448,12 @@ async fn run_loop(cfg: RunLoopConfig) {
     // Track when the 3P tick last ran so we can use the Anthropic
     // interval as the main loop cadence.
     let mut last_3p_tick = Instant::now() - cfg.interval_3p; // triggers on first loop
+
+    // Per-slot rebind-wake state (login-followup LOW-6): when each slot was
+    // last wake-polled, and the slots whose wake-poll is waiting out the
+    // per-slot floor. Both are owned by this loop iteration's lifetime.
+    let mut last_wake_poll: HashMap<u16, tokio::time::Instant> = HashMap::new();
+    let mut deferred: HashMap<u16, tokio::time::Instant> = HashMap::new();
 
     loop {
         use tracing::debug;
@@ -420,12 +519,76 @@ async fn run_loop(cfg: RunLoopConfig) {
             last_3p_tick = Instant::now();
         }
 
-        tokio::select! {
-            _ = cfg.shutdown.cancelled() => {
-                info!("usage poller cancelled, exiting loop");
-                return;
+        // Wait for the next full sweep. A rebind wake does NOT end the wait:
+        // it re-polls only the woken slot(s) (login-followup LOW-6) and the
+        // sweep deadline is unchanged, so wakes neither multiply sweeps nor
+        // shift the cadence.
+        let sweep_deadline = tokio::time::Instant::now() + cfg.interval;
+        loop {
+            let next_due = deferred.values().min().copied();
+            tokio::select! {
+                // Biased, shutdown first: a wake whose permit is already
+                // stored must not win a coin flip against an operator's
+                // cancellation and buy one more network poll on the way out.
+                biased;
+                _ = cfg.shutdown.cancelled() => {
+                    info!("usage poller cancelled, exiting loop");
+                    return;
+                }
+                _ = tokio::time::sleep_until(sweep_deadline) => break,
+                // Rebind wake (login-followup): move every pending slot into
+                // `deferred` with its per-slot due time; same-slot wakes are
+                // one entry (the pending set is a set, `deferred` a map).
+                _ = cfg.wake.notified() => {
+                    let now = tokio::time::Instant::now();
+                    for slot in cfg.wake.drain() {
+                        let due = last_wake_poll
+                            .get(&slot)
+                            .map(|t| *t + cfg.wake_floor)
+                            .unwrap_or(now)
+                            .max(now);
+                        deferred.entry(slot).or_insert(due);
+                    }
+                }
+                // A deferred (floored) slot's due time arrived.
+                _ = async {
+                    match next_due {
+                        Some(due) => tokio::time::sleep_until(due).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {}
             }
-            _ = tokio::time::sleep(cfg.interval) => {}
+            // Poll every slot whose due time has arrived. Never a sweep, and
+            // `anthropic::tick_slot` runs the normal cooldown check, so a
+            // wake can never override an active cooldown.
+            let now = tokio::time::Instant::now();
+            let due_slots: Vec<u16> = deferred
+                .iter()
+                .filter(|(_, due)| **due <= now)
+                .map(|(slot, _)| *slot)
+                .collect();
+            for slot in due_slots {
+                deferred.remove(&slot);
+                last_wake_poll.insert(slot, tokio::time::Instant::now());
+                // Only the provider that owns the slot has anything to
+                // poll: each `tick_slot` filters discovery to this slot id.
+                anthropic::tick_slot(
+                    &cfg.base_dir,
+                    &cfg.http_get_retry_after,
+                    &cfg.cooldowns,
+                    &cfg.backoffs,
+                    slot,
+                )
+                .await;
+                codex::tick_slot(&cfg.base_dir, &cfg.http_get, &cfg.codex_breakers, slot).await;
+                gemini_oauth::tick_slot(
+                    &cfg.base_dir,
+                    &cfg.http_post_probe,
+                    &cfg.gemini_oauth_project_cache,
+                    slot,
+                )
+                .await;
+            }
         }
     }
 }
@@ -832,6 +995,433 @@ mod cooldown_backoff_tests {
         assert!(
             !in_cooldown(&cooldowns, 4),
             "cleared cooldown must be inactive"
+        );
+    }
+}
+
+/// Tests for the rebind wake channel (login-followup):
+/// `POST /api/slot-rebind` → `WakeChannel::wake_slot` → the run loop's
+/// `select!` arm → an immediate tick.
+///
+/// The tick observable is the Anthropic transport mock's call counter:
+/// `anthropic::tick` makes exactly one `http_get_retry_after` call per
+/// eligible account per tick, so with one seeded account the counter IS
+/// the tick count. The loop is spawned with an interval of one hour —
+/// far longer than either bounded wait below — so a tick observed inside
+/// a test window can only have come from the wake arm (the negative
+/// control in the first test pins exactly that).
+#[cfg(test)]
+mod wake_channel_tests {
+    use super::*;
+    use crate::credentials::{
+        self, file as cred_file, AnthropicCredentialFile, CredentialFile, OAuthPayload,
+    };
+    use crate::types::{AccessToken, AccountNum, RefreshToken};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use tempfile::TempDir;
+
+    /// Mirrors `anthropic::tests::install_account` — writes
+    /// `credentials/<N>.json` so `discovery::discover_anthropic` finds the
+    /// slot and `anthropic::tick` polls it.
+    fn install_account(base: &std::path::Path, account: u16) {
+        let num = AccountNum::try_from(account).unwrap();
+        let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("sk-ant-oat01-test-token".into()),
+                refresh_token: RefreshToken::new("sk-ant-ort01-test-refresh".into()),
+                expires_at: 9_999_999_999_999,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        credentials::save(&cred_file::canonical_path(base, num), &creds).unwrap();
+    }
+
+    /// A 200 response for the usage GET; each invocation counts one tick.
+    fn counting_http(counter: Arc<AtomicU32>) -> HttpGetWithRetryAfterFn {
+        Arc::new(move |_url, _token, _headers| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok((
+                200,
+                None,
+                br#"{"five_hour":{"utilization":42.0,"resets_at":"2099-01-01T00:00:00Z"}}"#
+                    .to_vec(),
+            ))
+        })
+    }
+
+    /// Long-interval loop harness: one account, interval = 1 hour,
+    /// startup delay 0 (first tick runs immediately).
+    ///
+    /// `wake_floor` is pinned per test — the floor tests pass a real value
+    /// (1s), the wake-channel tests pass `Duration::ZERO` so they measure
+    /// only the channel, not the floor. Same pinning mechanism as
+    /// `interval` (a `spawn_with_config` parameter).
+    fn spawn_long_interval_loop(
+        base: &std::path::Path,
+        counter: Arc<AtomicU32>,
+        wake: Arc<WakeChannel>,
+        shutdown: &CancellationToken,
+        wake_floor: Duration,
+    ) -> PollerHandle {
+        let http_get: HttpGetFn = Arc::new(|_url, _token, _headers| Ok((200, Vec::new())));
+        let http_post_probe: HttpPostProbeFn =
+            Arc::new(|_url, _headers, _body| Ok((200, HashMap::new(), String::new())));
+        spawn_with_config(
+            base.to_path_buf(),
+            http_get,
+            counting_http(counter),
+            http_post_probe,
+            gemini::GeminiConsumerState::default(),
+            shutdown.clone(),
+            wake,
+            // One hour — far longer than any bounded wait in these tests.
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+            Duration::ZERO,
+            wake_floor,
+        )
+    }
+
+    /// Bounded wait for `counter` to reach `target`; the panic names the
+    /// count actually observed, so a failure reports what it saw.
+    async fn wait_for(counter: &Arc<AtomicU32>, target: u32, bound: Duration) {
+        let deadline = tokio::time::Instant::now() + bound;
+        loop {
+            if counter.load(Ordering::SeqCst) >= target {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "counter never reached {target} within {bound:?} (saw {})",
+                counter.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// A wake must force an immediate tick while `interval` is long.
+    /// Removing the `cfg.wake.notified()` arm from `run_loop` makes this
+    /// test time out on the positive phase.
+    #[tokio::test]
+    async fn wake_forces_a_tick_without_waiting_for_the_interval() {
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1);
+        let counter = Arc::new(AtomicU32::new(0));
+        let wake = Arc::new(crate::daemon::usage_poller::WakeChannel::new());
+        let shutdown = CancellationToken::new();
+        let handle = spawn_long_interval_loop(
+            dir.path(),
+            Arc::clone(&counter),
+            Arc::clone(&wake),
+            &shutdown,
+            Duration::ZERO,
+        );
+
+        // Tick 1: the loop's own first iteration (startup_delay = 0).
+        wait_for(&counter, 1, Duration::from_secs(10)).await;
+
+        // Negative control: with NO wake, a window bounded well under the
+        // 1h interval must produce no second tick.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "no wake was sent — the 3600s interval must not have ticked again"
+        );
+
+        // Positive: the wake must tick immediately, not at the interval.
+        wake.wake_slot(1);
+        wait_for(&counter, 2, Duration::from_secs(5)).await;
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle.join).await;
+    }
+
+    /// `notify_one` stores a permit: a wake sent BEFORE the loop reaches
+    /// its wait (racing the in-flight tick) must still produce a tick,
+    /// not be lost. This is the property `notify_waiters` would NOT have.
+    #[tokio::test]
+    async fn wake_sent_mid_tick_is_not_lost() {
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1);
+        let counter = Arc::new(AtomicU32::new(0));
+        let wake = Arc::new(crate::daemon::usage_poller::WakeChannel::new());
+        let shutdown = CancellationToken::new();
+        let handle = spawn_long_interval_loop(
+            dir.path(),
+            Arc::clone(&counter),
+            Arc::clone(&wake),
+            &shutdown,
+            Duration::ZERO,
+        );
+
+        // Sent immediately after spawn — while the first tick is most
+        // likely still running, i.e. before the loop's select! is armed.
+        wake.wake_slot(1);
+
+        // Tick 1 (own schedule) + tick 2 (the stored permit) must both land
+        // without any further wake.
+        wait_for(&counter, 2, Duration::from_secs(5)).await;
+
+        // And the loop must then go quiet again (the permit was CONSUMED,
+        // not re-armed): no third tick inside a bounded window.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "the stored permit must be consumed by exactly one extra tick"
+        );
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle.join).await;
+    }
+
+    /// 429 for every call: the first sweep puts slot 1 into cooldown.
+    fn rate_limited_http(counter: Arc<AtomicU32>) -> HttpGetWithRetryAfterFn {
+        Arc::new(move |_url, _token, _headers| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok((429, None, Vec::new()))
+        })
+    }
+
+    /// LOW-6: N wakes for the SAME slot that land before the loop drains
+    /// the pending set are ONE entry, so they cost ONE targeted poll — and
+    /// no other slot is polled (a wake is never a sweep). The test runs on
+    /// the current-thread runtime, so the loop task cannot run between the
+    /// synchronous `wake_slot` calls: all 50 are pending together.
+    ///
+    /// Discriminates: a channel that counted wakes (instead of a set)
+    /// polls 50 times; a wake that fell through to a full sweep also polls
+    /// slot 2 (counter 2 -> 4 instead of 2 -> 3).
+    #[tokio::test]
+    async fn same_slot_wake_burst_is_one_targeted_poll_not_a_sweep() {
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1);
+        install_account(dir.path(), 2);
+        let counter = Arc::new(AtomicU32::new(0));
+        let wake = Arc::new(WakeChannel::new());
+        let shutdown = CancellationToken::new();
+        let handle = spawn_long_interval_loop(
+            dir.path(),
+            Arc::clone(&counter),
+            Arc::clone(&wake),
+            &shutdown,
+            WAKE_FLOOR,
+        );
+
+        // Sweep 1 polls both slots.
+        wait_for(&counter, 2, Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        for _ in 0..50 {
+            wake.wake_slot(2);
+        }
+        wait_for(&counter, 3, Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            3,
+            "50 wakes for one slot must be exactly one poll of that slot \
+             (2 sweep polls + 1), saw {}",
+            counter.load(Ordering::SeqCst)
+        );
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle.join).await;
+    }
+
+    /// LOW-6: wakes for one slot SPREAD over a burst window are floored per
+    /// slot. With the floor pinned to 1s, ten wakes over ~250ms produce the
+    /// immediate poll for the first, then exactly ONE deferred poll at the
+    /// floor's end for all the rest (the last wake is never dropped), and
+    /// nothing at 2x the floor.
+    #[tokio::test]
+    async fn spread_wakes_are_floored_per_slot_and_the_last_is_not_dropped() {
+        const FLOOR: Duration = Duration::from_secs(1);
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1);
+        let counter = Arc::new(AtomicU32::new(0));
+        let wake = Arc::new(WakeChannel::new());
+        let shutdown = CancellationToken::new();
+        let handle = spawn_long_interval_loop(
+            dir.path(),
+            Arc::clone(&counter),
+            Arc::clone(&wake),
+            &shutdown,
+            FLOOR,
+        );
+        wait_for(&counter, 1, Duration::from_secs(10)).await;
+
+        for _ in 0..10 {
+            wake.wake_slot(1);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // Inside the floor window: only the first wake's immediate poll.
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "inside the floor window only the first wake may poll, saw {}",
+            counter.load(Ordering::SeqCst)
+        );
+        // At the window's end: the one deferred poll.
+        wait_for(&counter, 3, Duration::from_millis(1800)).await;
+        // And nothing more.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            3,
+            "the burst must cost one immediate and one deferred poll, saw {}",
+            counter.load(Ordering::SeqCst)
+        );
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle.join).await;
+    }
+
+    /// LOW-6: a wake never overrides an active cooldown. The first sweep
+    /// gets a 429 (cooldown); N wakes for that slot, including after the
+    /// floor, must make ZERO further calls to the usage endpoint.
+    #[tokio::test]
+    async fn wake_never_polls_a_slot_in_cooldown() {
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1);
+        let counter = Arc::new(AtomicU32::new(0));
+        let wake = Arc::new(WakeChannel::new());
+        let shutdown = CancellationToken::new();
+        let http_get: HttpGetFn = Arc::new(|_url, _token, _headers| Ok((200, Vec::new())));
+        let http_post_probe: HttpPostProbeFn =
+            Arc::new(|_url, _headers, _body| Ok((200, HashMap::new(), String::new())));
+        let handle = spawn_with_config(
+            dir.path().to_path_buf(),
+            http_get,
+            rate_limited_http(Arc::clone(&counter)),
+            http_post_probe,
+            gemini::GeminiConsumerState::default(),
+            shutdown.clone(),
+            Arc::clone(&wake),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+            Duration::ZERO,
+            Duration::from_millis(200),
+        );
+        wait_for(&counter, 1, Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        for _ in 0..20 {
+            wake.wake_slot(1);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        // Past the (200ms) floor, so a deferred poll would have fired too.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "a wake must not poll a slot in 429 cooldown, saw {} calls",
+            counter.load(Ordering::SeqCst)
+        );
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle.join).await;
+    }
+
+    /// LOW-4: with a wake permit pending AND a cancellation already fired,
+    /// the loop must take the shutdown arm and exit WITHOUT running the
+    /// pending wake's tick — the `select!` is `biased` with shutdown
+    /// first. An un-biased select coin-flips between the two ready arms,
+    /// so this measures the count over 24 independent spawns: each one
+    /// cancels with a permit already stored and one extra tick is a
+    /// failure. (Measured 19/40 extra ticks for the un-biased form.)
+    #[tokio::test]
+    async fn cancelled_poller_never_runs_a_pending_wakes_tick() {
+        const ITERATIONS: u32 = 24;
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1);
+        let mut extra_ticks = 0u32;
+
+        for _ in 0..ITERATIONS {
+            let counter = Arc::new(AtomicU32::new(0));
+            let wake = Arc::new(crate::daemon::usage_poller::WakeChannel::new());
+            let shutdown = CancellationToken::new();
+            let handle = spawn_long_interval_loop(
+                dir.path(),
+                Arc::clone(&counter),
+                Arc::clone(&wake),
+                &shutdown,
+                Duration::ZERO,
+            );
+
+            // Let tick 1 run and the loop park on its select.
+            wait_for(&counter, 1, Duration::from_secs(10)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Both arms become ready before the loop is polled again.
+            wake.wake_slot(1);
+            shutdown.cancel();
+
+            let _ = tokio::time::timeout(Duration::from_secs(5), handle.join).await;
+            if counter.load(Ordering::SeqCst) > 1 {
+                extra_ticks += 1;
+            }
+        }
+
+        assert_eq!(
+            extra_ticks, 0,
+            "a cancelled poller ran the pending wake's network tick in \
+             {extra_ticks}/{ITERATIONS} spawns"
+        );
+    }
+
+    /// LOW-4, deferred path: cancelling DURING the floor's deferral wait
+    /// must also return without ticking — the deferred sleep is itself a
+    /// biased shutdown-first select. Without that, the loop sleeps out the
+    /// remainder, runs the sweep, and only then observes the cancellation.
+    #[tokio::test]
+    async fn cancel_during_a_deferred_wake_skips_the_tick() {
+        const FLOOR: Duration = Duration::from_secs(1);
+        let dir = TempDir::new().unwrap();
+        install_account(dir.path(), 1);
+        let counter = Arc::new(AtomicU32::new(0));
+        let wake = Arc::new(crate::daemon::usage_poller::WakeChannel::new());
+        let shutdown = CancellationToken::new();
+        let handle = spawn_long_interval_loop(
+            dir.path(),
+            Arc::clone(&counter),
+            Arc::clone(&wake),
+            &shutdown,
+            FLOOR,
+        );
+
+        // Tick 1, then let the loop park on its select.
+        wait_for(&counter, 1, Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // First wake for the slot polls at once (not deferred) ...
+        wake.wake_slot(1);
+        wait_for(&counter, 2, Duration::from_secs(5)).await;
+        // ... a second wake inside the per-slot floor is DEFERRED.
+        wake.wake_slot(1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown.cancel();
+
+        // Must return promptly (well inside the ~0.9s remainder) and
+        // without a tick. A deferral that ignored cancellation would sleep
+        // the remainder, tick, and blow the 500ms join bound below.
+        let joined = tokio::time::timeout(Duration::from_millis(500), handle.join).await;
+        assert!(
+            joined.is_ok(),
+            "cancellation during the deferred wake must end the loop promptly, \
+             not sleep out the floor remainder"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "a cancelled poller must not run the deferred poll, saw {}",
+            counter.load(Ordering::SeqCst)
         );
     }
 }

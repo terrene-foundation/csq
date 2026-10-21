@@ -42,9 +42,13 @@ pub mod authoring_intent;
 pub mod authoring_memory;
 pub mod authoring_session;
 pub mod capabilities;
+pub mod directives;
 pub mod envelope;
 pub mod error;
+pub mod messages;
 pub mod models;
+pub mod session_disk;
+pub mod sessions;
 pub mod verify;
 
 pub use adapter::parse_claude_json;
@@ -76,6 +80,7 @@ pub use capabilities::{
 pub use envelope::{emit, Completion, Envelope, FinishReason, Usage};
 pub use error::{SdkError, SdkErrorCode};
 pub use models::{ModelEntry, ModelsPayload};
+pub use sessions::{SessionRow, SessionsPayload};
 pub use verify::{VerifyFailureDetail, VerifyKeyGap, VerifyPayload};
 
 // ── Contract-change policy for every SCHEMA_* constant below (an internal ticket Track B) ──
@@ -114,6 +119,13 @@ pub const SCHEMA_EVAL_V1: &str = "csq.eval.v1";
 /// or retype was a silent break with no version to pin. The rows are unchanged;
 /// they move under the envelope's payload.
 pub const SCHEMA_STATUS_V1: &str = "csq.status.v1";
+
+/// `csq status --json` — slot roster plus token-free daemon snapshot diagnostics.
+///
+/// Version 2 adds the always-present `sessions_undetermined` flag and optional
+/// snapshot age, session evidence and mirror counts. Version 1 remains available
+/// as a historical schema identifier; see spec 13 for the diagnostic contract.
+pub const SCHEMA_STATUS_V2: &str = "csq.status.v2";
 
 /// `csq listkeys --json` — bound 3P provider keys (fingerprinted, never raw).
 ///
@@ -178,6 +190,32 @@ pub const SCHEMA_AUTHORING_DISTILL_V1: &str = "csq.authoring_distill.v1";
 /// [`SCHEMA_AUTHORING_SESSION_V1`] binding, whose five invariants are re-validated
 /// against the established session before the store is reached at all.
 pub const SCHEMA_AUTHORING_MEMORY_V1: &str = "csq.authoring_memory.v1";
+
+/// `csq sessions list --json` — the live sessions on this host, each
+/// identified by `(pid, started_at)`.
+pub const SCHEMA_SESSIONS_V1: &str = "csq.sessions.v1";
+
+/// The directive an external issuer hands to `csq sessions deliver` (stdin).
+pub const SCHEMA_DIRECTIVE_V1: &str = "csq.directive.v1";
+
+/// `csq sessions deliver --json` and `csq sessions ack --json` — one
+/// directive's receipt.
+pub const SCHEMA_DIRECTIVE_RECEIPT_V1: &str = "csq.directive_receipt.v1";
+
+/// `csq sessions receipts --json` — receipts changed since a time.
+pub const SCHEMA_DIRECTIVE_RECEIPTS_V1: &str = "csq.directive_receipts.v1";
+
+/// `csq sessions inbox --json` — directives addressed to the calling session.
+pub const SCHEMA_DIRECTIVE_INBOX_V1: &str = "csq.directive_inbox.v1";
+
+/// `csq sessions send` and `csq sessions ack-message` — one message's receipt (spec 32 §4.1).
+pub const SCHEMA_MESSAGE_RECEIPT_V1: &str = "csq.message_receipt.v1";
+
+/// `csq sessions inbox --messages` — messages addressed to the calling session (spec 32 §4.1).
+pub const SCHEMA_MESSAGE_INBOX_V1: &str = "csq.message_inbox.v1";
+
+/// `csq sessions disk-report --json` — read-only lifecycle evidence, all KEEP.
+pub const SCHEMA_SESSION_DISK_V1: &str = "csq.session-disk.v1";
 
 /// This crate's own version, for the app to advertise in
 /// [`SdkSurface::version`] without restating it.

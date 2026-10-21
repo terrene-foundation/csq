@@ -45,7 +45,7 @@ use crate::accounts::AccountSource;
 use crate::providers::catalog::Surface;
 use crate::quota::state as quota_state;
 use crate::rotation::config as rotation_config;
-use crate::session::handle_dir::repoint_handle_dir;
+use crate::session::handle_dir::repoint_handle_dir_guarded_locked;
 use crate::types::AccountNum;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -67,7 +67,7 @@ pub const STARTUP_DELAY: Duration = Duration::from_secs(15);
 /// `cooldown_secs` (a successful repoint's own cooldown), because the
 /// symlink switch already landed; only the keychain mirror is in doubt,
 /// and that is worth retrying sooner than a full rotation cycle.
-const RECONCILE_DESYNC_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
+const RECONCILE_DESYNC_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// S-H-A/D-F1 decision seam: whether a [`crate::credentials::keychain::ReconcileOutcome`]
 /// confirms the keychain genuinely followed a successful repoint — factored
@@ -127,6 +127,19 @@ fn repoint_failure_operator_line(
     }
 }
 
+/// Profile contention is discovered before any forced write. Delay another
+/// rotation attempt by the short retry cadence, which exceeds a tick.
+fn record_busy_repoint_retry(
+    cooldowns: &mut HashMap<PathBuf, Instant>,
+    handle_dir: &Path,
+    cooldown_duration: Duration,
+) {
+    let short_retry_at = Instant::now()
+        .checked_sub(cooldown_duration.saturating_sub(RECONCILE_DESYNC_RETRY_COOLDOWN))
+        .unwrap_or_else(Instant::now);
+    cooldowns.insert(handle_dir.to_path_buf(), short_retry_at);
+}
+
 /// Handle to a running auto-rotation task.
 pub struct AutoRotateHandle {
     pub join: tokio::task::JoinHandle<()>,
@@ -183,6 +196,7 @@ type ReconcileAccountFn = std::sync::Arc<
             AccountNum,
             &str,
             &crate::daemon::usage_poller::HttpGetFn,
+            &crate::daemon::custodian::OnDemandView<'_>,
         ) -> crate::daemon::custodian::ReconcileOutcome
         + Send
         + Sync,
@@ -191,7 +205,9 @@ type ReconcileAccountFn = std::sync::Arc<
 /// Production implementation of [`ReconcileAccountFn`]: calls the real
 /// custodian.
 fn default_reconcile_account() -> ReconcileAccountFn {
-    std::sync::Arc::new(crate::daemon::custodian::reconcile_account)
+    // Pre-write last-chance check: the tick's on-demand view (shared Mismatch,
+    // local Dead — a stale cached Dead must not block the forced write).
+    std::sync::Arc::new(crate::daemon::custodian::reconcile_account_on_demand_with)
 }
 
 /// Like [`spawn`] but with explicit intervals for testing.
@@ -255,12 +271,13 @@ async fn run_loop(
     loop {
         // C-F6 (`keychain-fix-r8.md`): `tick_with_http` performs synchronous
         // I/O throughout — disk reads via `quota_state`, and (through
-        // `custodian::reconcile_account`, invoked below) a keychain
+        // `custodian::reconcile_account_on_demand_with`, invoked below) a keychain
         // `security` subprocess read plus a node-subprocess HTTPS validation
         // call, mirroring the blocking work `refresher.rs` dispatches with
-        // its own `tokio::task::spawn_blocking` around the SAME
-        // `custodian::reconcile_account` call (csq-core/src/daemon/refresher.rs,
-        // ~line 996). `tick_with_http` stays a plain fn (not `async`) so the
+        // its own `tokio::task::spawn_blocking` around
+        // `custodian::reconcile_account_periodic` (a different entry point with
+        // a different cache; see the refresher's reconcile call site).
+        // `tick_with_http` stays a plain fn (not `async`) so the
         // unit tests below keep calling it directly with no tokio runtime;
         // this production loop is the sole caller that owns a runtime and
         // must not let that synchronous work — up to the bounded ~20s
@@ -558,6 +575,14 @@ fn tick_with_deps(
     let mut rate_limited_this_tick =
         crate::daemon::server::harvest_gate::gate_is_rate_limited(gate);
 
+    // ONE on-demand verdict view per tick, shared by every terminal this tick
+    // visits: a Dead learned for the first terminal is local to the view and
+    // visible to the rest, and a Mismatch goes to the shared cache, so neither
+    // is re-validated within the tick (an `Unknown` verdict is never cached, so
+    // later terminals DO re-validate it), and a Mismatch WARN is not repeated
+    // per terminal.
+    let tick_view = crate::daemon::custodian::NegativeCache::on_demand_view();
+
     for entry in entries.flatten() {
         let candidate = entry.path();
         // Preserve the scanned namespace as well as the resolved term-* shape.
@@ -703,7 +728,13 @@ fn tick_with_deps(
                 crate::accounts::profiles::resolve_slot_to_uuid(base_dir, current_account.get())
             {
                 if matches!(
-                    reconcile(base_dir, current_account, &uuid.to_string(), http_get,),
+                    reconcile(
+                        base_dir,
+                        current_account,
+                        &uuid.to_string(),
+                        http_get,
+                        &tick_view,
+                    ),
                     crate::daemon::custodian::ReconcileOutcome::RateLimited
                 ) {
                     rate_limited_this_tick = true;
@@ -843,6 +874,80 @@ fn tick_with_deps(
             skipped += 1;
             continue;
         }
+        // Acquire both handle locks before profile custody. A busy profile
+        // now refuses BEFORE any forced keychain write, and custody stays held
+        // through the force-write, repoint and compensating reconcile.
+        let rotation_custody =
+            match crate::session::handle_dir::lock_repoint_custody(base_dir, &handle_dir) {
+                Ok(custody) => custody,
+                Err(error) if crate::session::handle_dir::is_profiles_lock_busy(&error) => {
+                    warn!(
+                        error_kind = "auto_rotate_profiles_lock_busy",
+                        "auto-rotation: profiles busy; no forced write or repoint attempted"
+                    );
+                    record_busy_repoint_retry(cooldowns, &handle_dir, cooldown_duration);
+                    skipped += 1;
+                    continue;
+                }
+                Err(_) => {
+                    warn!(
+                        error_kind = "auto_rotate_profile_custody_refused",
+                        "auto-rotation: profile custody unavailable; rotation not attempted"
+                    );
+                    cooldowns.insert(handle_dir.clone(), Instant::now());
+                    skipped += 1;
+                    continue;
+                }
+            };
+        let native_capture = match crate::session::handle_dir::capture_native_swap_locked(
+            &rotation_custody.profiles,
+            base_dir,
+            &handle_dir,
+        ) {
+            Ok(capture) => capture,
+            Err(_) => {
+                warn!(
+                        error_kind = "auto_rotate_native_identity_unconfirmed",
+                        account = target.get(),
+                        "auto-rotation: native identity capture refused; rotation not performed; run csq login for this slot to confirm its organization"
+                    );
+                cooldowns.insert(handle_dir.clone(), Instant::now());
+                skipped += 1;
+                continue;
+            }
+        };
+        let target_binding =
+            match crate::accounts::anthropic_identity::capture_anthropic_binding_locked(
+                &rotation_custody.profiles,
+                base_dir,
+                target,
+            ) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    warn!(
+                    error_kind = if error == crate::accounts::anthropic_identity::IdentityError::BindingBusy {
+                        "auto_rotate_binding_busy"
+                    } else {
+                        "auto_rotate_target_identity_unconfirmed"
+                    },
+                    account = target.get(),
+                    "auto-rotation: target organization identity unconfirmed; rotation not performed; run csq login for this slot"
+                );
+                    cooldowns.insert(handle_dir.clone(), Instant::now());
+                    skipped += 1;
+                    continue;
+                }
+            };
+        if matches!(
+            target_binding.context(),
+            crate::accounts::anthropic_identity::StoredAnthropicContext::LegacyUnknown
+        ) {
+            info!(
+                error_kind = "auto_rotate_legacy_context_unconfirmed",
+                account = target.get(),
+                "auto-rotation: using only the selected legacy UUID's own canonical credentials; daemon organization verification remains pending"
+            );
+        }
         let target_creds =
             crate::accounts::identity_store::target_token_for_forced_write(base_dir, target);
 
@@ -881,17 +986,20 @@ fn tick_with_deps(
         // v5 ("keychain follows the links", 2026-09-26 owner directive):
         // every `Ok(_)` write outcome (Applied, AbsentWriteFailed, or
         // WriteFailedUnknown) proceeds to the repoint below identically —
-        // `reconcile_keychain_to_marker` is the SOLE compensating action for
-        // whatever the repoint does next, so this call site no longer
-        // branches on the write's own outcome.
-        if let Err(_msg) = crate::credentials::keychain::force_swap_write_before_repoint(
+        // Reconcile runs after every repoint attempt. Failed repoint plus
+        // unconfirmed reconcile also permits bounded cleanup of the exact
+        // attempted target grant; neither branches on this write's outcome.
+        if let Err(reason) = crate::credentials::keychain::force_swap_write_before_repoint_locked(
+            &rotation_custody.profiles,
             base_dir,
             &handle_dir,
             target_creds.as_valid_str(),
+            &target_binding,
+            &native_capture,
         ) {
-            // F6/S4: this arm is reached when the keychain READ itself
-            // failed (Unreadable) or the caller's own lock/read plumbing
-            // errored. NOTHING was mutated. The switch is NOT performed.
+            // Refusal may come from marker-token validity, identity custody,
+            // native reads, or write-policy guards. No repoint follows.
+            // The locked API returns only fixed-vocabulary reasons.
             //
             // D-F3: a persistent blocker (keychain locked every tick, e.g. a
             // headless/SSH session) must not retry on every single tick
@@ -899,18 +1007,26 @@ fn tick_with_deps(
             // gets, so a stuck dir is retried at the cooldown cadence
             // rather than every tick.
             warn!(
-                error_kind = "keychain_force_sync_unreadable_no_rotation",
+                error_kind = reason,
                 dir = %crate::cli_deps::sanitize::redact_path(&handle_dir),
-                "auto-rotation: keychain read/write failed; rotation NOT performed this tick (nothing changed) — will retry after cooldown"
+                "auto-rotation: guarded keychain operation refused; rotation not completed this tick — will retry after cooldown"
             );
+            if reason == "auto_rotate_marker_token_untrusted" {
+                warn!(
+                    error_kind = "auto_rotate_marker_token_untrusted",
+                    account = current_account.get(),
+                    "auto-rotation: marker account needs a valid login; run `csq login {}`",
+                    current_account.get()
+                );
+            }
             cooldowns.insert(handle_dir.clone(), Instant::now());
             skipped += 1;
             continue;
         }
 
-        // B2: `reconcile_keychain_to_marker` is the SOLE compensating
-        // action for whatever the repoint did — run it on BOTH outcomes,
-        // never only on `Err`. A successful repoint's own keychain write
+        // B2: reconcile runs on BOTH repoint outcomes, never only on Err.
+        // Failed repoint plus unconfirmed reconcile also permits bounded
+        // cleanup of the exact attempted target grant. A successful repoint's own keychain write
         // happened before it (under the same lock), but that write's own
         // outcome (`ForcedSyncResult`) may itself have been
         // `AbsentWriteFailed`/`WriteFailedUnknown` — an `Ok(())` repoint
@@ -924,8 +1040,16 @@ fn tick_with_deps(
             account: target,
             raw_json: target_creds.as_valid_str(),
         });
-        let repoint_result = repoint_handle_dir(base_dir, claude_home, &handle_dir, target);
-        let reconcile_outcome = crate::credentials::keychain::reconcile_keychain_to_marker(
+        let repoint_result = repoint_handle_dir_guarded_locked(
+            &rotation_custody,
+            base_dir,
+            claude_home,
+            &handle_dir,
+            &target_binding,
+            &native_capture,
+        );
+        let reconcile_outcome = crate::credentials::keychain::reconcile_keychain_to_marker_locked(
+            &rotation_custody.profiles,
             base_dir,
             &handle_dir,
             forced_write,
@@ -970,6 +1094,27 @@ fn tick_with_deps(
                 skipped += 1;
             }
             Err(e) => {
+                if !reconcile_outcome_confirms_rotation(&reconcile_outcome) {
+                    if let Some(written) = forced_write {
+                        match crate::credentials::keychain::clear_unconfirmed_rotation_write_locked(
+                            &rotation_custody.profiles,
+                            base_dir,
+                            &handle_dir,
+                            written,
+                        ) {
+                            Ok(true) => warn!(
+                                error_kind = "auto_rotate_unconfirmed_forced_write_cleared",
+                                "auto-rotation: unconfirmed forced login removed after failed repoint"
+                            ),
+                            Ok(false) => {}
+                            Err(reason) => warn!(
+                                error_kind = reason,
+                                operation = "auto_rotate_unconfirmed_forced_write_cleanup_refused",
+                                "auto-rotation: forced login cleanup could not be confirmed"
+                            ),
+                        }
+                    }
+                }
                 // B3: the handle dir's OWN symlinks may ALSO be left mixed
                 // across two accounts by a partially-rolled-back repoint —
                 // a signal independent of the keychain reconcile above.
@@ -1310,6 +1455,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn profiles_busy_before_force_write_sets_short_retry_cooldown() {
+        use crate::accounts::profiles_lock::HeldOnOtherThread;
+        let _env_lock = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        for slot in [1, 2] {
+            setup_account(dir.path(), slot);
+            setup_config_dir_uuid(dir.path(), slot);
+        }
+        setup_quota(dir.path(), 1, 97.0);
+        setup_quota(dir.path(), 2, 10.0);
+        save_rotation_config(
+            dir.path(),
+            &RotationConfig {
+                enabled: true,
+                threshold_percent: 95.0,
+                cooldown_secs: 300,
+                ..RotationConfig::default()
+            },
+        )
+        .unwrap();
+        let handle = setup_handle_dir(dir.path(), home.path(), 59997, 1);
+        let held = HeldOnOtherThread::profiles(dir.path());
+        let before = std::fs::read_link(handle.join(".csq-account")).unwrap();
+        let mut cooldowns = HashMap::new();
+        let http: crate::daemon::usage_poller::HttpGetFn =
+            std::sync::Arc::new(|_, _, _| panic!("no network"));
+        let reconcile: ReconcileAccountFn = std::sync::Arc::new(|_, _, _, _, _| {
+            crate::daemon::custodian::ReconcileOutcome::SkippedUnknown
+        });
+        tick_with_deps(
+            dir.path(),
+            Some(home.path()),
+            &mut cooldowns,
+            &http,
+            &reconcile,
+            &crate::daemon::server::harvest_gate::new_ip_rate_limit_gate(),
+        );
+        let retry = cooldowns
+            .get(&std::fs::canonicalize(&handle).unwrap())
+            .expect("tick must back off profile contention before any forced write");
+        let elapsed = retry.elapsed();
+        assert!(elapsed >= Duration::from_secs(300) - RECONCILE_DESYNC_RETRY_COOLDOWN);
+        assert!(
+            elapsed < Duration::from_secs(300) - TICK_INTERVAL,
+            "profile retry must skip at least the next tick"
+        );
+        assert_eq!(
+            std::fs::read_link(handle.join(".csq-account")).unwrap(),
+            before
+        );
+        drop(held);
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────
 
     fn make_creds(access: &str, refresh: &str) -> CredentialFile {
@@ -1360,7 +1560,9 @@ mod tests {
     }
 
     fn setup_quota(base: &Path, account: u16, five_hour_pct: f64) {
-        let mut quota = quota_state::load_state_salvage(base);
+        let mut quota = quota_state::load_state_or_skip(base).unwrap();
+        let origin =
+            crate::quota::origin::capture(base, AccountNum::try_from(account).unwrap()).stamp();
         quota.set(
             account,
             AccountQuota {
@@ -1370,6 +1572,7 @@ mod tests {
                     // during the load cycle. Year 2100 = 4102444800 seconds.
                     resets_at: 4_102_444_800,
                 }),
+                extras: origin.map(|origin| serde_json::json!({"csq_anthropic_origin": origin})),
                 ..Default::default()
             },
         );
@@ -1437,7 +1640,37 @@ mod tests {
             ProfilesFile::empty()
         };
         pf.by_slot.insert(slot.to_string(), uuid);
+        let email = format!("rotation-{slot}@example.test");
+        let account_uuid = Uuid::from_u128(0x1000 + u128::from(slot));
+        let organization_uuid = Uuid::from_u128(0x2000 + u128::from(slot));
+        pf.anthropic_contexts
+            .retain(|entry| entry.identity_uuid != uuid);
+        pf.anthropic_contexts
+            .push(crate::accounts::anthropic_identity::AnthropicContextEntry {
+                email: email.clone(),
+                account_uuid,
+                organization_uuid,
+                identity_uuid: uuid,
+                extra: Default::default(),
+            });
         profiles::save(&path, &pf).unwrap();
+
+        let identity_dir = identity_store::identity_path(base, uuid);
+        std::fs::create_dir_all(&identity_dir).unwrap();
+        crate::platform::fs::secure_dir(&base.join("identities")).unwrap();
+        crate::platform::fs::secure_dir(&identity_dir).unwrap();
+        let metadata = identity_dir.join("identity.json");
+        std::fs::write(
+            &metadata,
+            serde_json::to_vec(&serde_json::json!({
+                "provider": "anthropic", "email": email,
+                "account_uuid": account_uuid, "organization_uuid": organization_uuid,
+                "created_at": "fixture", "key_id": null,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        crate::platform::fs::secure_file(&metadata).unwrap();
 
         // M4-4: also seed identities/<UUID>/credentials.json so the post-flip
         // reader finds credentials for this slot. Mirror the legacy creds
@@ -1446,6 +1679,24 @@ mod tests {
         let creds = make_creds(&format!("at-{slot}"), &format!("rt-{slot}"));
         let identity_path = identity_store::credentials_path_for(base, uuid);
         credentials::save(&identity_path, &creds).unwrap();
+
+        // Some original tests install quota before publishing the UUID fixture.
+        // Stamp only this newly bound fixture row, preserving every sibling.
+        if quota_state::quota_path(base).exists() {
+            let mut quota = quota_state::load_state_or_skip(base).unwrap();
+            if let Some(row) = quota.accounts.get_mut(&slot.to_string()) {
+                let origin =
+                    crate::quota::origin::capture(base, AccountNum::try_from(slot).unwrap())
+                        .stamp()
+                        .expect("Known fixture origin");
+                let extras = row.extras.get_or_insert_with(|| serde_json::json!({}));
+                extras.as_object_mut().unwrap().insert(
+                    "csq_anthropic_origin".into(),
+                    serde_json::to_value(origin).unwrap(),
+                );
+            }
+            quota_state::save_state(base, &quota).unwrap();
+        }
 
         uuid
     }
@@ -2273,7 +2524,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let calls_for_closure = std::sync::Arc::clone(&calls);
         let reconcile: ReconcileAccountFn =
-            std::sync::Arc::new(move |_base, account, _uuid, _http_get| {
+            std::sync::Arc::new(move |_base, account, _uuid, _http_get, _view| {
                 calls_for_closure.lock().unwrap().push(account.get());
                 crate::daemon::custodian::ReconcileOutcome::RateLimited
             });
@@ -2346,7 +2597,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let calls_for_closure = std::sync::Arc::clone(&calls);
         let reconcile: ReconcileAccountFn =
-            std::sync::Arc::new(move |_base, account, _uuid, _http_get| {
+            std::sync::Arc::new(move |_base, account, _uuid, _http_get, _view| {
                 calls_for_closure.lock().unwrap().push(account.get());
                 crate::daemon::custodian::ReconcileOutcome::NoCandidates
             });
@@ -2369,6 +2620,74 @@ mod tests {
             calls.lock().unwrap().is_empty(),
             "a pre-marked gate must suppress the opportunistic harvest call entirely"
         );
+    }
+
+    /// One tick, three terminals on the SAME account: every reconcile call
+    /// receives the SAME on-demand view, so a Dead learned for the first
+    /// terminal is visible to the other two (at most one validation spend per
+    /// tick, one Mismatch WARN per tick).
+    ///
+    /// RED: building the view inside the per-terminal call (instead of once
+    /// before the loop) makes the later calls see `None` and the call count of
+    /// "view already knew the verdict" drop to 0.
+    #[test]
+    fn tick_shares_one_on_demand_view_across_terminals() {
+        let dir = TempDir::new().unwrap();
+        let claude_home = TempDir::new().unwrap();
+        setup_account(dir.path(), 1);
+        setup_config_dir(dir.path(), 1);
+        setup_quota(dir.path(), 1, 5.0);
+        setup_account(dir.path(), 2);
+        setup_config_dir(dir.path(), 2);
+        setup_quota(dir.path(), 2, 97.0);
+        for pid in [40021u32, 40022, 40023] {
+            let _ = setup_handle_dir(dir.path(), claude_home.path(), pid, 2);
+        }
+        let cfg = RotationConfig {
+            enabled: true,
+            threshold_percent: 95.0,
+            ..RotationConfig::default()
+        };
+        save_rotation_config(dir.path(), &cfg).unwrap();
+
+        let id = crate::accounts::identity_store::IdentityId::new_v4();
+        let fp = crate::credentials::token_history::fingerprint_from_raw_json(
+            r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"rt-view","expiresAt":4102444800000}}"#,
+        )
+        .unwrap();
+        let total = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let already_known = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (t2, k2) = (
+            std::sync::Arc::clone(&total),
+            std::sync::Arc::clone(&already_known),
+        );
+        let reconcile: ReconcileAccountFn =
+            std::sync::Arc::new(move |_base, _account, _uuid, _http_get, view| {
+                t2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let now = std::time::Instant::now();
+                if view.cached(id, fp, now).is_some() {
+                    k2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                } else {
+                    view.remember(id, fp, now, crate::daemon::custodian::NegativeKind::Dead);
+                }
+                crate::daemon::custodian::ReconcileOutcome::NoCandidates
+            });
+        let gate = crate::daemon::server::harvest_gate::new_ip_rate_limit_gate();
+        let mut cooldowns = HashMap::new();
+        tick_with_reconcile_for_test(
+            dir.path(),
+            Some(claude_home.path()),
+            &mut cooldowns,
+            &reconcile,
+            &gate,
+        );
+        let t = total.load(std::sync::atomic::Ordering::SeqCst);
+        let k = already_known.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            t, 3,
+            "positive control: all three terminals were reconciled"
+        );
+        assert_eq!(k, 2, "terminals 2 and 3 must see terminal 1's verdict");
     }
 
     // ── VP-final F2: cooldown canonicalization ────────────────────────────
@@ -2947,6 +3266,43 @@ mod tests {
         );
     }
 
+    /// Profile contention is refused before forced writes and retried after
+    /// the short cadence rather than issuing another rotation every tick.
+    #[cfg(unix)]
+    #[test]
+    fn tick_busy_profiles_lock_sets_retry_before_mutation() {
+        let dir = TempDir::new().unwrap();
+        let claude_home = TempDir::new().unwrap();
+        setup_account(dir.path(), 1);
+        setup_account(dir.path(), 2);
+        setup_quota(dir.path(), 1, 97.0);
+        setup_quota(dir.path(), 2, 10.0);
+        setup_config_dir_uuid(dir.path(), 1);
+        setup_config_dir_uuid(dir.path(), 2);
+        let handle_dir = setup_handle_dir(dir.path(), claude_home.path(), 10098, 1);
+        let cfg = RotationConfig {
+            enabled: true,
+            threshold_percent: 95.0,
+            ..RotationConfig::default()
+        };
+        save_rotation_config(dir.path(), &cfg).unwrap();
+
+        let held = crate::accounts::profiles_lock::ProfilesFileLock::acquire(dir.path()).unwrap();
+        let mut cooldowns = HashMap::new();
+        tick(dir.path(), Some(claude_home.path()), &mut cooldowns);
+        drop(held);
+
+        assert_eq!(
+            markers::resolve_marker_to_slot(dir.path(), &handle_dir),
+            Some(AccountNum::try_from(1u16).unwrap()),
+            "a busy profiles lock must not rotate"
+        );
+        assert!(
+            cooldowns.contains_key(&std::fs::canonicalize(&handle_dir).unwrap()),
+            "busy contention must record the pre-write retry, got {cooldowns:?}"
+        );
+    }
+
     /// Lock-timeout cooldown parity: a `BoundedLockOutcome::Failed` (this
     /// test forces it deterministically — no waiting on the real ~20s
     /// bound) is a failure arm exactly like the keychain-read-failure and
@@ -3085,11 +3441,19 @@ mod tests {
             // decision to fire (proving it used the STALE account-1 view),
             // then move the marker to account 3 and release the lock.
             go_rx.recv().expect("pre-lock hook must signal go");
-            crate::session::handle_dir::repoint_handle_dir(
+            let native = crate::session::handle_dir::capture_native_swap(&base, &hd)
+                .expect("capture the source while holding the swap lock");
+            let target = crate::accounts::anthropic_identity::capture_anthropic_binding(
+                &base,
+                AccountNum::try_from(3u16).unwrap(),
+            )
+            .expect("capture account 3's own canonical binding");
+            crate::session::handle_dir::repoint_handle_dir_guarded(
                 &base,
                 &claude_home_path,
                 &hd,
-                AccountNum::try_from(3u16).unwrap(),
+                &target,
+                &native,
             )
             .expect("repoint to account 3 while this thread holds the lock");
             drop(guard);
@@ -3411,6 +3775,221 @@ mod tests {
             setup_handle_dir(dir, claude_home, pid, 1)
         }
 
+        fn tick_without_harvest(base: &Path, home: &Path) {
+            let http: crate::daemon::usage_poller::HttpGetFn =
+                std::sync::Arc::new(|_, _, _| panic!("no network"));
+            let reconcile: ReconcileAccountFn = std::sync::Arc::new(|_, _, _, _, _| {
+                crate::daemon::custodian::ReconcileOutcome::SkippedUnknown
+            });
+            tick_with_deps(
+                base,
+                Some(home),
+                &mut HashMap::new(),
+                &http,
+                &reconcile,
+                &crate::daemon::server::harvest_gate::new_ip_rate_limit_gate(),
+            );
+        }
+
+        #[test]
+        fn r4ft_expired_marker_token_refuses_before_forced_write() {
+            let _env_lock = crate::platform::test_env::lock();
+            let base = TempDir::new().unwrap();
+            let home = TempDir::new().unwrap();
+            let handle = setup_source_and_target(base.path(), home.path(), 59991);
+            let slot = AccountNum::try_from(1u16).unwrap();
+            let uuid =
+                crate::accounts::profiles::resolve_slot_to_uuid(base.path(), slot.get()).unwrap();
+            let canonical =
+                crate::accounts::identity_store::credentials_path_for(base.path(), uuid);
+            let mutated = Rc::new(std::cell::Cell::new(false));
+            let observed = mutated.clone();
+            set_pre_lock_test_hook_for_test(Some(Box::new(move || {
+                let CredentialFile::Anthropic(mut credential) = make_creds("at-1", "rt-1") else {
+                    panic!("Anthropic fixture");
+                };
+                credential.claude_ai_oauth.expires_at = 1;
+                credentials::save(&canonical, &CredentialFile::Anthropic(credential)).unwrap();
+                observed.set(true);
+            })));
+            struct ResetPreLock;
+            impl Drop for ResetPreLock {
+                fn drop(&mut self) {
+                    set_pre_lock_test_hook_for_test(None);
+                }
+            }
+            let _reset = ResetPreLock;
+            let (exec, _guard) = install_executor(RawContentClassification::Absent);
+            tick_without_harvest(base.path(), home.path());
+            assert!(
+                mutated.get(),
+                "fixture must reach the forced-write decision"
+            );
+            assert_eq!(
+                markers::resolve_marker_to_slot(base.path(), &handle),
+                Some(slot)
+            );
+            assert!(
+                exec.calls().is_empty(),
+                "expired marker forbids even native reads before force"
+            );
+        }
+
+        #[test]
+        fn r4ft_failed_repoint_and_unreadable_reconcile_clear_written_target() {
+            use crate::credentials::keychain::{KeychainExecutor, UnreadableKind};
+            struct UnreadableReconcile {
+                inner: ScriptedKeychainExecutor,
+                reads: std::cell::Cell<usize>,
+            }
+            impl KeychainExecutor for UnreadableReconcile {
+                fn find(&self, service: &str, account: &str) -> RawContentClassification {
+                    self.reads.set(self.reads.get() + 1);
+                    if self.reads.get() == 2 {
+                        RawContentClassification::Unreadable(UnreadableKind::Transient)
+                    } else {
+                        self.inner.find(service, account)
+                    }
+                }
+                fn add(
+                    &self,
+                    service: &str,
+                    account: &str,
+                    raw: &str,
+                ) -> Result<(), crate::error::PlatformError> {
+                    self.inner.add(service, account, raw)
+                }
+                fn delete(&self, service: &str, account: &str) -> bool {
+                    self.inner.delete(service, account)
+                }
+            }
+            let _env_lock = crate::platform::test_env::lock();
+            let base = TempDir::new().unwrap();
+            let home = TempDir::new().unwrap();
+            let handle = setup_source_and_target(base.path(), home.path(), 59992);
+            std::fs::remove_file(base.path().join("config-2/.csq-account")).unwrap();
+            let exec = Rc::new(UnreadableReconcile {
+                inner: ScriptedKeychainExecutor::scripted(RawContentClassification::Absent),
+                reads: Default::default(),
+            });
+            set_test_keychain_executor(exec.clone());
+            let _guard = ExecutorGuard;
+            tick_without_harvest(base.path(), home.path());
+            assert_eq!(
+                markers::resolve_marker_to_slot(base.path(), &handle),
+                Some(AccountNum::try_from(1u16).unwrap())
+            );
+            assert!(
+                exec.inner.last_add_payload().unwrap().contains("rt-2"),
+                "fixture must force target before the failure"
+            );
+            assert!(
+                matches!(
+                    exec.inner.find("fixture", "fixture"),
+                    RawContentClassification::Absent
+                ),
+                "failed compensation must leave terminal logged out, never on target2"
+            );
+            assert!(exec
+                .inner
+                .calls()
+                .iter()
+                .any(|(verb, _, _)| *verb == "delete"));
+        }
+
+        #[test]
+        fn r3dt_rotation_holds_profiles_across_write_repoint_and_reconcile() {
+            use crate::accounts::profiles_lock::ProfilesFileLock;
+            use crate::credentials::keychain::KeychainExecutor;
+            struct Observed {
+                inner: ScriptedKeychainExecutor,
+                base: PathBuf,
+                reads: std::cell::Cell<usize>,
+                writes: std::cell::Cell<usize>,
+            }
+            impl Observed {
+                fn assert_custody(&self) {
+                    assert!(
+                        ProfilesFileLock::try_acquire(&self.base).unwrap().is_none(),
+                        "profile custody must cover the native executor, not just its final apply"
+                    );
+                }
+            }
+            impl KeychainExecutor for Observed {
+                fn find(&self, service: &str, account: &str) -> RawContentClassification {
+                    self.assert_custody();
+                    self.reads.set(self.reads.get() + 1);
+                    self.inner.find(service, account)
+                }
+                fn add(
+                    &self,
+                    service: &str,
+                    account: &str,
+                    raw: &str,
+                ) -> Result<(), crate::error::PlatformError> {
+                    self.assert_custody();
+                    self.writes.set(self.writes.get() + 1);
+                    self.inner.add(service, account, raw)
+                }
+                fn delete(&self, service: &str, account: &str) -> bool {
+                    self.assert_custody();
+                    self.writes.set(self.writes.get() + 1);
+                    self.inner.delete(service, account)
+                }
+            }
+            let _env_lock = crate::platform::test_env::lock();
+            for busy in [true, false] {
+                let dir = TempDir::new().unwrap();
+                let home = TempDir::new().unwrap();
+                let handle = setup_source_and_target(dir.path(), home.path(), 59998);
+                let exec = Rc::new(Observed {
+                    inner: ScriptedKeychainExecutor::scripted(RawContentClassification::Absent),
+                    base: dir.path().to_path_buf(),
+                    reads: Default::default(),
+                    writes: Default::default(),
+                });
+                set_test_keychain_executor(exec.clone());
+                let _reset = ExecutorGuard;
+                let held = busy.then(|| ProfilesFileLock::acquire(dir.path()).unwrap());
+                let http: crate::daemon::usage_poller::HttpGetFn =
+                    std::sync::Arc::new(|_, _, _| panic!("no network"));
+                let reconcile: ReconcileAccountFn = std::sync::Arc::new(|_, _, _, _, _| {
+                    crate::daemon::custodian::ReconcileOutcome::SkippedUnknown
+                });
+                tick_with_deps(
+                    dir.path(),
+                    Some(home.path()),
+                    &mut HashMap::new(),
+                    &http,
+                    &reconcile,
+                    &crate::daemon::server::harvest_gate::new_ip_rate_limit_gate(),
+                );
+                assert_eq!(
+                    markers::resolve_marker_to_slot(dir.path(), &handle),
+                    Some(AccountNum::try_from(if busy { 1u16 } else { 2u16 }).unwrap())
+                );
+                if busy {
+                    assert_eq!(
+                        exec.reads.get(),
+                        0,
+                        "busy profiles must refuse before native reads"
+                    );
+                    assert_eq!(
+                        exec.writes.get(),
+                        0,
+                        "busy profiles must leave no forced write behind"
+                    );
+                } else {
+                    assert!(
+                        exec.reads.get() >= 2,
+                        "force and reconcile both run under custody"
+                    );
+                    assert!(exec.writes.get() > 0);
+                }
+                drop(held);
+            }
+        }
+
         /// (a) [`keychain-fix-r8.md`'s C-F7, auto_rotate mirror]: the
         /// pre-repoint forced write lands (X now holds the target's token),
         /// but `repoint_handle_dir` itself refuses — here via its own
@@ -3495,7 +4074,7 @@ mod tests {
             // is set to fail: WriteFailedUnknown, not Unreadable/Absent.
             let (_exec, _guard) = install_scripted(
                 ScriptedKeychainExecutor::scripted(RawContentClassification::Content(
-                    serde_json::to_string(&source_cf).unwrap(),
+                    (serde_json::to_string(&source_cf).unwrap()).into(),
                 ))
                 .with_add_failing(),
             );
@@ -3541,7 +4120,7 @@ mod tests {
 
             let foreign = make_creds("at-FOREIGN", "rt-FOREIGN");
             let (exec, _guard) = install_executor(RawContentClassification::Content(
-                serde_json::to_string(&foreign).unwrap(),
+                (serde_json::to_string(&foreign).unwrap()).into(),
             ));
 
             let mut cooldowns = HashMap::new();

@@ -36,6 +36,11 @@
 #   APT_DEPS_FAKE_INSTALLED  space-separated list treated as installed
 #   APT_DEPS_FAKE_SUDO       "ok" | "denied"  — stubs the sudo -n probe
 set -uo pipefail
+# shellcheck source=/dev/null
+. "$(cd "${BASH_SOURCE[0]%/*}" && pwd)/../lib/strmatch.sh" || {
+    echo "FATAL: cannot source scripts/lib/strmatch.sh — membership tests would be unmeasurable" >&2
+    exit 2
+}
 
 if [ "$#" -eq 0 ]; then
   echo "usage: ensure-apt-deps.sh <package>..." >&2
@@ -47,7 +52,9 @@ pkg_installed() {
   if [ -n "${APT_DEPS_FAKE_INSTALLED+x}" ]; then
     case " $APT_DEPS_FAKE_INSTALLED " in *" $pkg "*) return 0 ;; *) return 1 ;; esac
   fi
-  dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed'
+  local status
+  status="$(dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null)" || true
+  strmatch_contains "$status" 'install ok installed'
 }
 
 sudo_usable() {

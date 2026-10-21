@@ -65,6 +65,7 @@ fn sandbox_home() -> std::path::PathBuf {
 fn clean_cmd(path_override: Option<&str>) -> Command {
     let mut cmd = Command::new(csq_bin());
     cmd.env_clear();
+    common::strip_ci_env(&mut cmd);
     // Hermetic: the spawned `csq` binary must NOT shell `security` against the
     // operator's real login keychain (rules/test-hermeticity.md).
     cmd.env("CSQ_DISABLE_KEYCHAIN_MIRROR", "1");

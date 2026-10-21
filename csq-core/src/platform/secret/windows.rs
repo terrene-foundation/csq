@@ -41,7 +41,7 @@
 
 #![cfg(target_os = "windows")]
 
-use super::{run_with_timeout, SecretError, SlotKey, Vault};
+use super::{run_with_timeout, NamedKey, SecretError, SlotKey, Vault};
 use crate::types::AccountNum;
 use secrecy::{ExposeSecret, SecretString};
 use std::ffi::c_void;
@@ -61,6 +61,57 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use zeroize::Zeroizing;
 
+/// Owns the single CredReadW allocation. Embedded pointers belong to it.
+struct ReadAllocation(*mut CREDENTIALW);
+impl Drop for ReadAllocation {
+    fn drop(&mut self) {
+        // SAFETY: constructed only from a successful CredReadW; all embedded
+        // byte ranges are valid until the one outer allocation is released.
+        unsafe {
+            wipe_credential_blob(self.0);
+            CredFree(self.0 as *mut c_void);
+        }
+    }
+}
+
+/// Owns the single CredEnumerateW allocation, including every returned item.
+struct EnumeratedAllocation {
+    ptr: *mut *mut CREDENTIALW,
+    count: u32,
+}
+impl Drop for EnumeratedAllocation {
+    fn drop(&mut self) {
+        // SAFETY: native API provides count pointers in one allocated block.
+        unsafe {
+            if !self.ptr.is_null() {
+                for i in 0..self.count {
+                    wipe_credential_blob(*self.ptr.add(i as usize));
+                }
+                CredFree(self.ptr as *mut c_void);
+            }
+        }
+    }
+}
+
+/// Wipes the SDK-sized blob in a still-live native allocation.
+/// # Safety
+/// `credential` must be null or point to a live CREDENTIALW returned by
+/// CredReadW/CredEnumerateW; its blob byte range is owned by that allocation.
+unsafe fn wipe_credential_blob(credential: *mut CREDENTIALW) {
+    if credential.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees the native descriptor is still live.
+    let cred = unsafe { &mut *credential };
+    if !cred.CredentialBlob.is_null() && cred.CredentialBlobSize != 0 {
+        // SAFETY: DWORD size counts bytes in the API-owned blob allocation.
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(cred.CredentialBlob, cred.CredentialBlobSize as usize)
+        };
+        super::wipe_native_blob(bytes);
+    }
+}
+
 /// Production Windows Credential Manager backend. Stateless — every
 /// method is a fresh syscall, matching the macOS / Linux patterns'
 /// "no in-process caching" rule.
@@ -79,6 +130,168 @@ impl Default for WindowsCredentialVault {
 }
 
 impl Vault for WindowsCredentialVault {
+    fn set_named(&self, key: &NamedKey, secret: &SecretString) -> Result<(), SecretError> {
+        if secret.expose_secret().is_empty() {
+            return Err(SecretError::InvalidKey {
+                reason: "secret must not be empty".into(),
+            });
+        }
+        let target = to_wide(&key.native_name())?;
+        let username = to_wide("csq")?;
+        // `Zeroizing<Vec<u8>>` derefs to `Vec<u8>` so `as_mut_ptr` /
+        // `len` still work; `Drop` wipes the cleartext copy after the
+        // syscall returns. CredWriteW copies into its own internal
+        // storage per Microsoft's documentation, so the local buffer
+        // never has to outlive the call.
+        let mut blob: Zeroizing<Vec<u8>> =
+            Zeroizing::new(secret.expose_secret().as_bytes().to_vec());
+
+        super::named_mutation_result(super::run_named_mutation_with_timeout(
+            "csq-pool-credman",
+            "windows-credential-manager",
+            key,
+            move || {
+                let cred = CREDENTIALW {
+                    Flags: 0,
+                    Type: CRED_TYPE_GENERIC,
+                    TargetName: target.as_ptr() as *mut u16,
+                    Comment: ptr::null_mut(),
+                    LastWritten: FILETIME {
+                        dwLowDateTime: 0,
+                        dwHighDateTime: 0,
+                    },
+                    CredentialBlobSize: blob.len() as u32,
+                    CredentialBlob: blob.as_mut_ptr(),
+                    Persist: CRED_PERSIST_LOCAL_MACHINE,
+                    AttributeCount: 0,
+                    Attributes: ptr::null_mut(),
+                    TargetAlias: ptr::null_mut(),
+                    UserName: username.as_ptr() as *mut u16,
+                };
+                // SAFETY: pointers in `cred` reference buffers owned by
+                // the move closure; they outlive the call. CredWriteW
+                // does NOT take ownership of any pointer — the API copies
+                // into its own internal storage.
+                let ok = unsafe { CredWriteW(&cred, 0) };
+                if ok == 0 {
+                    return Err(map_last_error("CredWriteW"));
+                }
+                // Explicit drops keep the move-only buffers visible to a
+                // future reader of this code: the API has copied out of
+                // them, so we wipe `blob` (cleartext) and free the wide
+                // strings here rather than at end-of-closure scope.
+                drop(blob);
+                drop(target);
+                drop(username);
+                Ok(())
+            },
+        ))
+    }
+
+    fn get_named(&self, key: &NamedKey) -> Result<SecretString, SecretError> {
+        let target = to_wide(&key.native_name())?;
+        super::run_named_with_timeout("csq-vault-credman", move || {
+            let mut out: *mut CREDENTIALW = ptr::null_mut();
+            // SAFETY: `out` is a writable pointer location; CredReadW
+            // either fails or fills it with an allocated `CREDENTIALW`
+            // that we MUST free with CredFree.
+            let ok = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut out) };
+            if ok == 0 {
+                let err = unsafe { GetLastError() };
+                if err == ERROR_NOT_FOUND {
+                    return Err(SecretError::NamedNotFound);
+                }
+                return Err(map_error_code("CredReadW", err));
+            }
+
+            // SAFETY: `out` is valid for the duration of this block;
+            // we copy the blob bytes into a `Zeroizing` Vec so the
+            // cleartext copy is wiped on drop even if the UTF-8
+            // conversion path fails.
+            let allocation = ReadAllocation(out);
+            let bytes: Zeroizing<Vec<u8>> = Zeroizing::new(unsafe {
+                let cred = &*out;
+                if cred.CredentialBlobSize == 0 {
+                    Vec::new()
+                } else if cred.CredentialBlob.is_null() {
+                    return Err(SecretError::InvalidKey {
+                        reason: "invalid native credential blob".into(),
+                    });
+                } else {
+                    std::slice::from_raw_parts(
+                        cred.CredentialBlob,
+                        cred.CredentialBlobSize as usize,
+                    )
+                    .to_vec()
+                }
+            });
+            // SAFETY: `out` came from CredReadW — must be released
+            // via CredFree before we exit this block.
+            drop(allocation);
+
+            // Non-UTF-8 is a foreign-writer / corruption signal, NOT
+            // a decryption failure (the variant doc on
+            // SecretError::DecryptionFailed prompts re-provisioning
+            // which is not the right action here). Map to InvalidKey
+            // so the audit log carries the right tag.
+            let s = std::str::from_utf8(&bytes).map_err(|_| SecretError::InvalidKey {
+                reason: "stored Windows Credential Manager secret is not valid UTF-8".into(),
+            })?;
+            Ok(SecretString::new(s.to_owned().into()))
+        })
+    }
+
+    fn delete_named(&self, key: &NamedKey) -> Result<(), SecretError> {
+        let target = to_wide(&key.native_name())?;
+        super::named_mutation_result(super::run_named_mutation_with_timeout(
+            "csq-pool-credman",
+            "windows-credential-manager",
+            key,
+            move || {
+                // SAFETY: `target` is a null-terminated UTF-16 string for
+                // the duration of the call (closure owns the Vec).
+                let ok = unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) };
+                if ok == 0 {
+                    let err = unsafe { GetLastError() };
+                    if err == ERROR_NOT_FOUND {
+                        return Ok(());
+                    }
+                    return Err(map_error_code("CredDeleteW", err));
+                }
+                Ok(())
+            },
+        ))
+    }
+
+    fn contains_named(&self, key: &NamedKey) -> Result<bool, SecretError> {
+        let target = to_wide(&key.native_name())?;
+        super::run_named_with_timeout("csq-pool-credman", move || {
+            let mut out: *mut CREDENTIALW = ptr::null_mut();
+            // CredReadW is an exact-name existence query. Windows returns a
+            // plaintext blob even though the application only needs presence.
+            // SAFETY: validated terminated name; out is writable and receives
+            // one allocation, owned by the guard after native success.
+            let ok = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut out) };
+            if ok == 0 {
+                let err = unsafe { GetLastError() };
+                return if err == ERROR_NOT_FOUND {
+                    Ok(false)
+                } else {
+                    Err(map_error_code("CredReadW", err))
+                };
+            }
+            // No payload is inspected/copied. Wipe the OS-materialized blob
+            // before releasing its allocation; CredFree does not promise this.
+            let allocation = ReadAllocation(out);
+            drop(allocation);
+            Ok(true)
+        })
+    }
+
+    fn named_worker_state(&self, key: &NamedKey) -> super::NamedWorkerState {
+        super::named_worker_state(self.backend_id(), key)
+    }
+
     fn set(&self, slot: SlotKey, secret: &SecretString) -> Result<(), SecretError> {
         if secret.expose_secret().is_empty() {
             return Err(SecretError::InvalidKey {
@@ -156,24 +369,36 @@ impl Vault for WindowsCredentialVault {
             // we copy the blob bytes into a `Zeroizing` Vec so the
             // cleartext copy is wiped on drop even if the UTF-8
             // conversion path fails.
+            let allocation = ReadAllocation(out);
             let bytes: Zeroizing<Vec<u8>> = Zeroizing::new(unsafe {
                 let cred = &*out;
-                std::slice::from_raw_parts(cred.CredentialBlob, cred.CredentialBlobSize as usize)
+                if cred.CredentialBlobSize == 0 {
+                    Vec::new()
+                } else if cred.CredentialBlob.is_null() {
+                    return Err(SecretError::InvalidKey {
+                        reason: "invalid native credential blob".into(),
+                    });
+                } else {
+                    std::slice::from_raw_parts(
+                        cred.CredentialBlob,
+                        cred.CredentialBlobSize as usize,
+                    )
                     .to_vec()
+                }
             });
             // SAFETY: `out` came from CredReadW — must be released
             // via CredFree before we exit this block.
-            unsafe { CredFree(out as *mut c_void) };
+            drop(allocation);
 
             // Non-UTF-8 is a foreign-writer / corruption signal, NOT
             // a decryption failure (the variant doc on
             // SecretError::DecryptionFailed prompts re-provisioning
             // which is not the right action here). Map to InvalidKey
             // so the audit log carries the right tag.
-            let s = String::from_utf8(bytes.to_vec()).map_err(|_| SecretError::InvalidKey {
+            let s = std::str::from_utf8(&bytes).map_err(|_| SecretError::InvalidKey {
                 reason: "stored Windows Credential Manager secret is not valid UTF-8".into(),
             })?;
-            Ok(SecretString::new(s.into()))
+            Ok(SecretString::new(s.to_owned().into()))
         })
     }
 
@@ -222,6 +447,7 @@ impl Vault for WindowsCredentialVault {
                 return Err(map_error_code("CredEnumerateW", err));
             }
 
+            let allocation = EnumeratedAllocation { ptr: creds, count };
             let mut out: Vec<u16> = Vec::with_capacity(count as usize);
             // SAFETY: `creds` points at `count` valid `CREDENTIALW`
             // pointers; every dereference is bounded.
@@ -269,7 +495,7 @@ impl Vault for WindowsCredentialVault {
             // SAFETY: `creds` came from CredEnumerateW — freeing the
             // outer pointer also releases the inner CREDENTIALW
             // entries per Microsoft documentation.
-            unsafe { CredFree(creds as *mut c_void) };
+            drop(allocation);
 
             out.sort_unstable();
             out.dedup();

@@ -318,11 +318,27 @@ pub fn write_binding(
     if !surface.is_native_cli() {
         return Err(NativeError::NotNative(surface));
     }
+    // Native publication shares the profiles authority lock with finalization.
+    // Production callers do not already hold this lock.
+    let profiles =
+        crate::accounts::profiles_lock::ProfilesFileLock::acquire(base_dir).map_err(|_| {
+            NativeError::Io {
+                path: base_dir.join(".profiles.lock"),
+                source: std::io::Error::other("profiles_lock_refused"),
+            }
+        })?;
+    crate::accounts::profiles::advance_independent_binding_generation(&profiles, base_dir, slot)
+        .map_err(|_| NativeError::Io {
+            path: base_dir.join("profiles.json"),
+            source: std::io::Error::other("binding_generation_refused"),
+        })?;
     let path = marker_path(base_dir, slot, surface);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| NativeError::Io {
+        // SEC-2.15 (unified, R1 M1): the marker lives in credentials/ —
+        // create AND secure that dir fail-closed via the shared helper.
+        crate::platform::fs::ensure_private_dir(parent).map_err(|e| NativeError::Io {
             path: parent.to_path_buf(),
-            source: e,
+            source: std::io::Error::other(format!("credentials_dir_refused: {e}")),
         })?;
     }
     let binding = NativeBinding::new(surface);
@@ -404,6 +420,197 @@ pub fn unbind(base_dir: &Path, slot: AccountNum, surface: Surface) -> Result<(),
 pub fn marker_exists(base_dir: &Path, slot: AccountNum, surface: Surface) -> bool {
     surface.is_native_cli()
         && std::fs::symlink_metadata(marker_path(base_dir, slot, surface)).is_ok()
+}
+
+/// Why a native-home path component could not be trusted (an internal ticket). Never
+/// carries a path or an OS error body — only the class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeAnomaly {
+    /// A symlink where a real directory/file belongs; never followed.
+    Symlink,
+    /// `symlink_metadata`/`read_dir` failed for a reason other than NotFound
+    /// (e.g. EACCES) — the state could not be determined.
+    Unreadable,
+    /// A real node of the wrong type (file where a directory belongs, or the
+    /// reverse).
+    WrongType,
+}
+
+impl NativeAnomaly {
+    /// Fixed vocabulary for diagnostic rows.
+    pub fn describe(self) -> &'static str {
+        match self {
+            NativeAnomaly::Symlink => "is a symlink (not followed)",
+            NativeAnomaly::Unreadable => "could not be read",
+            NativeAnomaly::WrongType => "has an unexpected file type",
+        }
+    }
+}
+
+/// What a slot's native home holds, as seen by the doctor (an internal ticket).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeFindingKind {
+    /// Vendor credential present, slot bound to NO surface: an unfinished login.
+    Orphan,
+    /// Vendor credential present under a home whose slot is bound to a DIFFERENT
+    /// surface (the vendor home is deliberately left behind by an unbind). Not
+    /// an unfinished login — never remediate with login/logout.
+    Leftover(crate::accounts::binding_guard::BoundSurface),
+    /// This surface's OWN marker exists AND the slot is also bound to a different
+    /// surface (a live dual binding, not a leftover). Needs manual resolution.
+    DualBound(crate::accounts::binding_guard::BoundSurface),
+    /// The home (or a component under it) could not be trusted.
+    Anomalous(NativeAnomaly),
+}
+
+/// One native-home finding for slot `slot` of vendor `cli`.
+#[derive(Debug, Clone)]
+pub struct NativeFinding {
+    pub slot: AccountNum,
+    pub cli: &'static NativeCli,
+    pub kind: NativeFindingKind,
+}
+
+/// Result of scanning `<base>/native-homes/`.
+#[derive(Debug, Clone, Default)]
+pub struct NativeHomesScan {
+    /// Set when the `native-homes` container itself is a symlink, the wrong
+    /// type, or unreadable; slot findings are then incomplete.
+    pub container: Option<NativeAnomaly>,
+    /// Findings sorted by (vendor display order, slot).
+    pub findings: Vec<NativeFinding>,
+}
+
+/// Classifies one path with `symlink_metadata`. `Ok(None)` = absent.
+fn probe_node(p: &Path, want_dir: bool) -> Result<Option<()>, NativeAnomaly> {
+    match std::fs::symlink_metadata(p) {
+        Ok(m) if m.file_type().is_symlink() => Err(NativeAnomaly::Symlink),
+        Ok(m) if (want_dir && m.is_dir()) || (!want_dir && m.is_file()) => Ok(Some(())),
+        Ok(_) => Err(NativeAnomaly::WrongType),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(NativeAnomaly::Unreadable),
+    }
+}
+
+/// Whether slot `N`'s vendor credential file exists as a regular file under a
+/// chain of real directories. Existence checks only — the file is never
+/// opened. Resolves the SAME path the writer uses ([`native_home_path`] +
+/// `cred_relpath`) but, unlike [`has_credentials`] (whose `is_file` follows
+/// links), checks every component with `symlink_metadata`.
+fn credential_state(
+    base_dir: &Path,
+    slot: AccountNum,
+    surface: Surface,
+) -> Result<bool, NativeAnomaly> {
+    let Some(d) = descriptor(surface) else {
+        return Ok(false);
+    };
+    let mut cur = native_home_path(base_dir, slot, surface);
+    if probe_node(&cur, true)?.is_none() {
+        return Ok(false);
+    }
+    let comps: Vec<_> = Path::new(d.cred_relpath).components().collect();
+    for (i, c) in comps.iter().enumerate() {
+        cur.push(c);
+        if probe_node(&cur, i + 1 != comps.len())?.is_none() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Classifies slot `N`'s native home for `surface`; `None` = nothing to report
+/// (no credential, or credential with this surface's own marker).
+pub fn classify_native_home(
+    base_dir: &Path,
+    slot: AccountNum,
+    surface: Surface,
+) -> Option<NativeFindingKind> {
+    match credential_state(base_dir, slot, surface) {
+        Err(a) => Some(NativeFindingKind::Anomalous(a)),
+        Ok(false) => None,
+        Ok(true) => {
+            use crate::accounts::binding_guard::{detect_bound_surface, BoundSurface};
+            // `detect_bound_surface` is precedence-ordered (it answers "dominant
+            // binding", not "does binding X exist"), so this surface's OWN marker
+            // is read FIRST via the specific predicate; only without it may the
+            // union detector pick Orphan vs Leftover.
+            if marker_exists(base_dir, slot, surface) {
+                let other_native = NATIVE_CLIS
+                    .iter()
+                    .map(|nc| nc.surface)
+                    .find(|s| *s != surface && marker_exists(base_dir, slot, *s));
+                if let Some(o) = other_native {
+                    return Some(NativeFindingKind::DualBound(BoundSurface::Native(o)));
+                }
+                return match detect_bound_surface(base_dir, slot) {
+                    Some(b) if b != BoundSurface::Native(surface) => {
+                        Some(NativeFindingKind::DualBound(b))
+                    }
+                    _ => None,
+                };
+            }
+            match detect_bound_surface(base_dir, slot) {
+                None => Some(NativeFindingKind::Orphan),
+                Some(b) => Some(NativeFindingKind::Leftover(b)),
+            }
+        }
+    }
+}
+
+/// Scans `<base>/native-homes/` for `<surface>-<N>` entries and classifies each.
+/// Fail-visible: the container being a symlink, the wrong type or unreadable,
+/// an unreadable entry, and a symlinked/unreadable home are reported, never
+/// dropped.
+pub fn scan_native_homes(base_dir: &Path) -> NativeHomesScan {
+    let mut scan = NativeHomesScan::default();
+    let container = base_dir.join("native-homes");
+    match probe_node(&container, true) {
+        Ok(None) => return scan,
+        Err(a) => {
+            scan.container = Some(a);
+            return scan;
+        }
+        Ok(Some(())) => {}
+    }
+    let entries = match std::fs::read_dir(&container) {
+        Ok(e) => e,
+        Err(_) => {
+            scan.container = Some(NativeAnomaly::Unreadable);
+            return scan;
+        }
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(e) => {
+                if let Ok(n) = e.file_name().into_string() {
+                    names.push(n);
+                }
+            }
+            Err(_) => scan.container = Some(NativeAnomaly::Unreadable),
+        }
+    }
+    for nc in NATIVE_CLIS {
+        let prefix = format!("{}-", nc.surface.as_str());
+        let mut slots: Vec<AccountNum> = names
+            .iter()
+            .filter_map(|n| n.strip_prefix(&prefix)?.parse::<u16>().ok())
+            .filter_map(|n| AccountNum::try_from(n).ok())
+            .collect();
+        slots.sort_by_key(|s| s.get());
+        slots.dedup();
+        for slot in slots {
+            if let Some(kind) = classify_native_home(base_dir, slot, nc.surface) {
+                scan.findings.push(NativeFinding {
+                    slot,
+                    cli: nc,
+                    kind,
+                });
+            }
+        }
+    }
+    scan
 }
 
 /// Returns the native [`Surface`] bound to slot `N`, if any — the detection
@@ -772,5 +979,221 @@ mod tests {
             conflicting_bound_surface(tmp.path(), s, Surface::Kimi),
             Some(Surface::ClaudeCode),
         );
+    }
+
+    mod native_scan_tests {
+        use super::*;
+        use tempfile::TempDir;
+
+        fn put_cred(base: &Path, n: u16, surface: Surface) {
+            let s = AccountNum::try_from(n).unwrap();
+            let p =
+                native_home_path(base, s, surface).join(descriptor(surface).unwrap().cred_relpath);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"x").unwrap();
+        }
+
+        fn kinds(base: &Path) -> Vec<(u16, &'static str, NativeFindingKind)> {
+            scan_native_homes(base)
+                .findings
+                .into_iter()
+                .map(|f| (f.slot.get(), f.cli.id, f.kind))
+                .collect()
+        }
+
+        #[test]
+        fn orphan_cred_without_marker_is_found() {
+            let t = TempDir::new().unwrap();
+            put_cred(t.path(), 4, Surface::Kimi);
+            put_cred(t.path(), 7, Surface::Grok);
+            assert_eq!(
+                kinds(t.path()),
+                vec![
+                    (4, "kimi-cli", NativeFindingKind::Orphan),
+                    (7, "grok", NativeFindingKind::Orphan)
+                ]
+            );
+        }
+
+        #[test]
+        fn cred_with_own_marker_is_not_reported() {
+            let t = TempDir::new().unwrap();
+            put_cred(t.path(), 4, Surface::Kimi);
+            let s = AccountNum::try_from(4u16).unwrap();
+            write_binding(t.path(), s, Surface::Kimi).unwrap();
+            assert!(scan_native_homes(t.path()).findings.is_empty());
+        }
+
+        #[test]
+        fn neither_cred_nor_marker_is_not_reported() {
+            let t = TempDir::new().unwrap();
+            std::fs::create_dir_all(native_home_path(
+                t.path(),
+                AccountNum::try_from(4u16).unwrap(),
+                Surface::Kimi,
+            ))
+            .unwrap();
+            let scan = scan_native_homes(t.path());
+            assert!(scan.container.is_none() && scan.findings.is_empty());
+        }
+
+        #[test]
+        fn leftover_home_of_rebound_slot_is_not_an_orphan() {
+            use crate::accounts::binding_guard::BoundSurface;
+            let t = TempDir::new().unwrap();
+            // Anthropic-bound slot 7 (legacy credentials/<N>.json mirror) + kimi home.
+            std::fs::create_dir_all(t.path().join("credentials")).unwrap();
+            std::fs::write(t.path().join("credentials/7.json"), b"{}").unwrap();
+            put_cred(t.path(), 7, Surface::Kimi);
+            // Grok-bound slot 8 + leftover kimi home.
+            put_cred(t.path(), 8, Surface::Kimi);
+            write_binding(t.path(), AccountNum::try_from(8u16).unwrap(), Surface::Grok).unwrap();
+            assert_eq!(
+                kinds(t.path()),
+                vec![
+                    (
+                        7,
+                        "kimi-cli",
+                        NativeFindingKind::Leftover(BoundSurface::ClaudeCode)
+                    ),
+                    (
+                        8,
+                        "kimi-cli",
+                        NativeFindingKind::Leftover(BoundSurface::Native(Surface::Grok))
+                    ),
+                ]
+            );
+        }
+
+        #[test]
+        fn live_own_marker_plus_other_binding_is_dual_bound_not_leftover() {
+            use crate::accounts::binding_guard::BoundSurface;
+            let t = TempDir::new().unwrap();
+            // Kimi marker + kimi credential + stale Anthropic mirror credentials/7.json.
+            put_cred(t.path(), 7, Surface::Kimi);
+            write_binding(t.path(), AccountNum::try_from(7u16).unwrap(), Surface::Kimi).unwrap();
+            std::fs::write(t.path().join("credentials/7.json"), b"{}").unwrap();
+            // Kimi + Grok markers, credential under BOTH homes.
+            for s in [Surface::Kimi, Surface::Grok] {
+                put_cred(t.path(), 9, s);
+                write_binding(t.path(), AccountNum::try_from(9u16).unwrap(), s).unwrap();
+            }
+            assert_eq!(
+                kinds(t.path()),
+                vec![
+                    (
+                        7,
+                        "kimi-cli",
+                        NativeFindingKind::DualBound(BoundSurface::ClaudeCode)
+                    ),
+                    (
+                        9,
+                        "kimi-cli",
+                        NativeFindingKind::DualBound(BoundSurface::Native(Surface::Grok))
+                    ),
+                    (
+                        9,
+                        "grok",
+                        NativeFindingKind::DualBound(BoundSurface::Native(Surface::Kimi))
+                    ),
+                ]
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn symlinked_cred_is_anomalous_not_orphan() {
+            let t = TempDir::new().unwrap();
+            let s = AccountNum::try_from(4u16).unwrap();
+            let p = native_home_path(t.path(), s, Surface::Grok).join("auth.json");
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            let target = t.path().join("elsewhere");
+            std::fs::write(&target, b"x").unwrap();
+            std::os::unix::fs::symlink(&target, &p).unwrap();
+            assert_eq!(
+                kinds(t.path()),
+                vec![(
+                    4,
+                    "grok",
+                    NativeFindingKind::Anomalous(NativeAnomaly::Symlink)
+                )]
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn symlinked_home_is_anomalous() {
+            let t = TempDir::new().unwrap();
+            let s = AccountNum::try_from(4u16).unwrap();
+            let real = t.path().join("real-home");
+            std::fs::create_dir_all(&real).unwrap();
+            std::fs::write(real.join("auth.json"), b"x").unwrap();
+            let home = native_home_path(t.path(), s, Surface::Grok);
+            std::fs::create_dir_all(home.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&real, &home).unwrap();
+            assert_eq!(
+                kinds(t.path()),
+                vec![(
+                    4,
+                    "grok",
+                    NativeFindingKind::Anomalous(NativeAnomaly::Symlink)
+                )]
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn symlinked_container_is_anomalous() {
+            let t = TempDir::new().unwrap();
+            let real = t.path().join("real-container");
+            std::fs::create_dir_all(&real).unwrap();
+            std::os::unix::fs::symlink(&real, t.path().join("native-homes")).unwrap();
+            let scan = scan_native_homes(t.path());
+            assert_eq!(scan.container, Some(NativeAnomaly::Symlink));
+            assert!(scan.findings.is_empty());
+        }
+
+        /// EACCES cannot be provoked as root; the test says so rather than passing silently.
+        #[cfg(unix)]
+        fn can_provoke_eacces(dir: &Path) -> bool {
+            std::fs::read_dir(dir).is_err()
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn unreadable_container_is_anomalous() {
+            use std::os::unix::fs::PermissionsExt;
+            let t = TempDir::new().unwrap();
+            put_cred(t.path(), 4, Surface::Kimi);
+            let c = t.path().join("native-homes");
+            std::fs::set_permissions(&c, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let provoked = can_provoke_eacces(&c);
+            let scan = scan_native_homes(t.path());
+            std::fs::set_permissions(&c, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(provoked, "running as a user that bypasses mode bits (root)");
+            assert_eq!(scan.container, Some(NativeAnomaly::Unreadable));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn unreadable_home_is_anomalous() {
+            use std::os::unix::fs::PermissionsExt;
+            let t = TempDir::new().unwrap();
+            put_cred(t.path(), 4, Surface::Kimi);
+            let h = native_home_path(t.path(), AccountNum::try_from(4u16).unwrap(), Surface::Kimi);
+            std::fs::set_permissions(&h, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let provoked = can_provoke_eacces(&h);
+            let got = kinds(t.path());
+            std::fs::set_permissions(&h, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(provoked, "running as a user that bypasses mode bits (root)");
+            assert_eq!(
+                got,
+                vec![(
+                    4,
+                    "kimi-cli",
+                    NativeFindingKind::Anomalous(NativeAnomaly::Unreadable)
+                )]
+            );
+        }
     }
 }

@@ -405,11 +405,104 @@ mod tests {
     mod spawned {
         use super::*;
         use std::io::Write as _;
+        use std::os::unix::process::CommandExt as _;
         use std::process::{Command, Stdio};
         use std::time::{Duration, Instant};
 
+        /// Spawning a copied test binary right after it was written can fail
+        /// with ETXTBSY when another test's `fork` still holds the copy's write
+        /// descriptor (the fork duplicates every open descriptor until its
+        /// own exit). That is a harness race, not ancestry behaviour: retry
+        /// the spawn, bounded, and let any other error through at once.
+        trait RetryBusy {
+            fn spawn_retrying_busy(&mut self) -> std::io::Result<std::process::Child>;
+            fn status_retrying_busy(&mut self) -> std::io::Result<std::process::ExitStatus> {
+                self.spawn_retrying_busy()?.wait()
+            }
+        }
+
+        impl RetryBusy for Command {
+            fn spawn_retrying_busy(&mut self) -> std::io::Result<std::process::Child> {
+                for _ in 0..100 {
+                    match self.spawn() {
+                        Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                        other => return other,
+                    }
+                }
+                self.spawn()
+            }
+        }
+
+        /// The retry really waits out a held write descriptor: a plain spawn of
+        /// a file somebody still has open for writing fails ETXTBSY (so the
+        /// hold is effective, not vacuous), and the retrying one succeeds once
+        /// the holder lets go. Linux only: macOS execs a file that is open for
+        /// writing (measured on the darwin gate leg: the plain spawn succeeds),
+        /// so the race, and this precondition, do not exist there.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_spawn_that_hits_a_held_write_descriptor_is_retried() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("script.sh");
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            let holder = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("hold for writing");
+            let err = Command::new(&path)
+                .spawn()
+                .expect_err("held file must not exec");
+            assert_eq!(err.raw_os_error(), Some(libc::ETXTBSY), "{err:?}");
+            let release = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                drop(holder);
+            });
+            let status = Command::new(&path)
+                .status_retrying_busy()
+                .expect("retried spawn");
+            release.join().expect("release thread");
+            assert!(status.success(), "{status:?}");
+        }
+
         const RESULT_ENV: &str = "CSQ_TEST_CODEX_ANCESTRY_RESULT_FILE";
         const CHILD_EXE_ENV: &str = "CSQ_TEST_CODEX_ANCESTRY_CHILD_EXE";
+
+        /// A spawned test child that is ALWAYS killed and reaped, on every exit path
+        /// (panics and early returns included). The child leads its own process group,
+        /// so grandchildren it spawned are killed with it; a child that already exited
+        /// leaves nothing to kill. Without this a failed assertion left helpers alive
+        /// (a leak that the capped test runner reports as `LEAK`).
+        struct ChildGuard {
+            child: std::process::Child,
+        }
+
+        impl ChildGuard {
+            fn new(child: std::process::Child) -> Self {
+                Self { child }
+            }
+            fn id(&self) -> u32 {
+                self.child.id()
+            }
+            fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+                self.child.wait()
+            }
+        }
+
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                // SAFETY: killpg on the group this guard's child leads (set at spawn via
+                // `process_group(0)`); a group with no members is ESRCH, ignored.
+                unsafe {
+                    libc::killpg(self.child.id() as libc::pid_t, libc::SIGKILL);
+                }
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
 
         fn copy_self_to(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
             let src = std::env::current_exe().expect("current_exe for the running test binary");
@@ -462,7 +555,7 @@ mod tests {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::inherit())
-                .status()
+                .status_retrying_busy()
                 .expect("spawn child probe");
             assert!(status.success(), "child probe exited non-zero: {status:?}");
         }
@@ -493,19 +586,22 @@ mod tests {
             // `codex`. Only its PARENT (spawned above) carries that name.
             let child_bin = copy_self_to(dir.path(), "csq-test-child-probe");
 
-            let mut parent = Command::new(&codex_bin)
-                .args([
-                    "--ignored",
-                    "--exact",
-                    "providers::codex::ancestry::tests::spawned::ancestry_parent_helper",
-                ])
-                .env(RESULT_ENV, &result_path)
-                .env(CHILD_EXE_ENV, &child_bin)
-                .stdin(Stdio::null())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .expect("spawn renamed-to-codex parent helper");
+            let mut parent = ChildGuard::new(
+                Command::new(&codex_bin)
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "providers::codex::ancestry::tests::spawned::ancestry_parent_helper",
+                    ])
+                    .env(RESULT_ENV, &result_path)
+                    .env(CHILD_EXE_ENV, &child_bin)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .process_group(0)
+                    .spawn_retrying_busy()
+                    .expect("spawn renamed-to-codex parent helper"),
+            );
             let parent_pid = parent.id();
 
             let deadline = Instant::now() + Duration::from_secs(60);
@@ -551,7 +647,7 @@ mod tests {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::inherit())
-                .status()
+                .status_retrying_busy()
                 .expect("spawn chain parent helper");
             assert!(
                 status.success(),
@@ -576,7 +672,7 @@ mod tests {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::inherit())
-                .status()
+                .status_retrying_busy()
                 .expect("spawn chain child probe");
             assert!(
                 status.success(),
@@ -603,6 +699,9 @@ mod tests {
 
         #[test]
         fn ancestor_chain_finds_the_supervisor_two_hops_up_and_excludes_an_unrelated_pid() {
+            // A bare program name resolves through the process PATH, which sibling tests swap
+            // under the shared env lock; hold it so the spawn cannot see a mid-swap PATH.
+            let _env_lock = crate::platform::test_env::lock();
             let dir = tempfile::TempDir::new().expect("tempdir");
             let result_path = dir.path().join("result.txt");
             let grandparent_bin = copy_self_to(dir.path(), "csq-test-chain-supervisor");
@@ -613,30 +712,34 @@ mod tests {
             // ancestor of the child at any depth — proves the chain
             // specifically EXCLUDES it, rather than merely "always
             // finding something".
-            let mut unrelated = Command::new("sh")
-                .arg("-c")
-                .arg("sleep 30")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawn unrelated sibling process");
+            let unrelated = ChildGuard::new(
+                Command::new("sleep")
+                    .arg("30")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn_retrying_busy()
+                    .expect("spawn unrelated sibling process"),
+            );
             let unrelated_pid = unrelated.id();
 
-            let mut grandparent = Command::new(&grandparent_bin)
-                .args([
-                    "--ignored",
-                    "--exact",
-                    "providers::codex::ancestry::tests::spawned::chain_grandparent_helper",
-                ])
-                .env(CHAIN_RESULT_ENV, &result_path)
-                .env(CHAIN_PARENT_EXE_ENV, &parent_bin)
-                .env(CHAIN_CHILD_EXE_ENV, &child_bin)
-                .stdin(Stdio::null())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .expect("spawn renamed supervisor stand-in");
+            let mut grandparent = ChildGuard::new(
+                Command::new(&grandparent_bin)
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "providers::codex::ancestry::tests::spawned::chain_grandparent_helper",
+                    ])
+                    .env(CHAIN_RESULT_ENV, &result_path)
+                    .env(CHAIN_PARENT_EXE_ENV, &parent_bin)
+                    .env(CHAIN_CHILD_EXE_ENV, &child_bin)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .process_group(0)
+                    .spawn_retrying_busy()
+                    .expect("spawn renamed supervisor stand-in"),
+            );
             let grandparent_pid = grandparent.id();
 
             let deadline = Instant::now() + Duration::from_secs(60);
@@ -647,8 +750,7 @@ mod tests {
                 "grandparent helper exited non-zero: {status:?}"
             );
 
-            let _ = unrelated.kill();
-            let _ = unrelated.wait();
+            drop(unrelated);
 
             let chain: Vec<u32> = content
                 .trim()
@@ -680,19 +782,22 @@ mod tests {
             let other_bin = copy_self_to(dir.path(), "not-codex-test-host");
             let child_bin = copy_self_to(dir.path(), "csq-test-child-probe-2");
 
-            let mut parent = Command::new(&other_bin)
-                .args([
-                    "--ignored",
-                    "--exact",
-                    "providers::codex::ancestry::tests::spawned::ancestry_parent_helper",
-                ])
-                .env(RESULT_ENV, &result_path)
-                .env(CHILD_EXE_ENV, &child_bin)
-                .stdin(Stdio::null())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .expect("spawn renamed-to-non-codex parent helper");
+            let mut parent = ChildGuard::new(
+                Command::new(&other_bin)
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "providers::codex::ancestry::tests::spawned::ancestry_parent_helper",
+                    ])
+                    .env(RESULT_ENV, &result_path)
+                    .env(CHILD_EXE_ENV, &child_bin)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .process_group(0)
+                    .spawn_retrying_busy()
+                    .expect("spawn renamed-to-non-codex parent helper"),
+            );
 
             let deadline = Instant::now() + Duration::from_secs(60);
             let content = wait_for_file(&result_path, deadline);
@@ -744,7 +849,7 @@ mod tests {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::inherit())
-                .status()
+                .status_retrying_busy()
                 .expect("spawn sf1 hop1 target");
             assert!(
                 status.success(),
@@ -763,7 +868,7 @@ mod tests {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::inherit())
-                .status()
+                .status_retrying_busy()
                 .expect("spawn sf1 hop2 target");
             assert!(
                 status.success(),
@@ -782,7 +887,7 @@ mod tests {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::inherit())
-                .status()
+                .status_retrying_busy()
                 .expect("spawn sf1 hop3 target");
             assert!(
                 status.success(),
@@ -821,23 +926,26 @@ mod tests {
             let supervisor_bin = copy_self_to(dir.path(), "csq-test-sf1-supervisor-1");
             let codex_bin = copy_self_to(dir.path(), "codex");
 
-            let mut supervisor = Command::new(&supervisor_bin)
-                .args([
-                    "--ignored",
-                    "--exact",
-                    "providers::codex::ancestry::tests::spawned::sf1_supervisor_root",
-                ])
-                .env(SF1_HOP1_EXE_ENV, &codex_bin)
-                .env(
-                    SF1_HOP1_TEST_ENV,
-                    "providers::codex::ancestry::tests::spawned::sf1_probe",
-                )
-                .env(SF1_RESULT_ENV, &result_path)
-                .stdin(Stdio::null())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .expect("spawn sf1 case-1 supervisor stand-in");
+            let mut supervisor = ChildGuard::new(
+                Command::new(&supervisor_bin)
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "providers::codex::ancestry::tests::spawned::sf1_supervisor_root",
+                    ])
+                    .env(SF1_HOP1_EXE_ENV, &codex_bin)
+                    .env(
+                        SF1_HOP1_TEST_ENV,
+                        "providers::codex::ancestry::tests::spawned::sf1_probe",
+                    )
+                    .env(SF1_RESULT_ENV, &result_path)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .process_group(0)
+                    .spawn_retrying_busy()
+                    .expect("spawn sf1 case-1 supervisor stand-in"),
+            );
 
             let deadline = Instant::now() + Duration::from_secs(60);
             let content = wait_for_file(&result_path, deadline);
@@ -864,28 +972,31 @@ mod tests {
             let launcher_bin = copy_self_to(dir.path(), "csq-test-sf1-node-launcher");
             let codex_native_bin = copy_self_to(dir.path(), "codex");
 
-            let mut supervisor = Command::new(&supervisor_bin)
-                .args([
-                    "--ignored",
-                    "--exact",
-                    "providers::codex::ancestry::tests::spawned::sf1_supervisor_root",
-                ])
-                .env(SF1_HOP1_EXE_ENV, &launcher_bin)
-                .env(
-                    SF1_HOP1_TEST_ENV,
-                    "providers::codex::ancestry::tests::spawned::sf1_hop2_relay",
-                )
-                .env(SF1_HOP2_EXE_ENV, &codex_native_bin)
-                .env(
-                    SF1_HOP2_TEST_ENV,
-                    "providers::codex::ancestry::tests::spawned::sf1_probe",
-                )
-                .env(SF1_RESULT_ENV, &result_path)
-                .stdin(Stdio::null())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .expect("spawn sf1 case-2 supervisor stand-in");
+            let mut supervisor = ChildGuard::new(
+                Command::new(&supervisor_bin)
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "providers::codex::ancestry::tests::spawned::sf1_supervisor_root",
+                    ])
+                    .env(SF1_HOP1_EXE_ENV, &launcher_bin)
+                    .env(
+                        SF1_HOP1_TEST_ENV,
+                        "providers::codex::ancestry::tests::spawned::sf1_hop2_relay",
+                    )
+                    .env(SF1_HOP2_EXE_ENV, &codex_native_bin)
+                    .env(
+                        SF1_HOP2_TEST_ENV,
+                        "providers::codex::ancestry::tests::spawned::sf1_probe",
+                    )
+                    .env(SF1_RESULT_ENV, &result_path)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .process_group(0)
+                    .spawn_retrying_busy()
+                    .expect("spawn sf1 case-2 supervisor stand-in"),
+            );
 
             let deadline = Instant::now() + Duration::from_secs(60);
             let content = wait_for_file(&result_path, deadline);
@@ -915,33 +1026,36 @@ mod tests {
             std::fs::create_dir(&inner_codex_bin_dir).expect("create inner codex dir");
             let inner_codex_bin = copy_self_to(&inner_codex_bin_dir, "codex");
 
-            let mut supervisor = Command::new(&supervisor_bin)
-                .args([
-                    "--ignored",
-                    "--exact",
-                    "providers::codex::ancestry::tests::spawned::sf1_supervisor_root",
-                ])
-                .env(SF1_HOP1_EXE_ENV, &outer_codex_bin)
-                .env(
-                    SF1_HOP1_TEST_ENV,
-                    "providers::codex::ancestry::tests::spawned::sf1_hop2_relay",
-                )
-                .env(SF1_HOP2_EXE_ENV, &shell_bin)
-                .env(
-                    SF1_HOP2_TEST_ENV,
-                    "providers::codex::ancestry::tests::spawned::sf1_hop3_relay",
-                )
-                .env(SF1_HOP3_EXE_ENV, &inner_codex_bin)
-                .env(
-                    SF1_HOP3_TEST_ENV,
-                    "providers::codex::ancestry::tests::spawned::sf1_probe",
-                )
-                .env(SF1_RESULT_ENV, &result_path)
-                .stdin(Stdio::null())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .expect("spawn sf1 case-3 supervisor stand-in");
+            let mut supervisor = ChildGuard::new(
+                Command::new(&supervisor_bin)
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "providers::codex::ancestry::tests::spawned::sf1_supervisor_root",
+                    ])
+                    .env(SF1_HOP1_EXE_ENV, &outer_codex_bin)
+                    .env(
+                        SF1_HOP1_TEST_ENV,
+                        "providers::codex::ancestry::tests::spawned::sf1_hop2_relay",
+                    )
+                    .env(SF1_HOP2_EXE_ENV, &shell_bin)
+                    .env(
+                        SF1_HOP2_TEST_ENV,
+                        "providers::codex::ancestry::tests::spawned::sf1_hop3_relay",
+                    )
+                    .env(SF1_HOP3_EXE_ENV, &inner_codex_bin)
+                    .env(
+                        SF1_HOP3_TEST_ENV,
+                        "providers::codex::ancestry::tests::spawned::sf1_probe",
+                    )
+                    .env(SF1_RESULT_ENV, &result_path)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .process_group(0)
+                    .spawn_retrying_busy()
+                    .expect("spawn sf1 case-3 supervisor stand-in"),
+            );
 
             let deadline = Instant::now() + Duration::from_secs(60);
             let content = wait_for_file(&result_path, deadline);

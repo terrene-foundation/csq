@@ -494,6 +494,96 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    struct RestoreRuntimeEnv {
+        key: Option<&'static str>,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for RestoreRuntimeEnv {
+        fn drop(&mut self) {
+            if let Some(key) = self.key {
+                match self.prior.take() {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    // The caller holds the shared env lock until after both values drop.
+    // Short roots also keep the server's Unix socket below sun_path limits.
+    fn private_daemon_paths(
+        _env: &crate::platform::test_env::EnvTestGuard,
+    ) -> (TempDir, RestoreRuntimeEnv) {
+        #[cfg(unix)]
+        let dir = tempfile::Builder::new()
+            .prefix("cd-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        #[cfg(not(unix))]
+        let dir = TempDir::new().unwrap();
+        let key = if cfg!(target_os = "linux") {
+            Some("XDG_RUNTIME_DIR")
+        } else if cfg!(windows) {
+            Some("LOCALAPPDATA")
+        } else {
+            None
+        };
+        let restore = RestoreRuntimeEnv {
+            key,
+            prior: key.and_then(std::env::var_os),
+        };
+        if let Some(key) = key {
+            std::env::set_var(key, dir.path());
+        }
+        assert!(super::super::pid_file_path(dir.path()).starts_with(dir.path()));
+        (dir, restore)
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn private_daemon_paths_isolates_hostile_ambient_roots_and_restores_env() {
+        let env = crate::platform::test_env::lock();
+        let key = if cfg!(target_os = "linux") {
+            "XDG_RUNTIME_DIR"
+        } else {
+            "LOCALAPPDATA"
+        };
+        let _original = RestoreRuntimeEnv {
+            key: Some(key),
+            prior: std::env::var_os(key),
+        };
+        let ambient = TempDir::new().unwrap();
+        let canary = ambient.path().join("untouched");
+        fs::write(&canary, b"ambient state").unwrap();
+        let missing = ambient.path().join("already-deleted");
+        for prior in [
+            Some(ambient.path().as_os_str()),
+            Some(missing.as_os_str()),
+            None,
+        ] {
+            match prior {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+            let expected = std::env::var_os(key);
+            {
+                let (private, _restore) = private_daemon_paths(&env);
+                let pid = super::super::pid_file_path(private.path());
+                assert!(pid.starts_with(private.path()));
+                fs::create_dir_all(pid.parent().unwrap()).unwrap();
+                fs::write(&pid, b"private pid").unwrap();
+                #[cfg(target_os = "linux")]
+                assert!(super::super::socket_path(private.path()).starts_with(private.path()));
+            }
+            assert_eq!(std::env::var_os(key), expected);
+            assert_eq!(fs::read(&canary).unwrap(), b"ambient state");
+            assert!(!missing.exists());
+            assert!(!ambient.path().join("csq-daemon.pid").exists());
+            assert!(!ambient.path().join("csq").exists());
+        }
+    }
+
     #[test]
     fn parse_daemon_version_extracts_version_from_axum_health_body() {
         // Real axum response shape (Connection: close, no Transfer-Encoding).
@@ -643,33 +733,9 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
 
-        let dir = TempDir::new().unwrap();
-
-        // pid_file_path() uses platform-specific storage:
-        //   * Linux: $XDG_RUNTIME_DIR/csq-daemon.pid
-        //   * macOS: {base_dir}/csq-daemon.pid
-        //   * Windows: %LOCALAPPDATA%\csq\csq-daemon.pid
-        //
-        // On Linux and Windows, the default path is shared across
-        // tests running in parallel — we must override the env var
-        // so this test checks an isolated location. macOS uses
-        // base_dir directly so no override is needed there.
-        #[cfg(target_os = "linux")]
-        unsafe {
-            std::env::set_var("XDG_RUNTIME_DIR", dir.path());
-        }
-        #[cfg(target_os = "windows")]
-        unsafe {
-            std::env::set_var("LOCALAPPDATA", dir.path());
-        }
-
-        // Clean up any leftover PID file that a previous test run
-        // may have written to the pid_file_path location — the
-        // LOCALAPPDATA override moves us to a fresh tempdir, but a
-        // sibling test may have already set the env to some other
-        // value that already contains a stale PID file.
+        let (dir, _restore) = private_daemon_paths(&_shared_env_guard);
         let pid_path = super::super::pid_file_path(dir.path());
-        let _ = fs::remove_file(&pid_path);
+        assert!(!pid_path.exists(), "fresh private PID fixture");
 
         assert_eq!(detect_daemon(dir.path()), DetectResult::NotRunning);
     }
@@ -745,9 +811,9 @@ mod tests {
     fn detect_live_but_foreign_pid_is_not_running() {
         let _shared_env_guard = crate::platform::test_env::lock();
         let _guard = SOCKET_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = TempDir::new().unwrap();
+        let (dir, _restore) = private_daemon_paths(&_shared_env_guard);
         let pid_path = super::super::pid_file_path(dir.path());
-        fs::create_dir_all(pid_path.parent().unwrap()).ok();
+        fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
 
         let mut foreign = crate::platform::process::spawn_foreign_test_process();
         fs::write(&pid_path, format!("{}\n", foreign.id())).unwrap();
@@ -766,17 +832,8 @@ mod tests {
         );
     }
 
-    /// Serializes the two tests that read / write the shared
-    /// `socket_path(base_dir)` on Linux. `socket_path` ignores
-    /// `base_dir` when `XDG_RUNTIME_DIR` is set (paths.rs:65-78),
-    /// which is the common case on Ubuntu CI runners — so
-    /// `detect_live_pid_but_missing_socket_is_stale` and
-    /// `detect_live_daemon_returns_healthy` contend on the same
-    /// `$XDG_RUNTIME_DIR/csq.sock` file regardless of their
-    /// per-test TempDir. Running them concurrently produces a flaky
-    /// Healthy / Stale outcome depending on scheduler order. Origin:
-    /// PR-C3c CI flake surfaced on an internal ticket; pre-existing latent race
-    /// but never manifested until new tests changed parallel timing.
+    /// Shared env lock comes first; the module lock retains ordering for
+    /// tests of the server while private_daemon_paths isolates their files.
     #[cfg(unix)]
     static SOCKET_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -810,21 +867,15 @@ mod tests {
         // is `#[cfg(target_os = "linux")]`). Mirrors the Windows pattern below.
         let _shared_env_guard = crate::platform::test_env::lock();
         let _guard = SOCKET_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = TempDir::new().unwrap();
+        let (dir, _restore) = private_daemon_paths(&_shared_env_guard);
         let pid_path = super::super::pid_file_path(dir.path());
-        fs::create_dir_all(pid_path.parent().unwrap()).ok();
+        fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
         // Write our own PID — we're alive.
         fs::write(&pid_path, format!("{}\n", std::process::id())).unwrap();
 
-        // Defensive unlink: XDG_RUNTIME_DIR on Linux means
-        // `socket_path(dir.path())` may return a path shared with
-        // the detect_live_daemon_returns_healthy test. The mutex
-        // prevents those two from running concurrently, but a stale
-        // socket from a prior test run (or an orphaned real csq
-        // daemon on the runner) would still fail the assertion. The
-        // mutex plus this delete make the test hermetic.
         let sock_path = super::super::socket_path(dir.path());
-        let _ = fs::remove_file(&sock_path);
+        assert!(sock_path.starts_with(dir.path()));
+        assert!(!sock_path.exists(), "fresh private socket fixture");
 
         match detect_daemon(dir.path()) {
             DetectResult::Stale { reason } => {
@@ -847,21 +898,19 @@ mod tests {
         // first to serialize against `paths::linux_prefers_xdg_runtime_dir`.
         let _shared_env_guard = crate::platform::test_env::lock();
         let _guard = SOCKET_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = TempDir::new().unwrap();
+        let (dir, _restore) = private_daemon_paths(&_shared_env_guard);
         let pid_path = super::super::pid_file_path(dir.path());
         let sock_path = super::super::socket_path(dir.path());
 
         // Write our own PID (the test process is alive).
-        fs::create_dir_all(pid_path.parent().unwrap()).ok();
+        fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
         fs::write(&pid_path, format!("{}\n", std::process::id())).unwrap();
 
-        // Start the real server at the computed socket path. Note:
-        // socket_path() may return a path outside the TempDir on
-        // Linux (XDG_RUNTIME_DIR). In that case the test is best
-        // effort — it still verifies the detection logic.
+        assert!(sock_path.starts_with(dir.path()));
+        // Start the real server inside the private runtime directory.
         let sock_parent = sock_path.parent().unwrap();
         if !sock_parent.exists() {
-            fs::create_dir_all(sock_parent).ok();
+            fs::create_dir_all(sock_parent).unwrap();
         }
 
         let state = crate::daemon::server::RouterState {
@@ -875,20 +924,13 @@ mod tests {
             audit_health: crate::audit::new_shared(crate::audit::AuditHealth::Verified),
             audit_records_unverified: 0,
             anchor_sink: None,
+            usage_poller_wake: std::sync::Arc::new(crate::daemon::usage_poller::WakeChannel::new()),
             #[cfg(feature = "enterprise")]
             interactive: std::sync::Arc::new(
                 crate::daemon::interactive_ipc::InteractiveSessionRegistry::empty(),
             ),
         };
-        let (handle, join) = match server::serve(&sock_path, state).await {
-            Ok(r) => r,
-            Err(_) => {
-                // Non-writable socket parent (XDG_RUNTIME_DIR may
-                // not exist in a test env) — skip this test.
-                eprintln!("skipping: could not bind socket at {}", sock_path.display());
-                return;
-            }
-        };
+        let (handle, join) = server::serve(&sock_path, state).await.unwrap();
 
         // Detection runs in a blocking context — spawn_blocking so
         // the tokio runtime doesn't complain.
@@ -918,14 +960,9 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
 
-        let dir = TempDir::new().unwrap();
-        // On Windows, pid_file_path uses %LOCALAPPDATA%\csq\ by default.
-        // Override so the test is isolated.
-        unsafe {
-            std::env::set_var("LOCALAPPDATA", dir.path());
-        }
+        let (dir, _restore) = private_daemon_paths(&_shared_env_guard);
         let pid_path = super::super::pid_file_path(dir.path());
-        fs::create_dir_all(pid_path.parent().unwrap()).ok();
+        fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
         // Write our own PID — we're definitely alive.
         fs::write(&pid_path, format!("{}\n", std::process::id())).unwrap();
 
@@ -958,12 +995,9 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
 
-        let dir = TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("LOCALAPPDATA", dir.path());
-        }
+        let (dir, _restore) = private_daemon_paths(&_shared_env_guard);
         let pid_path = super::super::pid_file_path(dir.path());
-        fs::create_dir_all(pid_path.parent().unwrap()).ok();
+        fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
         fs::write(&pid_path, format!("{}\n", std::process::id())).unwrap();
 
         // Use a unique pipe name to avoid collisions with other tests.
@@ -980,6 +1014,7 @@ mod tests {
             audit_health: crate::audit::new_shared(crate::audit::AuditHealth::Verified),
             audit_records_unverified: 0,
             anchor_sink: None,
+            usage_poller_wake: std::sync::Arc::new(crate::daemon::usage_poller::WakeChannel::new()),
             #[cfg(feature = "enterprise")]
             interactive: std::sync::Arc::new(
                 crate::daemon::interactive_ipc::InteractiveSessionRegistry::empty(),

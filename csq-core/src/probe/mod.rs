@@ -116,6 +116,16 @@ pub enum SkipReason {
         surface: crate::providers::catalog::Surface,
         observed_kind: &'static str,
     },
+    /// ROOT ruling A reader parity: a durable post-commit rescue record is
+    /// PENDING for this slot's identity. The credential EXISTS — it has
+    /// simply not been installed at the canonical path yet (the refresh
+    /// that rotated it lost the canonical-lock race, or the record could
+    /// not be parsed and is fail-closed PENDING). Distinct from
+    /// `NoCredentials` because the operator remedy is the opposite: take no
+    /// action and let the next refresher tick adopt it, never "log in".
+    /// Payload deliberately omitted — same path-freedom rationale as
+    /// `NoCredentials` (`security.md` §2).
+    CredentialsRescuePending,
 }
 
 impl SkipReason {
@@ -128,6 +138,14 @@ impl SkipReason {
                 // Slot number is on ProbeRecord.slot — omit here.
                 observed_shape: "missing".into(),
                 hint: "run `csq login <N>` to provision the slot".into(),
+            },
+            SkipReason::CredentialsRescuePending => ProbeDiagnostic {
+                failed_assertion: "prerequisite: credential readable".into(),
+                observed_shape: "a durable rescued credential is pending installation".into(),
+                hint: "no action: the rotated pair was durably rescued after a refresh and \
+                       the daemon adopts it on its next refresh tick; re-run `csq probe` after \
+                       the daemon refreshes"
+                    .into(),
             },
             SkipReason::NoCodexCredentials => ProbeDiagnostic {
                 failed_assertion: "prerequisite: slot has codex credentials".into(),
@@ -228,9 +246,16 @@ pub fn probe_slot(base_dir: &Path, home_dir: &Path, slot: AccountNum) -> ProbeRe
         ))
     });
 
-    let anthropic_creds_path =
-        crate::accounts::profiles::resolve_slot_to_uuid(base_dir, slot.get())
-            .map(|uuid| crate::accounts::identity_store::credentials_path_for(base_dir, uuid));
+    // ROOT ruling A (reader parity): resolve the slot's identity FIRST and
+    // adopt a pending post-commit rescue record BEFORE classifying credential
+    // presence. A rescued pair is a durable credential the canonical file may
+    // not hold yet (the refresh that rotated it lost the commit lock race);
+    // reporting `NoCredentials` / "run `csq login`" while one is pending is a
+    // false LOGIN-NEEDED verdict.
+    let anthropic_uuid = crate::accounts::profiles::resolve_slot_to_uuid(base_dir, slot.get());
+    adopt_pending_anthropic_rescue(base_dir, anthropic_uuid);
+    let anthropic_creds_path = anthropic_uuid
+        .map(|uuid| crate::accounts::identity_store::credentials_path_for(base_dir, uuid));
 
     // `anthropic_present`: explicit `symlink_metadata` classification on the
     // resolved UUID credential path (spec 00-synthesis §Decided design step 1).
@@ -431,6 +456,20 @@ pub fn probe_slot(base_dir: &Path, home_dir: &Path, slot: AccountNum) -> ProbeRe
             if discovery_codex_match(base_dir, slot) {
                 return codex_oauth::probe(base_dir, slot);
             }
+            // Reader parity (ROOT ruling A): while a rescued post-commit pair
+            // is still PENDING, this slot is NOT credential-less — the durable
+            // pair exists and has simply not been installed yet (adoption was
+            // refused, or the record is unreadable and therefore fail-closed
+            // PENDING). Report the recoverable outcome, never LOGIN-NEEDED.
+            if rescue_pending_for(base_dir, anthropic_uuid) {
+                return skipped(
+                    slot,
+                    "credential-rescue-pending",
+                    "n/a",
+                    "n/a",
+                    SkipReason::CredentialsRescuePending,
+                );
+            }
             // Do NOT propagate `path_display` into the SkipReason — the resolved
             // identity-store path leaks OS username + home-dir layout
             // (`security.md` §2). Slot number is on ProbeRecord.slot.
@@ -461,6 +500,61 @@ pub fn probe_slot(base_dir: &Path, home_dir: &Path, slot: AccountNum) -> ProbeRe
             "credential file parses as neither Anthropic nor Codex shape".into(),
         ),
     )
+}
+
+/// Adopts a pending post-commit rescue record for `uuid`, if any.
+///
+/// Mirrors `refresh/check.rs`'s `adopt_pending_rescue`: one record read on
+/// the normal path; the canonical commit lock is taken only when a record
+/// actually exists. A refused adoption (live holder, unreadable record) is
+/// logged and left PENDING — [`rescue_pending_for`] then keeps this probe
+/// from concluding LOGIN-NEEDED.
+fn adopt_pending_anthropic_rescue(
+    base_dir: &Path,
+    uuid: Option<crate::accounts::identity_store::IdentityId>,
+) {
+    let Some(uuid) = uuid else { return };
+    let Some(identity_dir) = crate::accounts::identity_store::credentials_path_for(base_dir, uuid)
+        .parent()
+        .map(Path::to_path_buf)
+    else {
+        return;
+    };
+    if crate::credentials::rescue::rescue_record_pending(&identity_dir).is_none() {
+        return;
+    }
+    // D237 round-2 security L3: `probe` is reachable from interactive and
+    // render paths (`csq probe`, doctor), so it must never block on the 30 s
+    // commit-class canonical wait. A non-blocking attempt leaves the record
+    // PENDING on refusal and the existing rescue-pending reader state
+    // reports it.
+    match crate::credentials::rescue::adopt_rescue_record_nonblocking(base_dir, &uuid.to_string()) {
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            error_kind = "rescue_adopt_refused",
+            reason = error.error_kind_tag(),
+            "probe: pending rescue record could not be adopted; left pending"
+        ),
+    }
+}
+
+/// Whether a rescue record is still PENDING for `uuid`.
+///
+/// ROOT ruling A / reader parity: while one is pending, no reader may
+/// conclude "no credential" or "login needed" — the durable pair exists and
+/// simply has not been installed yet. Rescue records are UUID-keyed and live
+/// inside `identities/<uuid>/`, so a slot with no `by_slot` mapping
+/// structurally cannot have one.
+fn rescue_pending_for(
+    base_dir: &Path,
+    uuid: Option<crate::accounts::identity_store::IdentityId>,
+) -> bool {
+    let Some(uuid) = uuid else { return false };
+    crate::accounts::identity_store::credentials_path_for(base_dir, uuid)
+        .parent()
+        .is_some_and(|identity_dir| {
+            crate::credentials::rescue::rescue_record_pending(identity_dir).is_some()
+        })
 }
 
 /// Returns the catalog provider id (`mm`, `zai`, `deepseek`, …) if
@@ -722,6 +816,237 @@ mod tests {
             "probe must have read the identity-keyed credentials and dispatched to a \
              credential-keyed cell, got cell={}",
             r.cell
+        );
+    }
+
+    /// Seeds `profiles.json::by_slot[slot] = uuid` plus an owner-only
+    /// identity directory, and returns `(uuid, identity_dir, canonical)`.
+    fn seed_identity_dir(
+        base: &Path,
+        slot: u16,
+    ) -> (
+        crate::accounts::identity_store::IdentityId,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(slot);
+        let mut profiles = crate::accounts::profiles::ProfilesFile::empty();
+        profiles.by_slot.insert(slot.to_string(), uuid);
+        crate::accounts::profiles::save(&crate::accounts::profiles::profiles_path(base), &profiles)
+            .unwrap();
+        let canonical = crate::accounts::identity_store::credentials_path_for(base, uuid);
+        let identity_dir = canonical.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&identity_dir).unwrap();
+        crate::platform::fs::secure_dir(&base.join("identities")).unwrap();
+        crate::platform::fs::secure_dir(&identity_dir).unwrap();
+        (uuid, identity_dir, canonical)
+    }
+
+    /// ROOT ruling A reader parity: with a pending rescue record and a STALE
+    /// canonical, `probe_slot` adopts the record first and probes the
+    /// adopted credential. It must never report `NoCredentials` / "run
+    /// `csq login <N>`".
+    ///
+    /// D237 round-2 H-c: the record carries a SOURCE witness that matches the
+    /// seeded canonical, so adoption re-runs the writer's gate.
+    ///
+    /// RED: remove the `adopt_pending_anthropic_rescue` call in `probe_slot`
+    /// -> the record stays pending and the probe reports the rescue-pending
+    /// state instead of the adopted credential, failing the adoption assertion.
+    #[test]
+    fn probe_adopts_pending_rescue_before_reporting_no_credentials() {
+        use tempfile::tempdir;
+        let base = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let slot = AccountNum::try_from(2u16).unwrap();
+        let (uuid, identity_dir, canonical) = seed_identity_dir(base.path(), 2);
+
+        let context = crate::accounts::anthropic_identity::RescueKnownContext {
+            email: "probe@example.test".into(),
+            account_uuid: uuid::Uuid::from_u128(0x77),
+            organization_uuid: uuid::Uuid::from_u128(0x88),
+        };
+        let identity_json = identity_dir.join("identity.json");
+        std::fs::write(
+            &identity_json,
+            serde_json::to_vec(&serde_json::json!({
+                "email": context.email, "provider": "anthropic",
+                "created_at": "2026-01-01T00:00:00Z", "key_id": null,
+                "account_uuid": context.account_uuid,
+                "organization_uuid": context.organization_uuid
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        crate::platform::fs::secure_file(&identity_json).unwrap();
+
+        // API-key prefix so the post-adoption dispatch lands on the pure
+        // `anthropic-api-key` cell (no live wire in a unit test).
+        let stale: crate::credentials::CredentialFile = serde_json::from_str(
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-api03-STALE","refreshToken":"rt-stale","expiresAt":100,"scopes":["user:inference"]}}"#,
+        )
+        .unwrap();
+        crate::credentials::save(&canonical, &stale).unwrap();
+        let rescued: crate::credentials::CredentialFile = serde_json::from_str(
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-api03-RESCUED","refreshToken":"rt-rescued","expiresAt":99999999999999,"scopes":["user:inference"]}}"#,
+        )
+        .unwrap();
+        let witness = crate::credentials::rescue::RescueWitness::Anthropic(
+            crate::accounts::anthropic_identity::RescueLineageWitness {
+                kind: crate::accounts::anthropic_identity::RescueWitnessKind::Refresh,
+                source_version:
+                    crate::accounts::anthropic_identity::CredentialVersion::for_credentials(
+                        stale.anthropic().unwrap(),
+                    )
+                    .unwrap(),
+                result_version:
+                    crate::accounts::anthropic_identity::CredentialVersion::for_credentials(
+                        rescued.anthropic().unwrap(),
+                    )
+                    .unwrap(),
+                context: Some(context),
+                legacy_email: None,
+            },
+        );
+        crate::credentials::rescue::write_rescue_record(
+            &identity_dir,
+            "anthropic",
+            &uuid.to_string(),
+            "post_commit_lock_timeout",
+            &serde_json::to_value(&rescued).unwrap(),
+            &witness,
+        )
+        .unwrap();
+
+        let r = probe_slot(base.path(), home.path(), slot);
+
+        // Adopted: the record is gone and the canonical holds the rescued pair.
+        assert!(
+            crate::credentials::rescue::rescue_record_pending(&identity_dir).is_none(),
+            "the probe must adopt the pending rescue record"
+        );
+        let installed = crate::credentials::load(&canonical).unwrap();
+        assert_eq!(
+            installed
+                .anthropic()
+                .unwrap()
+                .claude_ai_oauth
+                .access_token
+                .expose_secret(),
+            "sk-ant-api03-RESCUED"
+        );
+        // NOT login-needed: no `csq login` hint, no NoCredentials cell.
+        assert_ne!(
+            r.cell, "unknown",
+            "probe must not fall through to NoCredentials"
+        );
+        let diag = r.diagnostic.as_ref().expect("diagnostic");
+        assert!(
+            !diag.hint.contains("csq login"),
+            "a pending rescue must never surface as a login instruction; got {diag:?}"
+        );
+    }
+
+    /// Ruling 3(a): an UNPARSEABLE rescue record can never install, so the
+    /// probe's adoption QUARANTINES it (bytes kept for forensics) and the
+    /// genuinely absent canonical is reported as `NoCredentials`.
+    ///
+    /// RED: make adoption skip the unparseable quarantine -> the record
+    /// stays pending and the probe reports "credential-rescue-pending".
+    #[test]
+    fn unparseable_rescue_record_is_quarantined_and_reports_no_credentials() {
+        use tempfile::tempdir;
+        let base = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let slot = AccountNum::try_from(3u16).unwrap();
+        let (_uuid, identity_dir, canonical) = seed_identity_dir(base.path(), 3);
+        let record_path = crate::credentials::rescue::rescue_record_path(&identity_dir);
+        std::fs::write(&record_path, b"not json").unwrap();
+        assert!(!canonical.exists());
+
+        let r = probe_slot(base.path(), home.path(), slot);
+
+        assert_eq!(r.cell, "unknown");
+        assert_eq!(r.status, ProbeStatus::Skipped);
+        assert!(
+            crate::credentials::rescue::rescue_record_pending(&identity_dir).is_none(),
+            "a quarantined record leaves the pending set"
+        );
+        assert!(
+            identity_dir
+                .join("quarantine")
+                .join(record_path.file_name().unwrap())
+                .is_file(),
+            "the unparseable record is QUARANTINED, never deleted"
+        );
+    }
+
+    /// Fail-closed: a PROVABLE rescue record against an UNREADABLE canonical
+    /// cannot be re-gated by adoption (it cannot prove the source), so it
+    /// stays PENDING and the probe must report the recoverable
+    /// rescue-pending outcome instead of `NoCredentials`.
+    ///
+    /// RED: remove the `rescue_pending_for` guard in the NoCredentials arm ->
+    /// the probe returns cell "unknown" with the `csq login` hint.
+    #[test]
+    fn pending_rescue_against_unreadable_canonical_is_not_no_credentials() {
+        use tempfile::tempdir;
+        let base = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let slot = AccountNum::try_from(3u16).unwrap();
+        let (uuid, identity_dir, canonical) = seed_identity_dir(base.path(), 3);
+        // Corrupt, not absent: adoption refuses to install over a canonical
+        // it cannot read, so the record stays pending.
+        std::fs::write(&canonical, b"not json").unwrap();
+
+        let stale: crate::credentials::CredentialFile = serde_json::from_str(
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-api03-STALE","refreshToken":"rt-stale","expiresAt":100,"scopes":["user:inference"]}}"#,
+        )
+        .unwrap();
+        let rescued: crate::credentials::CredentialFile = serde_json::from_str(
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-api03-RESCUED","refreshToken":"rt-rescued","expiresAt":99999999999999,"scopes":["user:inference"]}}"#,
+        )
+        .unwrap();
+        let witness = crate::credentials::rescue::RescueWitness::Anthropic(
+            crate::accounts::anthropic_identity::RescueLineageWitness {
+                kind: crate::accounts::anthropic_identity::RescueWitnessKind::Refresh,
+                source_version:
+                    crate::accounts::anthropic_identity::CredentialVersion::for_credentials(
+                        stale.anthropic().unwrap(),
+                    )
+                    .unwrap(),
+                result_version:
+                    crate::accounts::anthropic_identity::CredentialVersion::for_credentials(
+                        rescued.anthropic().unwrap(),
+                    )
+                    .unwrap(),
+                context: None,
+                legacy_email: None,
+            },
+        );
+        crate::credentials::rescue::write_rescue_record(
+            &identity_dir,
+            "anthropic",
+            &uuid.to_string(),
+            "post_commit_lock_timeout",
+            &serde_json::to_value(&rescued).unwrap(),
+            &witness,
+        )
+        .unwrap();
+
+        let r = probe_slot(base.path(), home.path(), slot);
+
+        assert_eq!(r.cell, "credential-rescue-pending");
+        assert_eq!(r.status, ProbeStatus::Skipped);
+        let diag = r.diagnostic.as_ref().expect("diagnostic");
+        assert!(
+            !diag.hint.contains("csq login"),
+            "a pending (PENDING) record must never surface as a login instruction: {diag:?}"
+        );
+        // The refused adoption leaves the record pending.
+        assert!(
+            crate::credentials::rescue::rescue_record_pending(&identity_dir).is_some(),
+            "an adoption refusal must leave the record pending"
         );
     }
 

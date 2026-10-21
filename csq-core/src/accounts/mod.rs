@@ -11,7 +11,9 @@ pub mod discovery;
 // slot-id in credential writers) and MUST NOT Rule 3 (dir-name fallback
 // for identity derivation). Callers now read the `.csq-account` marker
 // directly — the SOLE authority per spec 02 INV-03.
+pub mod anthropic_identity;
 pub mod identity_store;
+pub mod launch_block;
 pub mod legacy_mirror_cleanup;
 pub mod login;
 pub mod login_lock;
@@ -21,6 +23,7 @@ pub mod move_slot;
 pub mod orphan_identity_gc;
 pub mod profiles;
 pub mod profiles_lock;
+pub mod refresh_token_audit;
 pub mod snapshot;
 pub mod third_party;
 
@@ -47,7 +50,7 @@ pub struct AccountInfo {
     ///
     /// Identity-mint Pass-0 MUST use this field (not `label`) as the
     /// `by_email` key. When this field is `None`, Pass-0 skips the slot
-    /// with a warn — identity is minted at login time via `mint_for_login`
+    /// with a warn — identity is minted at login time via `commit_anthropic_login`
     /// which carries an explicit OAuth-flow email.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_email: Option<String>,

@@ -167,20 +167,15 @@ fn fingerprint_token(token: &str) -> u64 {
     hasher.finish()
 }
 
-/// Resolves the user's home directory at runtime. Pulled out so tests
-/// can stub via `home_dir_for_test`.
+/// Resolves the user's home directory at runtime with the shared resolver
+/// (`platform::home::home_dir`): the same one the OAuth writer
+/// (`providers::gemini::oauth_flow`), the headless check and the spawn plan use, so the
+/// poller reads the file the writer wrote. On Windows `HOME` is usually unset and the
+/// known-folder profile directory is the real home; under `test-utils` an explicit
+/// `CSQ_HOME` takes precedence, which is how a test redirects it. An empty home is
+/// treated as unavailable.
 fn home_dir() -> Option<std::path::PathBuf> {
-    if let Some(h) = std::env::var_os("HOME") {
-        return Some(std::path::PathBuf::from(h));
-    }
-    #[cfg(windows)]
-    {
-        std::env::var_os("USERPROFILE").map(std::path::PathBuf::from)
-    }
-    #[cfg(not(windows))]
-    {
-        None
-    }
+    crate::platform::home::home_dir().filter(|h| !h.as_os_str().is_empty())
 }
 
 /// Runs a single Code Assist OAuth quota poll tick.
@@ -191,15 +186,39 @@ fn home_dir() -> Option<std::path::PathBuf> {
 /// lives in `quota::state` via the event-driven `gemini::drain_all`
 /// path).
 pub async fn tick(base_dir: &Path, http_post: &HttpPostProbeFn, project_cache: &ProjectCache) {
+    tick_filtered(base_dir, http_post, project_cache, None).await;
+}
+
+/// Targeted refresh for the rebind wake path (login-followup LOW-6): the
+/// identity projection is fetched once as usual but written ONLY to `slot`
+/// (and only when it is an OAuth-mode slot).
+pub(crate) async fn tick_slot(
+    base_dir: &Path,
+    http_post: &HttpPostProbeFn,
+    project_cache: &ProjectCache,
+    slot: u16,
+) {
+    tick_filtered(base_dir, http_post, project_cache, Some(slot)).await;
+}
+
+async fn tick_filtered(
+    base_dir: &Path,
+    http_post: &HttpPostProbeFn,
+    project_cache: &ProjectCache,
+    only_slot: Option<u16>,
+) {
     let home = match home_dir() {
         Some(h) => h,
         None => {
-            warn!("gemini_oauth poller: HOME not set, skipping tick");
+            warn!("gemini_oauth poller: home directory unavailable, skipping tick");
             return;
         }
     };
 
-    let oauth_slots = enumerate_oauth_mode_slots(base_dir);
+    let mut oauth_slots = enumerate_oauth_mode_slots(base_dir);
+    if let Some(only) = only_slot {
+        oauth_slots.retain(|a| a.get() == only);
+    }
     if oauth_slots.is_empty() {
         debug!("gemini_oauth poller: no OAuth-mode slots, skipping tick");
         return;
@@ -537,7 +556,10 @@ fn write_quota(
     // load_state failure → SKIP the write. Falling back to
     // QuotaFile::empty would silently destroy every other account's
     // quota when the file is corrupt.
-    let mut quota_file = match quota_state::load_state(base_dir) {
+    // Write leg: strict RAW load — the public read path's origin filter must
+    // not be reachable from a load→save cycle, or hidden sibling rows would
+    // be clobbered by the save below.
+    let mut quota_file = match quota_state::load_state_or_skip(base_dir) {
         Ok(qf) => qf,
         Err(e) => {
             warn!(
@@ -714,6 +736,27 @@ fn parse_iso8601_to_unix_secs(s: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    struct FixtureEnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl FixtureEnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self(
+                keys.iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            )
+        }
+    }
+    impl Drop for FixtureEnvRestore {
+        fn drop(&mut self) {
+            for (key, previous) in self.0.drain(..).rev() {
+                match previous {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     use super::*;
     use crate::providers::gemini::provisioning::{write_binding, GeminiBinding};
     use tempfile::TempDir;
@@ -889,7 +932,7 @@ mod tests {
     /// Rule 6, tests that mutate process env MUST hold
     /// `test_env::lock()` for the full duration of the env-sensitive
     /// work — including across `tick(...).await` because the poller
-    /// reads HOME inside spawn_blocking. The single-threaded tokio
+    /// reads the home directory inside spawn_blocking. The single-threaded tokio
     /// test runtime bounds deadlock risk.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -910,12 +953,14 @@ mod tests {
         )
         .unwrap();
         // SAFETY: _guard MUST outlive `tick(...).await` because tick
-        // spawns blocking workers that read HOME on the shared
+        // spawns blocking workers that read the home directory on the shared
         // blocking pool. Dropping early lets a sibling test's env
         // mutation race in.
         let _guard = crate::platform::test_env::lock();
-        let prev_home = std::env::var_os("HOME");
+        let restore_home = FixtureEnvRestore::capture(&["HOME", "CSQ_HOME"]);
         std::env::set_var("HOME", &home);
+        // The shared resolver ignores HOME on Windows; CSQ_HOME redirects it under test-utils.
+        std::env::set_var("CSQ_HOME", &home);
 
         // Mock counts how many times loadCodeAssist + retrieveUserQuota
         // are called. Dedup contract: ONE pair per tick, not per slot.
@@ -949,10 +994,7 @@ mod tests {
         let cache: ProjectCache = Arc::new(Mutex::new(ProjectCacheState::default()));
         tick(dir.path(), &mock, &cache).await;
 
-        match prev_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
+        drop(restore_home);
 
         // Dedup: ONE call to each endpoint per tick, regardless of N
         // OAuth slots.
@@ -1021,8 +1063,10 @@ mod tests {
         )
         .unwrap();
         let _guard = crate::platform::test_env::lock();
-        let prev_home = std::env::var_os("HOME");
+        let restore_home = FixtureEnvRestore::capture(&["HOME", "CSQ_HOME"]);
         std::env::set_var("HOME", &home);
+        // The shared resolver ignores HOME on Windows; CSQ_HOME redirects it under test-utils.
+        std::env::set_var("CSQ_HOME", &home);
 
         let load_calls = Arc::new(Mutex::new(0u32));
         let load_calls_c = Arc::clone(&load_calls);
@@ -1052,10 +1096,7 @@ mod tests {
         // Tick 2 — same identity, should skip loadCodeAssist.
         tick(dir.path(), &mock, &cache).await;
 
-        match prev_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
+        drop(restore_home);
 
         assert_eq!(
             *load_calls.lock().unwrap(),
@@ -1090,8 +1131,10 @@ mod tests {
         )
         .unwrap();
         let _guard = crate::platform::test_env::lock();
-        let prev_home = std::env::var_os("HOME");
+        let restore_home = FixtureEnvRestore::capture(&["HOME", "CSQ_HOME"]);
         std::env::set_var("HOME", &home);
+        // The shared resolver ignores HOME on Windows; CSQ_HOME redirects it under test-utils.
+        std::env::set_var("CSQ_HOME", &home);
 
         let mock: HttpPostProbeFn = Arc::new(|url: &str, _h, _b| {
             if url.contains(":loadCodeAssist") {
@@ -1112,10 +1155,7 @@ mod tests {
         let cache: ProjectCache = Arc::new(Mutex::new(ProjectCacheState::default()));
         tick(dir.path(), &mock, &cache).await;
 
-        match prev_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
+        drop(restore_home);
 
         // The corrupt file should NOT have been replaced with a fresh
         // empty file containing only this slot.
@@ -1171,8 +1211,10 @@ mod tests {
         )
         .unwrap();
         let _guard = crate::platform::test_env::lock();
-        let prev_home = std::env::var_os("HOME");
+        let restore_home = FixtureEnvRestore::capture(&["HOME", "CSQ_HOME"]);
         std::env::set_var("HOME", &home);
+        // The shared resolver ignores HOME on Windows; CSQ_HOME redirects it under test-utils.
+        std::env::set_var("CSQ_HOME", &home);
 
         let mock: HttpPostProbeFn = Arc::new(|url: &str, _h, _b| {
             if url.contains(":loadCodeAssist") {
@@ -1190,10 +1232,7 @@ mod tests {
         let cache: ProjectCache = Arc::new(Mutex::new(ProjectCacheState::default()));
         tick(dir.path(), &mock, &cache).await;
 
-        match prev_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
+        drop(restore_home);
 
         let qf = quota_state::load_state(dir.path()).unwrap();
         let acct = qf
@@ -1248,8 +1287,10 @@ mod tests {
         )
         .unwrap();
         let _guard = crate::platform::test_env::lock();
-        let prev_home = std::env::var_os("HOME");
+        let restore_home = FixtureEnvRestore::capture(&["HOME", "CSQ_HOME"]);
         std::env::set_var("HOME", &home);
+        // The shared resolver ignores HOME on Windows; CSQ_HOME redirects it under test-utils.
+        std::env::set_var("CSQ_HOME", &home);
 
         let phase = Arc::new(Mutex::new(0u32));
         let phase_c = Arc::clone(&phase);
@@ -1287,10 +1328,7 @@ mod tests {
         *phase.lock().unwrap() = 1;
         tick(dir.path(), &mock, &cache).await;
 
-        match prev_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
+        drop(restore_home);
 
         let qf = quota_state::load_state(dir.path()).unwrap();
         let acct = &qf.accounts["8"];
@@ -1336,8 +1374,10 @@ mod tests {
         )
         .unwrap();
         let _guard = crate::platform::test_env::lock();
-        let prev_home = std::env::var_os("HOME");
+        let restore_home = FixtureEnvRestore::capture(&["HOME", "CSQ_HOME"]);
         std::env::set_var("HOME", &home);
+        // The shared resolver ignores HOME on Windows; CSQ_HOME redirects it under test-utils.
+        std::env::set_var("CSQ_HOME", &home);
 
         let phase = Arc::new(Mutex::new(0u32));
         let phase_c = Arc::clone(&phase);
@@ -1376,10 +1416,7 @@ mod tests {
         *phase.lock().unwrap() = 1;
         tick(dir.path(), &mock, &cache).await;
 
-        match prev_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
+        drop(restore_home);
 
         let qf = quota_state::load_state(dir.path()).unwrap();
         let acct = &qf.accounts["11"];
@@ -1455,8 +1492,10 @@ mod tests {
         )
         .unwrap();
         let _guard = crate::platform::test_env::lock();
-        let prev_home = std::env::var_os("HOME");
+        let restore_home = FixtureEnvRestore::capture(&["HOME", "CSQ_HOME"]);
         std::env::set_var("HOME", &home);
+        // The shared resolver ignores HOME on Windows; CSQ_HOME redirects it under test-utils.
+        std::env::set_var("CSQ_HOME", &home);
 
         let load_calls = Arc::new(Mutex::new(0u32));
         let load_calls_c = Arc::clone(&load_calls);
@@ -1482,10 +1521,7 @@ mod tests {
         // called again), not a cache hit.
         tick(dir.path(), &mock, &cache).await;
 
-        match prev_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
+        drop(restore_home);
 
         assert_eq!(
             *load_calls.lock().unwrap(),
@@ -1512,8 +1548,10 @@ mod tests {
         )
         .unwrap();
         let _guard = crate::platform::test_env::lock();
-        let prev_home = std::env::var_os("HOME");
+        let restore_home = FixtureEnvRestore::capture(&["HOME", "CSQ_HOME"]);
         std::env::set_var("HOME", &home);
+        // The shared resolver ignores HOME on Windows; CSQ_HOME redirects it under test-utils.
+        std::env::set_var("CSQ_HOME", &home);
 
         let load_calls = Arc::new(Mutex::new(0u32));
         let phase = Arc::new(Mutex::new(0u32));
@@ -1549,10 +1587,7 @@ mod tests {
         tick(dir.path(), &mock, &cache).await; // 500 invalidates
         tick(dir.path(), &mock, &cache).await; // re-discovers
 
-        match prev_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
+        drop(restore_home);
 
         // loadCodeAssist called twice: tick 1 (initial cache miss)
         // and tick 3 (cache was invalidated by tick 2's 500).
@@ -1560,6 +1595,77 @@ mod tests {
             *load_calls.lock().unwrap(),
             2,
             "non-200 on cache hit must invalidate; round-2 broaden-invalidation contract"
+        );
+    }
+
+    /// M1 parity: the OAuth WRITER, the usage POLLER and the headless-run CHECK resolve the
+    /// same home directory. Under `test-utils` the process `HOME` points at a decoy while
+    /// `CSQ_HOME` (what `platform::home::home_dir` honours, as the known-folder lookup does
+    /// on Windows where `HOME` is usually unset) points at the real one: a reader that still
+    /// consulted `HOME` would look in the decoy, find nothing, and the poller would make no
+    /// call / the check would report not-found. Without `test-utils` the resolver is
+    /// `dirs::home_dir` (HOME on unix), so both variables name the one home.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn writer_poller_and_headless_check_resolve_the_same_home() {
+        let dir = TempDir::new().unwrap();
+        let real_home = dir.path().join("real-home");
+        let decoy_home = dir.path().join("decoy-home");
+        std::fs::create_dir_all(&real_home).unwrap();
+        std::fs::create_dir_all(&decoy_home).unwrap();
+        write_binding(
+            dir.path(),
+            slot(2),
+            &GeminiBinding::new(AuthMode::CodeAssistOAuth, "auto"),
+        )
+        .unwrap();
+        let _guard = crate::platform::test_env::lock();
+        let restore_home = FixtureEnvRestore::capture(&["HOME", "CSQ_HOME"]);
+        std::env::set_var("CSQ_HOME", &real_home);
+        std::env::set_var(
+            "HOME",
+            if cfg!(feature = "test-utils") {
+                &decoy_home
+            } else {
+                &real_home
+            },
+        );
+
+        // 1. WRITER: the production writer lands the file under the resolved home.
+        crate::providers::gemini::oauth_flow::write_creds_for_test(
+            "ya29.parity",
+            4_102_444_800_000,
+        )
+        .unwrap();
+        assert!(real_home.join(".gemini/oauth_creds.json").is_file());
+        assert!(!decoy_home.join(".gemini").exists(), "decoy HOME untouched");
+
+        // 2. HEADLESS CHECK: finds that file through the process-home entry point.
+        crate::providers::gemini::oauth_login::check_headless_oauth_ready_for_process(slot(2))
+            .expect("the headless check must read the file the writer wrote");
+
+        // 3. POLLER: reads it too (a missing file would mean no loadCodeAssist call).
+        let load_calls = Arc::new(Mutex::new(0u32));
+        let load_calls_c = Arc::clone(&load_calls);
+        let mock: HttpPostProbeFn = Arc::new(move |url: &str, _h, _b| {
+            if url.contains(":loadCodeAssist") {
+                *load_calls_c.lock().unwrap() += 1;
+                Ok((
+                    200,
+                    Default::default(),
+                    r#"{"cloudaicompanionProject":"projects/p"}"#.to_string(),
+                ))
+            } else {
+                Ok((200, Default::default(), r#"{"buckets":[]}"#.to_string()))
+            }
+        });
+        let cache: ProjectCache = Arc::new(Mutex::new(ProjectCacheState::default()));
+        tick(dir.path(), &mock, &cache).await;
+        drop(restore_home);
+        assert_eq!(
+            *load_calls.lock().unwrap(),
+            1,
+            "the poller must read the credential file the writer wrote"
         );
     }
 }

@@ -96,14 +96,13 @@ fn extract_oauth_error(body: &[u8]) -> Option<String> {
             Some(msg) => format!("{err_type}: {msg}"),
             None => err_type.to_string(),
         }
-    } else if let Some(err_str) = error_val.as_str() {
+    } else {
+        let err_str = error_val.as_str()?;
         // Standard OAuth: {"error": "invalid_grant", "error_description": "..."}
         match json.get("error_description").and_then(|v| v.as_str()) {
             Some(desc) => format!("{err_str}: {desc}"),
             None => err_str.to_string(),
         }
-    } else {
-        return None;
     };
 
     Some(redact_tokens(&detail))

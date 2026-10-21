@@ -211,9 +211,56 @@ mod tests {
     use super::*;
     use csq_core::probe::ProbeStatus;
 
+    /// Own both filesystem roots and ambient discovery context for the whole
+    /// probe. Explicit Unix roots cannot inherit a sibling's transient TMPDIR.
+    struct IsolatedProbeFixture {
+        base: tempfile::TempDir,
+        home: tempfile::TempDir,
+        prior_home: Option<std::ffi::OsString>,
+        prior_base: Option<std::ffi::OsString>,
+        _env_guard: csq_core::platform::test_env::EnvTestGuard,
+    }
+
+    impl IsolatedProbeFixture {
+        fn new() -> Self {
+            let guard = csq_core::platform::test_env::lock();
+            #[cfg(unix)]
+            let make_dir = || tempfile::TempDir::new_in("/tmp").unwrap();
+            #[cfg(not(unix))]
+            let make_dir = || tempfile::TempDir::new().unwrap();
+            let base = make_dir();
+            let home = make_dir();
+            let prior_home = std::env::var_os("HOME");
+            let prior_base = std::env::var_os("CSQ_BASE_DIR");
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("CSQ_BASE_DIR", base.path());
+            Self {
+                base,
+                home,
+                prior_home,
+                prior_base,
+                _env_guard: guard,
+            }
+        }
+    }
+
+    impl Drop for IsolatedProbeFixture {
+        fn drop(&mut self) {
+            for (name, prior) in [
+                ("HOME", &self.prior_home),
+                ("CSQ_BASE_DIR", &self.prior_base),
+            ] {
+                match prior {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
     /// Seed profiles.json::by_slot[slot_n] = UUID and write Anthropic OAuth
     /// credentials at the UUID-keyed identity path.
-    fn stage_valid_anthropic_identity(base: &std::path::Path, slot_n: u16) {
+    fn stage_discovered_anthropic_identity(base: &std::path::Path, slot_n: u16) {
         let uuid = csq_core::testing::identity_fixtures::fixture_uuid_for_slot(slot_n);
         let profiles_path = csq_core::accounts::profiles::profiles_path(base);
         let mut profiles = csq_core::accounts::profiles::ProfilesFile::empty();
@@ -221,25 +268,22 @@ mod tests {
         csq_core::accounts::profiles::save(&profiles_path, &profiles).unwrap();
         let cred_path = csq_core::accounts::identity_store::credentials_path_for(base, uuid);
         std::fs::create_dir_all(cred_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &cred_path,
-            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-VALID-TOKEN","refreshToken":"rt","expiresAt":99999999999999,"scopes":["user:inference"]}}"#,
-        )
-        .unwrap();
+        std::fs::write(&cred_path, b"{ invalid fixture credential json").unwrap();
     }
 
     /// AC-6: `probe_all_slots` includes corrupt Gemini slots in --all output.
     ///
-    /// A base dir with 1 healthy Anthropic slot plus 1 corrupt Gemini marker
+    /// A base dir with 1 discoverable Anthropic slot plus 1 corrupt Gemini marker
     /// must produce a record set where the corrupt slot appears exactly once
     /// classified as `gemini-corrupt-binding` (no double-listing).
     #[test]
     fn probe_all_includes_corrupt_gemini_slot() {
-        let base = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let fixture = IsolatedProbeFixture::new();
+        let base = &fixture.base;
+        let home = &fixture.home;
 
-        // Healthy Anthropic slot 1.
-        stage_valid_anthropic_identity(base.path(), 1);
+        // Discoverable Anthropic slot 1; corrupt credential bytes refuse locally.
+        stage_discovered_anthropic_identity(base.path(), 1);
 
         // Corrupt Gemini marker slot 2 (present but unparseable JSON).
         let creds = base.path().join("credentials");
@@ -282,16 +326,17 @@ mod tests {
 
     /// AC-6a/6b: `probe_all_slots` includes corrupt Codex slots in --all output.
     ///
-    /// A base dir with 1 healthy Anthropic slot plus 1 corrupt Codex marker
+    /// A base dir with 1 discoverable Anthropic slot plus 1 corrupt Codex marker
     /// must produce a record set where the corrupt slot appears exactly once
     /// classified as `codex-corrupt-binding` (no double-listing). (an internal ticket M4)
     #[test]
     fn probe_all_includes_corrupt_codex_slot() {
-        let base = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let fixture = IsolatedProbeFixture::new();
+        let base = &fixture.base;
+        let home = &fixture.home;
 
-        // Healthy Anthropic slot 1.
-        stage_valid_anthropic_identity(base.path(), 1);
+        // Discoverable Anthropic slot 1; corrupt credential bytes refuse locally.
+        stage_discovered_anthropic_identity(base.path(), 1);
 
         // Corrupt Codex marker slot 2 (present but unparseable JSON).
         let creds = base.path().join("credentials");

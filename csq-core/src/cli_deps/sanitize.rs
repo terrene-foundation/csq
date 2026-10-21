@@ -44,7 +44,119 @@ pub fn sanitize_for_display(raw: &str) -> String {
 /// `~/weird` — a DIFFERENT path. The `cfg!` gate is load-bearing, not
 /// defensive.
 fn is_path_sep(c: char) -> bool {
-    c == '/' || (cfg!(windows) && c == '\\')
+    SepStyle::native().is_sep(c)
+}
+
+/// Which platform's path grammar a redaction pass applies. Production
+/// always uses [`SepStyle::native`]; the explicit parameter exists so the
+/// Windows grammar (backslash separators, `%5C` encoded separators,
+/// ASCII-case-insensitive matching, the `\\?\` verbatim prefix) is unit-
+/// testable on every platform by feeding Windows-shaped strings to the
+/// pure functions, instead of only on a Windows runner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SepStyle {
+    Unix,
+    Windows,
+}
+
+/// The Win32 verbatim-path prefix `std::fs::canonicalize` returns on
+/// Windows (`\\?\C:\Users\…`), literal and in `sqlite_uri_path`'s
+/// percent-encoded form. `\\?\UNC\` shares the literal prefix; stripping
+/// it would leave `UNC\server\…`, which is not the home path, so a strip
+/// of that form never produces a matching needle and is harmless.
+const VERBATIM_PREFIX: &str = r"\\?\";
+const VERBATIM_PREFIX_ENCODED: &str = "%5C%5C%3F%5C";
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of `SepStyle::fold` calls on this thread.
+    static FOLD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl SepStyle {
+    fn native() -> Self {
+        if cfg!(windows) {
+            SepStyle::Windows
+        } else {
+            SepStyle::Unix
+        }
+    }
+
+    fn is_sep(self, c: char) -> bool {
+        c == '/' || (self == SepStyle::Windows && c == '\\')
+    }
+
+    /// Byte length of a path separator at the start of `s` — a literal
+    /// separator (1) or a percent-ENCODED one (3: `%2F`, and `%5C` on
+    /// Windows only, either hex case) — or `None`. The encoded forms are
+    /// needed because `sqlite_uri_path` encodes `\` as `%5C`, so on Windows
+    /// the separator FOLLOWING an encoded home needle is itself encoded;
+    /// accepting only a literal separator rejected every such match and
+    /// leaked the home path (Windows CI, `failing_attach_stderr_never_leaks_
+    /// a_home_path_containing_a_space`). `%5C` stays Windows-only for the
+    /// same reason `\` does: on Unix it is a filename byte, not a separator.
+    ///
+    /// `allow_encoded` is true ONLY when the needle itself is percent-encoded
+    /// (contains `%`): a plain needle followed by a literal `%2F` (a legal
+    /// filename byte sequence, e.g. `/home/jack%2Fx`) is a sibling, not a
+    /// path boundary.
+    fn sep_len_at(self, s: &str, allow_encoded: bool) -> Option<usize> {
+        let first = s.chars().next()?;
+        if self.is_sep(first) {
+            return Some(1);
+        }
+        if !allow_encoded {
+            return None;
+        }
+        let enc = s.get(..3)?;
+        if enc.eq_ignore_ascii_case("%2F")
+            || (self == SepStyle::Windows && enc.eq_ignore_ascii_case("%5C"))
+        {
+            return Some(3);
+        }
+        None
+    }
+
+    /// A match-folded copy of `s`, byte-for-byte the same length and with the
+    /// same char boundaries as `s`, so offsets found in it are valid in `s`
+    /// (`None` on Unix, which matches exactly). Windows paths are
+    /// case-insensitive (`c:\users\x` and `C:\Users\X` are one directory, as
+    /// are `%5c`/`%5C`) and accept `/` for `\`, so the fold lower-cases, maps
+    /// `/` to `\` and the encoded `%2F` to `%5C`. Lower-casing is per-char
+    /// folding applied PER CHARACTER with one fixed mapping, identical for
+    /// text and needle: a char is lower-cased only when its lowercase is a
+    /// single char of the same UTF-8 length (`É` -> `é`), else kept as is
+    /// (`İ`, Kelvin `K`, `ẞ`). No whole-string fallback, so the two sides
+    /// can never pick different modes.
+    fn fold(self, s: &str) -> Option<String> {
+        if self != SepStyle::Windows {
+            return None;
+        }
+        #[cfg(test)]
+        FOLD_CALLS.with(|c| c.set(c.get() + 1));
+        let mut base = String::with_capacity(s.len());
+        for c in s.chars() {
+            let mut it = c.to_lowercase();
+            match (it.next(), it.next()) {
+                (Some(l), None) if l.len_utf8() == c.len_utf8() => base.push(l),
+                _ => base.push(c),
+            }
+        }
+        Some(base.replace('/', "\\").replace("%2f", "%5c"))
+    }
+
+    /// `s` with a leading verbatim prefix (literal or encoded) removed, on
+    /// Windows only; `None` when there is none.
+    fn strip_verbatim(self, s: &str) -> Option<&str> {
+        if self != SepStyle::Windows {
+            return None;
+        }
+        s.strip_prefix(VERBATIM_PREFIX).or_else(|| {
+            s.get(..VERBATIM_PREFIX_ENCODED.len())
+                .filter(|p| p.eq_ignore_ascii_case(VERBATIM_PREFIX_ENCODED))
+                .map(|_| &s[VERBATIM_PREFIX_ENCODED.len()..])
+        })
+    }
 }
 
 pub fn redact_home_prefix(p: &str) -> String {
@@ -70,11 +182,28 @@ pub fn redact_home_prefix(p: &str) -> String {
     let Some(home_str) = home.to_str() else {
         return p.to_string();
     };
-    let home_trimmed = home_str.trim_end_matches(is_path_sep);
+    redact_home_prefix_with(p, home_str, SepStyle::native())
+}
+
+/// The pure core of [`redact_home_prefix`]: `home` and the separator
+/// grammar are parameters so the Windows grammar is testable everywhere.
+fn redact_home_prefix_with(p: &str, home: &str, style: SepStyle) -> String {
+    let home_trimmed = home.trim_end_matches(|c| style.is_sep(c));
+    // A verbatim `\\?\` home and a plain path name the same directory (and
+    // vice versa): compare both with the prefix removed.
+    let home_trimmed = style.strip_verbatim(home_trimmed).unwrap_or(home_trimmed);
     if home_trimmed.is_empty() {
         return p.to_string();
     }
-    if let Some(rest) = p.strip_prefix(home_trimmed) {
+    let p_cmp = style.strip_verbatim(p).unwrap_or(p);
+    let head_matches = match style {
+        SepStyle::Unix => p_cmp.starts_with(home_trimmed),
+        SepStyle::Windows => p_cmp
+            .get(..home_trimmed.len())
+            .is_some_and(|h| h.eq_ignore_ascii_case(home_trimmed)),
+    };
+    if head_matches {
+        let rest = &p_cmp[home_trimmed.len()..];
         // `rest` either starts with a separator or is empty (input == $HOME
         // exactly). Anything else means the prefix matched a parent directory
         // whose name happens to be a prefix of $HOME's last component — bail
@@ -87,7 +216,7 @@ pub fn redact_home_prefix(p: &str) -> String {
         // native separators. Real Windows paths mix them — the leak that
         // found this was `C:\Users\runneradmin\.tmpXXXX\skills/SKILL-BLOCKED`,
         // backslashes from `Path::join` and a forward slash from a literal.
-        if let Some(rest) = rest.strip_prefix(is_path_sep) {
+        if let Some(rest) = rest.strip_prefix(|c| style.is_sep(c)) {
             return format!("~/{rest}");
         }
     }
@@ -170,6 +299,20 @@ pub fn redact_home_anywhere(s: &str) -> String {
     if let Some(canon) = canonical_home_string() {
         raws.push(canon.trim_end_matches(is_path_sep).to_string());
     }
+    // Windows 8.3 short names (`RUNNER~1` for `runneradmin`) name the same
+    // directory but are a different string; neither the literal nor the
+    // canonical (long-name) needle matches them. The right-boundary check in
+    // `redact_one_needle` keeps `RUNNER~1` from eating `RUNNER~10`.
+    let shorts: Vec<String> = raws
+        .iter()
+        .filter_map(|raw| short_path_string(raw))
+        .map(|sh| sh.trim_end_matches(is_path_sep).to_string())
+        .filter(|sh| !sh.is_empty() && !raws.contains(sh))
+        .collect();
+    let redacted = shorts
+        .iter()
+        .fold(redacted, |acc, sh| redact_needle_anywhere(&acc, sh));
+    raws.extend(shorts);
     let mut needles: Vec<String> = raws
         .iter()
         .map(|raw| (percent_encode_unreserved(raw), raw))
@@ -181,6 +324,62 @@ pub fn redact_home_anywhere(s: &str) -> String {
     needles
         .iter()
         .fold(redacted, |acc, needle| redact_needle_anywhere(&acc, needle))
+}
+
+/// The 8.3 short form of `path` from `GetShortPathNameW`, when the OS has
+/// one that differs from `path`. `None` on non-Windows, on a failed call
+/// (path missing, 8.3 generation disabled) and when the result is identical.
+#[cfg(windows)]
+pub(crate) fn short_path_string(path: &str) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    // Bounded per-raw-value cache: render paths call this per redaction and
+    // the answer is stable for a given home string.
+    const CACHE_CAP: usize = 16;
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(hit) = guard.get(path) {
+            return hit.clone();
+        }
+    }
+    let computed = short_path_string_uncached(path);
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= CACHE_CAP {
+            guard.clear();
+        }
+        guard.insert(path.to_string(), computed.clone());
+    }
+    computed
+}
+
+#[cfg(windows)]
+fn short_path_string_uncached(path: &str) -> Option<String> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+    let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+    let mut buf = vec![0u16; 1024];
+    // SAFETY: `wide` is NUL-terminated and live; `buf` is writable for the
+    // `buf.len()` units passed.
+    let n =
+        unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    // 0 = failure; n >= len = buffer too small (the value is the needed size).
+    if n == 0 || n >= buf.len() {
+        tracing::debug!(
+            error_kind = "short_path_unavailable",
+            "8.3 short-name lookup failed"
+        );
+        return None;
+    }
+    let short = std::ffi::OsString::from_wide(&buf[..n])
+        .into_string()
+        .ok()?;
+    (short != path).then_some(short)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn short_path_string(_path: &str) -> Option<String> {
+    None
 }
 
 /// RFC 3986 unreserved-set percent-encoding, byte-for-byte identical to
@@ -257,16 +456,50 @@ pub(crate) fn canonical_home_string() -> Option<String> {
 /// `pub(crate)` — the second call site is
 /// [`crate::audit::op_emit::redact_reason`]'s canonical-`$HOME` pass.
 pub(crate) fn redact_needle_anywhere(s: &str, needle: &str) -> String {
-    let needle_trimmed = needle.trim_end_matches(is_path_sep);
+    redact_needle_anywhere_with(s, needle, SepStyle::native())
+}
+
+/// [`redact_needle_anywhere`] under an explicit separator grammar. On
+/// Windows a verbatim (`\\?\`, literal or percent-encoded) needle is ALSO
+/// run with the prefix stripped — `canonicalize` returns the verbatim form
+/// but most error text carries the plain one — and a plain match that sits
+/// right after a verbatim prefix in `s` absorbs that prefix, so neither
+/// spelling of the home path survives in either direction.
+fn redact_needle_anywhere_with(s: &str, needle: &str, style: SepStyle) -> String {
+    let needle_trimmed = needle.trim_end_matches(|c| style.is_sep(c));
+    let stripped = style
+        .strip_verbatim(needle_trimmed)
+        .filter(|n| !n.trim_end_matches(|c| style.is_sep(c)).is_empty());
+    // Longer (verbatim) needle first, so the stripped pass never half-
+    // rewrites it.
+    let once = redact_one_needle(s, needle_trimmed, style);
+    match stripped {
+        Some(plain) => redact_one_needle(&once, plain, style),
+        None => once,
+    }
+}
+
+fn redact_one_needle(s: &str, needle: &str, style: SepStyle) -> String {
+    let needle_trimmed = needle.trim_end_matches(|c| style.is_sep(c));
     if needle_trimmed.is_empty() {
         return s.to_string();
     }
 
+    // Folded ONCE per call; every offset below indexes the folded copy and
+    // the original alike (see `SepStyle::fold`), so the walk is linear.
+    let folded_s = style.fold(s);
+    let folded_needle = style.fold(needle_trimmed);
+    let hay: &str = folded_s.as_deref().unwrap_or(s);
+    let pat: &str = folded_needle.as_deref().unwrap_or(needle_trimmed);
+    let allow_encoded = needle_trimmed.contains('%');
+
     let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(idx) = rest.find(needle_trimmed) {
-        let (before, after_match) = rest.split_at(idx);
-        let after = &after_match[needle_trimmed.len()..];
+    let mut pos = 0;
+    while let Some(rel) = hay[pos..].find(pat) {
+        let idx = pos + rel;
+        let before = &s[pos..idx];
+        let matched = &s[idx..idx + pat.len()];
+        let after = &s[idx + pat.len()..];
         out.push_str(before);
         // Item 7 (S-LOW-2): the RIGHT-boundary check below (`after` is
         // empty or starts with a separator) was the only boundary this
@@ -287,35 +520,80 @@ pub(crate) fn redact_needle_anywhere(s: &str, needle: &str) -> String {
         // component" is not. (`out`'s last char is checked, not just this
         // iteration's `before`, so a boundary carried over from a prior
         // non-matching iteration is still seen correctly.)
-        let left_ok = !matches!(out.chars().last(), Some(c) if c.is_alphanumeric());
+        //
+        // On Windows a verbatim prefix (`\\?\`, literal or `%5C%5C%3F%5C`) or
+        // an encoded separator (`%5C`/`%2F`, which end in the alphanumerics
+        // `C`/`F`) directly before the match is itself a boundary.
+        let left_ok = !matches!(out.chars().last(), Some(c) if c.is_alphanumeric())
+            || (style == SepStyle::Windows
+                && (ends_with_verbatim_prefix(&out) || ends_with_encoded_sep(&out)));
         if !left_ok {
             // Same non-boundary handling as the right-boundary "keep and
             // resume" branch below: not a real match, make forward
-            // progress without touching the text.
-            out.push_str(needle_trimmed);
-            rest = after;
+            // progress without touching the text. `matched` (the original
+            // bytes), not the needle: Windows matching folds case.
+            out.push_str(matched);
+            pos = idx + pat.len();
             continue;
         }
-        if after.is_empty() {
-            out.push('~');
-            rest = after;
-            break;
-        }
-        if after.starts_with(is_path_sep) {
-            // `is_path_sep` chars are single-byte ASCII, so slicing at [1..]
-            // never splits a multi-byte codepoint.
-            out.push_str("~/");
-            rest = &after[1..];
+        let boundary = if after.is_empty() {
+            Some(0)
         } else {
+            style.sep_len_at(after, allow_encoded)
+        };
+        let Some(sep_len) = boundary else {
             // Not a real boundary (e.g. the match is a prefix of a longer
             // component like `/Users/jackson`) — keep the literal text and
             // resume scanning right after it so we make forward progress.
-            out.push_str(needle_trimmed);
-            rest = after;
+            out.push_str(matched);
+            pos = idx + pat.len();
+            continue;
+        };
+        // A plain-form match preceded by a verbatim prefix is the verbatim
+        // spelling of the same path: drop the prefix rather than leave a
+        // `\\?\~/` stub.
+        if style == SepStyle::Windows {
+            if let Some(n) = verbatim_prefix_len_at_end(&out) {
+                out.truncate(out.len() - n);
+            }
         }
+        if sep_len == 0 {
+            out.push('~');
+            pos = s.len();
+            break;
+        }
+        // Separators (literal or `%XX`) are ASCII, so slicing at
+        // `sep_len` never splits a multi-byte codepoint.
+        out.push_str("~/");
+        pos = idx + pat.len() + sep_len;
     }
-    out.push_str(rest);
+    out.push_str(&s[pos..]);
     out
+}
+
+/// Length of a verbatim prefix (literal or encoded, either hex case) that
+/// `s` ends with, if any.
+fn verbatim_prefix_len_at_end(s: &str) -> Option<usize> {
+    [VERBATIM_PREFIX, VERBATIM_PREFIX_ENCODED]
+        .into_iter()
+        .find(|prefix| {
+            s.len() >= prefix.len()
+                && s.is_char_boundary(s.len() - prefix.len())
+                && s[s.len() - prefix.len()..].eq_ignore_ascii_case(prefix)
+        })
+        .map(str::len)
+}
+
+fn ends_with_verbatim_prefix(s: &str) -> bool {
+    verbatim_prefix_len_at_end(s).is_some()
+}
+
+/// `s` ends with an encoded separator, `%5C` or `%2F` in either hex case.
+fn ends_with_encoded_sep(s: &str) -> bool {
+    s.len() >= 3
+        && s.is_char_boundary(s.len() - 3)
+        && (s[s.len() - 3..].eq_ignore_ascii_case("%5C")
+            || s[s.len() - 3..].eq_ignore_ascii_case("%2F"))
 }
 
 /// Renders any `Display` value for the IPC / operator boundary with
@@ -500,6 +778,27 @@ mod tests {
         assert_eq!(sanitized, "codex-cli 0.128.0");
     }
 
+    struct FixtureEnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl FixtureEnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self(
+                keys.iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            )
+        }
+    }
+    impl Drop for FixtureEnvRestore {
+        fn drop(&mut self) {
+            for (key, previous) in self.0.drain(..).rev() {
+                match previous {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     fn with_home<R>(home: Option<&str>, f: impl FnOnce() -> R) -> R {
         // Use the workspace-wide test env mutex (per `rules/testing.md`
         // §4/4b shared-env discipline) so HOME mutation here serializes
@@ -508,10 +807,8 @@ mod tests {
         // mutex would only protect within `cli_deps::sanitize::tests` —
         // round-6 redteam discovery.
         let _g = crate::platform::test_env::lock();
-        let prior = std::env::var_os("HOME");
-        // `resolved_home_string` falls back to USERPROFILE on Windows, so
-        // "no home" must clear that too or the fallback answers instead.
-        let prior_userprofile = std::env::var_os("USERPROFILE");
+        // Windows fallback is restored on unwind as well as success.
+        let _restore = FixtureEnvRestore::capture(&["HOME", "USERPROFILE"]);
         match home {
             Some(h) => std::env::set_var("HOME", h),
             None => {
@@ -521,16 +818,7 @@ mod tests {
                 }
             }
         }
-        let out = f();
-        match prior {
-            Some(p) => std::env::set_var("HOME", p),
-            None => std::env::remove_var("HOME"),
-        }
-        match prior_userprofile {
-            Some(p) => std::env::set_var("USERPROFILE", p),
-            None => std::env::remove_var("USERPROFILE"),
-        }
-        out
+        f()
     }
 
     #[test]
@@ -873,6 +1161,289 @@ mod tests {
             "/System/Volumes/Data/~/file",
             "the same needle at a genuine left boundary must still be redacted"
         );
+    }
+
+    // ── Windows-grammar redaction, exercised on EVERY platform ────────────
+    //
+    // These feed Windows-shaped strings to the pure `_with` cores under
+    // `SepStyle::Windows`, so a Unix host verifies the Windows grammar too.
+
+    /// The Windows CI leak: `sqlite_uri_path` encodes `\` as `%5C`, so the
+    /// separator FOLLOWING the encoded home is itself encoded and the old
+    /// literal-only right boundary rejected the match.
+    #[test]
+    fn windows_encoded_home_followed_by_an_encoded_separator_is_redacted() {
+        let home = r"C:\Users\RUNNER~1\AppData\Local\Temp\.tmpAb12\home with space";
+        let needle = percent_encode_unreserved(home);
+        let msg = format!("unable to open database: file:{needle}%5C.csq-test-x.sqlite?mode=ro");
+        let out = redact_needle_anywhere_with(&msg, &needle, SepStyle::Windows);
+        assert_eq!(
+            out,
+            "unable to open database: file:~/.csq-test-x.sqlite?mode=ro"
+        );
+        // Either hex case, and an encoded forward slash.
+        let lower = msg.replace("%5C.csq", "%5c.csq");
+        assert_eq!(
+            redact_needle_anywhere_with(&lower, &needle, SepStyle::Windows),
+            "unable to open database: file:~/.csq-test-x.sqlite?mode=ro"
+        );
+        let slash = format!("file:{needle}%2Fx");
+        assert_eq!(
+            redact_needle_anywhere_with(&slash, &needle, SepStyle::Windows),
+            "file:~/x"
+        );
+        // An encoded non-separator after the needle is still a collision.
+        let collide = format!("file:{needle}%20two%5Cx");
+        assert_eq!(
+            redact_needle_anywhere_with(&collide, &needle, SepStyle::Windows),
+            collide
+        );
+    }
+
+    /// On Unix `\` is a filename byte, so `%5C` is NOT a boundary there;
+    /// `%2F` (an encoded `/`) is.
+    #[test]
+    fn unix_encoded_backslash_is_not_a_boundary_but_encoded_slash_is() {
+        let needle = percent_encode_unreserved("/home/a b");
+        let bs = format!("{needle}%5Cx");
+        assert_eq!(
+            redact_needle_anywhere_with(&bs, &needle, SepStyle::Unix),
+            bs
+        );
+        let fs = format!("{needle}%2Fx");
+        assert_eq!(
+            redact_needle_anywhere_with(&fs, &needle, SepStyle::Unix),
+            "~/x"
+        );
+    }
+
+    /// Windows paths are case-insensitive: a lower-case drive letter (or
+    /// any ASCII case difference) names the same home directory.
+    #[test]
+    fn windows_drive_letter_and_ascii_case_differences_are_redacted() {
+        let home = r"C:\Users\RUNNER~1";
+        assert_eq!(
+            redact_needle_anywhere_with(
+                r"open c:\users\runner~1\x failed",
+                home,
+                SepStyle::Windows
+            ),
+            "open ~/x failed"
+        );
+        let enc = percent_encode_unreserved(home);
+        assert_eq!(
+            redact_needle_anywhere_with(
+                "file:c%3a%5cUsers%5CRUNNER~1%5cx",
+                &enc,
+                SepStyle::Windows
+            ),
+            "file:~/x"
+        );
+        assert_eq!(
+            redact_home_prefix_with(r"c:\USERS\runner~1\x", home, SepStyle::Windows),
+            "~/x"
+        );
+        // Unix keeps exact-case matching.
+        assert_eq!(
+            redact_needle_anywhere_with("/HOME/jack/x", "/home/jack", SepStyle::Unix),
+            "/HOME/jack/x"
+        );
+    }
+
+    /// `canonicalize` on Windows returns the verbatim `\\?\` form AND the
+    /// LONG name (`runneradmin`, not the 8.3 `RUNNER~1`). Each spelling of
+    /// the home must be redacted whichever spelling the needle carries.
+    #[test]
+    fn windows_verbatim_prefix_is_redacted_in_both_directions() {
+        let canon = r"\\?\C:\Users\runneradmin\home";
+        // Verbatim needle, plain (long-name) text.
+        assert_eq!(
+            redact_needle_anywhere_with(
+                r"read C:\Users\runneradmin\home\a failed",
+                canon,
+                SepStyle::Windows
+            ),
+            "read ~/a failed"
+        );
+        // Plain needle, verbatim text: the prefix is absorbed, no `\\?\~/` stub.
+        assert_eq!(
+            redact_needle_anywhere_with(
+                r"read \\?\C:\Users\runneradmin\home\a",
+                r"C:\Users\runneradmin\home",
+                SepStyle::Windows
+            ),
+            "read ~/a"
+        );
+        // Encoded verbatim needle against encoded plain text.
+        let enc = percent_encode_unreserved(canon);
+        assert_eq!(
+            redact_needle_anywhere_with(
+                "file:C%3A%5CUsers%5Crunneradmin%5Chome%5Ca",
+                &enc,
+                SepStyle::Windows
+            ),
+            "file:~/a"
+        );
+        // Prefix redaction: verbatim path, plain home and vice versa.
+        assert_eq!(
+            redact_home_prefix_with(
+                r"\\?\C:\Users\runneradmin\home\a",
+                r"C:\Users\runneradmin\home",
+                SepStyle::Windows
+            ),
+            "~/a"
+        );
+        assert_eq!(
+            redact_home_prefix_with(r"C:\Users\runneradmin\home\a", canon, SepStyle::Windows),
+            "~/a"
+        );
+    }
+
+    /// The 8.3 short name and the long name are different strings; the
+    /// short-name needle redacts short-name text and leaves an unrelated
+    /// long-name sibling alone (the canonical, long-name needle covers it).
+    #[test]
+    fn windows_short_name_needle_does_not_match_a_longer_component() {
+        assert_eq!(
+            redact_needle_anywhere_with(
+                r"C:\Users\RUNNER~1\x C:\Users\RUNNER~10\y",
+                r"C:\Users\RUNNER~1",
+                SepStyle::Windows
+            ),
+            r"~/x C:\Users\RUNNER~10\y"
+        );
+    }
+
+    #[test]
+    fn windows_encoded_verbatim_prefix_is_absorbed_with_no_stub() {
+        let needle = "C%3A%5CUsers%5Cjack";
+        let text = "file:%5C%5C%3F%5CC%3A%5CUsers%5Cjack%5Cx";
+        assert_eq!(
+            redact_needle_anywhere_with(text, needle, SepStyle::Windows),
+            "file:~/x"
+        );
+        // Literal prefix, plain needle, same absorb.
+        assert_eq!(
+            redact_needle_anywhere_with(
+                r"\\?\C:\Users\jack\x",
+                r"C:\Users\jack",
+                SepStyle::Windows
+            ),
+            "~/x"
+        );
+    }
+
+    #[test]
+    fn windows_forward_slashes_in_the_home_path_are_redacted() {
+        let home = r"C:\Users\x";
+        assert_eq!(
+            redact_needle_anywhere_with("open C:/Users/x/a.txt", home, SepStyle::Windows),
+            "open ~/a.txt"
+        );
+        let enc = percent_encode_unreserved(home);
+        assert_eq!(
+            redact_needle_anywhere_with("file:C%3A%2FUsers%2Fx%2Fa", &enc, SepStyle::Windows),
+            "file:~/a"
+        );
+        // Mixed separators and a collision stay correct.
+        assert_eq!(
+            redact_needle_anywhere_with("C:/Users/xy/a", home, SepStyle::Windows),
+            "C:/Users/xy/a"
+        );
+    }
+
+    #[test]
+    fn plain_needle_does_not_treat_a_literal_encoded_separator_as_a_boundary() {
+        for style in [SepStyle::Unix, SepStyle::Windows] {
+            let (needle, text) = if style == SepStyle::Unix {
+                ("/home/jack", "/home/jack%2Fx /home/jack%5Cx")
+            } else {
+                (r"C:\home\jack", r"C:\home\jack%2Fx C:\home\jack%5Cx")
+            };
+            assert_eq!(
+                redact_needle_anywhere_with(text, needle, style),
+                text,
+                "{style:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_non_ascii_case_folds_when_length_preserving() {
+        assert_eq!(
+            redact_needle_anywhere_with(
+                r"open C:\Users\JOSÉ\x",
+                r"C:\Users\josé",
+                SepStyle::Windows
+            ),
+            "open ~/x"
+        );
+        assert_eq!(
+            redact_needle_anywhere_with(
+                r"open c:\users\josé\x",
+                r"C:\Users\JOSÉ",
+                SepStyle::Windows
+            ),
+            "open ~/x"
+        );
+        // Unix stays exact.
+        assert_eq!(
+            redact_needle_anywhere_with("/home/JOSÉ/x", "/home/josé", SepStyle::Unix),
+            "/home/JOSÉ/x"
+        );
+        // A length-changing char elsewhere falls back to ASCII folding and
+        // must not panic or misalign offsets.
+        assert_eq!(
+            redact_needle_anywhere_with(
+                "İ C:\\Users\\JACK\\x",
+                r"C:\Users\jack",
+                SepStyle::Windows
+            ),
+            "İ ~/x"
+        );
+    }
+
+    #[test]
+    fn windows_matching_is_linear_in_repeated_hits() {
+        let text = r"C:\h\a ".repeat(20_000);
+        let out = redact_needle_anywhere_with(&text, r"C:\h", SepStyle::Windows);
+        assert_eq!(out, "~/a ".repeat(20_000));
+    }
+
+    /// Exactly two folds per `redact_one_needle` call (text once, needle
+    /// once) however many hits there are. RED against a re-fold-per-hit
+    /// mutation: the count then scales with the hit count.
+    #[test]
+    fn windows_fold_runs_once_per_side_per_needle_call() {
+        let text = r"C:\h\a ".repeat(50);
+        FOLD_CALLS.with(|c| c.set(0));
+        let out = redact_one_needle(&text, r"C:\h", SepStyle::Windows);
+        assert_eq!(out, "~/a ".repeat(50));
+        assert_eq!(FOLD_CALLS.with(|c| c.get()), 2);
+    }
+
+    /// Item 1: needle and text share one per-char mapping, so a text char
+    /// whose lowercase changes length can never disable folding for the
+    /// needle (`İ`, Kelvin `K`, `ẞ`).
+    #[test]
+    fn windows_fold_is_one_per_char_mapping_for_text_and_needle() {
+        for text in [
+            "İ C:\\Users\\JOSÉ\\x",
+            "\u{212A} C:\\Users\\JOSÉ\\x",
+            "ẞ c:\\users\\josé\\x",
+            "Ω c:\\USERS\\JOSÉ\\x",
+        ] {
+            let out = redact_needle_anywhere_with(text, "C:\\Users\\JOSÉ", SepStyle::Windows);
+            assert!(!out.to_lowercase().contains("jos"), "leaked: {out}");
+            assert!(out.ends_with("~/x"), "{out}");
+        }
+    }
+
+    /// 8.3 helper is inert off Windows (no fabricated needle).
+    #[cfg(not(windows))]
+    #[test]
+    fn short_path_string_is_none_off_windows() {
+        assert_eq!(short_path_string("/tmp"), None);
     }
 
     /// `canonical_home_string` must not panic or error when `HOME` is

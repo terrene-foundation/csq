@@ -13,15 +13,18 @@
 //! - [`read_email_from_claude_json`] reads the OAuth account email
 //!   that CC writes to `<config_dir>/.claude.json` after a successful
 //!   `claude auth login`. Both `csq login N` and the desktop Add
-//!   Account modal use this to populate the `profiles.json` entry.
+//!   Account modal may use this as display or expected-context metadata; the
+//!   exact incoming grant must independently verify its account and organization
+//!   before publishing any `profiles.json` identity binding.
 //!
-//! - [`finalize_login`] does the post-login bookkeeping shared by
-//!   both code paths: writes the `.csq-account` marker, reads the
-//!   email, updates `profiles.json`, clears the broker-failed flag.
+//! - [`finalize_verified_login`] consumes an exact-grant commit receipt, writes
+//!   its identity marker under a custody lock, and queues asynchronous mirroring.
 
 use crate::accounts::profiles_lock::ProfilesFileLock;
 use crate::accounts::{markers, profiles};
-use crate::credentials::{self, file as cred_file};
+use crate::credentials;
+#[cfg(test)]
+use crate::credentials::file as cred_file;
 use crate::error::ConfigError;
 use crate::types::AccountNum;
 use std::path::{Path, PathBuf};
@@ -81,14 +84,16 @@ pub fn find_claude_binary() -> Option<PathBuf> {
 ///
 /// CC writes `oauthAccount.emailAddress` to its local `.claude.json`
 /// during `claude auth login`. This is a file-only read with no
-/// subprocess and no race window — it's the preferred source over
+/// subprocess. It supplies display metadata, never verified ownership authority.
+/// It avoids the status-query timing window of
 /// `claude auth status --json`, which has a documented timing
 /// window where stdout can lack `email` if csq runs it too soon
 /// after auth completes (see an internal journal entry §1).
 ///
 /// Returns `None` if the file is missing, malformed, or has no
 /// non-empty `emailAddress` field. Callers should fall back to
-/// `"unknown"` in that case rather than fail the whole login.
+/// `"unknown"` for display only. Identity publication still requires the complete
+/// expected context and exact-grant profile verification.
 pub fn read_email_from_claude_json(config_dir: &Path) -> Option<String> {
     let path = config_dir.join(".claude.json");
     let content = std::fs::read_to_string(&path).ok()?;
@@ -104,552 +109,547 @@ pub fn read_email_from_claude_json(config_dir: &Path) -> Option<String> {
     }
 }
 
-/// Ensures the slot's identity UUID is minted into `profiles.json::by_slot`
-/// BEFORE the canonical credential save (an internal ticket).
-///
-/// `credentials::file::save_canonical_for` is fail-closed on an absent UUID
-/// (M4-12), but on a fresh install the UUID is only minted by `finalize_login`
-/// — which runs AFTER `save_canonical_for` in both the CLI (`csq login`) and
-/// desktop login flows — and on macOS the daemon Pass-0 fallback cannot mint
-/// from a keychain-only credential (it reads `credentials/<N>.json`, never
-/// written when creds go to the keychain). The result, pre-fix: the first
-/// login on a fresh (especially macOS) install failed with "no credentials
-/// configured". This helper closes the gap: it mints the UUID up front, using
-/// the OAuth email `claude auth login` wrote to `config-N/.claude.json` — the
-/// same source `finalize_login` uses, so the minted UUID + `by_email` key match
-/// and `finalize_login`'s later `mint_for_login` is an idempotent no-op reuse.
-///
-/// No-ops (returns `Ok`) when the slot already has a UUID, or when the email is
-/// unavailable (the caller's `save_canonical_for` then surfaces its own
-/// fail-closed error rather than this helper inventing an identity). Holds
-/// `ProfilesFileLock` across the re-check + mint to serialize against a
-/// concurrent daemon Pass-0 / login mint.
-pub fn ensure_login_identity_minted(base_dir: &Path, account: AccountNum) -> Result<(), String> {
-    if crate::accounts::profiles::resolve_slot_to_uuid(base_dir, account.get()).is_some() {
-        return Ok(());
-    }
-    let config_dir = base_dir.join(format!("config-{account}"));
-    let Some(email) = read_email_from_claude_json(&config_dir) else {
-        // No email source yet — do NOT invent an identity. The caller's
-        // save_canonical_for will surface the genuine fail-closed error.
-        return Ok(());
-    };
-    // Fixed-vocabulary error tag — NO path. ProfilesFileLock::acquire returns
-    // ConfigError::InvalidJson whose Display embeds the `.profiles.lock` path
-    // (discloses $HOME / OS username), and both callers surface this String to
-    // operator stderr / IPC. redact_home_prefix is prefix-only and would NOT
-    // strip a path embedded mid-message, so we drop the path entirely per
-    // rules/operator-surface-verification.md Rule 6 + rules/security.md MUST-2.
-    let lock = ProfilesFileLock::acquire(base_dir)
-        .map_err(|_e| "could not acquire profiles lock for identity mint".to_string())?;
-    // Re-check under the lock: a concurrent daemon Pass-0 / login may have
-    // minted between the unlocked check above and acquiring the lock.
-    if crate::accounts::profiles::resolve_slot_to_uuid(base_dir, account.get()).is_some() {
-        return Ok(());
-    }
-    crate::daemon::identity_mint::mint_for_login(&lock, base_dir, account.get(), &email)
-        .map(|_uuid| ())
+/// Evidence from this login's canonical transition; never persisted or caller-constructed.
+#[cfg(target_os = "macos")]
+pub struct LoginMirrorContext {
+    base: PathBuf,
+    account: AccountNum,
+    identity: crate::accounts::identity_store::IdentityId,
+    prior: crate::credentials::token_history::Fingerprint,
+    incoming: [u8; 32],
+    expires: std::time::Instant,
+    custody: Option<crate::accounts::anthropic_identity::CapturedBinding>,
 }
 
-/// Post-login bookkeeping shared by `csq login` and the desktop
-/// Add Account flow.
-///
-/// 1. Writes the `.csq-account` marker for `account` inside its
-///    `config-N/` directory (best-effort if the dir doesn't exist
-///    yet — the canonical save in `credentials::save_canonical`
-///    will create it).
-/// 2. **Unbinds any third-party provider pinned to this slot.** If a
-///    user ran `csq setkey mm --slot N` earlier (intentionally or by
-///    accidentally submitting a junk key, an internal journal entry), slot N's
-///    `settings.json` contains `ANTHROPIC_BASE_URL` +
-///    `ANTHROPIC_AUTH_TOKEN` env vars that override OAuth
-///    credentials at CC startup. Strip them here so the fresh OAuth
-///    tokens actually route to Anthropic.
-/// 3. **Removes any stale Gemini or native-CLI (Kimi/Grok) binding marker**
-///    left on this slot (GH an internal ticket), for the same "replace, don't
-///    refuse" reason as step 2. Split into a DETECTION captured here, before
-///    the identity mint (see
-///    [`crate::accounts::binding_guard::detect_stale_marker_binding`] for why
-///    the ordering is load-bearing), and an ACTION deferred to the very end
-///    of this function — see
-///    [`crate::accounts::binding_guard::clear_detected_marker_binding`] for
-///    why acting immediately would risk destroying the prior binding on a
-///    subsequent failure.
-/// 4. Reads the OAuth email from `config-N/.claude.json` and
-///    updates `profiles.json`. Falls back to `"unknown"` if the
-///    email is missing — non-fatal because the credential file is
-///    already written and CC can use the account.
-/// 5. Clears the `broker_failed` sentinel for this account so the
-///    daemon retries refresh on the next tick.
-///
-/// Errors are propagated only when the *bookkeeping* itself fails
-/// (e.g. profiles.json save fails). The credential file is
-/// authoritative — losing the profile entry is recoverable, losing
-/// the credential file is not.
-pub fn finalize_login(base_dir: &Path, account: AccountNum) -> Result<String, ConfigError> {
-    let config_dir = base_dir.join(format!("config-{}", account));
+#[cfg(not(target_os = "macos"))]
+pub struct LoginMirrorContext;
 
-    // M4-7 (an internal ticket Phase 4, spec 02 §INV-03 + §2.3.1): the
-    // `.csq-account` marker is written AFTER `mint_for_login` below so
-    // we can resolve the slot's identity UUID and emit it as the
-    // marker content. For pure-legacy installs (mint deferred to
-    // daemon Pass 0), the post-mint resolution falls through to
-    // `write_csq_account_legacy` which preserves the decimal-content
-    // contract until `phase4_gate_check` refuses pure-legacy. See the
-    // marker write below the mint block.
-
-    // GH an internal ticket: CAPTURE (do not act on) any stale ADDITIVE marker
-    // binding (Gemini / native Kimi-Grok) BEFORE the identity mint below.
-    //
-    // an internal ticket regression (fixed): `detect_stale_marker_binding` used to
-    // delegate to `detect_bound_surface`'s precedence-ordered union
-    // detector (Codex → Anthropic → Gemini → native → 3P), so calling it
-    // here — before THIS function's own `mint_for_login` — was load-bearing:
-    // an internal ticket's `ensure_login_identity_minted` mints `by_slot[account]`
-    // for the fresh Anthropic identity in EVERY production caller before
-    // `finalize_login` is even invoked, so by the time this line ran,
-    // `by_slot[account]` already resolved to the new identity and the
-    // delegated detector reported Anthropic ahead of the stale marker —
-    // masking it regardless of where in this function the call sat.
-    // `detect_stale_marker_binding` now sources detection directly from the
-    // Gemini/native marker predicates instead of the union detector (see its
-    // doc comment), so it is no longer precedence-masked and this call is no
-    // longer ordering-sensitive relative to any mint. It stays here, ahead
-    // of the profiles lock, purely to keep the CAPTURE step visually
-    // adjacent to the rest of the pre-lock bookkeeping. The 3P unbind runs
-    // AFTER the profiles lock (see its comment there).
-    //
-    // Security review (GH an internal ticket): the ACTION is deferred to the very
-    // end of this function, past every later fallible step (`?` on the
-    // profiles lock, the mint, the settings pair) — see the call site below.
-    // Acting immediately here would delete the prior binding even when
-    // `finalize_login` subsequently fails, leaving the slot with NEITHER the
-    // new identity NOR the old one. `detect_stale_marker_binding` is pure —
-    // nothing is deleted by this call.
-    let stale_marker_binding =
-        crate::accounts::binding_guard::detect_stale_marker_binding(base_dir, account);
-
-    let email = read_email_from_claude_json(&config_dir).unwrap_or_else(|| "unknown".to_string());
-
-    // Acquire the profiles.json lock BEFORE the load+save cycle.
-    //
-    // This lock is held across BOTH steps:
-    //   1. profiles::save  — writes the AccountProfile row.
-    //   2. mint_for_login  — writes the by_slot/by_email UUID mappings.
-    //
-    // Holding the lock across both steps makes the two-write sequence atomic
-    // from a cross-process perspective. Without the lock, a concurrent daemon
-    // Pass 0 could interleave its own load between these two writes and
-    // clobber the profile row or the UUID mapping. (A-HIGH-1 fix, round 1.5.)
-    //
-    // Error path: if we cannot acquire the lock, fail the entire finalize_login.
-    // The credential file is already written; the profile row failure is
-    // recoverable by the next login or daemon Pass 0, but we should surface it.
-    let profiles_lock = ProfilesFileLock::acquire(base_dir)?;
-
-    // GH an internal ticket (security review, round 3): strip any pre-existing 3P
-    // binding HERE — after the profiles lock, not before it.
-    //
-    // `unbind_provider_from_slot` is DESTRUCTIVE: it removes
-    // `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` from
-    // `config-<N>/settings.json`. That auth token IS the operator's 3P API
-    // key, so running it before a step that can still fail meant a login
-    // which then failed left the slot with NEITHER a new OAuth identity NOR
-    // its previous 3P key — the operator had to find and re-enter the key.
-    // This is the same defect the marker capture/act split above fixes, and
-    // strictly worse, because a marker is credential-less and a key is not.
-    //
-    // Placement is bounded on BOTH sides and neither bound is optional:
-    //   - It MUST be after `ProfilesFileLock::acquire`, the only remaining
-    //     early-return (`?`) in this window. The `mint_for_login` failure
-    //     below is non-fatal (warn-and-continue), as is the marker write.
-    //   - It MUST stay before TWO dependents that both read
-    //     `config-<N>/settings.json` OFF DISK and require the strip to have
-    //     already happened. Deferring past either would leak the stale 3P
-    //     `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` into the fresh OAuth
-    //     identity's settings — a correctness bug, not merely a security one:
-    //       (a) `mint_for_login`'s M2-3 fresh-UUID seed, which copies
-    //           `config-<N>/settings.json` into `identities/<UUID>/settings.json`
-    //           on first mint (`daemon::identity_mint`, "M2-3: seed
-    //           identities/<UUID>/settings.json from config-<N>/settings.json").
-    //       (b) the M4-2 settings pair-write below, whose contract is that the
-    //           two paths are BYTE-EQUIVALENT; copying pre-unbind bytes and then
-    //           mutating the source would desync the pair.
-    //     (a) is the TIGHTER bound and sits earlier than (b) — an earlier
-    //     revision of this comment named only (b), which understated how narrow
-    //     the window actually is.
-    //
-    // Residual, deliberately not closed here: a later fallible return (the
-    // UUID-credential freshness seed, reachable only once `mint_for_login` has
-    // already SUCCEEDED) still sits past the unbind. Closing it would require
-    // (a) and (b) to take a passed-in stripped-settings value instead of
-    // re-reading disk — shared-code surgery outside this change's blast radius.
-    // It is materially less severe: by that point `by_slot` is mapped and the
-    // profile is written, so the operator has a working-but-erroring Anthropic
-    // login rather than the "neither identity nor key" state this fix removes.
-    //
-    // So this is a MOVE, not the capture/act split used for the markers: the
-    // unbind reads `config-<N>/settings.json` directly rather than `by_slot`,
-    // so the mint cannot mask it and there is nothing to capture early.
-    match crate::accounts::third_party::unbind_provider_from_slot(base_dir, account) {
-        Ok(true) => {
-            tracing::info!(
-                account = account.get(),
-                "finalize_login: stripped third-party provider binding"
-            );
-        }
-        Ok(false) => {}
-        Err(e) => return Err(e),
+/// Capture exact pre-write evidence for the selected target, without reading a live account.
+pub(crate) fn prepare_verified_login_mirror(
+    base: &Path,
+    account: AccountNum,
+    identity: crate::accounts::identity_store::IdentityId,
+    credential: &credentials::CredentialFile,
+) -> Option<LoginMirrorContext> {
+    #[cfg(target_os = "macos")]
+    {
+        let prior = read_login_canonical(base, identity)?;
+        login_raw_version(&prior)?;
+        Some(LoginMirrorContext {
+            base: std::fs::canonicalize(base).ok()?,
+            account,
+            identity,
+            prior: crate::credentials::token_history::fingerprint_from_raw_json(&prior)?,
+            incoming: login_credential_version(credential)?,
+            expires: std::time::Instant::now() + std::time::Duration::from_secs(600),
+            custody: None,
+        })
     }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (base, account, identity, credential);
+        None
+    }
+}
 
-    // F-H-1 fix: clear any stale `by_slot_identity[N]` left from a prior
-    // non-OAuth binding (3P API-key or Codex) on this slot.  Without this
-    // cleanup `get_email`'s step 1.5 returns `"apikey:<provider>"` instead
-    // of the OAuth email resolved via step 3, making the newly-logged-in
-    // slot misidentified.
-    //
-    // Non-fatal: the credential file is already written.  A failure here is
-    // logged and skipped; the next daemon reconciler pass can prune the stale
-    // entry when the information-preserving arm-4 predicate no longer fires.
-    match profiles::clear_slot_identity(&profiles_lock, base_dir, account.get()) {
-        Ok(()) => {
-            tracing::debug!(
-                account = account.get(),
-                "finalize_login: cleared stale by_slot_identity (if any)"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                account = account.get(),
-                error_kind = "clear_slot_identity_failed",
-                "finalize_login: could not clear by_slot_identity (non-fatal): {e}"
-            );
+/// Remedy for a damaged organization record. It never names `csq login`: login refuses on
+/// the same record, so that advice would send the operator in a circle.
+const INDEX_DAMAGED_REMEDY: &str = "profiles.json holds a damaged organization record that may belong to this account; restore a trusted profiles.json backup and do not hand-edit it, because signing in again cannot clear a damaged record";
+
+/// The one outcome vocabulary for a verified-login commit that did not land.
+///
+/// The daemon (`/api/oauth/exchange`), the CLI (`csq login`) and the desktop
+/// (login / paste-code / race) all map `IdentityError` through THIS type, so
+/// every surface reports the same fixed `error_kind` and the same operator
+/// message. A busy profiles store is a retry, never an identity refusal; a
+/// publication failure after another identity's canonical credentials were
+/// advanced is named explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginCommitOutcome {
+    /// Staging/publishing failed with an I/O fault; nothing observable advanced.
+    PublicationFailed,
+    /// The existing target's canonical credentials were advanced, then the
+    /// remaining publication failed.
+    TargetAdvancedPublicationFailed,
+    /// The slot's login authority moved while the login ran.
+    IdentityChanged,
+    /// The profiles store was held by another operation; retry.
+    Busy,
+    /// The grant's organization identity could not be confirmed.
+    Refused,
+    /// The committed receipt was refused at finalization.
+    FinalizationRefused,
+    /// A damaged organization record in profiles.json may belong to this account.
+    /// Logging in again cannot clear it, so it has its own tag and remedy.
+    IndexDamaged,
+}
+
+impl LoginCommitOutcome {
+    /// Map a commit failure.
+    pub fn from_identity_error(error: &crate::accounts::anthropic_identity::IdentityError) -> Self {
+        use crate::accounts::anthropic_identity::IdentityError as E;
+        match error {
+            E::Io => Self::PublicationFailed,
+            E::TargetAdvancedPublicationFailed => Self::TargetAdvancedPublicationFailed,
+            E::BindingChanged => Self::IdentityChanged,
+            E::BindingBusy => Self::Busy,
+            E::DamagedContextIndexRow => Self::IndexDamaged,
+            // Explicit: both are identity refusals whose remedy text lives in
+            // `describe_error` (they name a slot), not the generic one.
+            E::SiblingCustodyUnreadable { .. } | E::LoginCredentialHeldElsewhere { .. } => {
+                Self::Refused
+            }
+            _ => Self::Refused,
         }
     }
 
-    // M4-9 (release N affordance, an internal ticket Phase 4): the v1
-    // `profiles.accounts` field is empty-write in production. The email
-    // is captured in `profiles.json::by_email` by `mint_for_login`
-    // below — that is the post-M4-9 source of truth for the slot's
-    // display label, resolved via `ProfilesFile::get_email`'s primary
-    // `by_slot → UUID → by_email` reverse lookup.
-    //
-    // The v1 `accounts` field stays as `HashMap<String, AccountProfile>`
-    // for release N (serializes as `accounts: {}`) so the v2.6.x
-    // forward-compat round-trip (M1-2 regression test) still holds.
-    // M4-13 (release N+1) deletes the field after the v2.6.x downgrade
-    // window closes.
-    //
-    // The load+save cycle that previously seeded the slot's AccountProfile
-    // row is retired. The subsequent `mint_for_login` call performs its
-    // own load+save under the SAME `profiles_lock` held here, writing
-    // `by_slot[N] = uuid` + `by_email[email] = uuid`.
+    /// Fixed-vocabulary tag; also the daemon's `error_kind` log field.
+    pub fn error_kind(self) -> &'static str {
+        match self {
+            Self::PublicationFailed => "oauth_login_publication_failed",
+            Self::TargetAdvancedPublicationFailed => {
+                "oauth_login_target_advanced_publication_failed"
+            }
+            Self::IdentityChanged => "oauth_identity_changed",
+            Self::Busy => "oauth_identity_busy",
+            Self::Refused => "oauth_identity_refused",
+            Self::FinalizationRefused => "oauth_identity_finalization_refused",
+            Self::IndexDamaged => "oauth_identity_index_damaged",
+        }
+    }
 
-    // A++ Phase 1 (M1-4): attempt per-login identity mint for this slot.
-    // Non-fatal: if minting fails (e.g. partial upgrade, no identities/ dir
-    // yet) we log and continue — the daemon's startup Pass 0 handles bulk
-    // minting on the next start. The email is already available here.
-    //
-    // The profiles_lock is passed as a type-witness to mint_for_login,
-    // documenting that the caller (us) already holds the lock. This prevents
-    // accidental re-acquisition inside mint_for_login (which would deadlock
-    // on some platforms).
-    //
-    // Skip if email is "unknown" — we can't establish a stable by_email key.
-    if email != "unknown" {
-        match crate::daemon::identity_mint::mint_for_login(
-            &profiles_lock,
-            base_dir,
-            account.get(),
-            &email,
+    /// Inverse of [`Self::error_kind`]; an unknown tag is a publication failure.
+    pub fn from_error_kind(kind: &str) -> Self {
+        [
+            Self::TargetAdvancedPublicationFailed,
+            Self::IdentityChanged,
+            Self::Busy,
+            Self::Refused,
+            Self::FinalizationRefused,
+            Self::IndexDamaged,
+        ]
+        .into_iter()
+        .find(|outcome| outcome.error_kind() == kind)
+        .unwrap_or(Self::PublicationFailed)
+    }
+
+    /// Operator-facing text; carries no token, body or path.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::PublicationFailed => "credential publication failed",
+            Self::TargetAdvancedPublicationFailed => {
+                "login stopped after this slot's existing credentials were advanced; run the login again to finish"
+            }
+            Self::IdentityChanged => "login authority changed; start login again",
+            Self::Busy => "another csq operation holds the profiles store; retry the login in a moment",
+            Self::Refused => "organization identity could not be confirmed; login refused",
+            Self::FinalizationRefused => "verified login finalization refused; start login again",
+            Self::IndexDamaged => INDEX_DAMAGED_REMEDY,
+        }
+    }
+
+    /// `"<message> (<error_kind>)"` — the one line every surface shows.
+    ///
+    /// Preserve specific fixed-text remedies rather than sending every refusal
+    /// back to a login that cannot repair the broken local authority.
+    pub fn describe_error(error: &crate::accounts::anthropic_identity::IdentityError) -> String {
+        use crate::accounts::anthropic_identity::IdentityError as E;
+        let outcome = Self::from_identity_error(error);
+        let message = match error {
+            E::BoundIdentityMetadataMissing { account } => format!(
+                "identity.json is missing for this slot; run `csq logout {account}` then `csq login {account}` to replace the broken slot binding"
+            ),
+            E::InvalidMetadata => "identity metadata was refused; run `csq logout N` then `csq login N`; do not hand-edit identity metadata or profiles.json".to_owned(),
+            E::LegacyEmailUnparseable => "the recorded legacy email cannot be verified; run `csq login N` to authenticate the affected slot".to_owned(),
+            E::UnsafePermissions => "identity.json or credentials.json has unsafe permissions; restore private permissions only after confirming no other user modified the file, or run `csq logout N` then `csq login N`".to_owned(),
+            E::MultipleLinks => "identity.json or credentials.json has extra hard links; remove the extra links after confirming the file contents, or run `csq logout N` then `csq login N`".to_owned(),
+            E::SnapshotChanged => "the file changed while it was read; retry the operation".to_owned(),
+            E::ProfilesUnsafePermissions => "profiles.json has unsafe permissions; run chmod 600 on profiles.json after confirming no other user modified it; if its provenance is untrusted, restore a trusted backup".to_owned(),
+            E::ProfilesMultipleLinks => "profiles.json has extra hard links; remove the extra links after confirming its contents; otherwise restore a trusted backup".to_owned(),
+            E::ProfilesSnapshotChanged => "profiles.json kept changing while it was read; retry the operation".to_owned(),
+            E::ProfilesReadRefused => "profiles.json could not be safely read; restore a trusted backup; do not hand-edit identity metadata or profiles.json".to_owned(),
+            E::DamagedContextIndexRow => INDEX_DAMAGED_REMEDY.to_owned(),
+            E::SharedLegacyIdentity => "this legacy identity is shared by several slots or its organization is already held by another identity; authenticate each affected slot with `csq login` and its own slot number so each one is verified individually".to_owned(),
+            E::SiblingCustodyUnreadable { sibling } => match sibling.account() {
+                Some(slot) => format!(
+                    "slot {slot}'s stored identity is unreadable; run `csq login {slot}` or `csq logout {slot}` to replace it (the slot being logged in is unaffected)"
+                ),
+                None => "another slot's stored identity is unreadable; run `csq login <slot>` or `csq logout <slot>` for that slot to replace it (the slot being logged in is unaffected)".to_owned(),
+            },
+            E::LoginCredentialHeldElsewhere { holder } => match holder.account() {
+                Some(slot) => format!(
+                    "this login produced a credential that slot {slot} already holds; run `csq login N` again so a fresh credential is issued, or `csq logout {slot}` if slot {slot} is the one that is stale"
+                ),
+                None => "this login produced a credential that another slot already holds; run `csq login N` again so a fresh credential is issued".to_owned(),
+            },
+            _ => outcome.message().to_owned(),
+        };
+        format!("{message} ({})", outcome.error_kind())
+    }
+
+    /// Account-aware commit wording shared by CLI and desktop. A new login
+    /// helps only the transient/changed-authority outcomes, not every refusal.
+    /// [`Self::describe_error_for_account`] for a FAILED login commit, plus
+    /// the fixed operator line when the commit's refusal could not be made
+    /// durable (corr LOW-1: every login surface shows the same line as the
+    /// CLI). Reads and clears the process flag.
+    pub fn describe_commit_failure_for_account(
+        error: &crate::accounts::anthropic_identity::IdentityError,
+        account: AccountNum,
+    ) -> String {
+        let text = Self::describe_error_for_account(error, account);
+        match crate::credentials::rescue::take_refusal_not_durable_notice() {
+            Some(notice) => format!("{text}; {notice}"),
+            None => text,
+        }
+    }
+
+    pub fn describe_error_for_account(
+        error: &crate::accounts::anthropic_identity::IdentityError,
+        account: AccountNum,
+    ) -> String {
+        let outcome = Self::from_identity_error(error);
+        let text = Self::describe_error(error)
+            .replace("csq logout N", &format!("csq logout {account}"))
+            .replace("csq login N", &format!("csq login {account}"));
+        if matches!(
+            outcome,
+            Self::IdentityChanged | Self::Busy | Self::TargetAdvancedPublicationFailed
         ) {
-            Ok(_) => {
-                tracing::debug!(
-                    account = account.get(),
-                    "finalize_login: identity mint hook succeeded"
-                );
-            }
-            Err(reason) => {
-                // All Err(reason) strings from mint_for_login are fixed-vocabulary
-                // static literals (see identity_mint.rs) — no PII, safe to log.
-                tracing::warn!(
-                    account = account.get(),
-                    error_kind = "identity_mint_failed",
-                    reason = %reason,
-                    "finalize_login: identity mint hook failed (non-fatal)"
-                );
-            }
+            let suffix = format!(" ({})", outcome.error_kind());
+            let message = match outcome {
+                Self::IdentityChanged => "login authority changed",
+                Self::Busy => "another csq operation holds the profiles store",
+                _ => text.strip_suffix(&suffix).unwrap_or(&text),
+            };
+            format!("{message}; run `csq login {account}` again{suffix}")
+        } else {
+            text
         }
     }
 
-    // M4-7: write the `.csq-account` marker now that `mint_for_login` has
-    // run. If a UUID mapping exists in `profiles.json::by_slot`, write the
-    // canonical UUID-v4 string; otherwise (pure-legacy install where mint
-    // failed or was skipped), fall back to the decimal slot id via
-    // `write_csq_account_legacy` so the M1-5 reader still surfaces the
-    // numeric account.
-    //
-    // Best-effort: the marker write is non-fatal because the credential
-    // file is already authoritative and the daemon's next sweep can
-    // re-seed the marker. Failures are logged with a fixed-vocabulary tag.
-    if config_dir.exists() {
-        match profiles::resolve_slot_to_uuid(base_dir, account.get()) {
-            Some(uuid) => {
-                if let Err(e) = markers::write_csq_account(&config_dir, uuid) {
-                    tracing::warn!(
-                        account = account.get(),
-                        error_kind = "csq_account_marker_uuid_write_failed",
-                        "finalize_login: could not write UUID marker (non-fatal)"
-                    );
-                    let _ = e;
-                }
-                // `keychain-fix-r9.md` D-Q2: a fresh `csq login` grant starts
-                // a NEW token-history segment for this identity — clearing
-                // whatever fingerprints an EARLIER grant left behind, so an
-                // old-grant token is no longer recognised as "known" by
-                // `keychain::decide_cc_keychain_write` rule 2. The fresh
-                // grant was already written to the canonical UUID-keyed
-                // credentials file (`credentials::save_canonical_for`, which
-                // runs BEFORE `finalize_login` — see this function's own
-                // top-level doc) and its own `record_write` call already
-                // appended it onto the OLD segment; this call is what
-                // actually starts the new one. Best-effort and non-fatal, the
-                // same as every other step in this block: an unreadable or
-                // non-Anthropic canonical file simply means no segment reset
-                // happens this login, never a hard failure.
-                let uuid_creds_path =
-                    crate::accounts::identity_store::credentials_path_for(base_dir, uuid);
-                if let Ok(raw) = std::fs::read_to_string(&uuid_creds_path) {
-                    if let Some(fp) =
-                        crate::credentials::token_history::fingerprint_from_raw_json(&raw)
-                    {
-                        crate::credentials::token_history::start_new_segment(base_dir, uuid, fp);
-                    }
-                }
-            }
-            None => {
-                if let Err(e) = markers::write_csq_account_legacy(&config_dir, account) {
-                    tracing::warn!(
-                        account = account.get(),
-                        error_kind = "csq_account_marker_legacy_write_failed",
-                        "finalize_login: could not write legacy decimal marker (non-fatal)"
-                    );
-                    let _ = e;
-                }
-            }
+    /// Message for a failure BEFORE any login ran (the `capture_login_prior`
+    /// snapshot). Nothing was published, so the commit-time wording of
+    /// [`Self::describe_error`] ("credential publication failed") would be
+    /// wrong; this is the raw identity error text, like the CLI surface shows.
+    pub fn describe_prior_capture_error(
+        error: &crate::accounts::anthropic_identity::IdentityError,
+    ) -> String {
+        error.to_string()
+    }
+}
+
+/// Finish only the identity committed by the exact verified grant. Never remint or reseed.
+pub fn finalize_verified_login(
+    base: &Path,
+    account: AccountNum,
+    committed: crate::accounts::anthropic_identity::CommittedAnthropicLogin,
+) -> Result<String, ConfigError> {
+    use crate::accounts::anthropic_identity::{self as ai, StoredAnthropicContext};
+    let refused = || ConfigError::InvalidJson {
+        path: profiles::profiles_path(base),
+        reason: "anthropic_identity_finalization_refused".into(),
+    };
+    if committed.binding().slot() != account {
+        return Err(refused());
+    }
+    let lock = ProfilesFileLock::acquire(base)?;
+    if !committed
+        .independent_matches_locked(&lock, base)
+        .map_err(|_| refused())?
+    {
+        return Err(refused());
+    }
+    let (binding, mirror, fingerprint) = committed.into_parts();
+    #[cfg(target_os = "macos")]
+    let mirror =
+        mirror.and_then(|mut mirror| mirror.bind_committed_custody(&binding).then_some(mirror));
+    if !ai::binding_custody_matches_locked(&lock, base, &binding).map_err(|_| refused())? {
+        return Err(refused());
+    }
+    let email = match binding.context() {
+        StoredAnthropicContext::Known(context) => context.email().to_owned(),
+        _ => return Err(refused()),
+    };
+    let stale = crate::accounts::binding_guard::detect_stale_marker_binding(base, account);
+    crate::accounts::third_party::unbind_provider_from_slot(base, account)?;
+    profiles::clear_slot_identity(&lock, base, account.get())?;
+    let config = base.join(format!("config-{}", account.get()));
+    if config.exists() {
+        markers::write_csq_account(&config, binding.identity()).map_err(|_| refused())?;
+        let settings = config.join("settings.json");
+        if let Ok(bytes) = std::fs::read(&settings) {
+            credentials::save_uuid_settings(base, binding.identity(), &bytes)
+                .map_err(|_| refused())?;
         }
     }
-
-    // M4-2: explicit settings.json pair-write — mirror `config-<N>/settings.json`
-    // into `identities/<UUID>/settings.json` byte-equivalent.
-    //
-    // `mint_for_login` seeds the UUID settings file ONLY when it is absent
-    // (idempotent seed). That covers fresh logins but NOT re-logins where
-    // a stale UUID settings.json from a prior session must be refreshed to
-    // match the legacy `config-<N>/settings.json` written by 3P bind/unbind
-    // (which `unbind_provider_from_slot` above just ran).
-    //
-    // The pair is intentionally byte-equivalent — the WBS acceptance criterion
-    // for M4-2 is "finalize_login writes identities/<UUID>/settings.json
-    // byte-equivalent to config-<N>/settings.json". A merged / transformed copy
-    // would break downstream readers that expect identical content at both
-    // paths during the M4-2 → M4-5 transition window.
-    //
-    // Non-fatal: settings pairing failure does not block login. The credential
-    // write above is authoritative; the settings overlay is a per-slot 3P env
-    // mirror that the daemon's next pass can rebuild from `config-<N>/`.
-    if let Some(uuid) = profiles::resolve_slot_to_uuid(base_dir, account.get()) {
-        let config_settings_path = config_dir.join("settings.json");
-        if config_settings_path.exists() {
-            match std::fs::read(&config_settings_path) {
-                Ok(bytes) => {
-                    if let Err(e) = credentials::save_uuid_settings(base_dir, uuid, &bytes) {
-                        tracing::warn!(
-                            account = account.get(),
-                            error_kind = "uuid_settings_pair_failed",
-                            "finalize_login: could not pair UUID settings.json (non-fatal): \
-                             daemon backsync will retry"
-                        );
-                        let _ = e;
-                    } else {
-                        tracing::debug!(
-                            account = account.get(),
-                            "finalize_login: UUID settings paired from config-N/settings.json"
-                        );
-                    }
-                }
-                Err(_) => {
-                    // Settings file unreadable (race with concurrent setkey?) — skip.
-                    tracing::debug!(
-                        account = account.get(),
-                        "finalize_login: config-N/settings.json unreadable; UUID pair deferred"
-                    );
-                }
-            }
-        }
+    if let Some(surface) = stale {
+        crate::accounts::binding_guard::clear_detected_marker_binding(base, account, surface);
     }
-
-    // HIGH-2 (M2-2 redteam): seed identities/<UUID>/credentials.json immediately
-    // after mint succeeds, while still holding the ProfilesFileLock — a fresh
-    // login that did NOT pre-seed the store (legacy callers, or a UUID minted
-    // for the first time just above) otherwise leaves credentials.json missing
-    // until the daemon's first refresh tick, and csq doctor reports
-    // MissingCredentialsAtUuidPath on every freshly-logged-in slot.
-    //
-    // **The freshness guard (config-N login-overwrite fix, 2026-06-24).** The
-    // `live_path` read here (`config-N/.credentials.json`) was, pre-keychain-CC,
-    // the freshest token: the `claude auth login` subprocess wrote its OAuth
-    // payload there before csq's post-subprocess hook ran. That assumption is
-    // no longer reliable — modern keychain-first CC commits the fresh token to
-    // the macOS keychain and may leave `config-N/.credentials.json` STALE or
-    // absent (empirically observed: refreshed daemon stores while config-N sat
-    // weeks behind). EVERY production caller of finalize_login now pre-seeds the
-    // store with the freshest token the flow produced BEFORE calling us — the
-    // subprocess flows via `read_fresh_after_login` (keychain ∪ config-N, later
-    // `expiresAt` wins) and the paste/race flows via `oauth::exchange_code`
-    // (which never writes config-N) → `save_canonical_for` — so the store is
-    // already ≥ config-N here. An UNCONDITIONAL re-seed from config-N (the prior
-    // `save_canonical_for` call) therefore REGRESSED the store back to a
-    // stale/rotated-dead token, 401-ing every session of the account.
-    //
-    // Fix: route the re-seed through `save_canonical_for_if_fresher`, which
-    // re-reads the store expiry UNDER the write lock and writes config-N's token
-    // ONLY when it is strictly fresher (fail-closed — Ok(false), no write — on a
-    // non-Anthropic/corrupt store). The seed is now MONOTONIC: it can advance a
-    // store that a non-pre-seeding caller left empty/older (the HIGH-2 safety
-    // net), but it can NEVER regress the fresh token a pre-seeding caller already
-    // wrote. On the happy path (store already holds the caller's fresh token) it
-    // cleanly no-ops. `min_expiry_exclusive = 0` because we carry no harvested
-    // baseline; the under-lock store re-read is the SOLE guard for this caller.
-    //
-    // Scope of the guard: this is a FRESHNESS guard, not an IDENTITY guard.
-    // config-N is per-slot-path-keyed (`config-<N>/.credentials.json`), so under
-    // the same-account threat model it cannot carry a FOREIGN account's token —
-    // unlike the keychain custodian, whose harvest source is account-anonymous
-    // and so carries an explicit same-account email gate. The residual the
-    // monotonic guard does NOT cover is shared with `read_fresh_after_login`:
-    // `expiresAt` is a recency proxy, not a chain-liveness proof, so a
-    // dead-but-later-expiry token could in principle be selected upstream. That
-    // is a pre-existing limitation of expiry-based selection (post_login.rs),
-    // not introduced here; `if_fresher` is strictly more conservative than the
-    // unconditional write it replaces.
-    //
-    // Non-fatal: if the live creds are missing (e.g. CC wrote only the keychain)
-    // we log and skip; the caller's pre-seed already populated the store.
-    let live_path = cred_file::live_path(base_dir, account);
-    match credentials::load(&live_path) {
-        Ok(live_creds) => {
-            // RN1-C (M4-12): the UUID-keyed write is fail-closed — an absent
-            // by_slot mapping yields Err(NoCredentials).
-            //
-            // Propagation policy (unchanged by the freshness guard):
-            // - When by_slot IS populated (mint succeeded above), an Err MUST be
-            //   propagated fail-closed: the caller sees "login bookkeeping failed"
-            //   rather than Ok(email) while no UUID-keyed credential file exists.
-            //   broker_check reads the UUID path — a missing UUID credentials.json
-            //   means LOGIN_REQUIRED on the very next daemon tick.
-            // - When by_slot is NOT populated (legacy/pure-legacy install,
-            //   email="unknown" so mint was skipped), Err(NoCredentials) is
-            //   "non-fatal": broker_check falls back to the numeric path for
-            //   legacy accounts. Preserve the non-fatal behaviour for this case.
-            //
-            // Ok(true) = config-N was strictly fresher and was written;
-            // Ok(false) = the store already held an at-or-fresher token (the
-            // pre-seed, a daemon refresh) OR the store was non-Anthropic/corrupt
-            // (fail-closed) — either way the seed is correctly a no-op.
-            let uuid_populated = profiles::resolve_slot_to_uuid(base_dir, account.get()).is_some();
-            // No harvested baseline at this callsite: the under-lock store re-read
-            // inside `save_canonical_for_if_fresher` is the sole TOCTOU guard.
-            const NO_HARVEST_BASELINE: u64 = 0;
-            match cred_file::save_canonical_for_if_fresher(
-                base_dir,
-                account,
-                &live_creds,
-                NO_HARVEST_BASELINE,
-            ) {
-                Ok(true) => {
-                    tracing::debug!(
-                        account = account.get(),
-                        "finalize_login: UUID credentials seeded from live (config-N was fresher)"
-                    );
-                }
-                Ok(false) => {
-                    tracing::debug!(
-                        account = account.get(),
-                        "finalize_login: live re-seed skipped \
-                         (store at-or-fresher, or non-Anthropic/corrupt — fail-closed)"
-                    );
-                }
-                Err(cred_err) if uuid_populated => {
-                    tracing::warn!(
-                        account = account.get(),
-                        error_kind = "uuid_credential_seed_failed",
-                        "finalize_login: could not seed UUID credentials path"
-                    );
-                    return Err(ConfigError::InvalidJson {
-                        path: live_path.clone(),
-                        reason: format!("UUID credential seed failed: {cred_err}"),
-                    });
-                }
-                Err(_) => {
-                    // Legacy install: no UUID mapping, NoCredentials is expected.
-                    // broker_check uses the numeric path fallback for legacy accounts.
-                    tracing::debug!(
-                        account = account.get(),
-                        "finalize_login: UUID seed skipped (no by_slot mapping — legacy install)"
-                    );
-                }
-            }
-        }
-        Err(crate::error::CredentialError::NotFound { .. }) => {
-            // CC has not written live creds yet — backsync will seed UUID path.
-            tracing::debug!(
-                account = account.get(),
-                "finalize_login: live creds not yet present; UUID seed deferred to backsync"
-            );
-        }
-        Err(_) => {
-            tracing::warn!(
-                account = account.get(),
-                error_kind = "uuid_credential_seed_live_corrupt",
-                "finalize_login: live credential file unreadable; UUID seed deferred to backsync"
-            );
-        }
+    if ai::capture_anthropic_binding_locked(&lock, base, account)
+        .map_err(|_| refused())?
+        .credential_version()
+        == binding.credential_version()
+    {
+        crate::credentials::token_history::start_new_segment(base, binding.identity(), fingerprint);
     }
-
-    // Release the profiles lock explicitly before the broker fanout so any
-    // reader of profiles.json can proceed.
-    drop(profiles_lock);
-
-    crate::refresh::sentinel::clear_broker_failed(base_dir, account);
-
-    // Mirror the freshly-logged-in token into the keychain CC reads for every
-    // live handle dir (current CC is keychain-first). `claude auth login` wrote
-    // the keychain only for the LOGIN config dir, so a session already bound to
-    // this account on a different `term-<pid>` path keeps the stale token until
-    // its next launch. Done HERE (the shared finalize) — not in the CLI wrapper —
-    // so every caller gets it: `csq login` AND all three desktop login twins
-    // (subprocess, paste-code, race). Account-agnostic sweep; the
-    // newer-than-keychain guard no-ops unaffected dirs. Best-effort; never blocks
-    // login. Test-safe: a base with no `term-*` dirs sweeps nothing.
-    let _ = crate::credentials::keychain::sync_all_handle_dirs(
-        base_dir,
-        &std::collections::HashMap::new(),
-    );
-
-    // GH an internal ticket (CLOSED, shipped): ACT on the marker binding captured
-    // earlier — left un-acted until this point — before the mint above.
-    // This is the LAST statement in `finalize_login`
-    // reachable only once every fallible step (`?`) above has already
-    // succeeded — the mint, the profile save, the UUID credential seed.
-    // Acting here rather than at detection time means a `finalize_login`
-    // that fails partway through leaves the prior Gemini/native binding
-    // untouched, exactly like the pre-fix refuse behaviour did on failure.
-    if let Some(surface) = stale_marker_binding {
-        crate::accounts::binding_guard::clear_detected_marker_binding(base_dir, account, surface);
-    }
-
+    // Sentinel cleanup belongs to the custody window too: a later provider
+    // winner must not have its newly written failure cleared by this receipt.
+    crate::refresh::sentinel::clear_broker_failed(base, account);
+    // F5/L3: a re-bound slot no longer shares the grant that suppressed its refresh. It ends
+    // THIS slot's suppression only (no other slot's login releases anything), and it runs
+    // INSIDE the receipt's profiles lock, so the startup audit (which also runs inside that
+    // lock) cannot read the old grant and re-apply a verdict after this clear.
+    crate::accounts::refresh_token_audit::clear_on_login_locked(&lock, base, account.get());
+    drop(lock);
+    crate::credentials::keychain::queue_login_mirror(base, account, mirror);
     Ok(email)
+}
+
+// Bind the precise access/refresh pair and expiry without retaining credential bytes.
+#[cfg(target_os = "macos")]
+fn login_grant_version(access: &str, refresh: &str, expiry: u64) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for token in [access, refresh] {
+        hash.update((token.len() as u64).to_be_bytes());
+        hash.update(token.as_bytes());
+    }
+    hash.update(expiry.to_be_bytes());
+    hash.finalize().into()
+}
+
+#[cfg(target_os = "macos")]
+fn login_credential_version(credential: &credentials::CredentialFile) -> Option<[u8; 32]> {
+    let oauth = &credential.anthropic()?.claude_ai_oauth;
+    Some(login_grant_version(
+        oauth.access_token.expose_secret(),
+        oauth.refresh_token.expose_secret(),
+        oauth.expires_at,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn login_raw_version(raw: &str) -> Option<[u8; 32]> {
+    crate::credentials::keychain::inspect_secret_json(raw, |value| {
+        let oauth = value.get("claudeAiOauth")?;
+        Some(login_grant_version(
+            oauth.get("accessToken")?.as_str()?,
+            oauth.get("refreshToken")?.as_str()?,
+            oauth.get("expiresAt")?.as_u64()?,
+        ))
+    })
+    .flatten()
+}
+
+// Hold each canonical namespace component; reject aliases, nonregular/private
+// files and oversized payloads. Partial reads and decode failures zeroize too.
+#[cfg(target_os = "macos")]
+fn read_login_canonical(
+    base: &Path,
+    identity: crate::accounts::identity_store::IdentityId,
+) -> Option<zeroize::Zeroizing<String>> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let root = std::fs::canonicalize(base).ok()?;
+    let mut directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(root)
+        .ok()?;
+    for name in ["identities".to_string(), identity.to_canonical_string()] {
+        let name = std::ffi::CString::new(name).ok()?;
+        // The parent descriptor stays held while opening its direct child.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        // Successful openat transfers sole descriptor ownership to File.
+        directory = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c"credentials.json".as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata().ok()?;
+    const MAX_BYTES: u64 = 65_536;
+    if !metadata.is_file()
+        || metadata.mode() & 0o077 != 0
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.len() > MAX_BYTES
+    {
+        return None;
+    }
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    file.take(MAX_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_BYTES {
+        return None;
+    }
+    crate::credentials::keychain::zeroizing_utf8(bytes).ok()
+}
+
+#[cfg(all(test, target_os = "macos"))]
+std::thread_local! {
+    static TEST_LOGIN_MIRROR_CLOCK: std::cell::RefCell<Option<std::collections::VecDeque<std::time::Instant>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(target_os = "macos")]
+impl LoginMirrorContext {
+    /// Bind only an opaque captured publication authority, never a synthesized epoch.
+    /// The finalizer calls this while its original profiles lock is still held.
+    pub(crate) fn bind_committed_custody(
+        &mut self,
+        binding: &crate::accounts::anthropic_identity::CapturedBinding,
+    ) -> bool {
+        use crate::accounts::anthropic_identity::StoredAnthropicContext;
+        if self.custody.is_some()
+            || !binding.belongs_to(&self.base)
+            || binding.slot() != self.account
+            || binding.identity() != self.identity
+            || !matches!(binding.context(), StoredAnthropicContext::Known(_))
+        {
+            return false;
+        }
+        self.custody = Some(binding.clone());
+        true
+    }
+
+    // Queue callers may hold their mutex: bounded file reads only, no lock acquire.
+    fn custody_snapshot_matches(&self, base: &Path) -> bool {
+        use crate::accounts::anthropic_identity as ai;
+        let Some(binding) = self.custody.as_ref() else {
+            return false;
+        };
+        let ai::StoredAnthropicContext::Known(context) = binding.context() else {
+            return false;
+        };
+        let pf = match ai::read_profiles_snapshot(base) {
+            Ok(pf) => pf,
+            Err(_) => {
+                tracing::warn!(
+                    error_kind = "login_custody_snapshot_unreadable",
+                    account = self.account.get(),
+                    "login custody check failed closed: profiles snapshot unreadable"
+                );
+                return false;
+            }
+        };
+        let stored = match ai::read_stored_anthropic_context(base, self.identity) {
+            Ok(stored) => stored,
+            Err(_) => {
+                tracing::warn!(
+                    error_kind = "login_custody_context_unreadable",
+                    account = self.account.get(),
+                    "login custody check failed closed: stored context unreadable"
+                );
+                return false;
+            }
+        };
+        pf.by_slot.get(&self.account.to_string()).copied() == Some(self.identity)
+            && pf
+                .slot_binding_generations
+                .get(&self.account.to_string())
+                .copied()
+                .unwrap_or(0)
+                == binding.generation()
+            && stored == *binding.context()
+            && ai::validate_target_index(&pf, Some(self.identity), Some(context), true).is_ok()
+    }
+
+    /// Recheck the ORIGINAL witness custody inside the actual apply authority lock.
+    /// No lock is acquired here; canonical incoming digest and deadline remain required.
+    pub(crate) fn prior_for_locked(
+        &self,
+        lock: &ProfilesFileLock,
+        base: &Path,
+        account: AccountNum,
+        target: &str,
+    ) -> Option<crate::credentials::token_history::Fingerprint> {
+        let binding = self.custody.as_ref()?;
+        if !crate::accounts::anthropic_identity::binding_custody_matches_locked(lock, base, binding)
+            .ok()?
+        {
+            return None;
+        }
+        self.prior_for(base, account, target)
+    }
+
+    pub(crate) fn current_for(&self, base: &Path, account: AccountNum) -> bool {
+        !self.expired()
+            && read_login_canonical(base, self.identity)
+                .is_some_and(|current| self.prior_for(base, account, &current).is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_for_test(&mut self) {
+        self.expires = std::time::Instant::now();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cross_deadline_during_read_for_test(&self) {
+        TEST_LOGIN_MIRROR_CLOCK.with(|clock| {
+            *clock.borrow_mut() = Some(
+                [
+                    self.expires - std::time::Duration::from_secs(1),
+                    self.expires,
+                ]
+                .into(),
+            );
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_clock_for_test() {
+        TEST_LOGIN_MIRROR_CLOCK.with(|clock| *clock.borrow_mut() = None);
+    }
+
+    fn expired(&self) -> bool {
+        #[cfg(test)]
+        if let Some(now) = TEST_LOGIN_MIRROR_CLOCK.with(|clock| {
+            clock
+                .borrow_mut()
+                .as_mut()
+                .and_then(|times| times.pop_front())
+        }) {
+            return now >= self.expires;
+        }
+        std::time::Instant::now() >= self.expires
+    }
+
+    // Called inside the existing handle lock against the policy's actual target.
+    pub(crate) fn prior_for(
+        &self,
+        base: &Path,
+        account: AccountNum,
+        target: &str,
+    ) -> Option<crate::credentials::token_history::Fingerprint> {
+        if account != self.account
+            || self.expired()
+            || std::fs::canonicalize(base).ok().as_deref() != Some(self.base.as_path())
+            || !self.custody_snapshot_matches(base)
+        {
+            return None;
+        }
+        let current = read_login_canonical(base, self.identity)?;
+        (login_raw_version(&current) == Some(self.incoming)
+            && login_raw_version(target) == Some(self.incoming)
+            && !self.expired())
+        .then_some(self.prior)
+    }
 }
 
 /// System-wide install directories searched after `$PATH`.
@@ -744,6 +744,112 @@ mod tests {
     use crate::platform::test_env::with_in_memory_secret_backend;
     use std::fs;
     use tempfile::TempDir;
+
+    /// Explicit fake canonical/history staging; never an authorization API.
+    fn stage_fixture_canonical(
+        base: &Path,
+        account: AccountNum,
+        credential: &credentials::CredentialFile,
+    ) -> Result<(), crate::error::CredentialError> {
+        let identity = profiles::resolve_slot_to_uuid(base, account.get())
+            .ok_or(crate::error::CredentialError::NoCredentials(account.get()))?;
+        credentials::file::save(
+            &crate::accounts::identity_store::credentials_path_for(base, identity),
+            credential,
+        )?;
+        crate::credentials::token_history::record_write(base, identity, credential);
+        Ok(())
+    }
+
+    // Full-context synthetic fixture setup. This is not a legacy upgrade path.
+    // The transport proves the precise incoming token; only production commit
+    // and receipt finalization perform the operation under test.
+    fn fixture_verified_commit(
+        base: &Path,
+        account: AccountNum,
+    ) -> Result<crate::accounts::anthropic_identity::CommittedAnthropicLogin, ConfigError> {
+        use crate::accounts::anthropic_identity as ai;
+        let config = base.join(format!("config-{}", account.get()));
+        let refused = || ConfigError::InvalidJson {
+            path: config.clone(),
+            reason: "fixture_verified_login_refused".into(),
+        };
+        let email = read_email_from_claude_json(&config).ok_or_else(refused)?;
+        let credential =
+            credentials::load(&config.join(".credentials.json")).map_err(|_| refused())?;
+        let context = ai::AnthropicContext::new(
+            &email,
+            uuid::Uuid::from_u128(101),
+            uuid::Uuid::from_u128(202),
+        )
+        .map_err(|_| refused())?;
+        if let Some(identity) = profiles::resolve_slot_to_uuid(base, account.get()) {
+            // coexisting_fixture models the older migration layout and creates
+            // directories at ordinary umask modes. These successful-login tests
+            // explicitly stage a private Known identity, not a production legacy
+            // upgrade or a bypass of the writer's private-directory requirement.
+            for directory in [
+                crate::accounts::identity_store::identities_dir(base),
+                crate::accounts::identity_store::identity_path(base, identity),
+            ] {
+                crate::platform::fs::secure_dir(&directory).map_err(|_| refused())?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(
+                        fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+                        0o700
+                    );
+                }
+            }
+            // Existing-success fixtures are explicitly known-context identities.
+            let metadata_path =
+                crate::accounts::identity_store::identity_json_path_for(base, identity);
+            let mut metadata: serde_json::Value =
+                serde_json::from_slice(&fs::read(&metadata_path).map_err(|_| refused())?)
+                    .map_err(|_| refused())?;
+            metadata["email"] = serde_json::json!(context.email());
+            metadata["account_uuid"] = serde_json::json!(context.account_uuid());
+            metadata["organization_uuid"] = serde_json::json!(context.organization_uuid());
+            fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap())
+                .map_err(|_| refused())?;
+            crate::platform::fs::secure_file(&metadata_path).map_err(|_| refused())?;
+            let mut pf = profiles::load(&profiles::profiles_path(base))?;
+            pf.anthropic_contexts
+                .retain(|entry| entry.identity_uuid != identity);
+            pf.anthropic_contexts.push(ai::AnthropicContextEntry {
+                email: context.email().into(),
+                account_uuid: context.account_uuid(),
+                organization_uuid: context.organization_uuid(),
+                identity_uuid: identity,
+                extra: Default::default(),
+            });
+            profiles::save(&profiles::profiles_path(base), &pf)?;
+        }
+        let token = credential
+            .anthropic()
+            .ok_or_else(refused)?
+            .claude_ai_oauth
+            .access_token
+            .expose_secret()
+            .to_owned();
+        let http: crate::daemon::usage_poller::HttpGetFn = std::sync::Arc::new(
+            move |url, bearer, _| {
+                assert_eq!(url, "https://api.anthropic.com/api/oauth/profile");
+                assert_eq!(bearer, token, "must prove the exact incoming fixture grant");
+                Ok((200, serde_json::to_vec(&serde_json::json!({"account":{"uuid":context.account_uuid(),"email":context.email()},"organization":{"uuid":context.organization_uuid()}})).unwrap()))
+            },
+        );
+        let prior = ai::capture_login_prior(base, account).map_err(|_| refused())?;
+        ai::commit_anthropic_login_with(base, account, &credential, &http, None, prior)
+            .map_err(|_| refused())
+    }
+    fn fixture_verified_finalize(base: &Path, account: AccountNum) -> Result<String, ConfigError> {
+        with_in_memory_secret_backend(|| {
+            let committed = fixture_verified_commit(base, account)?;
+            finalize_verified_login(base, account, committed)
+        })
+    }
 
     #[cfg(unix)]
     fn make_executable(path: &Path) {
@@ -884,8 +990,8 @@ mod tests {
         let account = AccountNum::try_from(1u16).unwrap();
         let uuid = fixture_uuid_for_slot(1);
 
-        // Write .claude.json with the fixture email so mint_for_login reuses the
-        // existing fixture UUID (by_email lookup succeeds → Reused path, no new UUID).
+        // Write .claude.json with the fixture email so the fixture UUID stays the
+        // slot's binding (no new UUID is minted).
         // This keeps the test hermetic — fixture_uuid_for_slot(1) stays canonical.
         let config_dir = base.join("config-1");
         let claude_json_path = config_dir.join(".claude.json");
@@ -926,7 +1032,7 @@ mod tests {
         let _ = crate::accounts::markers::write_csq_account_legacy(&config_dir, account);
 
         // Act
-        let result = finalize_login(base, account);
+        let result = fixture_verified_finalize(base, account);
         assert!(result.is_ok(), "finalize_login must succeed: {:?}", result);
 
         // Assert: identities/<UUID>/credentials.json exists
@@ -1028,10 +1134,10 @@ mod tests {
         // absent, so `finalize_login`'s `std::fs::read_to_string` fails and
         // the whole `start_new_segment` call is silently never reached —
         // not a bug in `finalize_login`, but an unrealistic test fixture.
-        crate::credentials::file::save_canonical_for(base, account, &new_grant).unwrap();
+        stage_fixture_canonical(base, account, &new_grant).unwrap();
         let _ = crate::accounts::markers::write_csq_account_legacy(&config_dir, account);
 
-        let result = finalize_login(base, account);
+        let result = fixture_verified_finalize(base, account);
         assert!(result.is_ok(), "finalize_login must succeed: {:?}", result);
 
         let history = crate::credentials::token_history::read_history(base, uuid);
@@ -1049,108 +1155,970 @@ mod tests {
         );
     }
 
-    /// config-N login-overwrite regression (HIGH, 2026-06-24): a STALE
-    /// `config-N/.credentials.json` MUST NOT regress a fresher store token.
-    ///
-    /// Every production caller pre-seeds the store with the authoritative
-    /// token (`read_fresh_after_login` → `save_canonical_for`) before calling
-    /// `finalize_login`. Modern keychain-first CC may leave
-    /// `config-N/.credentials.json` stale or weeks-old. The prior unconditional
-    /// `save_canonical_for` re-seed reverted the store to that stale token,
-    /// 401-ing every session. The freshness guard
-    /// (`save_canonical_for_if_fresher`) makes the re-seed monotonic.
-    ///
-    /// Arrange:
-    /// - store `identities/<UUID>/credentials.json` pre-seeded FRESH (expiry 2100)
-    /// - `config-1/.credentials.json` STALE (expiry 2033, different access_token)
-    ///
-    /// After `finalize_login`, the store MUST still carry the FRESH token.
+    // Real login producer ordering: canonical save, history reset, then sweep.
+    // The injected executor exercises write policy without any host Keychain call.
+    #[cfg(target_os = "macos")]
     #[test]
-    fn finalize_login_stale_config_n_does_not_regress_fresh_store() {
-        use crate::accounts::identity_store::credentials_path_for as uuid_creds_path;
-        use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+    fn finalize_login_delivers_new_grant_after_history_reset() {
+        login_mirror_case("fresh");
+    }
 
-        fn anthropic_creds(access: &str, expires_at: u64) -> crate::credentials::CredentialFile {
-            crate::credentials::CredentialFile::Anthropic(
-                crate::credentials::AnthropicCredentialFile {
-                    claude_ai_oauth: crate::credentials::OAuthPayload {
-                        access_token: crate::types::AccessToken::new(access.into()),
-                        refresh_token: crate::types::RefreshToken::new(format!(
-                            "sk-ant-ort01-{access}"
-                        )),
-                        expires_at,
-                        scopes: vec!["user:inference".into()],
-                        subscription_type: Some("max".into()),
-                        rate_limit_tier: None,
-                        extra: std::collections::HashMap::new(),
-                    },
-                    extra: std::collections::HashMap::new(),
-                },
-            )
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_mirror_refuses_canonical_change_during_keychain_read() {
+        login_mirror_case("canonical_changed");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_mirror_refuses_refresh_change_during_keychain_read() {
+        login_mirror_case("refresh_changed");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_mirror_refuses_expiry_change_during_keychain_read() {
+        login_mirror_case("expiry_changed");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_mirror_with_unreadable_prior_retains_safe_refusal() {
+        login_mirror_case("unreadable_prior");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_mirror_with_incomplete_prior_retains_safe_refusal() {
+        login_mirror_case("incomplete_prior");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_mirror_refuses_uuid_rebind_during_keychain_read() {
+        login_mirror_case("uuid_rebound");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_mirror_refuses_symlinked_prior_canonical() {
+        login_mirror_case("symlink_prior");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_mirror_refuses_symlinked_current_canonical() {
+        login_mirror_case("symlink_current");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_mirror_refuses_context_from_another_root() {
+        login_mirror_case("other_root");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_mirror_without_prior_canonical_retains_safe_refusal() {
+        login_mirror_case("missing_prior");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_mirror_refuses_unrelated_foreign_grant() {
+        login_mirror_case("foreign");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_mirror_refuses_different_account_prior() {
+        login_mirror_case("other_account");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_mirror_refuses_expired_context() {
+        login_mirror_case("expired");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_mirror_refuses_deadline_crossing_during_canonical_recheck() {
+        login_mirror_case("cross_deadline");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_mirror_refresh_context_takes_precedence() {
+        login_mirror_case("refreshed_precedence");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_mirror_context_is_not_reused_by_later_sweep() {
+        login_mirror_case("later_sweep");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn stage_known_mirror_fixture(
+        base: &Path,
+        identity: crate::accounts::identity_store::IdentityId,
+        email: &str,
+        credential: &credentials::CredentialFile,
+    ) {
+        use crate::accounts::anthropic_identity as ai;
+        let context = ai::AnthropicContext::new(
+            email,
+            uuid::Uuid::from_u128(101),
+            uuid::Uuid::from_u128(202),
+        )
+        .unwrap();
+        let path = crate::accounts::identity_store::identity_json_path_for(base, identity);
+        let metadata = serde_json::json!({"provider":"anthropic","email":context.email(),"account_uuid":context.account_uuid(),"organization_uuid":context.organization_uuid(),"created_at":"fixture"});
+        fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        crate::platform::fs::secure_file(&path).unwrap();
+        let mut pf = profiles::load(&profiles::profiles_path(base)).unwrap();
+        pf.anthropic_contexts
+            .retain(|entry| entry.identity_uuid != identity);
+        pf.anthropic_contexts.push(ai::AnthropicContextEntry {
+            email: context.email().into(),
+            account_uuid: context.account_uuid(),
+            organization_uuid: context.organization_uuid(),
+            identity_uuid: identity,
+            extra: Default::default(),
+        });
+        profiles::save(&profiles::profiles_path(base), &pf).unwrap();
+        credentials::file::save(
+            &crate::accounts::identity_store::credentials_path_for(base, identity),
+            credential,
+        )
+        .unwrap();
+        crate::credentials::token_history::record_write(base, identity, credential);
+        // No old-token owner proof: the transient witness must be the sole authorization channel.
+    }
+
+    /// Records the `error_kind` field of every event emitted inside `run`.
+    #[cfg(target_os = "macos")]
+    fn capture_error_kinds<T>(run: impl FnOnce() -> T) -> (T, Vec<String>) {
+        use std::sync::{Arc, Mutex};
+        struct Kinds(Arc<Mutex<Vec<String>>>);
+        struct Visit<'a>(&'a Mutex<Vec<String>>);
+        impl tracing::field::Visit for Visit<'_> {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "error_kind" {
+                    self.0.lock().unwrap().push(value.to_owned());
+                }
+            }
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
         }
+        impl tracing::Subscriber for Kinds {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                event.record(&mut Visit(&self.0));
+            }
+        }
+        let _guard = crate::testing::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let out = tracing::subscriber::with_default(Kinds(Arc::clone(&seen)), run);
+        let kinds = seen.lock().unwrap().clone();
+        (out, kinds)
+    }
 
-        const FRESH_EXPIRY: u64 = 4102444800000; // 2100-01-01
-        const STALE_EXPIRY: u64 = 2000000000000; // 2033-05-18 (< FRESH)
-
-        let dir = coexisting_fixture(1);
-        let base = dir.path();
-        let account = AccountNum::try_from(1u16).unwrap();
-        let uuid = fixture_uuid_for_slot(1);
-        let config_dir = base.join("config-1");
-
-        // .claude.json with the fixture email → mint reuses the fixture UUID.
-        fs::write(
-            config_dir.join(".claude.json"),
-            r#"{"oauthAccount":{"emailAddress":"fixture-slot-1@test.invalid"}}"#,
-        )
-        .unwrap();
-        let _ = crate::accounts::markers::write_csq_account_legacy(&config_dir, account);
-
-        // Pre-seed the store with the FRESH token (what a caller's
-        // read_fresh_after_login → save_canonical_for would have written).
-        credentials::save_canonical_for(
-            base,
-            account,
-            &anthropic_creds("sk-ant-oat01-FRESH", FRESH_EXPIRY),
-        )
-        .expect("pre-seed store with fresh token");
-
-        // config-N holds a STALE token (older expiry, different access_token) —
-        // the leftover keychain-first CC never refreshed.
-        credentials::save(
-            &cred_file::live_path(base, account),
-            &anthropic_creds("sk-ant-oat01-STALE", STALE_EXPIRY),
-        )
-        .unwrap();
-
-        // Act
-        let result = finalize_login(base, account);
-        assert!(result.is_ok(), "finalize_login must succeed: {result:?}");
-
-        // Assert: the store STILL carries the FRESH token — NOT regressed to STALE.
-        let store = credentials::load(&uuid_creds_path(base, uuid)).expect("store readable");
+    #[test]
+    fn login_commit_outcome_maps_busy_and_target_advanced_distinctly() {
+        use crate::accounts::anthropic_identity::IdentityError as E;
         assert_eq!(
-            store
-                .expect_anthropic()
-                .claude_ai_oauth
-                .access_token
-                .expose_secret(),
-            "sk-ant-oat01-FRESH",
-            "config-N login-overwrite: a stale config-N must NOT regress the fresher store token"
+            LoginCommitOutcome::from_identity_error(&E::BindingBusy),
+            LoginCommitOutcome::Busy
         );
         assert_eq!(
-            store.expect_anthropic().claude_ai_oauth.expires_at,
-            FRESH_EXPIRY,
-            "store expiry must remain the fresh value after finalize_login"
+            LoginCommitOutcome::from_identity_error(&E::TargetAdvancedPublicationFailed),
+            LoginCommitOutcome::TargetAdvancedPublicationFailed
+        );
+        assert_eq!(
+            LoginCommitOutcome::from_identity_error(&E::BindingChanged),
+            LoginCommitOutcome::IdentityChanged
+        );
+        assert_eq!(
+            LoginCommitOutcome::from_identity_error(&E::Io),
+            LoginCommitOutcome::PublicationFailed
+        );
+        assert_eq!(
+            LoginCommitOutcome::from_identity_error(&E::ProfileRefused),
+            LoginCommitOutcome::Refused
+        );
+        let all = [
+            LoginCommitOutcome::PublicationFailed,
+            LoginCommitOutcome::TargetAdvancedPublicationFailed,
+            LoginCommitOutcome::IdentityChanged,
+            LoginCommitOutcome::Busy,
+            LoginCommitOutcome::Refused,
+            LoginCommitOutcome::FinalizationRefused,
+            LoginCommitOutcome::IndexDamaged,
+        ];
+        for outcome in all {
+            assert_eq!(
+                LoginCommitOutcome::from_error_kind(outcome.error_kind()),
+                outcome
+            );
+        }
+        assert!(LoginCommitOutcome::describe_error_for_account(
+            &E::BindingBusy,
+            AccountNum::try_from(7u16).unwrap()
+        )
+        .contains("run `csq login 7` again"));
+        assert!(!LoginCommitOutcome::TargetAdvancedPublicationFailed
+            .message()
+            .contains("could not be confirmed"));
+        assert!(
+            !LoginCommitOutcome::describe_error(&E::BindingBusy).contains("anthropic_identity_")
         );
     }
 
-    /// config-N login-overwrite — monotonic-UP direction (R1 deep-analyst MED-2):
-    /// a config-N STRICTLY FRESHER than the store MUST advance the store. Pins the
-    /// `<=` boundary in `save_canonical_for_if_fresher` so a future operator flip
-    /// (`<` vs `<=`) or a regression to "never write" is caught. This is the
-    /// HIGH-2 safety net's general case: a non-pre-seeding caller (or a store left
-    /// behind an older token) is still seeded from a genuinely-fresh config-N.
+    /// A damaged organization record is refused with its own tag and remedy. `csq login`
+    /// refuses on the same record, so no surface (error text, message, per-account text)
+    /// may tell the operator to run it; the healthy shared-identity remedy still may.
+    #[test]
+    fn damaged_index_row_has_its_own_kind_and_a_remedy_that_never_says_csq_login() {
+        use crate::accounts::anthropic_identity::IdentityError as E;
+        let account = AccountNum::try_from(7u16).unwrap();
+        let damaged = [
+            LoginCommitOutcome::describe_error(&E::DamagedContextIndexRow),
+            LoginCommitOutcome::describe_error_for_account(&E::DamagedContextIndexRow, account),
+            LoginCommitOutcome::IndexDamaged.message().to_owned(),
+            E::DamagedContextIndexRow.to_string(),
+        ];
+        for text in &damaged {
+            assert!(!text.contains("csq login"), "got: {text}");
+            assert!(!text.contains("start login again"), "got: {text}");
+            assert!(
+                text.contains("restore a trusted profiles.json backup"),
+                "got: {text}"
+            );
+        }
+        assert!(
+            damaged[0].ends_with("(oauth_identity_index_damaged)"),
+            "got: {}",
+            damaged[0]
+        );
+        assert_eq!(
+            LoginCommitOutcome::from_identity_error(&E::DamagedContextIndexRow).error_kind(),
+            "oauth_identity_index_damaged"
+        );
+        // Control: the healthy shared-identity refusal keeps its own kind and its remedy.
+        let shared = LoginCommitOutcome::describe_error(&E::SharedLegacyIdentity);
+        assert!(shared.contains("`csq login`") && shared.ends_with("(oauth_identity_refused)"));
+    }
+
+    /// N-3: refusals with their own remedy keep it instead of collapsing to
+    /// the generic "organization identity could not be confirmed".
+    #[test]
+    fn describe_error_carries_each_refusal_remedy() {
+        use crate::accounts::anthropic_identity::IdentityError as E;
+        let shared = LoginCommitOutcome::describe_error(&E::SharedLegacyIdentity);
+        assert!(
+            shared.contains("each affected slot with `csq login` and its own slot number"),
+            "got: {shared}"
+        );
+        assert!(shared.contains("shared by several slots"), "got: {shared}");
+        let meta = LoginCommitOutcome::describe_error(&E::InvalidMetadata);
+        assert!(meta.contains("csq logout N"), "got: {meta}");
+        assert!(meta.contains("then `csq login N`"), "got: {meta}");
+        assert!(meta.contains("do not hand-edit"), "got: {meta}");
+        for text in [&shared, &meta] {
+            assert!(!text.contains("could not be confirmed"), "got: {text}");
+            assert!(!text.contains("anthropic_identity_"), "got: {text}");
+            assert!(text.ends_with("(oauth_identity_refused)"), "got: {text}");
+        }
+        // Negative control: other refusals keep the generic text.
+        assert!(LoginCommitOutcome::describe_error(&E::InvalidContext)
+            .contains("could not be confirmed"));
+    }
+
+    #[test]
+    fn org_identity_r3d_describe_error_preserves_specific_remedies() {
+        use crate::accounts::anthropic_identity::IdentityError as E;
+        for (error, required) in [
+            (
+                E::BoundIdentityMetadataMissing { account: 7 },
+                vec!["identity.json", "csq logout 7", "csq login 7"],
+            ),
+            (
+                E::LegacyEmailUnparseable,
+                vec!["legacy email", "csq login N"],
+            ),
+            (
+                E::UnsafePermissions,
+                vec![
+                    "identity.json",
+                    "credentials.json",
+                    "after confirming no other user modified",
+                    "csq logout N",
+                ],
+            ),
+            (
+                E::MultipleLinks,
+                vec!["identity.json", "hard links", "csq logout N"],
+            ),
+            (E::SnapshotChanged, vec!["retry"]),
+            (
+                E::ProfilesUnsafePermissions,
+                vec![
+                    "chmod 600 on profiles.json",
+                    "after confirming no other user modified it",
+                    "trusted backup",
+                ],
+            ),
+            (
+                E::ProfilesMultipleLinks,
+                vec!["profiles.json", "hard links"],
+            ),
+            (E::ProfilesSnapshotChanged, vec!["profiles.json", "retry"]),
+            (
+                E::ProfilesReadRefused,
+                vec!["profiles.json", "trusted backup", "do not hand-edit"],
+            ),
+        ] {
+            let text = LoginCommitOutcome::describe_error(&error);
+            for needle in required {
+                assert!(text.contains(needle), "missing {needle}: {text}");
+            }
+            assert!(!text.contains("could not be confirmed"), "{text}");
+            assert!(!text.contains("anthropic_identity_"), "{text}");
+            assert!(!text.contains("run the login again"), "{text}");
+        }
+    }
+
+    #[test]
+    fn org_identity_r3d_account_remedies_only_retry_supported_outcomes() {
+        use crate::accounts::anthropic_identity::IdentityError as E;
+        let account = AccountNum::try_from(7u16).unwrap();
+        for error in [
+            E::BindingChanged,
+            E::BindingBusy,
+            E::TargetAdvancedPublicationFailed,
+        ] {
+            let text = LoginCommitOutcome::describe_error_for_account(&error, account);
+            assert!(text.contains("run `csq login 7` again"), "{text}");
+            if matches!(error, E::BindingChanged | E::BindingBusy) {
+                assert!(!text.contains("start login again"), "{text}");
+                assert!(!text.contains("retry the login in a moment"), "{text}");
+            }
+            assert!(
+                text.ends_with(&format!(
+                    "({})",
+                    LoginCommitOutcome::from_identity_error(&error).error_kind()
+                )),
+                "{text}"
+            );
+        }
+        for error in [
+            E::InvalidMetadata,
+            E::LegacyEmailUnparseable,
+            E::BoundIdentityMetadataMissing { account: 7 },
+            E::UnsafePermissions,
+            E::MultipleLinks,
+            E::SnapshotChanged,
+            E::ProfilesUnsafePermissions,
+            E::ProfilesMultipleLinks,
+            E::ProfilesSnapshotChanged,
+            E::ProfilesReadRefused,
+            E::SharedLegacyIdentity,
+            E::InvalidContext,
+            E::Io,
+            E::ProfileRefused,
+        ] {
+            let text = LoginCommitOutcome::describe_error_for_account(&error, account);
+            assert!(!text.contains("run `csq login 7` again"), "{text}");
+            assert!(!text.contains("csq login N"), "{text}");
+            assert!(!text.contains("csq logout N"), "{text}");
+        }
+        let text = LoginCommitOutcome::describe_error_for_account(&E::InvalidMetadata, account);
+        assert!(text.contains("`csq logout 7` then `csq login 7`"), "{text}");
+        assert!(text.contains("do not hand-edit"), "{text}");
+        let unsafe_profiles =
+            LoginCommitOutcome::describe_error_for_account(&E::ProfilesUnsafePermissions, account);
+        assert!(
+            unsafe_profiles.contains("trusted backup"),
+            "{unsafe_profiles}"
+        );
+        assert!(!unsafe_profiles.contains("csq logout"), "{unsafe_profiles}");
+    }
+
+    /// r4 F2/L2: the two slot-naming refusals show the slot and the remedy on every
+    /// surface; the kind stays the refusal tag and no secret-bearing text appears.
+    #[test]
+    fn describe_error_names_the_slot_for_custody_and_held_elsewhere() {
+        use crate::accounts::anthropic_identity::{IdentityError as E, SlotKey};
+        let account = AccountNum::try_from(4u16).unwrap();
+        let sibling = E::SiblingCustodyUnreadable {
+            sibling: SlotKey::from_key("2"),
+        };
+        assert_eq!(
+            LoginCommitOutcome::describe_error(&sibling),
+            "slot 2's stored identity is unreadable; run `csq login 2` or `csq logout 2` to replace it (the slot being logged in is unaffected) (oauth_identity_refused)"
+        );
+        let held = E::LoginCredentialHeldElsewhere {
+            holder: SlotKey::from_key("2"),
+        };
+        assert_eq!(
+            LoginCommitOutcome::describe_error_for_account(&held, account),
+            "this login produced a credential that slot 2 already holds; run `csq login 4` again so a fresh credential is issued, or `csq logout 2` if slot 2 is the one that is stale (oauth_identity_refused)"
+        );
+        // A key that is not a canonical account number never reaches the text.
+        for key in ["evil\nkey", "+2", "02", "0", ""] {
+            let text = LoginCommitOutcome::describe_error(&E::SiblingCustodyUnreadable {
+                sibling: SlotKey::from_key(key),
+            });
+            assert!(text.starts_with("another slot's stored identity"), "{text}");
+            assert!(!text.contains("evil"), "{text}");
+            let text = LoginCommitOutcome::describe_error(&E::LoginCredentialHeldElsewhere {
+                holder: SlotKey::from_key(key),
+            });
+            assert!(text.contains("another slot already holds"), "{text}");
+        }
+        for error in [sibling, held] {
+            assert_eq!(
+                LoginCommitOutcome::from_identity_error(&error),
+                LoginCommitOutcome::Refused
+            );
+            let text = LoginCommitOutcome::describe_error(&error);
+            assert!(!text.contains("could not be confirmed"), "{text}");
+            assert!(!text.contains("anthropic_identity_"), "{text}");
+        }
+    }
+
+    /// N-3: a pre-login capture failure is not a "publication" failure.
+    #[test]
+    fn describe_prior_capture_error_is_not_a_publication_failure() {
+        use crate::accounts::anthropic_identity::IdentityError as E;
+        let io = LoginCommitOutcome::describe_prior_capture_error(&E::Io);
+        assert_eq!(io, E::Io.to_string());
+        assert!(!io.contains("credential publication failed"), "got: {io}");
+        assert!(
+            LoginCommitOutcome::describe_error(&E::Io).contains("credential publication failed")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_custody_snapshot_failure_warns_with_error_kind() {
+        with_in_memory_secret_backend(|| {
+            use crate::accounts::anthropic_identity as ai;
+            use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+            let dir = coexisting_fixture(2);
+            let base = dir.path();
+            let account = AccountNum::try_from(1u16).unwrap();
+            let identity = fixture_uuid_for_slot(1);
+            let config = base.join("config-1");
+            let raw = r#"{"claudeAiOauth":{"accessToken":"snap-at","refreshToken":"snap-rt","expiresAt":4102444800000,"scopes":["user:inference"],"subscriptionType":"max"}}"#;
+            fs::write(config.join(".credentials.json"), raw).unwrap();
+            let old = credentials::load(&config.join(".credentials.json")).unwrap();
+            stage_known_mirror_fixture(base, identity, "snap@test.invalid", &old);
+            fs::write(
+                config.join(".claude.json"),
+                r#"{"oauthAccount":{"emailAddress":"snap@test.invalid"}}"#,
+            )
+            .unwrap();
+            let incoming = raw
+                .replace("snap-at", "snap-new")
+                .replace("4102444800000", "4102444800001");
+            fs::write(config.join(".credentials.json"), &incoming).unwrap();
+            let receipt = fixture_verified_commit(base, account).unwrap();
+            let (binding, mirror, _) = receipt.into_parts();
+            let mut witness = mirror.expect("verified commit retains a witness");
+            {
+                let lock = ProfilesFileLock::acquire(base).unwrap();
+                assert!(ai::binding_custody_matches_locked(&lock, base, &binding).unwrap());
+                assert!(witness.bind_committed_custody(&binding));
+            }
+            let (healthy, kinds) = capture_error_kinds(|| witness.custody_snapshot_matches(base));
+            assert!(healthy);
+            assert!(kinds.is_empty(), "{kinds:?}");
+            let profiles_path = profiles::profiles_path(base);
+            fs::remove_file(&profiles_path).unwrap();
+            fs::create_dir(&profiles_path).unwrap();
+            let (matched, kinds) = capture_error_kinds(|| witness.custody_snapshot_matches(base));
+            assert!(!matched);
+            assert!(
+                kinds
+                    .iter()
+                    .any(|k| k == "login_custody_snapshot_unreadable"),
+                "{kinds:?}"
+            );
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_mirror_original_custody_rejects_aba_context_drift_and_canonical_advance() {
+        with_in_memory_secret_backend(|| {
+            use crate::accounts::{anthropic_identity as ai, identity_store};
+            use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+            for case in ["same_grant", "aba", "context_drift", "canonical_advance"] {
+                let dir = coexisting_fixture(2);
+                let base = dir.path();
+                let account = AccountNum::try_from(1u16).unwrap();
+                let identity = fixture_uuid_for_slot(1);
+                let config = base.join("config-1");
+                let old_raw = r#"{"claudeAiOauth":{"accessToken":"custody-old-at","refreshToken":"custody-old-rt","expiresAt":4102444800000,"scopes":["user:inference"],"subscriptionType":"max"}}"#;
+                fs::write(config.join(".credentials.json"), old_raw).unwrap();
+                let old = credentials::load(&config.join(".credentials.json")).unwrap();
+                stage_known_mirror_fixture(base, identity, "custody@test.invalid", &old);
+                fs::write(
+                    config.join(".claude.json"),
+                    r#"{"oauthAccount":{"emailAddress":"custody@test.invalid"}}"#,
+                )
+                .unwrap();
+                let incoming = old_raw
+                    .replace("custody-old", "custody-new")
+                    .replace("4102444800000", "4102444800001");
+                fs::write(config.join(".credentials.json"), &incoming).unwrap();
+                let receipt = fixture_verified_commit(base, account).unwrap();
+                let (binding, mirror, _) = receipt.into_parts();
+                let mut first = mirror.expect("actual verified commit retains original witness");
+                {
+                    let lock = ProfilesFileLock::acquire(base).unwrap();
+                    assert!(ai::binding_custody_matches_locked(&lock, base, &binding).unwrap());
+                    assert!(first.bind_committed_custody(&binding));
+                }
+                let repeated = fixture_verified_commit(base, account).unwrap();
+                let (same_binding, mirror, _) = repeated.into_parts();
+                let mut second = mirror.unwrap();
+                assert_eq!(same_binding.generation(), binding.generation());
+                {
+                    let lock = ProfilesFileLock::acquire(base).unwrap();
+                    assert!(
+                        ai::binding_custody_matches_locked(&lock, base, &same_binding).unwrap()
+                    );
+                    assert!(second.bind_committed_custody(&same_binding));
+                    assert_eq!(
+                        first.prior_for_locked(&lock, base, account, &incoming),
+                        token_history_fingerprint(old_raw)
+                    );
+                    assert_eq!(
+                        second.prior_for_locked(&lock, base, account, &incoming),
+                        token_history_fingerprint(&incoming)
+                    );
+                }
+                assert!(first.current_for(base, account));
+                let canonical = identity_store::credentials_path_for(base, identity);
+                let before = fs::read(&canonical).unwrap();
+                match case {
+                    "aba" => {
+                        let lock = ProfilesFileLock::acquire(base).unwrap();
+                        assert!(profiles::swap_slot_mapping(&lock, base, 1, 2).unwrap());
+                        assert!(profiles::swap_slot_mapping(&lock, base, 1, 2).unwrap());
+                        assert_eq!(profiles::resolve_slot_to_uuid(base, 1), Some(identity));
+                        let current =
+                            ai::capture_anthropic_binding_locked(&lock, base, account).unwrap();
+                        assert!(current.generation() > binding.generation());
+                        assert!(
+                            !first.bind_committed_custody(&current),
+                            "old witness custody is immutable across ABA"
+                        );
+                        assert_eq!(fs::read(&canonical).unwrap(), before);
+                    }
+                    "context_drift" => {
+                        let _lock = ProfilesFileLock::acquire(base).unwrap();
+                        let path = identity_store::identity_json_path_for(base, identity);
+                        let mut metadata: serde_json::Value =
+                            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                        metadata["organization_uuid"] =
+                            serde_json::json!(uuid::Uuid::from_u128(303));
+                        fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+                        let mut pf = profiles::load(&profiles::profiles_path(base)).unwrap();
+                        pf.anthropic_contexts
+                            .iter_mut()
+                            .find(|entry| entry.identity_uuid == identity)
+                            .unwrap()
+                            .organization_uuid = uuid::Uuid::from_u128(303);
+                        profiles::save(&profiles::profiles_path(base), &pf).unwrap();
+                        assert_eq!(fs::read(&canonical).unwrap(), before);
+                    }
+                    "canonical_advance" => {
+                        let changed = incoming
+                            .replace("custody-new-at", "custody-next-at")
+                            .replace("4102444800001", "4102444800002");
+                        fs::write(&canonical, changed).unwrap();
+                    }
+                    "same_grant" => (),
+                    _ => unreachable!(),
+                }
+                let lock = ProfilesFileLock::acquire(base).unwrap();
+                if case == "same_grant" {
+                    assert!(first.current_for(base, account));
+                    assert_eq!(
+                        first.prior_for_locked(&lock, base, account, &incoming),
+                        token_history_fingerprint(old_raw)
+                    );
+                } else {
+                    assert!(
+                        !first.current_for(base, account),
+                        "original witness must refuse {case}"
+                    );
+                    assert!(first.prior_for(base, account, &incoming).is_none());
+                    assert!(first
+                        .prior_for_locked(&lock, base, account, &incoming)
+                        .is_none());
+                }
+            }
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    fn token_history_fingerprint(
+        raw: &str,
+    ) -> Option<crate::credentials::token_history::Fingerprint> {
+        crate::credentials::token_history::fingerprint_from_raw_json(raw)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn login_mirror_case(case: &str) {
+        with_in_memory_secret_backend(|| {
+            use crate::credentials::keychain::{
+                clear_test_keychain_executor, set_test_keychain_executor, KeychainExecutor,
+                RawContentClassification, ScriptedKeychainExecutor,
+            };
+            use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            use std::rc::Rc;
+            struct ResetExecutor;
+            impl Drop for ResetExecutor {
+                fn drop(&mut self) {
+                    clear_test_keychain_executor();
+                }
+            }
+            struct ResetClock(Option<std::collections::VecDeque<std::time::Instant>>);
+            impl Drop for ResetClock {
+                fn drop(&mut self) {
+                    TEST_LOGIN_MIRROR_CLOCK.with(|clock| {
+                        clock.replace(self.0.take());
+                    });
+                }
+            }
+            struct MutatingExecutor {
+                inner: Rc<ScriptedKeychainExecutor>,
+                after_find: std::cell::RefCell<Option<Box<dyn FnOnce()>>>,
+            }
+            impl KeychainExecutor for MutatingExecutor {
+                fn find(&self, service: &str, account: &str) -> RawContentClassification {
+                    let value = self.inner.find(service, account);
+                    if let Some(change) = self.after_find.borrow_mut().take() {
+                        change();
+                    }
+                    value
+                }
+                fn add(
+                    &self,
+                    service: &str,
+                    account: &str,
+                    payload: &str,
+                ) -> Result<(), crate::error::PlatformError> {
+                    self.inner.add(service, account, payload)
+                }
+                fn delete(&self, service: &str, account: &str) -> bool {
+                    self.inner.delete(service, account)
+                }
+            }
+            let dir = coexisting_fixture(2);
+            let base = dir.path();
+            let account = AccountNum::try_from(1u16).unwrap();
+            let uuid = fixture_uuid_for_slot(1);
+            let config = base.join("config-1");
+            fs::write(
+                config.join(".claude.json"),
+                r#"{"oauthAccount":{"emailAddress":"fixture-slot-1@test.invalid"}}"#,
+            )
+            .unwrap();
+            // Year 2100 keeps both fixture grants valid for the real mirror policy.
+            let old_raw = r#"{"claudeAiOauth":{"accessToken":"fixture-old-at","refreshToken":"fixture-old-rt","expiresAt":4102444800000,"scopes":["user:inference"],"subscriptionType":"max"}}"#;
+            fs::write(config.join(".credentials.json"), old_raw).unwrap();
+            let old = credentials::load(&config.join(".credentials.json")).unwrap();
+            stage_known_mirror_fixture(base, uuid, "fixture-slot-1@test.invalid", &old);
+            crate::credentials::file::save(
+                &crate::accounts::identity_store::credentials_path_for(base, uuid),
+                &old,
+            )
+            .unwrap();
+            crate::credentials::token_history::record_write(base, uuid, &old);
+            let old_fp =
+                crate::credentials::token_history::fingerprint_from_raw_json(old_raw).unwrap();
+            assert!(crate::credentials::token_history::read_history(base, uuid).contains(&old_fp));
+            let handle = base.join(format!("term-{}", std::process::id()));
+            fs::create_dir(&handle).unwrap();
+            crate::accounts::markers::write_csq_account(&config, uuid).unwrap();
+            symlink(
+                crate::accounts::identity_store::credentials_path_for(base, uuid),
+                handle.join(".credentials.json"),
+            )
+            .unwrap();
+            symlink(config.join(".csq-account"), handle.join(".csq-account")).unwrap();
+            fs::write(handle.join(".live-pid"), std::process::id().to_string()).unwrap();
+            assert!(crate::session::handle_dir::handle_dir_symlinks_are_consistent(base, &handle));
+            let foreign_raw = old_raw
+                .replace("fixture-old-at", "fixture-foreign-at")
+                .replace("fixture-old-rt", "fixture-foreign-rt");
+            let exec = Rc::new(ScriptedKeychainExecutor::scripted(
+                RawContentClassification::Content(
+                    if matches!(case, "symlink_prior" | "foreign" | "other_account") {
+                        foreign_raw.clone().into()
+                    } else {
+                        old_raw.to_string().into()
+                    },
+                ),
+            ));
+            let _reset = ResetExecutor;
+            let new_raw = old_raw
+                .replace("fixture-old-at", "fixture-new-at")
+                .replace("fixture-old-rt", "fixture-new-rt");
+            fs::write(config.join(".credentials.json"), &new_raw).unwrap();
+            let new = credentials::load(&config.join(".credentials.json")).unwrap();
+            if case == "missing_prior" {
+                fs::remove_file(crate::accounts::identity_store::credentials_path_for(
+                    base, uuid,
+                ))
+                .unwrap();
+            }
+            if case == "unreadable_prior" {
+                fs::write(
+                    crate::accounts::identity_store::credentials_path_for(base, uuid),
+                    "invalid-fixture-json",
+                )
+                .unwrap();
+            }
+            if case == "incomplete_prior" {
+                fs::write(
+                    crate::accounts::identity_store::credentials_path_for(base, uuid),
+                    r#"{"claudeAiOauth":{"refreshToken":"fixture-old-rt"}}"#,
+                )
+                .unwrap();
+            }
+            let foreign_path = base.join("foreign-grant.json");
+            if case == "symlink_prior" {
+                std::fs::write(&foreign_path, &foreign_raw).unwrap();
+                std::fs::set_permissions(&foreign_path, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+                let path = crate::accounts::identity_store::credentials_path_for(base, uuid);
+                std::fs::remove_file(&path).unwrap();
+                symlink(&foreign_path, &path).unwrap();
+            }
+            let mut context = prepare_verified_login_mirror(base, account, uuid, &new);
+            let canonical = crate::accounts::identity_store::credentials_path_for(base, uuid);
+            // Explicit fixture setup includes deliberate malformed/symlink inputs; no production write bypass.
+            if std::fs::symlink_metadata(&canonical).is_ok_and(|m| m.file_type().is_symlink()) {
+                std::fs::remove_file(&canonical).unwrap();
+            }
+            crate::credentials::file::save(&canonical, &new).unwrap();
+            if !matches!(case, "symlink_prior" | "incomplete_prior") {
+                assert_eq!(
+                    context.is_some(),
+                    !matches!(case, "missing_prior" | "unreadable_prior")
+                );
+            }
+            let other_root = (case == "other_root").then(|| coexisting_fixture(1));
+            if let Some(other) = other_root.as_ref() {
+                stage_known_mirror_fixture(other.path(), uuid, "fixture-slot-1@test.invalid", &old);
+                crate::credentials::file::save(
+                    &crate::accounts::identity_store::credentials_path_for(other.path(), uuid),
+                    &old,
+                )
+                .unwrap();
+                context = prepare_verified_login_mirror(other.path(), account, uuid, &new);
+                crate::credentials::file::save(
+                    &crate::accounts::identity_store::credentials_path_for(other.path(), uuid),
+                    &new,
+                )
+                .unwrap();
+            }
+            if case == "other_account" {
+                let other = AccountNum::try_from(2u16).unwrap();
+                let metadata_path = profiles::profiles_path(base);
+                let mut metadata = profiles::load(&metadata_path).unwrap();
+                metadata.by_slot.insert("2".into(), uuid);
+                profiles::save(&metadata_path, &metadata).unwrap();
+                assert_eq!(
+                    profiles::resolve_slot_to_uuid(base, other.get()),
+                    Some(uuid)
+                );
+                let path = config.join(".credentials.json");
+                fs::write(&path, &foreign_raw).unwrap();
+                let prior = credentials::load(&path).unwrap();
+                crate::credentials::file::save(
+                    &crate::accounts::identity_store::credentials_path_for(base, uuid),
+                    &prior,
+                )
+                .unwrap();
+                context = prepare_verified_login_mirror(base, other, uuid, &new);
+                crate::credentials::file::save(
+                    &crate::accounts::identity_store::credentials_path_for(base, uuid),
+                    &new,
+                )
+                .unwrap();
+                fs::write(&path, &new_raw).unwrap();
+            }
+            if let Some(context) = context.as_mut() {
+                let binding = crate::accounts::anthropic_identity::capture_anthropic_binding(
+                    &context.base,
+                    context.account,
+                )
+                .unwrap();
+                assert!(context.bind_committed_custody(&binding));
+            }
+            if case == "expired" {
+                context.as_mut().unwrap().expires = std::time::Instant::now();
+            }
+            let base_owned = base.to_path_buf();
+            let changed = match case {
+                "refresh_changed" => new_raw.replace("fixture-new-rt", "fixture-changed-rt"),
+                "expiry_changed" => new_raw.replace("4102444800000", "4102444800001"),
+                _ => new_raw.replace("fixture-new-at", "fixture-changed-at"),
+            };
+            let current_raw = new_raw.clone();
+            let after_find: Option<Box<dyn FnOnce()>> = match case {
+                "canonical_changed" | "refresh_changed" | "expiry_changed" => {
+                    Some(Box::new(move || {
+                        let path = crate::accounts::identity_store::credentials_path_for(
+                            &base_owned,
+                            uuid,
+                        );
+                        fs::write(path, changed).unwrap();
+                    }))
+                }
+                "symlink_current" => Some(Box::new(move || {
+                    let foreign = base_owned.join("foreign-current.json");
+                    std::fs::write(&foreign, &current_raw).unwrap();
+                    std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                    let path =
+                        crate::accounts::identity_store::credentials_path_for(&base_owned, uuid);
+                    std::fs::remove_file(&path).unwrap();
+                    symlink(&foreign, path).unwrap();
+                })),
+                "uuid_rebound" => Some(Box::new(move || {
+                    let path = profiles::profiles_path(&base_owned);
+                    let mut metadata = profiles::load(&path).unwrap();
+                    metadata
+                        .by_slot
+                        .insert("1".into(), fixture_uuid_for_slot(2));
+                    profiles::save(&path, &metadata).unwrap();
+                })),
+                _ => None,
+            };
+            set_test_keychain_executor(Rc::new(MutatingExecutor {
+                inner: exec.clone(),
+                after_find: std::cell::RefCell::new(after_find),
+            }));
+            // Only the witness clock is scripted: early eligibility succeeds, then
+            // the final probe occurs after the held reread and grant digests.
+            let _clock = (case == "cross_deadline").then(|| {
+                let deadline = context.as_ref().unwrap().expires;
+                let early = deadline - std::time::Duration::from_secs(1);
+                ResetClock(TEST_LOGIN_MIRROR_CLOCK.with(|clock| {
+                    clock.replace(Some(std::collections::VecDeque::from([early, deadline])))
+                }))
+            });
+            // Exercise synchronous mirror policy directly; verified finalization now queues delivery.
+            crate::credentials::token_history::start_new_segment(
+                base,
+                uuid,
+                crate::credentials::token_history::fingerprint_from_raw_json(&new_raw).unwrap(),
+            );
+            if case == "refreshed_precedence" {
+                let map = std::collections::HashMap::from([(
+                    account,
+                    crate::credentials::token_history::fingerprint_from_raw_json(&foreign_raw)
+                        .unwrap(),
+                )]);
+                crate::credentials::keychain::sync_all_handle_dirs_context(
+                    base,
+                    &map,
+                    context.as_ref(),
+                );
+            } else {
+                crate::credentials::keychain::sync_all_handle_dirs_context(
+                    base,
+                    &std::collections::HashMap::new(),
+                    context.as_ref(),
+                );
+            }
+            if case == "symlink_prior" {
+                assert!(
+                    std::fs::read_to_string(&foreign_path).unwrap() == foreign_raw,
+                    "canonical save must preserve the symlink target bytes"
+                );
+            }
+            let history = crate::credentials::token_history::read_history(base, uuid);
+            assert!(
+                !history.contains(&old_fp),
+                "login must still discard the old grant history"
+            );
+            assert!(
+                exec.calls().iter().any(|(verb, _, _)| *verb == "find"),
+                "the real sweep must reach its injected executor"
+            );
+            if matches!(case, "fresh" | "later_sweep") {
+                let written = exec
+                    .last_add_payload()
+                    .expect("login must deliver the new grant");
+                let written_fp =
+                    crate::credentials::token_history::fingerprint_from_raw_json(&written).unwrap();
+                let new_fp =
+                    crate::credentials::token_history::fingerprint_from_raw_json(&new_raw).unwrap();
+                assert_eq!(written_fp, new_fp, "mirror must carry the fresh grant");
+                assert!(history.contains(&new_fp));
+                if case == "later_sweep" {
+                    let later = Rc::new(ScriptedKeychainExecutor::scripted(
+                        RawContentClassification::Content(old_raw.to_string().into()),
+                    ));
+                    set_test_keychain_executor(later.clone());
+                    crate::credentials::keychain::sync_all_handle_dirs(
+                        base,
+                        &std::collections::HashMap::new(),
+                    );
+                    assert!(later.calls().iter().any(|(verb, _, _)| *verb == "find"));
+                    assert!(
+                        later
+                            .calls()
+                            .iter()
+                            .all(|(verb, _, _)| *verb != "add" && *verb != "delete"),
+                        "consumed login context must not authorize a later sweep"
+                    );
+                }
+            } else {
+                assert!(
+                    exec.calls()
+                        .iter()
+                        .all(|(verb, _, _)| *verb != "add" && *verb != "delete"),
+                    "a mismatched or absent witness must grant no mirror write"
+                );
+                if case == "cross_deadline" {
+                    assert!(
+                        TEST_LOGIN_MIRROR_CLOCK.with(|clock| {
+                            clock
+                                .borrow()
+                                .as_ref()
+                                .is_some_and(|times| times.is_empty())
+                        }),
+                        "both early and final witness clock probes must execute"
+                    );
+                }
+            }
+        });
+    }
+
+    /// An exact-token profile proof permits a same-context new login grant; TTL alone grants no authority.
     #[test]
     fn finalize_login_fresher_config_n_advances_store() {
         use crate::accounts::identity_store::credentials_path_for as uuid_creds_path;
@@ -1191,7 +2159,7 @@ mod tests {
         let _ = crate::accounts::markers::write_csq_account_legacy(&config_dir, account);
 
         // Store holds an OLDER token; config-N holds a strictly NEWER token.
-        credentials::save_canonical_for(
+        stage_fixture_canonical(
             base,
             account,
             &anthropic_creds("sk-ant-oat01-OLD", OLD_EXPIRY),
@@ -1203,7 +2171,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = finalize_login(base, account);
+        let result = fixture_verified_finalize(base, account);
         assert!(result.is_ok(), "finalize_login must succeed: {result:?}");
 
         let store = credentials::load(&uuid_creds_path(base, uuid)).expect("store readable");
@@ -1223,156 +2191,10 @@ mod tests {
         );
     }
 
-    /// config-N login-overwrite — fail-closed on a corrupt store (R1 code-review
-    /// LOW): the new `save_canonical_for_if_fresher` path returns Ok(false) WITHOUT
-    /// writing when the store is unreadable/corrupt, whereas the old unconditional
-    /// `save_canonical_for` would have overwritten it from config-N. This pins the
-    /// fail-closed posture (an account-global store must never be clobbered on
-    /// doubt) so a future refactor cannot silently reintroduce the overwrite.
-    #[test]
-    fn finalize_login_corrupt_store_no_ops_fail_closed() {
-        use crate::accounts::identity_store::credentials_path_for as uuid_creds_path;
-        use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
-
-        fn anthropic_creds(access: &str, expires_at: u64) -> crate::credentials::CredentialFile {
-            crate::credentials::CredentialFile::Anthropic(
-                crate::credentials::AnthropicCredentialFile {
-                    claude_ai_oauth: crate::credentials::OAuthPayload {
-                        access_token: crate::types::AccessToken::new(access.into()),
-                        refresh_token: crate::types::RefreshToken::new(format!(
-                            "sk-ant-ort01-{access}"
-                        )),
-                        expires_at,
-                        scopes: vec!["user:inference".into()],
-                        subscription_type: Some("max".into()),
-                        rate_limit_tier: None,
-                        extra: std::collections::HashMap::new(),
-                    },
-                    extra: std::collections::HashMap::new(),
-                },
-            )
-        }
-
-        let dir = coexisting_fixture(1);
-        let base = dir.path();
-        let account = AccountNum::try_from(1u16).unwrap();
-        let uuid = fixture_uuid_for_slot(1);
-        let config_dir = base.join("config-1");
-        fs::write(
-            config_dir.join(".claude.json"),
-            r#"{"oauthAccount":{"emailAddress":"fixture-slot-1@test.invalid"}}"#,
-        )
-        .unwrap();
-        let _ = crate::accounts::markers::write_csq_account_legacy(&config_dir, account);
-
-        // Corrupt the store file (exists but unparseable) and place a valid,
-        // fresher token in config-N. if_fresher must read the corrupt store,
-        // fail closed (Ok(false)), and leave it untouched.
-        let store_path = uuid_creds_path(base, uuid);
-        if let Some(parent) = store_path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        let corrupt_bytes = b"{ this is not valid credential json ";
-        std::fs::write(&store_path, corrupt_bytes).unwrap();
-        credentials::save(
-            &cred_file::live_path(base, account),
-            &anthropic_creds("sk-ant-oat01-CONFIGN", 4102444800000),
-        )
-        .unwrap();
-
-        let result = finalize_login(base, account);
-        assert!(
-            result.is_ok(),
-            "finalize_login must remain Ok (non-fatal) on a corrupt store: {result:?}"
-        );
-
-        let after = std::fs::read(&store_path).expect("store file still present");
-        assert_eq!(
-            after.as_slice(),
-            corrupt_bytes,
-            "fail-closed: a corrupt store MUST NOT be overwritten from config-N"
-        );
-    }
-
-    /// config-N login-overwrite — ABSENT config-N path (R2 completeness NIT):
-    /// keychain-first CC may leave NO `config-N/.credentials.json` at all. That
-    /// routes to the Err(NotFound) deferral branch, which MUST NOT write the
-    /// store. Pins "absent config-N => no store write, finalize_login still Ok"
-    /// so a future refactor cannot make the NotFound branch seed a default cred.
-    #[test]
-    fn finalize_login_absent_config_n_defers_without_touching_store() {
-        use crate::accounts::identity_store::credentials_path_for as uuid_creds_path;
-        use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
-
-        fn anthropic_creds(access: &str, expires_at: u64) -> crate::credentials::CredentialFile {
-            crate::credentials::CredentialFile::Anthropic(
-                crate::credentials::AnthropicCredentialFile {
-                    claude_ai_oauth: crate::credentials::OAuthPayload {
-                        access_token: crate::types::AccessToken::new(access.into()),
-                        refresh_token: crate::types::RefreshToken::new(format!(
-                            "sk-ant-ort01-{access}"
-                        )),
-                        expires_at,
-                        scopes: vec!["user:inference".into()],
-                        subscription_type: Some("max".into()),
-                        rate_limit_tier: None,
-                        extra: std::collections::HashMap::new(),
-                    },
-                    extra: std::collections::HashMap::new(),
-                },
-            )
-        }
-
-        const FRESH_EXPIRY: u64 = 4102444800000; // 2100
-
-        let dir = coexisting_fixture(1);
-        let base = dir.path();
-        let account = AccountNum::try_from(1u16).unwrap();
-        let uuid = fixture_uuid_for_slot(1);
-        let config_dir = base.join("config-1");
-        fs::write(
-            config_dir.join(".claude.json"),
-            r#"{"oauthAccount":{"emailAddress":"fixture-slot-1@test.invalid"}}"#,
-        )
-        .unwrap();
-        let _ = crate::accounts::markers::write_csq_account_legacy(&config_dir, account);
-
-        // Pre-seed a FRESH store, then ensure config-N/.credentials.json is ABSENT.
-        credentials::save_canonical_for(
-            base,
-            account,
-            &anthropic_creds("sk-ant-oat01-FRESH", FRESH_EXPIRY),
-        )
-        .expect("pre-seed fresh store");
-        let live = cred_file::live_path(base, account);
-        let _ = std::fs::remove_file(&live);
-        assert!(
-            !live.exists(),
-            "precondition: config-N/.credentials.json must be absent"
-        );
-
-        let result = finalize_login(base, account);
-        assert!(
-            result.is_ok(),
-            "finalize_login must remain Ok when config-N is absent: {result:?}"
-        );
-
-        let store = credentials::load(&uuid_creds_path(base, uuid)).expect("store readable");
-        assert_eq!(
-            store
-                .expect_anthropic()
-                .claude_ai_oauth
-                .access_token
-                .expose_secret(),
-            "sk-ant-oat01-FRESH",
-            "absent config-N: the fresh store token MUST be left untouched"
-        );
-    }
-
     /// M4-2 Criterion: `finalize_login` writes `identities/<UUID>/settings.json`
     /// byte-equivalent to `config-<N>/settings.json`.
     ///
-    /// The pair-write in `finalize_login` (post-`mint_for_login`) reads the
+    /// The pair-write in `finalize_login` (post-`commit_anthropic_login`) reads the
     /// legacy `config-<N>/settings.json` and writes the same bytes verbatim to
     /// `identities/<UUID>/settings.json`. The two paths must be byte-equivalent
     /// during the M4-2 → M4-5 transition window (spec 02 §2.3.3) so
@@ -1400,7 +2222,7 @@ mod tests {
         let uuid = fixture_uuid_for_slot(1);
 
         // Set up the config-1 marker + .claude.json so finalize_login's
-        // mint_for_login reuses the fixture UUID by email.
+        // the verified commit keeps the fixture UUID.
         let config_dir = base.join("config-1");
         let claude_json_path = config_dir.join(".claude.json");
         fs::write(
@@ -1459,7 +2281,7 @@ mod tests {
         .unwrap();
 
         // Act
-        let result = finalize_login(base, account);
+        let result = fixture_verified_finalize(base, account);
         assert!(result.is_ok(), "finalize_login must succeed: {:?}", result);
 
         // Assert: UUID settings.json now byte-equivalent to legacy.
@@ -1479,7 +2301,7 @@ mod tests {
 
     /// M4-7 acceptance: `finalize_login` writes UUID content to
     /// `config-<N>/.csq-account` when `profiles.json::by_slot` carries a
-    /// mapping for the slot. `mint_for_login` runs inside `finalize_login`
+    /// mapping for the slot. `commit_anthropic_login` runs before `finalize_verified_login`
     /// and (re)uses the fixture UUID via the by_email lookup, so the
     /// post-mint marker write surfaces `Some(uuid)` and emits the
     /// canonical UUID-v4 string. Filename `.csq-account` is unchanged
@@ -1489,8 +2311,8 @@ mod tests {
         use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
 
         // Arrange: coexisting fixture seeds profiles.json with the
-        // by_email entry for slot 1; finalize_login's mint_for_login
-        // hook re-uses the fixture UUID via by_email lookup so the
+        // by_email entry for slot 1; the verified commit
+        // keeps the fixture UUID so the
         // by_slot mapping resolves after the lock release.
         let dir = coexisting_fixture(1);
         let base = dir.path();
@@ -1531,7 +2353,7 @@ mod tests {
         .unwrap();
 
         // Act
-        let result = finalize_login(base, account);
+        let result = fixture_verified_finalize(base, account);
         assert!(result.is_ok(), "finalize_login must succeed: {:?}", result);
 
         // Assert: UUID accessor returns the fixture UUID.
@@ -1550,80 +2372,11 @@ mod tests {
         );
     }
 
-    /// M4-7 acceptance: when no `by_slot` mapping is resolvable for the
-    /// slot (pure-legacy install where mint failed or was skipped),
-    /// `finalize_login` falls back to the legacy decimal writer so the
-    /// M1-5 numeric reader still surfaces the slot id. Achieved here by
-    /// providing a `.claude.json` whose email is `"unknown"` — that
-    /// short-circuits the mint hook (cannot establish a stable by_email
-    /// key per the existing mint guard), leaving `by_slot` empty.
-    #[test]
-    fn finalize_login_legacy_writes_decimal_when_no_by_slot() {
-        // Build a base where profiles.json carries no by_slot mapping at all.
-        let dir = TempDir::new().unwrap();
-        let base = dir.path();
-        let account = AccountNum::try_from(2u16).unwrap();
-        let config_dir = base.join("config-2");
-        std::fs::create_dir_all(&config_dir).unwrap();
-
-        // `.claude.json` with empty email field → read_email returns None
-        // → finalize_login uses "unknown" → mint_for_login is skipped
-        // → no by_slot entry materializes → resolve_slot_to_uuid is None.
-        fs::write(
-            config_dir.join(".claude.json"),
-            r#"{"oauthAccount":{"emailAddress":""}}"#,
-        )
-        .unwrap();
-
-        // Live creds for the credential-seed step (best-effort).
-        let live_creds_path = config_dir.join(".credentials.json");
-        credentials::save(
-            &live_creds_path,
-            &crate::credentials::CredentialFile::Anthropic(
-                crate::credentials::AnthropicCredentialFile {
-                    claude_ai_oauth: crate::credentials::OAuthPayload {
-                        access_token: crate::types::AccessToken::new(
-                            "sk-ant-oat01-m47-legacy-test".into(),
-                        ),
-                        refresh_token: crate::types::RefreshToken::new(
-                            "sk-ant-ort01-m47-legacy-test".into(),
-                        ),
-                        expires_at: 4102444800000,
-                        scopes: vec!["user:inference".into()],
-                        subscription_type: Some("max".into()),
-                        rate_limit_tier: None,
-                        extra: std::collections::HashMap::new(),
-                    },
-                    extra: std::collections::HashMap::new(),
-                },
-            ),
-        )
-        .unwrap();
-
-        // Act
-        let result = finalize_login(base, account);
-        assert!(result.is_ok(), "finalize_login must succeed: {:?}", result);
-
-        // Assert: marker content is decimal slot id (legacy writer used
-        // because no by_slot mapping exists for slot 2).
-        assert_eq!(
-            crate::accounts::markers::read_csq_account(&config_dir),
-            Some(account),
-            "M4-7: pure-legacy install (no by_slot) must write the decimal slot id"
-        );
-        // No UUID is recoverable from the marker file.
-        assert_eq!(
-            crate::accounts::markers::read_csq_account_uuid(&config_dir),
-            None,
-            "M4-7: legacy marker has no UUID content"
-        );
-    }
-
     /// M4-9 (release N affordance, an internal ticket Phase 4):
     /// `finalize_login` MUST NOT populate the v1
     /// `profiles.json::accounts[N]` map. After login, the map is `{}`.
     /// The slot's email is carried by `by_email` (written by
-    /// `mint_for_login`), and `ProfilesFile::get_email(N)` resolves it
+    /// `commit_anthropic_login`), and `ProfilesFile::get_email(N)` resolves it
     /// via the `by_slot → UUID → by_email` reverse-lookup fallback.
     #[test]
     fn finalize_login_does_not_populate_v1_accounts_map() {
@@ -1684,7 +2437,7 @@ mod tests {
         }
 
         // Act
-        let result = finalize_login(base, account);
+        let result = fixture_verified_finalize(base, account);
         assert!(result.is_ok(), "finalize_login must succeed: {result:?}");
 
         // Assert: profiles.json::accounts is still empty.
@@ -1780,7 +2533,7 @@ mod tests {
         .unwrap();
 
         // Act: perform Anthropic OAuth finalize on the same slot.
-        let result = finalize_login(base, account);
+        let result = fixture_verified_finalize(base, account);
         assert!(
             result.is_ok(),
             "finalize_login must succeed on 3P→OAuth transition: {result:?}"
@@ -1806,8 +2559,8 @@ mod tests {
     /// PRODUCTION ORDERING (an internal ticket regression — was a false pass here
     /// before the fix): every production caller
     /// (`csq/src/cli/commands/login.rs::handle_direct_post_subprocess`, and
-    /// the desktop login twins) calls `ensure_login_identity_minted` +
-    /// `save_canonical_for` BEFORE `finalize_login` ever runs (an internal ticket),
+    /// the desktop login twins) calls `commit_anthropic_login` BEFORE
+    /// `finalize_verified_login` ever runs (an internal ticket),
     /// which mints `by_slot[account]` for the fresh Anthropic identity ahead
     /// of the marker-cleanup call inside `finalize_login`. The prior version
     /// of this test called `finalize_login` directly against a base with NO
@@ -1858,10 +2611,7 @@ mod tests {
         // PRODUCTION ORDERING: mint the slot's identity UUID, then write the
         // canonical UUID-keyed credential — exactly what
         // `handle_direct_post_subprocess` does — BEFORE `finalize_login` runs.
-        ensure_login_identity_minted(base, account)
-            .expect("ensure_login_identity_minted must succeed");
-        credentials::save_canonical_for(base, account, &anthropic_creds)
-            .expect("save_canonical_for must succeed");
+        let committed = fixture_verified_commit(base, account).expect("exact grant verified");
 
         // Pin the vault backend: `clear_detected_marker_binding` deletes the
         // Gemini vault entry BEFORE the marker and is fail-closed on any
@@ -1870,7 +2620,8 @@ mod tests {
         // open) and RED on a bus-less Linux CI runner, where the marker is
         // deliberately left in place. See
         // `platform::test_env::with_in_memory_secret_backend`.
-        let result = with_in_memory_secret_backend(|| finalize_login(base, account));
+        let result =
+            with_in_memory_secret_backend(|| finalize_verified_login(base, account, committed));
         assert!(
             result.is_ok(),
             "finalize_login must succeed on Gemini→OAuth transition: {result:?}"
@@ -1953,10 +2704,13 @@ mod tests {
         )
         .unwrap();
 
+        let committed =
+            fixture_verified_commit(base, account).expect("verified receipt precedes lock failure");
         // Force ProfilesFileLock::acquire to fail: it opens `.profiles.lock`
         // with `OpenOptions::write(true)`, which errors EISDIR against a
         // directory. This is the exact failure point security review named
         // ("the very next fallible step is ProfilesFileLock::acquire").
+        fs::remove_file(base.join(".profiles.lock")).unwrap();
         fs::create_dir_all(base.join(".profiles.lock")).unwrap();
 
         // Pinned for the same reason as the sibling cleanup test, and for one
@@ -1964,7 +2718,8 @@ mod tests {
         // by the environment rather than by the capture/act split, so the
         // survival assertion would hold even if that split regressed. Pinning
         // an always-available backend keeps this test discriminating.
-        let result = with_in_memory_secret_backend(|| finalize_login(base, account));
+        let result =
+            with_in_memory_secret_backend(|| finalize_verified_login(base, account, committed));
         assert!(
             result.is_err(),
             "finalize_login must fail when the profiles lock cannot be acquired: {result:?}"
@@ -2049,6 +2804,8 @@ mod tests {
         )
         .unwrap();
 
+        let committed =
+            fixture_verified_commit(base, account).expect("verified receipt precedes lock failure");
         // Act: force the same EISDIR failure at `ProfilesFileLock::acquire`.
         // Unlike the Gemini fixture, `bind_provider_to_slot` has already taken
         // the profiles lock, so `.profiles.lock` exists as a regular FILE —
@@ -2056,7 +2813,7 @@ mod tests {
         let lock_path = base.join(".profiles.lock");
         let _ = fs::remove_file(&lock_path);
         fs::create_dir_all(&lock_path).unwrap();
-        let result = finalize_login(base, account);
+        let result = finalize_verified_login(base, account, committed);
 
         // Assert: the login failed AND the operator's key survived it.
         assert!(
@@ -2064,6 +2821,10 @@ mod tests {
             "finalize_login must fail when the profiles lock cannot be acquired: {result:?}"
         );
         let after = fs::read_to_string(&settings_path).unwrap();
+        assert_eq!(
+            before, after,
+            "failed receipt finalization must preserve every settings byte"
+        );
         assert!(
             after.contains("ANTHROPIC_AUTH_TOKEN"),
             "the 3P API key must SURVIVE a finalize_login that fails — a login \
@@ -2118,12 +2879,9 @@ mod tests {
         credentials::save(&config_dir.join(".credentials.json"), &anthropic_creds).unwrap();
 
         // PRODUCTION ORDERING: mint, then save canonical — BEFORE finalize_login.
-        ensure_login_identity_minted(base, account)
-            .expect("ensure_login_identity_minted must succeed");
-        credentials::save_canonical_for(base, account, &anthropic_creds)
-            .expect("save_canonical_for must succeed");
+        let committed = fixture_verified_commit(base, account).expect("exact grant verified");
 
-        let result = finalize_login(base, account);
+        let result = finalize_verified_login(base, account, committed);
         assert!(
             result.is_ok(),
             "finalize_login must succeed on native→OAuth transition: {result:?}"
@@ -2135,13 +2893,9 @@ mod tests {
         );
     }
 
-    /// an internal ticket: `ensure_login_identity_minted` mints a fresh slot's UUID from the
-    /// OAuth email in `config-N/.claude.json` when no `by_slot` mapping exists.
-    /// This is the fresh-install / macOS-keychain-only case where the later
-    /// `save_canonical_for` would otherwise fail-closed on the absent UUID
-    /// (M4-12) because the only mint site (`finalize_login`) runs AFTER it.
+    /// Fresh verified login publishes a full context and UUID; legacy email indexing remains unchanged.
     #[test]
-    fn ensure_login_identity_minted_mints_when_absent_on_fresh_install() {
+    fn verified_login_mints_uuid_when_absent_on_fresh_install() {
         let dir = TempDir::new().unwrap();
         let base = dir.path();
         let account = AccountNum::try_from(3u16).unwrap();
@@ -2160,24 +2914,94 @@ mod tests {
             "pre-condition: slot 3 must have no UUID before mint"
         );
 
-        ensure_login_identity_minted(base, account).expect("mint must succeed");
+        let credential: credentials::CredentialFile = serde_json::from_value(serde_json::json!({"claudeAiOauth":{"accessToken":"fixture-verified-at","refreshToken":"fixture-verified-rt","expiresAt":4102444800000u64,"scopes":[]}})).unwrap();
+        credentials::save(&config_dir.join(".credentials.json"), &credential).unwrap();
+        fixture_verified_finalize(base, account).expect("verified fresh login must succeed");
 
         let uuid = profiles::resolve_slot_to_uuid(base, 3)
-            .expect("slot 3 must resolve to a minted UUID after ensure_login_identity_minted");
+            .expect("slot 3 must resolve to a minted UUID after verified login");
         let pf = profiles::load(&profiles::profiles_path(base)).unwrap();
-        assert_eq!(
-            pf.by_email.get("fresh-slot-3@test.invalid").copied(),
-            Some(uuid),
-            "by_email must map the OAuth email to the same minted UUID so \
-             finalize_login's later mint_for_login is an idempotent reuse"
+        assert!(
+            pf.by_email.is_empty(),
+            "legacy email index is not new ownership authority"
+        );
+        assert!(
+            pf.anthropic_contexts
+                .iter()
+                .any(|entry| entry.identity_uuid == uuid
+                    && entry.email == "fresh-slot-3@test.invalid")
         );
     }
 
-    /// an internal ticket: a second call is a no-op — the slot keeps its original UUID.
-    /// This is the property that makes `finalize_login`'s later
-    /// `mint_for_login` an idempotent reuse rather than a churn / second UUID.
+    /// The exact grants' verified native contexts distinguish equal-email orgs.
     #[test]
-    fn ensure_login_identity_minted_is_idempotent() {
+    fn org_identity_regression_same_email_distinct_native_contexts_get_distinct_uuids() {
+        use crate::accounts::anthropic_identity as ai;
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let email = "same-user@test.invalid";
+        for slot in [1u16, 2u16] {
+            let account_uuid = uuid::Uuid::from_u128(u128::from(slot) + 100);
+            let organization_uuid = uuid::Uuid::from_u128(u128::from(slot) + 200);
+            let config = base.join(format!("config-{slot}"));
+            fs::create_dir_all(&config).unwrap();
+            let native = serde_json::json!({"oauthAccount": {"emailAddress":email,"accountUuid":account_uuid,"organizationUuid":organization_uuid}});
+            fs::write(
+                config.join(".claude.json"),
+                serde_json::to_vec(&native).unwrap(),
+            )
+            .unwrap();
+            crate::platform::fs::secure_file(&config.join(".claude.json")).unwrap();
+            let expected = ai::read_native_expectation(&config).unwrap();
+            let credential = crate::credentials::CredentialFile::Anthropic(
+                crate::credentials::AnthropicCredentialFile {
+                    claude_ai_oauth: crate::credentials::OAuthPayload {
+                        access_token: crate::types::AccessToken::new(format!("fake-access-{slot}")),
+                        refresh_token: crate::types::RefreshToken::new(format!(
+                            "fake-refresh-{slot}"
+                        )),
+                        expires_at: 4102444800000,
+                        scopes: vec![],
+                        subscription_type: None,
+                        rate_limit_tier: None,
+                        extra: std::collections::HashMap::new(),
+                    },
+                    extra: std::collections::HashMap::new(),
+                },
+            );
+            let transport: crate::daemon::usage_poller::HttpGetFn = std::sync::Arc::new(
+                move |url, bearer, _| {
+                    assert_eq!(url, "https://api.anthropic.com/api/oauth/profile");
+                    assert_eq!(bearer, format!("fake-access-{slot}"));
+                    Ok((200, serde_json::to_vec(&serde_json::json!({"account":{"uuid":account_uuid,"email":email},"organization":{"uuid":organization_uuid}})).unwrap()))
+                },
+            );
+            let account = AccountNum::try_from(slot).unwrap();
+            let prior = ai::capture_login_prior(base, account).unwrap();
+            let committed = ai::commit_anthropic_login_with(
+                base,
+                account,
+                &credential,
+                &transport,
+                Some(&expected),
+                prior,
+            )
+            .unwrap();
+            assert_eq!(
+                finalize_verified_login(base, account, committed).unwrap(),
+                email
+            );
+        }
+        assert_ne!(profiles::resolve_slot_to_uuid(base, 1).unwrap(), profiles::resolve_slot_to_uuid(base, 2).unwrap(),
+            "different verified account/organization contexts must not share a credential identity merely because their emails match");
+        let pf = profiles::load(&profiles::profiles_path(base)).unwrap();
+        assert_eq!(pf.anthropic_contexts.len(), 2);
+        assert!(pf.by_email.is_empty(), "fresh context publication must preserve the legacy index without creating ownership claims");
+    }
+
+    /// Repeated verified login to the same full context preserves the identity UUID.
+    #[test]
+    fn verified_login_reuses_uuid_for_same_context() {
         let dir = TempDir::new().unwrap();
         let base = dir.path();
         let account = AccountNum::try_from(2u16).unwrap();
@@ -2189,30 +3013,13 @@ mod tests {
         )
         .unwrap();
 
-        ensure_login_identity_minted(base, account).expect("first mint must succeed");
+        let credential: credentials::CredentialFile = serde_json::from_value(serde_json::json!({"claudeAiOauth":{"accessToken":"fixture-verified-at","refreshToken":"fixture-verified-rt","expiresAt":4102444800000u64,"scopes":[]}})).unwrap();
+        credentials::save(&config_dir.join(".credentials.json"), &credential).unwrap();
+        fixture_verified_finalize(base, account).expect("first verified login must succeed");
         let first = profiles::resolve_slot_to_uuid(base, 2).unwrap();
-        ensure_login_identity_minted(base, account).expect("second call must be a no-op Ok");
+        fixture_verified_finalize(base, account)
+            .expect("same-context verified login must reuse UUID");
         let second = profiles::resolve_slot_to_uuid(base, 2).unwrap();
         assert_eq!(first, second, "UUID must not churn across repeat calls");
-    }
-
-    /// an internal ticket: with no email source (no `.claude.json`), the helper returns `Ok`
-    /// WITHOUT inventing an identity. The caller's `save_canonical_for` then
-    /// surfaces its own genuine fail-closed error rather than this helper
-    /// minting a UUID against a guessed / absent email.
-    #[test]
-    fn ensure_login_identity_minted_noops_without_email() {
-        let dir = TempDir::new().unwrap();
-        let base = dir.path();
-        let account = AccountNum::try_from(4u16).unwrap();
-        // config-4 exists but CC hasn't written `.claude.json` yet.
-        fs::create_dir_all(base.join("config-4")).unwrap();
-
-        ensure_login_identity_minted(base, account).expect("must return Ok with no mint");
-
-        assert!(
-            profiles::resolve_slot_to_uuid(base, 4).is_none(),
-            "no email → no UUID minted; helper must not invent an identity"
-        );
     }
 }

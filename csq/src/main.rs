@@ -21,6 +21,9 @@ mod mode;
 #[cfg(any(feature = "cli", feature = "desktop"))]
 mod daemon_log;
 
+#[cfg(any(feature = "cli", feature = "desktop"))]
+mod daemon_host;
+
 #[cfg(feature = "cli")]
 mod cli;
 
@@ -36,13 +39,14 @@ mod desktop;
 /// what was actually compiled. Names per `rules/terrene-naming.md`: community =
 /// `csq`, enterprise = `csq-ee`; the invoked command stays `csq` for both.
 /// Defined at the crate root (not under the feature-gated `cli`/`desktop`
-/// modules) so both surfaces can read it in any feature combination.
-#[cfg(feature = "enterprise")]
+/// modules) so either compiled surface can read it; omitted when neither is built.
+#[cfg(all(any(feature = "cli", feature = "desktop"), feature = "enterprise"))]
 pub(crate) const BUILD_EDITION: &str = "enterprise";
-#[cfg(not(feature = "enterprise"))]
+#[cfg(all(any(feature = "cli", feature = "desktop"), not(feature = "enterprise")))]
 pub(crate) const BUILD_EDITION: &str = "community";
 
 /// Human-readable edition label, e.g. `Enterprise (csq-ee)` / `Community (csq)`.
+#[cfg(feature = "cli")]
 pub(crate) fn edition_label() -> &'static str {
     match BUILD_EDITION {
         "enterprise" => "Enterprise (csq-ee)",
@@ -52,9 +56,9 @@ pub(crate) fn edition_label() -> &'static str {
 
 /// `--version` string carrying the edition suffix, e.g. `2.16.2 (community)`.
 /// `concat!(env!(...), ...)` resolves at compile time to a single `&'static str`.
-#[cfg(feature = "enterprise")]
+#[cfg(all(any(feature = "cli", feature = "desktop"), feature = "enterprise"))]
 pub(crate) const VERSION_LINE: &str = concat!(env!("CARGO_PKG_VERSION"), " (enterprise)");
-#[cfg(not(feature = "enterprise"))]
+#[cfg(all(any(feature = "cli", feature = "desktop"), not(feature = "enterprise")))]
 pub(crate) const VERSION_LINE: &str = concat!(env!("CARGO_PKG_VERSION"), " (community)");
 
 fn main() {

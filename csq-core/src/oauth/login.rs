@@ -92,6 +92,29 @@ pub struct LoginRequest {
 /// supported platforms (they panic only if the OS CSPRNG is
 /// unavailable, which cannot happen on macOS/Linux/Windows).
 pub fn start_login(store: &OAuthStateStore, account: AccountNum) -> Result<LoginRequest, CsqError> {
+    start_login_inner(store, account, None)
+}
+
+/// Bind pending PKCE state to authority captured before URL generation.
+/// `base` is the canonical base captured by the initiating caller.
+pub fn start_login_with_prior(
+    store: &OAuthStateStore,
+    account: AccountNum,
+    base: std::path::PathBuf,
+    prior: crate::accounts::anthropic_identity::LoginPrior,
+) -> Result<LoginRequest, CsqError> {
+    start_login_inner(
+        store,
+        account,
+        Some(super::state_store::PendingLogin { base, prior }),
+    )
+}
+
+fn start_login_inner(
+    store: &OAuthStateStore,
+    account: AccountNum,
+    verified_login: Option<super::state_store::PendingLogin>,
+) -> Result<LoginRequest, CsqError> {
     // AccountNum already guarantees 1..=999, but we defensively
     // re-check so a future widening of AccountNum's range doesn't
     // silently allow 0 here.
@@ -103,7 +126,9 @@ pub fn start_login(store: &OAuthStateStore, account: AccountNum) -> Result<Login
 
     let verifier = generate_verifier();
     let challenge = challenge_from_verifier(&verifier);
-    let state = store.insert(verifier, account).map_err(CsqError::OAuth)?;
+    let state = store
+        .insert_with_login_prior(verifier, account, verified_login)
+        .map_err(CsqError::OAuth)?;
     let auth_url = build_auth_url(&state, &challenge, PASTE_CODE_REDIRECT_URI);
 
     Ok(LoginRequest {

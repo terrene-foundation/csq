@@ -89,7 +89,7 @@ pub fn target_debug_dir() -> PathBuf {
                 .map(PathBuf::from)
         })
         .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            csq_core::testing::manifest_dir(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .unwrap()
                 .join("target")
@@ -127,4 +127,17 @@ pub fn stub_cli_bin() -> PathBuf {
         path.display()
     );
     path
+}
+
+/// Remove every CI-sentinel variable the production detector reads from a
+/// child command's env. Sourced from `csq_core::env::CI_SENTINEL_VARS` (the
+/// slice the detector itself iterates), never a hand-copied list, so a new
+/// detector variable is stripped automatically. Defence in depth on top of
+/// `env_clear()`: removes the CI vars set on `cmd` before this call; call it
+/// last if a pass-through loop is added.
+#[allow(dead_code)]
+pub fn strip_ci_env(cmd: &mut std::process::Command) {
+    for v in csq_core::env::CI_SENTINEL_VARS {
+        cmd.env_remove(v);
+    }
 }

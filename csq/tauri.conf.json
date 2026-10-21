@@ -1,7 +1,7 @@
 {
   "$schema": "ui/node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Code Squad Q",
-  "version": "2.20.2",
+  "version": "2.21.0",
   "identifier": "foundation.terrene.claude-squad",
   "build": {
     "frontendDist": "ui/dist",
@@ -26,6 +26,7 @@
   },
   "plugins": {
     "updater": {
+      "requireSignedVersion": true,
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYxQzJGN0ZENzlGOTUyREQKUldUZFV2bDUvZmZDOFFEWU83V1J3TDZPb21wVXI2My9XVml2WWdHZWUxTG55SjUxY3JyVUY1M0gK",
       "endpoints": [
         "https://github.com/terrene-foundation/csq/releases/download/updater-manifest/latest.json",

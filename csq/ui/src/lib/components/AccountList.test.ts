@@ -109,6 +109,7 @@ let mockResponses: Record<string, unknown> = {};
 function setupMocks(overrides: Record<string, unknown> = {}) {
   mockResponses = {
     get_accounts: [ACCOUNT_1, ACCOUNT_2],
+    get_pending_rescues: [],
     remove_account: undefined,
     rename_account: undefined,
     list_providers: [],
@@ -274,12 +275,303 @@ describe("AccountList", () => {
     );
   });
 
+  it("maps the refresh_suppressed_duplicate_grant tag to operator text", async () => {
+    setupMocks({
+      get_accounts: [
+        { ...ACCOUNT_2, last_refresh_error: "refresh_suppressed_duplicate_grant" },
+      ],
+    });
+    const { container } = render(AccountList);
+    await settle();
+    expect(container.textContent).toContain(
+      "shares a sign-in with another slot \u2014 re-login needed",
+    );
+    // The raw tag must not leak through the unknown-tag passthrough.
+    expect(container.textContent).not.toContain(
+      "refresh_suppressed_duplicate_grant",
+    );
+  });
+
   it("shows re-auth button for expired or errored accounts", async () => {
     const { container } = render(AccountList);
     await settle();
     const reauthBtns = container.querySelectorAll(".reauth-btn");
     expect(reauthBtns.length).toBeGreaterThanOrEqual(1);
     expect(reauthBtns[0].textContent).toContain("Re-auth");
+  });
+
+  // ── Pending login rescue state ──────────────────────────────
+  //
+  // `AccountView` carries the fixed-vocabulary `rescue_pending` tag plus
+  // the SAME operator text `csq status` / `csq doctor` print
+  // (`rescue_pending_message`). `unadoptable` means the saved login could
+  // NOT be restored — the user must sign in again — so the row must say so
+  // as a warning. `adoptable` is transient (the next refresh tick installs
+  // or discards the record) and must read quieter, so the two states are
+  // not visually confusable. Both fields are serde-skipped when None:
+  // an older backend (or an identity with no pending record) sends
+  // neither, and the row must render nothing at all.
+
+  describe("Pending login rescue state", () => {
+    it("renders the unadoptable message as a warning in the row", async () => {
+      const unadoptable = {
+        ...ACCOUNT_1,
+        id: 40,
+        label: "Rescue-40",
+        rescue_pending: "unadoptable" as const,
+        rescue_pending_message:
+          "a saved login could not be restored; sign in again for this account",
+      };
+      setupMocks({ get_accounts: [unadoptable] });
+      const { container } = render(AccountList);
+      await settle();
+
+      const warning = container.querySelector(
+        '[data-testid="rescue-pending-unadoptable"]',
+      ) as HTMLElement | null;
+      expect(warning).not.toBeNull();
+      expect(warning?.textContent).toContain(
+        "a saved login could not be restored",
+      );
+      expect(warning?.textContent).toContain(
+        "sign in again for this account",
+      );
+      // Warning marker — the same ⚠ idiom `.refresh-error` uses.
+      expect(warning?.textContent).toContain("⚠");
+      // The transient/quiet variant is NOT also rendered for this row.
+      expect(
+        container.querySelector('[data-testid="rescue-pending-adoptable"]'),
+      ).toBeNull();
+      // Rendered on the card, alongside the account it belongs to.
+      const card = warning?.closest(".account-card") as HTMLElement | null;
+      expect(card).not.toBeNull();
+      expect(card?.textContent).toContain("Rescue-40");
+    });
+
+    it("renders the adoptable message in the quieter transient style", async () => {
+      const adoptable = {
+        ...ACCOUNT_1,
+        id: 41,
+        label: "Rescue-41",
+        rescue_pending: "adoptable" as const,
+        rescue_pending_message:
+          "saved login restoration pending; the next refresh tick retries it automatically",
+      };
+      setupMocks({ get_accounts: [adoptable] });
+      const { container } = render(AccountList);
+      await settle();
+
+      const transient = container.querySelector(
+        '[data-testid="rescue-pending-adoptable"]',
+      ) as HTMLElement | null;
+      expect(transient).not.toBeNull();
+      expect(transient?.textContent).toContain(
+        "saved login restoration pending",
+      );
+      expect(transient?.textContent).toContain(
+        "the next refresh tick retries it automatically",
+      );
+      // Quieter style: no warning marker, no warning testid.
+      expect(transient?.textContent).not.toContain("⚠");
+      expect(
+        container.querySelector('[data-testid="rescue-pending-unadoptable"]'),
+      ).toBeNull();
+    });
+
+    it("renders neither rescue element when the fields are absent or null", async () => {
+      // Absent = the real wire shape for None (serde skips both fields);
+      // explicit null covers a hand-built/IPC payload that spells it out.
+      const nullRescue = {
+        ...ACCOUNT_1,
+        id: 42,
+        label: "NoRescue-42",
+        rescue_pending: null,
+        rescue_pending_message: null,
+      };
+      setupMocks({ get_accounts: [ACCOUNT_1, nullRescue] });
+      const { container } = render(AccountList);
+      await settle();
+
+      expect(container.querySelectorAll(".account-card").length).toBe(2);
+      expect(
+        container.querySelector('[data-testid="rescue-pending-unadoptable"]'),
+      ).toBeNull();
+      expect(
+        container.querySelector('[data-testid="rescue-pending-adoptable"]'),
+      ).toBeNull();
+    });
+
+    it("falls back to the fixed operator text when only the tag is sent", async () => {
+      // Version-skew defense: the Rust fields are mapped together today,
+      // so this covers a payload that carries the tag without its paired
+      // message. The row must still state the state, never render a blank
+      // line. The fallback strings mirror RescuePendingState::message().
+      const tagOnly = {
+        ...ACCOUNT_1,
+        id: 43,
+        label: "Rescue-43",
+        rescue_pending: "unadoptable" as const,
+      };
+      setupMocks({ get_accounts: [tagOnly] });
+      const { container } = render(AccountList);
+      await settle();
+
+      const warning = container.querySelector(
+        '[data-testid="rescue-pending-unadoptable"]',
+      ) as HTMLElement | null;
+      expect(warning).not.toBeNull();
+      expect(warning?.textContent).toContain(
+        "a saved login could not be restored; sign in again for this account",
+      );
+    });
+
+    // ── Page-level rescue rows (get_pending_rescues) ─────────
+    //
+    // When `profiles.json` is unreadable there is no slot→identity mapping,
+    // so a pending rescue has NO account card to live on. The backend's
+    // fallback enumerates `identities/` and labels each row by canonical
+    // UUID; if even that scan cannot run it emits ONE explicit `unknown`
+    // row. Both render above the list from the backend's fixed-vocabulary
+    // `status_line` — the desktop must never show silence where `csq
+    // status` and `csq doctor` show a warning.
+
+    it("renders a UUID-labelled fallback rescue row above the list", async () => {
+      const uuid = "550e8400-e29b-41d4-a716-446655440000";
+      setupMocks({
+        get_pending_rescues: [
+          {
+            slot: null,
+            label: "",
+            state: "unadoptable",
+            identity_uuid: uuid,
+            message:
+              "a saved login could not be restored; sign in again for this account",
+            status_line: `identity ${uuid}: a saved login could not be restored; sign in again for this account`,
+          },
+        ],
+      });
+      const { container } = render(AccountList);
+      await settle();
+
+      const rows = container.querySelectorAll(
+        '[data-testid="pending-rescue-unadoptable"]',
+      );
+      expect(rows.length).toBe(1);
+      expect(rows[0].textContent).toContain(`identity ${uuid}`);
+      expect(rows[0].textContent).toContain(
+        "a saved login could not be restored",
+      );
+      expect(rows[0].textContent).toContain("⚠");
+      // Page-level, not inside an account card.
+      expect(rows[0].closest(".account-card")).toBeNull();
+    });
+
+    it("renders exactly one explicit unknown row when rescue state is undetermined", async () => {
+      setupMocks({
+        get_pending_rescues: [
+          {
+            slot: null,
+            label: "",
+            state: "unknown",
+            message: "rescue status unknown: profiles unreadable",
+            status_line: "rescue status unknown: profiles unreadable",
+          },
+        ],
+      });
+      const { container } = render(AccountList);
+      await settle();
+
+      const rows = container.querySelectorAll(
+        '[data-testid="pending-rescue-unknown"]',
+      );
+      expect(rows.length).toBe(1);
+      expect(rows[0].textContent).toContain(
+        "rescue status unknown: profiles unreadable",
+      );
+      expect(rows[0].textContent).toContain("⚠");
+      expect(
+        container.querySelector('[data-testid="pending-rescue-unadoptable"]'),
+      ).toBeNull();
+    });
+
+    // R3 finding corr L-9: a REJECTED `get_pending_rescues` is a diagnostic
+    // state, not silence. The desktop must render the same explicit unknown
+    // row `csq status`/`csq doctor` show, and log a fixed-vocabulary tag —
+    // never the rejection text (which can carry paths / free-form detail).
+    it("renders an explicit unknown row and a fixed log tag when the rescue query rejects", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        mockInvoke.mockImplementation((cmd: string) => {
+          if (cmd === "get_pending_rescues") {
+            return Promise.reject(
+              new Error("ipc exploded: /Users/someone/secret"),
+            );
+          }
+          return Promise.resolve(mockResponses[cmd]);
+        });
+        const { container } = render(AccountList);
+        await settle();
+
+        const rows = container.querySelectorAll(
+          '[data-testid="pending-rescue-unknown"]',
+        );
+        expect(rows.length).toBe(1);
+        expect(rows[0].textContent).toContain(
+          "rescue status unknown: pending rescue query failed",
+        );
+        expect(rows[0].textContent).toContain("⚠");
+        // Page-level, not inside an account card.
+        expect(rows[0].closest(".account-card")).toBeNull();
+
+        // Fixed vocabulary only: neither the rendered row nor the log may
+        // carry the rejection text.
+        expect(container.textContent).not.toContain("ipc exploded");
+        expect(container.textContent).not.toContain("/Users/someone/secret");
+        expect(warn).toHaveBeenCalledWith(
+          "[csq] error_kind=pending_rescue_fetch_failed",
+        );
+        for (const call of warn.mock.calls) {
+          expect(JSON.stringify(call)).not.toContain("ipc exploded");
+        }
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("does not duplicate a slot-keyed rescue that already renders in its card", async () => {
+      const inCard = {
+        ...ACCOUNT_1,
+        id: 7,
+        rescue_pending: "unadoptable" as const,
+        rescue_pending_message:
+          "a saved login could not be restored; sign in again for this account",
+      };
+      setupMocks({
+        get_accounts: [inCard],
+        get_pending_rescues: [
+          {
+            slot: 7,
+            label: "Account 1",
+            state: "unadoptable",
+            message:
+              "a saved login could not be restored; sign in again for this account",
+            status_line:
+              "slot 7: a saved login could not be restored; sign in again for this account",
+          },
+        ],
+      });
+      const { container } = render(AccountList);
+      await settle();
+
+      // The card warning renders; the page-level copy does not.
+      expect(
+        container.querySelectorAll('[data-testid="rescue-pending-unadoptable"]')
+          .length,
+      ).toBe(1);
+      expect(
+        container.querySelector('[data-testid="pending-rescue-unadoptable"]'),
+      ).toBeNull();
+    });
   });
 
   // ── Error state ─────────────────────────────────────────────
@@ -1427,6 +1719,31 @@ describe("AccountList", () => {
       expect(container.querySelector(".error")).toBeNull();
     });
 
+    it("an unreadable-marker remove failure does not claim a session is running", async () => {
+      mockInvoke.mockImplementation((cmd: string) => {
+        if (cmd === "remove_account") {
+          return Promise.reject(
+            "ACCOUNT_MARKER_UNREADABLE: account 1: handle dir term-1234 has a pid marker that cannot be read; inspect it and remove it if stale, then retry",
+          );
+        }
+        return Promise.resolve(mockResponses[cmd]);
+      });
+      const { container } = render(AccountList);
+      await settle();
+
+      const removeBtns = container.querySelectorAll(".remove-btn");
+      await fireEvent.click(removeBtns[0]);
+      await tick();
+      await fireEvent.click(removeBtns[0]);
+      await settle();
+
+      const text = container.querySelector('[data-testid="remove-error"]')?.textContent ?? "";
+      expect(text).toContain("term-1234");
+      expect(text).toContain("cannot be read");
+      expect(text).not.toContain("still running");
+      expect(text).not.toContain("ACCOUNT_MARKER_UNREADABLE");
+    });
+
     it("a move failure renders inline inside the still-open picker without blanking the list", async () => {
       mockInvoke.mockImplementation((cmd: string) => {
         if (cmd === "move_account") {
@@ -1467,6 +1784,88 @@ describe("AccountList", () => {
       expect(container.querySelectorAll(".account-card").length).toBe(2);
       expect(container.querySelector(".error")).toBeNull();
     });
+  });
+
+  // ── Remove outcome: deferred credential-folder cleanup ────────
+  //
+  // `remove_account` SUCCEEDS once the account is tombstoned even if the
+  // slot's local credential folder could not be deleted yet (its
+  // credential lock was busy or the delete failed). The summary reports
+  // that deferral on `identity_dir_pending_removal`; the UI must say the
+  // folder is still on disk — not report an unqualified success.
+
+  const PENDING_SUMMARY = {
+    account: 1,
+    canonical_removed: true,
+    config_dir_removed: true,
+    profiles_entry_removed: true,
+    keychain_cleared: true,
+    identity_dir_pending_removal: true,
+  };
+
+  it("says the credential folder was NOT removed when the summary reports it pending", async () => {
+    setupMocks({ remove_account: PENDING_SUMMARY });
+    const { container } = render(AccountList);
+    await settle();
+
+    const removeBtns = container.querySelectorAll(".remove-btn");
+    await fireEvent.click(removeBtns[0]); // arm
+    await tick();
+    await fireEvent.click(removeBtns[0]); // confirm
+    await settle();
+
+    const notice = container.querySelector(".info-notice");
+    expect(notice).not.toBeNull();
+    expect(notice?.textContent).toContain("NOT removed");
+    expect(notice?.textContent).toContain("next cleanup pass will remove it");
+  });
+
+  it("keeps the plain success path when the credential folder was removed", async () => {
+    setupMocks({
+      remove_account: {
+        ...PENDING_SUMMARY,
+        identity_dir_pending_removal: false,
+      },
+    });
+    const { container } = render(AccountList);
+    await settle();
+
+    const removeBtns = container.querySelectorAll(".remove-btn");
+    await fireEvent.click(removeBtns[0]);
+    await tick();
+    await fireEvent.click(removeBtns[0]);
+    await settle();
+
+    expect(container.querySelector(".info-notice")).toBeNull();
+  });
+
+  it("still reports the pending folder when removing the last account empties the list", async () => {
+    let accountFetches = 0;
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_accounts") {
+        accountFetches += 1;
+        // First load: one account. Post-removal refetch: empty list, so
+        // the component falls into its "No accounts configured" branch —
+        // the notice must paint there too.
+        return Promise.resolve(accountFetches === 1 ? [ACCOUNT_1] : []);
+      }
+      if (cmd === "remove_account") return Promise.resolve(PENDING_SUMMARY);
+      return Promise.resolve(undefined);
+    });
+    const { container } = render(AccountList);
+    await settle();
+
+    const removeBtns = container.querySelectorAll(".remove-btn");
+    await fireEvent.click(removeBtns[0]);
+    await tick();
+    await fireEvent.click(removeBtns[0]);
+    await settle();
+
+    expect(container.querySelectorAll(".account-card").length).toBe(0);
+    expect(container.textContent).toContain("No accounts configured");
+    const notice = container.querySelector(".info-notice");
+    expect(notice).not.toBeNull();
+    expect(notice?.textContent).toContain("NOT removed");
   });
 
   // ── F5 — keyboard access to card controls ─────────────────────

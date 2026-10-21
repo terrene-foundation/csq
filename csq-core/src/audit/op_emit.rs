@@ -780,26 +780,41 @@ fn redact_reason_with_needles(
     literal: Option<String>,
     canonical: Option<String>,
 ) -> String {
-    let (first, second) = match (&literal, &canonical) {
-        (Some(a), Some(b)) if a.len() != b.len() => {
-            let (longer, shorter) = if a.len() > b.len() { (a, b) } else { (b, a) };
-            if longer.contains(shorter.as_str()) {
-                (Some(longer.clone()), Some(shorter.clone()))
-            } else {
-                (literal.clone(), canonical.clone())
-            }
-        }
-        _ => (literal.clone(), canonical.clone()),
-    };
+    redact_reason_with_needles_and_shorts(
+        raw,
+        literal,
+        canonical,
+        crate::cli_deps::sanitize::short_path_string,
+    )
+}
 
-    let mut scrubbed = raw.to_string();
-    if let Some(needle) = &first {
-        scrubbed = crate::cli_deps::sanitize::redact_needle_anywhere(&scrubbed, needle);
+/// [`redact_reason_with_needles`] with the 8.3 short-name lookup injected,
+/// so a test can exercise the short-name needles on any OS. Needles are the
+/// literal and canonical home plus the short form of each (mirroring
+/// `redact_home_anywhere`), run longest first so a containing needle is
+/// never half-rewritten by a contained one.
+fn redact_reason_with_needles_and_shorts(
+    raw: &str,
+    literal: Option<String>,
+    canonical: Option<String>,
+    short_of: impl Fn(&str) -> Option<String>,
+) -> String {
+    let mut needles: Vec<String> = Vec::new();
+    for n in [literal, canonical].into_iter().flatten() {
+        if !needles.contains(&n) {
+            needles.push(n);
+        }
     }
-    if let Some(needle) = &second {
-        scrubbed = crate::cli_deps::sanitize::redact_needle_anywhere(&scrubbed, needle);
+    let shorts: Vec<String> = needles.iter().filter_map(|n| short_of(n)).collect();
+    for sh in shorts {
+        if !sh.is_empty() && !needles.contains(&sh) {
+            needles.push(sh);
+        }
     }
-    scrubbed
+    needles.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    needles.iter().fold(raw.to_string(), |acc, needle| {
+        crate::cli_deps::sanitize::redact_needle_anywhere(&acc, needle)
+    })
 }
 
 #[cfg(test)]
@@ -1539,6 +1554,25 @@ mod tests {
     /// canonical path) must still redact via the literal needle — the
     /// reordering above must not accidentally suppress the shorter
     /// needle's own, independent occurrences.
+    /// Item 2: the 8.3 short form of the literal and canonical home is a
+    /// needle too. RED if the short needles are dropped (the short spelling
+    /// then survives).
+    #[test]
+    fn redact_reason_scrubs_8_3_short_names_of_both_homes() {
+        let short = |p: &str| match p {
+            "/home/runneradmin" => Some("/home/RUNNER~1".to_string()),
+            "/mnt/real/runneradmin" => Some("/mnt/REAL~1/RUNNER~1".to_string()),
+            _ => None,
+        };
+        let out = redact_reason_with_needles_and_shorts(
+            "a /home/RUNNER~1/x b /mnt/REAL~1/RUNNER~1/y c /home/RUNNER~10/z",
+            Some("/home/runneradmin".to_string()),
+            Some("/mnt/real/runneradmin".to_string()),
+            short,
+        );
+        assert_eq!(out, "a ~/x b ~/y c /home/RUNNER~10/z");
+    }
+
     #[test]
     fn redact_reason_still_redacts_a_literal_only_occurrence_after_reordering() {
         let literal = "/Users/jack".to_string();

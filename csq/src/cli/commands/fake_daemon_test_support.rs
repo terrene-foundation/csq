@@ -42,9 +42,11 @@ pub(crate) struct FakeHealthyDaemon {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     _listener_thread: std::thread::JoinHandle<()>,
     #[cfg(target_os = "linux")]
-    _env_guard: std::sync::MutexGuard<'static, ()>,
+    _env_guard: csq_core::platform::test_env::EnvTestGuard,
     #[cfg(target_os = "linux")]
     saved_xdg: Option<String>,
+    #[cfg(target_os = "linux")]
+    _runtime_dir: tempfile::TempDir,
 }
 
 #[cfg(unix)]
@@ -79,6 +81,14 @@ pub(crate) fn spawn_fake_healthy_daemon(base_dir: &Path) -> FakeHealthyDaemon {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
+    // Keep the Linux socket in an owned short directory, independent of a
+    // runner's arbitrarily deep TMPDIR. State fixtures remain in base_dir.
+    #[cfg(target_os = "linux")]
+    let runtime_dir = tempfile::Builder::new()
+        .prefix("csq-fd-")
+        .tempdir_in("/tmp")
+        .expect("private short fake daemon runtime dir");
+
     #[cfg(target_os = "linux")]
     let env_state = {
         let guard = csq_core::platform::test_env::lock();
@@ -86,7 +96,7 @@ pub(crate) fn spawn_fake_healthy_daemon(base_dir: &Path) -> FakeHealthyDaemon {
         // SAFETY: guarded by the shared cross-module env-test mutex above,
         // per `csq_core::platform::test_env`'s documented contract.
         unsafe {
-            std::env::set_var("XDG_RUNTIME_DIR", base_dir);
+            std::env::set_var("XDG_RUNTIME_DIR", runtime_dir.path());
         }
         (guard, saved)
     };
@@ -163,6 +173,8 @@ pub(crate) fn spawn_fake_healthy_daemon(base_dir: &Path) -> FakeHealthyDaemon {
         _env_guard: env_state.0,
         #[cfg(target_os = "linux")]
         saved_xdg: env_state.1,
+        #[cfg(target_os = "linux")]
+        _runtime_dir: runtime_dir,
     }
 }
 
@@ -180,7 +192,7 @@ pub(crate) fn spawn_fake_healthy_daemon(base_dir: &Path) -> FakeHealthyDaemon {
 #[cfg(unix)]
 pub(crate) struct NoDaemonEnvGuard {
     #[cfg(target_os = "linux")]
-    _env_guard: std::sync::MutexGuard<'static, ()>,
+    _env_guard: csq_core::platform::test_env::EnvTestGuard,
     #[cfg(target_os = "linux")]
     saved_xdg: Option<String>,
 }
@@ -227,5 +239,44 @@ pub(crate) fn spawn_no_daemon_env_guard(base_dir: &Path) -> NoDaemonEnvGuard {
     {
         let _ = base_dir;
         NoDaemonEnvGuard {}
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    #[test]
+    fn fake_daemon_socket_is_healthy_beneath_an_overlong_state_root() {
+        let root = tempfile::TempDir::new_in("/tmp").unwrap();
+        let state = root.path().join("x".repeat(160));
+        std::fs::create_dir(&state).unwrap();
+        // macOS resolves its socket through the base path rather than XDG.
+        // An owned short alias keeps the kernel address bounded while the
+        // physical state still resides beneath the overlong directory.
+        #[cfg(target_os = "macos")]
+        let base = {
+            let alias = root.path().join("s");
+            std::os::unix::fs::symlink(&state, &alias).unwrap();
+            assert_eq!(
+                std::fs::canonicalize(&alias).unwrap(),
+                std::fs::canonicalize(&state).unwrap(),
+            );
+            alias
+        };
+        #[cfg(not(target_os = "macos"))]
+        let base = state.clone();
+        let fixture = super::spawn_fake_healthy_daemon(&base);
+        let socket = csq_core::daemon::socket_path(&base);
+        assert!(!socket.starts_with(&state));
+        assert!(socket.as_os_str().len() < 104);
+        assert!(matches!(
+            csq_core::daemon::detect_daemon(&base),
+            csq_core::daemon::DetectResult::Healthy { .. },
+        ));
+        let runtime = socket.parent().unwrap().to_owned();
+        drop(fixture);
+        // Linux's fixture owns the short runtime; macOS's root owns the alias.
+        #[cfg(target_os = "macos")]
+        drop(root);
+        assert!(!runtime.exists(), "owned runtime dir is removed on drop");
     }
 }

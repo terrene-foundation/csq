@@ -27,7 +27,7 @@
 //! decide whether to add an entitlement file or fall back to the
 //! `security` CLI for the CLI binary's writes.
 
-use super::{run_with_timeout, SecretError, SlotKey, Vault};
+use super::{run_with_timeout, NamedKey, SecretError, SlotKey, Vault};
 use crate::types::AccountNum;
 use secrecy::{ExposeSecret, SecretString};
 use security_framework::passwords::{
@@ -58,6 +58,74 @@ impl Default for MacosKeychainVault {
 }
 
 impl Vault for MacosKeychainVault {
+    fn set_named(&self, key: &NamedKey, secret: &SecretString) -> Result<(), SecretError> {
+        if secret.expose_secret().is_empty() {
+            return Err(SecretError::InvalidKey {
+                reason: "secret must not be empty".into(),
+            });
+        }
+        let service = key.native_name();
+        let bytes = zeroize::Zeroizing::new(secret.expose_secret().as_bytes().to_vec());
+        super::named_mutation_result(super::run_named_mutation_with_timeout(
+            "csq-pool-keychain",
+            "macos-keychain",
+            key,
+            move || set_generic_password(&service, KEYCHAIN_ACCOUNT, &bytes).map_err(map_sf_error),
+        ))
+    }
+    fn get_named(&self, key: &NamedKey) -> Result<SecretString, SecretError> {
+        let service = key.native_name();
+        super::run_named_with_timeout("csq-pool-keychain", move || {
+            let bytes = zeroize::Zeroizing::new(
+                get_generic_password(&service, KEYCHAIN_ACCOUNT).map_err(|e| {
+                    if is_not_found(&e) {
+                        SecretError::NamedNotFound
+                    } else {
+                        map_sf_error(e)
+                    }
+                })?,
+            );
+            let value = std::str::from_utf8(&bytes).map_err(|_| SecretError::DecryptionFailed)?;
+            Ok(SecretString::new(value.to_owned().into()))
+        })
+    }
+    fn delete_named(&self, key: &NamedKey) -> Result<(), SecretError> {
+        let service = key.native_name();
+        super::named_mutation_result(super::run_named_mutation_with_timeout(
+            "csq-pool-keychain",
+            "macos-keychain",
+            key,
+            move || match delete_generic_password(&service, KEYCHAIN_ACCOUNT) {
+                Ok(()) => Ok(()),
+                Err(e) if is_not_found(&e) => Ok(()),
+                Err(e) => Err(map_sf_error(e)),
+            },
+        ))
+    }
+    fn contains_named(&self, key: &NamedKey) -> Result<bool, SecretError> {
+        let service = key.native_name();
+        super::run_named_with_timeout("csq-pool-keychain", move || {
+            let mut options = security_framework::item::ItemSearchOptions::new();
+            options
+                .class(security_framework::item::ItemClass::generic_password())
+                .service(&service)
+                .account(KEYCHAIN_ACCOUNT)
+                .load_data(false)
+                .load_refs(false)
+                .load_attributes(true)
+                .limit(1);
+            match options.search() {
+                Ok(items) => Ok(!items.is_empty()),
+                Err(e) if is_not_found(&e) => Ok(false),
+                Err(e) => Err(map_sf_error(e)),
+            }
+        })
+    }
+
+    fn named_worker_state(&self, key: &NamedKey) -> super::NamedWorkerState {
+        super::named_worker_state(self.backend_id(), key)
+    }
+
     fn set(&self, slot: SlotKey, secret: &SecretString) -> Result<(), SecretError> {
         if secret.expose_secret().is_empty() {
             return Err(SecretError::InvalidKey {

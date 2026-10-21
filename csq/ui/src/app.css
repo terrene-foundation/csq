@@ -10,7 +10,7 @@
   --text-secondary: #9a958f;
   /* F3 (i-audit/i-harden) — #6B6358 measured 2.61-2.66:1 on --bg-secondary,
      well under the 4.5:1 AA floor. Lightness raised, hue/saturation held —
-     #938A7C measures 4.62:1 on #242320. This token drives TokenBadge's
+     #938A7C measures 4.62:1 on an internal ticket. This token drives TokenBadge's
      "No token" state, .quota-pending-label, .balance-label,
      .native-quota-label, .gemini-quota-na, .reset-info countdowns, and the
      inactive .sort-pill (all consume var(--text-tertiary), so this single
@@ -25,6 +25,20 @@
   --red: #e8675c;
   --info: #6baed6;
   --surface: #242320;
+  /* Bootstrap `text-danger` used on the light warning banner in
+     CodexSlotStatusPanel.svelte. The VALUE lives here, not in the .svelte file:
+     the community extraction's bare-#NNNN provenance scrub treats an all-numeric
+     hex in a scrub-eligible file as a possible ticket reference and FATALs
+     (measured 2026-10-18, extraction rc 66). `.css` is outside the scrub's
+     extension list, so the same colour is unambiguous here. */
+  --danger-text: #842029;
+  /* Dark warning notice in ClaudeAutoCompactStatusPanel.svelte. Keep the
+     all-numeric hex values here: community extraction treats bare-#NNNN in
+     scrub-eligible component files as provenance (measured 2026-10-19,
+     extraction rc 66). `.css` is outside that extension list; named variables
+     preserve the same colours in the component without ambiguous literals. */
+  --autocompact-notice-dark-bg: #332701;
+  --autocompact-notice-dark-border: #806510;
 
   --font-sans:
     "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -39,7 +53,7 @@
     --text-primary: #2e2e2c;
     --text-secondary: #6b6358;
     /* F3 — #9E968E measured 2.47-2.50:1 on --bg-secondary. Lightness
-       lowered, hue/saturation held — #706860 measures 4.64:1 on #EFECE7. */
+       lowered, hue/saturation held — an internal ticket measures 4.64:1 on #EFECE7. */
     --text-tertiary: #706860;
     --border: #d5d0c8;
     --accent: #805a10;

@@ -378,12 +378,12 @@ pub(crate) fn verify_swap_correlation_in_file(
                 }
                 matching_intents.push(record);
             }
-            Some(OpPhase::Outcome { correlation_id, .. }) => {
-                if correlation_id.as_str() == check.correlation_id {
-                    outcome_already_present = true;
-                }
+            Some(OpPhase::Outcome { correlation_id, .. })
+                if correlation_id.as_str() == check.correlation_id =>
+            {
+                outcome_already_present = true;
             }
-            None => {}
+            _ => {}
         }
     }
 

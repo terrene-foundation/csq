@@ -148,6 +148,39 @@ describe("InteractiveConsole", () => {
     );
   });
 
+  it("tells the operator to run csq login when the picked slot shares its sign-in", async () => {
+    routeByCommand({
+      interactive_open: new Error("slot_sign_in_shared:7"),
+    });
+
+    const { container } = render(InteractiveConsole);
+    await fireEvent.click(container.querySelector("button.primary")!);
+
+    await waitFor(() => {
+      const alert = container.querySelector('[role="alert"]');
+      expect(alert).not.toBeNull();
+      expect(alert!.textContent).toBe(
+        "slot 7 shares its sign-in with another account; run `csq login 7`",
+      );
+    });
+    expect(get(container, "input-field")).toBeNull();
+  });
+
+  it("tells the operator to run csq doctor when the suppression record is damaged", async () => {
+    routeByCommand({ interactive_open: new Error("suppression_state_damaged") });
+
+    const { container } = render(InteractiveConsole);
+    await fireEvent.click(container.querySelector("button.primary")!);
+
+    await waitFor(() => {
+      const alert = container.querySelector('[role="alert"]');
+      expect(alert).not.toBeNull();
+      expect(alert!.textContent).toBe(
+        "refresh-suppression state is damaged; run `csq doctor`",
+      );
+    });
+  });
+
   it("shows the inactive notice when the daemon surface is unavailable", async () => {
     routeByCommand({ interactive_open: new Error("interactive_unavailable") });
 

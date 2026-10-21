@@ -6,7 +6,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 use crate::providers::catalog::Surface;
 
@@ -82,28 +84,97 @@ impl ParseError {
     }
 }
 
+/// Local origin of the winning parsed rule, from the same bytes as its definition.
+/// This is not producer attestation or proof that the file remains unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedRuleOrigin {
+    pub relative_path: PathBuf,
+    pub raw_sha256: [u8; 32],
+}
+
+/// Parsed definitions with one local origin for every winning rule ID.
+/// This additive Rust API does not change the serialized `CocSet` contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedCocWithRuleOrigins {
+    pub set: CocSet,
+    pub rule_origins: BTreeMap<RuleId, LoadedRuleOrigin>,
+}
+
 /// Read `.coc/` at `coc_dir` and produce a `CocSet`.
 pub fn parse_coc_dir(coc_dir: &Path, source: CocSource) -> Result<CocSet, ParseError> {
+    parse_coc_dir_with_rule_origins(coc_dir, source).map(|parsed| parsed.set)
+}
+
+/// Read definitions and retain the selected rule paths and raw-byte hashes.
+pub fn parse_coc_dir_with_rule_origins(
+    coc_dir: &Path,
+    source: CocSource,
+) -> Result<ParsedCocWithRuleOrigins, ParseError> {
+    parse_coc_dir_with_rule_origins_using(coc_dir, source, &|path| fs::read_to_string(path))
+}
+
+fn parse_coc_dir_with_rule_origins_using(
+    coc_dir: &Path,
+    source: CocSource,
+    read_rule: &dyn Fn(&Path) -> std::io::Result<String>,
+) -> Result<ParsedCocWithRuleOrigins, ParseError> {
     let coc_md = coc_dir.join("COC.md");
     let version = parse_coc_md_version(&coc_md)?;
 
-    let mut rules: BTreeMap<RuleId, (RuleDef, std::path::PathBuf)> = BTreeMap::new();
-    let mut agents: BTreeMap<AgentId, (AgentDef, std::path::PathBuf)> = BTreeMap::new();
-    let mut skills: BTreeMap<SkillId, (SkillDef, std::path::PathBuf)> = BTreeMap::new();
-    let mut commands: BTreeMap<CommandId, (CommandDef, std::path::PathBuf)> = BTreeMap::new();
+    let mut rules: BTreeMap<RuleId, (RuleDef, PathBuf, [u8; 32])> = BTreeMap::new();
+    let mut agents: BTreeMap<AgentId, (AgentDef, PathBuf, [u8; 32])> = BTreeMap::new();
+    let mut skills: BTreeMap<SkillId, (SkillDef, PathBuf, [u8; 32])> = BTreeMap::new();
+    let mut commands: BTreeMap<CommandId, (CommandDef, PathBuf, [u8; 32])> = BTreeMap::new();
 
-    parse_subdir_rules(coc_dir, "rules", &mut rules)?;
-    parse_subdir_agents(coc_dir, "agents", &mut agents)?;
-    parse_subdir_skills(coc_dir, "skills", &mut skills)?;
-    parse_subdir_commands(coc_dir, "commands", &mut commands)?;
+    parse_subdir_rules(coc_dir, "rules", &mut rules, read_rule)?;
+    let read_file = |path: &Path| fs::read_to_string(path);
+    parse_subdir_agents(coc_dir, "agents", &mut agents, &read_file)?;
+    parse_subdir_skills(coc_dir, "skills", &mut skills, &read_file)?;
+    parse_subdir_commands(coc_dir, "commands", &mut commands, &read_file)?;
 
-    Ok(CocSet {
-        rules: rules.into_iter().map(|(k, (def, _))| (k, def)).collect(),
-        agents: agents.into_iter().map(|(k, (def, _))| (k, def)).collect(),
-        skills: skills.into_iter().map(|(k, (def, _))| (k, def)).collect(),
-        commands: commands.into_iter().map(|(k, (def, _))| (k, def)).collect(),
-        version,
-        source,
+    let mut rule_origins = BTreeMap::new();
+    let mut rule_defs = BTreeMap::new();
+    for (id, (def, path, raw_sha256)) in rules {
+        // sorted_entries returns lexical entry paths under coc_dir/subdir;
+        // reject an inconsistent path rather than report a misleading origin.
+        let relative_path = path
+            .strip_prefix(coc_dir)
+            .map_err(|_| ParseError::Io {
+                path: path.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "rule entry is outside the parsed directory",
+                ),
+            })?
+            .to_path_buf();
+        rule_origins.insert(
+            id.clone(),
+            LoadedRuleOrigin {
+                relative_path,
+                raw_sha256,
+            },
+        );
+        rule_defs.insert(id, def);
+    }
+    Ok(ParsedCocWithRuleOrigins {
+        set: CocSet {
+            rules: rule_defs,
+            agents: agents
+                .into_iter()
+                .map(|(k, (def, _, _))| (k, def))
+                .collect(),
+            skills: skills
+                .into_iter()
+                .map(|(k, (def, _, _))| (k, def))
+                .collect(),
+            commands: commands
+                .into_iter()
+                .map(|(k, (def, _, _))| (k, def))
+                .collect(),
+            version,
+            source,
+        },
+        rule_origins,
     })
 }
 
@@ -145,12 +216,14 @@ macro_rules! parse_subdir_kind {
         $id_ty:ty,
         $def_ty:ty,
         $build_def:expr,
-        $kind_label:literal
+        $kind_label:literal,
+        $capture_rule_origin:literal
     ) => {
         fn $fn_name(
             coc_dir: &Path,
             subdir_name: &str,
-            out: &mut BTreeMap<$id_ty, ($def_ty, std::path::PathBuf)>,
+            out: &mut BTreeMap<$id_ty, ($def_ty, PathBuf, [u8; 32])>,
+            read: &dyn Fn(&Path) -> std::io::Result<String>,
         ) -> Result<(), ParseError> {
             let subdir = coc_dir.join(subdir_name);
             if !subdir.exists() {
@@ -161,10 +234,16 @@ macro_rules! parse_subdir_kind {
                 if !name.ends_with(".md") {
                     continue;
                 }
-                let content = fs::read_to_string(&path).map_err(|e| ParseError::Io {
+                let content = read(&path).map_err(|e| ParseError::Io {
                     path: path.clone(),
                     source: e,
                 })?;
+                // Hash the exact content supplied to the parser, never reopen the file.
+                let raw_sha256: [u8; 32] = if $capture_rule_origin {
+                    Sha256::digest(content.as_bytes()).into()
+                } else {
+                    [0; 32]
+                };
                 let fm =
                     super::yaml::parse(&content).map_err(|e| ParseError::from_yaml(&path, e))?;
 
@@ -189,7 +268,7 @@ macro_rules! parse_subdir_kind {
                     unknowns,
                 )?;
 
-                if let Some((_existing_def, existing_path)) = out.get(&id) {
+                if let Some((_existing_def, existing_path, _)) = out.get(&id) {
                     let existing_prec = precedence_of_def(_existing_def);
                     if existing_prec == precedence {
                         return Err(ParseError::DuplicateId {
@@ -199,11 +278,11 @@ macro_rules! parse_subdir_kind {
                         });
                     }
                     if precedence > existing_prec {
-                        out.insert(id.clone(), (def, path.clone()));
+                        out.insert(id.clone(), (def, path.clone(), raw_sha256));
                     }
                     continue;
                 }
-                out.insert(id, (def, path));
+                out.insert(id, (def, path, raw_sha256));
             }
             Ok(())
         }
@@ -233,7 +312,8 @@ parse_subdir_kind!(
             unknowns,
         })
     },
-    "rule"
+    "rule",
+    true
 );
 
 parse_subdir_kind!(
@@ -257,7 +337,8 @@ parse_subdir_kind!(
             unknowns,
         })
     },
-    "agent"
+    "agent",
+    false
 );
 
 parse_subdir_kind!(
@@ -281,7 +362,8 @@ parse_subdir_kind!(
             unknowns,
         })
     },
-    "skill"
+    "skill",
+    false
 );
 
 parse_subdir_kind!(
@@ -305,7 +387,8 @@ parse_subdir_kind!(
             unknowns,
         })
     },
-    "command"
+    "command",
+    false
 );
 
 fn require_scalar<'a>(
@@ -470,6 +553,8 @@ fn precedence_of_def<T: HasPrecedence>(t: &T) -> i32 {
 mod tests {
     use super::*;
     use std::fs;
+
+    include!("rule_origin_tests.rs");
 
     fn write_md(dir: &Path, name: &str, content: &str) {
         fs::write(dir.join(name), content).unwrap();

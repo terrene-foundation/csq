@@ -146,18 +146,9 @@ fn parse_surface(name: &str) -> Result<SurfaceCli> {
 /// Any of these being set indicates a non-interactive CI/CD environment
 /// where interactive consent is not possible.
 fn is_ci_environment() -> bool {
-    const CI_VARS: &[&str] = &[
-        "CI",
-        "GITHUB_ACTIONS",
-        "GITLAB_CI",
-        "JENKINS_URL",
-        "BUILDKITE",
-        "CIRCLECI",
-        "TEAMCITY_VERSION",
-        "DRONE",
-        "TF_BUILD",
-    ];
-    CI_VARS.iter().any(|v| std::env::var_os(v).is_some())
+    csq_core::env::CI_SENTINEL_VARS
+        .iter()
+        .any(|v| std::env::var_os(v).is_some())
 }
 
 /// Returns `true` when the test-only TTY bypass is active.

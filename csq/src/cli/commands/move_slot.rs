@@ -56,7 +56,11 @@ pub fn handle(base_dir: &Path, from: AccountNum, to: AccountNum, yes: bool) -> R
             };
             println!("Moved slot {from} → {to}: renamed {what}.");
 
-            if let Some(line) = format_live_pid_info_line(from, &summary.live_pids_bound) {
+            if let Some(line) = format_live_pid_info_line(
+                from,
+                &summary.live_pids_bound,
+                &summary.unreadable_handle_dirs,
+            ) {
                 println!("{line}");
             }
 
@@ -88,20 +92,38 @@ fn confirm(from: AccountNum, to: AccountNum) -> Result<bool> {
 
 /// Formats the Phase 3 (M3-6) "moved while N processes were bound" notice.
 ///
-/// Returns `Some(line)` when at least one live process was bound to the
-/// source slot at move time; `None` otherwise. Pulled out as a pure helper
-/// so the renderer's behavior is unit-testable without `println!` capture.
-pub(crate) fn format_live_pid_info_line(from: AccountNum, live_pids: &[u32]) -> Option<String> {
-    if live_pids.is_empty() {
-        return None;
+/// Returns `Some(line)` when at least one live process was bound to the source slot at
+/// move time, or a bound handle dir had a pid marker that could not be read; `None`
+/// otherwise. Unreadable dirs are reported by NAME, never as a pid. Move does not refuse
+/// on either; this is telemetry. Pure so the renderer is unit-testable.
+pub(crate) fn format_live_pid_info_line(
+    from: AccountNum,
+    live_pids: &[u32],
+    unreadable_dirs: &[String],
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if !live_pids.is_empty() {
+        parts.push(format!(
+            "moved while {} process(es) were bound to slot {} (PIDs {:?}) \
+             — they will swap targets on next API call.",
+            live_pids.len(),
+            from,
+            live_pids
+        ));
     }
-    Some(format!(
-        "Note: moved while {} process(es) were bound to slot {} (PIDs {:?}) \
-         — they will swap targets on next API call.",
-        live_pids.len(),
-        from,
-        live_pids
-    ))
+    if !unreadable_dirs.is_empty() {
+        parts.push(format!(
+            "slot {} has handle dir(s) {} whose pid marker cannot be read, so it is unknown \
+             whether a session is bound there; if one is, it will swap targets on next API call.",
+            from,
+            unreadable_dirs.join(", ")
+        ));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("Note: {}", parts.join(" Also, ")))
+    }
 }
 
 fn notify_daemon_cache_invalidation(base_dir: &Path) {
@@ -130,7 +152,7 @@ mod tests {
         let from = AccountNum::try_from(3u16).unwrap();
 
         // Non-empty → returns a notice naming the slot, the count, and each PID.
-        let line = format_live_pid_info_line(from, &[1234, 5678])
+        let line = format_live_pid_info_line(from, &[1234, 5678], &[])
             .expect("non-empty live_pids must produce a notice line");
         assert!(line.contains("2 process(es)"), "line: {line}");
         assert!(line.contains("slot 3"), "line: {line}");
@@ -143,8 +165,24 @@ mod tests {
 
         // Empty → no notice at all (None, so the renderer skips the println!).
         assert!(
-            format_live_pid_info_line(from, &[]).is_none(),
+            format_live_pid_info_line(from, &[], &[]).is_none(),
             "empty live_pids must produce no notice"
+        );
+    }
+
+    #[test]
+    fn cli_move_renderer_names_unreadable_dirs_never_pid_zero() {
+        let from = AccountNum::try_from(3u16).unwrap();
+        let line = format_live_pid_info_line(from, &[], &["term-1234".to_string()])
+            .expect("an unreadable dir must produce a notice");
+        assert!(line.contains("term-1234"), "{line}");
+        assert!(line.contains("cannot be read"), "{line}");
+        assert!(!line.contains("PIDs"), "{line}");
+        assert!(!line.contains("[0]"), "{line}");
+        let both = format_live_pid_info_line(from, &[9], &["term-1".to_string()]).unwrap();
+        assert!(
+            both.contains("PIDs [9]") && both.contains("term-1"),
+            "{both}"
         );
     }
 }

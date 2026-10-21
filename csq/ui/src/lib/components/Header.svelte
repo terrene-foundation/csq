@@ -4,58 +4,88 @@
   import { homeDir, join } from '@tauri-apps/api/path';
   import SettingsPopover from './SettingsPopover.svelte';
 
+  interface KeychainOrphansView {
+    level: 'ok' | 'info' | 'warn' | 'needs_action';
+    summary: string;
+  }
+
   interface DaemonStatusView {
     running: boolean;
     pid: number | null;
+    keychain_orphans?: KeychainOrphansView;
   }
 
   let daemonRunning = $state(false);
+  // The keychain orphan sweep's state (same accessor as `csq status`/`csq doctor`).
+  // Only a warning or an action-needed state is surfaced in the header.
+  let orphans = $state<KeychainOrphansView | null>(null);
   let appVersion = $state<string | null>(null);
   // Build edition: 'community' | 'enterprise' (from the compile-time
   // crate::BUILD_EDITION const). null until loaded — guard the badge with
   // {#if} so a failed/pending fetch renders nothing rather than a wrong label.
   let edition = $state<string | null>(null);
 
-  async function fetchEdition() {
-    try {
-      edition = await invoke<string>('get_build_edition');
-    } catch {
-      edition = null;
-    }
-  }
-
-  async function fetchDaemonStatus() {
-    try {
-      // Use `join` so the platform's path separator is honored.
-      // Tauri 2.10's `homeDir()` returns a path without a trailing
-      // separator, so naive concatenation produces an invalid path
-      // like `/Users/example.claude/accounts` (see an internal journal entry).
-      const home = await homeDir();
-      const baseDir = await join(home, '.claude', 'accounts');
-      const status = await invoke<DaemonStatusView>('get_daemon_status', { baseDir });
-      daemonRunning = status.running;
-    } catch {
-      daemonRunning = false;
-    }
-  }
-
-  async function fetchVersion() {
-    try {
-      appVersion = await getVersion();
-    } catch {
-      // Version lookup should never fail — but if it does, hide
-      // the span rather than show misleading text (an internal journal entry P1-5:
-      // alpha.21 shipped with a literal that drifted).
-      appVersion = null;
-    }
-  }
-
   $effect(() => {
-    fetchDaemonStatus();
-    fetchVersion();
-    fetchEdition();
-    const interval = setInterval(fetchDaemonStatus, 10000);
-    return () => clearInterval(interval);
+    let active = true;
+    let statusInFlight = false;
+
+    async function fetchEdition() {
+      try {
+        const next = await invoke<string>('get_build_edition');
+        if (active) edition = next;
+      } catch {
+        if (active) edition = null;
+      }
+    }
+
+    async function fetchDaemonStatus() {
+      // A slow read must not accumulate another request every poll tick.
+      if (!active || statusInFlight) return;
+      statusInFlight = true;
+      try {
+        // Use `join` so the platform's path separator is honored.
+        // Tauri 2.10's `homeDir()` returns a path without a trailing
+        // separator, so naive concatenation produces an invalid path
+        // like `/Users/example.claude/accounts` (see an internal journal entry).
+        const home = await homeDir();
+        if (!active) return;
+        const baseDir = await join(home, '.claude', 'accounts');
+        if (!active) return;
+        const status = await invoke<DaemonStatusView>('get_daemon_status', { baseDir });
+        if (active) {
+          daemonRunning = status.running;
+          orphans = status.keychain_orphans ?? null;
+        }
+      } catch {
+        if (active) {
+          daemonRunning = false;
+          orphans = null;
+        }
+      } finally {
+        statusInFlight = false;
+      }
+    }
+
+    async function fetchVersion() {
+      try {
+        const next = await getVersion();
+        if (active) appVersion = next;
+      } catch {
+        // Version lookup should never fail — but if it does, hide
+        // the span rather than show misleading text (an internal journal entry P1-5:
+        // alpha.21 shipped with a literal that drifted).
+        if (active) appVersion = null;
+      }
+    }
+
+    void fetchDaemonStatus();
+    void fetchVersion();
+    void fetchEdition();
+    const interval = setInterval(() => void fetchDaemonStatus(), 10000);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
   });
 </script>
 
@@ -84,6 +114,17 @@
       <span class="dot" class:running={daemonRunning}></span>
       <span class="status-label">{daemonRunning ? 'Running' : 'Stopped'}</span>
     </div>
+    {#if orphans && (orphans.level === 'warn' || orphans.level === 'needs_action')}
+      <span
+        class="orphans"
+        class:needs-action={orphans.level === 'needs_action'}
+        title={orphans.summary}
+        aria-label={orphans.summary}
+        data-testid="keychain-orphans"
+      >
+        {orphans.level === 'needs_action' ? 'Keychain: action needed' : 'Keychain: orphans'}
+      </span>
+    {/if}
     <SettingsPopover {daemonRunning} />
   </div>
 </header>
@@ -175,5 +216,14 @@
   }
   .status-label {
     white-space: nowrap;
+  }
+  .orphans {
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    white-space: nowrap;
+  }
+  .orphans.needs-action {
+    color: var(--red);
+    font-weight: 600;
   }
 </style>

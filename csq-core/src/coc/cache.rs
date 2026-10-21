@@ -3,7 +3,7 @@
 //!
 //! # Parse cache (spec 10 §10.9.3 / design 08 §1.3)
 //!
-//! The parse cache stores the deserialized `CocSet` as a binary blob so
+//! The parse cache stores `CocSet` and optional local rule origins as a blob so
 //! that subsequent `csq run` invocations can skip the YAML parse + build
 //! step. The cache key is the SHA-256 of `COC.lock`. Cache files live
 //! under `<coc_root>/.cache/` with file-level security controls.
@@ -27,6 +27,7 @@
 //! at the runtime lifecycle layer (Step 3, `internal-design-docs`).
 //! This module is now scoped to cache-key derivation and parse-cache I/O.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,7 +35,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
-use super::types::CocSet;
+use super::parser::{LoadedRuleOrigin, ParsedCocWithRuleOrigins};
+use super::types::{CocSet, RuleId};
 
 /// SHA-256 of `.coc/COC.lock`'s content. Used as the cache-invalidation
 /// key per spec 10 §10.9.3.
@@ -65,7 +67,63 @@ pub const CACHE_MAGIC: &[u8; 9] = b"COC1CACHE";
 
 /// Binary format version stored at bytes 9..11 (big-endian u16).
 /// Bump when the on-disk layout changes in a backward-incompatible way.
-pub const CACHE_FORMAT_VERSION: u16 = 0x0001;
+pub const CACHE_FORMAT_VERSION: u16 = 0x0002;
+
+// Private CSQ cache representation, not the producer's artifact schema.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedRuleOrigin {
+    relative_path: PathBuf,
+    raw_sha256: [u8; 32],
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ParsedCachePayload {
+    set: CocSet,
+    #[serde(default)]
+    rule_origins: Option<BTreeMap<RuleId, CachedRuleOrigin>>,
+}
+
+fn complete_origins(set: &CocSet, origins: &BTreeMap<RuleId, CachedRuleOrigin>) -> bool {
+    if !set.rules.keys().eq(origins.keys()) {
+        return false;
+    }
+    origins.values().all(|origin| {
+        use std::path::Component;
+        let mut parts = origin.relative_path.components();
+        matches!(parts.next(), Some(Component::Normal(part)) if part == "rules")
+            && matches!(parts.next(), Some(Component::Normal(_)))
+            && parts.next().is_none()
+            && origin.relative_path.extension() == Some(std::ffi::OsStr::new("md"))
+    })
+}
+
+/// Read a cached snapshot with structurally complete local origins.
+/// These stored bytes are historical; no current member hashes are consulted.
+pub fn read_parsed_cache_with_rule_origins(
+    coc_root: &Path,
+    lock_sha: &[u8; 32],
+) -> Option<ParsedCocWithRuleOrigins> {
+    let payload = read_cache_payload(coc_root, lock_sha)?;
+    let origins = payload.rule_origins?;
+    if !complete_origins(&payload.set, &origins) {
+        return None;
+    }
+    Some(ParsedCocWithRuleOrigins {
+        set: payload.set,
+        rule_origins: origins
+            .into_iter()
+            .map(|(id, origin)| {
+                (
+                    id,
+                    LoadedRuleOrigin {
+                        relative_path: origin.relative_path,
+                        raw_sha256: origin.raw_sha256,
+                    },
+                )
+            })
+            .collect(),
+    })
+}
 
 /// Maximum size of a cache file we are willing to read into memory (1 MiB).
 const CACHE_MAX_FILE_SIZE: u64 = 1_048_576;
@@ -100,6 +158,10 @@ pub fn cache_file(coc_root: &Path, lock_sha: &[u8; 32]) -> PathBuf {
 /// - Logs corrupted bincode at WARN with fixed tag `cache_corrupt`; no
 ///   content bytes are included in the log message.
 pub fn read_parsed_cache(coc_root: &Path, lock_sha: &[u8; 32]) -> Option<CocSet> {
+    read_cache_payload(coc_root, lock_sha).map(|payload| payload.set)
+}
+
+fn read_cache_payload(coc_root: &Path, lock_sha: &[u8; 32]) -> Option<ParsedCachePayload> {
     let path = cache_file(coc_root, lock_sha);
 
     // Open with O_NOFOLLOW on Unix; metadata-then-open with symlink rejection
@@ -160,14 +222,15 @@ pub fn read_parsed_cache(coc_root: &Path, lock_sha: &[u8; 32]) -> Option<CocSet>
         return None;
     }
 
-    // Read all bytes.
-    use std::io::Read as _;
-    let mut buf = Vec::with_capacity(meta.len() as usize);
-    if let Err(_e) = std::io::BufReader::new(file).read_to_end(&mut buf) {
-        #[cfg(test)]
-        eprintln!("[cache_read] read_to_end failed: {_e}");
-        return None;
-    }
+    // Bound reads from the opened descriptor even if it grows after metadata.
+    let buf = match read_cache_bytes(file, meta.len()) {
+        Ok(buf) => buf,
+        Err(_e) => {
+            #[cfg(test)]
+            eprintln!("[cache_read] bounded read failed: {_e}");
+            return None;
+        }
+    };
 
     // Layout:
     //   [0..9]    magic (9 bytes)
@@ -230,7 +293,7 @@ pub fn read_parsed_cache(coc_root: &Path, lock_sha: &[u8; 32]) -> Option<CocSet>
     }
 
     // Bincode-deserialize the payload as a length-prefixed Vec<u8> containing
-    // JSON-serialized CocSet. Bincode wraps the JSON bytes with a length prefix;
+    // JSON-serialized private ParsedCachePayload. Bincode wraps the JSON bytes with a length prefix;
     // the JSON encoding handles CocSource's internally-tagged serde representation
     // which bincode cannot natively deserialize.
     let payload = &buf[HEADER_LEN..];
@@ -244,8 +307,8 @@ pub fn read_parsed_cache(coc_root: &Path, lock_sha: &[u8; 32]) -> Option<CocSet>
             return None;
         }
     };
-    match serde_json::from_slice::<CocSet>(&json_bytes) {
-        Ok(set) => Some(set),
+    match serde_json::from_slice::<ParsedCachePayload>(&json_bytes) {
+        Ok(payload) => Some(payload),
         Err(_e) => {
             warn!(tag = "cache_corrupt", path = %path.display(), "parse cache JSON decode error; will re-parse");
             #[cfg(test)]
@@ -255,12 +318,73 @@ pub fn read_parsed_cache(coc_root: &Path, lock_sha: &[u8; 32]) -> Option<CocSet>
     }
 }
 
+// Limit the actual reader before buffering; metadata is only a capacity hint.
+fn read_cache_bytes(reader: impl io::Read, observed_len: u64) -> io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut buf = Vec::with_capacity(observed_len.min(CACHE_MAX_FILE_SIZE) as usize);
+    reader.take(CACHE_MAX_FILE_SIZE + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > CACHE_MAX_FILE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "parse cache exceeds maximum file size",
+        ));
+    }
+    Ok(buf)
+}
+
 /// Write a `CocSet` binary parse cache for the given `lock_sha`.
 ///
 /// Uses the tmp → secure_file → atomic_replace pattern with partial-failure
 /// cleanup per security.md §5a. Any error from `secure_file` or
 /// `atomic_replace` cleans up the tmp file before propagating.
 pub fn write_parsed_cache(coc_root: &Path, lock_sha: &[u8; 32], set: &CocSet) -> io::Result<()> {
+    write_cache_payload(
+        coc_root,
+        lock_sha,
+        &ParsedCachePayload {
+            set: set.clone(),
+            rule_origins: None,
+        },
+    )
+}
+
+/// Store definitions and selected-read origins in one atomic cache payload.
+pub fn write_parsed_cache_with_rule_origins(
+    coc_root: &Path,
+    lock_sha: &[u8; 32],
+    parsed: &ParsedCocWithRuleOrigins,
+) -> io::Result<()> {
+    let origins = parsed
+        .rule_origins
+        .iter()
+        .map(|(id, origin)| {
+            (
+                id.clone(),
+                CachedRuleOrigin {
+                    relative_path: origin.relative_path.clone(),
+                    raw_sha256: origin.raw_sha256,
+                },
+            )
+        })
+        .collect();
+    if !complete_origins(&parsed.set, &origins) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "incomplete parsed rule origins",
+        ));
+    }
+    let payload = ParsedCachePayload {
+        set: parsed.set.clone(),
+        rule_origins: Some(origins),
+    };
+    write_cache_payload(coc_root, lock_sha, &payload)
+}
+
+fn write_cache_payload(
+    coc_root: &Path,
+    lock_sha: &[u8; 32],
+    parsed: &ParsedCachePayload,
+) -> io::Result<()> {
     let dir = cache_dir(coc_root);
 
     // Create cache dir with mode 0700 on Unix.
@@ -278,16 +402,11 @@ pub fn write_parsed_cache(coc_root: &Path, lock_sha: &[u8; 32], set: &CocSet) ->
     }
 
     // Build the buffer: magic + version + csq_ver(16) + lock_sha + payload.
-    // The payload is `encode_length_prefixed(serde_json(CocSet))` — a u64 LE
-    // length followed by the JSON bytes. We use JSON for CocSet because its
-    // CocSource enum uses `#[serde(tag = "kind")]` (internally-tagged), and
-    // we want a self-describing format. The length prefix bounds the bytes
-    // the reader has to allocate. Wire format is bit-identical to bincode 1.x's
-    // `with_fixint_encoding` over a `Vec<u8>` so 0x0001 caches written by older
-    // csq builds keep round-tripping.
+    // Format2 retains set and optional origins in one length-prefixed JSON payload.
+    // Format1 remains a miss, so old payloads are reparsed rather than guessed.
     let csq_ver = csq_version_padded();
     let json_bytes =
-        serde_json::to_vec(set).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        serde_json::to_vec(parsed).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let payload = encode_length_prefixed(&json_bytes);
 
     let mut buf =
@@ -456,6 +575,9 @@ pub fn read_lock(coc_dir: &Path) -> Result<Option<Vec<u8>>, CacheError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    include!("rule_origin_cache_tests.rs");
+    include!("cache_read_bound_tests.rs");
 
     #[test]
     fn lock_sha256_is_deterministic() {

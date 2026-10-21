@@ -4,6 +4,8 @@ All notable changes to csq are documented here. Format follows [Keep a Changelog
 
 ## [Unreleased]
 
+- Codex’s default footer now follows Claude Code’s segment order with weekly quota, context used, estimated session cost, model, project and git. Existing csq defaults upgrade on regeneration; custom global and slot statuslines remain intact.
+
 ---
 
 ## [2.13.1] — 2026-05-27

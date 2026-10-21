@@ -38,6 +38,7 @@ pub mod version;
 pub mod version_grace;
 pub mod yaml;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use tracing::{info, warn};
@@ -45,8 +46,8 @@ use tracing::{info, warn};
 use self::cache::{lock_sha256, read_lock};
 use self::fallback::{probe as legacy_probe, LegacyResolution};
 use self::loader::discover;
-use self::parser::parse_coc_dir;
-use self::types::{CocSet, CocSource};
+use self::parser::{parse_coc_dir_with_rule_origins, LoadedRuleOrigin};
+use self::types::{CocSet, CocSource, RuleId};
 use self::version::CompatVerdict;
 
 /// Errors that can arise from `load`. Most variants are non-fatal —
@@ -99,6 +100,23 @@ pub struct LoadOutcomeWithWarmth {
     pub warmth: Warmth,
 }
 
+/// Load result with optional selected-rule origins. Legacy results are unavailable.
+/// A warm origin map describes the cached parsed snapshot, not current disk bytes.
+#[derive(Debug)]
+pub struct LoadOutcomeWithRuleOrigins {
+    pub outcome: LoadOutcome,
+    pub warmth: Warmth,
+    pub rule_origins: Option<BTreeMap<RuleId, LoadedRuleOrigin>>,
+}
+
+/// Cache-disabled richer load; preserves local origins when `.coc/` is parsed.
+pub fn load_with_rule_origins(
+    start: &Path,
+    base_dir: &Path,
+) -> Result<LoadOutcomeWithRuleOrigins, LoadError> {
+    load_with_cache_and_rule_origins(start, base_dir, false)
+}
+
 /// Load `.coc/` (or fall back to legacy) starting from `start`.
 ///
 /// `base_dir` is csq's accounts directory (typically
@@ -131,15 +149,29 @@ pub fn load_with_cache(
     base_dir: &Path,
     cache_enabled: bool,
 ) -> Result<LoadOutcomeWithWarmth, LoadError> {
+    let parsed = load_with_cache_and_rule_origins(start, base_dir, cache_enabled)?;
+    Ok(LoadOutcomeWithWarmth {
+        outcome: parsed.outcome,
+        warmth: parsed.warmth,
+    })
+}
+
+/// Load definitions and origins together; incomplete cache metadata reparses.
+pub fn load_with_cache_and_rule_origins(
+    start: &Path,
+    base_dir: &Path,
+    cache_enabled: bool,
+) -> Result<LoadOutcomeWithRuleOrigins, LoadError> {
     let location = match discover(start)? {
         Some(loc) => loc,
         None => {
-            return Ok(LoadOutcomeWithWarmth {
+            return Ok(LoadOutcomeWithRuleOrigins {
                 outcome: LoadOutcome {
                     set: load_legacy_or_empty(start),
                     project_root: None,
                 },
                 warmth: Warmth::Cold,
+                rule_origins: None,
             });
         }
     };
@@ -155,12 +187,13 @@ pub fn load_with_cache(
                 project_root = %location.project_root.display(),
                 "COC.lock absent under .coc/; treating as missing and falling back"
             );
-            return Ok(LoadOutcomeWithWarmth {
+            return Ok(LoadOutcomeWithRuleOrigins {
                 outcome: LoadOutcome {
                     set: load_legacy_or_empty(&location.project_root),
                     project_root: Some(location.project_root),
                 },
                 warmth: Warmth::Cold,
+                rule_origins: None,
             });
         }
     };
@@ -168,13 +201,16 @@ pub fn load_with_cache(
 
     // Cache hit attempt.
     if cache_enabled {
-        if let Some(mut cached_set) = cache::read_parsed_cache(&location.project_root, &lock_sha) {
-            // Replace the cached set's source with the freshly observed
-            // lock_sha so downstream consumers see current disk state.
+        if let Some(mut parsed) =
+            cache::read_parsed_cache_with_rule_origins(&location.project_root, &lock_sha)
+        {
+            let cached_set = &mut parsed.set;
+            // Refresh only the observed lock key; member origins remain historical
+            // selected-snapshot evidence, not a fresh member-content check.
             cached_set.source = CocSource::Coc {
                 lock_sha256: lock_sha,
             };
-            check_version_envelope(&cached_set, base_dir)?;
+            check_version_envelope(cached_set, base_dir)?;
             info!(
                 event = "coc.cache_hit",
                 project_root = %location.project_root.display(),
@@ -182,12 +218,13 @@ pub fn load_with_cache(
                 rule_count = cached_set.rules.len(),
                 "served .coc/ from parse cache"
             );
-            return Ok(LoadOutcomeWithWarmth {
+            return Ok(LoadOutcomeWithRuleOrigins {
                 outcome: LoadOutcome {
-                    set: cached_set,
+                    set: parsed.set,
                     project_root: Some(location.project_root),
                 },
                 warmth: Warmth::Warm,
+                rule_origins: Some(parsed.rule_origins),
             });
         }
     }
@@ -196,13 +233,16 @@ pub fn load_with_cache(
     let source = CocSource::Coc {
         lock_sha256: lock_sha,
     };
-    let set = parse_coc_dir(&location.coc_dir, source)?;
-    check_version_envelope(&set, base_dir)?;
+    let parsed = parse_coc_dir_with_rule_origins(&location.coc_dir, source)?;
+    let set = &parsed.set;
+    check_version_envelope(set, base_dir)?;
 
     // Best-effort cache write on cold path. A write failure must NOT
     // block the load — the parse already produced the canonical result.
     if cache_enabled {
-        if let Err(e) = cache::write_parsed_cache(&location.project_root, &lock_sha, &set) {
+        if let Err(e) =
+            cache::write_parsed_cache_with_rule_origins(&location.project_root, &lock_sha, &parsed)
+        {
             warn!(
                 event = "coc.cache_write_failed",
                 project_root = %location.project_root.display(),
@@ -220,12 +260,13 @@ pub fn load_with_cache(
         "loaded .coc/"
     );
 
-    Ok(LoadOutcomeWithWarmth {
+    Ok(LoadOutcomeWithRuleOrigins {
         outcome: LoadOutcome {
-            set,
+            set: parsed.set,
             project_root: Some(location.project_root),
         },
         warmth: Warmth::Cold,
+        rule_origins: Some(parsed.rule_origins),
     })
 }
 
@@ -355,6 +396,8 @@ fn load_legacy_or_empty(project_root: &Path) -> CocSet {
 mod tests {
     use super::*;
     use std::fs;
+
+    include!("rule_origin_load_tests.rs");
 
     /// Per the journal-0093 retraction the load functions take `base_dir`
     /// directly (the csq accounts dir; tests pass an isolated path).

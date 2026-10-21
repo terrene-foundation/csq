@@ -22,14 +22,17 @@
 //!
 //! All paths end by writing the `.csq-account` marker, updating
 //! `profiles.json` with the email label, and clearing any
-//! `broker_failed` sentinel via [`csq_core::accounts::login::finalize_login`].
+//! `broker_failed` sentinel via [`csq_core::accounts::login::finalize_verified_login`].
 
 use anyhow::{anyhow, Context, Result};
+use csq_core::accounts::anthropic_identity::{
+    capture_login_prior, commit_anthropic_login, read_native_expectation, CommittedAnthropicLogin,
+    LoginPrior,
+};
 use csq_core::accounts::login_lock::{AccountLoginLock, AcquireOutcome};
-use csq_core::accounts::markers;
 use csq_core::cli_deps::sanitize::redact_path;
 use csq_core::cli_deps::SurfaceCli;
-use csq_core::credentials::{self, file};
+use csq_core::credentials;
 use csq_core::oauth::{self, RaceResult};
 use csq_core::providers::catalog::Surface;
 use csq_core::types::AccountNum;
@@ -577,6 +580,7 @@ fn handle_race(base_dir: &Path, account: AccountNum) -> Result<()> {
     // returns (or panics) — at which point the kernel releases the
     // flock automatically.
     let _lock = acquire_login_lock(base_dir, account, Some("--legacy-shell"))?;
+    let prior = capture_login_prior(base_dir, account)?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -616,29 +620,19 @@ fn handle_race(base_dir: &Path, account: AccountNum) -> Result<()> {
     )
     .map_err(|e| anyhow!("token exchange failed: {e}"))?;
 
-    file::save_canonical_for(base_dir, account, &credential)
-        .with_context(|| format!("save credential for account {account}"))?;
+    let committed =
+        commit_anthropic_login(base_dir, account, &credential, None, prior).map_err(|e| {
+            report_undurable_rescue_refusal();
+            anyhow!(
+                "verify login for account {account}: {}",
+                csq_core::accounts::login::LoginCommitOutcome::describe_error_for_account(
+                    &e, account
+                )
+            )
+        })?;
     println!("Login successful.");
 
-    // Best-effort marker write — finalize_login also handles the
-    // marker but it requires the config dir to exist already on
-    // some legacy paths. Mirror handle_direct's defensive write.
-    //
-    // M4-7: prefer the UUID-content marker when `by_slot` maps;
-    // finalize_login below re-writes after mint_for_login completes.
-    let config_dir = base_dir.join(format!("config-{}", account));
-    if config_dir.exists() {
-        match csq_core::accounts::profiles::resolve_slot_to_uuid(base_dir, account.get()) {
-            Some(uuid) => {
-                let _ = markers::write_csq_account(&config_dir, uuid);
-            }
-            None => {
-                let _ = markers::write_csq_account_legacy(&config_dir, account);
-            }
-        }
-    }
-
-    finalize(base_dir, account)
+    finalize_verified(base_dir, account, committed)
 }
 
 /// Outcome of [`run_race_with_browser`]. Distinguishes a successful
@@ -783,6 +777,9 @@ fn stdin_paste_resolver() -> oauth::PasteResolver {
 
 /// `--provider codex` dispatch. Round-7 (this session) UX rewrite:
 ///
+/// 0. Refuse a non-interactive stdin (`guard_login_drivability`), right after the
+///    login lock and before ANY output or read: step 3's Enter read would otherwise block
+///    forever on an open non-TTY stdin.
 /// 1. Print the device-auth prerequisite banner.
 /// 2. Auto-open the ChatGPT Security Settings URL in the user's
 ///    default browser so they can flip "Device code authorization" on
@@ -828,6 +825,17 @@ fn handle_codex(
     // so contention is reported immediately rather than after the
     // user has already read the prerequisite and pressed Enter.
     let _lock = acquire_login_lock(base_dir, account, None)?;
+
+    // Fail-FAST drivability guard (an internal ticket), FIRST: refuse a non-interactive stdin before the
+    // prerequisite banner, the browser open and the Enter read below. That read blocks until the
+    // operator presses Enter; on an OPEN non-TTY stdin (unattended runner, `trestle`,
+    // `echo | csq login`) it never returns, and the EOF check after it only catches a CLOSED
+    // stdin. ORDER IS LOAD-BEARING: this guard must stay ahead of the read. It also runs ahead of
+    // `cli_deps_gate::enforce` (step 4 below), so an unattended host is told to find a TTY before
+    // it is told about the vendor-CLI state; the Enter read already preceded that gate, so no
+    // earlier behaviour regressed. With a TTY (or the test-utils bypass) it passes and the
+    // interactive path is unchanged.
+    guard_login_drivability("codex", json)?;
 
     const SETTINGS_URL: &str = "https://chatgpt.com/#settings/Security";
 
@@ -890,21 +898,6 @@ fn handle_codex(
         &format!("csq login {account} --provider codex"),
     )?;
 
-    // Fail-FAST drivability guard (an internal ticket) — a provider whose login flow needs an
-    // attended session (a TTY to block a confirmation read on, or a local browser
-    // its subprocess drives) refuses IMMEDIATELY rather than proceeding into a
-    // wait an unattended host can never satisfy.
-    //
-    // ORDER IS LOAD-BEARING: this runs AFTER `cli_deps_gate::enforce` above, not
-    // before the dispatch. Placing it earlier pre-empted the version gate, so a
-    // headless operator whose vendor CLI was outdated/missing was told to find a
-    // TTY instead of being told their CLI is unusable — they would fix the wrong
-    // thing first, then hit the real problem. The vendor-CLI state is the more
-    // fundamental and more actionable failure, and it must be reported first.
-    // (Caught by `cli_deps_login_integration`: 26 pass on main, 14 with the guard
-    // hoisted ahead of the gate.) The gate is itself timeout-bounded, so running
-    // it first preserves an internal ticket's no-hang property.
-    guard_login_drivability("codex", json)?;
     // ─────────────────────────────────────────────────────────────────────
 
     // Custom spawn function: pipe codex-cli's stdout, tee to terminal,
@@ -979,6 +972,12 @@ fn handle_codex(
     // provisioned Codex slot's identity-keyed credentials until the next
     // restart or periodic reconciliation tick.
     notify_daemon_cache_invalidation(base_dir);
+
+    // login-followup LOW-8 (same class as `finalize_verified`): the codex
+    // binding just COMMITTED, so wake the usage poller too. `codex::tick`
+    // rides the same 5-minute Anthropic cadence, so without this the freshly
+    // bound slot shows no quota for up to `POLL_INTERVAL`.
+    wake_usage_poller(base_dir, account);
 
     // Ledger #5: join the new slot to the cross-slot session store. Placed on
     // the SUCCESS path only, after the identity is minted, and advisory by
@@ -1081,6 +1080,12 @@ fn handle_gemini_oauth(
     // daemon discovery_cache + refresh-status cache on every successful
     // login surface.
     notify_daemon_cache_invalidation(base_dir);
+
+    // login-followup LOW-8 (same class as `finalize_verified`): the Code
+    // Assist binding just COMMITTED, so wake the usage poller. `gemini_oauth::
+    // tick` rides the Anthropic cadence, so without this a fresh OAuth
+    // binding shows no quota for up to `POLL_INTERVAL`.
+    wake_usage_poller(base_dir, account);
     eprintln!(
         "info: slot {account} bound in Code Assist OAuth mode. \
          Run `csq run {account}` to start a Gemini session."
@@ -1432,7 +1437,10 @@ fn handle_paste_code(base_dir: &Path, account: AccountNum) -> Result<()> {
 
     // Step 6: finalize.
     println!("Credentials written for account {}.", account);
-    finalize(base_dir, account).context("post-login finalization failed")
+    // The daemon already verified and finalized this exact exchanged grant.
+    // Re-reading ambient native metadata here could undo its organization binding.
+    notify_daemon_cache_invalidation(base_dir);
+    Ok(())
 }
 
 // `extract_device_auth_url` and the supporting `strip_ansi_escapes` /
@@ -1592,15 +1600,56 @@ fn handle_direct(base_dir: &Path, account: AccountNum, json: bool) -> Result<()>
     // earlier gate to order behind — the guard runs first thing instead.
     guard_login_drivability("claude", json)?;
 
+    handle_direct_flow(
+        base_dir,
+        account,
+        |config_dir| run_claude_auth_login(account, config_dir),
+        |config_dir, subprocess_succeeded, prior| {
+            handle_direct_post_subprocess(
+                base_dir,
+                account,
+                config_dir,
+                subprocess_succeeded,
+                prior,
+            )
+        },
+    )
+}
+
+/// The wiring of [`handle_direct`] with the subprocess and the verified
+/// commit injected: lock, prior capture, handle-dir creation, subprocess,
+/// post-subprocess commit, then `finalize_verified`. Production passes the
+/// real `claude auth login` runner and commit; tests pass stubs so the
+/// wiring itself (notably the finalize call) is observable without a
+/// browser, network or keychain.
+fn handle_direct_flow(
+    base_dir: &Path,
+    account: AccountNum,
+    run_login: impl FnOnce(&Path) -> Result<bool>,
+    post: impl FnOnce(&Path, bool, LoginPrior) -> Result<CommittedAnthropicLogin>,
+) -> Result<()> {
     // UX-R1-H3 (lock symmetry): serialise concurrent invocations.
     let _lock = acquire_login_lock(base_dir, account, Some("--legacy-shell"))?;
+    let prior = capture_login_prior(base_dir, account)?;
 
+    // SEC-2.15 (unified, R1 M1): secure the accounts root (config-N's
+    // parent) fail-closed before creating the handle dir.
+    csq_core::platform::fs::ensure_private_dir_root(base_dir)
+        .map_err(|e| anyhow::anyhow!("accounts_root_refused: {e}"))?;
     let config_dir = base_dir.join(format!("config-{}", account));
     std::fs::create_dir_all(&config_dir)?;
 
     println!("Starting OAuth login for account {}...", account);
     println!("Your browser will open for authorization.");
 
+    let subprocess_succeeded = run_login(&config_dir)?;
+    let committed = post(&config_dir, subprocess_succeeded, prior)?;
+    finalize_verified(base_dir, account, committed)
+}
+
+/// Run `claude auth login` against `config_dir` and report whether it exited
+/// successfully. Enforces the watchdog timeout.
+fn run_claude_auth_login(account: AccountNum, config_dir: &Path) -> Result<bool> {
     // Resolve the `claude` binary via `find_claude_binary`'s PATH +
     // well-known-locations walk rather than relying on `Command::new("claude")`
     // hitting $PATH alone. The latter fails on minimal shells (non-interactive
@@ -1629,7 +1678,7 @@ fn handle_direct(base_dir: &Path, account: AccountNum, json: bool) -> Result<()>
     // interactive prompt/browser flow is unchanged.
     let mut child = Command::new(&claude_bin)
         .args(["auth", "login"])
-        .env("CLAUDE_CONFIG_DIR", &config_dir)
+        .env("CLAUDE_CONFIG_DIR", config_dir)
         .spawn()
         .context("failed to spawn `claude auth login`")?;
 
@@ -1659,9 +1708,7 @@ fn handle_direct(base_dir: &Path, account: AccountNum, json: bool) -> Result<()>
             }
         }
     };
-
-    handle_direct_post_subprocess(base_dir, account, &config_dir, status.success())?;
-    finalize(base_dir, account)
+    Ok(status.success())
 }
 
 /// Watchdog timeout for the interactive `claude auth login` subprocess.
@@ -1687,10 +1734,9 @@ fn parse_login_timeout(raw: Option<&str>) -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Post-subprocess work for [`handle_direct`]: capture credentials
-/// from keychain or file, persist them canonically, then write the
-/// `.csq-account` marker — in that order so a subprocess failure or
-/// credential-capture failure leaves no orphan marker on disk.
+/// Post-subprocess work for [`handle_direct`]: capture credentials and verify
+/// their complete provider context before canonical publication. Return the
+/// receipt whose consuming finalizer writes the authoritative UUID marker.
 ///
 /// Extracted so REV-R1-02 / M8 can be regression-tested without
 /// spawning the real `claude` binary.
@@ -1699,7 +1745,82 @@ fn handle_direct_post_subprocess(
     account: AccountNum,
     config_dir: &Path,
     subprocess_succeeded: bool,
-) -> Result<()> {
+    prior: LoginPrior,
+) -> Result<CommittedAnthropicLogin> {
+    handle_direct_post_subprocess_using(
+        base_dir,
+        account,
+        config_dir,
+        subprocess_succeeded,
+        prior,
+        || credentials::read_fresh_after_login(config_dir).map_err(|e| anyhow!("{e}")),
+        |credential, expected, prior| {
+            let committed =
+                commit_anthropic_login(base_dir, account, credential, Some(expected), prior);
+            if committed.is_err() {
+                report_undurable_rescue_refusal();
+            }
+            committed
+        },
+    )
+}
+
+/// Prints ONE fixed operator line when a refused login grant's rescue
+/// record could not be discarded at all (tombstone and unlink both failed).
+/// No payload, path or token is printed.
+fn report_undurable_rescue_refusal() {
+    if let Some(notice) = csq_core::credentials::rescue::take_refusal_not_durable_notice() {
+        eprintln!("{notice}");
+    }
+}
+
+// Only the Unix-gated test module calls this.
+#[cfg(all(test, unix))]
+fn handle_direct_post_subprocess_with(
+    base_dir: &Path,
+    account: AccountNum,
+    config_dir: &Path,
+    subprocess_succeeded: bool,
+    prior: LoginPrior,
+    profile: &csq_core::daemon::usage_poller::HttpGetFn,
+    capture: impl FnOnce() -> Result<credentials::CredentialFile>,
+) -> Result<CommittedAnthropicLogin> {
+    handle_direct_post_subprocess_using(
+        base_dir,
+        account,
+        config_dir,
+        subprocess_succeeded,
+        prior,
+        capture,
+        |credential, expected, prior| {
+            csq_core::accounts::anthropic_identity::commit_anthropic_login_with(
+                base_dir,
+                account,
+                credential,
+                profile,
+                Some(expected),
+                prior,
+            )
+        },
+    )
+}
+
+fn handle_direct_post_subprocess_using(
+    _base_dir: &Path,
+    account: AccountNum,
+    config_dir: &Path,
+    subprocess_succeeded: bool,
+    prior: LoginPrior,
+    capture: impl FnOnce() -> Result<credentials::CredentialFile>,
+    commit: impl FnOnce(
+        &credentials::CredentialFile,
+        &csq_core::accounts::anthropic_identity::NativeContextExpectation,
+        LoginPrior,
+    ) -> std::result::Result<
+        CommittedAnthropicLogin,
+        csq_core::accounts::anthropic_identity::IdentityError,
+    >,
+) -> Result<CommittedAnthropicLogin> {
     if !subprocess_succeeded {
         // REV-R1-02 (M8): do NOT write the .csq-account marker
         // when the subprocess failed. The marker is the "this dir
@@ -1722,54 +1843,34 @@ fn handle_direct_post_subprocess(
     // can never shadow a fresh keychain token), retries to let CC commit, and
     // errors rather than persisting an already-expired token. See
     // `csq_core::credentials::post_login` for the full rationale.
-    let creds = credentials::read_fresh_after_login(config_dir).map_err(|e| anyhow!("{e}"))?;
-
-    // an internal ticket: mint the slot's identity UUID BEFORE save. `save_canonical_for`
-    // is fail-closed on an absent UUID (M4-12), but on a fresh install the UUID is
-    // minted only by `finalize_login` — which runs in `finalize()`, AFTER this.
-    // On macOS the daemon Pass-0 fallback can't mint from a keychain-only cred
-    // either. Without this, first login on a fresh install fails "no credentials
-    // configured". Idempotent + no-op when already minted or when no email source.
-    csq_core::accounts::login::ensure_login_identity_minted(base_dir, account)
-        .map_err(|e| anyhow!("mint identity for account {account}: {e}"))?;
-
-    // Save canonical (UUID-keyed; M4-12: fail-closed if UUID absent — minted above)
-    file::save_canonical_for(base_dir, account, &creds)?;
+    // Native metadata is only an expectation. The selected captured token must
+    // independently prove the complete account/organization context before save.
+    let expected = read_native_expectation(config_dir)?;
+    let creds = capture()?;
+    let committed = commit(&creds, &expected, prior).map_err(|e| {
+        anyhow!(
+            "identity verification failed: {}",
+            csq_core::accounts::login::LoginCommitOutcome::describe_error_for_account(&e, account)
+        )
+    })?;
     println!("Credentials saved for account {account}.");
 
-    // REV-R1-02 (M8): write the marker AFTER the credential save
-    // succeeds, so a subprocess failure or post-subprocess credential
-    // capture failure leaves no orphan marker on disk.
-    //
-    // M4-7: identity UUID if mapped, else legacy decimal slot id.
-    match csq_core::accounts::profiles::resolve_slot_to_uuid(base_dir, account.get()) {
-        Some(uuid) => markers::write_csq_account(config_dir, uuid)?,
-        None => markers::write_csq_account_legacy(config_dir, account)?,
-    }
-    Ok(())
+    // The receipt-consuming finalizer owns the marker under binding authority.
+    Ok(committed)
 }
 
-/// Post-login finalization shared by both paths.
-///
-/// 1. Writes the `.csq-account` marker if the config dir exists.
-/// 2. Updates `profiles.json` with the email (best-effort — uses
-///    `claude auth status --json` if the binary is available,
-///    otherwise stores "unknown").
-/// 3. Clears any `broker_failed` sentinel for this account.
-fn finalize(base_dir: &Path, account: AccountNum) -> Result<()> {
-    // Marker write + .claude.json email read + profiles update +
-    // broker-failed clear all live in csq_core so the desktop
-    // Add Account flow can call the same helper.
-    let email = csq_core::accounts::login::finalize_login(base_dir, account)
-        .with_context(|| format!("finalize for account {account}"))?;
-
+fn finalize_verified(
+    base_dir: &Path,
+    account: AccountNum,
+    committed: CommittedAnthropicLogin,
+) -> Result<()> {
+    let email = csq_core::accounts::login::finalize_verified_login(base_dir, account, committed)
+        .with_context(|| format!("finalize verified login for account {account}"))?;
     notify_daemon_cache_invalidation(base_dir);
-
-    // NOTE: the CC keychain mirror now lives in the shared
-    // `csq_core::accounts::login::finalize_login` (called above) so every login
-    // twin — this CLI path AND the desktop subprocess/paste-code/race flows —
-    // sweeps the keychain. Do NOT re-add a sweep here (would double-sweep).
-
+    // login-followup: the login just COMMITTED (finalize above succeeded),
+    // so wake the daemon's usage poller for an immediate quota tick —
+    // otherwise the new slot shows no quota for up to 5 minutes.
+    wake_usage_poller(base_dir, account);
     println!("Logged in as {} (account {}).", email, account);
     Ok(())
 }
@@ -1781,6 +1882,25 @@ fn finalize(base_dir: &Path, account: AccountNum) -> Result<()> {
 /// but-failing daemon.
 fn notify_daemon_cache_invalidation(base_dir: &Path) {
     csq_core::daemon::notify::cache_invalidation(base_dir);
+}
+
+/// Wake the daemon's usage poller for an IMMEDIATE quota tick after a
+/// slot's identity has just been bound (login-followup LOW-8).
+///
+/// Called on the SUCCESS path of every login surface whose slot the daemon
+/// polls on the fast (5-minute) cadence, AFTER the credential/profile write
+/// has committed: Anthropic (`finalize_verified`), codex (`handle_codex`)
+/// and Gemini Code Assist OAuth (`handle_gemini_oauth`). Without it a
+/// freshly bound slot shows "no quota" for up to `POLL_INTERVAL`.
+///
+/// Best-effort by construction — see `csq_core::daemon::notify::slot_rebind`
+/// (an internal ticket semantics): no daemon is the common case, the binding is already
+/// durable when this runs, and a failed wake must never turn a completed
+/// login into a failed one. The native kimi/grok surfaces deliberately do
+/// NOT wake: their ticks ride the 3P cadence and a wake does not run the
+/// 3P tick, so the call would be inert there.
+fn wake_usage_poller(base_dir: &Path, account: AccountNum) {
+    csq_core::daemon::notify::slot_rebind(base_dir, account.get());
 }
 
 // `get_email_from_cc` and `update_profile` were extracted to
@@ -1949,14 +2069,63 @@ mod tests {
 
     // ── an internal ticket: fail-fast login-drivability guard ────────────────────
 
-    /// `cargo test`'s harness stdin is never a TTY, so `handle(..., "codex",
-    /// ...)` on a clean slot (past the reverse-conflict guard, which these two
-    /// tests already prove fires independently) must refuse IMMEDIATELY at the
-    /// new guard — WITHOUT printing the device-auth banner, opening a browser,
-    /// or blocking on the `Enter` confirmation read `handle_codex` would
-    /// otherwise perform. A regression here would hang this very test.
+    /// Clears `CSQ_TEST_BYPASS_TTY` and restores its previous value on drop
+    /// (also on a failed assertion). Callers hold the test-env lock.
+    struct BypassTtyOff(Option<std::ffi::OsString>);
+
+    impl BypassTtyOff {
+        fn new() -> Self {
+            let prev = std::env::var_os("CSQ_TEST_BYPASS_TTY");
+            // SAFETY: callers hold `csq_core::platform::test_env::lock()`, the
+            // process-wide lock every env-mutating test in this crate takes.
+            unsafe { std::env::remove_var("CSQ_TEST_BYPASS_TTY") };
+            Self(prev)
+        }
+    }
+
+    impl Drop for BypassTtyOff {
+        fn drop(&mut self) {
+            if let Some(v) = self.0.take() {
+                // SAFETY: still under the caller's test-env lock (dropped after).
+                unsafe { std::env::set_var("CSQ_TEST_BYPASS_TTY", v) };
+            }
+        }
+    }
+
+    /// True (after printing why) when the harness stdin IS a terminal: the TTY-guard tests
+    /// assume it never is, and at a terminal the guard passes and `handle` would open a
+    /// browser, block on Enter and spawn the real vendor login.
+    fn skip_at_terminal(test: &str) -> bool {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() {
+            eprintln!("SKIP {test}: stdin is a terminal, so the TTY guard would not fire");
+            return true;
+        }
+        false
+    }
+
+    /// `cargo test`'s harness stdin is never a TTY, so `handle(..., "codex", ...)` on a
+    /// clean slot (past the reverse-conflict guard, which these two tests already prove fires
+    /// independently) must refuse with the drivability guard's own "attended session" message.
+    /// The assertions check that message (and, for codex, that it is NOT the later
+    /// "stdin reached EOF" error); they do not capture stderr, so "no banner / no browser" is
+    /// established by the guard being the first statement after the lock, not by this test.
+    /// A regression that moves the read ahead of the guard hangs this test on an open stdin.
+    /// At a real terminal the guard would pass and `handle` would run a real login, so the
+    /// test skips there with a printed reason ([`skip_at_terminal`]).
     #[test]
     fn handle_codex_refuses_fast_without_a_tty() {
+        if skip_at_terminal("handle_codex_refuses_fast_without_a_tty") {
+            return;
+        }
+        // The TTY guard also passes when the test-only `CSQ_TEST_BYPASS_TTY`
+        // is set, and `check_test_bypass_honours_env_var` sets it process-wide
+        // under the shared test-env lock. Hold that same lock and clear the var
+        // for this test's duration; otherwise a concurrent run makes the guard
+        // pass and `handle` blocks on the Enter read forever (observed hanging
+        // the csq bins suite under trestle, where stdin never reaches EOF).
+        let _env_guard = csq_core::platform::test_env::lock();
+        let _bypass_off = BypassTtyOff::new();
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let account = AccountNum::try_from(9u16).unwrap();
@@ -1976,7 +2145,7 @@ mod tests {
         .unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("attended session") || msg.contains("TTY"),
+            msg.contains("attended session") && !msg.contains("stdin reached EOF"),
             "expected an interaction-required refusal, got: {msg}"
         );
     }
@@ -1987,6 +2156,17 @@ mod tests {
     /// `CSQ_LOGIN_TIMEOUT_SECS` wait.
     #[test]
     fn handle_claude_default_refuses_fast_without_a_tty() {
+        if skip_at_terminal("handle_claude_default_refuses_fast_without_a_tty") {
+            return;
+        }
+        // The TTY guard also passes when the test-only `CSQ_TEST_BYPASS_TTY`
+        // is set, and `check_test_bypass_honours_env_var` sets it process-wide
+        // under the shared test-env lock. Hold that same lock and clear the var
+        // for this test's duration; otherwise a concurrent run makes the guard
+        // pass and `handle` blocks on the Enter read forever (observed hanging
+        // the csq bins suite under trestle, where stdin never reaches EOF).
+        let _env_guard = csq_core::platform::test_env::lock();
+        let _bypass_off = BypassTtyOff::new();
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let account = AccountNum::try_from(9u16).unwrap();
@@ -2011,6 +2191,108 @@ mod tests {
         );
     }
 
+    /// Repoints the process-wide fd 0 at a fresh pty slave and restores the
+    /// saved stdin on drop (including on panic).
+    ///
+    /// SAFETY: fd 0 is process-global. Callers MUST hold
+    /// `csq_core::platform::test_env::lock()` — the same shared mutex the
+    /// other fd-0 swapper (`codex_supervise::tests::flush_typed_ahead_stdin_
+    /// discards_queued_pty_input`) and these refusal tests take — so a swap
+    /// can never overlap a test that samples `stdin().is_terminal()`.
+    #[cfg(unix)]
+    struct Fd0Pty {
+        master: std::os::fd::RawFd,
+        slave: std::os::fd::RawFd,
+        saved_stdin: std::os::fd::RawFd,
+    }
+
+    #[cfg(unix)]
+    impl Fd0Pty {
+        fn new() -> Self {
+            // SAFETY: every call operates on fds this constructor owns; the
+            // pty helpers are POSIX and used identically by
+            // `codex_supervise`'s typed-ahead test.
+            unsafe {
+                let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+                assert!(
+                    master >= 0,
+                    "posix_openpt failed: {:?}",
+                    std::io::Error::last_os_error()
+                );
+                assert_eq!(libc::grantpt(master), 0, "grantpt failed");
+                assert_eq!(libc::unlockpt(master), 0, "unlockpt failed");
+                let ptr = libc::ptsname(master);
+                assert!(!ptr.is_null(), "ptsname returned null");
+                let slave_path = std::ffi::CStr::from_ptr(ptr).to_owned();
+                let slave = libc::open(slave_path.as_ptr(), libc::O_RDWR);
+                assert!(
+                    slave >= 0,
+                    "open(slave) failed: {:?}",
+                    std::io::Error::last_os_error()
+                );
+                let saved_stdin = libc::dup(0);
+                assert!(saved_stdin >= 0, "dup(0) failed");
+                assert_eq!(libc::dup2(slave, 0), 0, "dup2(slave, 0) failed");
+                Self {
+                    master,
+                    slave,
+                    saved_stdin,
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Fd0Pty {
+        fn drop(&mut self) {
+            // SAFETY: restores the descriptor saved in `new` and closes the
+            // three fds this guard owns, each exactly once.
+            unsafe {
+                libc::dup2(self.saved_stdin, 0);
+                libc::close(self.saved_stdin);
+                libc::close(self.slave);
+                libc::close(self.master);
+            }
+        }
+    }
+
+    /// Pins the MECHANISM behind the darwin preflight flake: the drivability
+    /// guard samples the process-wide fd 0, so any concurrent test that
+    /// repoints fd 0 at a pty flips its verdict. `codex_supervise::tests::
+    /// flush_typed_ahead_stdin_discards_queued_pty_input` is the only
+    /// in-process fd-0 swapper in this binary; it now holds the same shared
+    /// env-test lock these tests hold. This test proves both halves with no
+    /// host or timing dependence:
+    ///   - with the harness's non-tty fd 0 the guard refuses;
+    ///   - with fd 0 repointed at a pty it passes with NO test bypass set.
+    ///
+    /// If the swap ever stops taking the shared lock, these refusal tests
+    /// become timing-dependent again — exactly the flake recorded in the dev
+    /// preflight's darwin `lib-bins` leg.
+    #[cfg(unix)]
+    #[test]
+    fn drivability_guard_reads_fd0_so_fd0_swaps_share_the_env_lock() {
+        let _env_guard = csq_core::platform::test_env::lock();
+        let _bypass_off = BypassTtyOff::new();
+
+        assert!(
+            guard_login_drivability("claude", false).is_err(),
+            "precondition: with a non-tty fd 0 (and no bypass) the guard must refuse"
+        );
+
+        let _tty = Fd0Pty::new();
+        assert_eq!(
+            unsafe { libc::isatty(0) },
+            1,
+            "fd 0 must be a tty for this test to exercise the mechanism"
+        );
+        assert!(
+            guard_login_drivability("claude", false).is_ok(),
+            "with fd 0 a tty the guard passes WITHOUT any test bypass — a \
+             concurrent fd-0 swap is what makes a refusal test fall through"
+        );
+    }
+
     // Non-headless-guard exemption for gemini (`ExternalPrerequisite`) and the
     // native device-code providers is covered at the unit level in
     // `csq_core::providers::login_capability::tests` (`guard_never_gates_
@@ -2018,6 +2300,451 @@ mod tests {
     // oauth`/`handle_native` go on to read REAL `~/.gemini/oauth_creds.json` /
     // spawn a real vendor binary once past the guard, which would make an
     // end-to-end `handle()` test here environment-dependent.
+
+    fn native_identity_fixture(config: &Path, organization: &str) -> credentials::CredentialFile {
+        std::fs::create_dir_all(config).unwrap();
+        std::fs::write(
+            config.join(".claude.json"),
+            serde_json::json!({
+                "oauthAccount": {
+                    "emailAddress": "native-ingress@test.invalid",
+                    "accountUuid": "11111111-1111-4111-8111-111111111111",
+                    "organizationUuid": organization,
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        csq_core::platform::fs::secure_file(&config.join(".claude.json")).unwrap();
+        // Both candidate grants share a year-2100 TTL. TTL cannot prove org identity.
+        serde_json::from_value(serde_json::json!({"claudeAiOauth": {
+            "accessToken": "fixture-native-selected-token",
+            "refreshToken": "fixture-native-selected-refresh",
+            "expiresAt": 4102444800000_u64,
+            "scopes": ["user:profile", "user:inference"],
+        }}))
+        .unwrap()
+    }
+
+    fn native_profile_fixture(
+        organization: &'static str,
+    ) -> csq_core::daemon::usage_poller::HttpGetFn {
+        Arc::new(move |url, token, _| {
+            assert_eq!(url, "https://api.anthropic.com/api/oauth/profile");
+            assert_eq!(
+                token, "fixture-native-selected-token",
+                "profile must verify the captured candidate"
+            );
+            Ok((200, serde_json::json!({
+                "account": {"uuid": "11111111-1111-4111-8111-111111111111", "email": "native-ingress@test.invalid"},
+                "organization": {"uuid": organization},
+            }).to_string().into_bytes()))
+        })
+    }
+
+    #[test]
+    fn native_login_equal_ttl_wrong_organization_candidate_does_not_publish() {
+        csq_core::platform::test_env::with_in_memory_secret_backend(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let account = AccountNum::try_from(7).unwrap();
+            let config = dir.path().join("config-7");
+            let captured = native_identity_fixture(&config, "22222222-2222-4222-8222-222222222222");
+            let prior = capture_login_prior(dir.path(), account).unwrap();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed_calls = Arc::clone(&calls);
+            let response = native_profile_fixture("33333333-3333-4333-8333-333333333333");
+            let profile: csq_core::daemon::usage_poller::HttpGetFn =
+                Arc::new(move |url, token, headers| {
+                    observed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    response(url, token, headers)
+                });
+            let result = handle_direct_post_subprocess_with(
+                dir.path(),
+                account,
+                &config,
+                true,
+                prior,
+                &profile,
+                || Ok(captured),
+            );
+            assert!(
+                result.is_err(),
+                "equal TTL does not authorize a different organization"
+            );
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the refusal must follow exact-token profile verification"
+            );
+            assert!(
+                csq_core::accounts::profiles::resolve_slot_to_uuid(dir.path(), account.get())
+                    .is_none()
+            );
+            assert!(
+                !config.join(".csq-account").exists(),
+                "refused candidate must not publish a marker"
+            );
+        });
+    }
+
+    #[test]
+    fn native_login_profile_transport_error_does_not_leak_token_or_body() {
+        csq_core::platform::test_env::with_in_memory_secret_backend(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let account = AccountNum::try_from(7).unwrap();
+            let config = dir.path().join("config-7");
+            let captured = native_identity_fixture(&config, "22222222-2222-4222-8222-222222222222");
+            let profile: csq_core::daemon::usage_poller::HttpGetFn =
+                Arc::new(|_, token, _| Err(format!("{token}: fixture-private-profile-body")));
+            let err = handle_direct_post_subprocess_with(
+                dir.path(),
+                account,
+                &config,
+                true,
+                capture_login_prior(dir.path(), account).unwrap(),
+                &profile,
+                || Ok(captured),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(!err.contains("fixture-native-selected-token"));
+            assert!(!err.contains("fixture-private-profile-body"));
+            assert!(
+                csq_core::accounts::profiles::resolve_slot_to_uuid(dir.path(), account.get())
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn native_login_unknown_full_context_refuses_before_capture_or_profile() {
+        csq_core::platform::test_env::with_in_memory_secret_backend(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let account = AccountNum::try_from(7).unwrap();
+            let config = dir.path().join("config-7");
+            std::fs::create_dir_all(&config).unwrap();
+            std::fs::write(
+                config.join(".claude.json"),
+                r#"{"oauthAccount":{"emailAddress":"native-ingress@test.invalid"}}"#,
+            )
+            .unwrap();
+            csq_core::platform::fs::secure_file(&config.join(".claude.json")).unwrap();
+            let profile: csq_core::daemon::usage_poller::HttpGetFn =
+                Arc::new(|_, _, _| panic!("unknown context must refuse before HTTP"));
+            let result = handle_direct_post_subprocess_with(
+                dir.path(),
+                account,
+                &config,
+                true,
+                capture_login_prior(dir.path(), account).unwrap(),
+                &profile,
+                || panic!("unknown context must refuse before credential capture"),
+            );
+            assert!(result.is_err());
+            assert!(
+                csq_core::accounts::profiles::resolve_slot_to_uuid(dir.path(), account.get())
+                    .is_none()
+            );
+            assert!(!config.join(".csq-account").exists());
+        });
+    }
+
+    #[test]
+    fn native_login_exact_captured_context_publishes_and_reuses_same_identity() {
+        csq_core::platform::test_env::with_in_memory_secret_backend(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let account = AccountNum::try_from(7).unwrap();
+            let config = dir.path().join("config-7");
+            let credential =
+                native_identity_fixture(&config, "22222222-2222-4222-8222-222222222222");
+            let profile = native_profile_fixture("22222222-2222-4222-8222-222222222222");
+            let first = handle_direct_post_subprocess_with(
+                dir.path(),
+                account,
+                &config,
+                true,
+                capture_login_prior(dir.path(), account).unwrap(),
+                &profile,
+                || Ok(credential.clone()),
+            )
+            .unwrap();
+            let first_id = first.identity();
+            assert_eq!(
+                csq_core::accounts::profiles::resolve_slot_to_uuid(dir.path(), account.get()),
+                Some(first_id)
+            );
+            assert!(
+                csq_core::accounts::identity_store::credentials_path_for(dir.path(), first_id)
+                    .is_file()
+            );
+            let again = handle_direct_post_subprocess_with(
+                dir.path(),
+                account,
+                &config,
+                true,
+                capture_login_prior(dir.path(), account).unwrap(),
+                &profile,
+                || Ok(credential),
+            )
+            .unwrap();
+            assert_eq!(
+                again.identity(),
+                first_id,
+                "same complete verified context reuses identity"
+            );
+        });
+    }
+
+    /// an internal ticket regression (moved from `cli_deps_login_integration`): on a FRESH
+    /// install (empty base, no `profiles.json`, no `by_slot` mapping) the first
+    /// Anthropic login must publish credentials. Pre-an internal ticket `save_canonical_for`
+    /// failed closed on the absent UUID because the mint ran only after the save.
+    ///
+    /// The subprocess form of this test cannot be hermetic since the org-identity
+    /// change: the commit now verifies the captured token against
+    /// `api.anthropic.com/api/oauth/profile` and requires `accountUuid` and
+    /// `organizationUuid` in `.claude.json`. This drives the same chain
+    /// (real `.claude.json`/`.credentials.json` reads through
+    /// `read_fresh_after_login` -> verified commit -> finalize) with the profile
+    /// transport injected, and asserts the original an internal ticket outcomes.
+    #[test]
+    fn fresh_install_login_mints_uuid_and_persists_creds() {
+        csq_core::platform::test_env::with_in_memory_secret_backend(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let account = AccountNum::try_from(1).unwrap();
+            let config = dir.path().join("config-1");
+            let credential =
+                native_identity_fixture(&config, "22222222-2222-4222-8222-222222222222");
+            // What `claude auth login` leaves behind on Linux/Windows.
+            credentials::save(&config.join(".credentials.json"), &credential).unwrap();
+            assert!(
+                !dir.path().join("profiles.json").exists(),
+                "fixture must be a fresh install"
+            );
+            let profile = native_profile_fixture("22222222-2222-4222-8222-222222222222");
+            let committed = handle_direct_post_subprocess_with(
+                dir.path(),
+                account,
+                &config,
+                true,
+                capture_login_prior(dir.path(), account).unwrap(),
+                &profile,
+                || credentials::read_fresh_after_login(&config).map_err(|e| anyhow!("{e}")),
+            )
+            .expect("an internal ticket: fresh-install login must succeed");
+            let email =
+                csq_core::accounts::login::finalize_verified_login(dir.path(), account, committed)
+                    .expect("an internal ticket: fresh-install login must finalize");
+            assert_eq!(email, "native-ingress@test.invalid");
+
+            let profiles: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(dir.path().join("profiles.json"))
+                    .expect("an internal ticket: profiles.json must exist after login"),
+            )
+            .unwrap();
+            let uuid = profiles
+                .get("by_slot")
+                .and_then(|m| m.get("1"))
+                .and_then(|v| v.as_str())
+                .expect(
+                    "an internal ticket: by_slot[\"1\"] must hold a minted UUID after fresh login",
+                );
+            assert!(
+                dir.path()
+                    .join("identities")
+                    .join(uuid)
+                    .join("credentials.json")
+                    .is_file(),
+                "an internal ticket: identities/{uuid}/credentials.json must exist after login"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(
+                    dir.path()
+                        .join("identities")
+                        .join(uuid)
+                        .join("credentials.json"),
+                )
+                .unwrap()
+                .permissions()
+                .mode()
+                    & 0o777;
+                assert_eq!(
+                    mode, 0o600,
+                    "an internal ticket: the canonical credential must be private"
+                );
+            }
+            // finalize owns the UUID marker; a finalize that returns Ok without
+            // publishing it leaves the slot credential-less to every marker reader.
+            assert_eq!(
+                csq_core::accounts::markers::read_csq_account_uuid(&config)
+                    .map(|id| id.to_string())
+                    .as_deref(),
+                Some(uuid),
+                "an internal ticket: finalize must write the UUID .csq-account marker"
+            );
+        });
+    }
+
+    /// an internal ticket, fail-closed pole: on a fresh install, a captured token whose profile does not
+    /// confirm the recorded organization is refused, and nothing is minted or written.
+    /// (The retired subprocess test's per-slot `CLAUDE_CONFIG_DIR` coverage is pinned by
+    /// `login_subprocess_timeout_integration`; this test pins the refusal outcome.)
+    #[test]
+    fn fresh_install_login_with_an_unconfirmed_profile_mints_nothing() {
+        csq_core::platform::test_env::with_in_memory_secret_backend(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let account = AccountNum::try_from(1).unwrap();
+            let config = dir.path().join("config-1");
+            let credential =
+                native_identity_fixture(&config, "22222222-2222-4222-8222-222222222222");
+            credentials::save(&config.join(".credentials.json"), &credential).unwrap();
+            // The profile reports a different organization than the captured context.
+            let response = native_profile_fixture("33333333-3333-4333-8333-333333333333");
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed_calls = Arc::clone(&calls);
+            let profile: csq_core::daemon::usage_poller::HttpGetFn =
+                Arc::new(move |url, token, headers| {
+                    observed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    response(url, token, headers)
+                });
+            // Every file under the base, with its bytes, before the attempt: the refusal must
+            // leave the whole tree (by_slot / profiles.json contexts, identities/*, the
+            // credential files, the config-1 handle and its marker) untouched.
+            fn snapshot(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+                fn walk(
+                    root: &Path,
+                    dir: &Path,
+                    out: &mut std::collections::BTreeMap<String, Vec<u8>>,
+                ) {
+                    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            out.insert(
+                                format!("{}/", path.strip_prefix(root).unwrap().display()),
+                                Vec::new(),
+                            );
+                            walk(root, &path, out);
+                        } else {
+                            out.insert(
+                                path.strip_prefix(root).unwrap().display().to_string(),
+                                std::fs::read(&path).unwrap(),
+                            );
+                        }
+                    }
+                }
+                let mut out = std::collections::BTreeMap::new();
+                walk(root, root, &mut out);
+                out
+            }
+            let prior = capture_login_prior(dir.path(), account).unwrap();
+            let before = snapshot(dir.path());
+            let result = handle_direct_post_subprocess_with(
+                dir.path(),
+                account,
+                &config,
+                true,
+                prior,
+                &profile,
+                || credentials::read_fresh_after_login(&config).map_err(|e| anyhow!("{e}")),
+            );
+            let err = result.expect_err("an unconfirmed organization must be refused");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("organization identity could not be confirmed")
+                    && msg.contains("oauth_identity_refused"),
+                "the refusal must be the unconfirmed-organization one, got: {msg}"
+            );
+            // The product words a transport failure and an organization mismatch the same, so
+            // the text alone cannot tell them apart; the call count does: the refusal must
+            // FOLLOW exactly one exact-token profile verification, not precede it.
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the refusal must follow the profile verification, not a pre-check"
+            );
+            assert_eq!(
+                snapshot(dir.path()),
+                before,
+                "a refused login must not create, change or remove any file under the base"
+            );
+            let by_slot_minted = std::fs::read_to_string(dir.path().join("profiles.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .and_then(|v| v.get("by_slot").and_then(|m| m.get("1")).cloned())
+                .is_some();
+            assert!(!by_slot_minted, "nothing may be minted for a refused login");
+            let identities = dir.path().join("identities");
+            let written = identities.is_dir()
+                && std::fs::read_dir(&identities)
+                    .unwrap()
+                    .flatten()
+                    .any(|e| e.path().join("credentials.json").exists());
+            assert!(
+                !written,
+                "no canonical credential may be written for a refused login"
+            );
+        });
+    }
+
+    /// M-2: `handle_direct`'s own wiring must reach `finalize_verified`.
+    /// Drives `handle_direct_flow` with a stub subprocess and the injected
+    /// profile transport; the UUID marker exists only if finalize ran.
+    #[test]
+    fn handle_direct_flow_finalizes_the_verified_login() {
+        csq_core::platform::test_env::with_in_memory_secret_backend(|| {
+            // The recording daemon's socket derives from `dir` on macOS; a
+            // deep runner TMPDIR would push its pathname past `sun_path`.
+            let dir = csq_core::testing::socket_fixture::short_root("csq-login-").unwrap();
+            let account = AccountNum::try_from(1).unwrap();
+            let config = dir.path().join("config-1");
+            let credential =
+                native_identity_fixture(&config, "22222222-2222-4222-8222-222222222222");
+            credentials::save(&config.join(".credentials.json"), &credential).unwrap();
+            let profile = native_profile_fixture("22222222-2222-4222-8222-222222222222");
+            // Pin XDG_RUNTIME_DIR to a private dir (Linux) so finalize's daemon POSTs hit this
+            // recorder, never a real daemon: the socket path ignores `base` on Linux. The
+            // surrounding `with_in_memory_secret_backend` already holds the env lock.
+            let daemon = RecordingDaemon::spawn_with_env_lock_held(dir.path());
+            handle_direct_flow(
+                dir.path(),
+                account,
+                |_| Ok(true),
+                |config_dir, ok, prior| {
+                    handle_direct_post_subprocess_with(
+                        dir.path(),
+                        account,
+                        config_dir,
+                        ok,
+                        prior,
+                        &profile,
+                        || {
+                            credentials::read_fresh_after_login(config_dir)
+                                .map_err(|e| anyhow!("{e}"))
+                        },
+                    )
+                },
+            )
+            .expect("handle_direct_flow must succeed");
+            let got = daemon.wait_for_requests(2, Duration::from_secs(5));
+            assert!(
+                got.iter()
+                    .any(|r| r.starts_with("POST /api/invalidate-cache ")),
+                "finalize must invalidate the daemon cache: {got:?}"
+            );
+            assert!(
+                got.iter().any(|r| r.starts_with("POST /api/slot-rebind ")),
+                "finalize must wake the usage poller: {got:?}"
+            );
+            let marker = std::fs::read_to_string(config.join(".csq-account"))
+                .expect("finalize must publish the account marker");
+            assert!(
+                !marker.trim().is_empty(),
+                "marker must carry the minted identity"
+            );
+        });
+    }
 
     // ── REV-R1-02 / M8: marker-write ordering regression ───────────
 
@@ -2034,7 +2761,13 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
 
         // Pretend the subprocess returned non-zero.
-        let result = handle_direct_post_subprocess(dir.path(), account, &config_dir, false);
+        let result = handle_direct_post_subprocess(
+            dir.path(),
+            account,
+            &config_dir,
+            false,
+            capture_login_prior(dir.path(), account).unwrap(),
+        );
         assert!(result.is_err(), "subprocess failure must propagate as Err");
 
         // No marker written.
@@ -2337,7 +3070,18 @@ mod tests {
         let config_dir = dir.path().join("config-8");
         std::fs::create_dir_all(&config_dir).unwrap();
 
-        let result = handle_direct_post_subprocess(dir.path(), account, &config_dir, true);
+        let _ = native_identity_fixture(&config_dir, "22222222-2222-4222-8222-222222222222");
+        let profile: csq_core::daemon::usage_poller::HttpGetFn =
+            Arc::new(|_, _, _| panic!("missing credentials must not query a real profile"));
+        let result = handle_direct_post_subprocess_with(
+            dir.path(),
+            account,
+            &config_dir,
+            true,
+            capture_login_prior(dir.path(), account).unwrap(),
+            &profile,
+            || Err(anyhow!("fixture has no credentials")),
+        );
         assert!(result.is_err(), "missing credentials must propagate as Err");
 
         let marker = config_dir.join(".csq-account");
@@ -2520,5 +3264,207 @@ mod tests {
         // the "free" case — out of scope for this lock-scoping check).
         acquire_login_lock(dir.path(), other_account, None)
             .expect("a different account's slot must not be blocked");
+    }
+
+    // ── login-followup LOW-8: the login surfaces' usage-poller wake ──────
+
+    /// A Unix-socket listener standing in for the daemon's IPC socket: it
+    /// records every request it receives and answers 200. Mirrors the
+    /// `$XDG_RUNTIME_DIR` isolation documented on
+    /// `fake_daemon_test_support` — on Linux `daemon::socket_path` prefers
+    /// that process-global variable over `base_dir`, so without the
+    /// override this fixture would bind (and the wake would POST into)
+    /// whatever the ambient runtime dir holds, a real daemon included.
+    struct RecordingDaemon {
+        socket: std::path::PathBuf,
+        requests: Arc<std::sync::Mutex<Vec<String>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        _thread: std::thread::JoinHandle<()>,
+        _guard: RecordingDaemonEnvGuard,
+        #[cfg(target_os = "linux")]
+        _runtime_dir: tempfile::TempDir,
+    }
+
+    #[cfg(target_os = "linux")]
+    struct RecordingDaemonEnvGuard {
+        // `None` when the caller already holds the env lock (`spawn_with_env_lock_held`).
+        _env_guard: Option<csq_core::platform::test_env::EnvTestGuard>,
+        saved: Option<String>,
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    struct RecordingDaemonEnvGuard;
+
+    #[cfg(target_os = "linux")]
+    impl Drop for RecordingDaemonEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: `_env_guard` (dropped after this fn returns, per
+            // field-drop order) still holds the shared env-test mutex for
+            // the duration of this restore.
+            unsafe {
+                match &self.saved {
+                    Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                    None => std::env::remove_var("XDG_RUNTIME_DIR"),
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    impl Drop for RecordingDaemonEnvGuard {
+        fn drop(&mut self) {}
+    }
+
+    impl RecordingDaemon {
+        fn spawn(base: &std::path::Path) -> Self {
+            Self::start(base, true)
+        }
+
+        /// For a caller that ALREADY holds `test_env::lock()` (e.g. inside
+        /// `with_in_memory_secret_backend`): the lock is not re-entrant, so `spawn` would
+        /// deadlock on Linux. The caller's lock must outlive the returned recorder.
+        fn spawn_with_env_lock_held(base: &std::path::Path) -> Self {
+            Self::start(base, false)
+        }
+
+        fn start(base: &std::path::Path, take_env_lock: bool) -> Self {
+            use std::io::{Read, Write};
+            use std::sync::atomic::Ordering;
+
+            #[cfg(target_os = "linux")]
+            // The shared short-root fixture pins this private (0700) runtime
+            // directory at creation, not by a later chmod.
+            let runtime_dir = csq_core::testing::socket_fixture::short_root("csq-r2b-")
+                .expect("private runtime dir for the recording daemon");
+
+            #[cfg(target_os = "linux")]
+            let guard = {
+                let env_guard = take_env_lock.then(csq_core::platform::test_env::lock);
+                let saved = std::env::var("XDG_RUNTIME_DIR").ok();
+                // SAFETY: guarded by the shared cross-module env-test mutex
+                // above, per `csq_core::platform::test_env`'s contract.
+                unsafe { std::env::set_var("XDG_RUNTIME_DIR", runtime_dir.path()) };
+                RecordingDaemonEnvGuard {
+                    _env_guard: env_guard,
+                    saved,
+                }
+            };
+            #[cfg(not(target_os = "linux"))]
+            let guard = {
+                let _ = take_env_lock;
+                RecordingDaemonEnvGuard
+            };
+
+            let socket = csq_core::daemon::socket_path(base);
+            if let Some(parent) = socket.parent() {
+                std::fs::create_dir_all(parent).expect("socket parent dir");
+            }
+            let _ = std::fs::remove_file(&socket);
+            let listener = std::os::unix::net::UnixListener::bind(&socket)
+                .expect("bind recording daemon socket");
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking recording listener");
+
+            let requests: Arc<std::sync::Mutex<Vec<String>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let requests_for_thread = Arc::clone(&requests);
+            let stop_for_thread = Arc::clone(&stop);
+            let thread = std::thread::spawn(move || {
+                while !stop_for_thread.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let _ = stream.set_nonblocking(false);
+                            let mut buf = [0u8; 4096];
+                            let n = stream.read(&mut buf).unwrap_or(0);
+                            requests_for_thread
+                                .lock()
+                                .unwrap()
+                                .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                            let body = r#"{"ok":true}"#;
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = stream.write_all(resp.as_bytes());
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            RecordingDaemon {
+                socket,
+                requests,
+                stop,
+                _thread: thread,
+                _guard: guard,
+                #[cfg(target_os = "linux")]
+                _runtime_dir: runtime_dir,
+            }
+        }
+
+        /// Bounded wait for `n` recorded requests; the panic names how many
+        /// actually arrived.
+        fn wait_for_requests(&self, n: usize, bound: Duration) -> Vec<String> {
+            let deadline = Instant::now() + bound;
+            loop {
+                let seen = self.requests.lock().unwrap().clone();
+                if seen.len() >= n {
+                    return seen;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "recording daemon saw {} of {n} requests within {bound:?}",
+                    seen.len()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for RecordingDaemon {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = std::fs::remove_file(&self.socket);
+        }
+    }
+
+    /// `wake_usage_poller` — the single call the Anthropic finalize, codex
+    /// and gemini-oauth completion sites share — must POST the daemon's
+    /// rebind route carrying THAT slot. Removing the notify call inside the
+    /// helper reds this test (no request is recorded); a wrong route or a
+    /// dropped slot number reds the two content assertions.
+    #[test]
+    fn wake_usage_poller_posts_the_rebind_route_with_the_bound_slot() {
+        // The recording daemon's socket derives from `dir` on macOS.
+        let dir = csq_core::testing::socket_fixture::short_root("csq-login-").unwrap();
+        let daemon = RecordingDaemon::spawn(dir.path());
+
+        let account = AccountNum::try_from(7u16).unwrap();
+        wake_usage_poller(dir.path(), account);
+
+        let got = daemon.wait_for_requests(1, Duration::from_secs(5));
+        assert_eq!(
+            got.len(),
+            1,
+            "one wake must issue exactly one request, got {got:?}"
+        );
+        assert!(
+            got[0].starts_with("POST /api/slot-rebind "),
+            "the wake must POST the rebind route, got {:?}",
+            got[0]
+        );
+        assert!(
+            got[0].contains(r#"{"slot":7}"#),
+            "the wake must carry the bound slot, got {:?}",
+            got[0]
+        );
     }
 }

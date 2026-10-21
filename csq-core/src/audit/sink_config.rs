@@ -217,10 +217,14 @@ impl AuditSinkConfig {
     pub fn save(&self, base_dir: &Path) -> Result<(), SinkConfigError> {
         let path = Self::path(base_dir);
 
-        // Ensure parent directory exists before taking a tmp path.
+        // SEC-2.15 (unified, R1 M1): create AND secure the parent (the
+        // accounts root or a secured child of it) fail-closed via the
+        // shared helper before taking a tmp path.
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| SinkConfigError::Io {
-                message: format!("create parent dir for audit-sink.json: {e}"),
+            crate::platform::fs::ensure_private_dir_root(parent).map_err(|e| {
+                SinkConfigError::Io {
+                    message: format!("secure parent dir for audit-sink.json: {e}"),
+                }
             })?;
         }
 

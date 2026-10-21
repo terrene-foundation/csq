@@ -188,6 +188,19 @@ impl AuditEmitter {
         }
     }
 
+    /// Test seam: the record this emitter holds (`None` once flushed or
+    /// discarded, or for a disabled emitter).
+    #[cfg(test)]
+    pub(crate) fn record_for_test(&self) -> Option<&csq_core::audit::AuditRecord> {
+        self.record.as_ref()
+    }
+
+    /// Test seam: the operation label this emitter was built with.
+    #[cfg(test)]
+    pub(crate) fn operation_for_test(&self) -> &str {
+        &self.operation
+    }
+
     /// Overwrite `start_ts` in the held record.
     ///
     /// Call this immediately after constructing the emitter, before any
@@ -326,14 +339,18 @@ impl AuditEmitter {
     /// e.g. a pre-spawn termination check where no session was ever
     /// actually started and a record describing one would be misleading.
     ///
-    /// Gated `#[cfg(unix)]`: its only caller today is
-    /// `codex_supervise::exit_cleanly_if_terminating_before_spawn` (also
-    /// `#[cfg(unix)]` — the SIGHUP/SIGTERM pre-spawn termination check is
-    /// unix-signal-only), so on a non-unix build this method is genuinely
-    /// unreachable rather than merely untested.
-    #[cfg(unix)]
+    /// Callers: `codex_supervise::exit_cleanly_if_terminating_before_spawn`
+    /// (unix) and `run::end_codex_run_before_spawn` (every platform — a
+    /// `csq swap` into a codex slot refused or declined before codex spawns).
     pub fn discard(&mut self) {
         self.record = None;
+    }
+
+    /// Whether the held record carries an M6 spawn-gate verdict
+    /// ([`set_spawn_gate`](Self::set_spawn_gate)). `false` once the record
+    /// has been flushed or discarded.
+    pub fn spawn_gate_recorded(&self) -> bool {
+        self.record.as_ref().is_some_and(|r| r.spawn_gate.is_some())
     }
 
     /// Emit the record immediately, best-effort (test-only).
@@ -1129,38 +1146,95 @@ mod tests {
         );
     }
 
-    // ── Timeout: simulate hung daemon (fast test via missing socket) ───────
+    // ── Timeout: a daemon that accepts the connection and never answers ─────
 
-    /// The 100 ms deadline test uses a socket that doesn't exist (immediate
-    /// ENOENT), which is indistinguishable from a timeout at the test level.
-    /// The timeout boundary itself is tested implicitly by the connect-timeout
-    /// being 5 ms — any real hung daemon would trigger the fallback path.
-    ///
-    /// For a genuine hung-daemon test, a stub listener that sleeps > 100 ms
-    /// is required; that lives in T10 (PR-CA10c load test).
+    /// The sink is a REAL hung daemon: a listening socket whose peer never
+    /// reads or replies. The connect completes (kernel backlog) and the write
+    /// fits the socket buffer, so only the enforced read deadline
+    /// (`IPC_TOTAL_DEADLINE_MS`) lets `drop` return. The property proven is
+    /// "drop does not wait on the sink": the drop runs on a worker thread and
+    /// the test waits on a channel for its completion, so a `drop` that waited
+    /// on the sink would never send and the test would RED at `HANG_GUARD`
+    /// instead of hanging. The guard is 50x the enforced deadline: a hang is
+    /// unbounded while the sink never answers, whereas host load only stretches
+    /// the ~100 ms deadline by a small factor, so no wall-clock bound on the
+    /// drop itself is asserted (a 200 ms bound failed at 754 ms under load).
     #[cfg(unix)]
     #[test]
     fn emit_timeout_uses_fallback() {
         let dir = TempDir::new().unwrap();
-        let socket_path = dir.path().join("no-daemon.sock");
-        let pending_dir = dir.path().join("csq-runs").join(".pending");
-
-        let run_id = "00000000-0000-4000-a000-000000000003";
-        let start = std::time::Instant::now();
-        drop(AuditEmitter::new(
-            sample_record(run_id),
-            socket_path,
-            pending_dir.clone(),
-            "csq run account 3".to_string(),
-        ));
-        let elapsed = start.elapsed();
-
-        // Drop must complete within 200 ms (100 ms budget + 100 ms slack).
-        assert!(
-            elapsed.as_millis() < 200,
-            "AuditEmitter::drop must complete within 200ms, took {}ms",
-            elapsed.as_millis()
+        let socket_dir = csq_core::testing::socket_fixture::short_root("csq-ae-").unwrap();
+        let socket_path = socket_dir.path().join("s");
+        drop_on_hung_sink_falls_back(
+            dir.path(),
+            &socket_path,
+            "00000000-0000-4000-a000-000000000003",
         );
+    }
+
+    /// Same property with the state root nested >= 90 bytes deep: the
+    /// geometry of a CI runner whose `TMPDIR` is long. The `.pending/` state
+    /// stays under that deep root while the socket lives in a short owned
+    /// directory, so the bind cannot hit the `sun_path` limit (104 bytes on
+    /// macOS, 108 on Linux) however deep the runner's `TMPDIR` is.
+    #[cfg(unix)]
+    #[test]
+    fn emit_timeout_uses_fallback_with_long_state_root() {
+        let outer = TempDir::new().unwrap();
+        let state_root = outer.path().join("x".repeat(90));
+        std::fs::create_dir_all(&state_root).unwrap();
+        assert!(state_root.as_os_str().len() >= 90);
+        let socket_dir = csq_core::testing::socket_fixture::short_root("csq-ae-").unwrap();
+        let socket_path = socket_dir.path().join("s");
+        drop_on_hung_sink_falls_back(
+            &state_root,
+            &socket_path,
+            "00000000-0000-4000-a000-000000000004",
+        );
+    }
+
+    #[cfg(unix)]
+    fn drop_on_hung_sink_falls_back(
+        state_root: &std::path::Path,
+        socket_path: &std::path::Path,
+        run_id: &'static str,
+    ) {
+        const HANG_GUARD: std::time::Duration =
+            std::time::Duration::from_millis(50 * IPC_TOTAL_DEADLINE_MS);
+
+        let pending_dir = state_root.join("csq-runs").join(".pending");
+        // Bound and listening, never accepted or read: the hung sink. Held to
+        // the end of the test so the peer stays connected-but-silent.
+        let _hung_sink = std::os::unix::net::UnixListener::bind(socket_path).unwrap_or_else(|e| {
+            panic!(
+                "bind hung sink ({} bytes): {e}",
+                socket_path.as_os_str().len()
+            )
+        });
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let worker = {
+            let socket_path = socket_path.to_path_buf();
+            let pending_dir = pending_dir.clone();
+            std::thread::spawn(move || {
+                drop(AuditEmitter::new(
+                    sample_record(run_id),
+                    socket_path,
+                    pending_dir,
+                    "csq run account 3".to_string(),
+                ));
+                let _ = done_tx.send(());
+            })
+        };
+
+        assert!(
+            done_rx.recv_timeout(HANG_GUARD).is_ok(),
+            "AuditEmitter::drop must not wait on a sink that never answers: \
+             no completion within {}ms (the enforced deadline is {}ms)",
+            HANG_GUARD.as_millis(),
+            IPC_TOTAL_DEADLINE_MS
+        );
+        worker.join().unwrap();
 
         // Record must be in .pending/.
         let expected = pending_dir.join(format!("{run_id}.jsonl"));

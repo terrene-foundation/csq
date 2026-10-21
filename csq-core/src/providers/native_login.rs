@@ -1,6 +1,6 @@
 //! Native-CLI login orchestrator (Wave B / an internal journal entry) — Kimi and Grok.
 //!
-//! Mirrors [`crate::providers::codex::login::perform`]/`perform_with`'s
+//! Mirrors [`crate::providers::codex::login::perform_with`]'s
 //! dependency-injected shape, but simpler: there is no credential
 //! relocation, no UUID mint, and no post-spawn cleanup guard, because the
 //! vendor CLI's credentials NEVER leave the slot's vendor home
@@ -297,8 +297,8 @@ where
 
 /// CLI TTY entry point. Spawns the real vendor binary with **inherited**
 /// stdio — the user sees the vendor's own device-code prompt directly,
-/// the same UX as `codex login --device-auth`'s CLI path
-/// (`codex::login::perform`). Because stdio is inherited (not piped),
+/// the same UX as `codex login --device-auth` run from the CLI
+/// (`handle_codex` in `csq/src/cli/commands/login.rs`). Because stdio is inherited (not piped),
 /// there is no device-code line for csq to parse or forward here.
 ///
 /// Resolves the binary via
@@ -347,22 +347,175 @@ pub fn login_native_cli(base_dir: &Path, slot: AccountNum, surface: Surface) -> 
     finish_native_login(base_dir, slot, surface, descriptor, &home, status)
 }
 
+/// True iff the error is a POSIX **mode-bits-only** failure from `fchmod`
+/// (EPERM on e.g. an immutable-flag dir; ENOTSUP/EOPNOTSUPP on FAT and some
+/// network filesystems). Only that class may be downgraded to a warning:
+/// `secure_dir_fd` verifies the fd is a REAL directory owned by `geteuid`
+/// (`O_DIRECTORY | O_NOFOLLOW` + `fstat`) BEFORE it reaches its `fchmod`.
+/// The DOWNGRADE additionally requires the caller's stage gate
+/// (`verified_existing_owned_dir`; fixcheck2 LOW 5): the path must have
+/// pre-existed as a real euid-owned directory, so a mode-bits errno from a
+/// CREATE stage (path absent) or from a symlinked path is never downgraded
+/// — it refuses.
+/// Every other error class — symlink refusal, non-directory refusal,
+/// foreign-owner refusal, create failure, ELOOP — is a refusal, and the
+/// R3 MED bug was exactly this predicate's absence: `home.is_dir()` follows
+/// symlinks, so refusals read as "exists, warn and continue" and vendor
+/// tokens then got written through a planted link.
+///
+/// R3-fix-check LOW 1: this predicate is NECESSARY but NOT SUFFICIENT.
+/// Errno alone cannot tell a failed `fchmod` on an existing owner dir from
+/// an EPERM raised by the create/open stages, so callers MUST additionally
+/// gate the downgrade on [`verified_existing_owned_dir`] (the stage gate):
+/// only a target that ALREADY existed as a real, euid-owned directory may
+/// downgrade.
+fn is_mode_bits_only_failure(e: &crate::error::PlatformError) -> bool {
+    #[cfg(unix)]
+    {
+        if let crate::error::PlatformError::Io(io) = e {
+            // Comparisons, not a `matches!` arm list: on Linux
+            // `ENOTSUP == EOPNOTSUPP` (both 95), so an OR-pattern of the two
+            // is an unreachable duplicate; on macOS they are distinct
+            // (45/102) and both must be accepted.
+            let code = io.raw_os_error();
+            return code == Some(libc::EPERM)
+                || code == Some(libc::ENOTSUP)
+                || code == Some(libc::EOPNOTSUPP);
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows has no POSIX mode bits to fail on; every error is fatal.
+        let _ = e;
+        false
+    }
+}
+
+/// R3-fix-check LOW 1 (stage gate): true iff `path` ALREADY exists as a
+/// REAL directory (no-follow) owned by `geteuid` — i.e. `ensure_private_dir`
+/// on it cannot enter its create stage, only its open + `fchmod` tighten.
+/// Only then may the errno-based mode-bits class downgrade to a warning: an
+/// EPERM/ENOTSUP raised by the CREATE or OPEN stage on a missing or
+/// unverified target refuses like any other failure.
+#[cfg(unix)]
+fn verified_existing_owned_dir(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => {
+            // SAFETY: geteuid has no memory or synchronization preconditions.
+            meta.uid() == unsafe { libc::geteuid() }
+        }
+        _ => false,
+    }
+}
+#[cfg(not(unix))]
+fn verified_existing_owned_dir(path: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(path), Ok(meta) if meta.is_dir())
+}
+
 /// Creates the slot's per-slot vendor home and restricts it to `0o700` on
 /// Unix (defense-in-depth: the vendor writes its real tokens into this dir at
 /// perms of its own choosing, so csq locks the containing dir down — redteam
-/// R1 LOW). The chmod is best-effort (non-fatal on FAT/network fs).
+/// R1 LOW). The chmod is best-effort ONLY for the mode-bits-only failure
+/// class on a filesystem that cannot carry it (FAT/network fs); every
+/// refusal is fatal.
+/// Test-only seam (fixcheck2 LOW 5): lets a unit test force the next
+/// [`secure_vendor_dir`] call for one exact path to fail with a chosen raw
+/// OS error, so the CALLER-LEVEL stage gate (`existed && mode-bits-only`)
+/// is exercised end-to-end — removing either conjunct must red a caller
+/// test, not only the predicate's own test.
+#[cfg(test)]
+mod secure_failure_hook {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static ARMED: RefCell<Option<(PathBuf, i32)>> = const { RefCell::new(None) };
+    }
+
+    #[cfg(unix)]
+    pub(super) fn arm(path: &Path, errno: i32) {
+        ARMED.with(|slot| *slot.borrow_mut() = Some((path.to_path_buf(), errno)));
+    }
+
+    pub(super) fn take_for(path: &Path) -> Option<std::io::Error> {
+        ARMED.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            match slot.as_ref() {
+                Some((armed, errno)) if armed == path => {
+                    let errno = *errno;
+                    *slot = None;
+                    Some(std::io::Error::from_raw_os_error(errno))
+                }
+                _ => None,
+            }
+        })
+    }
+}
+
+/// `ensure_private_dir` behind the test seam above; identical in
+/// production builds.
+fn secure_vendor_dir(path: &Path) -> Result<(), crate::error::PlatformError> {
+    #[cfg(test)]
+    if let Some(injected) = secure_failure_hook::take_for(path) {
+        return Err(crate::error::PlatformError::Io(injected));
+    }
+    crate::platform::fs::ensure_private_dir(path)
+}
+
 fn ensure_vendor_home(
     base_dir: &Path,
     slot: AccountNum,
     surface: Surface,
 ) -> Result<std::path::PathBuf> {
     let home = native::native_home_path(base_dir, slot, surface);
-    std::fs::create_dir_all(&home)
-        .with_context(|| format!("create native vendor home for slot {slot}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
+    // R3 MED: secure the CONTAINING `native-homes/` FIRST. The recursive
+    // create below would otherwise follow a symlinked `native-homes/` and
+    // land `home` (and the vendor's real tokens) behind a planted link.
+    // Strict helper is correct for this leaf: `native-homes/` itself is not
+    // the operator-symlinkable component — only the accounts root above it
+    // is (R2 H1).
+    if let Some(native_homes) = home.parent() {
+        // R3-fix-check LOW 1: the mode-bits downgrade additionally requires
+        // the target to have ALREADY existed as a verified euid-owned real
+        // directory — only then can the failure be a pure mode-write.
+        let native_homes_existed = verified_existing_owned_dir(native_homes);
+        if let Err(e) = secure_vendor_dir(native_homes) {
+            if !(native_homes_existed && is_mode_bits_only_failure(&e)) {
+                return Err(anyhow!(
+                    "refusing native vendor home for slot {slot}: \
+                     the containing native-homes directory could not be secured: {}",
+                    redact_tokens(&e.to_string())
+                ));
+            }
+            tracing::warn!(
+                error_kind = "native_homes_secure_failed",
+                "native-homes directory for slot {slot} could not be fully secured \
+                 (mode bits only): {}",
+                redact_tokens(&e.to_string())
+            );
+        }
+    }
+    // R2 M3 + R3 MED: route through the shared fail-closed helper (0o700 at
+    // creation, no create-then-chmod window). Every refusal — symlink at
+    // `home`, foreign owner, non-directory, create/IO failure — is FATAL.
+    // Only a verified mode-bits-only failure on a real euid-owned directory
+    // (see `is_mode_bits_only_failure`) is surfaced as a warning and
+    // tolerated.
+    let home_existed = verified_existing_owned_dir(&home);
+    if let Err(e) = secure_vendor_dir(&home) {
+        if !(home_existed && is_mode_bits_only_failure(&e)) {
+            return Err(anyhow!(
+                "refusing native vendor home for slot {slot}: {}",
+                crate::error::redact_tokens(&e.to_string())
+            ));
+        }
+        tracing::warn!(
+            error_kind = "native_home_secure_failed",
+            "native vendor home for slot {slot} could not be fully secured (mode bits only): {}",
+            crate::error::redact_tokens(&e.to_string())
+        );
     }
     Ok(home)
 }
@@ -452,6 +605,105 @@ mod tests {
         let cred_path = home.join(descriptor.cred_relpath);
         std::fs::create_dir_all(cred_path.parent().unwrap()).unwrap();
         std::fs::write(&cred_path, "{}").unwrap();
+    }
+
+    // ── R3 MED: ensure_vendor_home fails CLOSED ─────────────────────────
+
+    /// R3 MED regression: a SYMLINK planted at the slot's vendor home is a
+    /// refusal, not a warning. The former shape checked `home.is_dir()`
+    /// (which FOLLOWS the link), downgraded the strict helper's refusal to
+    /// a warn, and let the vendor CLI write real tokens through the planted
+    /// link.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_vendor_home_refuses_symlinked_home_and_writes_nothing_through_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+        let home = native::native_home_path(base, slot(7), Surface::Kimi);
+        std::fs::create_dir_all(home.parent().unwrap()).unwrap();
+        let outside = dir.path().join("outside-target");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &home).unwrap();
+
+        let err = ensure_vendor_home(base, slot(7), Surface::Kimi)
+            .expect_err("a symlinked vendor home must be refused");
+
+        assert!(
+            format!("{err:#}").contains("refusing native vendor home"),
+            "the refusal must be explicit (MED: fail closed, not warn): {err:#}"
+        );
+        let names: Vec<_> = std::fs::read_dir(&outside)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            names.is_empty(),
+            "nothing may be written through the link: {names:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&home)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted link must be left in place, not replaced or followed"
+        );
+    }
+
+    /// R3 MED regression: a symlinked `native-homes/` CONTAINER is refused
+    /// up front — the former shape's recursive create would have followed
+    /// the container link and created the slot home behind it.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_vendor_home_refuses_symlinked_native_homes_container() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+        let container = base.join("native-homes");
+        let outside = dir.path().join("outside-container");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &container).unwrap();
+
+        let err = ensure_vendor_home(base, slot(3), Surface::Grok)
+            .expect_err("a symlinked native-homes/ must be refused");
+
+        assert!(
+            format!("{err:#}").contains("native-homes"),
+            "the refusal must name the container: {err:#}"
+        );
+        assert!(
+            std::fs::read_dir(&outside).unwrap().next().is_none(),
+            "no slot home may be created behind the container link"
+        );
+    }
+
+    /// R3-fix-check LOW 1 regression (stage predicate): only a REAL,
+    /// euid-owned, pre-existing directory qualifies for the mode-bits
+    /// downgrade; a missing path (the create stage may be the failure) and
+    /// a symlink never do. The mutation that keeps errno-only classification
+    /// (making this predicate unconditional) reds this test.
+    #[cfg(unix)]
+    #[test]
+    fn mode_bits_downgrade_requires_a_verified_existing_owned_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+        let missing = base.join("missing-home");
+        assert!(
+            !verified_existing_owned_dir(&missing),
+            "a MISSING path must not qualify — the failing stage could be create"
+        );
+        let real = base.join("real-home");
+        std::fs::create_dir(&real).unwrap();
+        assert!(
+            verified_existing_owned_dir(&real),
+            "a real euid-owned directory qualifies"
+        );
+        let link_target = base.join("link-target");
+        std::fs::create_dir(&link_target).unwrap();
+        let link = base.join("link-home");
+        std::os::unix::fs::symlink(&link_target, &link).unwrap();
+        assert!(
+            !verified_existing_owned_dir(&link),
+            "a symlink must not qualify, even when its target is a real dir"
+        );
     }
 
     // ── parse_native_device_code (directive 4e) ─────────────────────────
@@ -703,5 +955,47 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!native::marker_exists(base, s, surface));
+    }
+
+    /// fixcheck2 LOW 5 (a): the native-homes/ stage gate at the CALLER — a
+    /// mode-bits-only (EPERM) failure on a container that did NOT pre-exist
+    /// must REFUSE. Removing the `native_homes_existed &&` conjunct reds
+    /// this test (the former predicate-only test stayed green).
+    #[cfg(unix)]
+    #[test]
+    fn ensure_vendor_home_refuses_a_mode_bits_failure_on_a_missing_container() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+        let container = base.join("native-homes");
+        secure_failure_hook::arm(&container, libc::EPERM);
+        let err = ensure_vendor_home(base, slot(3), Surface::Grok)
+            .expect_err("a mode-bits-only failure on a NON-existing container must refuse");
+        assert!(
+            format!("{err:#}").contains("could not be secured"),
+            "the refusal must name the container failure: {err:#}"
+        );
+        assert!(
+            !container.exists(),
+            "nothing may be created past a refused container"
+        );
+    }
+
+    /// fixcheck2 LOW 5 (b): same gate for the vendor home itself — the
+    /// container is real, the home's ensure fails EPERM while the home did
+    /// NOT pre-exist → REFUSE. Removing `home_existed &&` reds this test.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_vendor_home_refuses_a_mode_bits_failure_on_a_missing_home() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+        let home = native::native_home_path(base, slot(4), Surface::Kimi);
+        secure_failure_hook::arm(&home, libc::EPERM);
+        let err = ensure_vendor_home(base, slot(4), Surface::Kimi)
+            .expect_err("a mode-bits-only failure on a NON-existing home must refuse");
+        assert!(
+            format!("{err:#}").contains("refusing native vendor home"),
+            "the refusal must be the home refusal: {err:#}"
+        );
+        assert!(!home.exists(), "nothing may be created past a refused home");
     }
 }

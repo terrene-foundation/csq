@@ -80,8 +80,12 @@ pub const VAULT_OP_TIMEOUT: Duration = Duration::from_secs(5);
 /// (`macos` and `windows`); the Linux backend uses its own tokio-
 /// based `block_with_timeout` because the upstream crate is
 /// async-only.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-pub(crate) fn run_with_timeout<F, T>(thread_name: &'static str, op: F) -> Result<T, SecretError>
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+fn run_with_timeout_at<F, T>(
+    thread_name: &'static str,
+    timeout: Duration,
+    op: F,
+) -> Result<T, SecretError>
 where
     F: FnOnce() -> Result<T, SecretError> + Send + 'static,
     T: Send + 'static,
@@ -99,13 +103,147 @@ where
         .map_err(|e| SecretError::BackendUnavailable {
             reason: format!("vault worker thread spawn: {e}"),
         })?;
-    match rx.recv_timeout(VAULT_OP_TIMEOUT) {
+    match rx.recv_timeout(timeout) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => Err(SecretError::Timeout),
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(SecretError::BackendUnavailable {
             reason: "vault worker thread panicked before producing a result".into(),
         }),
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) fn run_with_timeout<F, T>(thread_name: &'static str, op: F) -> Result<T, SecretError>
+where
+    F: FnOnce() -> Result<T, SecretError> + Send + 'static,
+    T: Send + 'static,
+{
+    run_with_timeout_at(thread_name, VAULT_OP_TIMEOUT, op)
+}
+
+pub(crate) fn named_native_timeout(interactive: bool) -> Duration {
+    if interactive {
+        Duration::from_secs(60)
+    } else {
+        VAULT_OP_TIMEOUT
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+pub(crate) fn run_named_with_timeout<F, T>(
+    thread_name: &'static str,
+    op: F,
+) -> Result<T, SecretError>
+where
+    F: FnOnce() -> Result<T, SecretError> + Send + 'static,
+    T: Send + 'static,
+{
+    let interactive = crate::credentials::keychain::interactive_scope_active();
+    run_with_timeout_at(thread_name, named_native_timeout(interactive), move || {
+        if interactive {
+            crate::credentials::keychain::with_interactive_keychain(op)
+        } else {
+            op()
+        }
+    })
+}
+
+/// Completion evidence is process-local and exact-backend/exact-key scoped.
+/// It never attests work in an OS service after this process exits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NamedWorkerState {
+    Unknown,
+    Outstanding,
+    Completed,
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+#[derive(Default)]
+struct NamedWorkers {
+    pending: usize,
+    all_returned: bool,
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+type WorkerMap = std::collections::BTreeMap<(&'static str, String), NamedWorkers>;
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+fn named_workers() -> &'static std::sync::Mutex<WorkerMap> {
+    static WORKERS: std::sync::OnceLock<std::sync::Mutex<WorkerMap>> = std::sync::OnceLock::new();
+    WORKERS.get_or_init(Default::default)
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+struct NamedWorker {
+    id: (&'static str, String),
+    returned: bool,
+}
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+impl NamedWorker {
+    fn begin(backend: &'static str, key: &NamedKey) -> Result<Self, SecretError> {
+        let id = (backend, key.native_name());
+        let mut map = named_workers().lock().map_err(|_| named_unsupported())?;
+        let state = map.entry(id.clone()).or_default();
+        if state.pending == 0 {
+            state.all_returned = true;
+        }
+        state.pending += 1;
+        Ok(Self {
+            id,
+            returned: false,
+        })
+    }
+}
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+impl Drop for NamedWorker {
+    fn drop(&mut self) {
+        if let Ok(mut map) = named_workers().lock() {
+            if let Some(state) = map.get_mut(&self.id) {
+                state.pending = state.pending.saturating_sub(1);
+                state.all_returned &= self.returned;
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+pub(crate) fn named_worker_state(backend: &'static str, key: &NamedKey) -> NamedWorkerState {
+    let Ok(map) = named_workers().lock() else {
+        return NamedWorkerState::Unknown;
+    };
+    match map.get(&(backend, key.native_name())) {
+        Some(state) if state.pending != 0 => NamedWorkerState::Outstanding,
+        Some(state) if state.all_returned => NamedWorkerState::Completed,
+        _ => NamedWorkerState::Unknown,
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+pub(crate) fn run_named_mutation_with_timeout<F, T>(
+    thread_name: &'static str,
+    backend: &'static str,
+    key: &NamedKey,
+    op: F,
+) -> Result<T, SecretError>
+where
+    F: FnOnce() -> Result<T, SecretError> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut worker = NamedWorker::begin(backend, key)?;
+    run_named_with_timeout(thread_name, move || {
+        let result = op();
+        // Only the native call returning supplies completion evidence. Timeout
+        // in the caller leaves this guard inside the still-running worker.
+        worker.returned = true;
+        drop(worker);
+        result
+    })
+}
+
+/// Volatile zeroization for OS-owned credential buffers, before freeing them.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn wipe_native_blob(bytes: &mut [u8]) {
+    use zeroize::Zeroize;
+    bytes.zeroize();
 }
 
 /// Logical identifier for a stored secret. csq is multi-account +
@@ -147,6 +285,32 @@ impl SlotKey {
     }
 }
 
+/// Validated pool identity, independent of account slots.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NamedKey(String);
+
+impl NamedKey {
+    pub fn pool(name: &str) -> Result<Self, SecretError> {
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        {
+            return Err(SecretError::InvalidKey {
+                reason: "invalid pool key name".into(),
+            });
+        }
+        Ok(Self(name.to_owned()))
+    }
+    pub fn native_name(&self) -> String {
+        format!("csq.pool.{}", self.0)
+    }
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Errors raised by [`Vault`] operations. Every variant maps to a
 /// user-actionable IPC string via [`From<SecretError> for String`] —
 /// per `rules/tauri-commands.md` §6, no opaque "secret error" tag is
@@ -155,6 +319,10 @@ impl SlotKey {
 /// token-leakage risk; the redactor is still defence-in-depth.
 #[derive(Debug, thiserror::Error)]
 pub enum SecretError {
+    #[error("named secret mutation outcome is unknown; automatic recovery refused")]
+    NamedOutcomeUnknown,
+    #[error("no secret stored for named key")]
+    NamedNotFound,
     /// No secret stored for the given slot. Distinct from
     /// `BackendUnavailable` so the UI can prompt provisioning rather
     /// than show a backend warning.
@@ -223,6 +391,8 @@ impl SecretError {
     /// operations MUST use a tag, not `%e` formatting.
     pub fn error_kind_tag(&self) -> &'static str {
         match self {
+            SecretError::NamedOutcomeUnknown => "vault_named_outcome_unknown",
+            SecretError::NamedNotFound => "vault_not_found",
             SecretError::NotFound { .. } => "vault_not_found",
             SecretError::PermissionDenied { .. } => "vault_permission_denied",
             SecretError::Locked => "vault_locked",
@@ -257,6 +427,37 @@ impl SecretError {
 /// derived key is one step removed from the secret material, while
 /// the cleartext is the secret itself.
 pub trait Vault: Send + Sync {
+    /// Additive named operations fail closed for legacy custom implementations.
+    fn set_named(&self, _key: &NamedKey, _secret: &SecretString) -> Result<(), SecretError> {
+        Err(named_unsupported())
+    }
+    fn get_named(&self, _key: &NamedKey) -> Result<SecretString, SecretError> {
+        Err(named_unsupported())
+    }
+    fn delete_named(&self, _key: &NamedKey) -> Result<(), SecretError> {
+        Err(named_unsupported())
+    }
+    /// Checks presence without returning or copying the payload to the caller.
+    /// Windows may materialize plaintext through the OS API; it is immediately wiped.
+    fn contains_named(&self, _key: &NamedKey) -> Result<bool, SecretError> {
+        Err(named_unsupported())
+    }
+    /// Explicit interactive recovery may authorize unlocking. Ordinary listing
+    /// continues to use the non-unlocking presence method above.
+    fn contains_named_for_recovery(&self, key: &NamedKey) -> Result<bool, SecretError> {
+        match self.get_named(key) {
+            Ok(value) => {
+                drop(value);
+                Ok(true)
+            }
+            Err(SecretError::NamedNotFound) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+    fn named_worker_state(&self, _key: &NamedKey) -> NamedWorkerState {
+        NamedWorkerState::Unknown
+    }
+
     /// Stores `secret` at `slot`, overwriting any existing value.
     /// Atomic on every backend — partial writes are not observable
     /// to a concurrent reader.
@@ -287,6 +488,22 @@ pub trait Vault: Send + Sync {
     fn backend_id(&self) -> &'static str;
 }
 
+pub(crate) fn named_mutation_result<T>(result: Result<T, SecretError>) -> Result<T, SecretError> {
+    result.map_err(|e| {
+        if matches!(e, SecretError::Timeout) {
+            SecretError::NamedOutcomeUnknown
+        } else {
+            e
+        }
+    })
+}
+
+fn named_unsupported() -> SecretError {
+    SecretError::BackendUnavailable {
+        reason: "named keys unsupported by this backend".into(),
+    }
+}
+
 /// Selects the right [`Vault`] implementation for the current
 /// platform. Returns `BackendUnavailable` when the native primitive
 /// is absent and the user has not opted into the file fallback via
@@ -307,19 +524,41 @@ pub trait Vault: Send + Sync {
 /// Windows have a native primitive and refusing here prevents an
 /// attacker (or an over-eager systemd unit) from quietly downgrading
 /// the threat model on a host that already has Keychain / DPAPI.
+///
+/// `CSQ_SECRET_BACKEND=in-memory` is honoured ONLY in a build with the
+/// `secret-in-memory` feature (or `cfg(test)`); any other build refuses it with
+/// `BackendUnavailable` instead of opening the platform vault.
 pub fn open_default_vault() -> Result<Box<dyn Vault>, SecretError> {
     let override_kind = std::env::var("CSQ_SECRET_BACKEND").ok();
-    match override_kind.as_deref() {
-        Some("in-memory") if cfg!(any(test, feature = "secret-in-memory")) => {
-            Ok(Box::new(in_memory::InMemoryVault::new()))
-        }
+    open_default_vault_with(
+        override_kind.as_deref(),
+        cfg!(any(test, feature = "secret-in-memory")),
+    )
+}
+
+/// `open_default_vault` with the env value and the in-memory capability injected,
+/// so the feature-off refusal is testable from a build where the feature is on.
+fn open_default_vault_with(
+    override_kind: Option<&str>,
+    in_memory_enabled: bool,
+) -> Result<Box<dyn Vault>, SecretError> {
+    match override_kind {
+        Some("in-memory") if in_memory_enabled => Ok(Box::new(in_memory::InMemoryVault::new())),
+        // A build without the `secret-in-memory` feature must refuse the pin. Falling
+        // through to the platform default would silently hand a caller that asked for
+        // an ephemeral test store the REAL vault (the macOS login keychain).
+        Some("in-memory") => Err(SecretError::BackendUnavailable {
+            reason:
+                "CSQ_SECRET_BACKEND=in-memory requires a build with the secret-in-memory feature"
+                    .into(),
+        }),
         Some(other) if !is_known_override(other) => Err(SecretError::BackendUnavailable {
             reason: format!("unknown CSQ_SECRET_BACKEND value: {other}"),
         }),
         // Known overrides (`auto`, `keychain`, `file`) and the unset
         // case all flow into the platform native dispatch, which
         // honours the override locally.
-        _ => open_native_default(override_kind.as_deref()),
+        _ => open_native_default(override_kind),
     }
 }
 
@@ -375,6 +614,113 @@ mod tests {
     use super::*;
     use crate::providers::catalog::Surface;
     use std::sync::Mutex;
+
+    #[test]
+    fn named_worker_evidence_is_exact_and_waits_for_every_worker() {
+        let key = NamedKey::pool("worker-fixture").unwrap();
+        let backend = "fixture-native";
+        let mut old = NamedWorker::begin(backend, &key).unwrap();
+        let mut newer = NamedWorker::begin(backend, &key).unwrap();
+        newer.returned = true;
+        drop(newer);
+        assert_eq!(
+            named_worker_state(backend, &key),
+            NamedWorkerState::Outstanding
+        );
+        assert_eq!(
+            named_worker_state("other-native", &key),
+            NamedWorkerState::Unknown
+        );
+        old.returned = true;
+        drop(old);
+        assert_eq!(
+            named_worker_state(backend, &key),
+            NamedWorkerState::Completed
+        );
+        let panicking = NamedWorker::begin(backend, &key).unwrap();
+        drop(panicking);
+        assert_eq!(named_worker_state(backend, &key), NamedWorkerState::Unknown);
+        run_named_mutation_with_timeout("worker-fixture", backend, &key, || Ok(())).unwrap();
+        assert_eq!(
+            named_worker_state(backend, &key),
+            NamedWorkerState::Completed
+        );
+    }
+
+    #[test]
+    fn recovery_presence_distinguishes_absence_and_drops_returned_secret() {
+        let vault = in_memory::InMemoryVault::new();
+        let key = NamedKey::pool("recovery-fixture").unwrap();
+        assert!(!vault.contains_named_for_recovery(&key).unwrap());
+        vault
+            .set_named(&key, &SecretString::from("synthetic-fixture".to_owned()))
+            .unwrap();
+        assert!(vault.contains_named_for_recovery(&key).unwrap());
+    }
+
+    #[test]
+    fn native_blob_fixture_is_zero_before_release() {
+        let mut blob = [0xa5u8; 48];
+        wipe_native_blob(&mut blob);
+        assert!(blob.iter().all(|b| *b == 0));
+        wipe_native_blob(&mut []);
+    }
+
+    #[test]
+    fn named_interactive_timeout_preserves_background_bound() {
+        assert_eq!(named_native_timeout(false), Duration::from_secs(5));
+        assert_eq!(named_native_timeout(true), Duration::from_secs(60));
+        assert_eq!(VAULT_OP_TIMEOUT, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn named_worker_propagates_and_restores_interactive_scope() {
+        use crate::credentials::keychain::{interactive_scope_active, with_interactive_keychain};
+        assert!(!interactive_scope_active());
+        assert!(
+            !run_named_with_timeout("named-fixture", || Ok(interactive_scope_active())).unwrap()
+        );
+        let active = with_interactive_keychain(|| {
+            run_named_with_timeout("named-fixture", || Ok(interactive_scope_active()))
+        })
+        .unwrap();
+        assert!(active);
+        assert!(!interactive_scope_active());
+    }
+
+    #[test]
+    fn named_key_validation_and_namespace_are_distinct_from_slots() {
+        assert_eq!(
+            NamedKey::pool("a.b_1-2").unwrap().native_name(),
+            "csq.pool.a.b_1-2"
+        );
+        for invalid in ["", "a/b", "a b", "a\n", "é", "*"] {
+            assert!(NamedKey::pool(invalid).is_err());
+        }
+        assert!(NamedKey::pool(&"a".repeat(64)).is_ok());
+        assert!(NamedKey::pool(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn named_timeout_is_ambiguous_and_cannot_be_ordinary_retry() {
+        assert!(matches!(
+            named_mutation_result::<()>(Err(SecretError::Timeout)),
+            Err(SecretError::NamedOutcomeUnknown)
+        ));
+        assert!(matches!(
+            named_mutation_result::<()>(Err(SecretError::Locked)),
+            Err(SecretError::Locked)
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn named_extension_does_not_allow_macos_file_override() {
+        assert!(matches!(
+            open_native_default(Some("file")),
+            Err(SecretError::BackendUnavailable { .. })
+        ));
+    }
 
     /// Surface tag for the only surface currently using the vault.
     /// Resolved from [`Surface::Gemini::as_str()`] so the test fixture
@@ -508,6 +854,29 @@ mod tests {
             result,
             Err(SecretError::BackendUnavailable { .. })
         ));
+    }
+
+    /// A build without `secret-in-memory` must REFUSE the in-memory pin: the old
+    /// fall-through opened the platform vault (the real macOS login keychain). The
+    /// enabled arm is the control that the refusal is conditional on the feature.
+    #[test]
+    fn in_memory_pin_without_the_feature_refuses_instead_of_opening_the_platform_vault() {
+        let Err(refused) = open_default_vault_with(Some("in-memory"), false) else {
+            panic!("in-memory pin must be refused when the feature is off");
+        };
+        match refused {
+            SecretError::BackendUnavailable { reason } => {
+                assert!(
+                    reason.contains("secret-in-memory"),
+                    "reason must name the missing feature: {reason}"
+                );
+            }
+            other => panic!("expected BackendUnavailable, got {other:?}"),
+        }
+        let Ok(vault) = open_default_vault_with(Some("in-memory"), true) else {
+            panic!("in-memory pin must open when the feature is on");
+        };
+        assert_eq!(vault.backend_id(), "in-memory");
     }
 
     #[test]

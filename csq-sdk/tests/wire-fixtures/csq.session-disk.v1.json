@@ -1,0 +1,22 @@
+{
+  "complete": false,
+  "id": "corr-id-1",
+  "ok": false,
+  "reasons": [
+    "current_session_union_unknown"
+  ],
+  "rows": [
+    {
+      "decision": "KEEP",
+      "generation": "01234567-89ab-4def-8123-0123456789ab",
+      "pid": 4242,
+      "reasons": [
+        "open_handles_unknown"
+      ],
+      "scratch_dir": "/scratch/project/session",
+      "session_id": "12345678-9abc-4def-8123-123456789abc",
+      "state": "ended"
+    }
+  ],
+  "schema": "csq.session-disk.v1"
+}

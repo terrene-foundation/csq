@@ -54,20 +54,29 @@
 
 #![allow(unsafe_code)]
 
-use super::windows_parse::{exe_matches_claude, parse_environment_block};
-use super::{parse_term_session_id, SessionInfo};
+use super::windows_parse::{
+    exe_matches_claude, hop_probe_from_image, open_failure_means_gone, owner_verdict,
+    parse_environment_block,
+};
+use super::{parse_term_session_id, HopProbe, Listing, PidLookup, SessionInfo, Undetermined};
 use std::ffi::OsString;
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 
-use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_NO_MORE_FILES, FALSE, HANDLE, INVALID_HANDLE_VALUE,
+};
+use windows_sys::Win32::Security::{
+    GetLengthSid, GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER,
+};
 use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
 };
 
 // ---------------------------------------------------------------------------
@@ -117,26 +126,53 @@ extern "system" {
 
 /// Returns the list of live CC sessions for the current user.
 pub fn list() -> Vec<SessionInfo> {
-    let mut out = Vec::new();
-    for pid in enumerate_claude_pids() {
-        if let Some(info) = read_process(pid) {
-            out.push(info);
+    try_list().unwrap_or_default()
+}
+
+/// [`list`], but `None` when the process snapshot itself could not be
+/// taken, so a caller can tell "no live sessions" from "could not look".
+pub fn try_list() -> Option<Vec<SessionInfo>> {
+    try_list_detailed().map(|l| l.sessions)
+}
+
+/// [`try_list`] plus the count of `claude.exe` processes that could not be read. The
+/// candidates are chosen by image name, so a candidate that fails to read (open refused,
+/// token or PEB unreadable) is counted rather than skipped (INV-31-02). A process that is
+/// gone, or positively owned by another user, is not.
+pub fn try_list_detailed() -> Option<Listing> {
+    let mut sessions = Vec::new();
+    let mut unreadable_pids: Vec<u32> = Vec::new();
+    for pid in enumerate_claude_pids(None)? {
+        match read_process_checked(pid) {
+            Ok(Some(info)) => sessions.push(info),
+            Ok(None) => {}
+            Err(Undetermined) => unreadable_pids.push(pid),
         }
     }
-    out
+    Some(Listing {
+        sessions,
+        unreadable_claude: unreadable_pids.len(),
+        unreadable_pids,
+        incomplete: false,
+        incomplete_cause: None,
+        restricted: false,
+    })
 }
 
 /// Walks the full process list and returns PIDs whose executable
 /// basename is `claude.exe`. We filter here (not in `read_process`)
 /// so the expensive PEB walk happens only for candidate processes.
-fn enumerate_claude_pids() -> Vec<u32> {
+///
+/// `only` restricts the walk to one pid (the targeted lookup): the snapshot is the
+/// cheap part on Windows; the PEB walk is what it avoids repeating per session.
+fn enumerate_claude_pids(only: Option<u32>) -> Option<Vec<u32>> {
     // SAFETY: CreateToolhelp32Snapshot is a well-defined syscall
     // that returns INVALID_HANDLE_VALUE on failure; we check and
     // bail. The returned handle is closed via CloseHandle in the
     // defer below.
     let snapshot: HANDLE = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot == 0 || snapshot == INVALID_HANDLE_VALUE {
-        return Vec::new();
+        return None;
     }
 
     let mut out = Vec::new();
@@ -146,43 +182,197 @@ fn enumerate_claude_pids() -> Vec<u32> {
     // Process32FirstW / Process32NextW iterate the snapshot.
     // szExeFile is a fixed-size WCHAR array; find the NUL
     // terminator and compare against "claude.exe".
-    if unsafe { Process32FirstW(snapshot, &mut entry) } != 0 {
-        loop {
-            if exe_matches_claude(&entry.szExeFile) {
-                out.push(entry.th32ProcessID);
+    //
+    // INV-31-02: a failed call is "could not read the table" (`None`) unless
+    // GetLastError is ERROR_NO_MORE_FILES, which is how the API reports the
+    // end of the table (or an empty one). A mid-walk failure also yields
+    // `None`: a truncated table must not read as "enumerated".
+    let mut complete = true;
+    // SAFETY: `snapshot` is a valid handle and `entry.dwSize` is set.
+    let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    loop {
+        if !ok {
+            // SAFETY: GetLastError only reads thread-local state.
+            let code = unsafe { GetLastError() };
+            if !is_end_of_table(code) {
+                tracing::warn!(
+                    reason = "process_walk_failed",
+                    code,
+                    "process table walk failed; listing undetermined"
+                );
+                complete = false;
             }
-            if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
-                break;
-            }
+            break;
         }
+        if exe_matches_claude(&entry.szExeFile)
+            && (only.is_none() || only == Some(entry.th32ProcessID))
+        {
+            out.push(entry.th32ProcessID);
+        }
+        // SAFETY: as above.
+        ok = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
     }
 
     unsafe {
         CloseHandle(snapshot);
     }
-    out
+    complete.then_some(out)
+}
+
+/// `GetLastError` value the ToolHelp walk reports at the end of the table.
+fn is_end_of_table(code: u32) -> bool {
+    code == ERROR_NO_MORE_FILES
+}
+
+/// The session for one pid, three-outcome (see [`super::session_info_for_pid`]): the
+/// snapshot confirms it is a `claude.exe`, then one PEB walk reads it. A failed snapshot
+/// is `Err`; so is any open or PEB failure other than "no such process".
+///
+/// Same-user filter: the target's process-token user SID (`OpenProcessToken` +
+/// `GetTokenInformation(TokenUser)`) is compared with this process's. A different SID is
+/// `Ok(None)`; a token that cannot be read is `Err(Undetermined)`, never a determinate
+/// answer (see [`read_process_checked`] and [`owner_verdict`]). Windows has no
+/// controlling-terminal concept for `claude.exe`, so no terminal is required.
+/// (Compile-checked only on `x86_64-pc-windows-gnu`; never run here.)
+pub(crate) fn session_info_for_pid(pid: u32) -> PidLookup {
+    let pids = enumerate_claude_pids(Some(pid)).ok_or(Undetermined)?;
+    if pids.contains(&pid) {
+        read_process_checked(pid)
+    } else {
+        Ok(None)
+    }
+}
+
+/// The user SID of a process or token owner, as owned bytes (`TOKEN_USER` -> `Sid`, length
+/// from `GetLengthSid`). `None` when any step fails.
+fn token_user_sid(process: HANDLE) -> Option<Vec<u8>> {
+    let mut token: HANDLE = 0;
+    // SAFETY: `process` is a valid process handle or pseudo-handle; `token` is a live
+    // out-pointer. OpenProcessToken returns 0 on failure, checked.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+        return None;
+    }
+    let sid = (|| {
+        let mut needed = 0u32;
+        // SAFETY: a null buffer with length 0 only asks for the required size.
+        unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+        if needed == 0 {
+            return None;
+        }
+        // 8-byte alignment for the TOKEN_USER the kernel writes at the start.
+        let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
+        // SAFETY: `buf` is at least `needed` bytes and exclusively borrowed; the call
+        // writes at most `needed` bytes and returns 0 on failure, checked.
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buf.as_mut_ptr().cast::<core::ffi::c_void>(),
+                needed,
+                &mut needed,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        // SAFETY: a successful TokenUser query wrote a TOKEN_USER at the start of `buf`
+        // (aligned above), whose `User.Sid` points at the SID stored in the same buffer.
+        let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        if sid.is_null() {
+            return None;
+        }
+        // The kernel-written `sid` pointer is not trusted to lie inside `buf`: bound its
+        // offset from the buffer start before ANY read through it. A SID's fixed header
+        // (revision, sub-authority count, 6-byte authority) is 8 bytes; GetLengthSid reads
+        // only that header, so the header must fit within the `needed` bytes first.
+        const SID_HEADER_LEN: usize = 8;
+        let off = (sid as usize).checked_sub(buf.as_ptr() as usize)?;
+        if off.checked_add(SID_HEADER_LEN)? > needed as usize {
+            return None;
+        }
+        // SAFETY: `off + 8 <= needed <= buf.len() * 8` (checked above), so the SID header
+        // GetLengthSid reads lies inside `buf`.
+        let len = unsafe { GetLengthSid(sid) } as usize;
+        if len == 0 || off.checked_add(len)? > needed as usize {
+            return None;
+        }
+        // SAFETY: `off + len <= needed <= buf.len() * 8` (checked above), so the `len`
+        // bytes starting `off` bytes into `buf` lie inside it; the slice is derived from
+        // `buf`'s own pointer, never from the kernel-written one.
+        Some(
+            unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>().add(off), len) }.to_vec(),
+        )
+    })();
+    // SAFETY: `token` was opened above and is closed exactly once.
+    unsafe {
+        CloseHandle(token);
+    }
+    sid
+}
+
+/// Whether `pid` is owned by the same user as this process, via the token user SIDs.
+/// `Ok(false)` is returned for a vanished process and for a process whose token was read
+/// and carries a different SID. A non-admin caller usually CANNOT query another user's
+/// token, so such a process normally lands in `Err(Undetermined)` (the token could not be
+/// read), not `Ok(false)`; on a shared Windows host that makes the per-pid lookups
+/// answer undetermined, which is fail-closed.
+fn same_owner(pid: u32) -> Result<bool, Undetermined> {
+    // Limited-information access is typically enough to read a token when the caller may
+    // open the process at all (the same user, or an admin). The exception is a protected
+    // process, whose token can be refused even to an admin; that too lands in
+    // `Err(Undetermined)`, as does another user's process, as the function doc says.
+    // SAFETY: OpenProcess returns NULL (0) on failure, checked; the handle is closed below.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) };
+    if handle == 0 {
+        // SAFETY: GetLastError only reads thread-local state.
+        let code = unsafe { GetLastError() };
+        return if open_failure_means_gone(code) {
+            Ok(false)
+        } else {
+            Err(Undetermined)
+        };
+    }
+    let target = token_user_sid(handle);
+    // SAFETY: `handle` was opened above and is closed exactly once.
+    unsafe {
+        CloseHandle(handle);
+    }
+    // SAFETY: GetCurrentProcess returns a pseudo-handle that needs no close.
+    let own = token_user_sid(unsafe { GetCurrentProcess() });
+    owner_verdict(target.as_deref(), own.as_deref()).ok_or(Undetermined)
 }
 
 /// Opens a process, walks its PEB, extracts env and cwd.
-fn read_process(pid: u32) -> Option<SessionInfo> {
+fn read_process_checked(pid: u32) -> PidLookup {
+    // Same-user filter first: a process whose token was read and carries another SID is
+    // positively not ours (`Ok(None)`); one whose owner cannot be read — usually another
+    // user's process, for a non-admin caller — is undetermined (fail-closed).
+    if !same_owner(pid)? {
+        return Ok(None);
+    }
     // SAFETY: OpenProcess returns NULL (0) on failure. We check and
     // bail immediately. The returned handle is closed in the
     // cleanup path below.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid) };
     if handle == 0 {
-        return None;
+        // SAFETY: GetLastError only reads thread-local state.
+        let code = unsafe { GetLastError() };
+        return if open_failure_means_gone(code) {
+            Ok(None)
+        } else {
+            Err(Undetermined)
+        };
     }
 
     // PEB walk. Wrapped in a closure so the CloseHandle below
     // always runs, even on early return.
-    let result = (|| -> Option<SessionInfo> {
-        let (env_block, cwd) = read_peb_env_and_cwd(handle)?;
+    let result = (|| -> PidLookup {
+        let (env_block, cwd) = read_peb_env_and_cwd(handle).ok_or(Undetermined)?;
         let environ = parse_environment_block(&env_block);
 
-        let config_dir = environ.get("CLAUDE_CONFIG_DIR")?;
-        if config_dir.is_empty() {
-            return None;
-        }
+        let Some(config_dir) = environ.get("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) else {
+            return Ok(None);
+        };
         let config_dir = PathBuf::from(config_dir);
         let account_id = SessionInfo::extract_account_id(&config_dir);
 
@@ -195,7 +385,7 @@ fn read_process(pid: u32) -> Option<SessionInfo> {
 
         let started_at = get_process_start_time(handle);
 
-        Some(SessionInfo {
+        Ok(Some(SessionInfo {
             pid,
             cwd: PathBuf::from(cwd),
             config_dir,
@@ -207,7 +397,7 @@ fn read_process(pid: u32) -> Option<SessionInfo> {
             term_pane,
             iterm_profile,
             terminal_title: None, // no osascript equivalent on Windows
-        })
+        }))
     })();
 
     unsafe {
@@ -216,10 +406,125 @@ fn read_process(pid: u32) -> Option<SessionInfo> {
     result
 }
 
+/// One process between a caller and a claimed owner, classified by IMAGE NAME from a
+/// Toolhelp snapshot (a CLI image is a session whatever its owner; another readable image is
+/// not; no env or terminal is needed). A failed snapshot is `Unreadable`; a pid absent from
+/// the snapshot is `Gone`.
+/// (Compile-checked only on `x86_64-pc-windows-gnu`; never run here.)
+pub(crate) fn hop_probe(pid: u32) -> HopProbe {
+    // SAFETY: CreateToolhelp32Snapshot returns INVALID_HANDLE_VALUE on failure; checked below.
+    let snapshot: HANDLE = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == 0 || snapshot == INVALID_HANDLE_VALUE {
+        return HopProbe::Unreadable;
+    }
+    // SAFETY: PROCESSENTRY32W is plain-old-data; all-zero is valid before dwSize is set.
+    let mut entry: PROCESSENTRY32W = unsafe { zeroed() };
+    entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+    let mut image: Option<Vec<u16>> = None;
+    // SAFETY: `snapshot` is a valid handle and `entry.dwSize` is set.
+    let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while ok {
+        if entry.th32ProcessID == pid {
+            image = Some(entry.szExeFile.to_vec());
+            break;
+        }
+        // SAFETY: as above.
+        ok = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: GetLastError only reads thread-local state.
+    let walk_failed = image.is_none() && !is_end_of_table(unsafe { GetLastError() });
+    // SAFETY: `snapshot` is a valid handle returned above and is closed exactly once.
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    match image {
+        Some(image) => hop_probe_from_image(&image),
+        None if walk_failed => HopProbe::Unreadable,
+        None => HopProbe::Gone,
+    }
+}
+
+/// The parent pid of `pid` from a Toolhelp snapshot (`th32ParentProcessID`), or `None`
+/// when the snapshot cannot be taken, the walk fails, or `pid` is not in it.
+pub(crate) fn parent_pid_of(pid: u32) -> Option<u32> {
+    // SAFETY: CreateToolhelp32Snapshot returns INVALID_HANDLE_VALUE on failure; checked below.
+    let snapshot: HANDLE = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == 0 || snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    // SAFETY: PROCESSENTRY32W is plain-old-data; all-zero is valid before dwSize is set.
+    let mut entry: PROCESSENTRY32W = unsafe { zeroed() };
+    entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+    let mut found = None;
+    // SAFETY: `snapshot` is a valid handle and `entry.dwSize` is set.
+    let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while ok {
+        if entry.th32ProcessID == pid {
+            found = Some(entry.th32ParentProcessID);
+            break;
+        }
+        // SAFETY: as above.
+        ok = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: `snapshot` is a valid handle returned above and is closed exactly once.
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    found
+}
+
+/// The creation time of `pid` as unix seconds, or `None` when the process cannot be
+/// opened or queried.
+pub(crate) fn start_time_of(pid: u32) -> Option<u64> {
+    // SAFETY: OpenProcess returns NULL (0) on failure; the handle is closed below.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid) };
+    if handle == 0 {
+        return None;
+    }
+    let started = get_process_start_time(handle);
+    // SAFETY: `handle` is a valid handle returned by OpenProcess above.
+    unsafe {
+        CloseHandle(handle);
+    }
+    started
+}
+
 /// Returns the process creation time as a Unix timestamp (seconds since epoch),
 /// or `None` if the call fails. Uses `GetProcessTimes` which returns
 /// `FILETIME` structs (100-nanosecond intervals since 1601-01-01 UTC).
 fn get_process_start_time(handle: HANDLE) -> Option<u64> {
+    let creation = get_process_creation_filetime(handle)?;
+    // Convert FILETIME (100ns since 1601-01-01) to Unix epoch (seconds since 1970-01-01).
+    // Difference between 1601 and 1970 epochs in 100ns intervals:
+    // 11644473600 seconds * 10_000_000 = 116444736000000000
+    const FILETIME_UNIX_DIFF: u64 = 116_444_736_000_000_000;
+    if creation < FILETIME_UNIX_DIFF {
+        return None; // date before Unix epoch — shouldn't happen
+    }
+    Some((creation - FILETIME_UNIX_DIFF) / 10_000_000)
+}
+
+/// The creation FILETIME of `pid` in raw 100 ns units, the full-precision start the
+/// ancestry walk compares ([`super::is_ancestor_of_current`]). `None` when the process
+/// cannot be opened or queried.
+pub(crate) fn creation_filetime_of(pid: u32) -> Option<u64> {
+    // SAFETY: OpenProcess returns NULL (0) on failure; the handle is closed below.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid) };
+    if handle == 0 {
+        return None;
+    }
+    let t = get_process_creation_filetime(handle);
+    // SAFETY: `handle` is a valid handle returned by OpenProcess above.
+    unsafe {
+        CloseHandle(handle);
+    }
+    // A zero creation time (kernel pseudo-processes) is not a real start: refusing it keeps
+    // the walk fail-closed, matching macOS `micros` and the old `start_time_of` filter.
+    t.filter(|&c| c != 0)
+}
+
+/// Raw creation FILETIME (100 ns since 1601-01-01 UTC) via `GetProcessTimes`.
+fn get_process_creation_filetime(handle: HANDLE) -> Option<u64> {
     use windows_sys::Win32::System::Threading::GetProcessTimes;
 
     // FILETIME = two u32s representing a 64-bit count of 100ns intervals
@@ -243,15 +548,7 @@ fn get_process_start_time(handle: HANDLE) -> Option<u64> {
     if ok == 0 {
         return None;
     }
-
-    // Convert FILETIME (100ns since 1601-01-01) to Unix epoch (seconds since 1970-01-01).
-    // Difference between 1601 and 1970 epochs in 100ns intervals:
-    // 11644473600 seconds * 10_000_000 = 116444736000000000
-    const FILETIME_UNIX_DIFF: u64 = 116_444_736_000_000_000;
-    if creation < FILETIME_UNIX_DIFF {
-        return None; // date before Unix epoch — shouldn't happen
-    }
-    Some((creation - FILETIME_UNIX_DIFF) / 10_000_000)
+    Some(creation)
 }
 
 /// Walks the PEB to extract the environment block and cwd.
@@ -416,4 +713,19 @@ fn read_remote_wide_string(handle: HANDLE, addr: usize, word_count: usize) -> St
     OsString::from_wide(&buf[..bytes_read / 2])
         .to_string_lossy()
         .into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only ERROR_NO_MORE_FILES (18) is a clean end of table; access-denied
+    /// or any other code is "could not read" (INV-31-02).
+    #[test]
+    fn only_no_more_files_ends_the_table_cleanly() {
+        assert!(is_end_of_table(18));
+        assert!(!is_end_of_table(0));
+        assert!(!is_end_of_table(5)); // ERROR_ACCESS_DENIED
+        assert!(!is_end_of_table(24)); // ERROR_BAD_LENGTH
+    }
 }

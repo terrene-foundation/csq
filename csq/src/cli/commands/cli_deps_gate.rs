@@ -348,16 +348,18 @@ fn enforce_with_fns(
 /// operator at a terminal" (C-F11).
 ///
 /// `csq/src/cli/commands/cli.rs::is_ci_environment` is the codebase's other
-/// CI detector, checking a wider set (`CIRCLECI`, `TEAMCITY_VERSION`,
-/// `DRONE`, `TF_BUILD` in addition to these five) for a DIFFERENT purpose —
-/// it gates *interactive consent* for `csq cli install/upgrade`. This one
+/// CI detector. It gates *interactive consent* for `csq cli install/upgrade`
+/// by iterating the shared `csq_core::env::CI_SENTINEL_VARS` (the wider set,
+/// which adds `CIRCLECI`, `TEAMCITY_VERSION`, `DRONE`, `TF_BUILD`). This one
 /// gates a *silent best-effort* background upgrade attempt from `csq run` /
 /// `csq login`, and uses exactly the five vars named for that decision
 /// (finding C-F11: `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, `BUILDKITE`,
-/// `JENKINS_URL`). `is_ci_environment` is module-private in a sibling file
-/// this shard does not own, so it cannot be called directly; keep this list
-/// in sync with it in SPIRIT (the sentinel vocabulary) even though the two
-/// sets differ in size on purpose.
+/// `JENKINS_URL`). The two sets differ in size on purpose, but this list MUST
+/// stay a SUBSET of `CI_SENTINEL_VARS`: the test
+/// `other_production_ci_detectors_are_covered_by_the_shared_list` in
+/// `csq/tests/ci_env_hermeticity_integration.rs` reds when a variable is added
+/// here without being added to `CI_SENTINEL_VARS`, so subprocess tests would
+/// otherwise fail to strip it.
 const TRACK_LATEST_CI_VARS: &[&str] = &[
     "CI",
     "GITHUB_ACTIONS",

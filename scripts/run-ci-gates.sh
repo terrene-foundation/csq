@@ -156,16 +156,18 @@ fi
 # and anchored at start-of-line so a reference INSIDE another comment sentence
 # (this file is full of them) does not match.
 marker_of() {
+    # `sed -n '1p'` reads the whole stream and prints its first line — same
+    # answer as head -1, with no early exit to SIGPIPE the producer.
     sed -n '1,80p' "$1" \
         | grep -Eo '^# ci-gate:[[:space:]]*[a-z-]+' \
-        | head -1 \
+        | sed -n '1p' \
         | sed -E 's/^# ci-gate:[[:space:]]*//'
 }
 
 reason_of() {
     sed -n '1,80p' "$1" \
         | grep -Eo '^# ci-gate-reason:[[:space:]]*.+' \
-        | head -1 \
+        | sed -n '1p' \
         | sed -E 's/^# ci-gate-reason:[[:space:]]*//'
 }
 

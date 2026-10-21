@@ -57,6 +57,22 @@
     /// Rendered next to the token status so "Expired" grows a
     /// "— invalid token" suffix when the refresh token is dead.
     last_refresh_error: string | null;
+    /// Pending post-commit rescue state for this slot's identity:
+    /// `"adoptable"` (a blocked refresh tick is transient — the next tick
+    /// installs or discards the record) or `"unadoptable"` (the saved login
+    /// cannot be restored; the user must sign in again for this account).
+    /// Absent (null/undefined) for rows with no identity (3P / manual /
+    /// native), for identities with no pending record, AND from older
+    /// backends that predate the field — all three render nothing.
+    /// Optional rather than required for the same backward-compatibility
+    /// reason as `has_quota` above.
+    rescue_pending?: 'adoptable' | 'unadoptable' | null;
+    /// Fixed-vocabulary operator text for `rescue_pending`, so the row
+    /// renders the SAME message `csq status` and `csq doctor` show. The
+    /// backend sends both fields together, but it is optional on the wire
+    /// (skipped when None) — see `rescuePendingMessage` for the
+    /// version-skew fallback.
+    rescue_pending_message?: string | null;
     /// Stable 3P provider id ("mm" | "zai" | "deepseek" | "ollama"),
     /// or null for first-party OAuth slots. Used to branch UI on
     /// provider type (e.g. only Ollama slots get a "Change model"
@@ -95,6 +111,26 @@
     gemini_effective_model?: string | null;
   }
 
+  /// One pending post-commit rescue row from `get_pending_rescues`
+  /// (`csq_core::credentials::rescue::PendingRescue`). The backend sends the
+  /// fixed-vocabulary `message` and `status_line`, so the renderer never
+  /// re-derives operator text.
+  interface PendingRescueView {
+    /// Numeric slot when `profiles.json` supplied the mapping; `null` when
+    /// the row came from the identities-directory fallback (profiles
+    /// unreadable), in which case it is labelled by `identity_uuid`.
+    slot: number | null;
+    label: string;
+    /// `unknown` is the explicit fail-closed state: neither `profiles.json`
+    /// nor the identities directory could be read.
+    state: 'adoptable' | 'unadoptable' | 'unknown';
+    identity_uuid?: string | null;
+    /// Fixed-vocabulary state text (shared with `csq status` / `csq doctor`).
+    message: string;
+    /// The complete status row, same text the CLI prints.
+    status_line: string;
+  }
+
   /// Formats `gemini_rate_limit_reset_at` (ISO-8601 UTC) into a
   /// human-readable countdown like "resets in 59m 58s". Returns the
   /// empty string when the reset is in the past or the input is
@@ -122,6 +158,8 @@
     switch (tag) {
       case 'broker_token_invalid':
         return 'invalid token — re-login needed';
+      case 'refresh_suppressed_duplicate_grant':
+        return 'shares a sign-in with another slot — re-login needed';
       case 'broker_refresh_failed':
         return 'refresh failed — check network or re-login';
       case 'broker_other':
@@ -139,6 +177,22 @@
       default:
         return tag; // pass through unknown tags
     }
+  }
+
+  /// Operator text for a pending rescue state. The backend's
+  /// `rescue_pending_message` is authoritative — it is the SAME fixed
+  /// vocabulary `csq status` and `csq doctor` print, so all three
+  /// surfaces stay in agreement. The local literals below are ONLY a
+  /// version-skew fallback for a payload that carries the tag without its
+  /// paired message (the two Rust fields are mapped together today, so
+  /// this is defense in depth, not a live path); they must stay verbatim
+  /// copies of `RescuePendingState::message()` in
+  /// `csq-core/src/credentials/rescue.rs`.
+  function rescuePendingMessage(account: AccountView): string {
+    if (account.rescue_pending_message) return account.rescue_pending_message;
+    return account.rescue_pending === 'unadoptable'
+      ? 'a saved login could not be restored; sign in again for this account'
+      : 'saved login restoration pending; the next refresh tick retries it automatically';
   }
 
   // ── Quota staleness (F1) ─────────────────────────────────
@@ -209,6 +263,18 @@
   }
 
   let accounts = $state<AccountView[]>([]);
+  // Page-level pending rescue rows from `get_pending_rescues`: entries that
+  // have NO account card to live on — a UUID-labelled fallback row when
+  // `profiles.json` is unreadable, or the explicit `unknown` state when even
+  // the identities directory cannot be scanned. Slot-keyed rows stay inside
+  // their card (`rescue_pending`); rendering those here too would duplicate
+  // the same warning.
+  let pendingRescues = $state<PendingRescueView[]>([]);
+  let unmappedRescues = $derived.by(() =>
+    pendingRescues.filter(
+      (row) => row.slot == null || !accounts.some((account) => account.id === row.slot),
+    ),
+  );
   // F2 (desktop account-list redteam): a poll failure (the 5s interval,
   // or a post-action re-fetch after remove/move/rename) is TRANSIENT and
   // MUST NOT blank the card list — the daemon may just be mid-restart.
@@ -229,13 +295,24 @@
   // picker. Only one picker can be open at a time (`movingFromId`), so
   // no separate id is needed — `movingFromId === account.id` scopes it.
   let moveError = $state<string | null>(null);
-  // Informational notice surfaced after a successful `csq move` when the
-  // pre-rename scan found live processes bound to the source slot. Phase 3
-  // (M3-6) replaced the `SLOT_IN_USE` refusal with `live_pids_bound`
-  // telemetry; the renderer displays this notice so the user knows daemon
-  // attribution survived the renumber. Auto-clears after ~5s.
-  let moveNotice = $state<string | null>(null);
-  let moveNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+  // Informational notice surfaced after a successful action whose outcome
+  // needs a word: a `csq move` that found live processes bound to the
+  // source slot (Phase 3 (M3-6) replaced the `SLOT_IN_USE` refusal with
+  // `live_pids_bound` telemetry, so the user learns daemon attribution
+  // survived the renumber), or a `remove_account` that succeeded while the
+  // slot's local credential folder stayed on disk
+  // (`identity_dir_pending_removal`). Auto-clears after ~5s.
+  let actionNotice = $state<string | null>(null);
+  let actionNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function showActionNotice(text: string) {
+    if (actionNoticeTimer != null) clearTimeout(actionNoticeTimer);
+    actionNotice = text;
+    actionNoticeTimer = setTimeout(() => {
+      actionNotice = null;
+      actionNoticeTimer = null;
+    }, 5000);
+  }
   let loading = $state(true);
   let modalOpen = $state(false);
   let reauthSlot = $state<number | null>(null);
@@ -257,7 +334,7 @@
   // remaining `config-N/`-keyed symlinks are rewritten by Step 5.5 of
   // `move_account`. The Tauri command returns `MoveAccountSummary` with
   // `live_pids_bound: u32[]` telemetry; the renderer surfaces it via the
-  // `moveNotice` state.
+  // `actionNotice` state.
   let movingFromId = $state<number | null>(null);
   let moveTargetId = $state<number | null>(null);
   let moveBusy = $state(false);
@@ -452,6 +529,55 @@
     }
   }
 
+  // Page-level rescue rows (see `pendingRescues`). Deliberately separate
+  // from `fetchAccounts`: a failure here must never set `pollError` (the
+  // account list is fine), and an older backend that predates the command
+  // simply has no page-level rows.
+  //
+  // R3 finding corr L-9: the failure itself is a DIAGNOSTIC STATE, not a
+  // reason to render nothing. `csq status`/`csq doctor` say "rescue status
+  // unknown" when they cannot determine it; the desktop must not show
+  // silence where they show a warning. A rejected query therefore sets
+  // `rescueFetchFailed` and the template renders ONE explicit unknown row.
+  // The previous `catch {}` swallowed the error outright (zero-tolerance
+  // Rule 3 — silent fallback).
+  //
+  // The log tag is FIXED VOCABULARY with no error text: an IPC rejection can
+  // carry paths and free-form detail (`security.md` MUST-2). The rendered
+  // line is likewise fixed and does NOT reuse the backend's "profiles
+  // unreadable" verdict — the backend never ran, so claiming that would be a
+  // false diagnostic.
+  const RESCUE_FETCH_FAILED_LINE =
+    'rescue status unknown: pending rescue query failed';
+  let rescueFetchFailed = $state(false);
+
+  async function fetchPendingRescues() {
+    try {
+      const baseDir = await getBaseDir();
+      const rows = await invoke<PendingRescueView[]>('get_pending_rescues', { baseDir });
+      // Defensive against a payload that is not an array (an older bridge
+      // or a test double): the derived filter must never throw.
+      pendingRescues = Array.isArray(rows) ? rows : [];
+      rescueFetchFailed = false;
+    } catch {
+      // Non-destructive (F2): a transient failure must not erase a warning
+      // already on screen — `pendingRescues` is left exactly as it was. The
+      // explicit unknown row (rendered from `rescueFetchFailed`) reports
+      // that the CURRENT state is undetermined, so the user is never told
+      // everything is fine by an empty panel.
+      const wasFailing = rescueFetchFailed;
+      rescueFetchFailed = true;
+      // Log the TRANSITION only: this poll runs every 5s, and a persistent
+      // failure (e.g. a version-skewed backend with no such command) must
+      // not emit a warn 12 times a minute. The rendered row is the standing
+      // signal; this line is the one-time breadcrumb.
+      if (!wasFailing) {
+        // eslint-disable-next-line no-console
+        console.warn('[csq] error_kind=pending_rescue_fetch_failed');
+      }
+    }
+  }
+
   // The next free slot is the smallest 1..=999 integer not already
   // taken by an existing account. Using `length + 1` would skip
   // past gaps (e.g. after the user deletes account 3 from five).
@@ -490,8 +616,25 @@
     disarmRemove();
     try {
       const baseDir = await getBaseDir();
-      await invoke('remove_account', { baseDir, account: accountId });
+      // `remove_account` can SUCCEED while the slot's local credential
+      // folder (`identities/<UUID>/`) stays on disk: the credential lock
+      // was busy or the delete failed. The account is tombstoned, so no
+      // writer can recreate it, and the next cleanup pass collects the
+      // folder — but the user MUST NOT be left believing the removal
+      // finished. The summary carries that deferral; state it plainly
+      // instead of reporting an unqualified success.
+      const summary = (await invoke('remove_account', {
+        baseDir,
+        account: accountId,
+      })) as { identity_dir_pending_removal?: boolean } | undefined;
       await fetchAccounts();
+      if (summary?.identity_dir_pending_removal) {
+        showActionNotice(
+          `Account ${accountId} was logged out, but the local credential folder was NOT removed ` +
+            `(its credential lock was busy or the delete failed). The account is already ` +
+            `tombstoned, so no running process can write to it; the next cleanup pass will remove it.`,
+        );
+      }
     } catch (e) {
       // F2: surface the typed error message INLINE on the affected card
       // (`removeError`/`removeErrorId`) rather than the global banner —
@@ -501,6 +644,10 @@
       const raw = String(e);
       if (raw.startsWith('ACCOUNT_IN_USE:')) {
         removeError = `Cannot remove account ${accountId} — a Claude Code session is still running. Exit it first, then retry.`;
+      } else if (raw.startsWith('ACCOUNT_MARKER_UNREADABLE:')) {
+        // A pid marker could not be read: nothing is known to be running, so do NOT
+        // claim a session is. The backend text names the handle dir and what to do.
+        removeError = raw.slice('ACCOUNT_MARKER_UNREADABLE:'.length).trim();
       } else {
         removeError = raw;
       }
@@ -570,15 +717,11 @@
 
       const livePids = summary?.live_pids_bound ?? [];
       if (livePids.length > 0) {
-        if (moveNoticeTimer != null) clearTimeout(moveNoticeTimer);
-        moveNotice =
+        showActionNotice(
           `Moved slot ${from} → ${to} while ${livePids.length} Claude Code session(s) ` +
-          `were bound (PID${livePids.length === 1 ? '' : 's'} ${livePids.join(', ')}). ` +
-          `Their next API call will continue against slot ${to}.`;
-        moveNoticeTimer = setTimeout(() => {
-          moveNotice = null;
-          moveNoticeTimer = null;
-        }, 5000);
+            `were bound (PID${livePids.length === 1 ? '' : 's'} ${livePids.join(', ')}). ` +
+            `Their next API call will continue against slot ${to}.`,
+        );
       }
 
       await fetchAccounts();
@@ -673,7 +816,11 @@
   $effect(() => {
     try { localStorage.removeItem('csq-card-order'); } catch {}
     fetchAccounts();
-    const interval = setInterval(fetchAccounts, 5000);
+    fetchPendingRescues();
+    const interval = setInterval(() => {
+      fetchAccounts();
+      fetchPendingRescues();
+    }, 5000);
     // F1: advances `nowSecs` independently of the fetch cycle so a
     // card's staleness age keeps ticking forward even while
     // `get_accounts` itself is failing (F2) — that is exactly the
@@ -692,6 +839,53 @@
     };
   });
 </script>
+
+{#if actionNotice}
+  <!-- Page-level, not list-level: a successful removal that empties the
+       list still reports a deferred credential-folder cleanup, so this
+       banner must paint in the `accounts.length === 0` branch too. -->
+  <div class="info-notice" role="status">{actionNotice}</div>
+{/if}
+
+{#if unmappedRescues.length > 0 || rescueFetchFailed}
+  <!-- Page-level pending rescue rows: each has NO account card to live on.
+       A UUID-labelled row means `profiles.json` was unreadable and the
+       identity was found by scanning `identities/`; `unknown` means not
+       even that scan could run. Painting here (above the loading/empty/list
+       branches) guarantees the desktop never shows silence where `csq
+       status` and `csq doctor` show a warning. The text is the backend's
+       fixed-vocabulary `status_line` — never re-derived here — except for
+       the query-failure row below, whose text is a UI-local fixed literal
+       because no backend answer exists at all. -->
+  <div class="rescue-notices" data-testid="pending-rescue-rows">
+    {#if rescueFetchFailed}
+      <!-- The query itself failed: state is UNDETERMINED (fail closed), so
+           render the same explicit unknown row shape rather than dropping
+           the state. Retained rows above may be stale; this row is the
+           current verdict. -->
+      <div
+        class="rescue-pending-unadoptable"
+        data-testid="pending-rescue-unknown"
+        role="alert"
+        title="Pending login rescue state could not be determined"
+      >
+        ⚠ {RESCUE_FETCH_FAILED_LINE}
+      </div>
+    {/if}
+    {#each unmappedRescues as rescue (rescue.status_line)}
+      <div
+        class={rescue.state === 'adoptable' ? 'rescue-pending-adoptable' : 'rescue-pending-unadoptable'}
+        data-testid="pending-rescue-{rescue.state}"
+        role={rescue.state === 'adoptable' ? 'status' : 'alert'}
+        title={rescue.state === 'unknown'
+          ? 'Pending login rescue state could not be determined'
+          : 'Pending post-commit login rescue'}
+      >
+        {rescue.state === 'adoptable' ? '' : '⚠ '}{rescue.status_line}
+      </div>
+    {/each}
+  </div>
+{/if}
 
 {#if loading}
   <div class="loading">Loading accounts...</div>
@@ -715,9 +909,6 @@
     <div class="poll-error-banner" role="alert" data-testid="poll-error-banner">
       Couldn't refresh — showing last known values. Retrying…
     </div>
-  {/if}
-  {#if moveNotice}
-    <div class="info-notice" role="status">{moveNotice}</div>
   {/if}
   <div class="sort-control">
     <button
@@ -913,6 +1104,40 @@
           {#if account.last_refresh_error}
             <div class="refresh-error" title="Most recent refresh failure tag from the daemon">
               ⚠ {formatRefreshError(account.last_refresh_error)}
+            </div>
+          {/if}
+          {#if account.rescue_pending === 'unadoptable'}
+            <!--
+              Pending post-commit rescue record this identity can never
+              adopt: the saved login is lost until the user signs in again.
+              Rendered as a WARNING (same ⚠/red/mono idiom as
+              `.refresh-error` above) because it is terminal state that
+              needs user action — not a transient tick artifact.
+            -->
+            <div
+              class="rescue-pending-unadoptable"
+              data-testid="rescue-pending-unadoptable"
+              role="alert"
+              title="Pending login rescue cannot be adopted for this account"
+            >
+              ⚠ {rescuePendingMessage(account)}
+            </div>
+          {:else if account.rescue_pending === 'adoptable'}
+            <!--
+              Adoptable == TRANSIENT: the next refresher tick either
+              installs the rescued pair or discards the record, with no
+              user action. Rendered in the quieter honest-uncertainty
+              idiom (`.quota-stale-label` / `.balance-pending`: italic,
+              tertiary, mono) rather than the error red — alarming the
+              user about a state that clears itself would train them to
+              ignore the unadoptable warning above.
+            -->
+            <div
+              class="rescue-pending-adoptable"
+              data-testid="rescue-pending-adoptable"
+              title="A rescued login is pending adoption by the next refresh tick"
+            >
+              {rescuePendingMessage(account)}
             </div>
           {/if}
           {#if account.surface === 'gemini'}
@@ -1510,6 +1735,28 @@
     font-family: ui-monospace, monospace;
     margin-top: -0.15rem;
   }
+  /* Pending login rescue, unadoptable: terminal state requiring a fresh
+     sign-in, so it reuses `.refresh-error`'s red/mono warning idiom
+     rather than inventing a second error language for the same kind of
+     "authentication needs your attention" message. */
+  .rescue-pending-unadoptable {
+    font-size: 0.72rem;
+    color: var(--red);
+    font-family: ui-monospace, monospace;
+    margin-top: -0.15rem;
+  }
+  /* Pending login rescue, adoptable: TRANSIENT — the next refresh tick
+     retries it with no user action — so it takes the quieter
+     honest-uncertainty idiom already established by `.quota-stale-label`
+     below (italic, tertiary text, mono) instead of the error red. */
+  .rescue-pending-adoptable {
+    color: var(--text-tertiary);
+    font-weight: 400;
+    font-style: italic;
+    font-size: 0.72rem;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    margin-top: -0.1rem;
+  }
   /* F1: staleness label paired with UsageBar's dimmed `stale` prop.
      Reuses the `.balance-pending` / `.quota-pending-label` idiom
      (italic, tertiary text) already established in this file for
@@ -1598,6 +1845,11 @@
     color: var(--text-emphasis, #4080ff);
     font-size: 0.85rem;
     line-height: 1.3;
+  }
+  /* Page-level pending rescue rows (no account card to live on). Same
+     red/mono warning idiom as the per-card `.rescue-pending-*` lines. */
+  .rescue-notices {
+    margin-bottom: 0.75rem;
   }
   .hint { font-size: 0.85rem; color: var(--text-secondary); }
   code { background: var(--bg-tertiary); padding: 0.15em 0.4em; border-radius: 3px; font-size: 0.85em; }

@@ -103,6 +103,9 @@ pub struct MoveSummary {
     /// here as informational telemetry — callers SHOULD print a notice but
     /// MUST NOT treat a non-empty vector as a failure mode.
     pub live_pids_bound: Vec<u32>,
+    /// NAMES (never paths) of source-bound handle dirs whose pid marker could not be
+    /// read at move time. Telemetry like `live_pids_bound`: move never refuses on it.
+    pub unreadable_handle_dirs: Vec<String>,
 }
 
 /// Failure modes for [`move_account`].
@@ -287,6 +290,14 @@ pub fn move_account(
     // return releases the lock.
     let _move_lock = acquire_move_lock(base_dir)?;
 
+    // SEC-2.15 (unified, R1 M1): one upfront fail-closed ensure of the
+    // accounts root — every per-step create below (credentials/ parents,
+    // native-homes/) lives under it, and the secure is idempotent.
+    crate::platform::fs::ensure_private_dir_root(base_dir).map_err(|e| MoveError::Io {
+        path: base_dir.to_path_buf(),
+        source: std::io::Error::other(format!("accounts_root_refused: {e}")),
+    })?;
+
     if from == to {
         return Err(MoveError::SameSlot);
     }
@@ -360,8 +371,9 @@ pub fn move_account(
     // dangle after the rename without the Step 5.5 rewrite below.
     //
     // Scanning BEFORE the rename so the marker still resolves to FROM.
-    let live_pids_bound =
-        crate::accounts::logout::scan_live_handle_dirs_for_account_pub(base_dir, from);
+    let live_scan = crate::accounts::logout::scan_live_handle_dirs_for_account_pub(base_dir, from);
+    let live_pids_bound = live_scan.pids;
+    let unreadable_handle_dirs = live_scan.unreadable_dirs;
 
     // M13b — emit INTENT after acquire_move_lock succeeds and after
     // source/target validation (pre-side-effect rejections above emit NO
@@ -632,6 +644,17 @@ pub fn move_account(
             }
         };
 
+    // The refresh-suppression entries are keyed by slot AND identity; swap them with the
+    // binding, under the same profiles lock, so the suppression follows the moved identity.
+    if by_slot_swapped {
+        crate::accounts::refresh_token_audit::rekey_on_move(
+            &profiles_lock,
+            base_dir,
+            from.get(),
+            to.get(),
+        );
+    }
+
     drop(profiles_lock); // release before quota write (different lock)
 
     // Step 9: rewrite quota.json.
@@ -673,6 +696,7 @@ pub fn move_account(
         by_slot_identity_swapped,
         quota_entry_moved,
         live_pids_bound,
+        unreadable_handle_dirs,
     })
 }
 
@@ -758,7 +782,7 @@ fn move_quota_entry(base_dir: &Path, from: AccountNum, to: AccountNum) -> bool {
         Err(_) => return false,
     };
 
-    let mut quota = match quota_state::load_state(base_dir) {
+    let mut quota = match quota_state::load_state_or_skip(base_dir) {
         Ok(q) => q,
         Err(_) => return false,
     };
@@ -1496,8 +1520,23 @@ mod tests {
     /// (an internal journal entry Delta J, N-4 deep.)
     #[test]
     fn move_account_succeeds_when_daemon_is_down() {
+        // On Linux `socket_path` prefers the user-shared $XDG_RUNTIME_DIR, so a
+        // real daemon would falsify the "daemon down" pre-condition: pin it to
+        // a private dir for the test and restore it on drop.
+        let _env = crate::platform::test_env::lock();
         let dir = TempDir::new().unwrap();
         let base = dir.path();
+        struct XdgRestore(Option<std::ffi::OsString>);
+        impl Drop for XdgRestore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                    None => std::env::remove_var("XDG_RUNTIME_DIR"),
+                }
+            }
+        }
+        let _xdg = XdgRestore(std::env::var_os("XDG_RUNTIME_DIR"));
+        std::env::set_var("XDG_RUNTIME_DIR", base);
         make_slot(base, 4);
 
         // Pre-condition: no socket file present (daemon "down").
@@ -1742,7 +1781,7 @@ mod tests {
         let n3 = AccountNum::try_from(3u16).unwrap();
         let pre_scan = crate::accounts::logout::scan_live_handle_dirs_for_account_pub(base, n3);
         assert!(
-            pre_scan.contains(&pid),
+            pre_scan.pids.contains(&pid),
             "pre: scanner must surface the binding under slot 3; got {pre_scan:?}"
         );
 
@@ -1755,7 +1794,7 @@ mod tests {
         let n8 = AccountNum::try_from(8u16).unwrap();
         let post_to_scan = crate::accounts::logout::scan_live_handle_dirs_for_account_pub(base, n8);
         assert!(
-            post_to_scan.contains(&pid),
+            post_to_scan.pids.contains(&pid),
             "post: scanner under TO=8 must surface the rebound PID; got {post_to_scan:?}"
         );
 
@@ -1764,7 +1803,7 @@ mod tests {
         let post_from_scan =
             crate::accounts::logout::scan_live_handle_dirs_for_account_pub(base, n3);
         assert!(
-            !post_from_scan.contains(&pid),
+            !post_from_scan.pids.contains(&pid),
             "post: scanner under FROM=3 must NOT surface the PID after rename; got {post_from_scan:?}"
         );
     }

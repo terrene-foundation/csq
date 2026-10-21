@@ -1,0 +1,15 @@
+# Byte-pinned hook-registry fixtures must check out identically on every platform:
+# Windows `core.autocrlf=true` would otherwise convert LF to CRLF and change the
+# bytes their checksums are pinned to. `-text` stops git transforming them.
+csq-core/tests/fixtures/hook_registry_1b/** -text
+csq-core/tests/fixtures/hook-registry/** -text
+
+# codex-cli 0.159.2's real `threads` schema. Its trigger bodies are hashed byte-for-byte
+# against `CODEX_OWN_TRIGGERS` (SHA-256 of the exact `sqlite_master.sql` text, measured from
+# real LF databases); a CRLF checkout changes those bytes and the known-upstream schema is
+# refused. Keep the Git-object LF bytes on every platform.
+csq-core/tests/fixtures/codex-state5-threads-0.159.2.sql -text
+
+# Rust source always checks out with LF, on every platform: tests scan source text
+# at fixed `\n` boundaries.
+*.rs text eol=lf

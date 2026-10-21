@@ -443,10 +443,10 @@ pub(crate) fn sha256_hex(input: &[u8]) -> String {
     // ── Processing message schedule ──────────────────────────────────────────
     let mut h: [Wrapping<u32>; 8] = SHA256_H0.map(Wrapping);
 
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w: [Wrapping<u32>; 64] = [Wrapping(0); 64];
         // Prepare message schedule W₀..W₁₅ from chunk.
-        for (i, block) in chunk.chunks_exact(4).enumerate().take(16) {
+        for (i, block) in chunk.as_chunks::<4>().0.iter().enumerate().take(16) {
             w[i] = Wrapping(u32::from_be_bytes([block[0], block[1], block[2], block[3]]));
         }
         // Extend W₁₆..W₆₃.
@@ -2631,10 +2631,8 @@ mod tests {
     #[test]
     fn v1_drain_produces_v1_record_log_tag() {
         // Structural source probe — reconciler must log with the v1_drain tag.
-        let source_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/daemon/startup_reconciler.rs"
-        );
+        let source_path = crate::testing::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+            .join("src/daemon/startup_reconciler.rs");
         let source = std::fs::read_to_string(source_path)
             .expect("startup_reconciler.rs must be readable from csq-core");
         assert!(

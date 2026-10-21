@@ -21,6 +21,15 @@
 //! future direct `keyring::Entry::new` callsite — instead of an enumerated
 //! list of test modules that each remember to call `init_mock_keyring()`.
 
+// The scan resolves its root through the `test-utils`-gated
+// `csq_core::testing::manifest_dir`. Gated here rather than with
+// `required-features` (same convention as `auto_rotate_integration.rs`) so a
+// plain `cargo test -p csq-core` builds this as an empty test binary instead of
+// failing to compile on an unresolved import, and so the manifest never names a
+// file the community extraction might remove. CI and the local sign-off always
+// pass `csq-core/test-utils`, so the test still runs in both editions.
+#![cfg(feature = "test-utils")]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -55,7 +64,7 @@ fn collect_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
 
 #[test]
 fn keyring_entry_new_only_in_chokepoint() {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir = csq_core::testing::manifest_dir(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir.parent().expect("workspace root");
 
     let mut offenders: Vec<String> = Vec::new();

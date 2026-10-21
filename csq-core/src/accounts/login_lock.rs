@@ -19,14 +19,18 @@
 //! # Lock file naming
 //!
 //! `<base_dir>/.login-N.lock` — sibling to `accounts/credentials/`
-//! and `profiles.json`. The lock file CONTAINS the holder's PID as
-//! decimal text so a concurrent attempt can render a useful error
-//! ("PID 12345 is already running csq login 5"). On lock release
-//! the file is *not* deleted: keeping it around lets the next
-//! attempt re-use the same inode and ensures the lock survives
-//! filesystem races between unlink and re-open. The PID inside is
-//! cleared on release so a stale file never misattributes a fresh
-//! lock attempt.
+//! and `profiles.json`. The holder's PID is written as decimal text
+//! to the SIDECAR `<base_dir>/.login-N.lock.pid` (never inside the
+//! lock file itself — Windows `LockFileEx` blocks reads from
+//! non-holding handles even in the same process; the sidecar is
+//! never locked, so any waiter can read it) so a concurrent attempt
+//! can render a useful error ("PID 12345 is already running csq
+//! login 5"). On lock release the lock file is *not* deleted:
+//! keeping it around lets the next attempt re-use the same inode
+//! and ensures the lock survives filesystem races between unlink
+//! and re-open. The lock file is emptied and the sidecar removed on
+//! release so a retained file never misattributes a fresh lock
+//! attempt.
 
 use crate::platform::fs::secure_file;
 use crate::types::AccountNum;
@@ -40,8 +44,8 @@ pub enum AcquireOutcome {
     /// release.
     Acquired(AccountLoginLock),
     /// Another process holds the lock. The PID is the holder
-    /// (read from the lock file) when available, `None` if the
-    /// lock file is empty or unreadable.
+    /// (read from the `.login-N.lock.pid` sidecar) when available,
+    /// `None` if the sidecar is missing or unreadable.
     ///
     /// `pid_alive` is `Some(true)` when the holder PID is verifiably
     /// running, `Some(false)` when the PID is dead (stale lock from a
@@ -76,9 +80,12 @@ impl std::fmt::Debug for AcquireOutcome {
 #[derive(Debug, Clone)]
 pub struct LockHolder {
     /// PID read from the `.login-N.lock.pid` sidecar, if present and
-    /// parseable. `None` means the lock file exists but the sidecar is
-    /// missing/unreadable (a microsecond acquire race, or a manual
-    /// leftover).
+    /// parseable. `None` normally means the lock file is a RETAINED
+    /// artefact of a prior login ATTEMPT (the file is created at
+    /// `acquire` and kept on every release — success, failure, and abort
+    /// alike; the sidecar is deleted on drop) — i.e. "no live holder",
+    /// not "crashed". It can also mean a microsecond acquire race or a
+    /// manual leftover.
     pub pid: Option<u32>,
     /// Whether that PID is currently alive. `None` when there is no PID.
     /// A live holder means the lock is genuinely in use (or hung); a dead
@@ -108,6 +115,16 @@ pub struct ForceReleaseReport {
 /// The lock is process-scoped (POSIX flock on Unix, LockFileEx on
 /// Windows) so a panic that unwinds past the guard still releases
 /// it via the kernel's process-exit cleanup.
+///
+/// # Forking
+///
+/// Do NOT fork WITHOUT exec while holding this guard. The child inherits
+/// the lock descriptor, and a child that drops its copy releases the lock
+/// for the whole open file description — including the parent's, because
+/// POSIX flock is per-description, not per-process (`flock(2)`). The
+/// parent's own `Drop` releases explicitly for the mirror-image hazard: a
+/// child that KEEPS its copy past the parent's close would otherwise hold
+/// the lock until it execs (`FD_CLOEXEC`) or exits.
 pub struct AccountLoginLock {
     file: File,
     path: PathBuf,
@@ -148,13 +165,14 @@ impl AccountLoginLock {
     /// file, cannot write PID). A held lock is reported via
     /// [`AcquireOutcome::Held`], not as an error.
     pub fn acquire(base_dir: &Path, account: AccountNum) -> std::io::Result<AcquireOutcome> {
-        // Make sure base_dir exists before trying to create the
-        // lock file — otherwise the OpenOptions open would fail
-        // with ENOENT, which would mask the real "your base dir is
-        // missing" error.
-        if !base_dir.exists() {
-            std::fs::create_dir_all(base_dir)?;
-        }
+        // SEC-2.15 (unified, R1 M1): the lock lives directly in the
+        // accounts root. Create AND secure it through the shared
+        // fail-closed helper unconditionally — a pre-existing 0o755 root
+        // is tightened here rather than left world-enumerable. Failure
+        // propagates; a root that cannot be secured never receives a lock
+        // (and never falls through to the OpenOptions ENOENT below).
+        crate::platform::fs::ensure_private_dir_root(base_dir)
+            .map_err(|e| std::io::Error::other(format!("accounts_root_refused: {e}")))?;
 
         let path = Self::lock_path(base_dir, account);
         let pid_path = Self::pid_path(base_dir, account);
@@ -217,11 +235,11 @@ impl AccountLoginLock {
                 // released the flock when the process exited — so any
                 // FRESH attempt would actually succeed on `flock` and
                 // fall through this branch. Reaching `WouldBlock` with
-                // a dead PID written inside is the rarer race where
+                // a dead PID in the sidecar is the rarer race where
                 // ANOTHER concurrent acquire holds the live flock but
-                // hasn't yet rewritten the file with its own PID.
+                // hasn't yet rewritten the sidecar with its own PID.
                 // Either way, the user sees a more accurate message:
-                // "stale lock file" when the file contents lie about
+                // "stale lock file" when the sidecar contents lie about
                 // the holder, "PID N — wait or kill" when the holder
                 // is verifiably alive.
                 let pid_alive = pid.map(pid_is_alive);
@@ -249,24 +267,64 @@ impl Drop for AccountLoginLock {
         // explicit). Best-effort.
         let _ = self.file.set_len(0);
         let _ = self.file.flush();
-        // POSIX flock is released when ALL handles to the open
-        // file description are closed (the kernel does this on
-        // File::drop). On Windows, LockFileEx is released by
-        // CloseHandle, also driven by File::drop.
+
+        // RELEASE THE FLOCK EXPLICITLY — do not rely on the close below.
         //
-        // REV-R2-02: actively delete the lock file after the kernel
-        // releases the flock. Without this, every `csq login N` ever
-        // run leaves a `.login-N.lock` artefact on disk that
-        // accumulates across the lifetime of the install. The race
-        // the original docstring warned about ("re-create vs remove")
-        // is bounded by the next acquirer's `OpenOptions::create(true)`
-        // which is atomic with respect to deletion: the worst case is
-        // the next acquirer creates a fresh file with default umask,
-        // and the SECURE_FILE call in `acquire` then sets it back to
-        // 0o600 before any meaningful content is written. Best-effort
-        // — a failure (filesystem unmounted, perms changed under us)
-        // leaves the artefact but does not affect correctness.
-        let _ = std::fs::remove_file(&self.path);
+        // POSIX flock is associated with the OPEN FILE DESCRIPTION, and the
+        // kernel releases it only when EVERY descriptor referring to that
+        // description is closed (`flock(2)`: "the lock is released either by
+        // an explicit LOCK_UN operation on any of these duplicate file
+        // descriptors, or when all such file descriptors have been closed").
+        // A fork from ANY thread of this process duplicates every open
+        // descriptor — a sibling test spawning a subprocess, a daemon-style
+        // child — so the child's inherited copy keeps the description (and
+        // the lock) alive past this guard's close: until exec for a spawned
+        // command (FD_CLOEXEC), or until exit for a child that never execs.
+        // In that window a re-acquire sees WouldBlock with the sidecar
+        // already gone — the `acquire_login_lock_succeeds_once_prior_guard_drops`
+        // full-suite flake (`drop_releases_even_while_a_forked_child_holds_the_inherited_descriptor`
+        // freezes the window deterministically). LOCK_UN on ANY duplicate
+        // releases the lock for the whole description, which makes THIS drop
+        // the release point regardless of what any child inherited.
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // G2b item 3 (rule 6): the release result is CHECKED, not
+            // ignored — a silently failed unlock leaves the lock held until
+            // close (and longer, if a fork inherited the description). The
+            // warning carries a fixed error_kind vocabulary; the io::Error
+            // itself is never formatted (`security.md` MUST-2).
+            // SAFETY: `self.file` is still open here (field drop runs after
+            // this body); flock(LOCK_UN) touches no memory and only releases
+            // an advisory lock this description holds.
+            if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+                tracing::warn!(
+                    error_kind = "login_lock_unlock_failed",
+                    errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                    "login lock could not be released"
+                );
+            }
+        }
+        // Windows needs no explicit unlock: there is no fork(), and std's
+        // File handles are non-inheritable (CreateFileW without
+        // bInheritHandle), so no child can hold a duplicate of this handle.
+        // LockFileEx is released by CloseHandle, driven by File::drop.
+        //
+        // The lock FILE IS RETAINED — the module contract above: "On
+        // lock release the file is not deleted: keeping it around lets
+        // the next attempt re-use the same inode and ensures the lock
+        // survives filesystem races between unlink and re-open."
+        // REV-R2-02 removed the file here to avoid artefacts on disk;
+        // that re-opened the very race the contract names: a contender
+        // that pre-opened the old inode could lock it AFTER this drop,
+        // while the next acquirer created and locked a NEW inode at the
+        // same path — two processes each holding "the" lock
+        // (`preopened_contender_cannot_lock_after_holder_drops`). The
+        // cost of retention is one cleared file per account slot
+        // (secured to 0600 by `secure_file` on acquire, best-effort;
+        // bounded by the slot count, not accumulative), and it is what
+        // makes re-acquisition inode-stable. Do NOT unlink here;
+        // explicit cleanup belongs to `force_release`.
     }
 }
 
@@ -534,6 +592,16 @@ fn terminate_pid(pid: u32) {
 /// `Ok(Some(holder))` describing the current holder otherwise — whether or not
 /// a live process holds it. Read-only; safe to call while another process holds
 /// the lock. Powers `csq unlock N`'s "here is what is holding it" display.
+///
+/// Operator-semantics note (retained-file contract): because the lock file is
+/// RETAINED across `Drop`, a slot whose login flow ever reached `acquire`
+/// keeps a cleared `.login-N.lock` on disk (retained on every release —
+/// success, failure, and abort), so a later call normally returns
+/// `Some(holder)` with `pid = None` and `alive = None` even though no process
+/// holds the lock. `csq unlock N`'s current rendering for that state is the
+/// "(stale)" arm — accurate for "no live holder", but it is the steady state,
+/// not evidence of a crashed login. The wording is deliberately NOT changed in
+/// this fix.
 pub fn inspect_lock(base_dir: &Path, account: AccountNum) -> std::io::Result<Option<LockHolder>> {
     let lock_path = AccountLoginLock::lock_path(base_dir, account);
     let pid_path = AccountLoginLock::pid_path(base_dir, account);
@@ -650,6 +718,70 @@ mod tests {
         AccountNum::try_from(n).unwrap()
     }
 
+    /// R2 H1 regression: the documented symlinked accounts root works
+    /// through the login-lock path — the strict refusal would have broken
+    /// every login on such a setup. RED on the pre-R3 bytes.
+    #[cfg(unix)]
+    #[test]
+    fn acquire_accepts_symlinked_accounts_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("external");
+        std::fs::create_dir(&target).unwrap();
+        let link = dir.path().join("accounts");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let guard = reacquire_expect_acquired(&link, account(1), "symlinked-root acquire");
+        drop(guard);
+
+        assert_eq!(
+            std::fs::symlink_metadata(&target)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "the resolved accounts root must be secured by acquire"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the operator's symlink must be intact"
+        );
+    }
+
+    /// Bounded retry wrapper for RE-acquisition after a drop.
+    ///
+    /// A sibling test's `Command::spawn` forks, duplicating this process's
+    /// open file descriptors, and CLOEXEC closes them only at the child's
+    /// exec. If a drop+re-acquire lands inside that fork→exec gap, the
+    /// dropped guard's DESCRIPTION (not any fd we can see: measured on the
+    /// flake — pid=None, no in-process fd, no /proc/locks entry by the time
+    /// a probe runs) still holds the flock, so the fresh attempt transiently
+    /// reports `Held`. The property under test is "a fresh acquire succeeds
+    /// once no descriptor remains", so the transient `Held` is retried
+    /// rather than misread. A deadline miss is still a FAILURE, and a real
+    /// release regression never recovers, so it cannot hide here.
+    fn reacquire_expect_acquired(dir: &Path, account: AccountNum, what: &str) -> AccountLoginLock {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match AccountLoginLock::acquire(dir, account).unwrap() {
+                AcquireOutcome::Acquired(g) => return g,
+                AcquireOutcome::Held { pid, pid_alive } => {
+                    if std::time::Instant::now() >= deadline {
+                        panic!(
+                            "{what}: still Held (pid={pid:?}, alive={pid_alive:?}) 5s after drop"
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
     // ── Cross-process contention (an internal ticket) ───────────────────────────────
     //
     // The property that matters is CROSS-PROCESS mutual exclusion: two
@@ -668,6 +800,10 @@ mod tests {
 
     /// Env var naming the lock directory the helper below should hold.
     const HOLD_DIR_ENV: &str = "CSQ_TEST_LOGIN_LOCK_HOLD_DIR";
+
+    /// Env var naming the lock directory a PRE-OPENED-contender child should
+    /// work in (the retained-inode regression below).
+    const CONTENDER_DIR_ENV: &str = "CSQ_TEST_LOGIN_LOCK_CONTENDER_DIR";
 
     /// Child-process role: acquire the lock, announce readiness by writing our
     /// PID to `ready`, then hold it until `stop` appears.
@@ -800,6 +936,155 @@ mod tests {
             Some(true),
             "a live cross-process holder must be reported alive"
         );
+    }
+
+    /// Child-process role for the retained-inode regression: PRE-OPEN the
+    /// lock file the parent currently holds, announce readiness, wait for the
+    /// parent's `go`, then attempt a non-blocking exclusive lock on the
+    /// still-open handle and record the outcome in `result`. With the file
+    /// retained across the parent's release+re-acquire this stays WouldBlock
+    /// (same file, new lock); if the old holder's Drop unlinked the file, the
+    /// parent's re-acquire creates a NEW inode and this handle locks the
+    /// orphaned OLD one — Acquired, i.e. two simultaneous holders.
+    ///
+    /// Cross-PROCESS by design (both platforms, one code path), mirroring the
+    /// an internal ticket pair above: a same-process second handle exercises handle
+    /// semantics, not the user-facing guarantee. With `CONTENDER_DIR_ENV`
+    /// unset it returns immediately, so it is a no-op in an ordinary run.
+    #[test]
+    fn preopened_contender_helper() {
+        let Ok(dir) = std::env::var(CONTENDER_DIR_ENV) else {
+            return; // not the child — nothing to do
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let path = AccountLoginLock::lock_path(&dir, account(7));
+
+        // Pre-open the live lock file the parent holds (no create — the
+        // parent already made it; a miss means the spawn ordering broke).
+        let handle = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("contender must pre-open the live lock file");
+        std::fs::write(dir.join("ready"), std::process::id().to_string()).expect("write ready");
+
+        let go = dir.join("go");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !go.exists() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        if !go.exists() {
+            panic!("contender never saw 'go' within 20s");
+        }
+
+        let result = match try_lock_exclusive(&handle) {
+            Ok(LockResult::Acquired) => "Acquired".to_string(),
+            Ok(LockResult::WouldBlock) => "WouldBlock".to_string(),
+            Err(e) => format!("Err:{e}"),
+        };
+        std::fs::write(dir.join("result"), result).expect("write result");
+    }
+
+    /// THE ASSERTION for the retained-inode contract, cross-process and
+    /// cross-platform: a contender that pre-opened the lock file must remain
+    /// blocked after the original holder releases and a fresh holder
+    /// re-acquires. Falsifier: Drop unlinks the lock file; the fresh holder
+    /// then locks a NEW inode while the pre-opened contender locks the
+    /// orphaned old one (result file says "Acquired").
+    #[test]
+    fn preopened_cross_process_contender_stays_blocked_after_reacquire() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+
+        let guard1 = match AccountLoginLock::acquire(&dir, account(7)).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            _ => panic!("first acquire must succeed"),
+        };
+
+        let exe = std::env::current_exe().expect("test binary path");
+        let mut cmd = std::process::Command::new(exe);
+        cmd.env_clear();
+        for k in [
+            "HOME",
+            "PATH",
+            "LANG",
+            "LC_ALL",
+            "TERM",
+            "USER",
+            "TMPDIR",
+            "SYSTEMROOT",
+            "SystemRoot",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "WINDIR",
+            "ComSpec",
+            "PATHEXT",
+            "NUMBER_OF_PROCESSORS",
+        ] {
+            if let Ok(v) = std::env::var(k) {
+                cmd.env(k, v);
+            }
+        }
+        let mut child = cmd
+            .env(CONTENDER_DIR_ENV, &dir)
+            .args([
+                "--exact",
+                "accounts::login_lock::tests::preopened_contender_helper",
+                "--nocapture",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the contender child");
+
+        // Wait for the child's pre-open. Bounded; a timeout is a FAILURE
+        // rather than a skip (test-skip-discipline).
+        let ready = dir.join("ready");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        if !ready.exists() {
+            let _ = child.kill();
+            panic!("contender child never pre-opened the lock file within 20s");
+        }
+
+        // The holder releases; a fresh holder re-acquires BY PATH.
+        drop(guard1);
+        let guard2 =
+            reacquire_expect_acquired(&dir, account(7), "cross-process contender reacquire");
+
+        // Release the child to make its attempt.
+        std::fs::write(dir.join("go"), b"1").ok();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut status = None;
+        while status.is_none() && std::time::Instant::now() < deadline {
+            status = child.try_wait().expect("try_wait");
+            if status.is_none() {
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
+        let status = match status {
+            Some(s) => s,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("contender child did not exit within 10s of 'go'");
+            }
+        };
+
+        let result = std::fs::read_to_string(dir.join("result"))
+            .expect("contender must write its lock result");
+        assert_eq!(
+            result.trim(),
+            "WouldBlock",
+            "pre-opened contender acquired the retired lock — Drop unlinked the file \
+             (two simultaneous holders); child exit={status:?}"
+        );
+        drop(guard2);
     }
 
     #[test]
@@ -979,14 +1264,11 @@ mod tests {
             _ => panic!("first acquire must succeed"),
         }
 
-        // After drop, a second acquire must succeed.
-        let second = AccountLoginLock::acquire(&dir_path, account(3)).unwrap();
-        match second {
-            AcquireOutcome::Acquired(_) => {}
-            AcquireOutcome::Held { .. } => {
-                panic!("lock must be released when the guard drops")
-            }
-        }
+        // After drop, a second acquire must succeed (bounded retry — a
+        // sibling test's fork/exec spawn can briefly keep the dropped
+        // guard's open file description, and thus the flock, alive in the
+        // forked child; see `reacquire_expect_acquired`).
+        let _second = reacquire_expect_acquired(&dir_path, account(3), "drop-then-reacquire");
     }
 
     #[test]
@@ -1026,12 +1308,9 @@ mod tests {
         // (and thus the flock) is fully released.
         let _ = handle.join();
 
-        // Now we should be able to acquire.
-        let result = AccountLoginLock::acquire(&dir_path, account(9)).unwrap();
-        match result {
-            AcquireOutcome::Acquired(_) => {}
-            AcquireOutcome::Held { .. } => panic!("lock must be released after holder panics"),
-        }
+        // Now we should be able to acquire (bounded retry — see
+        // `reacquire_expect_acquired` for the transient-fork-copy artifact).
+        let _after = reacquire_expect_acquired(&dir_path, account(9), "panic-then-reacquire");
     }
 
     #[test]
@@ -1076,27 +1355,199 @@ mod tests {
         );
     }
 
-    // ── REV-R2-02: lock file removed after Drop ────────────────────
+    // ── Retained-file contract across Drop (REV-R2-02 retracted): the lock
+    // file is NOT deleted on release. Retention keeps the inode stable so a
+    // pre-opened contender cannot lock a dead inode while a fresh acquirer
+    // locks a new one; explicit cleanup belongs to `force_release`.
 
     #[test]
-    fn lock_file_removed_after_drop() {
-        // The lock file is best-effort removed when the guard drops.
-        // After the next acquire, a fresh file is created — so we
-        // observe the artefact going away between the two windows.
+    fn lock_file_persists_across_drop_and_reacquire() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join(".login-13.lock");
+        let pid_path = dir.path().join(".login-13.lock.pid");
 
-        {
-            let _guard = match AccountLoginLock::acquire(dir.path(), account(13)).unwrap() {
-                AcquireOutcome::Acquired(g) => g,
-                _ => panic!("first acquire must succeed"),
-            };
-            assert!(path.exists(), "lock file must exist while guard is alive");
-        }
+        let guard = match AccountLoginLock::acquire(dir.path(), account(13)).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            _ => panic!("first acquire must succeed"),
+        };
+        assert!(path.exists(), "lock file must exist while guard is alive");
+        assert!(pid_path.exists(), "sidecar must exist while guard is alive");
+        drop(guard);
+
         assert!(
-            !path.exists(),
-            "lock file MUST be removed after guard drops (REV-R2-02): {:?}",
+            path.exists(),
+            "lock file MUST be retained after guard drops (inode-identity contract): {:?}",
             path
+        );
+        assert!(
+            !pid_path.exists(),
+            "sidecar MUST be removed on drop so no stale PID is readable: {:?}",
+            pid_path
+        );
+
+        // Re-acquiring takes the SAME retained path and works normally; a
+        // second drop again retains the file.
+        let guard2 = reacquire_expect_acquired(dir.path(), account(13), "retained-file reacquire");
+        drop(guard2);
+        assert!(
+            path.exists(),
+            "lock file retained across a second drop too: {:?}",
+            path
+        );
+    }
+
+    /// The deterministic two-holder race the retention contract prevents:
+    /// a contender PRE-OPENS the lock file while holder 1 is live; holder 1
+    /// drops; holder 2 acquires by path. If Drop unlinks the file, holder 2
+    /// locks a NEW inode while the pre-opened contender can still lock the
+    /// OLD one — two simultaneous "holders". With retention, both handles
+    /// refer to the SAME inode, so the contender must stay WouldBlock.
+    #[cfg(unix)]
+    #[test]
+    fn preopened_contender_cannot_lock_after_holder_drops() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".login-21.lock");
+
+        let guard1 = match AccountLoginLock::acquire(dir.path(), account(21)).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            _ => panic!("first acquire must succeed"),
+        };
+        // Contender pre-opens the lock file while guard1 holds the flock.
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("contender must open the live lock file");
+        let ino_held = std::fs::metadata(&path).unwrap().ino();
+        drop(guard1);
+
+        // Fresh acquirer takes the lock BY PATH, as the CLI does.
+        let guard2 = reacquire_expect_acquired(dir.path(), account(21), "inode-identity reacquire");
+        let ino_now = std::fs::metadata(&path).unwrap().ino();
+        assert_eq!(
+            ino_held, ino_now,
+            "acquire must reuse the RETAINED inode; an inode swap means Drop unlinked the file"
+        );
+
+        let res = try_lock_exclusive(&contender).unwrap();
+        assert_eq!(
+            res,
+            LockResult::WouldBlock,
+            "pre-opened contender acquired the retired inode — Drop unlinked the lock file \
+             (two simultaneous holders)"
+        );
+        drop(guard2);
+    }
+
+    /// Dropping the holder MUST release the flock even while ANOTHER
+    /// descriptor to the same open file description is still open.
+    ///
+    /// POSIX flock is associated with the open file description, and the
+    /// kernel releases it only when EVERY descriptor referring to that
+    /// description is closed — the holder's own `File::drop` is NOT the
+    /// release point while a duplicate exists. A `fork` from ANY thread of
+    /// this process (a sibling test spawning a subprocess; a daemon-style
+    /// child) duplicates every open descriptor, including this lock fd,
+    /// and keeps the description (and the lock) alive until the child
+    /// closes it — at exec for a spawned command (`FD_CLOEXEC`), or at
+    /// exit for a child that never execs. That window is the
+    /// `acquire_login_lock_succeeds_once_prior_guard_drops` flake: the
+    /// holder drops, but the immediate re-acquire still sees `WouldBlock`.
+    ///
+    /// This test freezes a forked child in place (a blocking pipe read, no
+    /// exec) so the inheritance window is deterministic rather than
+    /// scheduler-dependent, and asserts the guard's drop IS the release
+    /// point. It is RED on a Drop that relies on close-alone (the child
+    /// still holds the description) and GREEN once Drop releases the lock
+    /// explicitly.
+    #[cfg(unix)]
+    #[test]
+    fn drop_releases_even_while_a_forked_child_holds_the_inherited_descriptor() {
+        let dir = TempDir::new().unwrap();
+        let account = account(31);
+
+        let guard = match AccountLoginLock::acquire(dir.path(), account).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            other => panic!("first acquire must succeed, got {other:?}"),
+        };
+
+        // The production exposure of an EXEC'd child is bounded by
+        // FD_CLOEXEC: exec closes the inherited copy. Assert the flag so
+        // the mechanism this test models stays documented and true (Rust's
+        // OpenOptions sets it); the unbounded case is a child that never
+        // execs, which the fork below models.
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: F_GETFD only reads descriptor flags; no memory access.
+            let flags = unsafe { libc::fcntl(guard.file.as_raw_fd(), libc::F_GETFD) };
+            assert_ne!(flags, -1, "F_GETFD on the lock fd failed");
+            assert_ne!(
+                flags & libc::FD_CLOEXEC,
+                0,
+                "the lock fd must be close-on-exec; otherwise an exec'd child would hold the \
+                 flock for its whole lifetime"
+            );
+        }
+
+        // Fork a child that holds its inherited duplicate. The shared
+        // harness is leak-proof: the child closes the pipe's write end
+        // before blocking (a dead parent delivers EOF, never an orphan),
+        // arms an alarm backstop, and the parent's wake+reap is RAII, so a
+        // panic between here and the normal path still releases it.
+        let child = crate::fork_harness::ForkedChild::spawn();
+
+        // Release the guard while the child still holds its inherited copy.
+        drop(guard);
+
+        match AccountLoginLock::acquire(dir.path(), account).unwrap() {
+            AcquireOutcome::Acquired(second) => drop(second),
+            AcquireOutcome::Held { .. } => panic!(
+                "dropping the holder must release the lock even while a forked child \
+                 holds the inherited descriptor — an inherited duplicate kept the flock \
+                 alive past the holder's close (the full-suite login-lock flake)"
+            ),
+        }
+        drop(child);
+    }
+
+    /// A panic between the fork and the normal release path MUST NOT leave
+    /// the forked child alive holding the harness's descriptors — the
+    /// fleet-offline leak class. The shared harness's RAII release runs
+    /// during unwinding, so the child is woken and reaped; this test pins
+    /// that contract against a future rewrite that drops the guard.
+    #[cfg(unix)]
+    #[test]
+    fn a_panic_after_the_fork_still_reaps_the_child() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let account = account(32);
+        let guard = match AccountLoginLock::acquire(dir.path(), account).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            other => panic!("first acquire must succeed, got {other:?}"),
+        };
+
+        let recorded = Arc::new(AtomicI32::new(-1));
+        let slot = Arc::clone(&recorded);
+        // The default panic hook prints the injected panic to stderr. That
+        // noise IS the mechanism; the hook is deliberately not swapped,
+        // because the harness runs tests in parallel threads.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let child = crate::fork_harness::ForkedChild::spawn();
+            slot.store(child.pid(), Ordering::SeqCst);
+            drop(guard);
+            panic!("injected after the fork");
+        }));
+        assert!(panicked.is_err(), "the injected panic must unwind");
+
+        let pid = recorded.load(Ordering::SeqCst);
+        assert!(pid > 0, "the child pid must have been recorded");
+        assert!(
+            !pid_is_alive(pid as u32),
+            "a panic between fork and release orphaned the forked child (pid {pid})"
         );
     }
 

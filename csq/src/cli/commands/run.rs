@@ -24,6 +24,9 @@ use std::process::{Command, Stdio};
 
 use csq_core::daemon::{self, DetectResult};
 
+#[path = "provider_session_policy.rs"]
+mod provider_session_policy;
+
 /// Phase B' billing-ledger attribution (an internal journal entry D2). Best-effort append
 /// to `accounts/.csq-launch.log` so the daemon aggregator can attribute CC
 /// session-meta files to slots via post-hoc time correlation.
@@ -141,10 +144,21 @@ pub fn handle(
         Some(a) => a,
         None => {
             // 0 accounts — launch vanilla claude
+            provider_session_policy::emit_warning(
+                provider_session_policy::check_unknown_launch_with_args(base_dir, rest)?,
+            );
             println!("No accounts configured — launching vanilla claude.");
-            return exec_claude(rest);
+            return exec_claude(base_dir, &claude_home, rest);
         }
     };
+
+    // orgident r7 item 9 (owner ruling "block new launches + warn"): never start a
+    // session in a slot whose sign-in is shared with another slot. First action after
+    // the slot is known, before the launch log, the audit record or any spawn. No
+    // override flag or env var exists; the only exit is `csq login N`. Sessions that
+    // are already open are not touched.
+    csq_core::accounts::launch_block::check_launch(base_dir, account.get())
+        .map_err(|message| anyhow!(message))?;
 
     // Phase B' billing-ledger attribution (an internal journal entry D2). Best-effort
     // append; failures MUST NOT block the launch — billing telemetry is
@@ -177,7 +191,7 @@ pub fn handle(
     // path is a no-op. We log the explicit acknowledgement to stderr at INFO
     // so the operator sees the gap they accepted.
     let start_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let mut audit_emitter = if no_audit {
+    let audit_emitter = if no_audit {
         // Operator-facing acknowledgement on stderr: the operator explicitly
         // accepted the audit gap for this invocation.
         //
@@ -198,12 +212,23 @@ pub fn handle(
         );
         crate::cli::audit_emit::AuditEmitter::disabled()
     } else {
-        build_audit_emitter(
-            base_dir,
-            audit_surface_for(surface_for_preflight),
-            format!("csq run account {}", account.get()),
-            start_ts.clone(),
+        run_audit_emitter(base_dir, surface_for_preflight, account, start_ts.clone())
+    };
+    // F1: a codex run's emitter enters the pre-spawn guard HERE, at
+    // construction — the same guard `csq swap` into a codex slot uses — so
+    // EVERY exit before `launch_codex` reaches its spawn (the 3P-collision
+    // and `--profile` refusals and pre-flight gates below, and every `?` in
+    // `launch_codex` ahead of its share lock) ends the record through
+    // `end_codex_run_before_spawn` instead of dropping it un-ended, which
+    // would write a phantom `Degraded`/`Bypass` record for a codex session
+    // that never ran. The other surfaces keep the plain emitter.
+    let (mut audit_emitter, mut codex_pre_spawn) = if surface_for_preflight == SurfaceCli::Codex {
+        (
+            crate::cli::audit_emit::AuditEmitter::disabled(),
+            Some(PreSpawnCodexRun::new(audit_emitter)),
         )
+    } else {
+        (audit_emitter, None)
     };
 
     // ── Pre-flight probe (PR-MCD2.5, spec/13 §3, R1-H5) ─────────────────────
@@ -237,6 +262,18 @@ pub fn handle(
         ));
     }
 
+    if surface_for_preflight == SurfaceCli::Claude {
+        let _ = provider_session_policy::check_claude_launch(
+            base_dir,
+            &claude_home,
+            account,
+            None,
+            rest,
+        )?;
+    } else {
+        let _ = provider_session_policy::check_unknown_launch_with_args(base_dir, rest)?;
+    }
+
     // Probe: skip for 3P slots (they redirect at the network layer, no
     // versioned CLI binary to probe). For all other surfaces, run the
     // shared pre-flight gate via cli_deps_gate::enforce (H4).
@@ -268,19 +305,29 @@ pub fn handle(
                 "--profile is not supported for Codex slots (slot {account} is Codex, requested: {profile_id})"
             ));
         }
-        return launch_codex(
-            base_dir,
-            account,
-            capability_layer_enabled,
-            layer_is_auto,
-            &persisted_toggles,
+        let codex_pre_spawn = codex_pre_spawn
+            .take()
+            .ok_or_else(|| anyhow!("csq run: codex run audit emitter not built"))?;
+        let settings = CodexLaunchSettings::from_run_flags(
+            layer_intent,
+            persisted_toggles,
             debug,
             bench_mode,
             coc_cache_enabled,
+        );
+        return launch_codex(
+            base_dir,
+            account,
+            settings.capability_layer_enabled,
+            settings.layer_is_auto,
+            &settings.toggles,
+            settings.debug,
+            settings.bench_mode,
+            settings.coc_cache_enabled,
             rest,
-            &mut audit_emitter,
-            /* is_relaunch */ false,
+            CodexLaunchAudit::First(Box::new(codex_pre_spawn)),
             /* swap_correlation */ None,
+            /* messaging */ None,
         );
     }
 
@@ -384,6 +431,12 @@ pub fn handle(
     // Reached only after the Anthropic-path identity gate above (or, for a
     // discovered 3P slot, config-N already exists — see the gate's doc
     // comment) — never for a slot csq is about to refuse to launch.
+    //
+    // SEC-2.15 (unified, R1 M1): secure the accounts root (config-N's
+    // parent) fail-closed first — create_dir_all below would otherwise
+    // create a virgin root at the process umask.
+    csq_core::platform::fs::ensure_private_dir_root(base_dir)
+        .map_err(|e| anyhow::anyhow!("accounts_root_refused: {e}"))?;
     let config_dir = base_dir.join(format!("config-{}", account));
     std::fs::create_dir_all(&config_dir)?;
 
@@ -633,7 +686,7 @@ pub(crate) fn build_audit_emitter(
 /// the SAME function `launch_codex` (`csq run`) and `csq swap`'s exec-replace
 /// path both call, so the two spawn surfaces cannot drift out of parity
 /// (cross-slot swap-resume governing task, item 1: "governance bypass" —
-/// `exec_codex_after_binding` used to skip this gate entirely because swap's
+/// `supervise_codex_after_binding` used to skip this gate entirely because swap's
 /// call site carried no `AuditEmitter`/`OperatingEnvelope`).
 ///
 /// Evaluates the gate via [`crate::cli::commands::spawn_gate::evaluate_spawn`], records the verdict
@@ -750,6 +803,12 @@ pub fn handle_native(
 
     let workdir = std::env::current_dir().context("native: cannot resolve current dir")?;
 
+    // The native loop uses the catalog endpoint, not the slot's configured URL.
+    let endpoint = csq_core::providers::catalog::get_provider(&provider_id)
+        .and_then(|provider| provider.default_base_url)
+        .ok_or_else(|| anyhow!("provider-session fence: native endpoint cannot be determined"))?;
+    provider_session_policy::check(base_dir, &workdir, endpoint)?;
+
     let cfg = csq_core::native::NativeRunConfig {
         base_dir: base_dir.to_path_buf(),
         provider_id,
@@ -796,6 +855,39 @@ pub fn handle_native(
 /// poisoned dotfile can't redirect traffic, then exec with
 /// `CLAUDE_CONFIG_DIR` pointing at the handle dir whose
 /// `settings.json` symlink resolves back to `config-<N>`.
+/// Production Anthropic construction. Layer flags and user args remain appended
+/// by launch_anthropic after this builder, in their original order.
+fn build_anthropic_command(base_dir: &Path, handle_dir: &Path, rest: &[String]) -> Result<Command> {
+    let mut cmd = Command::new("claude");
+    cmd.env("CLAUDE_CONFIG_DIR", handle_dir);
+    strip_sensitive_env(&mut cmd);
+    attach_messaging_claude(&mut cmd, handle_dir);
+    super::gate_launch::attach(&mut cmd, base_dir, handle_dir, rest)?;
+    Ok(cmd)
+}
+/// Production 3P construction; messaging/Gate flags precede user arguments.
+fn build_third_party_command(
+    base_dir: &Path,
+    handle_dir: &Path,
+    rest: &[String],
+) -> Result<Command> {
+    let mut cmd = build_anthropic_command(base_dir, handle_dir, rest)?;
+    cmd.args(rest);
+    Ok(cmd)
+}
+/// Production vanilla construction; no account/handle binding is introduced.
+fn build_vanilla_claude_command(
+    base_dir: &Path,
+    claude_home: &Path,
+    rest: &[String],
+) -> Result<Command> {
+    let mut cmd = Command::new("claude");
+    strip_sensitive_env(&mut cmd);
+    super::gate_launch::attach(&mut cmd, base_dir, claude_home, rest)?;
+    cmd.args(rest);
+    Ok(cmd)
+}
+
 fn launch_third_party(
     base_dir: &Path,
     claude_home: &Path,
@@ -803,6 +895,8 @@ fn launch_third_party(
     rest: &[String],
     audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
 ) -> Result<()> {
+    let _ =
+        provider_session_policy::check_claude_launch(base_dir, claude_home, account, None, rest)?;
     // Wave 3 kimi/grok host-isolation follow-through (spec 08 MED-03):
     // build HostContext from the parent env BEFORE any spawn-time work,
     // mirroring `launch_gemini`'s placement. Every 3P bearer slot
@@ -847,10 +941,16 @@ fn launch_third_party(
         redact_path(&settings_path)
     );
 
-    let mut cmd = Command::new("claude");
-    cmd.env("CLAUDE_CONFIG_DIR", &handle_dir_abs);
-    strip_sensitive_env(&mut cmd);
-    cmd.args(rest);
+    let cmd = build_third_party_command(base_dir, &handle_dir_abs, rest)?;
+
+    // Check the actual merged settings read by the child before handoff as well.
+    provider_session_policy::emit_warning(provider_session_policy::check_claude_launch(
+        base_dir,
+        claude_home,
+        account,
+        Some(&handle_dir_abs.join("settings.json")),
+        rest,
+    )?);
 
     // Spec 08 MED-03 host-isolation warning, generalized to every 3P
     // bearer provider (kimi included — the Wave 3 target) EXCEPT loopback
@@ -875,7 +975,7 @@ fn launch_third_party(
         use csq_core::audit::{Decision, ResultState};
         audit_emitter.set_result(ResultState::Degraded, Decision::Bypass);
     }
-    exec_or_spawn(cmd, &handle_dir, audit_emitter)
+    exec_or_spawn(cmd, &handle_dir, audit_emitter, true)
 }
 
 /// Resolves the catalog surface id (`"kimi"`, `"zai"`, `"mm"`, `"deepseek"`,
@@ -899,6 +999,171 @@ fn resolve_third_party_surface_name(base_dir: &Path, account: AccountNum) -> &'s
         })
         .unwrap_or("third-party")
 }
+
+/// Launch-directory admission only: a linked worktree is not a filesystem sandbox.
+/// Retain the outermost validated primary owner despite ambiguous inner metadata.
+fn provider_session_repository_context(
+    cwd: &Path,
+) -> Result<(Option<PathBuf>, Option<PathBuf>, bool)> {
+    let cwd = std::fs::canonicalize(cwd)
+        .map_err(|_| anyhow!("provider-session fence: cannot determine the launch directory"))?;
+    if !cwd.is_dir() {
+        bail!("provider-session fence: launch directory is not a directory");
+    }
+    let mut project_root = None;
+    let mut primary = None;
+    let mut ambiguous = false;
+    for root in cwd.ancestors() {
+        let marker = root.join(".git");
+        let metadata = match std::fs::symlink_metadata(&marker) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                ambiguous = true;
+                continue;
+            }
+        };
+        if project_root.is_none() {
+            project_root = Some(root.to_path_buf());
+        }
+        if metadata.is_dir() {
+            primary = Some(root.to_path_buf());
+        } else if !metadata.is_file() || validate_provider_linked_worktree(root, &marker).is_err() {
+            ambiguous = true;
+        }
+    }
+    Ok((project_root, primary, ambiguous))
+}
+
+#[cfg(test)]
+fn provider_session_repository(cwd: &Path) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
+    let (project_root, primary, ambiguous) = provider_session_repository_context(cwd)?;
+    if ambiguous {
+        bail!("provider-session fence: ambiguous repository metadata");
+    }
+    Ok((project_root, primary))
+}
+
+#[cfg(test)]
+fn admit_provider_session_workdir(cwd: &Path) -> Result<()> {
+    if provider_session_repository(cwd)?.1.is_some() {
+        bail!("provider-session fence: third-party sessions cannot start inside a primary checkout; a linked worktree does not restrict filesystem access");
+    }
+    Ok(())
+}
+
+/// Require Git's bidirectional worktree registration, not merely a `.git` file.
+/// Separate-git-dir clones and submodules have no such registration and fail closed.
+fn validate_provider_linked_worktree(root: &Path, marker: &Path) -> Result<()> {
+    fn metadata_line(path: &Path) -> Result<String> {
+        use std::io::Read;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+        }
+        let mut file = options
+            .open(path)
+            .map_err(|_| anyhow!("provider-session fence: cannot read worktree metadata"))?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| anyhow!("provider-session fence: cannot inspect worktree metadata"))?;
+        if !metadata.is_file() || metadata.len() > 16_384 {
+            bail!("provider-session fence: ambiguous worktree metadata");
+        }
+        let mut value = String::new();
+        (&mut file)
+            .take(16_385)
+            .read_to_string(&mut value)
+            .map_err(|_| anyhow!("provider-session fence: cannot decode worktree metadata"))?;
+        let value = value.trim_end_matches(['\r', '\n']);
+        if value.is_empty() || value.len() > 16_384 || value.contains(['\r', '\n']) {
+            bail!("provider-session fence: malformed worktree metadata");
+        }
+        Ok(value.to_string())
+    }
+    fn resolve(parent: &Path, value: &str) -> Result<PathBuf> {
+        std::fs::canonicalize(parent.join(value))
+            .map_err(|_| anyhow!("provider-session fence: cannot resolve worktree registration"))
+    }
+    let marker_value = metadata_line(marker)?;
+    let gitdir_value = marker_value
+        .strip_prefix("gitdir: ")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("provider-session fence: malformed repository metadata"))?;
+    let gitdir = resolve(root, gitdir_value)?;
+    let common = resolve(&gitdir, &metadata_line(&gitdir.join("commondir"))?)?;
+    let registry = resolve(&common, "worktrees")?;
+    let backlink = resolve(&gitdir, &metadata_line(&gitdir.join("gitdir"))?)?;
+    let expected = std::fs::canonicalize(marker)
+        .map_err(|_| anyhow!("provider-session fence: cannot resolve checkout registration"))?;
+    if gitdir == common || gitdir.parent() != Some(registry.as_path()) || backlink != expected {
+        bail!("provider-session fence: inconsistent linked-worktree registration");
+    }
+    Ok(())
+}
+
+/// Shared swap admission. Early checks do not emit warnings; the actual exec
+/// boundary emits once and rechecks Claude's materialized settings.
+pub(crate) fn admit_swap_provider_session(
+    base_dir: &Path,
+    account: AccountNum,
+    surface: Surface,
+    materialized: Option<&Path>,
+    emit: bool,
+) -> Result<()> {
+    let warning = if surface == Surface::ClaudeCode {
+        provider_session_policy::check_claude_launch(
+            base_dir,
+            &super::claude_home()?,
+            account,
+            materialized,
+            &[],
+        )?
+    } else {
+        provider_session_policy::check_unknown_launch(base_dir)?
+    };
+    if emit {
+        provider_session_policy::emit_warning(warning);
+    }
+    Ok(())
+}
+
+pub(crate) fn admit_exec_provider_session(
+    base_dir: &Path,
+    claude_home: &Path,
+    account: AccountNum,
+    surface: Surface,
+    materialized: Option<&Path>,
+) -> Result<Option<String>> {
+    if surface == Surface::ClaudeCode {
+        provider_session_policy::check_claude_launch(
+            base_dir,
+            claude_home,
+            account,
+            materialized,
+            &[],
+        )
+    } else {
+        let cwd = if surface == Surface::Codex {
+            claude_home.to_path_buf()
+        } else {
+            std::env::current_dir().unwrap_or_default()
+        };
+        provider_session_policy::check_exec_vendor_launch(base_dir, &cwd)
+    }
+}
+
+#[cfg(test)]
+#[path = "provider_session_fence_tests.rs"]
+mod provider_session_fence_tests;
 
 /// True when the target `surface`'s NATIVE artifacts exist at `cwd` or any
 /// ancestor up to `project_root` (inclusive).
@@ -1064,8 +1329,13 @@ fn native_artifacts_present(surface: Surface, cwd: &Path, project_root: Option<&
 /// `CSQ_COC_PARITY_TEST=1` forces injection regardless, the escape hatch for
 /// verifying `.coc/`→native parity via csq's sub-process path.
 fn should_inject_scaffold(surface: Surface, cwd: &Path, project_root: Option<&Path>) -> bool {
-    std::env::var_os("CSQ_COC_PARITY_TEST").is_some()
-        || !native_artifacts_present(surface, cwd, project_root)
+    let parity = std::env::var_os("CSQ_COC_PARITY_TEST");
+    let force = if surface == Surface::Codex {
+        parity.as_deref() == Some(std::ffi::OsStr::new("1"))
+    } else {
+        parity.is_some()
+    };
+    force || !native_artifacts_present(surface, cwd, project_root)
 }
 
 /// Emits the operator note explaining that a `.coc/` scaffold was suppressed
@@ -1102,6 +1372,8 @@ fn launch_anthropic(
     audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
 ) -> Result<()> {
     // Capability-layer pre-flight (spec 10 §10.4.2). When the flag
+    let _ =
+        provider_session_policy::check_claude_launch(base_dir, claude_home, account, None, rest)?;
     // is OFF (default for v2.4.0-alpha) we short-circuit here and
     // fall through to the v2.3.1 launch path — argv + env are
     // byte-identical to pre-PR-CA5 by construction.
@@ -1176,6 +1448,14 @@ fn launch_anthropic(
     let (handle_dir_abs, handle_dir_is_canonical) =
         csq_core::credentials::keychain::canonicalize_for_keychain_sync(&handle_dir);
 
+    provider_session_policy::emit_warning(provider_session_policy::check_claude_launch(
+        base_dir,
+        claude_home,
+        account,
+        Some(&handle_dir_abs.join("settings.json")),
+        rest,
+    )?);
+
     // Security review 1386 H1: opportunistically retry any keychain item a
     // prior `csq logout` could not confirm clearing (locked/unreachable
     // keychain at the time). The daemon's periodic sweep covers this too,
@@ -1221,9 +1501,7 @@ fn launch_anthropic(
     println!("Launching claude for account {} (term-{})...", account, pid);
 
     // Strip ANTHROPIC_* (and related) env vars before exec.
-    let mut cmd = Command::new("claude");
-    cmd.env("CLAUDE_CONFIG_DIR", &handle_dir_abs);
-    strip_sensitive_env(&mut cmd);
+    let mut cmd = build_anthropic_command(base_dir, &handle_dir_abs, rest)?;
     // NB: the user's `rest` args are appended LAST in each arm below — AFTER any
     // csq-injected top-level flags (`--plugin-dir`, `--append-system-prompt-file`).
     // Those flags MUST precede a `claude` SUBCOMMAND (e.g. `csq run N -- plugin
@@ -1243,7 +1521,7 @@ fn launch_anthropic(
             audit_emitter.set_result(ResultState::Degraded, Decision::Bypass);
             // Inherit adds no csq flags; append rest and go (byte-identical argv).
             cmd.args(rest);
-            exec_or_spawn(cmd, &handle_dir, audit_emitter)
+            exec_or_spawn(cmd, &handle_dir, audit_emitter, true)
         }
         LayerControl::WithLayer {
             mode,
@@ -1451,8 +1729,11 @@ pub(crate) fn launch_codex(
     bench_mode: Option<&str>,
     coc_cache_enabled: bool,
     rest: &[String],
-    audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
-    // FM-5: `false` for the primary `csq run`/`csq exec` entrypoint (via
+    // The run's audit emitter. `CodexLaunchAudit::First` (the primary
+    // `csq run` entrypoint) holds it in the pre-spawn guard, so every exit
+    // before the spawn ends the record; `Relaunch` borrows the supervisor's.
+    mut audit: CodexLaunchAudit<'_>,
+    // FM-5 (`is_relaunch`, derived from `audit` below): `false` for the primary `csq run`/`csq exec` entrypoint (via
     // `handle`, below), `true` when this call is a cross-slot swap RELAUNCH
     // (`codex_supervise::run_supervised`'s `relaunch` closure recursing back
     // in). Gates whether `require_daemon_healthy` and the capability-layer
@@ -1462,14 +1743,35 @@ pub(crate) fn launch_codex(
     // (`EXIT_CODE_DAEMON_REQUIRED`) — see `require_daemon_healthy`'s doc
     // comment for the exit-code-fidelity trade-off this preserves on the
     // primary path.
-    is_relaunch: bool,
     // PRIMARY DIRECTIVE (round 6): `Some(_)` iff this call IS the relaunch
     // half of an accepted cross-slot swap — see
     // `codex_supervise::run_supervised`'s `swap_correlation` doc for what it
     // gates. `None` for the primary (non-swap) entrypoint.
     swap_correlation: Option<csq_core::session::codex_supervisor::SwapAuditCorrelation>,
+    // The messaging decision a supervised swap RELAUNCH carries from its source terminal
+    // (`Some`), so the relaunch never re-reads `CSQ_MESSAGING`. `None` for a fresh launch,
+    // which decides once from the environment.
+    messaging: Option<bool>,
 ) -> Result<()> {
-    require_daemon_healthy(base_dir, audit_emitter, is_relaunch)?;
+    // Classify the caller's own arguments before csq derives account defaults.
+    // Explicit resume policy must retain native semantics on the embedded path.
+    let embedded_native_fallback = codex_supervise::requires_embedded_native(rest);
+    let is_relaunch = audit.is_relaunch();
+    // The capability-layer settings this launch threads into the supervised
+    // child's relaunch + relaunch-validation closures
+    // (`supervise_codex_holding_share_lock`).
+    let settings = CodexLaunchSettings {
+        capability_layer_enabled,
+        layer_is_auto,
+        toggles: *toggles,
+        debug,
+        bench_mode,
+        coc_cache_enabled,
+    };
+    provider_session_policy::emit_warning(provider_session_policy::check_unknown_launch_with_args(
+        base_dir, rest,
+    )?);
+    require_daemon_healthy(base_dir, audit.emitter_mut(), is_relaunch)?;
     verify_codex_config_toml(base_dir, account)?;
     verify_codex_canonical_is_regular_file(base_dir, account)?;
 
@@ -1546,6 +1848,7 @@ pub(crate) fn launch_codex(
             {
                 use csq_core::audit::{Decision, ResultState};
                 let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                let audit_emitter = audit.emitter_mut();
                 audit_emitter.set_end_ts(end_ts);
                 audit_emitter.set_result(ResultState::Fail, Decision::Reject);
                 fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
@@ -1566,7 +1869,7 @@ pub(crate) fn launch_codex(
 
     // --bench-mode layer-only: terminate before subprocess spawn.
     if let Some("layer-only") = bench_mode {
-        return handle_bench_mode_layer_only(Surface::Codex, audit_emitter);
+        return handle_bench_mode_layer_only(Surface::Codex, audit.emitter_mut());
     }
 
     // M6 T6.1: cross-CLI spawn-boundary governance gate (enterprise-only).
@@ -1585,7 +1888,7 @@ pub(crate) fn launch_codex(
     let (codex_spawn_scope_env, codex_gate_env): (
         Vec<(String, String)>,
         Option<Box<csq_trust_contract::OperatingEnvelope>>,
-    ) = match evaluate_codex_spawn_gate(base_dir, audit_emitter) {
+    ) = match evaluate_codex_spawn_gate(base_dir, audit.emitter_mut()) {
         Ok(v) => v,
         Err(e) => {
             // S-F3/C-F2: return Err rather than `process::exit` so a caller
@@ -1644,14 +1947,34 @@ pub(crate) fn launch_codex(
     // Cross-slot swap-resume shard S3 (parity, item 3 of the governing
     // task): the flag/env-stripping + sandbox-flag-derivation sequence
     // below is factored into `build_codex_exec_command` so
-    // `swap.rs::exec_codex_after_binding` — which still `exec()`s in-process
-    // rather than routing through this function's supervised spawn — builds
+    // `swap.rs::supervise_codex_after_binding` — which builds its own
+    // command before handing it to `supervise_codex_holding_share_lock` — builds
     // an identical `Command` on this axis. See that function's doc comment
     // for exactly what it does and does NOT share (spawn gate, MCP proxy
     // rewrite, and the capability-layer preflight above stay `launch_codex`
     // -only; they need an `AuditEmitter` and a resolved operating envelope
     // that call site does not carry).
-    let mut cmd = build_codex_exec_command(base_dir, account, &handle_dir_abs, rest)?;
+    let messaging_wrap = codex_mcp_rewrite
+        .as_ref()
+        .map(|(bin, path)| (bin.as_str(), path.as_path()));
+    // The launch decision, held in memory from here on: a carried one (a swap relaunch) or a
+    // fresh read of the marker/`CSQ_MESSAGING`. It is handed to the supervisor below so a
+    // failed marker write cannot turn messaging off at this terminal's next supervised swap.
+    let messaging_on =
+        messaging.unwrap_or_else(|| csq_core::messaging::register::decision(&handle_dir_abs));
+    let mut cmd = build_codex_exec_command_with(
+        base_dir,
+        account,
+        &handle_dir_abs,
+        rest,
+        messaging_wrap,
+        Some(messaging_on),
+    )?;
+    if messaging.is_some() {
+        // Record the carried decision in the new handle dir so an exec-replace swap reads it
+        // (a failure is logged with a fixed tag; the supervised path does not need the file).
+        csq_core::messaging::register::record_decision_logged(&handle_dir_abs, messaging_on);
+    }
 
     // M6 T6.4: inject the advisory path-scope env (empty unless the gate returned
     // Conditional with a declared path-scope). codex does NOT natively enforce
@@ -1694,41 +2017,25 @@ pub(crate) fn launch_codex(
                 verify_codex_handle_config_toml_is_regular_file(&handle_dir)?;
             }
 
-            audit_emitter.set_result(ResultState::Degraded, Decision::Bypass);
+            audit
+                .emitter_mut()
+                .set_result(ResultState::Degraded, Decision::Bypass);
+            // F1: the emitter leaves the pre-spawn guard only here, at the
+            // supervised spawn; the share-lock refusal below is the one exit
+            // after this point and ends the record explicitly.
+            let mut spawning = audit.into_spawning();
+            let audit_emitter = spawning.emitter_mut();
             // Cross-slot swap-resume shard S2: codex is supervised (spawn +
             // wait, never `exec` on unix) rather than exec-replaced, so a
             // `csq swap` shelled out from INSIDE this codex session can hand
-            // the swap back to THIS process. `relaunch` recurses into
+            // the swap back to THIS process. The relaunch closure
+            // `supervise_codex_holding_share_lock` builds recurses into
             // `launch_codex` itself for the target slot — its own spawn
             // point reaches back into `codex_supervise::run_supervised` for
             // the new child, so "the new child is supervised the same way"
             // without an explicit loop here. See `codex_supervise`'s module
             // doc for the full contract with `csq swap` (shard S3).
-            let relaunch = move |target_slot: u16,
-                                 thread_id: Option<&str>,
-                                 swap_correlation: Option<
-                csq_core::session::codex_supervisor::SwapAuditCorrelation,
-            >,
-                                 audit_emitter: &mut crate::cli::audit_emit::AuditEmitter|
-                  -> Result<()> {
-                let target_account = AccountNum::try_from(target_slot)
-                    .map_err(|e| anyhow!("invalid target slot {target_slot}: {e}"))?;
-                let new_rest = codex_supervise::relaunch_rest(target_slot, thread_id, rest);
-                launch_codex(
-                    base_dir,
-                    target_account,
-                    capability_layer_enabled,
-                    layer_is_auto,
-                    toggles,
-                    debug,
-                    bench_mode,
-                    coc_cache_enabled,
-                    &new_rest,
-                    audit_emitter,
-                    /* is_relaunch */ true,
-                    swap_correlation,
-                )
-            };
+            //
             // F8: held across the whole supervised run (spawn through
             // however long this codex child lives), not just the spawn
             // syscall — `csq sessions share`'s EXCLUSIVE migration lock
@@ -1739,34 +2046,26 @@ pub(crate) fn launch_codex(
             // own SHARED guard, so first launch and every relaunch are
             // covered uniformly. `ShareError`'s messages carry no secrets
             // (lock-contention/IO text over session-store paths only).
-            let _codex_share_lock =
-                csq_core::session::shared_state::acquire_codex_share_lock_shared(base_dir)
-                    .map_err(|e| anyhow!("{e}"))?;
-            // F2 (round 5) / D-F9 (round 7): `make_validate_relaunch`
-            // captures the EXACT same invocation values the `relaunch`
-            // closure above already captures — see its own doc, and
-            // `validate_codex_relaunch_target`'s, for what this validates.
-            // D-F6 close-out (round 8): `base_dir`/`toggles` are cloned
-            // (`to_path_buf()` / `Copy` deref) into the closure's OWNED
-            // captures — see `make_validate_relaunch`'s doc for why this is
-            // what makes the closure `Send + Sync + 'static`.
-            let validate_relaunch = make_validate_relaunch(
-                base_dir.to_path_buf(),
-                capability_layer_enabled,
-                layer_is_auto,
-                *toggles,
-                debug,
-                coc_cache_enabled,
-            );
-            codex_supervise::run_supervised(
+            let codex_share_lock =
+                match csq_core::session::shared_state::acquire_codex_share_lock_shared(base_dir) {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        end_codex_run_before_spawn(audit_emitter, is_relaunch);
+                        return Err(anyhow!("{e}"));
+                    }
+                };
+            supervise_codex_holding_share_lock(
+                codex_share_lock,
                 cmd,
                 &handle_dir,
                 base_dir,
-                validate_relaunch,
+                settings,
+                rest,
                 is_relaunch,
                 swap_correlation,
                 audit_emitter,
-                relaunch,
+                messaging_on,
+                embedded_native_fallback,
             )
         }
         LayerControl::WithLayer {
@@ -1880,6 +2179,11 @@ pub(crate) fn launch_codex(
             // existing `spawn_one_shot_with_post_validate` path unchanged
             // — bypassing `spawn_with_layer`'s dispatch wrapper directly
             // rather than editing that shared (claude-and-codex) function.
+            // F1: the emitter leaves the pre-spawn guard only here, at the
+            // spawn; the Interactive share-lock refusal below is the one exit
+            // after this point and ends the record explicitly.
+            let mut spawning = audit.into_spawning();
+            let audit_emitter = spawning.emitter_mut();
             let result = match mode {
                 SpawnMode::OneShot => spawn_one_shot_with_post_validate(
                     cmd,
@@ -1891,58 +2195,30 @@ pub(crate) fn launch_codex(
                     audit_emitter,
                 ),
                 SpawnMode::Interactive => {
-                    let relaunch =
-                        move |target_slot: u16,
-                              thread_id: Option<&str>,
-                              swap_correlation: Option<
-                            csq_core::session::codex_supervisor::SwapAuditCorrelation,
-                        >,
-                              audit_emitter: &mut crate::cli::audit_emit::AuditEmitter|
-                              -> Result<()> {
-                            let target_account = AccountNum::try_from(target_slot)
-                                .map_err(|e| anyhow!("invalid target slot {target_slot}: {e}"))?;
-                            let new_rest =
-                                codex_supervise::relaunch_rest(target_slot, thread_id, rest);
-                            launch_codex(
-                                base_dir,
-                                target_account,
-                                capability_layer_enabled,
-                                layer_is_auto,
-                                toggles,
-                                debug,
-                                bench_mode,
-                                coc_cache_enabled,
-                                &new_rest,
-                                audit_emitter,
-                                /* is_relaunch */ true,
-                                swap_correlation,
-                            )
-                        };
                     // F8: see the Inherit-branch call site's identical
                     // comment — held across the whole supervised run.
-                    let _codex_share_lock =
-                        csq_core::session::shared_state::acquire_codex_share_lock_shared(base_dir)
-                            .map_err(|e| anyhow!("{e}"))?;
-                    // F2 (round 5): see the Inherit-branch call site's
-                    // identical comment. D-F6 close-out (round 8): see the
-                    // same call site's comment on the owned-capture clone.
-                    let validate_relaunch = make_validate_relaunch(
-                        base_dir.to_path_buf(),
-                        capability_layer_enabled,
-                        layer_is_auto,
-                        *toggles,
-                        debug,
-                        coc_cache_enabled,
-                    );
-                    codex_supervise::run_supervised(
+                    let codex_share_lock =
+                        match csq_core::session::shared_state::acquire_codex_share_lock_shared(
+                            base_dir,
+                        ) {
+                            Ok(guard) => guard,
+                            Err(e) => {
+                                end_codex_run_before_spawn(audit_emitter, is_relaunch);
+                                return Err(anyhow!("{e}"));
+                            }
+                        };
+                    supervise_codex_holding_share_lock(
+                        codex_share_lock,
                         cmd,
                         &handle_dir,
                         base_dir,
-                        validate_relaunch,
+                        settings,
+                        rest,
                         is_relaunch,
                         swap_correlation,
                         audit_emitter,
-                        relaunch,
+                        messaging_on,
+                        embedded_native_fallback,
                     )
                 }
             };
@@ -1965,14 +2241,309 @@ pub(crate) fn launch_codex(
     }
 }
 
+/// The capability-layer settings `csq run` threads into `launch_codex` for a
+/// codex slot, and which a supervised codex session's relaunch and
+/// relaunch-validation closures capture. `csq run` builds them with
+/// [`CodexLaunchSettings::from_run_flags`]; `csq swap` into a codex slot
+/// builds them with [`CodexLaunchSettings::for_plain_run`] — the same
+/// constructor fed the values a flagless `csq run <N>` resolves — so a
+/// swap-launched codex session carries exactly what `csq run` would build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CodexLaunchSettings<'a> {
+    pub(crate) capability_layer_enabled: bool,
+    pub(crate) layer_is_auto: bool,
+    pub(crate) toggles: CapabilityLayerToggles,
+    pub(crate) debug: bool,
+    pub(crate) bench_mode: Option<&'a str>,
+    pub(crate) coc_cache_enabled: bool,
+}
+
+impl<'a> CodexLaunchSettings<'a> {
+    /// `csq run`'s construction from its parsed flags and the persisted
+    /// toggles (`handle`).
+    pub(crate) fn from_run_flags(
+        layer_intent: super::super::LayerIntent,
+        toggles: CapabilityLayerToggles,
+        debug: bool,
+        bench_mode: Option<&'a str>,
+        coc_cache_enabled: bool,
+    ) -> Self {
+        Self {
+            capability_layer_enabled: layer_intent.enabled(),
+            layer_is_auto: layer_intent.is_auto(),
+            toggles,
+            debug,
+            bench_mode,
+            coc_cache_enabled,
+        }
+    }
+}
+
+impl CodexLaunchSettings<'static> {
+    /// What `csq run <N>` with no flags builds: no `--capability-layer` /
+    /// `--no-capability-layer`, no `--debug`, no `--bench-mode`, no
+    /// `--no-coc-cache`, and the toggles persisted in `base_dir`.
+    pub(crate) fn for_plain_run(base_dir: &Path) -> Self {
+        Self::from_run_flags(
+            super::super::LayerIntent::from_flags(false, false),
+            load_capability_layer_toggles(base_dir),
+            /* debug */ false,
+            /* bench_mode */ None,
+            /* coc_cache_enabled */ true,
+        )
+    }
+}
+
+/// The audit emitter `csq run` builds for `account` on `surface` (`handle`),
+/// and `csq swap` into a codex slot builds for the session it supervises.
+pub(crate) fn run_audit_emitter(
+    base_dir: &Path,
+    surface: SurfaceCli,
+    account: AccountNum,
+    start_ts: String,
+) -> crate::cli::audit_emit::AuditEmitter {
+    build_audit_emitter(
+        base_dir,
+        audit_surface_for(surface),
+        format!("csq run account {}", account.get()),
+        start_ts,
+    )
+}
+
+/// Ends a codex run's audit record on an exit reached BEFORE codex was
+/// spawned, so no record claims a codex session that never ran (the
+/// emitter's default `Degraded`/`Bypass` state is what `Drop` would
+/// otherwise flush).
+///
+/// - A record carrying a spawn-gate verdict, or a swap RELAUNCH's emitter
+///   (F4: it reports that swap's own attempt), is finalised as `Fail` /
+///   `Reject` with `end_ts` — the shape `evaluate_codex_spawn_gate`'s
+///   `Refuse` arm writes — so the governance verdict is not dropped — and
+///   flushed HERE through [`fail_loud_on_audit_write_failure`], the same
+///   fail-loud flush the `Refuse` and spawn-failure arms use: a record that
+///   cannot be written even to `.pending/` exits non-zero with the
+///   remediation message instead of being left to `Drop`'s WARN-only write.
+/// - Otherwise the record is discarded: nothing was governed and nothing
+///   ran, the same disposition `exit_cleanly_if_terminating_before_spawn`
+///   gives a first launch.
+pub(crate) fn end_codex_run_before_spawn(
+    audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+    is_relaunch: bool,
+) {
+    if is_relaunch || audit_emitter.spawn_gate_recorded() {
+        use csq_core::audit::{Decision, ResultState};
+        let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        audit_emitter.set_end_ts(end_ts);
+        audit_emitter.set_result(ResultState::Fail, Decision::Reject);
+        fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+    } else {
+        audit_emitter.discard();
+    }
+}
+
+/// A first-launch codex run's audit emitter while every step before the
+/// spawn is still able to refuse (`csq run` and `csq swap` into a codex
+/// slot). Dropped on
+/// ANY such exit — a `?`, an early `return`, a declined prompt — it ends the
+/// record through [`end_codex_run_before_spawn`], so no pre-spawn path can
+/// flush the default `Bypass` record. [`Self::into_spawning`] hands the
+/// emitter on only at the supervised-spawn call; from there the supervisor
+/// ends it on its own pre-spawn exits.
+pub(crate) struct PreSpawnCodexRun {
+    emitter: Option<crate::cli::audit_emit::AuditEmitter>,
+}
+
+impl PreSpawnCodexRun {
+    pub(crate) fn new(emitter: crate::cli::audit_emit::AuditEmitter) -> Self {
+        Self {
+            emitter: Some(emitter),
+        }
+    }
+
+    /// The held emitter. `None` only after [`Self::into_spawning`], which
+    /// consumes `self`, so every reachable call sees `Some`.
+    pub(crate) fn emitter_mut(&mut self) -> &mut crate::cli::audit_emit::AuditEmitter {
+        self.emitter
+            .get_or_insert_with(crate::cli::audit_emit::AuditEmitter::disabled)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn emitter_for_test(&self) -> Option<&crate::cli::audit_emit::AuditEmitter> {
+        self.emitter.as_ref()
+    }
+
+    /// Releases the emitter to the spawn.
+    pub(crate) fn into_spawning(mut self) -> crate::cli::audit_emit::AuditEmitter {
+        self.emitter
+            .take()
+            .unwrap_or_else(crate::cli::audit_emit::AuditEmitter::disabled)
+    }
+}
+
+impl Drop for PreSpawnCodexRun {
+    fn drop(&mut self) {
+        if let Some(mut emitter) = self.emitter.take() {
+            // A governed record is finalised and flushed fail-loud inside
+            // the helper; `process::exit` (its `.pending/` total-failure
+            // arm) is an ordinary call from `drop` — it neither unwinds nor
+            // returns, so no destructor contract is broken. A discarded
+            // record writes nothing; `emitter` then drops as a no-op.
+            end_codex_run_before_spawn(&mut emitter, /* is_relaunch */ false);
+        }
+    }
+}
+
+/// The audit emitter `launch_codex` runs under. The variant IS the launch
+/// kind, so a first launch can never be mistaken for a relaunch.
+pub(crate) enum CodexLaunchAudit<'a> {
+    /// `csq run`'s first launch: the guard ends the record on EVERY exit
+    /// before [`Self::into_spawning`] (a `?`, an early `return`), so no
+    /// pre-spawn exit can flush the default `Degraded`/`Bypass` record.
+    First(Box<PreSpawnCodexRun>),
+    /// A swap RELAUNCH (`codex_supervise::run_supervised`'s `relaunch`
+    /// closure): the supervisor owns this emitter and finalises it as
+    /// `Fail`/`Reject` on any `Err` the relaunch returns (FM-6).
+    Relaunch(&'a mut crate::cli::audit_emit::AuditEmitter),
+}
+
+impl<'a> CodexLaunchAudit<'a> {
+    pub(crate) fn is_relaunch(&self) -> bool {
+        matches!(self, Self::Relaunch(_))
+    }
+
+    pub(crate) fn emitter_mut(&mut self) -> &mut crate::cli::audit_emit::AuditEmitter {
+        match self {
+            Self::First(guard) => guard.emitter_mut(),
+            Self::Relaunch(emitter) => emitter,
+        }
+    }
+
+    /// Leaves the pre-spawn guard. Called only at a spawn site; the exits
+    /// between here and the spawn end the record explicitly
+    /// ([`end_codex_run_before_spawn`]).
+    pub(crate) fn into_spawning(self) -> SpawningCodexAudit<'a> {
+        match self {
+            Self::First(guard) => SpawningCodexAudit::Owned(Box::new((*guard).into_spawning())),
+            Self::Relaunch(emitter) => SpawningCodexAudit::Borrowed(emitter),
+        }
+    }
+}
+
+/// [`CodexLaunchAudit`] after it has left the pre-spawn guard.
+pub(crate) enum SpawningCodexAudit<'a> {
+    Owned(Box<crate::cli::audit_emit::AuditEmitter>),
+    Borrowed(&'a mut crate::cli::audit_emit::AuditEmitter),
+}
+
+impl SpawningCodexAudit<'_> {
+    pub(crate) fn emitter_mut(&mut self) -> &mut crate::cli::audit_emit::AuditEmitter {
+        match self {
+            Self::Owned(emitter) => emitter,
+            Self::Borrowed(emitter) => emitter,
+        }
+    }
+}
+
+/// The ONE path that supervises an interactive codex child: `launch_codex`
+/// (both its `Inherit` and `WithLayer`/`Interactive` arms) and `csq swap`
+/// into a codex slot both end here.
+///
+/// The caller has ALREADY acquired the SHARED codex share lock
+/// (`share_lock`) and prepared `handle_dir`. This holds the guard — whose
+/// descriptor keeps `FD_CLOEXEC`, so neither codex nor any tool subprocess
+/// it starts inherits it — until the supervised run returns, then drops
+/// it. That holds while csq lives: on Linux the codex child is armed with
+/// `PR_SET_PDEATHSIG(SIGTERM)` (`codex_supervise::reset_signal_dispositions_before_exec`)
+/// so it does not outlive csq; macOS has no death signal, and a SIGKILLed
+/// csq drops the lock while an orphaned codex runs on. A cross-slot swap requested from inside the session relaunches via
+/// `launch_codex`, which acquires its own fresh SHARED guard for the new
+/// child while this one is still held.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn supervise_codex_holding_share_lock(
+    share_lock: csq_core::session::shared_state::CodexShareLockGuard,
+    cmd: Command,
+    handle_dir: &Path,
+    base_dir: &Path,
+    settings: CodexLaunchSettings<'_>,
+    rest: &[String],
+    is_relaunch: bool,
+    swap_correlation: Option<csq_core::session::codex_supervisor::SwapAuditCorrelation>,
+    audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+    messaging_on: bool,
+    embedded_native_fallback: bool,
+) -> Result<()> {
+    let CodexLaunchSettings {
+        capability_layer_enabled,
+        layer_is_auto,
+        toggles,
+        debug,
+        bench_mode,
+        coc_cache_enabled,
+    } = settings;
+    let relaunch = move |target_slot: u16,
+                         thread_id: Option<&str>,
+                         swap_correlation: Option<
+        csq_core::session::codex_supervisor::SwapAuditCorrelation,
+    >,
+                         audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+                         messaging: bool|
+          -> Result<()> {
+        let target_account = AccountNum::try_from(target_slot)
+            .map_err(|e| anyhow!("invalid target slot {target_slot}: {e}"))?;
+        let new_rest = codex_supervise::relaunch_rest(target_slot, thread_id, rest);
+        launch_codex(
+            base_dir,
+            target_account,
+            capability_layer_enabled,
+            layer_is_auto,
+            &toggles,
+            debug,
+            bench_mode,
+            coc_cache_enabled,
+            &new_rest,
+            CodexLaunchAudit::Relaunch(audit_emitter),
+            swap_correlation,
+            Some(messaging),
+        )
+    };
+    // F2 (round 5) / D-F9 (round 7): `make_validate_relaunch` captures the
+    // EXACT same invocation values the `relaunch` closure above captures —
+    // see its own doc, and `validate_codex_relaunch_target`'s, for what this
+    // validates. D-F6 close-out (round 8): `base_dir`/`toggles` are cloned
+    // into the closure's OWNED captures — see `make_validate_relaunch`'s doc
+    // for why this is what makes the closure `Send + Sync + 'static`.
+    let validate_relaunch = make_validate_relaunch(
+        base_dir.to_path_buf(),
+        capability_layer_enabled,
+        layer_is_auto,
+        toggles,
+        debug,
+        coc_cache_enabled,
+    );
+    let result = codex_supervise::run_supervised_carrying(
+        cmd,
+        handle_dir,
+        base_dir,
+        validate_relaunch,
+        is_relaunch,
+        swap_correlation,
+        audit_emitter,
+        relaunch,
+        Some(messaging_on),
+        embedded_native_fallback,
+    );
+    drop(share_lock);
+    result
+}
+
 /// Builds a codex `Command` carrying the SAME env-stripping, sandbox/approval
 /// flag derivation, and passthrough-arg handling that `launch_codex` uses for
 /// its own spawn (`codex_command` + the GH an internal ticket sandbox-flag block that used
 /// to live inline in `launch_codex`). Cross-slot swap-resume shard S3 (item 3
 /// of the governing task) factored this out so
-/// `swap.rs::exec_codex_after_binding` — which must `exec()` a fresh codex
-/// binary in-process (it runs from a plain shell, not a supervised session,
-/// so there is no live supervisor to hand a spawn+wait off to) — builds an
+/// `swap.rs::supervise_codex_after_binding` — which supervises a fresh codex
+/// child itself (it runs from a plain shell, not inside a supervised session,
+/// so there is no live supervisor to hand the swap off to) — builds an
 /// identical process image on the flag/env axis instead of the bare
 /// `Command::new(CLI_BINARY)` it used before this shard.
 ///
@@ -1981,19 +2552,55 @@ pub(crate) fn launch_codex(
 /// resolve the M6 T6.2 MCP-proxy rewrite — those need an `&mut AuditEmitter`
 /// and (for the gate) a resolved `OperatingEnvelope` that THIS function's
 /// call site does not carry. This is no longer a silent or reported gap:
-/// `swap::exec_codex_after_binding` now runs the token-freshness check
+/// `swap::supervise_codex_after_binding` now runs the token-freshness check
 /// itself, and receives the gate verdict + MCP rewrite from ITS OWN caller
 /// (`exec_replace_swap`, which calls `evaluate_codex_spawn_gate` before the
 /// Step-2 tombstone and `resolve_codex_mcp_rewrite` after Step 3) as plain,
 /// cfg-independent arguments — see that function's doc comment for the exact
 /// sequencing that closed this parity gap (cross-slot swap-resume shard S3).
+#[cfg(test)]
 pub(crate) fn build_codex_exec_command(
     base_dir: &Path,
     account: AccountNum,
     handle_dir: &Path,
     rest: &[String],
 ) -> Result<Command> {
+    build_codex_exec_command_with(base_dir, account, handle_dir, rest, None, None)
+}
+
+/// `build_codex_exec_command` for a caller that has resolved the M6 T6.2 MCP-proxy rewrite
+/// (`(csq_bin, envelope_snapshot)`): the messaging MCP server (spec 32 §6) is then routed
+/// through `csq mcp-proxy` like every other stdio server, instead of registered direct.
+/// `messaging` is `Some(decision)` when the caller carries a terminal's launch decision (a
+/// swap), `None` for a fresh launch that reads it from the handle dir or the environment.
+pub(crate) fn build_codex_exec_command_with(
+    base_dir: &Path,
+    account: AccountNum,
+    handle_dir: &Path,
+    rest: &[String],
+    mcp_wrap: Option<(&str, &Path)>,
+    messaging: Option<bool>,
+) -> Result<Command> {
+    // Admission must use the actual passthrough, before native spawn or MCP setup.
+    let resume = codex_resume_route(rest)?;
+    if resume != CodexResumeRoute::Ordinary {
+        let config = codex_surface::config_toml_path(base_dir, account);
+        let sqlite_home = config.parent().ok_or(CodexResumeRefused {
+            reason: "slot state directory unavailable",
+        })?;
+        match resume {
+            CodexResumeRoute::Exact(target) => {
+                repair_codex_resume_target(base_dir, sqlite_home, target)?
+            }
+            CodexResumeRoute::Full => repair_codex_resume_all(base_dir, sqlite_home)?,
+            CodexResumeRoute::Ordinary => {}
+        }
+    }
     let mut cmd = codex_command(base_dir, account, handle_dir)?;
+    match messaging {
+        Some(on) => attach_messaging_codex_as(&mut cmd, handle_dir, mcp_wrap, on),
+        None => attach_messaging_codex(&mut cmd, handle_dir, mcp_wrap),
+    }
 
     // 2026-05-15 sandbox bug fix: pass sandbox/approval flags derived
     // from user-global ~/.codex/config.toml at spawn. Codex CLI's
@@ -2012,8 +2619,8 @@ pub(crate) fn build_codex_exec_command(
     // sandbox / approval policy (or `--ignore-user-config`), suppress the
     // derived flags entirely so the caller's explicit policy is the ONLY one
     // codex sees. Otherwise inject as before (BEFORE `rest`, last-wins for the
-    // granular `-a`/`-s` case).
-    if !codex_surface::caller_overrides_sandbox(rest) {
+    // granular `-a`/`-s` case). Resume never acquires csq-derived policy.
+    if !codex_surface::caller_overrides_sandbox(rest) && !codex_supervise::is_native_resume(rest) {
         let derived_flags = codex_surface::derive_spawn_flags(
             codex_surface::read_user_global_config_toml().as_deref(),
         );
@@ -2021,6 +2628,660 @@ pub(crate) fn build_codex_exec_command(
     }
     cmd.args(rest);
     Ok(cmd)
+}
+
+/// Record the launch-time messaging decision for a terminal that registers nothing itself
+/// (Gemini and the native kimi/grok launches have no messaging tools). A swap out of such a
+/// terminal reads this marker (`register::existing_decision`): without it the source reads
+/// "off" (no marker, no csq hook) and a Gemini or native terminal swapped into Claude or
+/// Codex would silently lose messaging. Reads `CSQ_MESSAGING` once (`register::decision`); a
+/// failed write is logged with a fixed tag and the launch proceeds.
+///
+/// Returns the decision, so a launch that builds its own `Command` can also put it in the
+/// CLI's environment ([`set_decision_env`]).
+pub(crate) fn record_launch_decision(handle_dir: &Path) -> bool {
+    csq_core::messaging::register::decision(handle_dir)
+}
+
+/// Put the launch decision in the CLI's own environment as `CSQ_MESSAGING_DECISION`. Set
+/// EXPLICITLY on every launch, on or off, so a value exported in the parent shell never
+/// reaches the session; `strip_sensitive_env` does not touch it (it removes only the vendor
+/// credential prefixes). A swap run from inside the session reads it when the marker file is
+/// missing (`register::existing_decision_in_session`).
+pub(crate) fn set_decision_env(cmd: &mut Command, on: bool) {
+    cmd.env(
+        csq_core::messaging::register::DECISION_ENV,
+        csq_core::messaging::register::decision_env_value(on),
+    );
+}
+
+/// Spec 32 §6: register the messaging MCP server for THIS Codex launch only, as `-c
+/// mcp_servers.csq-messaging.*` flags against the terminal's own `CODEX_HOME`. The user's
+/// `~/.codex/config.toml` is not opened (INV-32-07): the flags live in this process's argv.
+/// `CSQ_MESSAGING=off` adds nothing; a registration that cannot be built logs a fixed tag
+/// and the launch proceeds without messaging (fail-open).
+fn attach_messaging_codex(cmd: &mut Command, handle_dir: &Path, mcp_wrap: Option<(&str, &Path)>) {
+    // The launch decision: a fresh handle dir reads `CSQ_MESSAGING` once and records it; a
+    // swap target already carries its source's recorded decision, which is what is read here.
+    let on = csq_core::messaging::register::decision(handle_dir);
+    attach_messaging_codex_as(cmd, handle_dir, mcp_wrap, on);
+}
+
+/// [`attach_messaging_codex`] with the decision supplied by the caller (a swap hands over its
+/// source terminal's decision, so a failed marker write cannot send it back to the env).
+fn attach_messaging_codex_as(
+    cmd: &mut Command,
+    handle_dir: &Path,
+    mcp_wrap: Option<(&str, &Path)>,
+    on: bool,
+) {
+    use csq_core::messaging::register;
+    set_decision_env(cmd, on);
+    // Codex cannot send or be targeted on Windows (its session listing is undetermined), so
+    // five tools that always fail are not registered there (spec 32b section 6).
+    if cfg!(windows) || !on {
+        return;
+    }
+    let bin = register::program_path();
+    let proxy = mcp_wrap.map(|(b, envelope)| (Path::new(b), envelope));
+    match register::codex_config_args(&bin, handle_dir, proxy) {
+        Ok(args) => {
+            cmd.args(args);
+        }
+        Err(e) => tracing::warn!(
+            error_kind = register::LOG_TAG_FAILED,
+            reason = e.tag(),
+            "launching codex without the messaging server"
+        ),
+    }
+}
+
+/// Spec 32 §6: register the messaging MCP server and hooks for THIS Claude Code launch.
+/// The server is passed as an inline `--mcp-config` (no file lands in `term-<pid>`); the
+/// three hooks and six `permissions.allow` entries are added to the handle dir's own
+/// csq-materialized settings file, which the user-global one is only ever READ into
+/// (INV-32-07). Both halves are all-or-nothing: the config string is built first (it is pure
+/// and the likelier to fail), then the settings edit, then the flag is added, so a refusal
+/// never leaves tools registered but unapproved. `CSQ_MESSAGING=off` registers nothing, and
+/// any failure logs a fixed tag and launches without messaging.
+pub(crate) fn attach_messaging_claude(cmd: &mut Command, handle_dir: &Path) {
+    // The launch decision (see `attach_messaging_codex`): recorded once, then only read.
+    let on = csq_core::messaging::register::decision(handle_dir);
+    attach_messaging_claude_as(cmd, handle_dir, on);
+}
+
+/// [`attach_messaging_claude`] with the decision supplied by the caller (the swap exec path).
+pub(crate) fn attach_messaging_claude_as(cmd: &mut Command, handle_dir: &Path, on: bool) {
+    use csq_core::messaging::register;
+    set_decision_env(cmd, on);
+    if !on {
+        return;
+    }
+    let bin = register::program_path();
+    let built = register::claude_mcp_config(&bin, handle_dir).and_then(|cfg| {
+        let bin_str = bin.to_str().ok_or(register::RegisterError::NonUtf8Path)?;
+        register::register_handle_settings(handle_dir, bin_str)?;
+        Ok(cfg)
+    });
+    match built {
+        Ok(cfg) => {
+            cmd.arg("--mcp-config").arg(cfg);
+        }
+        Err(e) => tracing::warn!(
+            error_kind = register::LOG_TAG_FAILED,
+            reason = e.tag(),
+            "launching claude without the messaging server"
+        ),
+    }
+}
+
+/// Typed pre-spawn refusal, with a static operator-safe recovery hint.
+#[derive(Debug, thiserror::Error)]
+#[error("CSQ_CODEX_RESUME_TARGET: {reason}. Recover the target transcript in persistent storage, then retry the same csq resume command; native Codex was not launched")]
+struct CodexResumeRefused {
+    reason: &'static str,
+}
+
+/// Pre-spawn refusal for the DEADLINE class only: the bounded admission budget
+/// expired before the target could be verified. Distinct from
+/// [`CodexResumeRefused`] because the recovery action is the OPPOSITE one — the
+/// same command is retried unchanged, and no operator goes looking for a
+/// transcript to repair. A starved host (every sqlite3 child deferred behind
+/// sibling load) reaches this arm; a damaged or ambiguous target never does.
+/// Which inner failures route here:
+/// `shared_state::codex_sqlite::is_bounded_deadline_refusal`.
+#[derive(Debug, thiserror::Error)]
+#[error("CSQ_CODEX_RESUME_TARGET: {reason}. Native Codex was not launched and no persistent state was changed; retry the same csq resume command (this host did not finish the bounded admission in time — the transcript is not implicated)")]
+struct CodexResumeAdmissionBusy {
+    reason: &'static str,
+}
+
+/// Reason line for the deadline class. Names the deadline, never the transcript.
+const ADMISSION_DEADLINE_REASON: &str =
+    "the bounded admission deadline expired before the target could be verified";
+
+/// Test-only seam pinning the ORDERING "the admission work budget starts only
+/// after the shared migration lock is admitted" — without any elapsed-time
+/// assertion. `route_entry_at` is sampled on entry, `lock_admitted_at`
+/// immediately after the acquire returns, and `budget_started_at` where the
+/// deadline is computed. A test holds the lock file EXCLUSIVE across a launch
+/// (so the wait is real) and asserts
+/// `budget_started_at >= lock_admitted_at` — false by the whole lock wait
+/// whenever the clock is (wrongly) created first.
+///
+/// Same zero-footprint-outside-test posture as `shared_state`'s repair hooks:
+/// the `thread_local!` itself does not exist in a production build, and
+/// production code never populates it.
+// Recorded on every platform, but its only reader is a unix-only test, so a
+// Windows test build never reads the fields.
+#[cfg(test)]
+#[cfg_attr(not(unix), expect(dead_code))]
+#[derive(Clone, Copy)]
+struct AdmissionBudgetOrder {
+    route_entry_at: std::time::Instant,
+    lock_admitted_at: std::time::Instant,
+    budget_started_at: std::time::Instant,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ADMISSION_BUDGET_ORDER: std::cell::Cell<Option<AdmissionBudgetOrder>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn record_test_admission_budget_order(
+    route_entry_at: std::time::Instant,
+    lock_admitted_at: std::time::Instant,
+    budget_started_at: std::time::Instant,
+) {
+    TEST_ADMISSION_BUDGET_ORDER.with(|cell| {
+        cell.set(Some(AdmissionBudgetOrder {
+            route_entry_at,
+            lock_admitted_at,
+            budget_started_at,
+        }))
+    });
+}
+
+#[cfg(all(test, unix))]
+fn take_test_admission_budget_order() -> Option<AdmissionBudgetOrder> {
+    TEST_ADMISSION_BUDGET_ORDER.with(|cell| cell.take())
+}
+
+// Test-only override of the ADMISSION budget for POSITIVE-path rows: a row
+// that proves a healthy step COMPLETES must not be decided by the enclosing
+// admission clock on a loaded host, while the production derivation
+// (CODEX_REPAIR_BUDGET) stays unchanged. A deliberate-deadline row CLEARS it
+// with `set_test_admission_budget(None)` (a generous budget widens the per-step
+// window too — see step_budget). Zero footprint outside a test build.
+// Plain comments, not `///`: rustdoc does not document a `thread_local!`
+// invocation, and `unused_doc_comments` is denied under `-D warnings`.
+#[cfg(test)]
+thread_local! {
+    static TEST_ADMISSION_BUDGET: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+#[cfg_attr(not(unix), expect(dead_code))]
+fn set_test_admission_budget(budget: Option<std::time::Duration>) {
+    TEST_ADMISSION_BUDGET.with(|cell| cell.set(budget));
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexResumeRoute<'a> {
+    Ordinary,
+    Exact(&'a str),
+    Full,
+}
+
+#[cfg(test)]
+fn exact_codex_resume_target(rest: &[String]) -> Result<Option<&str>> {
+    Ok(match codex_resume_route(rest)? {
+        CodexResumeRoute::Exact(target) => Some(target),
+        CodexResumeRoute::Ordinary | CodexResumeRoute::Full => None,
+    })
+}
+
+/// Resume routing is parsed before touching any persistent state.
+/// Config overrides that may relocate SQLite are refused rather than repairing
+/// the slot DB while a different database would receive the native resume.
+fn codex_resume_route(rest: &[String]) -> Result<CodexResumeRoute<'_>> {
+    let refuse = |reason| CodexResumeRefused { reason };
+    // Primary installed 0.160.1 `resume --help` and `exec resume --help`:
+    // flags can precede SESSION_ID; PROMPT is the second positional argument.
+    let value_flags = [
+        "-c",
+        "--config",
+        "--enable",
+        "--disable",
+        "-m",
+        "--model",
+        "-s",
+        "--sandbox",
+        "-a",
+        "--ask-for-approval",
+        "-C",
+        "--cd",
+        "--add-dir",
+        "--local-provider",
+        "--thread-source",
+        "--output-schema",
+        "-o",
+        "--output-last-message",
+    ];
+    let bool_flags = [
+        "--all",
+        "--include-non-interactive",
+        "--strict-config",
+        "--oss",
+        "--approve-for-me",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-bypass-hook-trust",
+        "--search",
+        "--no-alt-screen",
+        "--no-daemon",
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--json",
+    ];
+    let mut index = 0;
+    let mut in_exec = false;
+    let mut in_resume = false;
+    let mut last = false;
+    let mut positionals = Vec::new();
+    let mut route_refusal = None;
+    while let Some(arg) = rest.get(index) {
+        if arg == "--" {
+            if !in_resume {
+                return Ok(CodexResumeRoute::Ordinary);
+            }
+            positionals.extend(rest[index + 1..].iter().map(String::as_str));
+            break;
+        }
+        if arg.starts_with('-') && arg != "-" {
+            let (flag, inline) = arg
+                .split_once('=')
+                .map_or((arg.as_str(), None), |(key, value)| (key, Some(value)));
+            if flag == "--last" {
+                last = true;
+                index += 1;
+                continue;
+            }
+            if flag == "-h" || flag == "--help" || flag == "-V" || flag == "--version" {
+                return Ok(CodexResumeRoute::Ordinary);
+            }
+            if [
+                "-p",
+                "--profile",
+                "--remote",
+                "--remote-auth-token-env",
+                "--worktree",
+                "-i",
+                "--image",
+            ]
+            .contains(&flag)
+            {
+                // Consume known option values before classifying the command:
+                // a filename/model/profile named `resume` is not a subcommand.
+                route_refusal = Some("resume routing or variadic option is not admitted");
+                if flag != "--worktree" && inline.is_none() {
+                    index += 1;
+                    if rest.get(index).is_none() {
+                        return if in_resume {
+                            Err(refuse("resume option value missing").into())
+                        } else {
+                            Ok(CodexResumeRoute::Ordinary)
+                        };
+                    }
+                }
+                index += 1;
+                continue;
+            }
+            if value_flags.contains(&flag) {
+                let value = if let Some(value) = inline {
+                    value
+                } else {
+                    index += 1;
+                    let Some(value) = rest.get(index) else {
+                        return if in_resume {
+                            Err(refuse("resume option value missing").into())
+                        } else {
+                            Ok(CodexResumeRoute::Ordinary)
+                        };
+                    };
+                    value.as_str()
+                };
+                if flag == "-c" || flag == "--config" {
+                    let key = value
+                        .split('=')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .trim_matches(['\"', '\'']);
+                    if key == "sqlite_home" || key.starts_with("sqlite_home.") {
+                        route_refusal =
+                            Some("explicit sqlite_home override is not admitted for exact resume");
+                    }
+                }
+                index += 1;
+                continue;
+            }
+            if bool_flags.contains(&flag) && inline.is_none() {
+                index += 1;
+                continue;
+            }
+            route_refusal = Some("unsupported or ambiguous resume option");
+            index += 1;
+            continue;
+        }
+        if !in_resume {
+            if arg == "resume" {
+                in_resume = true;
+            } else if !in_exec && (arg == "exec" || arg == "e") {
+                in_exec = true;
+            } else {
+                return Ok(CodexResumeRoute::Ordinary);
+            }
+        } else {
+            positionals.push(arg.as_str());
+        }
+        index += 1;
+    }
+    if !in_resume {
+        return Ok(CodexResumeRoute::Ordinary);
+    }
+    if let Some(reason) = route_refusal {
+        return Err(refuse(reason).into());
+    }
+    if positionals.len() > 2 {
+        return Err(refuse("ambiguous explicit resume target").into());
+    }
+    if last || positionals.is_empty() {
+        return Ok(CodexResumeRoute::Full);
+    }
+    let target = positionals[0];
+    let is_uuid = target.len() == 36
+        && target.bytes().enumerate().all(|(i, c)| {
+            if [8, 13, 18, 23].contains(&i) {
+                c == b'-'
+            } else {
+                c.is_ascii_hexdigit()
+            }
+        });
+    if !is_uuid {
+        return Err(refuse(
+            "resume name requires native resolution; an exact UUID target is required",
+        )
+        .into());
+    }
+    Ok(CodexResumeRoute::Exact(target))
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("CSQ_CODEX_RESUME_PARTIAL: {reason}; observed visited={visited} (rows in batches that held no rewrite were read, not committed), committed rewritten={rewritten}, databases={databases_completed}, last_write_commit_unknown={in_flight_commit_unknown}. Native Codex was not launched; retry after resolving the bounded repair condition")]
+struct CodexResumePartial {
+    reason: &'static str,
+    visited: usize,
+    rewritten: usize,
+    databases_completed: usize,
+    in_flight_commit_unknown: bool,
+}
+
+/// Launch-repair allowance, DERIVED from csq-core's terms — no measured term:
+///
+/// ```text
+/// CODEX_REPAIR_BUDGET = CODEX_REPAIR_READ_TOLERANCE_MS   (4_000: migration-lock
+///                                                         admission, discovery,
+///                                                         walks, and the first
+///                                                         step's caller-side
+///                                                         allowance)
+///                     + CODEX_REPAIR_STEP_BUDGET_MS       (9_000: one spawned
+///                                                         child's window, itself
+///                                                         derived as SQLite's
+///                                                         ENFORCED
+///                                                         busy_timeout 5_000
+///                                                         + the 4_000 read
+///                                                         tolerance)
+///                     = 13_000 ms
+/// ```
+///
+/// The budget is larger than `SQLITE_BUSY_TIMEOUT_MS` by construction: the flat
+/// four-second allowance this replaces was SMALLER than the one wait every
+/// generated write script enforces on the shared database, so a
+/// contended-but-healthy admission could never complete — its write step was
+/// killed while it was still waiting inside SQLite's own bound.
+///
+/// ENFORCED WORST CASES for one launch (arithmetic over the caps, never a
+/// measurement): a hung child is killed at its own step window, so the first
+/// candidate database's refusal lands at ≤ 13s + 9s = 22s; on the exact route a
+/// slot whose every spawned step progresses but never finishes is bounded by
+/// the discovery cap (labelled arithmetic over the enforced caps):
+/// 1024 × (5 × (9s + 100ms child-cleanup grace) + 4s walk) = 1024 × 49.5s =
+/// 50 688s ≈ 14.1h (every one of those steps must be slower than its window
+/// without hanging, i.e. an adversarial disk rather than a real host); a
+/// healthy host is unchanged (well under one step window). The `-bail` probe
+/// runs inside its step's window and adds no term. NOT BOUNDED:
+/// `resume_candidate`'s `canonicalize` of a database-supplied path is
+/// interrupted by no timer. These deadlines are enforced only while csq lives.
+/// On Unix, every write child inherits the migration lock's descriptor
+/// (`RepairChild::spawn` in csq-core, which refuses a writer when no lock is
+/// held), and `flock` ownership belongs to that shared open file description,
+/// so the lock stays held until the LAST writer exits, whatever ends csq
+/// (including `SIGKILL`): no migration can take the exclusive lock under a
+/// still-running orphaned writer. What ends an orphaned writer is Linux's
+/// `PR_SET_PDEATHSIG`; elsewhere on Unix, the end of its stdin script (an
+/// undelivered remainder ends at EOF and rolls back, while the delivered part
+/// may finish first with the lock held; see `RepairChild` in csq-core). On
+/// Windows each writer is in a kill-on-close Job Object instead. A terminal interrupt is not forwarded to the children
+/// (each runs in its own process group); each write batch is one transaction
+/// that commits or rolls back whole.
+///
+/// The FULL route (`repair_codex_resume_all`) spends this allowance on
+/// discovery (≤ 1024 entries) and the filename index (≤ 20 000 entries) only;
+/// its database walk is bounded by csq-core's own enforced windows, so its
+/// ENFORCED worst case is (arithmetic over the mechanisms, never a measurement)
+/// 13s + Σ over ≤ 1024 databases of [(5 + P + B) × (9s + 100ms child-cleanup
+/// grace) + (P + B) × 4s]. P ≤ R + 1 page reads and B ≤ R flushed write batches
+/// (each spawns at most one child); the 4s terms are the walk window armed
+/// after each page read and re-armed after each acknowledged batch (each
+/// max(remaining window, 4s)). R is bounded by the distinct rowids at or below
+/// the highwater read before paging that the walk observes (strictly
+/// increasing cursor, `rowid<=highwater` page filter), NOT a captured count.
+/// It scales with the rows rather than a flat cap, which is what lets a
+/// slow-but-healthy host finish a large table (see `repair_resume_all_before`).
+/// NOT BOUNDED: one row's filesystem admission (`canonicalize` of a
+/// database-supplied path in `indexed_resume_candidate`) is interrupted by no
+/// timer, so a hung mount can stall the launch.
+///
+/// The launch-latency COST is the middle number: `csq resume` against a hung
+/// slot now refuses after ~22s instead of at 4s. It is bought so that a
+/// HEALTHY step is never killed inside the enforced wait its own script
+/// performs, and A2's distinct refusal makes that latency legible
+/// ([`CodexResumeAdmissionBusy`], whose hint is to retry — never to repair a
+/// transcript).
+///
+/// The budget starts only AFTER `acquire_codex_share_lock_shared` returns: that
+/// acquire waits up to ~2s for a live migration, and charging that wait would
+/// cut this allowance on exactly the hosts already under load.
+const CODEX_REPAIR_BUDGET: std::time::Duration = std::time::Duration::from_millis(
+    csq_core::session::shared_state::codex_sqlite::CODEX_REPAIR_READ_TOLERANCE_MS
+        + csq_core::session::shared_state::codex_sqlite::CODEX_REPAIR_STEP_BUDGET_MS,
+);
+
+fn codex_repair_deadline() -> std::time::Instant {
+    #[cfg(test)]
+    if let Some(budget) = TEST_ADMISSION_BUDGET.with(|cell| cell.get()) {
+        return std::time::Instant::now() + budget;
+    }
+    std::time::Instant::now() + CODEX_REPAIR_BUDGET
+}
+
+fn repair_codex_resume_all(base_dir: &Path, sqlite_home: &Path) -> Result<()> {
+    use csq_core::session::shared_state::codex_sqlite::{
+        repair_resume_all_before, PagedResumeOutcome, PagedResumeProgress,
+    };
+    let partial = |reason| CodexResumePartial {
+        reason,
+        visited: 0,
+        rewritten: 0,
+        databases_completed: 0,
+        in_flight_commit_unknown: false,
+    };
+    // The allowance covers discovery and the filename index; every database's
+    // walk is then bounded by csq-core's per-step and per-page windows (see
+    // `CODEX_REPAIR_BUDGET`). It starts AFTER the shared migration lock is
+    // admitted, so waiting for a live migration to finish is not charged to the
+    // repair's own work budget. The
+    // instants are sampled only in test builds, where the ordering seam asserts
+    // this route as well as the exact one.
+    #[cfg(test)]
+    let route_entry_at = std::time::Instant::now();
+    let guard = csq_core::session::shared_state::acquire_codex_share_lock_shared(base_dir)
+        .map_err(|_| partial("migration guard unavailable"))?;
+    #[cfg(test)]
+    let (lock_admitted_at, budget_started_at) =
+        (std::time::Instant::now(), std::time::Instant::now());
+    #[cfg(test)]
+    record_test_admission_budget_order(route_entry_at, lock_admitted_at, budget_started_at);
+    let deadline = codex_repair_deadline();
+    let mut roots = Vec::new();
+    match std::fs::canonicalize(sqlite_home.join("codex-sessions")) {
+        Ok(root) => roots.push(root),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(partial("persistent slot transcript root unreadable").into()),
+    }
+    roots.push(base_dir.join("shared-state/codex/codex-sessions"));
+    let entries = std::fs::read_dir(sqlite_home)
+        .map_err(|_| partial("persistent state directory unreadable"))?;
+    let mut databases = Vec::new();
+    for (count, entry) in entries.enumerate() {
+        if count >= 1024 || std::time::Instant::now() >= deadline {
+            return Err(partial("persistent state discovery incomplete within budget").into());
+        }
+        let entry = entry.map_err(|_| partial("persistent state entry unreadable"))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name
+            .strip_prefix("state_")
+            .and_then(|name| name.strip_suffix(".sqlite"))
+            .is_some_and(|schema| !schema.is_empty() && schema.bytes().all(|c| c.is_ascii_digit()))
+        {
+            databases.push(entry.path());
+        }
+    }
+    databases.sort();
+    match repair_resume_all_before(&guard, base_dir, &databases, &roots, deadline) {
+        PagedResumeOutcome::Complete(_) => Ok(()),
+        PagedResumeOutcome::Partial { progress, reason } => {
+            let PagedResumeProgress {
+                visited,
+                rewritten,
+                databases_completed,
+                in_flight_commit_unknown,
+            } = progress;
+            Err(CodexResumePartial {
+                reason,
+                visited,
+                rewritten,
+                databases_completed,
+                in_flight_commit_unknown,
+            }
+            .into())
+        }
+    }
+}
+
+fn repair_codex_resume_target(base_dir: &Path, sqlite_home: &Path, target: &str) -> Result<()> {
+    use csq_core::session::shared_state::codex_sqlite::repair_resume_target_before;
+    let refuse = |reason| CodexResumeRefused { reason };
+    let busy = |reason| CodexResumeAdmissionBusy { reason };
+    // The budget starts AFTER the lock is admitted (see `CODEX_REPAIR_BUDGET`):
+    // the acquire can wait ~2s for a live migration, and that wait is not work
+    // this route may spend its own tolerance on. The instants are sampled only
+    // in test builds, where the ordering seam asserts this.
+    #[cfg(test)]
+    let route_entry_at = std::time::Instant::now();
+    let guard = csq_core::session::shared_state::acquire_codex_share_lock_shared(base_dir)
+        .map_err(|_| refuse("migration guard unavailable"))?;
+    #[cfg(test)]
+    let (lock_admitted_at, budget_started_at) =
+        (std::time::Instant::now(), std::time::Instant::now());
+    #[cfg(test)]
+    record_test_admission_budget_order(route_entry_at, lock_admitted_at, budget_started_at);
+    let deadline = codex_repair_deadline();
+    let mut roots = Vec::new();
+    match std::fs::canonicalize(sqlite_home.join("codex-sessions")) {
+        Ok(root) => roots.push(root),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(refuse("persistent slot transcript root unreadable").into()),
+    }
+    roots.push(base_dir.join("shared-state/codex/codex-sessions"));
+    let entries = std::fs::read_dir(sqlite_home)
+        .map_err(|_| refuse("persistent state directory unreadable"))?;
+    // Discovery alone runs under the initial allowance: it is filesystem-only
+    // (read_dir plus the name filter), so no repair can consume it. Each
+    // candidate database is then admitted separately, and its repair reseeds
+    // every spawned step's window (csq-core's `CODEX_REPAIR_STEP_BUDGET`
+    // through `step_budget`), so one database's slow-but-complete repair can
+    // never expire the admission of the next one. Measured: a host whose
+    // `sqlite3` children each cost ~1s (the host's stage disk) otherwise
+    // refused the launch on the entry AFTER the repaired database, although
+    // every step had completed within its bound. The same shape as
+    // `repair_codex_resume_all` here plus csq-core's per-database budget in
+    // `repair_resume_all_before`.
+    let mut databases = Vec::new();
+    for (count, entry) in entries.enumerate() {
+        if count >= 1024 {
+            return Err(refuse("target admission state directory exceeded its entry cap").into());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(busy(ADMISSION_DEADLINE_REASON).into());
+        }
+        let entry = entry.map_err(|_| refuse("state directory entry unreadable"))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let schema = name
+            .strip_prefix("state_")
+            .and_then(|v| v.strip_suffix(".sqlite"));
+        if !schema.is_some_and(|v| !v.is_empty() && v.bytes().all(|c| c.is_ascii_digit())) {
+            continue;
+        }
+        databases.push(entry.path());
+    }
+    databases.sort();
+    let mut found = false;
+    for database in &databases {
+        match repair_resume_target_before(&guard, base_dir, database, &roots, target, deadline) {
+            Ok(0) => {}
+            Ok(_) => found = true,
+            // A starved host spent the bounded budget; it did NOT fail to admit
+            // the target. Refuse with the retryable class (and its own recovery
+            // hint) instead of the unadmittable one, whose hint would send the
+            // operator to repair a transcript nothing is wrong with.
+            Err(e)
+                if csq_core::session::shared_state::codex_sqlite::is_bounded_deadline_refusal(
+                    &e,
+                ) =>
+            {
+                return Err(busy(ADMISSION_DEADLINE_REASON).into())
+            }
+            Err(_) => {
+                return Err(
+                    refuse("target database or transcript could not be safely admitted").into(),
+                )
+            }
+        }
+    }
+    if !found {
+        return Err(refuse("exact thread target not found in persistent state").into());
+    }
+    Ok(())
 }
 
 /// Keep authentication and governance in the terminal handle, but put SQLite
@@ -3017,6 +4278,7 @@ pub(crate) fn validate_codex_relaunch_target(
     debug: bool,
     coc_cache_enabled: bool,
 ) -> Result<AccountNum> {
+    let _ = provider_session_policy::check_unknown_launch(base_dir)?;
     // S-L1: the SAME enterprise license gate `csq run`'s own `handle`
     // enforces before doing anything else (task #77 shard 3) — a relaunch
     // is a fresh dispatch onto a (possibly different) account and must be
@@ -3250,7 +4512,7 @@ pub(crate) fn make_validate_relaunch(
 /// future Bedrock launcher reusing the same shape), factor both
 /// bodies into csq-core. Both sites must be edited together — AND the
 /// factored spawn path MUST carry the an internal ticket headless-OAuth guard
-/// (`gemini_invocation_is_headless` → `oauth_login::check_headless_oauth_ready`)
+/// (`gemini_invocation_is_headless` → `oauth_login::check_headless_oauth_ready_for_process`)
 /// so a future desktop/Bedrock caller cannot silently regress the "no
 /// interactive prompt on a headless run" contract. The guard is structurally
 /// required, not caller-optional.
@@ -3269,6 +4531,9 @@ fn launch_gemini(
     audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
 ) -> Result<()> {
     use csq_core::platform::secret;
+    provider_session_policy::emit_warning(provider_session_policy::check_unknown_launch_with_args(
+        base_dir, rest,
+    )?);
     use csq_core::providers::gemini::spawn::{
         build_spawn_plan_with_system_instruction, execute_plan_as_child,
         execute_plan_as_child_piped, spawn_gemini,
@@ -3400,17 +4665,17 @@ fn launch_gemini(
         let binding = provisioning::read_binding(base_dir, account)
             .with_context(|| format!("read Gemini binding for slot {account}"))?;
         if matches!(binding.auth, AuthMode::CodeAssistOAuth) {
-            let home = std::env::var_os("HOME")
-                .filter(|h| !h.is_empty())
-                .map(std::path::PathBuf::from);
             // Path-redaction: two OauthLoginError variants (Malformed/Unreadable)
             // embed the absolute `~/.gemini/oauth_creds.json` path in their
             // Display, which would leak $HOME/username to operator stderr — and
             // `csq run` is NOT operator-surface-exempt (operator-surface-verification.md
             // Rule 5). All four failure variants share one remediation, so emit a
             // fixed, path-free message instead of interpolating the raw error.
-            csq_core::providers::gemini::oauth_login::check_headless_oauth_ready(
-                home.as_deref(),
+            // The home is resolved by `platform::home::home_dir` (inside
+            // `check_headless_oauth_ready_for_process`), the SAME resolver the OAuth
+            // writer and the usage poller use: on Windows `HOME` is usually unset and
+            // the profile directory is the real one.
+            csq_core::providers::gemini::oauth_login::check_headless_oauth_ready_for_process(
                 account,
             )
             .map_err(|_e| {
@@ -3429,7 +4694,11 @@ fn launch_gemini(
     // ~/.claude/accounts/credentials/, and the per-spawn settings
     // file lives in the handle dir.
     let accounts_root = claude_home.join("accounts");
-    std::fs::create_dir_all(&accounts_root).context("failed to create accounts root")?;
+    // SEC-2.15 (unified, R1 M1): create AND secure the accounts root
+    // fail-closed via the shared helper (was create_dir_all at the
+    // process umask).
+    csq_core::platform::fs::ensure_private_dir_root(&accounts_root)
+        .map_err(|e| anyhow::anyhow!("accounts_root_refused: {e}"))?;
 
     // Minimal handle dir: just the directory + .csq-account marker.
     // The settings drift reassertion (called inside
@@ -3454,6 +4723,9 @@ fn launch_gemini(
     }
 
     let handle_dir_abs = std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
+    // Gemini's spawn env is a fixed allowlist, so the decision enters it explicitly through
+    // `SpawnPlan::with_messaging_decision`.
+    let messaging_on = record_launch_decision(&handle_dir_abs);
 
     // Open the platform-native vault. Failures here are
     // user-actionable (locked keychain, missing libsecret) — surface
@@ -3516,6 +4788,7 @@ fn launch_gemini(
                 account,
                 rest.to_vec(),
                 vault.as_ref(),
+                messaging_on,
             ) {
                 Ok(_never) => unreachable!("spawn_gemini returns Infallible on success"),
                 Err(e) => {
@@ -3549,7 +4822,9 @@ fn launch_gemini(
             // per round-3 R3-H1).
             let parent_env: std::collections::HashMap<String, String> = std::env::vars().collect();
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            // The shared home resolver (`HOME` is usually unset on Windows), the same one
+            // the gemini OAuth writer, the usage poller and the headless check use.
+            let home = csq_core::platform::home::home_dir();
             // Fix A (native-delegation gate): suppress the flattened `.coc/`
             // scaffold when the target's native `.gemini/` / `GEMINI.md` are
             // present — gemini-cli loads its own artifacts, so injecting the
@@ -3639,7 +4914,7 @@ fn launch_gemini(
                 rest.to_vec(),
                 system_instruction,
             ) {
-                Ok(p) => p,
+                Ok(p) => p.with_messaging_decision(messaging_on),
                 Err(e) => {
                     let _ = std::fs::remove_dir_all(&handle_dir);
                     return Err(map_spawn_error(account, e));
@@ -3931,6 +5206,9 @@ fn launch_native(
     audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
 ) -> Result<()> {
     use csq_core::providers::native;
+    provider_session_policy::emit_warning(provider_session_policy::check_unknown_launch_with_args(
+        base_dir, rest,
+    )?);
 
     let descriptor = native::descriptor(surface)
         .ok_or_else(|| anyhow!("internal error: {surface} is not a native-CLI surface"))?;
@@ -3995,10 +5273,13 @@ fn launch_native(
     // Minimal handle dir: just the directory + .csq-account marker. No
     // config-N/, no per-spawn settings/config file — native CLIs run
     // directly in the caller's cwd with no csq-managed home to redirect.
-    std::fs::create_dir_all(base_dir).context("failed to create accounts root")?;
+    // R2 M3: both dirs route through the shared SEC-2.15 helper — the
+    // accounts root resolves a leaf symlink (operator external-drive
+    // setup), the handle dir below it is strict (0o700 at creation).
+    csq_core::platform::fs::ensure_private_dir_root(base_dir).context("accounts_root_refused")?;
     let pid = std::process::id();
     let handle_dir = base_dir.join(format!("term-{}", pid));
-    std::fs::create_dir_all(&handle_dir).with_context(|| {
+    csq_core::platform::fs::ensure_private_dir(&handle_dir).with_context(|| {
         format!(
             "failed to create {} handle dir at {}",
             descriptor.display_name,
@@ -4017,6 +5298,8 @@ fn launch_native(
             descriptor.display_name
         ));
     }
+
+    let messaging_on = record_launch_decision(&handle_dir);
 
     println!(
         "Launching {} for account {} (term-{})...",
@@ -4072,6 +5355,7 @@ fn launch_native(
         })?;
 
     let mut cmd = Command::new(&binary_path);
+    set_decision_env(&mut cmd, messaging_on);
     // Scrub csq-session-dir env so the native CLI never accidentally
     // resolves a stale csq-managed config dir from the parent shell
     // (mirrors launch_codex's identical CLAUDE_CONFIG_DIR scrub posture).
@@ -4098,7 +5382,7 @@ fn launch_native(
         // surface's Inherit/no-layer classification.
         audit_emitter.set_result(ResultState::Degraded, Decision::Bypass);
     }
-    exec_or_spawn(cmd, &handle_dir, audit_emitter)
+    exec_or_spawn(cmd, &handle_dir, audit_emitter, false)
 }
 
 /// Sets the vendor-isolation env var for a native-CLI spawn (`csq run` on a
@@ -5286,6 +6570,7 @@ fn spawn_one_shot_with_post_validate(
             return Err(anyhow!("failed to launch claude: {e}"));
         }
     };
+    let lifecycle = csq_core::sessions::lifecycle::capture_child(handle_dir, &child);
     let child_pid = child.id();
     if let Err(e) = markers::write_live_cc_pid(&handle_dir_abs, child_pid) {
         eprintln!("warning: could not record CC child PID: {e}");
@@ -5298,6 +6583,8 @@ fn spawn_one_shot_with_post_validate(
             return Err(anyhow!("failed to wait for claude: {e}"));
         }
     };
+
+    csq_core::sessions::lifecycle::waited(lifecycle.as_ref(), &output.status);
 
     // The child FAILED and produced no stdout — surface ITS error, do not
     // post-validate.
@@ -5454,11 +6741,15 @@ fn spawn_interactive_inherited(
             return Err(anyhow!("failed to launch claude: {e}"));
         }
     };
+    let lifecycle = csq_core::sessions::lifecycle::capture_child(handle_dir, &child);
     let child_pid = child.id();
     if let Err(e) = markers::write_live_cc_pid(&handle_dir_abs, child_pid) {
         eprintln!("warning: could not record CC child PID: {e}");
     }
     let status = child.wait();
+    if let Ok(status) = &status {
+        csq_core::sessions::lifecycle::waited(lifecycle.as_ref(), status);
+    }
     let _ = std::fs::remove_dir_all(handle_dir);
     match status {
         Ok(s) if !s.success() => {
@@ -5520,6 +6811,7 @@ fn exec_or_spawn(
     mut cmd: Command,
     handle_dir: &Path,
     audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+    managed_claude: bool,
 ) -> Result<()> {
     #[cfg(unix)]
     {
@@ -5534,7 +6826,11 @@ fn exec_or_spawn(
         let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         audit_emitter.set_end_ts(end_ts);
         fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+        let lifecycle = managed_claude
+            .then(|| csq_core::sessions::lifecycle::prepare_exec(handle_dir))
+            .flatten();
         let err = cmd.exec();
+        csq_core::sessions::lifecycle::cancel_exec(lifecycle.as_ref());
         let _ = std::fs::remove_dir_all(handle_dir);
         Err(anyhow!("exec failed: {err}"))
     }
@@ -5560,11 +6856,17 @@ fn exec_or_spawn(
                 return Err(anyhow!("failed to launch claude: {e}"));
             }
         };
+        let lifecycle = managed_claude
+            .then(|| csq_core::sessions::lifecycle::capture_child(handle_dir, &child))
+            .flatten();
         let child_pid = child.id();
         if let Err(e) = markers::write_live_cc_pid(&handle_dir_abs, child_pid) {
             eprintln!("warning: could not record CC child PID: {e}");
         }
         let status = child.wait();
+        if let Ok(status) = &status {
+            csq_core::sessions::lifecycle::waited(lifecycle.as_ref(), status);
+        }
         let _ = std::fs::remove_dir_all(handle_dir);
         // Capture end_ts AFTER wait — this is the true child-exit time.
         // Flush BEFORE `process::exit` on non-zero status (process::exit
@@ -5676,11 +6978,8 @@ fn run_env_preflight(claude_home: &Path) {
     eprintln!();
 }
 
-fn exec_claude(rest: &[String]) -> Result<()> {
-    let mut cmd = Command::new("claude");
-    // Always strip sensitive env vars, even on the vanilla path.
-    strip_sensitive_env(&mut cmd);
-    cmd.args(rest);
+fn exec_claude(base_dir: &Path, claude_home: &Path, rest: &[String]) -> Result<()> {
+    let mut cmd = build_vanilla_claude_command(base_dir, claude_home, rest)?;
 
     #[cfg(unix)]
     {
@@ -6030,6 +7329,7 @@ fn write_bench_jsonl(
 
 #[cfg(test)]
 mod tests {
+    include!("ruletrim_override_tests.rs");
     use super::*;
     use tempfile::TempDir;
 
@@ -7145,6 +8445,1285 @@ mod tests {
         );
     }
 
+    /// R9 end-to-end through the launch builder: a state DB whose thread row
+    /// records a reaped `term-<pid>` rollout path is repaired by
+    /// `codex_command` (which every codex launch and swap-exec goes through).
+    #[test]
+    fn codex_command_repairs_reaped_handle_rollout_path() {
+        let _env = csq_core::platform::test_env::lock();
+        let Ok(sqlite3) = csq_core::session::shared_state::codex_sqlite::resolve_sqlite3() else {
+            return; // no sqlite3 on this host: nothing to repair with
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let cfg = codex_surface::config_toml_path(&base, acc(12));
+        let slot_dir = cfg.parent().unwrap().to_path_buf();
+        let rollout = slot_dir.join("codex-sessions/2026/10/06/rollout-a.jsonl");
+        std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        std::fs::write(&rollout, b"T").unwrap();
+        let dead = base.join("term-2776/sessions/2026/10/06/rollout-a.jsonl");
+        let db = slot_dir.join("state_5.sqlite");
+        let run = |sql: &str| {
+            let out = std::process::Command::new(&sqlite3)
+                .arg(&db)
+                .arg(sql)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        run("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT);");
+        run(&format!(
+            "INSERT INTO threads VALUES ('11111111-1111-4111-8111-111111111111', '{}');",
+            dead.display()
+        ));
+        build_codex_exec_command(
+            &base,
+            acc(12),
+            &base.join("term-1"),
+            &[
+                "resume".into(),
+                "11111111-1111-4111-8111-111111111111".into(),
+                "--sandbox".into(),
+                "read-only".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            run(
+                "SELECT rollout_path FROM threads WHERE id='11111111-1111-4111-8111-111111111111';"
+            )
+            .trim(),
+            rollout.display().to_string()
+        );
+    }
+
+    /// A healthy host whose `sqlite3` children are each slow — the exact
+    /// the host stage-disk shape, reproduced with a 1s wrapper instead of
+    /// depending on the host — must still admit the target. Every spawned step
+    /// runs under csq-core's per-step budget, and the slot's SECOND directory
+    /// entry (`codex-sessions/` beside `state_5.sqlite`) is checked under the
+    /// allowance advanced by the slow-but-progressing repair, not a flat 4s
+    /// launch allowance that the repair alone consumes. Pre-fix this row
+    /// refused after the repair had already succeeded, with
+    /// "target admission exceeded its bounded budget".
+    #[cfg(unix)]
+    #[test]
+    fn codex_command_admits_target_when_sqlite_children_are_slow() {
+        let _env = csq_core::platform::test_env::lock();
+        // Resolve the real binary with the override removed: the wrapper below
+        // must wrap IT, and the repair must reach it through the wrapper.
+        let saved = std::env::var_os("CSQ_SQLITE3");
+        // SAFETY: still under test_env::lock.
+        unsafe {
+            std::env::remove_var("CSQ_SQLITE3");
+        }
+        let Ok(real) = csq_core::session::shared_state::codex_sqlite::resolve_sqlite3() else {
+            // SAFETY: restore prior value under the lock.
+            unsafe {
+                match saved {
+                    Some(saved) => std::env::set_var("CSQ_SQLITE3", saved),
+                    None => std::env::remove_var("CSQ_SQLITE3"),
+                }
+            }
+            return; // no sqlite3 on this host: nothing to repair with
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let wrapper = base.join("slow-sqlite3");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\n/bin/sleep 1\nexec '{}' \"$@\"\n",
+                real.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg = codex_surface::config_toml_path(&base, acc(12));
+        let slot_dir = cfg.parent().unwrap().to_path_buf();
+        let rollout = slot_dir.join("codex-sessions/2026/10/06/rollout-a.jsonl");
+        std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        std::fs::write(&rollout, b"T").unwrap();
+        let dead = base.join("term-2776/sessions/2026/10/06/rollout-a.jsonl");
+        let db = slot_dir.join("state_5.sqlite");
+        let run = |sql: &str| {
+            let out = std::process::Command::new(&real)
+                .arg(&db)
+                .arg(sql)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        run("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT);");
+        run(&format!(
+            "INSERT INTO threads VALUES ('11111111-1111-4111-8111-111111111111', '{}');",
+            dead.display()
+        ));
+        // SAFETY: still under test_env::lock; restored before the asserts.
+        unsafe {
+            std::env::set_var("CSQ_SQLITE3", &wrapper);
+        }
+        let launched = build_codex_exec_command(
+            &base,
+            acc(12),
+            &base.join("term-1"),
+            &[
+                "resume".into(),
+                "11111111-1111-4111-8111-111111111111".into(),
+                "--sandbox".into(),
+                "read-only".into(),
+            ],
+        );
+        // SAFETY: restore prior value under the lock.
+        unsafe {
+            match saved {
+                Some(saved) => std::env::set_var("CSQ_SQLITE3", saved),
+                None => std::env::remove_var("CSQ_SQLITE3"),
+            }
+        }
+        launched.unwrap();
+        assert_eq!(
+            run(
+                "SELECT rollout_path FROM threads WHERE id='11111111-1111-4111-8111-111111111111';"
+            )
+            .trim(),
+            rollout.display().to_string()
+        );
+    }
+
+    /// Private real SQLite/FS launch fixtures; no native account/session state.
+    #[cfg(unix)]
+    struct R9LaunchRepairFixture {
+        _temp: TempDir,
+        base: PathBuf,
+        slot: PathBuf,
+        db: PathBuf,
+        dead: PathBuf,
+        candidate: PathBuf,
+        sqlite3: PathBuf,
+        fixture_home: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl R9LaunchRepairFixture {
+        fn new() -> Self {
+            // Every row built on this fixture gets the named generous admission
+            // budget: a positive row must never be decided by the enclosing
+            // repair clock on a loaded host. A row that deliberately exercises a
+            // deadline MUST clear it with `set_test_admission_budget(None)`
+            // (production's 13 s) before launching: csq-core's `step_budget`
+            // returns `deadline.max(now + CODEX_REPAIR_STEP_BUDGET)`, so a
+            // generous caller budget also WIDENS the step window, and a child
+            // sized to outrun 9 s would complete instead of being killed. The
+            // opt-outs are the two 10 s starved rows and r9p_full_route_child_
+            // overrunning_its_step_window_still_refuses. The production
+            // derivation is pinned separately by
+            // r9_admission_budget_covers_the_enforced_busy_timeout.
+            set_test_admission_budget(Some(R9_POSITIVE_ADMISSION_BUDGET));
+            let temp = TempDir::new().unwrap();
+            let base = temp.path().canonicalize().unwrap();
+            let slot = base.join("config-12");
+            let db = slot.join("state_5.sqlite");
+            let tail = "2026/10/06/rollout-launch-r9.jsonl";
+            let dead = base.join("term-2776/sessions").join(tail);
+            let candidate = base.join("shared-state/codex/codex-sessions").join(tail);
+            let fixture_home = base.join("fixture-home");
+            std::fs::create_dir_all(&slot).unwrap();
+            std::fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+            std::fs::create_dir(&fixture_home).unwrap();
+            std::fs::write(&candidate, b"private rollout fixture").unwrap();
+            let sqlite3 = csq_core::session::shared_state::codex_sqlite::resolve_sqlite3()
+                .expect("R9 launch fixtures require actual sqlite3; missing binary is not a pass");
+            let fixture = Self {
+                _temp: temp,
+                base,
+                slot,
+                db,
+                dead,
+                candidate,
+                sqlite3,
+                fixture_home,
+            };
+            fixture.sql("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT);");
+            fixture.sql(&format!(
+                "INSERT INTO threads VALUES ('99999999-9999-4999-8999-999999999999', '{}');",
+                fixture.dead.to_str().unwrap().replace('\'', "''")
+            ));
+            fixture
+        }
+
+        fn sql(&self, sql: &str) -> String {
+            let out = std::process::Command::new(&self.sqlite3)
+                .env_clear()
+                .env("HOME", &self.fixture_home)
+                .current_dir(&self.base)
+                .arg("-init")
+                .arg("/dev/null")
+                .arg(&self.db)
+                // `synchronous=OFF`: fixture-only durability, so these writes
+                // do not depend on the host's fsync latency (the host's stage
+                // disk costs ~1s per commit; same posture as the csq-core
+                // `r9_fixture_sql` the 2026-10-13 fixture fix gave).
+                .arg(format!(
+                    "PRAGMA trusted_schema=OFF;\nPRAGMA synchronous=OFF;\n{sql}"
+                ))
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "private SQLite fixture failed: {out:?}"
+            );
+            String::from_utf8(out.stdout).unwrap()
+        }
+
+        fn rollout(&self) -> String {
+            self.sql(
+                "SELECT rollout_path FROM threads WHERE id='99999999-9999-4999-8999-999999999999';",
+            )
+            .trim()
+            .to_owned()
+        }
+
+        fn launch(&self) -> Result<Command> {
+            build_codex_exec_command_with(
+                &self.base,
+                acc(12),
+                &self.base.join("term-1"),
+                &[
+                    "resume".into(),
+                    "99999999-9999-4999-8999-999999999999".into(),
+                    "--sandbox".into(),
+                    "read-only".into(),
+                ],
+                None,
+                Some(false),
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    fn r9_delayed_sqlite_wrapper(base: &Path, delay_ms: u64, real_sqlite3: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        // TempDir permissions follow umask on this Darwin; pin this owned root.
+        std::fs::set_permissions(base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // `<ms>\n<absolute sqlite3 path>` in `fixture-exec` is the stub's own
+        // spec: sleep the recorded milliseconds, then become the real sqlite3
+        // with the runner's argv.
+        std::fs::write(
+            base.join("fixture-exec"),
+            format!("{delay_ms}\n{}", real_sqlite3.display()),
+        )
+        .unwrap();
+        std::fs::write(base.join("fixture-mode"), "delayed").unwrap();
+        let wrapper = base.join("r9-sqlite-fixture");
+        std::os::unix::fs::symlink(r9_stub_cli_binary(), &wrapper).unwrap();
+        wrapper
+    }
+
+    /// Resolve the `stub-cli` fixture binary beside the test executable,
+    /// building it on demand when the active target profile has never seen an
+    /// explicit `cargo build`.
+    ///
+    /// `stub-cli` is declared `test = false` in `csq-core/Cargo.toml`, so NO
+    /// `cargo test` invocation builds it; a run against a fresh target dir
+    /// holds no binary and the fixture test dies on the availability assert
+    /// instead of testing admission. Build it once per test process into this
+    /// very profile instead of depending on prior build history in a shared
+    /// target directory (same helper as the csq-core R9 fixtures).
+    #[cfg(unix)]
+    fn r9_stub_cli_binary() -> &'static Path {
+        static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        BINARY
+            .get_or_init(|| {
+                let executable = std::env::current_exe().unwrap();
+                let executable_dir = executable.parent().unwrap();
+                let profile = if executable_dir
+                    .file_name()
+                    .is_some_and(|name| name == "deps")
+                {
+                    executable_dir.parent().unwrap()
+                } else {
+                    executable_dir
+                };
+                let binary = profile.join("stub-cli");
+                // Always ask cargo: an existing binary may predate this source.
+                // An up-to-date build is a no-op.
+                let target_dir = profile.parent().expect("cargo target dir above profile");
+                let mut command = std::process::Command::new(
+                    std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()),
+                );
+                command
+                    .args(["build", "-p", "csq-core", "--bin", "stub-cli"])
+                    // A runtime path, so it must resolve at RUN time: the
+                    // compile-time dir would read the BUILD tree from a stale
+                    // target artifact (runtime-manifest-dir gate).
+                    .current_dir(csq_core::testing::manifest_dir(env!("CARGO_MANIFEST_DIR")))
+                    .env("CARGO_TARGET_DIR", target_dir);
+                match profile.file_name().and_then(|name| name.to_str()) {
+                    Some("release") => {
+                        command.arg("--release");
+                    }
+                    Some("debug") | None => {}
+                    Some(other) => {
+                        command.args(["--profile", other]);
+                    }
+                }
+                let output = command
+                    .output()
+                    .expect("run cargo build for the stub-cli fixture");
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    output.status.success() && binary.is_file(),
+                    "R9 native fixture requires cargo build -p csq-core --bin stub-cli \
+                     (status {:?}; stderr: {stderr})",
+                    output.status,
+                );
+                binary
+            })
+            .as_path()
+    }
+
+    /// A sqlite3 that is slower than the whole admission budget must refuse as
+    /// the RETRYABLE deadline class — never as "could not be safely admitted",
+    /// whose recovery hint sends the operator to repair a transcript nothing is
+    /// wrong with.
+    ///
+    /// The instrument is ordering-based, not elapsed-based: the child starts
+    /// 10s late, past every window this route can grant it, and the runner
+    /// takes its deadline branch BEFORE any completion check — so the refusal
+    /// class never depends on host speed or load.
+    ///
+    /// Falsifying result pre-fix: the deadline-class inner is discarded by the
+    /// `Err(_)` arm and the message carries "could not be safely admitted".
+    #[cfg(unix)]
+    #[test]
+    fn r9_exact_resume_starved_sqlite_child_refuses_as_the_retryable_deadline_class() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        // Deliberate-deadline row: production's budget, so the 10 s child
+        // outruns the 9 s per-step window (a generous budget would widen it).
+        set_test_admission_budget(None);
+        let temp = tempfile::Builder::new()
+            .prefix("cr-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let wrapper_base = temp.path().canonicalize().unwrap();
+        // 10s: past every window this route grants — the merged per-step
+        // window (CODEX_REPAIR_STEP_BUDGET_MS, 9s) and the pre-merge flat 4s —
+        // so the child is always killed at a window, on any host speed.
+        let wrapper = r9_delayed_sqlite_wrapper(&wrapper_base, 10_000, &f.sqlite3);
+        let before = std::fs::read(&f.db).unwrap();
+        let prior_sqlite3 = std::env::var_os("CSQ_SQLITE3");
+        // SAFETY: under test_env::lock, so no other test thread reads these.
+        unsafe {
+            std::env::set_var("CSQ_SQLITE3", &wrapper);
+        }
+        let launched = f.launch();
+        // SAFETY: restore prior value under the lock.
+        unsafe {
+            match prior_sqlite3 {
+                Some(value) => std::env::set_var("CSQ_SQLITE3", value),
+                None => std::env::remove_var("CSQ_SQLITE3"),
+            }
+        }
+        let error = launched.unwrap_err();
+        let message = error.to_string();
+        eprintln!("R9 starved exact admission refusal: {message}");
+        assert!(message.contains("CSQ_CODEX_RESUME_TARGET"));
+        assert!(
+            message.contains("bounded admission deadline expired"),
+            "a starved host must refuse as the retryable deadline class: {message}"
+        );
+        assert!(
+            !message.contains("could not be safely admitted"),
+            "a starved host was refused as an unadmittable transcript: {message}"
+        );
+        assert_eq!(
+            f.rollout(),
+            f.dead.to_str().unwrap(),
+            "a refused admission must leave the recorded path untouched"
+        );
+        assert_eq!(std::fs::read(&f.db).unwrap(), before);
+    }
+
+    /// The admission work budget must start only AFTER the shared migration
+    /// lock is admitted: that acquire can wait ~2s for a live migration, and
+    /// charging it would cut the admission's own tolerance by half on exactly
+    /// the hosts already under load.
+    ///
+    /// Ordering-based: the lock is held EXCLUSIVE for 1.5s (inside the
+    /// acquire's ~2s bound) so the wait is real, and the seam's three instants
+    /// then show whether the budget clock was created before or after it — no
+    /// assertion depends on how long the work itself took.
+    ///
+    /// Falsifying result pre-fix: `budget_started_at` is sampled on entry, so
+    /// it precedes `lock_admitted_at` by the whole ~1.5s wait.
+    #[cfg(unix)]
+    #[test]
+    fn r9_exact_admission_budget_starts_after_the_share_lock_is_admitted() {
+        let _env = csq_core::platform::test_env::lock();
+        use std::os::fd::AsRawFd;
+        let f = R9LaunchRepairFixture::new();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(f.base.join("shared-state/codex/.share.lock"))
+            .unwrap();
+        // SAFETY: lock owns a live descriptor; flock changes only this private
+        // fixture's advisory lock and never touches any account namespace.
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1_500));
+            drop(lock);
+        });
+        let _ = take_test_admission_budget_order();
+        let launched = f.launch();
+        release.join().unwrap();
+        let order = take_test_admission_budget_order()
+            .expect("the exact route must record its admission ordering");
+        eprintln!(
+            "R9 admission ordering: entry {:?}, lock admitted {:?}, budget started {:?}",
+            order.route_entry_at, order.lock_admitted_at, order.budget_started_at
+        );
+        let waited = order
+            .lock_admitted_at
+            .saturating_duration_since(order.route_entry_at);
+        assert!(
+            waited >= std::time::Duration::from_millis(1_000),
+            "the migration lock must have been genuinely contended for this \
+             assertion to discriminate (waited {waited:?})"
+        );
+        assert!(launched.is_ok(), "{launched:?}");
+        assert!(
+            order.budget_started_at >= order.lock_admitted_at,
+            "the admission work budget started before the shared migration lock \
+             was admitted"
+        );
+    }
+
+    /// The fifth red row's entry point: `build_codex_exec_command` (the
+    /// pre-messaging wrapper whose `.unwrap()` in
+    /// `codex_command_repairs_reaped_handle_rollout_path` panics with
+    /// `CSQ_CODEX_RESUME_TARGET: ... could not be safely admitted`) reaches the
+    /// SAME `repair_codex_resume_target` admission as the `_with` wrapper — the
+    /// route is `build_codex_exec_command` -> `_with` ->
+    /// `CodexResumeRoute::Exact` -> `repair_codex_resume_target`, and there is no
+    /// second refusal site — so a starved host must render the DISTINCT
+    /// retryable refusal here too.
+    ///
+    /// Falsifying result pre-fix: this entry point renders the unadmittable
+    /// string the row panics with, which the assertion below refuses.
+    #[cfg(unix)]
+    #[test]
+    fn r9_codex_command_entry_shares_the_retryable_deadline_refusal() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        // Deliberate-deadline row: production's budget, so the 10 s child
+        // outruns the 9 s per-step window (a generous budget would widen it).
+        set_test_admission_budget(None);
+        let temp = tempfile::Builder::new()
+            .prefix("cr-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let wrapper_base = temp.path().canonicalize().unwrap();
+        // 10s: past every window this route grants — the merged per-step
+        // window (CODEX_REPAIR_STEP_BUDGET_MS, 9s) and the pre-merge flat 4s —
+        // so the child is always killed at a window, on any host speed.
+        let wrapper = r9_delayed_sqlite_wrapper(&wrapper_base, 10_000, &f.sqlite3);
+        let prior_sqlite3 = std::env::var_os("CSQ_SQLITE3");
+        // SAFETY: under test_env::lock, so no other test thread reads these.
+        unsafe {
+            std::env::set_var("CSQ_SQLITE3", &wrapper);
+        }
+        let launched = build_codex_exec_command(
+            &f.base,
+            acc(12),
+            &f.base.join("term-1"),
+            &[
+                "resume".into(),
+                "99999999-9999-4999-8999-999999999999".into(),
+                "--sandbox".into(),
+                "read-only".into(),
+            ],
+        );
+        // SAFETY: restore prior value under the lock.
+        unsafe {
+            match prior_sqlite3 {
+                Some(value) => std::env::set_var("CSQ_SQLITE3", value),
+                None => std::env::remove_var("CSQ_SQLITE3"),
+            }
+        }
+        let message = launched.unwrap_err().to_string();
+        eprintln!("R9 starved codex_command-entry refusal: {message}");
+        assert!(message.contains("CSQ_CODEX_RESUME_TARGET"));
+        assert!(
+            message.contains("bounded admission deadline expired"),
+            "the row's entry point must render the retryable deadline class: {message}"
+        );
+        assert!(
+            !message.contains("could not be safely admitted"),
+            "the row's entry point rendered the unadmittable class: {message}"
+        );
+        assert_eq!(
+            f.rollout(),
+            f.dead.to_str().unwrap(),
+            "a refused admission must leave the recorded path untouched"
+        );
+    }
+
+    /// The FULL route's admission budget must start after the shared migration
+    /// lock too — residual (3) of the r9 freeze, which pinned only the exact
+    /// route's ordering. A `resume --last` launch under a held migration lock
+    /// must record `budget_started_at >= lock_admitted_at`.
+    ///
+    /// Falsifying result with the clock created before the acquire: the budget
+    /// instant precedes the lock's by the whole ~1.5s wait.
+    #[cfg(unix)]
+    #[test]
+    fn r9p_full_route_admission_budget_starts_after_the_share_lock_is_admitted() {
+        let _env = csq_core::platform::test_env::lock();
+        use std::os::fd::AsRawFd;
+        let f = R9LaunchRepairFixture::new();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(f.base.join("shared-state/codex/.share.lock"))
+            .unwrap();
+        // SAFETY: lock owns a live descriptor; flock changes only this private
+        // fixture's advisory lock and never touches any account namespace.
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1_500));
+            drop(lock);
+        });
+        let _ = take_test_admission_budget_order();
+        let launched = build_codex_exec_command_with(
+            &f.base,
+            acc(12),
+            &f.base.join("term-1"),
+            &[
+                "resume".into(),
+                "--last".into(),
+                "--sandbox".into(),
+                "read-only".into(),
+            ],
+            None,
+            Some(false),
+        );
+        release.join().unwrap();
+        let order = take_test_admission_budget_order()
+            .expect("the full route must record its admission ordering");
+        eprintln!(
+            "R9 full-route admission ordering: entry {:?}, lock admitted {:?}, budget started {:?}",
+            order.route_entry_at, order.lock_admitted_at, order.budget_started_at
+        );
+        let waited = order
+            .lock_admitted_at
+            .saturating_duration_since(order.route_entry_at);
+        assert!(
+            waited >= std::time::Duration::from_millis(1_000),
+            "the migration lock must have been genuinely contended for this \
+             assertion to discriminate (waited {waited:?})"
+        );
+        assert!(launched.is_ok(), "{launched:?}");
+        assert!(
+            order.budget_started_at >= order.lock_admitted_at,
+            "the full route's admission budget started before the shared \
+             migration lock was admitted"
+        );
+    }
+
+    /// Positive-path admission budget for the R9 rows: generous by
+    /// construction (60 s, matching the gate fixture budgets) so a loaded host
+    /// cannot make a healthy step refuse. Production keeps its derived 13 s.
+    // Every user of this constant is a `#[cfg(unix)]` row, so on the Windows
+    // test target it is dead; the preflight's windows-cfg cross-lint compiles
+    // that target with `-D warnings`, and `dead_code` is denied there.
+    #[cfg_attr(not(unix), expect(dead_code))]
+    const R9_POSITIVE_ADMISSION_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// The production admission budget must never be smaller than the one wait
+    /// every generated write script enforces — the arithmetic face of the row
+    /// below, and the check that stays red for a flat-four-second mutant
+    /// regardless of host speed.
+    #[test]
+    fn r9_admission_budget_covers_the_enforced_busy_timeout() {
+        use csq_core::session::shared_state::codex_sqlite::SQLITE_BUSY_TIMEOUT_MS;
+        assert!(
+            CODEX_REPAIR_BUDGET > std::time::Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS),
+            "the admission budget {CODEX_REPAIR_BUDGET:?} must exceed the enforced \
+             busy_timeout {SQLITE_BUSY_TIMEOUT_MS}ms"
+        );
+    }
+
+    /// The admission-budget seam is LIVE: an exhausted budget refuses before any
+    /// repair runs.
+    ///
+    /// This is the falsifying instrument for [`set_test_admission_budget`]: with
+    /// the override removed, this launch would repair normally and succeed, so
+    /// the row reds. It is deliberately independent of host load — the budget is
+    /// zero, never a wall-clock allowance — because a smaller-than-production
+    /// budget cannot be tested through timing: `step_budget` re-arms every step
+    /// to `deadline.max(now + CODEX_REPAIR_STEP_BUDGET)`, so a 1 s budget still
+    /// leaves a 9 s step window and never reds this route.
+    #[cfg(unix)]
+    #[test]
+    fn r9_an_exhausted_admission_budget_refuses_before_any_repair() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        let before = std::fs::read(&f.db).unwrap();
+        set_test_admission_budget(Some(std::time::Duration::ZERO));
+        let launched = f.launch();
+        set_test_admission_budget(None);
+        let message = launched.unwrap_err().to_string();
+        assert!(
+            message.contains("bounded admission deadline expired"),
+            "an exhausted admission budget must refuse as the retryable class: {message}"
+        );
+        assert_eq!(
+            f.rollout(),
+            f.dead.to_str().unwrap(),
+            "a refused admission must leave the recorded path untouched"
+        );
+        assert_eq!(std::fs::read(&f.db).unwrap(), before);
+    }
+
+    /// A contended-but-HEALTHY admission must complete: the write step's wait is
+    /// bounded by the `PRAGMA busy_timeout` every generated write script
+    /// enforces ([`SQLITE_BUSY_TIMEOUT_MS`]), so a launch budget smaller than
+    /// that wait kills a step that was going to succeed. This is the red row
+    /// for the flat-four-second mutant.
+    ///
+    /// Ordering-based: a real `sqlite3` child holds `BEGIN IMMEDIATE` on the
+    /// fixture database until this test touches a sentinel, which lands
+    /// `SQLITE_BUSY_TIMEOUT_MS - 400ms` after the launch starts. The healthy
+    /// branch therefore finishes its wait 400ms INSIDE the enforced busy
+    /// timeout, while the mutant's flat four-second allowance kills the step
+    /// 600ms earlier, mid-wait.
+    #[cfg(unix)]
+    #[test]
+    fn r9_exact_admission_completes_when_the_write_step_waits_out_a_held_lock() {
+        use csq_core::session::shared_state::codex_sqlite::SQLITE_BUSY_TIMEOUT_MS;
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        let sentinel = f.base.join("release-write-lock");
+        let mut holder = {
+            let sentinel = sentinel.display();
+            let bin = f.sqlite3.display();
+            let db = f.db.display();
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!(
+                    "{{ printf 'BEGIN IMMEDIATE;\\n'; while [ ! -f '{sentinel}' ]; do sleep 0.05; done; printf 'COMMIT;\\n'; }} | '{bin}' -batch '{db}'"
+                ))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        // The lock is held once a busy_timeout=0 probe cannot take it: an
+        // ordering signal, never a sleep-based one.
+        let probe = |sql: &str| {
+            std::process::Command::new(&f.sqlite3)
+                .env_clear()
+                .env("HOME", &f.fixture_home)
+                .current_dir(&f.base)
+                .arg(&f.db)
+                .arg(sql)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        let mut held = false;
+        for _ in 0..300 {
+            if !probe("PRAGMA busy_timeout=0; BEGIN IMMEDIATE;") {
+                held = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            held,
+            "the fixture's write lock must be held before the launch starts"
+        );
+        let release_after = std::time::Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS - 400);
+        let launched = std::thread::scope(|scope| {
+            let launching = scope.spawn(|| {
+                // The fixture's thread-local budget does not cross into this
+                // scoped thread; the launch under test is the POSITIVE row, so
+                // grant it here too.
+                set_test_admission_budget(Some(R9_POSITIVE_ADMISSION_BUDGET));
+                f.launch()
+            });
+            std::thread::sleep(release_after);
+            std::fs::write(&sentinel, b"release").unwrap();
+            launching.join().unwrap()
+        });
+        let _ = holder.wait();
+        assert!(
+            launched.is_ok(),
+            "a contended-but-healthy write step must be allowed to finish its \
+             enforced busy-timeout wait: {launched:?}"
+        );
+        assert_eq!(
+            f.rollout(),
+            f.candidate.to_str().unwrap(),
+            "the gated rewrite must have landed once the holder released"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r9_launch_refuses_slot_root_enotdir_before_shared_fallback() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        let blocked = f.base.join("blocked-root-parent");
+        std::fs::write(&blocked, b"regular file, not a directory").unwrap();
+        std::os::unix::fs::symlink(blocked.join("child"), f.slot.join("codex-sessions")).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(f.slot.join("codex-sessions"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+        let before = std::fs::read(&f.db).unwrap();
+        let error = f.launch().unwrap_err();
+        assert!(error.downcast_ref::<CodexResumeRefused>().is_some());
+        assert_eq!(f.rollout(), f.dead.to_str().unwrap());
+        assert_eq!(std::fs::read(&f.db).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r9_launch_refuses_migration_contention_then_repairs_after_release() {
+        let _env = csq_core::platform::test_env::lock();
+        use std::os::fd::AsRawFd;
+        let f = R9LaunchRepairFixture::new();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(f.base.join("shared-state/codex/.share.lock"))
+            .unwrap();
+        // SAFETY: lock owns a live descriptor; flock changes only this private
+        // fixture's advisory lock and never touches any account namespace.
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let before = std::fs::read(&f.db).unwrap();
+        let start = std::time::Instant::now();
+        let error = f.launch().unwrap_err();
+        assert!(error.downcast_ref::<CodexResumeRefused>().is_some());
+        let elapsed = start.elapsed();
+        eprintln!("R9 private contended launch repair elapsed: {elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_secs(4));
+        assert_eq!(f.rollout(), f.dead.to_str().unwrap());
+        assert_eq!(std::fs::read(&f.db).unwrap(), before);
+        drop(lock);
+        f.launch().unwrap();
+        assert_eq!(f.rollout(), f.candidate.to_str().unwrap());
+        f.launch().unwrap();
+        assert_eq!(f.rollout(), f.candidate.to_str().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r9_launch_accepts_genuinely_missing_slot_root() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        assert_eq!(
+            std::fs::canonicalize(f.slot.join("codex-sessions"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        f.launch().unwrap();
+        assert_eq!(f.rollout(), f.candidate.to_str().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r9_exact_resume_ignores_8228_unrepairable_rows_beyond_old_output_cap() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        f.sql("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<8228) INSERT INTO threads SELECT 'dead-'||i, '/missing/'||printf('%0200d',i)||'/rollout-unrepairable.jsonl' FROM n;");
+        let before =
+            f.sql("SELECT count(*), sum(length(rollout_path)) FROM threads WHERE id!='99999999-9999-4999-8999-999999999999';");
+        assert_eq!(before.split('|').next(), Some("8228"));
+        assert!(
+            before
+                .split('|')
+                .nth(1)
+                .unwrap()
+                .trim()
+                .parse::<usize>()
+                .unwrap()
+                > 1024 * 1024
+        );
+        // The retained historical fullscan must actually reach its stdout cap
+        // on this same fixture; a query/API failure is not the regression control.
+        let lock = csq_core::session::shared_state::acquire_codex_share_lock_shared(&f.base)
+            .expect("migration lock");
+        let old = csq_core::session::shared_state::codex_sqlite::repair_slot_rollout_paths_before(
+            &lock,
+            &f.base,
+            &f.db,
+            &[f.base.join("shared-state/codex/codex-sessions")],
+            codex_repair_deadline(),
+        )
+        .unwrap_err();
+        match old {
+            csq_core::session::shared_state::ShareError::SqliteCommandFailed { detail, .. } => {
+                eprintln!("R9 actual historical fullscan refusal: {detail}");
+                assert!(
+                    detail.contains("output") || detail.contains("stdout"),
+                    "actual output cap required: {detail}"
+                );
+            }
+            other => panic!("fullscan control failed outside capped transport: {other:?}"),
+        }
+        let command = f
+            .launch()
+            .expect("exact resume must not read unrelated capped rows");
+        assert!(command.get_args().any(|v| v == "resume"));
+        assert_eq!(f.rollout(), f.candidate.to_str().unwrap());
+        assert_eq!(
+            f.sql("SELECT count(*), sum(length(rollout_path)) FROM threads WHERE id!='99999999-9999-4999-8999-999999999999';"),
+            before
+        );
+        assert_eq!(f.sql("SELECT count(*) FROM threads WHERE id!='99999999-9999-4999-8999-999999999999' AND rollout_path != '/missing/'||printf('%0200d',CAST(substr(id,6) AS INTEGER))||'/rollout-unrepairable.jsonl';").trim(), "0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r9_exact_resume_accepts_options_before_uuid_for_both_native_routes() {
+        let _env = csq_core::platform::test_env::lock();
+        for exec in [false, true] {
+            let f = R9LaunchRepairFixture::new();
+            let mut args: Vec<String> = if exec {
+                vec![
+                    "exec".into(),
+                    "resume".into(),
+                    "--json".into(),
+                    "--ignore-user-config".into(),
+                ]
+            } else {
+                vec!["resume".into(), "--sandbox".into(), "read-only".into()]
+            };
+            args.extend([
+                "--all".into(),
+                "--model".into(),
+                "gpt-6.1-sol".into(),
+                "99999999-9999-4999-8999-999999999999".into(),
+            ]);
+            let command = build_codex_exec_command_with(
+                &f.base,
+                acc(12),
+                &f.base.join("term-1"),
+                &args,
+                None,
+                Some(false),
+            )
+            .unwrap();
+            assert!(command.get_args().any(|v| v == "resume"));
+            assert_eq!(
+                f.rollout(),
+                f.candidate.to_str().unwrap(),
+                "supported options-before-UUID must reach target admission"
+            );
+        }
+        let full: Vec<String> = ["resume", "--last", "99999999-9999-4999-8999-999999999999"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert!(exact_codex_resume_target(&full).unwrap().is_none());
+        for args in [
+            vec![
+                "resume",
+                "--unknown-option",
+                "99999999-9999-4999-8999-999999999999",
+            ],
+            vec!["resume", "some-session-name"],
+            vec![
+                "resume",
+                "-p",
+                "other-profile",
+                "99999999-9999-4999-8999-999999999999",
+            ],
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+            assert!(exact_codex_resume_target(&args)
+                .unwrap_err()
+                .downcast_ref::<CodexResumeRefused>()
+                .is_some());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r9_exact_resume_canonicalizes_resolving_alias_after_native_activity() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        std::fs::create_dir_all(f.dead.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&f.candidate, &f.dead).unwrap();
+        f.launch().unwrap();
+        assert_eq!(f.rollout(), f.candidate.to_str().unwrap());
+        f.sql(&format!(
+            "UPDATE threads SET rollout_path='{}' WHERE id='99999999-9999-4999-8999-999999999999';",
+            f.dead.to_str().unwrap().replace('\'', "''")
+        ));
+        f.launch().unwrap();
+        assert_eq!(f.rollout(), f.candidate.to_str().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r9_exact_resume_refuses_missing_or_ambiguous_transcript_without_mutation() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        std::fs::remove_file(&f.candidate).unwrap();
+        let before = std::fs::read(&f.db).unwrap();
+        let error = f.launch().unwrap_err();
+        assert!(error.downcast_ref::<CodexResumeRefused>().is_some());
+        assert!(error.to_string().contains("CSQ_CODEX_RESUME_TARGET"));
+        assert!(!error.to_string().contains(f.base.to_str().unwrap()));
+        assert_eq!(std::fs::read(&f.db).unwrap(), before);
+        std::fs::write(&f.candidate, b"one").unwrap();
+        let second = f
+            .candidate
+            .parent()
+            .unwrap()
+            .join("duplicate")
+            .join(f.candidate.file_name().unwrap());
+        std::fs::create_dir_all(second.parent().unwrap()).unwrap();
+        std::fs::write(second, b"two").unwrap();
+        assert!(f
+            .launch()
+            .unwrap_err()
+            .downcast_ref::<CodexResumeRefused>()
+            .is_some());
+        assert_eq!(std::fs::read(&f.db).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r9_ordinary_launch_never_reads_or_repairs_thread_rows() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        let before = std::fs::read(&f.db).unwrap();
+        codex_command(&f.base, acc(12), &f.base.join("term-1")).unwrap();
+        build_codex_exec_command_with(
+            &f.base,
+            acc(12),
+            &f.base.join("term-1"),
+            &[
+                "--sandbox".into(),
+                "read-only".into(),
+                "exec".into(),
+                "--".into(),
+                "resume".into(),
+            ],
+            None,
+            Some(false),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&f.db).unwrap(), before);
+        assert_eq!(f.rollout(), f.dead.to_str().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r9_ordinary_option_value_named_resume_is_not_a_resume_route() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        let before = std::fs::read(&f.db).unwrap();
+        for option in ["--output-last-message", "--model"] {
+            let args: Vec<String> = vec![
+                "-c".into(),
+                "sqlite_home=\"/different\"".into(),
+                "exec".into(),
+                "--ignore-user-config".into(),
+                option.into(),
+                "resume".into(),
+                "hello".into(),
+            ];
+            let result = build_codex_exec_command_with(
+                &f.base,
+                acc(12),
+                &f.base.join("term-1"),
+                &args,
+                None,
+                Some(false),
+            );
+            assert!(
+                result.is_ok(),
+                "ordinary option value must not trigger target admission: {result:?}"
+            );
+            assert_eq!(std::fs::read(&f.db).unwrap(), before);
+        }
+        assert_eq!(f.rollout(), f.dead.to_str().unwrap());
+    }
+
+    #[test]
+    fn r9_exact_resume_refuses_sqlite_home_override_and_preserves_picker_scope() {
+        for args in [
+            vec![
+                "resume",
+                "99999999-9999-4999-8999-999999999999",
+                "-c",
+                "sqlite_home=\"/different\"",
+            ],
+            vec![
+                "--config=sqlite_home=\"/different\"",
+                "resume",
+                "99999999-9999-4999-8999-999999999999",
+            ],
+            vec![
+                "resume",
+                "99999999-9999-4999-8999-999999999999",
+                "--config",
+                "\"sqlite_home\" = \"/different\"",
+            ],
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+            assert!(exact_codex_resume_target(&args)
+                .unwrap_err()
+                .downcast_ref::<CodexResumeRefused>()
+                .is_some());
+        }
+        assert_eq!(
+            exact_codex_resume_target(&["resume".into(), "--last".into()]).unwrap(),
+            None
+        );
+        assert_eq!(exact_codex_resume_target(&["resume".into()]).unwrap(), None);
+        assert_eq!(
+            exact_codex_resume_target(&["exec".into(), "--".into(), "resume".into()]).unwrap(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r9p_bare_last_and_exec_last_use_the_actual_full_repair_builder() {
+        let _env = csq_core::platform::test_env::lock();
+        for args in [
+            vec!["resume"],
+            vec!["resume", "--last"],
+            vec!["exec", "resume", "--last", "hello"],
+        ] {
+            let f = R9LaunchRepairFixture::new();
+            let count = if args.len() == 1 { 8228 } else { 1200 };
+            let missing = f.base.join("missing").to_str().unwrap().replace('\'', "''");
+            f.sql(&format!("DELETE FROM threads; WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<{count}) INSERT INTO threads SELECT 'dead-'||i,'{missing}/'||printf('%0200d',i)||'/absent.jsonl' FROM n;"));
+            f.sql(&format!(
+                "INSERT INTO threads VALUES('99999999-9999-4999-8999-999999999999','{}');",
+                f.dead.to_str().unwrap().replace('\'', "''")
+            ));
+            let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+            let command = build_codex_exec_command_with(
+                &f.base,
+                acc(12),
+                &f.base.join("term-1"),
+                &args,
+                None,
+                Some(false),
+            )
+            .expect("full resume builder must repair beyond first page");
+            assert!(command.get_args().any(|arg| arg == "resume"));
+            assert_eq!(
+                f.rollout(),
+                f.candidate.to_str().unwrap(),
+                "actual full-route target canonicalization"
+            );
+            assert_eq!(f.sql(&format!("SELECT count(*) FROM threads WHERE id LIKE 'dead-%' AND rollout_path != '{missing}/'||printf('%0200d',CAST(substr(id,6) AS INTEGER))||'/absent.jsonl';")).trim(), "0");
+        }
+    }
+
+    /// Run a bare full-route `resume` over a 1200-row multi-page table with
+    /// every `sqlite3` child delayed by `delay_ms` (the stub's own enforced
+    /// sleep), restoring `CSQ_SQLITE3` afterwards.
+    #[cfg(unix)]
+    fn r9p_full_route_launch_with_delayed_children(
+        f: &R9LaunchRepairFixture,
+        delay_ms: u64,
+    ) -> Result<Command> {
+        let missing = f.base.join("missing").to_str().unwrap().replace('\'', "''");
+        f.sql(&format!("DELETE FROM threads; WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1200) INSERT INTO threads SELECT 'dead-'||i,'{missing}/'||printf('%0200d',i)||'/absent.jsonl' FROM n;"));
+        f.sql(&format!(
+            "INSERT INTO threads VALUES('99999999-9999-4999-8999-999999999999','{}');",
+            f.dead.to_str().unwrap().replace('\'', "''")
+        ));
+        let temp = tempfile::Builder::new()
+            .prefix("cr-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let wrapper_base = temp.path().canonicalize().unwrap();
+        let wrapper = r9_delayed_sqlite_wrapper(&wrapper_base, delay_ms, &f.sqlite3);
+        let prior_sqlite3 = std::env::var_os("CSQ_SQLITE3");
+        // SAFETY: under test_env::lock, so no other test thread reads these.
+        unsafe {
+            std::env::set_var("CSQ_SQLITE3", &wrapper);
+        }
+        let launched = build_codex_exec_command_with(
+            &f.base,
+            acc(12),
+            &f.base.join("term-1"),
+            &["resume".into()],
+            None,
+            Some(false),
+        );
+        // SAFETY: restore prior value under the lock.
+        unsafe {
+            match prior_sqlite3 {
+                Some(value) => std::env::set_var("CSQ_SQLITE3", value),
+                None => std::env::remove_var("CSQ_SQLITE3"),
+            }
+        }
+        launched
+    }
+
+    /// The full route's database walk is bounded by its per-step and per-page
+    /// windows, never by one coarse deadline over the whole walk. 1200 rows are
+    /// 3 pages plus the terminating empty read, after 5 fixed reads and before
+    /// the one rewrite batch: ≥ 10 children × 1.5s ENFORCED sleep = ≥ 15s of
+    /// walk, longer than one 9s step window on any host, while every child
+    /// stays far inside its own window. A coarse post-walk check against the
+    /// database's first step window refuses this completed repair.
+    #[cfg(unix)]
+    #[test]
+    fn r9p_full_route_completes_a_walk_longer_than_one_step_window() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        let launched = r9p_full_route_launch_with_delayed_children(&f, 1_500);
+        assert!(
+            launched.is_ok(),
+            "a slow-but-healthy full-route walk must complete: {:?}",
+            launched.err()
+        );
+        assert_eq!(
+            f.rollout(),
+            f.candidate.to_str().unwrap(),
+            "the full-route rewrite must have landed"
+        );
+    }
+
+    /// Fail-closed counterpart: a child slower than its own enforced step
+    /// window (10s > CODEX_REPAIR_STEP_BUDGET_MS, 9s) is still killed and the
+    /// full route refuses as a typed partial without launching or rewriting.
+    #[cfg(unix)]
+    #[test]
+    fn r9p_full_route_child_overrunning_its_step_window_still_refuses() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        // Deliberate-deadline row: production's budget, so the 10 s child
+        // outruns the 9 s per-step window (a generous budget would widen it).
+        set_test_admission_budget(None);
+        let error = r9p_full_route_launch_with_delayed_children(&f, 10_000).unwrap_err();
+        let typed = error
+            .downcast_ref::<CodexResumePartial>()
+            .unwrap_or_else(|| panic!("typed partial before native command: {error}"));
+        assert_eq!((typed.visited, typed.rewritten), (0, 0));
+        assert_eq!(
+            f.rollout(),
+            f.dead.to_str().unwrap(),
+            "a refused full-route repair must leave the recorded path untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r9p_full_resume_partial_refuses_native_spawn_with_observed_and_committed_counts() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        let duplicate = f.candidate.parent().unwrap().join("duplicate");
+        std::fs::create_dir(&duplicate).unwrap();
+        std::fs::write(
+            duplicate.join(f.candidate.file_name().unwrap()),
+            b"ambiguous transcript",
+        )
+        .unwrap();
+        let before = std::fs::read(&f.db).unwrap();
+        let error = build_codex_exec_command_with(
+            &f.base,
+            acc(12),
+            &f.base.join("term-1"),
+            &["resume".into()],
+            None,
+            Some(false),
+        )
+        .unwrap_err();
+        let typed = error
+            .downcast_ref::<CodexResumePartial>()
+            .expect("typed partial before native command");
+        assert_eq!((typed.visited, typed.rewritten), (0, 0));
+        assert!(!typed.in_flight_commit_unknown);
+        assert_eq!(std::fs::read(&f.db).unwrap(), before);
+    }
+
+    /// `visited` counts rows observed, including rows of batches that held no
+    /// rewrite and so were never transactionally confirmed; only `rewritten`
+    /// is committed. The operator string must not call visited rows
+    /// "confirmed". Falsifying result with the old wording: the message
+    /// contains "confirmed visited=".
+    #[test]
+    fn codex_resume_partial_message_does_not_over_claim_confirmation() {
+        let message = CodexResumePartial {
+            reason: "shared resume repair deadline exhausted",
+            visited: 7,
+            rewritten: 2,
+            databases_completed: 1,
+            in_flight_commit_unknown: true,
+        }
+        .to_string();
+        assert_eq!(
+            message,
+            "CSQ_CODEX_RESUME_PARTIAL: shared resume repair deadline exhausted; observed visited=7 (rows in batches that held no rewrite were read, not committed), committed rewritten=2, databases=1, last_write_commit_unknown=true. Native Codex was not launched; retry after resolving the bounded repair condition"
+        );
+        assert!(!message.contains("confirmed"));
+    }
+
+    #[test]
+    fn r9p_full_route_parser_keeps_ordinary_option_values_outside_repair() {
+        assert_eq!(
+            codex_resume_route(&[
+                "-m".into(),
+                "resume".into(),
+                "exec".into(),
+                "-o".into(),
+                "resume".into(),
+                "hello".into()
+            ])
+            .unwrap(),
+            CodexResumeRoute::Ordinary
+        );
+        assert_eq!(
+            codex_resume_route(&["resume".into(), "--last".into(), "a prompt".into()]).unwrap(),
+            CodexResumeRoute::Full
+        );
+        assert!(codex_resume_route(&[
+            "resume".into(),
+            "--last".into(),
+            "--config=sqlite_home=\"/different\"".into()
+        ])
+        .is_err());
+    }
+
     #[test]
     fn codex_command_sqlite_directory_is_slot_scoped() {
         let dir = TempDir::new().unwrap();
@@ -7184,7 +9763,7 @@ mod tests {
     }
 
     // ── `build_codex_exec_command` — the shared flag/env helper
-    // `launch_codex` and `swap::exec_codex_after_binding` both call
+    // `launch_codex` and `swap::supervise_codex_after_binding` both call
     // (cross-slot swap-resume shard S3, item 3) ─────────────────────────
 
     #[test]
@@ -7242,8 +9821,64 @@ mod tests {
         assert!(args.contains(&"read-only".to_string()));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn resume_does_not_acquire_derived_permission_policy() {
+        let _env = csq_core::platform::test_env::lock();
+        struct RestoreHome(Option<std::ffi::OsString>);
+        impl Drop for RestoreHome {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("HOME", value),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+        let _restore = RestoreHome(std::env::var_os("HOME"));
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(
+            home.join(".codex/config.toml"),
+            "approval_policy=\"never\"\nsandbox_mode=\"danger-full-access\"\n",
+        )
+        .unwrap();
+        std::env::set_var("HOME", &home);
+        std::fs::create_dir(dir.path().join("config-7")).unwrap();
+        let handle = dir.path().join("term-7");
+        std::fs::create_dir(&handle).unwrap();
+        for caller in [
+            vec!["resume", "--last"],
+            vec!["resume", "--last", "-c", "sandbox_mode=\"read-only\""],
+        ] {
+            let rest: Vec<String> = caller.into_iter().map(str::to_owned).collect();
+            let command = build_codex_exec_command_with(
+                dir.path(),
+                acc(7),
+                &handle,
+                &rest,
+                None,
+                Some(false),
+            )
+            .unwrap();
+            let args: Vec<_> = command.get_args().collect();
+            assert!(
+                !args.contains(&std::ffi::OsStr::new(
+                    "--dangerously-bypass-approvals-and-sandbox"
+                )),
+                "resume must not acquire any csq-derived bypass policy: {rest:?}"
+            );
+            assert!(!args.contains(&std::ffi::OsStr::new("--ask-for-approval")));
+            assert!(!args.contains(&std::ffi::OsStr::new("--sandbox")));
+            assert_eq!(
+                args[args.len() - rest.len()..],
+                rest.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>()
+            );
+        }
+    }
+
     /// Parity, by construction: both `launch_codex`'s spawn and
-    /// `swap::exec_codex_after_binding`'s exec build their `Command` through
+    /// `swap::supervise_codex_after_binding`'s exec build their `Command` through
     /// THIS SAME function with the SAME `(base_dir, account, handle_dir,
     /// rest)` — so two calls with identical inputs must produce identical
     /// argv/env, and any future flag added to one caller is automatically
@@ -7253,16 +9888,22 @@ mod tests {
     /// framing for the supervised-relaunch half of this same shard).
     #[test]
     fn build_codex_exec_command_is_deterministic_across_call_sites() {
+        let _env = csq_core::platform::test_env::lock();
         let dir = TempDir::new().unwrap();
         let config = dir.path().join("config-3");
         let handle = dir.path().join("term-3");
         std::fs::create_dir(&config).unwrap();
         std::fs::create_dir(&handle).unwrap();
-        let rest = vec!["resume".to_string(), "--last".to_string()];
+        // This assertion compares command construction, independently of
+        // resume repair's SQLite dependency and target-admission fixtures.
+        let rest: Vec<String> = ["exec", "--sandbox", "read-only", "--", "parity"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
 
         // Stand-in for `launch_codex`'s own call site.
         let from_launch = build_codex_exec_command(dir.path(), acc(3), &handle, &rest).unwrap();
-        // Stand-in for `swap::exec_codex_after_binding`'s call site.
+        // Stand-in for `swap::supervise_codex_after_binding`'s call site.
         let from_swap = build_codex_exec_command(dir.path(), acc(3), &handle, &rest).unwrap();
 
         assert_eq!(
@@ -7947,36 +10588,33 @@ mod tests {
         );
     }
 
-    /// [`keychain-fix-r8c.md`'s NIT] routing half: `csq run`'s launch call
-    /// (`force_sync_for_launch` → `force_sync_for_launch_locked` →
-    /// `force_sync_account_changed`) reaches
-    /// `ForcedSyncResult::ForeignLoginUnharvested` for a FRESH handle dir
-    /// whose keychain item X holds a valid Anthropic login from a
-    /// DIFFERENT, unknown account — the exact classification whose operator
-    /// message the NIT concerns (it must never assert "Claude Code just
-    /// refreshed" as fact, per `keychain-fix-r8.md` C-F1's retraction).
+    /// [`keychain-fix-r8c.md`'s NIT], retargeted by the custody model: the
+    /// no-custody entry point `force_sync_account_changed` — what this test
+    /// has always driven — must REFUSE (`TargetTokenInvalidated`) rather
+    /// than silently write when a FRESH handle dir's keychain item X holds a
+    /// valid Anthropic login from a DIFFERENT, unknown account AND the
+    /// caller supplied a token with no captured target custody.
     ///
-    /// NOTE on scope (STALE as of `keychain-fix-r8d.md` item 2 — kept for
-    /// history, corrected below): this comment used to say
-    /// `force_sync_for_launch`'s own top-level `keychain_mirror_disabled_now()`
-    /// short-circuit was checked BEFORE the test-installed-executor override,
-    /// unlike its sibling entry points `force_sync_account_changed`/
-    /// `reconcile_keychain_to_marker`, so it could not be driven to its `Err`
-    /// arms from a test in THIS crate. `force_sync_for_launch` now checks the
-    /// override FIRST, matching its siblings — see
-    /// `foreign_login_on_fresh_launch_is_quarantined_via_force_sync_for_launch`
-    /// below, which drives the SAME scenario through `force_sync_for_launch`
-    /// itself. This test is UNCHANGED and kept alongside it: it still pins
-    /// the routing through `force_sync_account_changed` directly, and the
-    /// message text itself is produced by keychain.rs's private
-    /// `decide_launch_disposition` and was verified by direct source
-    /// inspection to already carry the C-F1 wording at both call sites
-    /// (`ForeignLoginUnharvested`'s arms in `decide_swap_disposition` and
-    /// `decide_launch_disposition`) — no "just refreshed" text remains.
+    /// STALE PREMISE, corrected (quoted for history): the original doc said
+    /// this test pins `force_sync_for_launch` → `force_sync_for_launch_locked`
+    /// → `force_sync_account_changed` reaching
+    /// `ForcedSyncResult::ForeignLoginUnharvested`. Both hops are obsolete:
+    /// `force_sync_for_launch_locked` now calls
+    /// `force_sync_account_changed_for_launch` (custody-carrying, quarantining
+    /// — pinned by `foreign_login_on_fresh_launch_is_quarantined_via_force_sync_for_launch`
+    /// below), and since `12a5c873c` the custody-less
+    /// `force_sync_account_changed` refuses an `Intended::Token` with
+    /// `target_binding == None` (keychain.rs:7803-7805 — AFTER
+    /// `decide_cc_keychain_write` at :7793 and BEFORE the source-binding
+    /// rule-3 refusal at :7833-7835), so rule 3 is unreachable through it.
+    /// The property that survives — and the one the NIT cared about — is
+    /// that an unmatched foreign login is never a silent write; the
+    /// assertions below pin it with the keychain call log, not merely the
+    /// return variant (which `TargetTokenInvalidated` shares with the
+    /// expired-target case at :7789).
     #[cfg(target_os = "macos")]
     #[test]
-    fn foreign_login_unharvested_routes_through_force_sync_account_changed_for_a_fresh_launch_dir()
-    {
+    fn no_custody_forced_write_refuses_an_unmatched_foreign_login_on_a_fresh_launch_dir() {
         use csq_core::accounts::identity_store;
         use csq_core::credentials::keychain::{
             clear_test_keychain_executor, set_test_keychain_executor, ForcedSyncResult,
@@ -8021,9 +10659,11 @@ mod tests {
         assert!(is_canonical, "fixture: canonicalize must succeed");
 
         // X holds a valid Anthropic identity from a DIFFERENT, unknown
-        // account — no history entry matches it, so decide_cc_keychain_write
-        // classifies it as rule 3 (ForeignLoginUnharvested), same as swap's
-        // (d)/(e) cases.
+        // account: no history entry matches it, so
+        // `decide_cc_keychain_write` classifies it as `RefuseUnharvested`
+        // (rule 3). On THIS entry that classification never reaches its
+        // `ForeignLoginUnharvested` arm — the custody refusal returns first
+        // (see the order below).
         let foreign = CredentialFile::Anthropic(AnthropicCredentialFile {
             claude_ai_oauth: OAuthPayload {
                 access_token: AccessToken::new("at-FOREIGN".into()),
@@ -8038,13 +10678,38 @@ mod tests {
         });
         let foreign_json = serde_json::to_string(&foreign).unwrap();
         let exec = std::rc::Rc::new(ScriptedKeychainExecutor::scripted(
-            RawContentClassification::Content(foreign_json),
+            RawContentClassification::Content(foreign_json.into()),
         ));
-        set_test_keychain_executor(exec);
+        // The global takes ownership of the `Rc`; the clone kept here is what
+        // lets the assertions inspect the executor's own call log. A return
+        // value alone cannot separate "refused before touching the keychain"
+        // from "wrote, then returned the refusal variant".
+        set_test_keychain_executor(exec.clone());
 
-        // Mirrors force_sync_for_launch_locked's own call exactly: base,
-        // handle_dir_abs, and `Some(own_raw)` (what a real launch reads from
-        // handle_dir_abs/.credentials.json — this account's own token).
+        // `force_sync_account_changed` is the CUSTODY-LESS entry point
+        // (`force_sync_account_changed_with_executor` → `force_sync_inner_guarded(…, None, None)`),
+        // and since `12a5c873c` ("separate verified Anthropic organization
+        // contexts") a raw token is no longer accepted as ownership evidence.
+        //
+        // Verified order inside `force_sync_inner_with_profiles`: X is read
+        // (`find`, keychain.rs:7725), `decide_cc_keychain_write` runs FIRST
+        // (:7793 — it can itself return `Applied` on `NoWrite`), the custody
+        // refusal for `Intended::Token` with `target_binding == None`
+        // follows at :7803-7805, the source-binding rule-3 refusal
+        // (`ForeignLoginUnharvested`) at :7833-7835, and an EXPIRED target
+        // token also returns `TargetTokenInvalidated`, at :7789 — which is
+        // why the variant alone does not pin this path.
+        //
+        // Rule 3's `ForeignLoginUnharvested` is therefore unreachable through
+        // THIS entry — a custody-carrying caller that wants it
+        // (`csq swap`/auto-rotate) goes through
+        // `force_swap_write_before_repoint_guarded`/`_locked` with a
+        // captured binding, and the launch goes through
+        // `force_sync_account_changed_for_launch` (pinned by
+        // `foreign_login_on_fresh_launch_is_quarantined_via_force_sync_for_launch`
+        // below, which drives the same foreign X to its quarantine outcome).
+        // What this test pins is the property the original NIT cared about:
+        // an unmatched foreign login is NEVER a silent write.
         let result = csq_core::credentials::keychain::force_sync_account_changed(
             base.path(),
             &handle_dir_abs,
@@ -8053,24 +10718,42 @@ mod tests {
         clear_test_keychain_executor();
 
         assert!(
-            matches!(result, Ok(ForcedSyncResult::ForeignLoginUnharvested)),
-            "an unmatched foreign login on a fresh launch dir must classify as \
-             ForeignLoginUnharvested (rule 3), never a silent write: {result:?}"
+            matches!(result, Ok(ForcedSyncResult::TargetTokenInvalidated)),
+            "a forced write carrying a token but NO captured target custody must \
+             refuse: {result:?}"
         );
+        let calls = exec.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|(verb, _, _)| matches!(*verb, "add" | "delete")),
+            "the refusal must be decided BEFORE any keychain mutation — a write \
+             followed by this variant is indistinguishable from the refusal by \
+             the return value alone: {calls:?}"
+        );
+        assert_eq!(
+            calls.len(),
+            1,
+            "exactly one `find` (the single X read) and no mutation: {calls:?}"
+        );
+        assert_eq!(calls[0].0, "find");
     }
 
     /// `keychain-fix-r8d.md` item 2: the launch-level test the prior test's
     /// NOTE said could not exist — drives `force_sync_for_launch` ITSELF
-    /// (not `force_sync_account_changed` directly) to its
-    /// `ForeignLoginUnharvested` `Err` arm, now that it checks the
+    /// (not `force_sync_account_changed` directly), now that it checks the
     /// test-installed-executor override BEFORE its
     /// `keychain_mirror_disabled_now()` short-circuit, matching its siblings.
     ///
-    /// RED proof (quoted in the commit): reverting `force_sync_for_launch`
-    /// to check `keychain_mirror_disabled_now()` first makes this test fail
-    /// with `left: Ok(true), right: Err("the keychain holds a login...")`
-    /// — the override is installed but never consulted, and the trivial
-    /// `Ok(true)` short-circuit fires instead.
+    /// On a FRESH handle dir the launch does NOT surface an
+    /// `ForeignLoginUnharvested` `Err` — that arm belongs to the
+    /// non-quarantining callers of `decide_launch_disposition`. The foreign
+    /// item is saved to `keychain-quarantine/` and replaced, so the outcome
+    /// asserted here is `Ok(true)` PLUS the exact foreign payload on disk.
+    /// The `Ok(true)` comparison alone does not discriminate: the
+    /// mirror-disabled short-circuit also returns `Ok(true)` without ever
+    /// reaching the quarantine save, which is why the payload assertion is
+    /// the discriminating one.
     #[cfg(target_os = "macos")]
     #[test]
     fn foreign_login_on_fresh_launch_is_quarantined_via_force_sync_for_launch() {
@@ -8116,6 +10799,30 @@ mod tests {
             csq_core::credentials::keychain::canonicalize_for_keychain_sync(&handle_dir);
         assert!(is_canonical, "fixture: canonicalize must succeed");
 
+        // Mirror the real mint path (`accounts::login::finalize_login`): the
+        // identity record at `identities/<uuid>/identity.json`. The launch
+        // captures its target custody through `capture_known_slot` →
+        // `capture_anthropic_binding_locked` → `read_stored_anthropic_context`,
+        // which reads THIS file and FAILS CLOSED without it — the launch
+        // would then refuse with `TargetTokenInvalidated` before ever
+        // classifying X (`force_sync_inner_with_profiles`, the
+        // `Intended::Token` + `target_binding == None` gate). Mode 0o600:
+        // `read_json(path, private = true)` rejects any group/world bit.
+        let identity_path =
+            csq_core::accounts::identity_store::identity_json_path_for(base.path(), uuid);
+        std::fs::create_dir_all(identity_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &identity_path,
+            r#"{"email":"fixture-slot-1@test.invalid","provider":"anthropic",
+               "created_at":"2026-01-01T00:00:00Z","key_id":null}"#,
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&identity_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+
         // X holds a valid Anthropic identity from a DIFFERENT, unknown
         // account — same shape as the sibling test above.
         let foreign = CredentialFile::Anthropic(AnthropicCredentialFile {
@@ -8132,7 +10839,7 @@ mod tests {
         });
         let foreign_json = serde_json::to_string(&foreign).unwrap();
         let exec = std::rc::Rc::new(ScriptedKeychainExecutor::scripted(
-            RawContentClassification::Content(foreign_json.clone()),
+            RawContentClassification::Content((foreign_json.clone()).into()),
         ));
         set_test_keychain_executor(exec);
 
@@ -9313,5 +12020,630 @@ mod tests {
             "enabled=true must propagate the forced cwd-resolution Err: {}",
             describe_layer_control_result(&enabled)
         );
+    }
+}
+
+/// Spec 32 §6 / INV-32-07: launch registration of the messaging server and hooks.
+#[cfg(test)]
+mod messaging_registration_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    const VAR: &str = "CSQ_MESSAGING";
+
+    /// Run `f` with `CSQ_MESSAGING` set to `value` (or removed), under the shared env lock,
+    /// restoring the previous value afterwards.
+    fn with_messaging_env<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
+        let _lock = csq_core::platform::test_env::lock();
+        let saved = std::env::var(VAR).ok();
+        match value {
+            Some(v) => std::env::set_var(VAR, v),
+            None => std::env::remove_var(VAR),
+        }
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match saved {
+            Some(v) => std::env::set_var(VAR, v),
+            None => std::env::remove_var(VAR),
+        }
+        r.unwrap_or_else(|p| std::panic::resume_unwind(p))
+    }
+
+    struct Fixture {
+        _dir: TempDir,
+        handle: PathBuf,
+        user_settings: PathBuf,
+        #[cfg(not(windows))]
+        user_codex: PathBuf,
+    }
+
+    fn fixture() -> Fixture {
+        fixture_in(TempDir::new().unwrap())
+    }
+
+    fn fixture_in(dir: TempDir) -> Fixture {
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        let user_settings = home.join(".claude").join("settings.json");
+        let user_codex = home.join(".codex").join("config.toml");
+        std::fs::write(
+            &user_settings,
+            "{\"permissions\":{\"allow\":[\"WebSearch\"]}}\n",
+        )
+        .unwrap();
+        std::fs::write(&user_codex, "model = \"x\"\n").unwrap();
+        let handle = dir.path().join("accounts").join("term-4242");
+        std::fs::create_dir_all(&handle).unwrap();
+        std::fs::write(handle.join("settings.json"), "{\"effortLevel\":\"medium\"}").unwrap();
+        Fixture {
+            _dir: dir,
+            handle,
+            user_settings,
+            #[cfg(not(windows))]
+            user_codex,
+        }
+    }
+
+    /// The caller holds the shared env lock for fixture creation through assertions.
+    /// Registration builds commands without executing them, so no vendor CLI is needed.
+    fn launch_fixture() -> (Fixture, LaunchEnv) {
+        // A fixed OS temp root avoids an inherited TMPDIR that another fixture removed.
+        #[cfg(unix)]
+        let dir = TempDir::new_in("/tmp").unwrap();
+        #[cfg(not(unix))]
+        let dir = TempDir::new().unwrap();
+        let f = fixture_in(dir);
+        let home = f._dir.path().join("home");
+        let tmp = f._dir.path().join("tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        let bin = f._dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        // These commands are inspected, never spawned. If a future launch fixture
+        // resolves a vendor through PATH, it must still resolve inside this sandbox.
+        for name in ["claude", "codex"] {
+            let executable = bin.join(name);
+            std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+        }
+        let values = [
+            ("HOME", Some(home.into_os_string())),
+            (
+                "USERPROFILE",
+                Some(f._dir.path().join("home").into_os_string()),
+            ),
+            ("PATH", Some(bin.into_os_string())),
+            (
+                "CSQ_BASE_DIR",
+                Some(f._dir.path().join("accounts").into_os_string()),
+            ),
+            (VAR, None),
+        ];
+        let restore = LaunchEnv(
+            values
+                .iter()
+                .map(|(k, _)| (*k, std::env::var_os(k)))
+                .collect(),
+        );
+        for (key, value) in values {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        (f, restore)
+    }
+
+    struct LaunchEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl Drop for LaunchEnv {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn launch_command(f: &Fixture, surface: &str) -> Command {
+        let mut cmd = Command::new(f._dir.path().join("bin").join(surface));
+        let tmp = f._dir.path().join("tmp");
+        // Only this inspected child command receives the private temp root.
+        // Never expose ambient-tempdir sibling tests to a transient root.
+        for key in ["TMPDIR", "TEMP", "TMP"] {
+            cmd.env(key, &tmp);
+        }
+        cmd
+    }
+
+    #[test]
+    fn launch_fixture_keeps_parent_temp_environment_and_binds_child_temp() {
+        let _lock = csq_core::platform::test_env::lock();
+        let previous: Vec<_> = ["TMPDIR", "TEMP", "TMP"]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect();
+        {
+            let (f, _restore) = launch_fixture();
+            let cmd = launch_command(&f, "claude");
+            for (key, value) in &previous {
+                assert_eq!(std::env::var_os(key), *value);
+                assert!(cmd.get_envs().any(|(name, value)| name == *key
+                    && value == Some(f._dir.path().join("tmp").as_os_str())));
+            }
+        }
+        for (key, value) in previous {
+            assert_eq!(std::env::var_os(key), value);
+        }
+    }
+
+    #[test]
+    fn pool_values_never_enter_claude_launch_environment_or_materialized_settings() {
+        use secrecy::ExposeSecret;
+        let _lock = csq_core::platform::test_env::lock();
+        let (f, _restore) = launch_fixture();
+        let base = f._dir.path().join("accounts");
+        let vault =
+            csq_core::platform::secret::file::FileVault::open_test(&base.join("pool-test-vault"))
+                .unwrap();
+        csq_core::pool::Pool::with_default_vault_for_test(std::sync::Arc::new(vault), || {
+            let pool = csq_core::pool::Pool::new(&base);
+            let stored_value = "synthetic-private-pool-stored-value";
+            let env_value = "synthetic-private-pool-env-value";
+            pool.add("credit.one", "anthropic", stored_value.into(), None, None)
+                .unwrap();
+            let env_file = base.join("pool-input.env");
+            // Born owner-only on both platforms (0o600 on Unix; a protected
+            // single-owner-ACE DACL on Windows), so `add_env_file` admits it
+            // everywhere and the env-sourced leak probe genuinely runs.
+            csq_core::platform::fs::write_new_private(
+                &env_file,
+                format!("credit.env={env_value}\n").as_bytes(),
+            )
+            .unwrap();
+            pool.add_env_file(&env_file, &["credit.env".into()], "anthropic", None, None)
+                .unwrap();
+            let leak_probes = [stored_value, env_value];
+            assert!(pool.list().unwrap().iter().all(|row| row.present));
+            let home = f.user_settings.parent().unwrap();
+            let rest = vec!["plugin".to_owned(), "details".to_owned()];
+            // These are the production builders used by launch_anthropic,
+            // launch_third_party and exec_claude. Outer launch admission/native
+            // force_sync is deliberately outside this construction fixture.
+            for overlay in [
+                "{}",
+                r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.z.ai/api/anthropic","ANTHROPIC_AUTH_TOKEN":"synthetic-slot-key"}}"#,
+                "{}",
+            ] {
+                let config = base.join("config-1");
+                std::fs::create_dir_all(&config).unwrap();
+                std::fs::write(config.join("settings.json"), overlay).unwrap();
+                csq_core::session::materialize_handle_settings(&f.handle, home, &config).unwrap();
+                let mut anthropic = build_anthropic_command(&base, &f.handle, &rest).unwrap();
+                // Match the Inherit arm's final user-argument placement.
+                anthropic.args(&rest);
+                let commands = [
+                    anthropic,
+                    build_third_party_command(&base, &f.handle, &rest).unwrap(),
+                    build_vanilla_claude_command(&base, home, &rest).unwrap(),
+                ];
+                for cmd in &commands {
+                    assert_eq!(cmd.get_program(), "claude");
+                    assert!(argv(cmd).ends_with(&rest));
+                    let env: Vec<_> = cmd
+                        .get_envs()
+                        .map(|(key, value)| {
+                            (
+                                key.to_string_lossy().into_owned(),
+                                value.map(|v| v.to_string_lossy().into_owned()),
+                            )
+                        })
+                        .collect();
+                    for value in leak_probes.iter().copied() {
+                        assert!(!serde_json::to_string(&env).unwrap().contains(value));
+                        assert!(!serde_json::to_string(&argv(cmd)).unwrap().contains(value));
+                        assert!(!std::fs::read_to_string(f.handle.join("settings.json"))
+                            .unwrap()
+                            .contains(value));
+                    }
+                }
+                assert_eq!(
+                    pool.read_key("credit.one").unwrap().expose_secret(),
+                    stored_value
+                );
+                assert_eq!(
+                    pool.read_key("credit.env").unwrap().expose_secret(),
+                    env_value
+                );
+            }
+        });
+    }
+
+    fn argv(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn handle_settings(f: &Fixture) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(f.handle.join("settings.json")).unwrap()).unwrap()
+    }
+
+    fn decision_env_of(cmd: &Command) -> Option<Option<String>> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == csq_core::messaging::register::DECISION_ENV)
+            .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    /// F3: every launch that builds a `Command` sets `CSQ_MESSAGING_DECISION` EXPLICITLY, on or
+    /// off, so a parent-shell value cannot win, and `strip_sensitive_env` leaves it alone.
+    /// Falsifier: before, no launch set it, so `decision_env_of` is `None` for all four.
+    #[test]
+    fn every_launch_sets_the_decision_env_explicitly_and_the_strip_keeps_it() {
+        let f = fixture();
+        let var = csq_core::messaging::register::DECISION_ENV;
+        for on in [true, false] {
+            let want = Some(Some(if on { "on" } else { "off" }.to_owned()));
+            let mut claude = Command::new("echo");
+            attach_messaging_claude_as(&mut claude, &f.handle, on);
+            assert_eq!(decision_env_of(&claude), want, "claude on={on}");
+            let mut codex = Command::new("echo");
+            attach_messaging_codex_as(&mut codex, &f.handle, None, on);
+            assert_eq!(decision_env_of(&codex), want, "codex on={on}");
+            let mut native = Command::new("echo");
+            set_decision_env(&mut native, on);
+            assert_eq!(decision_env_of(&native), want, "native on={on}");
+        }
+        // a parent-shell value is overridden: the explicit set is what the child gets, and the
+        // strip does not remove it
+        let _lock = csq_core::platform::test_env::lock();
+        let prev = std::env::var_os(var);
+        std::env::set_var(var, "on");
+        let mut cmd = Command::new("echo");
+        set_decision_env(&mut cmd, false);
+        strip_sensitive_env(&mut cmd);
+        match prev {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+        assert_eq!(decision_env_of(&cmd), Some(Some("off".to_owned())));
+    }
+
+    #[test]
+    fn claude_launch_gets_inline_config_and_only_the_handle_dir_settings_change() {
+        let _lock = csq_core::platform::test_env::lock();
+        let (f, _restore) = launch_fixture();
+        let user_before = std::fs::read(&f.user_settings).unwrap();
+        let mut cmd = launch_command(&f, "claude");
+        attach_messaging_claude(&mut cmd, &f.handle);
+        let args = argv(&cmd);
+        assert_eq!(args[0], "--mcp-config", "{args:?}");
+        let cfg: serde_json::Value = serde_json::from_str(&args[1]).unwrap();
+        let srv = &cfg["mcpServers"]["csq-messaging"];
+        assert_eq!(srv["args"], serde_json::json!(["mcp-messaging"]));
+        assert_eq!(srv["env"]["CLAUDE_CONFIG_DIR"], f.handle.to_str().unwrap());
+        // Inline: no config file is written; the handle dir holds only settings.json (edited in
+        // place) and the launch-decision marker (spec 02 INV-02 permits the .csq* family).
+        let mut names: Vec<String> = std::fs::read_dir(&f.handle)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [".csq-messaging", "settings.json"],
+            "only the launch-decision marker joins settings.json"
+        );
+        let s = handle_settings(&f);
+        assert_eq!(s["hooks"].as_object().unwrap().len(), 3, "{s}");
+        for ev in ["UserPromptSubmit", "PostToolUse", "Stop"] {
+            let c = s["hooks"][ev][0]["hooks"][0]["command"].as_str().unwrap();
+            assert!(
+                c.ends_with(&format!("sessions inbox --messages --hook {ev}")),
+                "{c}"
+            );
+        }
+        assert_eq!(s["permissions"]["allow"].as_array().unwrap().len(), 6);
+        assert_eq!(s["effortLevel"], "medium");
+        // The user's own settings are byte-identical.
+        assert_eq!(std::fs::read(&f.user_settings).unwrap(), user_before);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn codex_launch_carries_the_c_flags_and_leaves_the_user_config_untouched() {
+        let _lock = csq_core::platform::test_env::lock();
+        let (f, _restore) = launch_fixture();
+        let user_before = std::fs::read(&f.user_codex).unwrap();
+        let mut cmd = launch_command(&f, "codex");
+        attach_messaging_codex(&mut cmd, &f.handle, None);
+        let args = argv(&cmd);
+        assert_eq!(args.len(), 8, "{args:?}");
+        assert!(args.iter().step_by(2).all(|a| a == "-c"));
+        assert!(args
+            .iter()
+            .any(|a| a.starts_with("mcp_servers.csq-messaging.command=")));
+        assert!(args.iter().any(|a| a
+            == &format!(
+                "mcp_servers.csq-messaging.env={{CODEX_HOME=\"{}\", CSQ_BASE_DIR=\"{}\"}}",
+                f.handle.to_str().unwrap(),
+                f._dir.path().join("accounts").to_str().unwrap()
+            )));
+        assert!(args
+            .iter()
+            .any(|a| a == "mcp_servers.csq-messaging.default_tools_approval_mode=\"approve\""));
+        assert_eq!(std::fs::read(&f.user_codex).unwrap(), user_before);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn codex_launch_under_an_mcp_policy_routes_the_server_through_the_proxy() {
+        let f = fixture();
+        let envelope = f.handle.join(".pact-mcp-envelope.json");
+        let mut cmd = Command::new("echo");
+        with_messaging_env(None, || {
+            attach_messaging_codex(&mut cmd, &f.handle, Some(("/opt/csq", &envelope)))
+        });
+        let args = argv(&cmd);
+        let a = args
+            .iter()
+            .find(|a| a.starts_with("mcp_servers.csq-messaging.args="))
+            .unwrap();
+        assert!(
+            a.contains("\"mcp-proxy\"")
+                && a.contains("\"--envelope\"")
+                && a.contains("\"mcp-messaging\""),
+            "{a}"
+        );
+        let c = args
+            .iter()
+            .find(|a| a.starts_with("mcp_servers.csq-messaging.command="))
+            .unwrap();
+        assert_eq!(c, "mcp_servers.csq-messaging.command=\"/opt/csq\"");
+    }
+
+    #[test]
+    fn the_off_switch_registers_nothing_in_either_cli() {
+        let f = fixture();
+        let settings_before = std::fs::read(f.handle.join("settings.json")).unwrap();
+        let mut claude = Command::new("echo");
+        let mut codex = Command::new("echo");
+        with_messaging_env(Some("off"), || {
+            attach_messaging_claude(&mut claude, &f.handle);
+            attach_messaging_codex(&mut codex, &f.handle, None);
+        });
+        assert!(argv(&claude).is_empty(), "{:?}", argv(&claude));
+        assert!(argv(&codex).is_empty(), "{:?}", argv(&codex));
+        assert_eq!(
+            std::fs::read(f.handle.join("settings.json")).unwrap(),
+            settings_before
+        );
+    }
+
+    #[test]
+    fn a_failed_registration_still_launches_without_half_registering() {
+        // Settings edit refused (no settings.json in the handle dir): no flag is added, so
+        // tools are never registered without their allow rules; the command is still usable.
+        let f = fixture();
+        std::fs::remove_file(f.handle.join("settings.json")).unwrap();
+        let mut cmd = Command::new("echo");
+        with_messaging_env(None, || attach_messaging_claude(&mut cmd, &f.handle));
+        assert!(argv(&cmd).is_empty(), "{:?}", argv(&cmd));
+
+        // Unbuildable config (handle dir not UTF-8): neither CLI gets a flag, nothing panics.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let bad = PathBuf::from(std::ffi::OsStr::from_bytes(b"/h/\xffterm"));
+            let mut claude = Command::new("echo");
+            let mut codex = Command::new("echo");
+            with_messaging_env(None, || {
+                attach_messaging_claude(&mut claude, &bad);
+                attach_messaging_codex(&mut codex, &bad, None);
+            });
+            assert!(argv(&claude).is_empty() && argv(&codex).is_empty());
+        }
+    }
+
+    /// M1: once a handle dir carries `off`, an attach reads THAT and not the environment.
+    /// Falsifier: the old `register::enabled()` read gave `--mcp-config` here.
+    #[test]
+    fn a_recorded_off_decision_beats_an_enabling_environment_in_both_clis() {
+        let f = fixture();
+        csq_core::messaging::register::record_decision(&f.handle, false).unwrap();
+        let mut claude = Command::new("echo");
+        let mut codex = Command::new("echo");
+        with_messaging_env(None, || {
+            attach_messaging_claude(&mut claude, &f.handle);
+            attach_messaging_codex(&mut codex, &f.handle, None);
+        });
+        assert!(argv(&claude).is_empty(), "{:?}", argv(&claude));
+        assert!(argv(&codex).is_empty(), "{:?}", argv(&codex));
+    }
+
+    /// A fresh launch records what the environment said, so a later swap can carry it.
+    #[test]
+    fn a_fresh_launch_records_the_environment_decision_once() {
+        let f = fixture();
+        let mut claude = Command::new("echo");
+        with_messaging_env(Some("off"), || {
+            attach_messaging_claude(&mut claude, &f.handle)
+        });
+        assert_eq!(
+            csq_core::messaging::register::read_decision(&f.handle),
+            Some(false)
+        );
+        let g = fixture();
+        let mut claude = Command::new("echo");
+        with_messaging_env(None, || attach_messaging_claude(&mut claude, &g.handle));
+        assert_eq!(
+            csq_core::messaging::register::read_decision(&g.handle),
+            Some(true)
+        );
+    }
+
+    /// I3: a Gemini or native launch records the decision, so a swap out of it into Claude or
+    /// Codex reads the operator's choice instead of "off". Falsifier: without the call the
+    /// marker is absent and `existing_decision` is false even with `CSQ_MESSAGING` unset (on).
+    #[test]
+    fn gemini_and_native_launches_record_the_decision_for_a_later_swap() {
+        for (env, want) in [(None, true), (Some("off"), false)] {
+            let f = fixture();
+            with_messaging_env(env, || record_launch_decision(&f.handle));
+            assert_eq!(
+                csq_core::messaging::register::read_decision(&f.handle),
+                Some(want)
+            );
+        }
+        // an existing marker is kept, not overwritten from the environment
+        let f = fixture();
+        csq_core::messaging::register::record_decision(&f.handle, false).unwrap();
+        with_messaging_env(None, || record_launch_decision(&f.handle));
+        assert_eq!(
+            csq_core::messaging::register::read_decision(&f.handle),
+            Some(false)
+        );
+    }
+
+    /// F8: Codex registers nothing on Windows even when messaging is on.
+    #[cfg(windows)]
+    #[test]
+    fn codex_registers_no_messaging_tools_on_windows() {
+        let f = fixture();
+        let mut codex = Command::new("echo");
+        with_messaging_env(None, || attach_messaging_codex(&mut codex, &f.handle, None));
+        assert!(argv(&codex).is_empty(), "{:?}", argv(&codex));
+    }
+}
+
+/// F1: `csq run` into a codex slot must not leave a phantom
+/// `Degraded`/`Bypass` run record when `launch_codex` refuses BEFORE its
+/// spawn. Drives the REAL `launch_codex` under the same
+/// `CodexLaunchAudit::First(PreSpawnCodexRun)` wrapper `handle` builds, past
+/// a fake healthy daemon, to the `check_codex_token_freshness` refusal of an
+/// expired token — one of the `?` exits ahead of the share lock.
+#[cfg(all(test, unix))]
+mod codex_pre_spawn_guard_tests {
+    use super::*;
+    use crate::cli::commands::fake_daemon_test_support::spawn_fake_healthy_daemon;
+
+    fn b64url(s: &str) -> String {
+        base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            s.as_bytes(),
+        )
+    }
+
+    /// A codex slot whose canonical credential carries an access token
+    /// that expired at `exp = 1000`.
+    fn expired_codex_slot(base: &Path, account: u16) {
+        let config = base.join(format!("config-{account}"));
+        std::fs::create_dir_all(config.join("codex-sessions")).unwrap();
+        std::fs::write(config.join(".csq-account"), account.to_string()).unwrap();
+        std::fs::write(config.join("config.toml"), "model = \"o1\"\n").unwrap(); // CI-ALLOW-fs-write-config-toml
+        std::fs::write(config.join("codex-history.jsonl"), "").unwrap();
+        let jwt = format!(
+            "{}.{}.fakesig",
+            b64url(r#"{"alg":"HS256","typ":"JWT"}"#),
+            b64url(r#"{"exp":1000,"sub":"test"}"#)
+        );
+        let creds = base.join("credentials");
+        std::fs::create_dir_all(&creds).unwrap();
+        std::fs::write(
+            creds.join(format!("codex-{account}.json")),
+            format!(
+                r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{jwt}","refresh_token":"rt","id_token":"it","account_id":"uuid"}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Every record under `csq-runs/` and `csq-runs/.pending/` (the same
+    /// reader as `swap::tests::run_records_including_pending`).
+    fn run_records_including_pending(base: &Path) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        for dir in [
+            base.join("csq-runs"),
+            base.join("csq-runs").join(".pending"),
+        ] {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if !entry.path().is_file() {
+                    continue;
+                }
+                let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+                match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(v) => out.push(v),
+                    Err(_) => out.extend(
+                        text.lines()
+                            .filter(|l| !l.trim().is_empty())
+                            .map(|l| serde_json::from_str(l).unwrap_or(serde_json::Value::Null)),
+                    ),
+                }
+            }
+        }
+        out
+    }
+
+    /// Falsifying result (pre-F1, `handle` passing its bare emitter): the
+    /// emitter drops un-ended on the token refusal and parks its default
+    /// `Degraded`/`Bypass` record in `csq-runs/.pending/`.
+    #[test]
+    fn csq_run_codex_expired_token_leaves_no_bypass_run_record() {
+        // The fake daemon's socket derives from `base` on macOS; a deep
+        // runner TMPDIR would push its pathname past `sun_path`.
+        let base = csq_core::testing::socket_fixture::short_root("csq-run-").unwrap();
+        let account = AccountNum::try_from(9u16).unwrap();
+        expired_codex_slot(base.path(), account.get());
+        let _daemon = spawn_fake_healthy_daemon(base.path());
+        let audit = CodexLaunchAudit::First(Box::new(PreSpawnCodexRun::new(run_audit_emitter(
+            base.path(),
+            SurfaceCli::Codex,
+            account,
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ))));
+        let toggles = CapabilityLayerToggles::default();
+        let result = launch_codex(
+            base.path(),
+            account,
+            /* capability_layer_enabled */ false,
+            /* layer_is_auto */ false,
+            &toggles,
+            /* debug */ false,
+            /* bench_mode */ None,
+            /* coc_cache_enabled */ false,
+            &[],
+            audit,
+            /* swap_correlation */ None,
+            /* messaging */ None,
+        );
+        let err = result.expect_err("an expired codex token must refuse the launch");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("expired"),
+            "the refusal must be the token check: {msg}"
+        );
+        let records = run_records_including_pending(base.path());
+        assert!(
+            !records
+                .iter()
+                .any(|r| r.to_string().contains("\"decision\":\"bypass\"")),
+            "a Bypass run record: {records:?}"
+        );
+        assert!(
+            records
+                .iter()
+                .all(|r| !r.to_string().contains("\"result_state\":\"degraded\"")),
+            "a Degraded run record: {records:?}"
+        );
+        let _ = std::fs::remove_dir_all(base.path().join(format!("term-{}", std::process::id())));
     }
 }

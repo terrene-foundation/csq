@@ -5,9 +5,9 @@
 //! - Slot-suppression: surface row appears only when authenticated slots exist.
 //! - Stale-slot variant: `Missing | WrongBinary` with slots configured.
 //! - Empty-state row: no slots on any surface.
-//! - `schema_version` in JSON output — both editions report 25 as of v25
-//!   (`stale_quota_slots`, cross-edition); asserted against the
-//!   build-active value, not a literal.
+//! - `schema_version` in JSON output — both editions report 34 as of v34
+//!   (v33 Codex hook-trust carry diagnostics + v34 keychain_orphans, spec 13 §9); expectations
+//!   follow `doctor.rs::DOCTOR_SCHEMA_VERSION`.
 //! - Absent-key test: `codex_cli` omitted when no codex slots (R1-L2).
 //! - Probe-disabled disclosure via env var.
 //! - Half-migrated handle dir does not trigger surface row.
@@ -226,21 +226,16 @@ fn test_1_all_surfaces_with_stubs_render_three_rows() {
 
     let json = run_doctor_json(base.path(), stubs.path().to_str().unwrap());
 
-    // schema_version: BOTH editions report 25. v25's `codex_shared_shape_mismatches` is
-    // NOT cfg-gated (the community build computes+emits it too), so per the
-    // shared-monotonic-counter "highest field-version an edition emits"
-    // contract the community ceiling jumps straight from 19 to 23 — past
-    // the intervening enterprise-only v20/v21/v22 — exactly as v19
-    // (`mcp_partial_coverage`) jumped it from 16 to 19 past v17/v18. The
-    // spawned binary carries this crate's feature set. Keep in lockstep
-    // with `doctor.rs::DOCTOR_SCHEMA_VERSION`.
+    // Spec 13 §9 pins both editions to v34 (v33 Codex hook-trust carry diagnostics + v34 keychain_orphans). The spawned binary
+    // carries this crate's feature set; keep this public JSON contract in
+    // lockstep with `doctor.rs::DOCTOR_SCHEMA_VERSION`.
     #[cfg(feature = "enterprise")]
-    let expected_schema = 25;
+    let expected_schema = 34;
     #[cfg(not(feature = "enterprise"))]
-    let expected_schema = 25;
+    let expected_schema = 34;
     assert_eq!(
         json["schema_version"], expected_schema,
-        "schema_version must equal the edition-active value (both editions: 25)"
+        "schema_version must equal the edition-active value (both editions: 34)"
     );
     assert_eq!(json["claude_code"]["status"], "ok");
     assert_eq!(json["codex_cli"]["status"], "ok");
@@ -528,22 +523,17 @@ fn test_10_json_schema_version_2() {
 
     let json = run_doctor_json(base.path(), stubs.path().to_str().unwrap());
 
-    // schema_version: BOTH editions report 25. v25 (`codex_shared_shape_mismatches`) is
-    // NOT cfg-gated (always-computed, `skip_serializing_if` empty — a
-    // RUNTIME-state omission, not an edition capability), so the community
-    // ceiling jumps straight from 19 to 23, past the intervening
-    // enterprise-only v20/v21/v22 — the same "highest field-version an
-    // edition emits" jump v19 (`mcp_partial_coverage`) made from 16 to 19.
-    // The spawned binary carries this crate's feature set. Keep in
+    // Spec 13 §9 pins both editions to v34 (v33 Codex hook-trust carry diagnostics + v34 keychain_orphans). The spawned binary
+    // carries this crate's feature set; keep this public JSON contract in
     // lockstep with `doctor.rs::DOCTOR_SCHEMA_VERSION`.
     #[cfg(feature = "enterprise")]
-    let expected_schema: u64 = 25;
+    let expected_schema: u64 = 34;
     #[cfg(not(feature = "enterprise"))]
-    let expected_schema: u64 = 25;
+    let expected_schema: u64 = 34;
     assert_eq!(
         json["schema_version"],
         Value::Number(serde_json::Number::from(expected_schema)),
-        "schema_version must equal the edition-active value (both editions: 25)"
+        "schema_version must equal the edition-active value (both editions: 34)"
     );
 }
 
@@ -1030,4 +1020,661 @@ fn test_f1_probe_disabled_kill_switch_fires_before_path_walk() {
         json["codex_cli"]["status"], "probe_disabled",
         "F1-sibling: kill-switch must fire before PATH walk; got probe_timed_out or similar; json={json}"
     );
+}
+
+#[test]
+fn cli_shim_doctor_binary_reports_live_failure_after_successful_receipt() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    use csq_core::cli_deps::cli_shim_refresh::{write_refresh_receipt, ShimRefreshReceipt};
+    let home = TempDir::new().unwrap();
+    let base = home.path().join(".claude/accounts");
+    let target = home.path().join(".local/bin/csq");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, b"not an executable").unwrap();
+    write_refresh_receipt(
+        &base,
+        &ShimRefreshReceipt {
+            outcome: "updated".into(),
+            target_path: Some(target),
+            expected_version_line: "csq 99.0.0 (enterprise)".into(),
+            verified_version_line: Some("csq 99.0.0 (enterprise)".into()),
+            plist_decision: "repaired".into(),
+            stale_plist_decision: "retained_verified".into(),
+            timestamp: 42,
+        },
+    )
+    .unwrap();
+    let cmd = || {
+        let mut c = clean_cmd(Some("/usr/bin:/bin"));
+        c.env("HOME", home.path())
+            .env("CSQ_HOME", home.path())
+            .env("CLAUDE_HOME", home.path())
+            .env("CSQ_BASE_DIR", &base);
+        c
+    };
+    let out = cmd().args(["doctor", "--json"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "doctor JSON failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["cli_shim"]["stale_or_unverifiable"], true);
+    assert_eq!(json["cli_shim"]["verified_version_line"], Value::Null);
+    assert_eq!(json["cli_shim"]["managed_plist_allowed"], false);
+    assert_eq!(json["cli_shim"]["receipt_status"], "present");
+    assert_eq!(json["cli_shim"]["last_refresh"]["outcome"], "updated");
+    assert_eq!(
+        json["cli_shim"]["last_refresh"]["plist_decision"],
+        "repaired"
+    );
+    assert_eq!(json["cli_shim"]["last_refresh"]["timestamp"], 42);
+    let text = cmd().arg("doctor").output().unwrap();
+    assert!(text.status.success());
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains("CLI shim stale or unverifiable"));
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(json["cli_shim"]["managed_plist_installed"], false);
+        assert!(text.contains("managed daemon plist not installed"));
+    }
+    let home_s = home.path().to_string_lossy();
+    assert!(
+        !text.contains(home_s.as_ref()),
+        "text must redact sandbox HOME"
+    );
+    assert!(
+        !String::from_utf8(out.stdout)
+            .unwrap()
+            .contains(home_s.as_ref()),
+        "JSON must redact sandbox HOME"
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn isolated_cli_shim_doctor_cmd(home: &std::path::Path, base: &std::path::Path) -> Command {
+    let mut cmd = clean_cmd(Some("/usr/bin:/bin"));
+    cmd.env("HOME", home)
+        .env("CSQ_HOME", home)
+        .env("CLAUDE_HOME", home)
+        .env("CSQ_BASE_DIR", base);
+    cmd
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn cli_only_doctor_does_not_require_a_desktop_managed_plist() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let home = TempDir::new().unwrap();
+    let base = home.path().join(".claude/accounts");
+    let target = home.path().join(".local/bin/csq");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::copy(csq_bin(), &target).unwrap();
+    // Community accepts a private ad-hoc CLI fixture. An unsigned enterprise
+    // test build still retains its team-pin gate; management is independent.
+    #[cfg(not(feature = "enterprise"))]
+    {
+        let signed = Command::new("/usr/bin/codesign")
+            .env_clear()
+            .env("HOME", home.path())
+            .env("PATH", "/usr/bin:/bin")
+            .args(["--force", "--sign", "-"])
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(signed.status.success(), "private fixture signing failed");
+    }
+    let text = isolated_cli_shim_doctor_cmd(home.path(), &base)
+        .arg("doctor")
+        .output()
+        .unwrap();
+    assert!(text.status.success());
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(
+        !text.contains("managed daemon plist not installed"),
+        "a CLI-only installation has no evidence of desktop management"
+    );
+    let out = isolated_cli_shim_doctor_cmd(home.path(), &base)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let json: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["cli_shim"]["receipt_status"], "absent");
+    assert_eq!(json["cli_shim"]["managed_plist_installed"], false);
+    assert_eq!(json["cli_shim"]["desktop_managed"], false);
+    #[cfg(not(feature = "enterprise"))]
+    {
+        assert_eq!(json["cli_shim"]["check_status"], "current");
+        assert_eq!(json["cli_shim"]["stale_or_unverifiable"], false);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn homebrew_symlink_doctor_reports_not_checked_without_executing_it() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let home = TempDir::new().unwrap();
+    let base = home.path().join(".claude/accounts");
+    let bin = home.path().join(".local/bin");
+    let cellar = home.path().join("opt/homebrew/Cellar/csq/99.0.0/bin");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&cellar).unwrap();
+    let fixture = write_stub(&cellar, "csq", "csq 99.0.0 (community)");
+    std::fs::write(
+        &fixture,
+        b"#!/bin/sh\nprintf executed > \"$HOME/symlink-executed\"\nprintf 'csq 99.0.0 (community)\\n'\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(fixture, bin.join("csq")).unwrap();
+    let text = isolated_cli_shim_doctor_cmd(home.path(), &base)
+        .arg("doctor")
+        .output()
+        .unwrap();
+    assert!(text.status.success());
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(
+        !text.contains("CLI shim stale or unverifiable"),
+        "a package-managed symlink is not an established broken CLI"
+    );
+    assert!(!text.contains("managed daemon plist not installed"));
+    let out = isolated_cli_shim_doctor_cmd(home.path(), &base)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let json: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["cli_shim"]["check_status"], "not_checked");
+    assert_eq!(json["cli_shim"]["stale_or_unverifiable"], false);
+    assert_eq!(json["cli_shim"]["verified_version_line"], Value::Null);
+    assert_eq!(json["cli_shim"]["managed_plist_allowed"], false);
+    assert_eq!(json["cli_shim"]["desktop_managed"], false);
+    assert!(text.contains(
+        "not checked — csq at ~/.local/bin/csq is a symlink; the desktop does not manage it"
+    ));
+    assert!(
+        !home.path().join("symlink-executed").exists(),
+        "doctor must never execute the unverified symlink"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn matching_desktop_receipt_symlink_doctor_has_no_unworkable_retry_advice() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    use csq_core::cli_deps::cli_shim_refresh::{write_refresh_receipt, ShimRefreshReceipt};
+    let home = TempDir::new().unwrap();
+    let base = home.path().join(".claude/accounts");
+    let bin = home.path().join(".local/bin");
+    let cellar = home.path().join("opt/homebrew/Cellar/csq/99.0.0/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&cellar).unwrap();
+    let fixture = write_stub(&cellar, "csq", "csq 99.0.0 (community)");
+    std::fs::write(
+        &fixture,
+        b"#!/bin/sh\nprintf executed > \"$HOME/symlink-executed\"\nprintf 'csq 99.0.0 (community)\\n'\n",
+    )
+    .unwrap();
+    let target = bin.join("csq");
+    std::os::unix::fs::symlink(fixture, &target).unwrap();
+    write_refresh_receipt(
+        &base,
+        &ShimRefreshReceipt {
+            outcome: "updated\n\x1breceipt-canary".into(),
+            target_path: Some(target),
+            expected_version_line: "csq 99.0.0 (community)".into(),
+            verified_version_line: Some("csq 99.0.0 (community)".into()),
+            plist_decision: "repaired".into(),
+            stale_plist_decision: "retained_verified".into(),
+            timestamp: 42,
+        },
+    )
+    .unwrap();
+    // Exact BUG-B: historical desktop receipt matches this symlink, but no
+    // managed plist exists. The receipt must not turn an omitted check into
+    // actionable advice to repeat a refresh that always rejects symlinks.
+    assert!(!home
+        .path()
+        .join("Library/LaunchAgents/foundation.terrene.csq.plist")
+        .exists());
+    let out = isolated_cli_shim_doctor_cmd(home.path(), &base)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let json: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["cli_shim"]["check_status"], "not_checked");
+    assert_eq!(json["cli_shim"]["stale_or_unverifiable"], false);
+    assert_eq!(json["cli_shim"]["verified_version_line"], Value::Null);
+    assert_eq!(json["cli_shim"]["managed_plist_allowed"], false);
+    assert_eq!(json["cli_shim"]["managed_plist_installed"], false);
+    assert_eq!(json["cli_shim"]["desktop_managed"], true);
+    assert_eq!(json["cli_shim"]["receipt_status"], "present");
+    assert_eq!(json["cli_shim"]["path"], "~/.local/bin/csq");
+    assert_eq!(
+        json["cli_shim"]["last_refresh"]["outcome"],
+        "updatedreceipt-canary"
+    );
+    let text = isolated_cli_shim_doctor_cmd(home.path(), &base)
+        .arg("doctor")
+        .output()
+        .unwrap();
+    assert!(text.status.success());
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(
+        !text.contains("managed daemon plist not installed"),
+        "a matching desktop receipt must not imply a symlink can be managed; output={text}"
+    );
+    assert!(!text.contains("launch a coherent desktop build to retry"));
+    assert!(text.contains(
+        "not checked — csq at ~/.local/bin/csq is a symlink; the desktop does not manage it"
+    ));
+    assert!(!text.contains("\x1breceipt-canary"));
+    assert!(!text.contains(home.path().to_str().unwrap()));
+    assert!(!String::from_utf8(out.stdout)
+        .unwrap()
+        .contains(home.path().to_str().unwrap()));
+    assert!(
+        !home.path().join("symlink-executed").exists(),
+        "doctor must never execute the unverified symlink"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn historical_dormant_receipt_does_not_claim_current_service_is_stopped() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    use csq_core::cli_deps::cli_shim_refresh::{write_refresh_receipt, ShimRefreshReceipt};
+    let home = TempDir::new().unwrap();
+    let base = home.path().join(".claude/accounts");
+    // No managed plist and no real launchd job are created or mutated. The
+    // historical receipt alone must not authorize a native job-state query.
+    write_refresh_receipt(
+        &base,
+        &ShimRefreshReceipt {
+            outcome: "current".into(),
+            target_path: Some(home.path().join(".local/bin/csq")),
+            expected_version_line: "csq 99.0.0 (community)".into(),
+            verified_version_line: Some("csq 99.0.0 (community)".into()),
+            plist_decision: "daemon_dormant".into(),
+            stale_plist_decision: "retained_verified".into(),
+            timestamp: 42,
+        },
+    )
+    .unwrap();
+    let out = isolated_cli_shim_doctor_cmd(home.path(), &base)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let json: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        json["cli_shim"]["last_refresh"]["plist_decision"],
+        "daemon_dormant"
+    );
+    assert_eq!(json["cli_shim"]["managed_plist_installed"], false);
+    assert!(json["cli_shim"].get("managed_daemon_dormant").is_none());
+    let text = isolated_cli_shim_doctor_cmd(home.path(), &base)
+        .arg("doctor")
+        .output()
+        .unwrap();
+    assert!(text.status.success());
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(!text.contains("managed daemon is loaded but stopped"));
+    assert!(!text.contains("token refresh for this managed service is not running"));
+    assert!(!text.contains(home.path().to_str().unwrap()));
+    assert!(!String::from_utf8(out.stdout)
+        .unwrap()
+        .contains(home.path().to_str().unwrap()));
+}
+
+#[cfg(all(target_os = "macos", feature = "test-utils"))]
+fn bounded_managed_service_fixture_output(command: &mut Command) -> std::process::Output {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::process::{Output, Stdio};
+    use std::time::{Duration, Instant};
+
+    // Refuse any runtime binary-path override before spawning. Cargo binds
+    // this path to the integration target's actual built csq binary.
+    assert_eq!(
+        command.get_program(),
+        std::ffi::OsStr::new(env!("CARGO_BIN_EXE_csq"))
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    struct Owned(std::process::Child);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+                let deadline = Instant::now() + Duration::from_millis(100);
+                while Instant::now() < deadline && matches!(self.0.try_wait(), Ok(None)) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    }
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let mut child = Owned(child);
+    for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
+        // SAFETY: both descriptors are live owned pipes; fcntl changes only flags.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            assert!(flags >= 0);
+            assert_eq!(libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK), 0);
+        }
+    }
+    fn drain(pipe: &mut impl Read, output: &mut Vec<u8>) {
+        let mut bytes = [0u8; 4096];
+        // Finite reads preserve the deadline even if a child keeps writing.
+        for _ in 0..4 {
+            match pipe.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(n) => {
+                    assert!(
+                        output.len() + n <= 16 * 1024,
+                        "managed service fixture output cap"
+                    );
+                    output.extend_from_slice(&bytes[..n]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => panic!("managed service fixture pipe: {error}"),
+            }
+        }
+    }
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "managed service fixture deadline"
+        );
+        drain(&mut stdout, &mut out);
+        drain(&mut stderr, &mut err);
+        if let Some(status) = child.0.try_wait().unwrap() {
+            drain(&mut stdout, &mut out);
+            drain(&mut stderr, &mut err);
+            return Output {
+                status,
+                stdout: out,
+                stderr: err,
+            };
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Read the native absent-job result through the production bounded probe and
+/// exercise doctor with an installed plist inside its private HOME.
+#[cfg(all(target_os = "macos", feature = "test-utils"))]
+#[test]
+fn r0_m3_doctor_binary_warns_for_definitely_unloaded_managed_service() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let home = TempDir::new().unwrap();
+    let base = home.path().join(".claude/accounts");
+    let label = format!(
+        "csq.fixture.doctor.{}.{}",
+        std::process::id(),
+        home.path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_start_matches('.')
+    );
+    let mut probe = Command::new("/bin/launchctl");
+    probe
+        .env_clear()
+        .env("HOME", home.path())
+        .args(["list", &label]);
+    assert!(
+        matches!(
+            csq_core::cli_deps::cli_shim::probe_command_exit_code(probe),
+            csq_core::cli_deps::cli_shim::ProbeOutcome::Ok(113)
+        ),
+        "fixture label must actually be absent"
+    );
+    let plist = home
+        .path()
+        .join("Library/LaunchAgents/foundation.terrene.csq.plist");
+    std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    std::fs::write(
+        &plist,
+        b"<?xml version=\"1.0\"?><plist version=\"1.0\"><dict/></plist>",
+    )
+    .unwrap();
+    let text = bounded_managed_service_fixture_output(
+        isolated_cli_shim_doctor_cmd(home.path(), &base)
+            .env("CSQ_TEST_LAUNCHD_LABEL", &label)
+            .env("CSQ_TEST_FORBID_MANAGED_LAUNCHCTL", "1")
+            .arg("doctor"),
+    );
+    assert!(text.status.success());
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(
+        text.contains("managed service not loaded"),
+        "actual unloaded job must warn: {text}"
+    );
+    assert!(
+        text.contains("rerun the desktop CLI refresh to register the managed service"),
+        "unloaded service warning must name a concrete recovery action: {text}"
+    );
+    assert!(!text.contains("managed daemon is loaded but stopped"));
+    assert!(!text.contains(home.path().to_str().unwrap()));
+    let out = bounded_managed_service_fixture_output(
+        isolated_cli_shim_doctor_cmd(home.path(), &base)
+            .env("CSQ_TEST_LAUNCHD_LABEL", &label)
+            .env("CSQ_TEST_FORBID_MANAGED_LAUNCHCTL", "1")
+            .args(["doctor", "--json"]),
+    );
+    assert!(out.status.success());
+    let json: Value = serde_json::from_slice(&out.stdout).unwrap();
+    // Spec 13 §9 and both edition-active doctor constants pin v34 (v33 Codex hook-trust carry diagnostics + v34 keychain_orphans).
+    assert_eq!(json["schema_version"], 34);
+    assert_eq!(json["cli_shim"]["managed_plist_installed"], true);
+    assert_eq!(json["cli_shim"]["managed_service_state"], "not_loaded");
+    assert!(json["cli_shim"].get("managed_job_loaded").is_none());
+    assert!(!String::from_utf8(out.stdout)
+        .unwrap()
+        .contains(home.path().to_str().unwrap()));
+}
+
+/// The fixture selects only its native absent job. Any accidentally reached
+/// lifecycle executor panics before a real launchctl mutation can be spawned.
+#[cfg(all(target_os = "macos", feature = "test-utils"))]
+#[test]
+fn r0_l2_uninstall_absent_service_binary_reports_not_installed_without_mutation() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let home = TempDir::new().unwrap();
+    let base = home.path().join(".claude/accounts");
+    let label = format!(
+        "csq.fixture.doctor.uninstall.{}.{}",
+        std::process::id(),
+        home.path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_start_matches('.')
+    );
+    let mut probe = Command::new("/bin/launchctl");
+    probe
+        .env_clear()
+        .env("HOME", home.path())
+        .args(["list", &label]);
+    assert!(
+        matches!(
+            csq_core::cli_deps::cli_shim::probe_command_exit_code(probe),
+            csq_core::cli_deps::cli_shim::ProbeOutcome::Ok(113)
+        ),
+        "fixture label must actually be absent"
+    );
+    let plist = home
+        .path()
+        .join("Library/LaunchAgents/foundation.terrene.csq.plist");
+    assert_eq!(
+        std::fs::symlink_metadata(&plist).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    let output = bounded_managed_service_fixture_output(
+        isolated_cli_shim_doctor_cmd(home.path(), &base)
+            .env("CSQ_TEST_LAUNCHD_LABEL", &label)
+            .env("CSQ_TEST_FORBID_MANAGED_LAUNCHCTL", "1")
+            .args(["daemon", "uninstall"]),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "status={:?}; stderr={stderr}",
+        output.status
+    );
+    assert_eq!(stderr, "csq daemon service not installed.\n");
+    assert!(!stderr.contains("uninstalled"));
+    assert!(!stderr.contains("Removed:"));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        std::fs::symlink_metadata(&plist).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+}
+
+// ── keychain orphan sweep status (doctor v34) ────────────────────────────────
+
+/// A status document as the daemon's orphan sweep writes it.
+#[cfg(unix)]
+fn orphan_status_json(undetermined: Option<&str>) -> Value {
+    serde_json::json!({
+        "checked_at_unix_secs": 1_800_000_000u64,
+        "keychain_items": 5,
+        "foreign_items": 1,
+        "orphan_candidates": 3,
+        "pending": 2,
+        "deleted_total": 4,
+        "kept_sole_copy": 1,
+        "kept_pid_in_use": 6,
+        "kept_revived_after_read": 7,
+        "kept_process_table_unknown": 10,
+        "kept_other": 8,
+        "undetermined": undetermined,
+    })
+}
+
+/// Run doctor in both output modes against `base` and return `(json, text)`.
+#[cfg(unix)]
+fn doctor_both(base: &std::path::Path) -> (Value, String) {
+    let path = std::env::var("PATH").expect("PATH");
+    (run_doctor_json(base, &path), run_doctor_text(base, &path))
+}
+
+/// Present: the published counts reach the JSON report verbatim and the text
+/// report names the candidate/total counts. RED against a doctor that does not
+/// read the status file at all.
+#[test]
+#[cfg(unix)]
+fn doctor_reports_the_published_keychain_orphan_counts_in_json_and_text() {
+    let _serial_guard = SERIAL.lock().unwrap_or_else(|p| {
+        SERIAL.clear_poison();
+        p.into_inner()
+    });
+    let base = TempDir::new().unwrap();
+    std::fs::write(
+        base.path().join("keychain-orphan-sweep.json"),
+        orphan_status_json(None).to_string(),
+    )
+    .unwrap();
+
+    let (json, text) = doctor_both(base.path());
+    assert_eq!(json["keychain_orphans"]["orphan_candidates"], 3);
+    assert_eq!(json["keychain_orphans"]["keychain_items"], 5);
+    assert_eq!(json["keychain_orphans"]["deleted_total"], 4);
+    assert_eq!(json["keychain_orphans"]["kept_pid_in_use"], 6);
+    assert_eq!(json["keychain_orphans"]["kept_process_table_unknown"], 10);
+    assert_eq!(json["keychain_orphans"]["undetermined"], Value::Null);
+    assert!(json.get("keychain_orphans_error").is_none(), "{json}");
+    let line = text
+        .lines()
+        .find(|l| l.contains("Keychain orphans:"))
+        .unwrap_or_else(|| panic!("no orphan line in doctor text:\n{text}"));
+    assert!(line.contains("3 of 5"), "{line}");
+    assert!(line.contains("4 deleted"), "{line}");
+}
+
+/// Absent: no status file means the daemon never published, and neither report
+/// invents a line or a key. RED against a doctor that always prints the row.
+#[test]
+#[cfg(unix)]
+fn doctor_omits_keychain_orphans_when_the_sweep_never_published() {
+    let _serial_guard = SERIAL.lock().unwrap_or_else(|p| {
+        SERIAL.clear_poison();
+        p.into_inner()
+    });
+    let base = TempDir::new().unwrap();
+    let (json, text) = doctor_both(base.path());
+    assert!(json.get("keychain_orphans").is_none(), "{json}");
+    assert!(json.get("keychain_orphans_error").is_none(), "{json}");
+    assert!(!text.contains("Keychain orphans"), "{text}");
+}
+
+/// A status file that exists but is not a status is an explicit error in BOTH
+/// reports, not "never published". RED against a reader that maps a parse
+/// failure to `None`.
+#[test]
+#[cfg(unix)]
+fn doctor_reports_a_corrupt_keychain_orphan_status_as_an_error() {
+    let _serial_guard = SERIAL.lock().unwrap_or_else(|p| {
+        SERIAL.clear_poison();
+        p.into_inner()
+    });
+    let base = TempDir::new().unwrap();
+    std::fs::write(
+        base.path().join("keychain-orphan-sweep.json"),
+        b"{\"checked",
+    )
+    .unwrap();
+
+    let (json, text) = doctor_both(base.path());
+    assert_eq!(json["keychain_orphans_error"], "corrupt");
+    assert!(json.get("keychain_orphans").is_none(), "{json}");
+    let line = text
+        .lines()
+        .find(|l| l.contains("Keychain orphans:"))
+        .unwrap_or_else(|| panic!("no orphan line in doctor text:\n{text}"));
+    assert!(line.contains("corrupt"), "{line}");
+}
+
+/// An UNDETERMINED cycle surfaces its fixed reason token in both reports.
+#[test]
+#[cfg(unix)]
+fn doctor_reports_an_undetermined_keychain_orphan_cycle() {
+    let _serial_guard = SERIAL.lock().unwrap_or_else(|p| {
+        SERIAL.clear_poison();
+        p.into_inner()
+    });
+    let base = TempDir::new().unwrap();
+    std::fs::write(
+        base.path().join("keychain-orphan-sweep.json"),
+        orphan_status_json(Some("enumeration_unavailable")).to_string(),
+    )
+    .unwrap();
+
+    let (json, text) = doctor_both(base.path());
+    assert_eq!(
+        json["keychain_orphans"]["undetermined"],
+        "enumeration_unavailable"
+    );
+    let line = text
+        .lines()
+        .find(|l| l.contains("Keychain orphans:"))
+        .unwrap_or_else(|| panic!("no orphan line in doctor text:\n{text}"));
+    assert!(line.contains("enumeration_unavailable"), "{line}");
+    assert!(line.contains("nothing was deleted"), "{line}");
 }

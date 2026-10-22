@@ -4519,7 +4519,6 @@ pub(crate) mod tests {
         // THIS test harness process if run in-process, so it is exercised
         // via a subprocess, mirroring `relaunch_failure_helper`'s pattern.
         let exe = std::env::current_exe().expect("current test exe");
-        let started = std::time::Instant::now();
         let output = std::process::Command::new(exe)
             .arg("cli::commands::codex_supervise::tests::sigint_disposition_helper")
             .arg("--exact")
@@ -4527,17 +4526,25 @@ pub(crate) mod tests {
             .arg("--ignored")
             .output()
             .expect("spawn self as sigint-disposition helper");
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(3),
+        // STRUCTURAL, not a wall clock: the helper's child kills itself with
+        // SIGINT, so the fixed path terminates at run_supervised_unix's
+        // non-zero-exit branch with 128 + SIGINT = 130. A child that inherited
+        // SIG_IGN survives its `sleep 5` and exits 0; the helper then RETURNS
+        // from run_supervised and dies on its own panic (exit 101). The three
+        // outcomes are distinct exit codes regardless of host load, where an
+        // elapsed bound re-sampled scheduling latency (2026-10-21 sign-off:
+        // 3.45 s for a correct run under the full parallel set).
+        assert_eq!(
+            output.status.code(),
+            Some(128 + libc::SIGINT),
             "the supervised child must die from its OWN self-delivered SIGINT \
              (default disposition, because C-F1 installs the supervisor's \
              SIG_IGN AFTER spawn) rather than survive past its `sleep 5` under \
-             an inherited SIG_IGN, elapsed={elapsed:?}"
-        );
-        assert!(
-            !output.status.success(),
-            "a child killed by its own SIGINT is a non-zero exit for csq"
+             an inherited SIG_IGN; csq must exit 128 + SIGINT = {} — status={:?} \
+             stderr={:?}",
+            128 + libc::SIGINT,
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
@@ -4577,7 +4584,6 @@ pub(crate) mod tests {
         // before_child_exec`: a successfully-delivered SIGINT drives
         // `process::exit`.
         let exe = std::env::current_exe().expect("current test exe");
-        let started = std::time::Instant::now();
         let output = std::process::Command::new(exe)
             .arg("cli::commands::codex_supervise::tests::run_unsupervised_fallback_sigint_helper")
             .arg("--exact")
@@ -4585,19 +4591,24 @@ pub(crate) mod tests {
             .arg("--ignored")
             .output()
             .expect("spawn self as run-unsupervised-fallback-sigint helper");
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(3),
+        // STRUCTURAL, same class as the C-F1 row above, but this branch is
+        // `run_unsupervised`, whose non-success exit is
+        // `exit(s.code().unwrap_or(1))` — a signal-killed child has no code, so
+        // the FIXED path exits exactly 1. A child that inherited SIG_IGN
+        // survives its `sleep 5`, exits 0, the helper returns from
+        // run_supervised and dies on its own panic (exit 101). No wall clock.
+        assert_eq!(
+            output.status.code(),
+            Some(1),
             "C-R4-2: reset_signal_dispositions_before_exec runs BEFORE the \
              write_supervisor_record check, so the run_unsupervised FALLBACK \
              (taken here because the handle dir is read-only) must ALSO \
              reset SIGINT to SIG_DFL before spawning — the child must die \
              from its own self-delivered SIGINT rather than survive under \
-             an inherited SIG_IGN, elapsed={elapsed:?}"
-        );
-        assert!(
-            !output.status.success(),
-            "a child killed by its own SIGINT is a non-zero exit for csq"
+             an inherited SIG_IGN; the fallback maps that signal death to \
+             exit 1 — status={:?} stderr={:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -5025,7 +5036,6 @@ pub(crate) mod tests {
         // non-zero exit drives `std::process::exit`, which would kill this
         // test harness if run in-process.
         let exe = std::env::current_exe().expect("current test exe");
-        let started = std::time::Instant::now();
         let output = std::process::Command::new(exe)
             .arg("cli::commands::codex_supervise::tests::relaunch_sigint_disposition_helper")
             .arg("--exact")
@@ -5033,19 +5043,25 @@ pub(crate) mod tests {
             .arg("--ignored")
             .output()
             .expect("spawn self as relaunch-sigint-disposition helper");
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(3),
+        // Same structural instrument as the C-F1 row above, applied to the
+        // RELAUNCHED child: 130 is the fixed path; a child that inherited the
+        // supervisor's SIG_IGN survives its `sleep 5`, the helper returns from
+        // run_supervised and dies on its own panic (101). No wall clock — the
+        // 2026-10-21 sign-off reddened this row at elapsed=3.45 s for a CORRECT
+        // run under the full parallel set.
+        assert_eq!(
+            output.status.code(),
+            Some(128 + libc::SIGINT),
             "the RELAUNCHED child must die from its OWN self-delivered SIGINT \
              (default disposition, because FM-1's `reset_signal_dispositions_\
              before_exec` resets it on EVERY spawn, including a relaunch — \
              not just the first) rather than survive past its `sleep 5` under \
              the supervisor's SIG_IGN (installed after the FIRST child, and \
-             inherited by fork+exec absent this fix), elapsed={elapsed:?}"
-        );
-        assert!(
-            !output.status.success(),
-            "a relaunched child killed by its own SIGINT is a non-zero exit"
+             inherited by fork+exec absent this fix); csq must exit \
+             128 + SIGINT = {} — status={:?} stderr={:?}",
+            128 + libc::SIGINT,
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 

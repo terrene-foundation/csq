@@ -77,11 +77,12 @@
 //
 // Both states are recorded in the receipt so the disposition stays auditable
 // instead of invisible; only their NOISE differs.
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
 import { randomUUID, createHash } from "node:crypto";
-import { parseFooter, measuredScript, signoffScript, signoffVerdict, retainOutput, lockedScript, cachedScript, runGateWorkers, aggregateExit, createFleetScope, acquireFleetSlotSync, COMMUNITY_EXTRACTION_COMMAND } from "./preflight-runtime.mjs";
+import { parseFooter, measuredScript, signoffScript, signoffVerdict, retainOutput, lockedScript, cachedScript, runGateWorkers, aggregateExit, createFleetScope, acquireFleetSlot, acquireFleetSlotSync, COMMUNITY_EXTRACTION_COMMAND, prunePreflightEvidence, stopLiveCaptures, shouldSignalGroup, CALLER_KILL_GRACE_MS, WORKER_KILL_GRACE_MS, LEG_ATTEMPTS, LEG_ADMISSION_WAIT_MS, LEG_RETRY_WAIT_S, gateDeadlineMsFor, attemptBoundMsFor, retryFits, engineRetryFits } from "./preflight-runtime.mjs";
+import { supervise, installStopHandlers, exitAfterBackstops, STOP_LATCH_REFUSAL } from "./child-supervisor.mjs";
 import { runShellGate, homeTilde, errIdent, isOwnEvidencePath, shownEvidencePath, isRelPath, SHA256_RE } from "./preflight-shell-tests.mjs";
 import {
   existsSync,
@@ -114,7 +115,7 @@ if (process.argv.includes("--help") || process.argv.includes("-h")) {
       "  fixture subsets never write a canonical receipt.\n" +
       "  Exit: 0 GREEN, 1 RED, 2 UNDETERMINED.",
   );
-  process.exit(0);
+  await exitAfterBackstops(0);
 }
 
 let activeGateCapture = null;
@@ -140,6 +141,17 @@ function sh(cmd, args, cwd, extraEnv) {
 }
 
 const ROOT = sh("git", ["rev-parse", "--show-toplevel"], process.cwd()).trim();
+// EVERY heavy leg fetches the lockfile FIRST, online, EXCEPT a leg that opts
+// out because it must not run cargo at all (community extraction). Fleet hosts
+// keep their own offline crate caches, so a lock bump can add a crate no host
+// has; the offline legs (license generation runs `cargo metadata --offline`)
+// then red as UNDETERMINED on a correct tree (2026-10-21: webpki-root-certs
+// 1.0.10 after the rustsec bump). The fetch is not fatal on its own: if it
+// fails, its warning is printed and the leg reports its own state rather than
+// pre-empting it. Declared HERE because the print-only path below reaches
+// heavyScript during module evaluation, before this file finishes loading.
+const LEG_LOCKFILE_FETCH =
+  "cargo fetch --locked >/dev/null 2>&1 || printf '%s\\n' 'dev-preflight: cargo fetch --locked failed; an offline leg may be UNDETERMINED' >&2;";
 // Print-only requests need workflow bytes and argv construction. Route them
 // before fleet-scope creation and tree fingerprinting, whose Git operations
 // can block a read-only derivation behind unrelated checkout work.
@@ -148,20 +160,37 @@ if (printStep) {
   const d = deriveStepCommand(printStep);
   if (d.err) {
     console.error(d.err);
-    process.exit(2);
+    await exitAfterBackstops(2);
   }
   console.log(process.env.DEV_PREFLIGHT_SHOW_WRAPPED
     ? JSON.stringify(trestleArgv(d.cmd, d.env, { os: "linux" }))
     : d.cmd);
-  process.exit(0);
+  await exitAfterBackstops(0);
 }
 // Preserve the print-only exception, then refuse recursive full preflight
 // before creating a fleet scope or writing a fingerprint index.
 const ONLY = process.env.DEV_PREFLIGHT_ONLY || "";
-if (process.env.DEV_PREFLIGHT_IN_SELFTEST && !ONLY) { console.error("UNDETERMINED: refusing to re-enter preflight from a self-test without a subset"); process.exit(2); }
+if (process.env.DEV_PREFLIGHT_IN_SELFTEST && !ONLY) { console.error("UNDETERMINED: refusing to re-enter preflight from a self-test without a subset"); await exitAfterBackstops(2); }
 const RECEIPT = join(ROOT, ".csq-dev-preflight.json");
 // A canonical parent creates its own scope; native workers inherit that scope.
 const FLEET_ENV = process.env.CSQ_PREFLIGHT_WORKER_TOKEN ? process.env : { ...process.env, ...createFleetScope() };
+// Writer-owned evidence retention, ONCE per preflight: the canonical parent
+// prunes this uid's stale csq-preflight-output-* dirs at start; forked workers
+// inherit the same TMPDIR and must not repeat the pass. Every dir the run is
+// about to create is fresh, so the age guard leaves it alone.
+if (!process.env.CSQ_PREFLIGHT_WORKER_TOKEN) {
+  // A refused override (a canonical run may not redirect the evidence roots)
+  // is a NAMED cannot-measure, never an uncaught crash: the refusal used to
+  // escape as exit 1 with a stack, which an operator cannot classify (D237 R2
+  // LOW-3).
+  let pruned;
+  try { pruned = prunePreflightEvidence(); }
+  catch (e) {
+    console.error(`dev-preflight: UNDETERMINED — evidence retention refused (${errIdent(e)}). No receipt written.`);
+    await exitAfterBackstops(2);
+  }
+  if (pruned.removed) console.log(`EVIDENCE_RETENTION pruned=${pruned.removed} examined=${pruned.examined}`);
+}
 
 // The receipt must describe the state the gates ACTUALLY RAN AGAINST.
 // Reading HEAD only at the END let a run bind its receipt to a commit made
@@ -264,7 +293,10 @@ function heavyScript(cmd, env, opts = {}) {
     .map(([k, v]) => `export ${k}=${shq(v)};`)
     .join(" ");
   const body = signoffScript(cmd, opts.leg || { token: randomUUID(), fixture: !!process.env.DEV_PREFLIGHT_ONLY && process.env.CSQ_PREFLIGHT_CANONICAL_WORKER !== "1" });
-  return measuredScript(cachedScript(`${exports}\n${body}`));
+  // A leg that must not invoke cargo (community extraction: it proves the
+  // public tree materializes without prebuilding the test stub) opts out.
+  const lockfileFetch = opts.leg?.lockfileFetch === false ? "" : `${LEG_LOCKFILE_FETCH}\n`;
+  return measuredScript(cachedScript(`${exports}\n${lockfileFetch}${body}`));
 }
 
 // The argv handed to trestle. Pure, so the self-test can assert its shape.
@@ -297,11 +329,221 @@ function ownThrowCause(e) {
   return typeof e?.message === "string" && KNOWN_OWN_THROWS.has(e.message) ? e.message : errIdent(e);
 }
 const heavyEvidence = [];
+// ── THE CALLER-SIDE LEG BOUND, derived from the ENFORCED budget on the same work
+// in CI. `.github/workflows/test.yml`, job `rust-test` (matrix os), step "Run
+// tests", declares `timeout-minutes: 60` — raised 25 -> 60 for an internal ticket after four
+// consecutive step timeouts on a diff containing ZERO Rust, with successful runs
+// of the workflow measured at 8–72 minutes wall-clock under contention. A leg
+// cannot legitimately take longer than the CI step that runs it under that
+// enforced bound, and the local caller also pays offload transport the step does
+// not; 60 minutes of enforced work plus a 5-minute transport allowance is
+// therefore the caller bound.
+//
+// A caller bound SHORTER than the enforced budget is not a bound on the work,
+// only on patience. Measured 2026-10-18: preflight sign-offs #2 (tree
+// 050b39bec) and #3 (tree f7cc0fd15), BOTH os lib-bins legs, retained evidence
+// status=null signal=SIGKILL error_code=ETIMEDOUT elapsed_ms=1800000 — exactly
+// the old 30-minute spawnSync timeout, fired while the tests were still
+// progressing, then reported as "trestle exit null … unclassifiable". The
+// defect was the caller bound, not the leg.
+const LEG_CALLER_TIMEOUT_MS = 65 * 60 * 1000;
+// STALL WINDOW for the cargo-test legs (D237 rule 8). A darwin lib-bins leg
+// hung 64+ minutes and the caller bound above could only say "the leg did not
+// finish". scripts/ci/test-watchdog.mjs watches libtest's result stream and fires
+// when the binary has COMPLETED NO TEST for this window — NOT on a single test's
+// elapsed age, which includes time spent queued behind a process-global test
+// lock (measured 2026-10-20: a trivial pty test at 115.7-173 s under load vs
+// 2.6 s alone; ROOT ruling 2026-10-20). On a stall it names EVERY open test with
+// its age, samples stacks BEFORE any signal, and kills the group; the caller
+// bound stays the outer backstop.
+//
+// DERIVED FROM THE ENFORCED WORST CASE a POSITIVE-path test can legitimately
+// block on, never from a measured typical. The largest such bound is the
+// messaging watcher deadline: `deliver_with(..., timeout, drain_wait, deadline)`
+// receives `Instant::now() + Duration::from_secs(300)` in the wake/deferred rows
+// (csq-core/src/messaging/wake.rs, messaging/deferred.rs) and cuts its lock wait,
+// spawn budget and drain watch to what remains of it. Once the fast tests have
+// drained, the serialized tail can be ONE such test, so the permitted
+// no-completion gap must exceed its full envelope:
+//   POSITIVE_WAIT_ENVELOPE_MS  300 s — the enforced deadline above
+// + TEST_TEARDOWN_MARGIN_MS      60 s — 20%: the wait's expiry, the test's
+//                                      conclusion, and scheduler jitter on a
+//                                      loaded fleet host
+// = PER_TEST_WATCHDOG_MS        360 s
+//
+// The previous 120 s AGE bound was ~446x the slowest HEALTHY measured test
+// (elapsed_ms=269, 2026-10-18, ovh-1) — a measured typical bounds nothing — and
+// it sat exactly on the enforced 120 s receives. It killed a healthy test queued
+// behind an unrelated lock holder at elapsed_ms=120392 and 120257 on linux
+// (2026-10-20), and darwin's slowest healthy test measured 115.7 s. The window
+// now bounds STALLED PROGRESS, so a queued waiter behind live progress is never
+// killed and a wedge costs at most the suite time plus this window. The
+// watchdog's own timeout rows pass an explicit short bound and are unaffected.
+const POSITIVE_WAIT_ENVELOPE_MS = 300 * 1000;
+const TEST_TEARDOWN_MARGIN_MS = 60 * 1000;
+const PER_TEST_WATCHDOG_MS = POSITIVE_WAIT_ENVELOPE_MS + TEST_TEARDOWN_MARGIN_MS;
+// CALLER_KILL_GRACE_MS (the TERM → KILL grace) and the deadline arithmetic are
+// defined ONCE in preflight-runtime.mjs: runGateWorkers uses the same ladder one
+// level up, and the self-tests assert the arithmetic directly from the module.
+// ── ONE PER-GATE DEADLINE. Every wait a single gate can legitimately do draws
+// from this ONE clock — no phase has its own independent bound:
+//   admission (x2) LEG_ADMISSION_WAIT_MS  30 min EACH attempt (acquireFleetSlotSync's
+//              own enforced ceiling; FLEET_SHARE_CAP 6 vs the ≥13 workers this
+//              file launches at once, so one attempt can wait the full 30)
+//   attempt 1      leg bound              65 min (LEG_CALLER_TIMEOUT_MS)
+//   attempt 2      leg + retry wait       75 min (the --wait-s is spent INSIDE
+//              the trestle invocation, so the retry's caller bound must cover
+//              both or the leg itself would be cut short by up to 10 min)
+//   ─────────────────────────────────────────
+//   GATE_DEADLINE_MS                     200 min
+// A retry starts ONLY when admission + retry wait + a FULL leg still remain on
+// this clock; else runHeavy returns a named UNDETERMINED ("gate deadline
+// exhausted"). The worker watchdog is this deadline PLUS
+// WORKER_WATCHDOG_GRACE_MS — the worker must outlive everything runHeavy is
+// still allowed to wait for, plus its cleanup and report.
+function gateDeadlineMs() {
+  return gateDeadlineMsFor(legCallerTimeoutMs());
+}
+const WORKER_WATCHDOG_GRACE_MS = 5 * 60 * 1000;
+function workerWatchdogMs() {
+  return gateDeadlineMs() + WORKER_WATCHDOG_GRACE_MS;
+}
+// Fixture/diagnostic hook: print the DERIVED bounds so the self-test can assert
+// the arithmetic with scaled-down constants, and a canonical regression can
+// prove that a leaked fixture override cannot shorten a real run. Prints only
+// when explicitly asked; the receipt is unaffected.
+if (process.env.DEV_PREFLIGHT_PRINT_BOUNDS) {
+  console.log(`PREFLIGHT_BOUNDS leg_ms=${legCallerTimeoutMs()} deadline_ms=${gateDeadlineMs()} watchdog_ms=${workerWatchdogMs()}`);
+}
+// Fixture-only test hook: DEV_PREFLIGHT_ONLY selects a gate and lowers the bound
+// so the timeout path costs seconds. It is honored ONLY in a fixture worker
+// (`CSQ_PREFLIGHT_CANONICAL_WORKER !== "1"`), so a canonical run can never be
+// shortened by an environment variable that leaked into it; the canonical
+// launcher also strips the key before forking real workers
+// (preflight-runtime.mjs). The value is passed through RAW, never clamped:
+// non-numeric, non-positive, and ABOVE the production bound are all REFUSED by
+// name by runHeavy — a silent clamp would hide a broken fixture, and an
+// oversized value can overflow the timer (2^31 ms) and fire immediately.
+function fixtureLegBoundAllowed() {
+  return !!ONLY && process.env.CSQ_PREFLIGHT_CANONICAL_WORKER !== "1";
+}
+function legCallerTimeoutMs() {
+  if (fixtureLegBoundAllowed() && process.env.DEV_PREFLIGHT_LEG_TIMEOUT_MS) {
+    const raw = Number(process.env.DEV_PREFLIGHT_LEG_TIMEOUT_MS);
+    if (Number.isFinite(raw) && raw > 0 && raw <= LEG_CALLER_TIMEOUT_MS) return raw;
+  }
+  return LEG_CALLER_TIMEOUT_MS;
+}
+function legCallerTimeoutOverrideInvalid() {
+  if (!fixtureLegBoundAllowed() || !process.env.DEV_PREFLIGHT_LEG_TIMEOUT_MS) return false;
+  const raw = Number(process.env.DEV_PREFLIGHT_LEG_TIMEOUT_MS);
+  return !(Number.isFinite(raw) && raw > 0 && raw <= LEG_CALLER_TIMEOUT_MS);
+}
+// Captured output (UTF-16 code units; streams are decoded with setEncoding) from
+// one leg before it is stopped. Above this the run is a named OUTPUT_LIMIT, not
+// an unbounded string build — the old 512 Mi value could reach a RangeError
+// before any bound fired.
+const OUTPUT_CAP_CHARS = 256 * 1024 * 1024;
+// One bounded trestle run, ASYNC so the caller can stop it gracefully.
+//
+// SIGNAL DIVISION: the leg is spawned DETACHED, in its own process group whose
+// id is the trestle pid. A stop therefore signals the GROUP — trestle and every
+// descendant that STAYED in it. A descendant that left the group (setsid) is
+// NOT reached; that consequence is stated, not hidden. A pid-only
+// SIGTERM/SIGKILL reaches even less: the review probe found a child of the
+// launcher still alive 1 s after the leader exited.
+//
+// TERM THEN KILL, ON THE GROUP: stop() on a LIVE leader sends SIGTERM to the
+// group once and arms ONE KILL backstop, fired after CALLER_KILL_GRACE_MS while
+// the group still has members (kill(-pgid) is ESRCH once empty; tolerated). The
+// backstop is cancelled ONLY when the leader's exit observes an EMPTY group; a
+// leader that exits while its helpers survive keeps it armed. A stop aimed at
+// an ALREADY-EXITED leader sends nothing at all — the supervisor's rule, since
+// a reused pgid is the greater hazard. Settlement waits for an armed backstop.
+//
+// PIPE DIVISION: settlement is on `exit`, not `close`: a descendant that
+// inherited the pipes can hold them open after the leader is gone, so `close`
+// may never fire (a hang with no bound). After exit we give OUR stream ends a
+// short drain, destroy them, and settle; whether the group still has members is
+// the backstop's business, not the pipe's.
+// STOP LATCH (R1 MED-1, 2026-10-18). A stop signal must not be followed by a new
+// attempt: runHeavy's retry path (a retryable footer 113/104/116 or an engine
+// 114/2) would otherwise start attempt 2 as a fresh detached group AFTER the
+// handlers ran, so nothing would ever signal it — the worker group's SIGKILL and
+// the parent's exit both land first, and the new group is orphaned holding a
+// fleet slot. Every admission and every spawn is gated on this latch; it is set
+// by the same handlers that stop the live legs.
+let stopping = null;
+function runTrestleBounded(argv, timeoutMs) {
+  return new Promise((resolve) => {
+    const started = performance.now();
+    // The ONE supervised spawner (child-supervisor.mjs) owns liveness, the stop
+    // set, the group probe and the KILL backstop. This function keeps only the
+    // caller's result collection and evidence.
+    const supervised = supervise("trestle", argv, { graceMs: CALLER_KILL_GRACE_MS,
+      spawn: { cwd: ROOT, env: FLEET_ENV, detached: process.platform !== "win32" } });
+    const child = supervised.child;
+    let stdout = "", stderr = "", bytes = 0, error = null, timedOut = false, settled = false;
+    let timer = null, drainTimer = null;
+    const settle = (status, signal) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (drainTimer) clearTimeout(drainTimer);
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      // Any armed backstop stays owned by the supervisor so the process exit
+      // path can await it (no process.exit with a live backstop).
+      supervised.dispose();
+      resolve({ status, signal, error, timedOut, stdout, stderr, elapsed_ms: performance.now() - started });
+    };
+    const scheduleDrain = (status, signal) => {
+      if (!drainTimer) drainTimer = setTimeout(() => {
+        drainTimer = null;
+        // A stop can land DURING this drain window (after the leader exited):
+        // settling now would exit the worker and discard the backstop that stop
+        // just armed (R3 MED-2). Wait for it first.
+        if (supervised.backstopArmed()) { supervised.awaitBackstop().then(() => scheduleDrain(status, signal)); return; }
+        settle(status, signal);
+      }, 250);
+    };
+    // Decode ONCE per stream: a multi-byte character split across chunks must
+    // not be mangled by per-chunk toString().
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    const collect = (which, chunk) => {
+      bytes += chunk.length;
+      if (bytes > OUTPUT_CAP_CHARS) { error = { code: "OUTPUT_LIMIT" }; supervised.stop("SIGTERM"); return; }
+      if (which === "stdout") stdout += chunk; else stderr += chunk;
+    };
+    child.stdout.on("data", (d) => collect("stdout", d));
+    child.stderr.on("data", (d) => collect("stderr", d));
+    // A spawn failure with no pid (ENOENT) would otherwise wait out the bound:
+    // settle from the error event with the named cause.
+    child.on("error", (e) => { error = { code: e.code ?? "SPAWN_ERROR" }; if (child.pid === undefined) settle(null, null); });
+    timer = setTimeout(() => {
+      // A stop already in flight keeps its classification: the bound must not
+      // relabel a signal-driven stop as a caller timeout.
+      if (supervised.backstopArmed()) return;
+      timedOut = true;
+      supervised.stop("SIGTERM");
+    }, timeoutMs);
+    // The supervisor already cancels the backstop when the group is empty at
+    // leader exit; here we wait for a live one so the KILL a TERM-ignoring
+    // helper needs is never discarded by settling early.
+    child.on("exit", (status, signal) => {
+      if (timer) clearTimeout(timer);
+      if (!supervised.backstopArmed()) scheduleDrain(status, signal);
+      else supervised.awaitBackstop().then(() => scheduleDrain(status, signal));
+    });
+  });
+}
 // Returns { ok, out } like tryRun, plus `und` (a string) when the step could
 // not be measured. A gate seeing `und` MUST return UNDETERMINED.
-function runHeavy(cmd, env, opts = {}) {
+async function runHeavy(cmd, env, opts = {}) {
   if (opts.leg && HEAVY_LOCAL) return { und: "sign-off legs require trestle footer evidence; local fixture bypass is unavailable" };
   if (HEAVY_LOCAL) return tryRun("bash", ["-c", lockedScript(cmd, { fixture: !!process.env.DEV_PREFLIGHT_ONLY && process.env.CSQ_PREFLIGHT_CANONICAL_WORKER !== "1" })], env);
+  if (legCallerTimeoutOverrideInvalid()) return { ok: false, out: "", und: `invalid DEV_PREFLIGHT_LEG_TIMEOUT_MS (must be a positive finite number of milliseconds, at most the ${Math.round(LEG_CALLER_TIMEOUT_MS / 1000)}s production bound)` };
   opts = { ...opts, leg: { token: randomUUID(), fixture: !!process.env.DEV_PREFLIGHT_ONLY && process.env.CSQ_PREFLIGHT_CANONICAL_WORKER !== "1", ...opts.leg } };
   if (!onPath("trestle")) {
     return {
@@ -312,18 +554,47 @@ function runHeavy(cmd, env, opts = {}) {
   }
   let waitS;
   let lastWhy = "";
-  for (let attempt = 0; attempt < 2; attempt++) {
+  // All waits draw from the ONE per-gate deadline (see the constant's comment):
+  // admission, each attempt's leg bound, and every retry wait are clamped to
+  // what remains, and a retry that cannot fit a FULL leg bound is refused by
+  // name rather than silently started.
+  const deadline = performance.now() + gateDeadlineMs();
+  const remainingMs = () => deadline - performance.now();
+  const exhausted = () => ({
+    ok: false,
+    out: "",
+    und: `gate deadline exhausted — ${Math.max(0, Math.round(remainingMs() / 1000))}s remains of ${Math.round(gateDeadlineMs() / 1000)}s; a retry needs admission + retry wait + a full leg bound (${Math.round((LEG_ADMISSION_WAIT_MS + LEG_RETRY_WAIT_S * 1000 + legCallerTimeoutMs()) / 1000)}s). NOT a verdict on the command`,
+  });
+  for (let attempt = 0; attempt < LEG_ATTEMPTS; attempt++) {
     let release, r;
+    let attemptBoundMs = 0;
+    // The stop latch is checked before EVERY attempt and again after admission:
+    // a signal that arrived during the previous attempt (or its verdict) must
+    // never be followed by a new detached group nothing would signal.
+    if (stopping) return { ok: false, out: "", und: `stopped by ${stopping} — no attempt started` };
     try {
-      release = acquireFleetSlotSync({ env: FLEET_ENV });
-      const attemptStarted = performance.now();
-      r = spawnSync("trestle", trestleArgv(cmd, env, { ...opts, waitS }), {
-        encoding: "utf8", cwd: ROOT, env: FLEET_ENV, stdio: ["ignore", "pipe", "pipe"],
-        maxBuffer: 512 * 1024 * 1024,
-        timeout: 30 * 60 * 1000, killSignal: "SIGKILL",
-      });
-      r.elapsed_ms = performance.now() - attemptStarted;
-    } catch (e) { return { ok: false, out: "", und: `caller fleet admission failed (${ownThrowCause(e)})` }; }
+      // ASYNC admission so a SIGTERM/SIGINT handler can run during the wait and
+      // stopWhen can interrupt it (the sync variant blocks the event loop for the
+      // whole span and can never observe a signal).
+      release = await acquireFleetSlot({ env: FLEET_ENV, waitMs: Math.min(LEG_ADMISSION_WAIT_MS, Math.max(1, Math.round(remainingMs()))), stopWhen: () => !!stopping });
+      if (stopping) return { ok: false, out: "", und: `stopped by ${stopping} — no attempt started` };
+      // A retry's bound must cover the --wait-s it spends INSIDE the trestle
+      // invocation plus a full leg; the first attempt pays only the leg. The
+      // arithmetic lives in preflight-runtime.mjs so the self-test asserts it
+      // directly, with no 30-minute wait and no re-derived copy to drift.
+      attemptBoundMs = attemptBoundMsFor(attempt, legCallerTimeoutMs(), remainingMs());
+      r = await runTrestleBounded(trestleArgv(cmd, env, { ...opts, waitS }), attemptBoundMs);
+    } catch (e) {
+      // The child supervisor refuses a new spawn once ITS stop latch is set
+      // (child-supervisor.mjs, D237 R2-M4). Name that fixed cause explicitly:
+      // reporting it as a fleet-admission failure misattributed which layer
+      // stopped the attempt, and hid the retry from the stop-latch proof.
+      if (e?.message === STOP_LATCH_REFUSAL) {
+        return { ok: false, out: "", und: "stopped — the leg spawn was refused by the stop latch (no attempt ran)" };
+      }
+      if (stopping) return { ok: false, out: "", und: `stopped by ${stopping} during admission — no attempt started` };
+      return { ok: false, out: "", und: `caller fleet admission failed (${ownThrowCause(e)})` };
+    }
     finally { try { release?.(); } catch { r = { ...r, error: { code: "FLEET_LEASE_RELEASE" } }; } }
     const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
     const f = parseFooter(r);
@@ -334,11 +605,28 @@ function runHeavy(cmd, env, opts = {}) {
         scope: "shared host cache counters before/after this command; concurrent processes may contribute" };
       heavyEvidence.push(evidence);
     } catch { return { ok: false, out, und: "could not retain heavy output" }; }
+    // A caller timeout is a NAMED cause, never "unclassifiable": the leg did not
+    // fail, the caller stopped it at the bound. Checked before the footer so a
+    // killed launcher's partial output cannot be misread as an engine failure.
+    if (r.timedOut) {
+      return {
+        ok: false,
+        out,
+        und: `caller timeout after ${Math.round(attemptBoundMs / 1000)}s — leg group killed (SIGTERM, then SIGKILL to the group after a ${Math.round(CALLER_KILL_GRACE_MS / 1000)}s grace); the remote run may be orphaned`,
+      };
+    }
+    if (r.error?.code === "OUTPUT_LIMIT") {
+      return {
+        ok: false,
+        out,
+        und: `leg output exceeded the ${Math.round(OUTPUT_CAP_CHARS / (1024 * 1024))} Mi captured-output cap — OUTPUT_LIMIT; the run was stopped and is not scored`,
+      };
+    }
     if (!f) {
       return {
         ok: false,
         out,
-        und: `trestle exit ${r.status} with no terminal framed stderr 'exit=N command|engine:<kind>|arbiter:<kind>' footer — unclassifiable, not scored`,
+        und: `trestle exit ${r.status}${r.signal ? ` (signal ${r.signal})` : ""}${r.error?.code ? ` (${r.error.code})` : ""} with no terminal framed stderr 'exit=N command|engine:<kind>|arbiter:<kind>' footer — unclassifiable, not scored`,
       };
     }
     if (f.kind === "command") {
@@ -350,13 +638,18 @@ function runHeavy(cmd, env, opts = {}) {
         porcelain: verdict.porcelain ?? null, rc: verdict.leg_rc ?? null, wall_ms: r.elapsed_ms };
       return { ...verdict, out, wall_ms: r.elapsed_ms };
     }
-    if (attempt === 0 && [113, 104, 116].includes(f.code)) { waitS = 600; continue; }
+    if (attempt === 0 && [113, 104, 116].includes(f.code)) {
+      // The retry pays its own admission wait and --wait-s and then runs a full
+      // leg; all three must fit inside what remains of the ONE deadline.
+      if (!retryFits(remainingMs(), legCallerTimeoutMs())) return exhausted();
+      waitS = LEG_RETRY_WAIT_S;
+      continue;
+    }
     if (f.kind === "arbiter") return { ok: false, out, und: `offload arbiter:${f.arbiter} exit=${f.code} — NOT a command verdict; not retried` };
     // engine failure: the command's own verdict was never produced
     lastWhy = `engine:${f.engine} exit=${f.code}`;
-    if (attempt === 0 && (f.code === 114 || f.code === 2)) continue;
-    if (attempt === 0 && f.code === 116) {
-      waitS = 600;
+    if (attempt === 0 && (f.code === 114 || f.code === 2)) {
+      if (!engineRetryFits(remainingMs(), legCallerTimeoutMs())) return exhausted();
       continue;
     }
     return { ok: false, out, und: `offload failed (${lastWhy}) — NOT a verdict on the command; re-run` };
@@ -376,8 +669,52 @@ const gates = [], registered = [];
 let treeMovedAfter = null;
 const worker = !!process.env.CSQ_PREFLIGHT_WORKER_TOKEN;
 if (worker && typeof process.send !== "function") {
-  console.error("UNDETERMINED: worker mode requires its parent's native IPC channel"); process.exit(2);
+  console.error("UNDETERMINED: worker mode requires its parent's native IPC channel"); await exitAfterBackstops(2);
 }
+// A worker's legs are DETACHED in their own groups, so a signal to the worker's
+// group reaches none of them: forward a stop to every live leg, and each leg
+// signals its own group TERM→KILL. The handler deliberately does NOT exit — a
+// stopped leg settles into the normal gate flow, which reports the row and
+// exits the worker. The parent/watchdog escalates to a worker-group SIGKILL
+// after WORKER_KILL_GRACE_MS if this worker never gets there.
+// ONE stop set for every child this process owns (legs, captures, gate
+// workers): installStopHandlers registers TERM/INT/HUP, records the latch and
+// drains the whole set (child-supervisor.mjs). `stopping` mirrors the latch for
+// the gate-level decisions. A parent schedules its exit after the grace, and
+// the exit itself goes through exitAfterBackstops so no armed backstop is
+// discarded (D237 R3 N1, structurally).
+// FIXTURE SEAM (subset runs only, like the other fixture knobs): the stop →
+// forced-exit grace is WORKER_KILL_GRACE_MS + 500 in production. A row that
+// needs to drive the path where the gate flow does NOT settle before the timer
+// (the "green row lost the race" case) shortens it, so the branch is exercised
+// deterministically instead of depending on which side of a 3.5 s race wins.
+function forcedExitDelayMs() {
+  const raw = process.env.DEV_PREFLIGHT_FORCED_EXIT_MS;
+  const production = WORKER_KILL_GRACE_MS + 500;
+  if (raw === undefined) return production;
+  if (!fixtureLegBoundAllowed()) return production;
+  const value = Number(raw);
+  if (!(Number.isFinite(value) && value > 0 && value <= production)) return Number.NaN;
+  return value;
+}
+const FORCED_EXIT_DELAY_MS = forcedExitDelayMs();
+if (Number.isNaN(FORCED_EXIT_DELAY_MS)) {
+  console.error(`dev-preflight: UNDETERMINED — invalid DEV_PREFLIGHT_FORCED_EXIT_MS (must be a positive finite number of milliseconds, at most the production ${WORKER_KILL_GRACE_MS + 500})`);
+  await exitAfterBackstops(2);
+}
+installStopHandlers({ onStop: (signal) => {
+  stopping ??= signal;
+  if (!worker) {
+    const code = signal === "SIGTERM" ? 143 : signal === "SIGHUP" ? 129 : 130;
+    setTimeout(async () => {
+      // A stopped run is NAMED even when the grace wins: this path previously
+      // exited silently, so a run that lost the settle race carried no record
+      // of the stop (zero-tolerance Rule 3 — no silent exit on a stop path).
+      console.log(`dev-preflight: UNDETERMINED — stopped by ${signal} — forced exit before the gate flow settled. No receipt written.`);
+      await exitAfterBackstops(code);
+    }, FORCED_EXIT_DELAY_MS);
+  }
+}});
 // ── RED EVIDENCE: ALLOWLIST-ONLY OUTPUT ─────────────────────────────────────
 // What the RED summary prints about a failing gate's retained evidence. NOTHING
 // here prints free-form text from a test, tool or error: every line is a fixed
@@ -1054,8 +1391,8 @@ async function executeGate({ name, fn }) {
 
 console.log("dev-preflight — the only check before a CI-free push\n");
 
-gate("cargo fmt", () => {
-  const r = runHeavy("cargo fmt --all -- --check");
+gate("cargo fmt", async () => {
+  const r = await runHeavy("cargo fmt --all -- --check");
   if (r.und) return { state: "UNDETERMINED", detail: r.und };
   return r.ok
     ? { state: "GREEN" }
@@ -1346,7 +1683,7 @@ function deriveStepCommand(
   return { cmd, env: { ...jobEnv.env, ...stepEnv.env } };
 }
 
-gate("clippy — derived from test.yml", () => {
+gate("clippy — derived from test.yml", async () => {
   const d = deriveStepCommand("Run clippy");
   if (d.err) {
     return {
@@ -1357,7 +1694,7 @@ gate("clippy — derived from test.yml", () => {
   // Run it through a shell, the way the workflow does, so a multi-line or
   // pipeline `run:` executes as CI executes it rather than as a tokenised guess.
   const shown = d.cmd.replace(/\s+/g, " ").slice(0, 120);
-  const r = runHeavy(d.cmd, d.env, { os: "linux" });
+  const r = await runHeavy(d.cmd, d.env, { os: "linux" });
   if (r.und) return { state: "UNDETERMINED", detail: r.und };
   if (r.ok) return { state: "GREEN", detail: `clean; ran: ${shown}` };
   // A toolchain that could not RUN is not a lint finding and must not be
@@ -1486,7 +1823,7 @@ function touchesRustSurface() {
   return { files, hit };
 }
 
-gate("windows-cfg cross-lint — derived from test.yml", () => {
+gate("windows-cfg cross-lint — derived from test.yml", async () => {
   const rel = touchesRustSurface();
   if (rel.err) return { state: "UNDETERMINED", detail: rel.err };
   if (!rel.hit) {
@@ -1515,7 +1852,7 @@ gate("windows-cfg cross-lint — derived from test.yml", () => {
     };
   }
   const shown = d.cmd.replace(/\s+/g, " ").slice(0, 120);
-  const r = runHeavy(d.cmd, d.env, { os: "linux" });
+  const r = await runHeavy(d.cmd, d.env, { os: "linux" });
   if (r.und) return { state: "UNDETERMINED", detail: r.und };
   if (r.ok) return { state: "GREEN", detail: `clean; ran: ${shown}` };
   // A fleet host without the mingw toolchain is "could not check" (and must
@@ -1577,7 +1914,7 @@ gate("windows-cfg cross-lint — derived from test.yml", () => {
   ];
 
 for (const t of targets) {
-  gate(`docs-${t.label} — derived from workflows`, () => {
+  gate(`docs-${t.label} — derived from workflows`, async () => {
   const rel = touchesRustSurface();
   if (rel.err) return { state: "UNDETERMINED", detail: rel.err };
   if (!rel.hit) {
@@ -1599,7 +1936,7 @@ for (const t of targets) {
     // it is the thing under test, and a reader who cannot see which command
     // produced a finding cannot tell a real broken link from a bad derivation.
     const shown = `${t.label}: ${d.cmd.replace(/\s+/g, " ").slice(0, 100)}`;
-    const r = runHeavy(d.cmd, d.env, { os: "linux" });
+    const r = await runHeavy(d.cmd, d.env, { os: "linux" });
     if (r.und) return { state: "UNDETERMINED", detail: `${t.label}: ${r.und}` };
     if (r.ok) {
       return { state: "GREEN", detail: `clean; ran: ${shown}` };
@@ -1872,20 +2209,39 @@ for (const os of ['linux', 'darwin']) {
   const legs = [
     ['lib-bins', `cargo test --workspace --lib --bins --no-fail-fast --features ${SIGNOFF_TEST_FEATURES}`, true],
     ['integration', `cargo test --workspace --test '*' --no-fail-fast --features ${SIGNOFF_TEST_FEATURES} -- --test-threads=2`, true],
+    // test.yml rust-test, between its integration and doc invocations:
+    // `bash scripts/verify/test-targets-nonempty.sh .` (D237 rule 9 — the
+    // rebuild4c train added that step to CI, and a step with no local twin
+    // would first run at the dev -> main promotion PR, which is the gap this
+    // sign-off exists to close). A separate leg per OS keeps its verdict a
+    // named line rather than folding a second claim into `integration`.
+    ['targets-nonempty', 'bash scripts/verify/test-targets-nonempty.sh .', false],
     ['doc', `cargo test --workspace --doc --features ${SIGNOFF_TEST_FEATURES}`, true],
     ['edition-leak', 'bash scripts/check-edition-leak.sh', false],
     // edition-seam.yml job (e): THIRD-PARTY-LICENSES freshness (D237 rule 9).
     ['licenses-fresh', 'bash scripts/check-third-party-licenses-fresh.sh', false],
     // Canonical extraction includes metadata, rustfmt and every leak check.
     // Linux covers the public-tree materialization without a second build.
-    ...(os === 'linux' ? [['community-extraction', COMMUNITY_EXTRACTION_COMMAND, false]] : []),
+    // It must not run cargo at all (the extraction self-test asserts no cargo
+    // invocation — a fetch there would prebuild the test stub), so it opts out
+    // of the lockfile fetch.
+    ...(os === 'linux' ? [['community-extraction', COMMUNITY_EXTRACTION_COMMAND, false, { lockfileFetch: false }]] : []),
   ];
-  for (const [kind, command, buildStub] of legs) {
-    gate(`sign-off ${os} ${kind}`, () => {
-      const r = runHeavy(command, {}, { os, leg: { token: randomUUID(), buildStub } });
+  for (const [kind, command, buildStub, legOpts] of legs) {
+    gate(`sign-off ${os} ${kind}`, async () => {
+      // Only the cargo-test legs carry the per-test bound; shell gates drive
+      // their own processes and keep the caller bound alone.
+      const testWatchdogMs = kind === 'lib-bins' || kind === 'integration' || kind === 'doc' ? PER_TEST_WATCHDOG_MS : 0;
+      const r = await runHeavy(command, {}, { os, leg: { token: randomUUID(), buildStub, testWatchdogMs, ...legOpts } });
       const leg = { platform: os, host: r.host ?? null, host_provenance: r.host_provenance ?? [], wall_ms: r.wall_ms ?? null, rc: r.leg_rc ?? null, tree: r.tree ?? null, porcelain: r.porcelain ?? null };
-      return { state: r.und ? 'UNDETERMINED' : r.ok ? 'GREEN' : 'RED', leg,
-        detail: `${r.und || `LEG_RC=${r.leg_rc}`} (wall_ms=${leg.wall_ms ?? 'unknown'} host=${leg.host ?? 'unknown'})` };
+      // `test-targets-nonempty.sh` is THREE-state — 1 is a finding (a target
+      // built but registers no test), 2 is UNDETERMINED (no cargo, or a
+      // platform it does not define). A leg must not report a finding it did
+      // not measure; both states still refuse the push, but the receipt says
+      // which claim was actually made.
+      const und = r.und || (kind === 'targets-nonempty' && r.leg_rc === 2 ? 'test-targets-nonempty: UNDETERMINED (rc 2 — cargo unavailable, or platform outside linux/macos)' : null);
+      return { state: und ? 'UNDETERMINED' : r.ok ? 'GREEN' : 'RED', leg,
+        detail: `${und || `LEG_RC=${r.leg_rc}`} (wall_ms=${leg.wall_ms ?? 'unknown'} host=${leg.host ?? 'unknown'})` };
     });
   }
 }
@@ -2048,27 +2404,52 @@ gate("shell-gate self-tests (globbed from scripts/tests/)", async () => {
   // to SELFTEST_PER_TEST_MS.
   const perTestOverride = local && process.env.DEV_PREFLIGHT_SELFTEST_PER_TEST_MS ? Number(process.env.DEV_PREFLIGHT_SELFTEST_PER_TEST_MS) : null;
   const perTestMs = perTestOverride ?? Math.min(SELFTEST_PER_TEST_MS, ceilingMs);
-  return runShellGate(ROOT, { local, ceilingMs, perTestMs });
+  return runShellGate(ROOT, { local, ceilingMs, perTestMs, stopWhen: () => !!stopping });
 });
 
 if (worker) {
-  if (registered.length !== 1) process.exit(2);
+  if (registered.length !== 1) await exitAfterBackstops(2);
   const row = await executeGate(registered[0]);
   if (treeMovedAfter || treeFingerprint() !== START_FINGERPRINT || START_FINGERPRINT !== process.env.CSQ_PREFLIGHT_PARENT_FINGERPRINT) {
     row.state = "UNDETERMINED"; row.detail = "source changed during gate worker execution";
   }
+  // R3 LOW-2: a worker told to stop must not send a GREEN frame — a TERM can
+  // reach THIS worker's group alone, while the parent is not stopping.
+  if (stopping) { row.state = "UNDETERMINED"; row.detail = `worker stopped by ${stopping} before its verdict`; }
   await new Promise((resolve) => process.send({ token: process.env.CSQ_PREFLIGHT_WORKER_TOKEN, gate: row,
     fingerprint: START_FINGERPRINT, no_receipt: true }, resolve));
-  process.exit(aggregateExit([row]));
+  // No process.exit with a live backstop: fire/await them (bounded), then exit.
+  await exitAfterBackstops(aggregateExit([row]));
 }
 const PREFLIGHT_STARTED = performance.now();
 const quickNames = new Set(["cargo fmt", "run-ci-gates", "ACL ratchet (f0)+(f) — derived from edition-seam.yml", "shellcheck — derived from test.yml", "workflow job-set vs origin/main", "tree clean (push carries everything)"]);
 const quick = registered.filter((r) => quickNames.has(r.name));
-for (const item of quick) gates.push(await executeGate(item));
+for (const item of quick) {
+  // A stop latch means no NEW work: a gate started after the signal is a child
+  // nothing will drain (D237 R2 advisory LOW).
+  if (stopping) {
+    const detail = `stopped by ${stopping} before this gate ran`;
+    gates.push({ name: item.name, state: "UNDETERMINED", elapsed_ms: 0, detail });
+    console.log(`  ${item.name} ... UNDETERMINED — ${detail}`);
+    continue;
+  }
+  gates.push(await executeGate(item));
+}
 const deferred = registered.filter((r) => !quickNames.has(r.name));
-if (gates.every((r) => r.state === "GREEN") && !treeMovedAfter) {
+if (gates.every((r) => r.state === "GREEN") && !treeMovedAfter && stopping) {
+  // Same rule one level up: never dispatch a worker after the stop latch.
+  for (const item of deferred) {
+    const detail = `stopped by ${stopping} — gate not launched`;
+    const row = { name: item.name, state: "UNDETERMINED", elapsed_ms: 0, detail };
+    gates.push(row); console.log(`  ${row.name} ... ${row.state} — ${detail}`);
+  }
+} else if (gates.every((r) => r.state === "GREEN") && !treeMovedAfter) {
+  // The worker watchdog is DERIVED from the ONE per-gate deadline (admission x2 +
+  // both attempt bounds) plus a cleanup grace, never a second, shorter constant:
+  // a watchdog below that deadline would kill a legitimate run before runHeavy
+  // could classify it — the same defect the leg bound itself had, one level up.
   gates.push(...await runGateWorkers(deferred.map((r) => r.name), { script: fileURLToPath(import.meta.url), cwd: ROOT,
-    env: FLEET_ENV, fingerprint: START_FINGERPRINT, onComplete: (row) => {
+    env: FLEET_ENV, fingerprint: START_FINGERPRINT, timeoutMs: workerWatchdogMs(), onComplete: (row) => {
       console.log(`  ${row.name} ... ${row.state}${row.detail ? ` — ${row.detail}` : ""}`);
       if (ONLY && process.env.DEV_PREFLIGHT_SHOW_GATE_EVIDENCE === "1") console.log("HEAVY_GATE_EVIDENCE " + JSON.stringify({ name: row.name, state: row.state, elapsed_ms: row.elapsed_ms, evidence: row.heavy_output_evidence || [], leg: row.leg, worker_evidence: row.worker_output_evidence }));
       if (treeFingerprint() !== START_FINGERPRINT) treeMovedAfter ||= row.name;
@@ -2104,7 +2485,7 @@ if (treeMovedAfter && END_FINGERPRINT === START_FINGERPRINT) {
   console.log(
     "  Some gates tested a different tree than the one being vouched for. Re-run on a quiet tree.",
   );
-  process.exit(2);
+  await exitAfterBackstops(2);
 }
 if (END_FINGERPRINT !== START_FINGERPRINT) {
   const [sHead, sTree] = START_FINGERPRINT.split(":");
@@ -2119,14 +2500,14 @@ if (END_FINGERPRINT !== START_FINGERPRINT) {
     `    tree: ${sTree.slice(0, 8)} -> ${eTree.slice(0, 8)}${sTree === eTree ? " (unchanged)" : " (CHANGED)"}`,
   );
   console.log("  Re-run on a tree nobody is editing. This is NOT a pass.");
-  process.exit(2);
+  await exitAfterBackstops(2);
 }
 // A filter that selected nothing must not read as "everything passed".
 if (ONLY && selected === 0) {
   console.log(
     `dev-preflight: UNDETERMINED — DEV_PREFLIGHT_ONLY='${shownSelector(ONLY)}' matched no gate.`,
   );
-  process.exit(2);
+  await exitAfterBackstops(2);
 }
 if (red.length) {
   console.log(
@@ -2141,9 +2522,9 @@ if (red.length) {
     const line = `RED evidence: printer failed (${errIdent(e)})`;
     try { console.log(line); }
     // stdout itself failed: say so on fd 2; if even that fails, exit RED now.
-    catch { try { writeSync(2, line + "\n"); } catch { process.exit(1); } }
+    catch { try { writeSync(2, line + "\n"); } catch { await exitAfterBackstops(1); } }
   }
-  process.exit(1);
+  await exitAfterBackstops(1);
 }
 if (und.length) {
   console.log(
@@ -2151,7 +2532,7 @@ if (und.length) {
   );
   und.forEach((g) => console.log(`    ${g.name}: ${g.detail}`));
   console.log("  This is NOT a pass. Resolve the oracle and re-run.");
-  process.exit(2);
+  await exitAfterBackstops(2);
 }
 // SKIPPED is loud by design ("could not check" — see header comment); a
 // receipt carrying it must not read as silently clean.
@@ -2169,6 +2550,23 @@ if (notApplicable.length) {
   );
 }
 
+// A STOP LANDING BEFORE THE VERDICT MUST NOT READ AS A PASS (D237 R2 LOW-2).
+// Every gate above can be GREEN while a signal arrived after the last one
+// finished; exiting 0 (subset) or writing a receipt (canonical) would then
+// report a run that was cut short as a pass. The fixture-only seam lets the
+// self-test land exactly in that window deterministically; it is refused
+// outside a fixture subset run, like the other fixture-only knobs.
+if (process.env.CSQ_PREFLIGHT_STOP_BEFORE_VERDICT === "1") {
+  if (!ONLY || process.env.CSQ_PREFLIGHT_CANONICAL_WORKER === "1") {
+    console.log("dev-preflight: UNDETERMINED — CSQ_PREFLIGHT_STOP_BEFORE_VERDICT is refused outside a fixture subset run.");
+    await exitAfterBackstops(2);
+  }
+  stopping ??= "SIGTERM";
+}
+if (stopping) {
+  console.log(`dev-preflight: UNDETERMINED — stopped by ${stopping} before a verdict could be written. No receipt written.`);
+  await exitAfterBackstops(2);
+}
 // A SUBSET RUN IS NOT A RECEIPT. Writing one here would let a filtered
 // invocation vouch for a commit whose other gates never ran — the push guard
 // reads only the SHA and the gate states, and would honour it.
@@ -2176,7 +2574,7 @@ if (ONLY) {
   console.log(
     `dev-preflight: the '${shownSelector(ONLY)}' subset passed (${selected} gate(s)). NO receipt written — a partial run is not evidence.`,
   );
-  process.exit(0);
+  await exitAfterBackstops(0);
 }
 
 writeFileSync(
@@ -2209,7 +2607,10 @@ console.log(
   "  job-set, Linux and Darwin lib/bins, integration and doc tests, edition-leak,",
 );
 console.log(
-  "  THIRD-PARTY-LICENSES freshness,",
+  "  THIRD-PARTY-LICENSES freshness, the security-tripwire test-target",
+);
+console.log(
+  "  nonemptiness check (test-targets-nonempty.sh),",
 );
 console.log(
   "  and the scripts/tests/*.test.sh shell-gate self-test set (the same",
@@ -2230,4 +2631,4 @@ console.log(
   "  test-windows.yml's own an internal ticket note). Those first run at the dev -> main",
 );
 console.log("  promotion gate.");
-process.exit(0);
+await exitAfterBackstops(0);

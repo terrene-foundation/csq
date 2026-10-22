@@ -27,11 +27,15 @@ use std::panic::PanicHookInfo;
 /// built with `format!`, which is where a token fragment would appear).
 /// Any other payload type (rare — `panic_any` with a non-string value) is
 /// reported by its type name only, never guessed at or displayed.
-pub fn format_panic_message(info: &PanicHookInfo<'_>) -> String {
+pub fn format_panic_message(label: &str, info: &PanicHookInfo<'_>) -> String {
     let location = info
         .location()
         .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
         .unwrap_or_else(|| "<unknown location>".to_string());
+    let thread = std::thread::current()
+        .name()
+        .unwrap_or("<unnamed>")
+        .to_string();
     let payload = info
         .payload()
         .downcast_ref::<&str>()
@@ -39,26 +43,64 @@ pub fn format_panic_message(info: &PanicHookInfo<'_>) -> String {
         .or_else(|| info.payload().downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "<non-string panic payload>".to_string());
     format!(
-        "daemon panicked at {location}: {}",
+        "{label} at {location} [thread {}]: {}",
+        crate::error::redact_tokens(&thread),
         crate::error::redact_tokens(&payload)
     )
 }
 
+/// Set once [`install`] has run in this process. Never reset: the hook is
+/// installed through a `OnceLock` and cannot be un-installed, so this reports
+/// the install EVENT, not whether the custom hook is currently the active
+/// one (a test may restore a prior hook for isolation).
+static INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether [`install`] has run in this process.
+pub fn is_installed() -> bool {
+    INSTALLED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The label the installed hook reports (`daemon_panic` / `desktop_panic`).
+/// Set exactly once, by the call that installs the hook; `None` before any
+/// install. Lets a caller ASSERT which process label won, instead of
+/// inferring it from an install flag.
+static LABEL: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// The active hook's process label, or `None` before any install.
+pub fn active_label() -> Option<&'static str> {
+    LABEL.get().copied()
+}
+
 /// Installs this hook process-wide, replacing the default. Idempotent via
-/// `std::sync::Once` — safe to call on every daemon-session start (the
-/// supervised loop restarts sessions in-process on a transient failure)
-/// without stacking hooks or re-wrapping an already-installed one.
-pub fn install() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        std::panic::set_hook(Box::new(|info| {
+/// `std::sync::OnceLock`: the first call stores its label in [`LABEL`],
+/// installs the hook with it, and every later call reports `false` without
+/// touching the process hook — safe to call on every daemon-session start
+/// (the supervised loop restarts sessions in-process on a transient
+/// failure) without stacking hooks or re-wrapping an already-installed one.
+///
+/// `label` names the PROCESS on every event and message (`daemon_panic` for
+/// the CLI daemon, `desktop_panic` for the desktop app), so a desktop UI or
+/// Tauri panic is never mislabelled as a daemon panic. Returns `true` when
+/// THIS call installed the hook, `false` when an earlier call already had —
+/// callers use that for order-independent tests rather than a process-global
+/// read.
+pub fn install(label: &'static str) -> bool {
+    let mut installed_now = false;
+    let active: &'static str = LABEL.get_or_init(|| {
+        installed_now = true;
+        label
+    });
+    if installed_now {
+        std::panic::set_hook(Box::new(move |info| {
             tracing::error!(
-                error_kind = "daemon_panic",
+                error_kind = active,
                 "{}",
-                format_panic_message(info)
+                format_panic_message(active, info)
             );
         }));
-    });
+        INSTALLED.store(true, std::sync::atomic::Ordering::Release);
+    }
+    installed_now
 }
 
 #[cfg(test)]
@@ -104,7 +146,8 @@ mod tests {
         let prior_in_hook = Arc::clone(&prior_hook);
         std::panic::set_hook(Box::new(move |info| {
             if std::thread::current().id() == owner {
-                *captured_in_hook.lock().unwrap() = Some(format_panic_message(info));
+                *captured_in_hook.lock().unwrap() =
+                    Some(format_panic_message("daemon_panic", info));
             } else {
                 prior_in_hook(info);
             }
@@ -204,8 +247,12 @@ mod tests {
         // Same shared mutex as `capture_formatted_panic` — this test also
         // mutates the process-global hook and must not race the others.
         let _guard = crate::platform::test_env::lock();
-        install();
-        install();
+        let _first = install("daemon_panic");
+        let second = install("daemon_panic");
+        assert!(
+            !second,
+            "the second install() must report that it did NOT install (Once already fired)"
+        );
         // Restore the default hook so this test does not leave the
         // process-wide hook installed for every later test in this binary.
         let _ = std::panic::take_hook();

@@ -3696,7 +3696,7 @@ attributes:
         }
 
         /// The re-list through the production witness: a process forked since the scan by the
-        /// launcher itself holds the terminal; one forked by a process the scan has does not;
+        /// launcher itself holds the terminal; one forked by a process the scan has, whose chain ends at launchd, is unknown (an arrival is opaque);
         /// one with a dead creator is unknown with the lineage cause; a re-list that cannot
         /// read the table, or no fresh scan to extend, is unknown.
         #[test]
@@ -3746,7 +3746,9 @@ attributes:
                 (holders.arrivals(base, &me), holders.outcome())
             };
             assert_eq!(ask(forked_by_launcher, true).0, TerminalHolder::Held);
-            assert_eq!(ask(forked_by_old_process, true).0, TerminalHolder::None);
+            // An arrival is never read, so it is opaque: its chain (800, forked by launchd)
+            // ends at launchd and cannot clear it, as the kernel may have rewritten a link.
+            assert_eq!(ask(forked_by_old_process, true).0, TerminalHolder::Unknown);
             let (verdict, outcome) = ask(forked_by_dead, true);
             assert_eq!(verdict, TerminalHolder::Unknown);
             assert_eq!(
@@ -4238,9 +4240,9 @@ attributes:
                 TerminalHolder::Held
             );
             assert_eq!(
-                holder_from_scan(&shell_scan(DEAD_PID + 1, 1), &base, &term_of(&pids, 500)),
+                holder_from_scan(&shell_scan(DEAD_PID + 1, 400), &base, &term_of(&pids, 500)),
                 TerminalHolder::None,
-                "control: the same shell in another group holds nothing"
+                "control: the same shell in another group, forked before the launcher, holds nothing"
             );
         }
 
@@ -4265,14 +4267,23 @@ attributes:
             assert!(!held.process_groups.contains(&DEAD_PID));
             assert_eq!(holder_from_scan(&held, &base, &me), TerminalHolder::Held);
             assert_eq!(
-                holder_from_scan(&shell_scan(900, 1), &base, &me),
+                holder_from_scan(&shell_scan(900, 400), &base, &me),
                 TerminalHolder::None,
-                "launchd-born: forked before any launcher"
+                "forked by something older than the launcher"
+            );
+            // The kernel sometimes rewrites a reparented process's creator id to launchd's,
+            // so a hidden-env same-uid shell above the launcher's id that reads launchd as
+            // its creator may be the launcher's orphan: keep.
+            assert_eq!(
+                holder_from_scan(&shell_scan(900, 1), &base, &me),
+                TerminalHolder::Unknown,
+                "creator reads launchd and the environment is hidden: it may be an orphan"
             );
             assert_eq!(
                 holder_from_scan(&shell_scan(900, 800), &base, &me),
-                TerminalHolder::None,
-                "forked by a live process the scan has, itself forked by launchd"
+                TerminalHolder::Unknown,
+                "hidden leaf behind a live readable link that launchd forked: the creator id \
+                 may have been rewritten at either link"
             );
             let broken = shell_scan(900, 777);
             assert_eq!(
@@ -4333,11 +4344,11 @@ attributes:
                     "{scan:?}"
                 );
             };
-            let mut whole = shell_scan(900, 1);
+            let mut whole = shell_scan(900, 400);
             assert_eq!(judge(&whole, &base, &me), Judgement::Clear, "control");
             whole.unreadable = 2;
             unknown(&whole, ProcessTableUnknown::ProcessUnreadable);
-            let mut slow = shell_scan(900, 1);
+            let mut slow = shell_scan(900, 400);
             slow.complete = false;
             unknown(&slow, ProcessTableUnknown::ScanIncomplete);
             let mut damaged = shell_scan(900, 500);

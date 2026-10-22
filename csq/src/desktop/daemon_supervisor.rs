@@ -29,8 +29,19 @@
 //!
 //! On app exit, the supervisor's `CancellationToken` is fired. The
 //! server, refresher, usage poller, and auto-rotator all observe the
-//! same token and drain gracefully. The `PidFile` drops last,
-//! cleaning up the `.csq-daemon.pid` file.
+//! same token and drain. `drain_subsystems` gives EACH handle its own
+//! deadline (5 s) SEQUENTIALLY, so the total drain is NOT bounded by 5 s
+//! — it can take 5 s per subsystem.
+//!
+//! The Exit handler therefore waits at most 6 s as a CAP ON APP EXIT,
+//! never as a drain guarantee. What the wait is for: the supervisor
+//! thread's return is what drops the `PidFile` guard (held last,
+//! cleaning up the `.csq-daemon.pid` file). If the drain is still running
+//! at the cap, the app leaves anyway — the OS then releases the lock when
+//! this process ends (the flock fd closes; a Windows waiter takes the
+//! named mutex as WAIT_ABANDONED) — and the cap is logged as
+//! `daemon_supervisor_exit_cap_reached`. No exit path hangs on the daemon
+//! (Q6 R1 L3 / R2 M-1).
 //!
 //! `csq daemon stop` reaches this same token from OUTSIDE the process,
 //! via a platform-specific bridge installed once in [`supervisor_loop`]:
@@ -62,26 +73,148 @@ use std::sync::Arc;
 /// [`shutdown`](Self::shutdown) explicitly at app exit.
 pub struct SupervisorHandle {
     shutdown: CancellationToken,
+    // Set (and notified) when the supervisor body finishes — by a DROP guard,
+    // so it also fires if the body panics (Q6 R2 L-1). The Exit handler waits
+    // on this instead of detaching the thread.
+    finished: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 }
 
 impl SupervisorHandle {
     /// Fires the shared cancellation token. Any subsystem currently
-    /// in-flight drains on its own deadline; the supervisor loop
-    /// exits on the next iteration.
+    /// in-flight drains on its own deadline (5 s, `run_daemon`'s bound);
+    /// the supervisor loop then exits.
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }
+
+    /// Waits up to `timeout` for the supervisor loop to return and release
+    /// its PidFile lock. Returns `false` when the bound was reached first; the
+    /// caller reports that and exits anyway, so the exit path never hangs.
+    pub fn wait_for_shutdown(&self, timeout: Duration) -> bool {
+        let (lock, finished) = &*self.finished;
+        let done = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let done = finished
+            .wait_timeout_while(done, timeout, |done| !*done)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0;
+        *done
+    }
+}
+
+/// Runs `body` with the supervisor's completion signal armed.
+///
+/// The signal is set by a DROP guard, so it fires on a normal return AND when
+/// `body` unwinds with a panic — a panicking supervisor body must not leave the
+/// Exit handler waiting out the whole exit cap on a thread that is already
+/// gone (Q6 R2 L-1). The guard is created BEFORE the body runs.
+fn run_signaling_completion(
+    finished: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    body: impl FnOnce(),
+) {
+    struct SignalOnDrop(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+    impl Drop for SignalOnDrop {
+        fn drop(&mut self) {
+            let (lock, done) = &*self.0;
+            let mut finished = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *finished = true;
+            done.notify_all();
+        }
+    }
+    let _signal = SignalOnDrop(finished);
+    body();
+}
+
+/// How the in-process supervisor task ended, as the fixed-vocabulary
+/// `cause` token [`start`]'s observer logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupervisorStop {
+    /// `supervisor_loop` unwound with a panic.
+    Panic,
+    /// The task was aborted (cancelled) before it could complete.
+    Cancelled,
+    /// The join failed in a shape that is neither panic nor cancellation, or
+    /// the terminal `tauri::Error` was not a join error at all. A DISTINCT
+    /// variant, never folded into `Cancelled`: deleting the cancellation arm
+    /// must red the cancelled-path test rather than silently reclassifying.
+    Unknown,
+    /// `supervisor_loop` returned normally — the clean-shutdown path.
+    Returned,
+}
+
+impl SupervisorStop {
+    /// The `cause=<token>` value for this outcome. Fixed vocabulary, no
+    /// error payload: the join error's Display is never logged
+    /// (security.md MUST-2).
+    fn token(self) -> &'static str {
+        match self {
+            SupervisorStop::Panic => "panic",
+            SupervisorStop::Cancelled => "cancelled",
+            SupervisorStop::Unknown => "unknown",
+            SupervisorStop::Returned => "returned",
+        }
+    }
+
+    /// Log level per outcome: a panic is an error the operator must see;
+    /// a cancellation is unexpected but not a crash; a normal return is
+    /// the clean shutdown path.
+    fn level(self) -> log::Level {
+        match self {
+            SupervisorStop::Panic => log::Level::Error,
+            SupervisorStop::Cancelled | SupervisorStop::Unknown => log::Level::Warn,
+            SupervisorStop::Returned => log::Level::Info,
+        }
+    }
+}
+
+/// Classifies the terminal state of the supervisor task awaited from
+/// [`start`]'s `spawn_blocking` handle.
+///
+/// Awaiting a `tauri::async_runtime::JoinHandle` yields `Ok(())` on a
+/// normal return and `Err(tauri::Error::JoinError(..))` on a panic or an
+/// abort. The cause token comes from the shared
+/// [`csq_core::error::join_cause`] classifier — one implementation for every
+/// join-error surface — and anything it cannot classify stays `Unknown`,
+/// never folded into `Cancelled`.
+fn supervisor_stop_cause(result: &Result<(), tauri::Error>) -> SupervisorStop {
+    match result {
+        Ok(()) => SupervisorStop::Returned,
+        Err(tauri::Error::JoinError(e)) => match csq_core::error::join_cause(e) {
+            "panic" => SupervisorStop::Panic,
+            "cancelled" => SupervisorStop::Cancelled,
+            _ => SupervisorStop::Unknown,
+        },
+        // `tauri::Error` is `#[non_exhaustive]`; a non-join terminal error is
+        // not classifiable as either a panic or a cancellation.
+        Err(_) => SupervisorStop::Unknown,
+    }
+}
+
+/// Installs the daemon's redacting panic hook for the desktop process.
+///
+/// Called from the app's setup after the tracing subscriber is initialised
+/// and before the supervisor thread starts: the Rust DEFAULT panic hook
+/// prints the payload verbatim to stderr, and a supervisor panic is exactly
+/// the class of failure whose message can embed upstream data. Idempotent —
+/// `panic_hook::install` is `OnceLock`-guarded, so autostart and relaunch
+/// paths are safe.
+pub(crate) fn install_panic_hook() -> bool {
+    csq_core::daemon::panic_hook::install("desktop_panic")
 }
 
 /// Starts the in-process daemon supervisor.
 ///
-/// Spawns a single tokio task that loops forever until `shutdown`
-/// fires. Each iteration tries to take ownership of the daemon
-/// (`PidFile::acquire` + `serve`), and if another daemon already
-/// has it, waits 60s and retries.
+/// Runs a single supervisor loop on a DEDICATED OS THREAD (it owns the
+/// thread-affine PidFile lock — Q6) until `shutdown` fires. Each iteration
+/// tries to take ownership of the daemon (`PidFile::acquire` + `serve`),
+/// and if another daemon already has it, waits 60s and retries.
 ///
-/// This function returns immediately — the work happens on the
-/// returned tokio task.
+/// The task's terminal state is observed: a panic or cancellation logs
+/// `event=daemon_supervisor_stopped cause=<panic|cancelled|returned>`
+/// instead of vanishing with the discarded JoinHandle. The supervisor is
+/// NOT auto-restarted — restart semantics belong to the loop's own
+/// `run_forever` retry path.
+///
+/// This function returns immediately — the work happens on that thread.
 pub fn start(base_dir: PathBuf) -> SupervisorHandle {
     // an internal ticket: reopening the desktop app is itself an explicit "start"
     // intent — clear any stop-requested sentinel left by a prior `csq
@@ -91,12 +224,45 @@ pub fn start(base_dir: PathBuf) -> SupervisorHandle {
 
     let shutdown = CancellationToken::new();
     let shutdown_clone = shutdown.clone();
+    // Signalled once the loop future has been dropped (PidFile released).
+    let finished = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let finished_supervisor = Arc::clone(&finished);
 
-    tauri::async_runtime::spawn(async move {
-        supervisor_loop(base_dir, shutdown_clone).await;
+    // THE SUPERVISOR LOOP MUST RUN ON ONE OS THREAD (Q6). A Windows mutex is
+    // owned by the THREAD that won `WaitForSingleObject`, and `ReleaseMutex`
+    // must run on that same thread — the guard is therefore `!Send`.
+    // `tauri::async_runtime::spawn` takes a Send future on the multi-threaded
+    // runtime: the old shape both depended on an unsound `unsafe impl Send` and
+    // could drop the guard on a different worker, silently leaving the named
+    // mutex owned (every other csq process then blocks until that worker
+    // exits). `spawn_blocking` gives the loop a dedicated thread, and
+    // `block_on` drives its own future THERE — so the PidFile guard is always
+    // acquired and released on that one thread — while every `tokio::spawn`
+    // inside the loop still lands on Tauri's multi-threaded runtime. That is
+    // the same shape as the CLI supervised path (`rt.block_on(...)` on the
+    // main thread).
+    // Keep the handle. Dropping it detached the loop: a panic in
+    // `supervisor_loop` stopped the in-process daemon while the app kept
+    // running, with nothing in the log saying so. Observe the task and
+    // report only the fixed-vocabulary cause token — the JoinError payload
+    // is never logged (security.md MUST-2). No auto-restart: `run_forever`
+    // owns retry semantics, and a panicking loop is reported, not silently
+    // re-run.
+    let supervisor = tauri::async_runtime::spawn_blocking(move || {
+        run_signaling_completion(finished_supervisor, || {
+            tauri::async_runtime::block_on(supervisor_loop(base_dir, shutdown_clone));
+        });
+    });
+    let _observer = tauri::async_runtime::spawn(async move {
+        let cause = supervisor_stop_cause(&supervisor.await);
+        log::log!(
+            cause.level(),
+            "event=daemon_supervisor_stopped cause={}",
+            cause.token()
+        );
     });
 
-    SupervisorHandle { shutdown }
+    SupervisorHandle { shutdown, finished }
 }
 
 /// Supervisor main loop. Delegates to the shared
@@ -138,8 +304,16 @@ async fn supervisor_loop(base_dir: PathBuf, cancel: CancellationToken) {
             });
         }
         Err(e) => {
+            // `DaemonError`'s Display carries the OS code and syscall context,
+            // not a credential, but this surface keeps the same fixed-vocabulary
+            // shape as the resolver arms (security.md MUST-2): the variant tag,
+            // never the formatted error.
+            let error_kind = match &e {
+                csq_core::error::DaemonError::Win32 { .. } => "windows_kernel_error",
+                _ => "daemon_error",
+            };
             log::warn!(
-                "could not create Windows shutdown event ({e}); \
+                "could not create Windows shutdown event (error_kind={error_kind}); \
                  `csq daemon stop` will not signal the desktop daemon"
             );
         }
@@ -199,9 +373,12 @@ fn install_unix_sigterm_bridge(cancel: CancellationToken) {
             });
         }
         Err(e) => {
+            // io::ErrorKind is a closed enum, so this stays fixed-vocabulary
+            // while keeping the diagnostic class (security.md MUST-2).
             log::warn!(
-                "could not install SIGTERM handler ({e}); `csq daemon stop` will not \
-                 signal the desktop daemon when this app's PID owns the PidFile"
+                "could not install SIGTERM handler (kind={:?}); `csq daemon stop` will not \
+                 signal the desktop daemon when this app's PID owns the PidFile",
+                e.kind()
             );
         }
     }
@@ -766,7 +943,8 @@ broken. Audit anchoring/emit are disabled this run. Run `csq audit migrate-keys`
             // FIX-5a: raise to ERROR + eprintln! — Unknown is as serious as Broken.
             Ok(Err(join_err)) => {
                 log::error!(
-                    "audit verify task panicked: {join_err} — audit subsystem fail-closed (desktop daemon startup)"
+                    "audit verify task panicked cause={} — audit subsystem fail-closed (desktop daemon startup)",
+                    csq_core::error::join_cause(&join_err)
                 );
                 eprintln!(
                     "csq desktop daemon: AUDIT VERIFY TASK PANICKED. \
@@ -1156,6 +1334,18 @@ Run `csq audit verify --full` for diagnosis."
 
 /// Resolves the active `LedgerSink` from `sink_cfg` for the desktop daemon.
 /// Mirrors `resolve_anchor_sink` in `cli/commands/daemon.rs` — keep the two in sync.
+///
+/// REDACTION: every failure arm logs only `e.fixed_tag()` (the fixed
+/// vocabulary `id_empty` / `id_length_out_of_range` /
+/// `id_disallowed_charset` / `id_shape_mismatch`), never the error's
+/// Display. `IdError`'s Display is documented non-echoing
+/// (`csq_core::audit::types::IdError`). `fixed_tag()` is a SHARED
+/// convention, not unique to that type — `AuditError::fixed_tag` and
+/// `AuditV2Error::fixed_tag` expose the same signature — so the guarantee
+/// is narrower and true: an error type with NO `fixed_tag` method fails to
+/// compile at these arms, and every existing `fixed_tag` implementation
+/// returns command-fixed `&'static str` literals rather than
+/// input-derived text (security.md MUST-2).
 fn resolve_anchor_sink_desktop(
     sink_cfg: &csq_core::audit::AuditSinkConfig,
 ) -> Option<std::sync::Arc<dyn csq_core::audit::LedgerSink>> {
@@ -1181,7 +1371,10 @@ fn resolve_anchor_sink_desktop(
                     Some(std::sync::Arc::new(s))
                 }
                 Err(e) => {
-                    log::warn!("rekor sink initialisation failed — anchor task not started: {e}");
+                    log::warn!(
+                        "rekor sink initialisation failed error_kind={} — anchor task not started",
+                        e.fixed_tag()
+                    );
                     None
                 }
             }
@@ -1193,7 +1386,8 @@ fn resolve_anchor_sink_desktop(
                 Ok(s) => Some(std::sync::Arc::new(s)),
                 Err(e) => {
                     log::warn!(
-                        "csq-ledger sink initialisation failed — anchor task not started: {e}"
+                        "csq-ledger sink initialisation failed error_kind={} — anchor task not started",
+                        e.fixed_tag()
                     );
                     None
                 }
@@ -1213,7 +1407,10 @@ fn resolve_anchor_sink_desktop(
                 Some(std::sync::Arc::new(s))
             }
             Err(e) => {
-                log::warn!("s3 sink initialisation failed — anchor task not started: {e}");
+                log::warn!(
+                    "s3 sink initialisation failed error_kind={} — anchor task not started",
+                    e.fixed_tag()
+                );
                 None
             }
         },
@@ -1232,7 +1429,10 @@ fn resolve_anchor_sink_desktop(
                     Some(std::sync::Arc::new(s))
                 }
                 Err(e) => {
-                    log::warn!("azure sink initialisation failed — anchor task not started: {e}");
+                    log::warn!(
+                        "azure sink initialisation failed error_kind={} — anchor task not started",
+                        e.fixed_tag()
+                    );
                     None
                 }
             }
@@ -1251,7 +1451,10 @@ fn resolve_anchor_sink_desktop(
                 Some(std::sync::Arc::new(s))
             }
             Err(e) => {
-                log::warn!("gcp sink initialisation failed — anchor task not started: {e}");
+                log::warn!(
+                    "gcp sink initialisation failed error_kind={} — anchor task not started",
+                    e.fixed_tag()
+                );
                 None
             }
         },
@@ -1271,7 +1474,8 @@ fn resolve_anchor_sink_desktop(
                 }
                 Err(e) => {
                     log::warn!(
-                        "azure-sql sink initialisation failed — anchor task not started: {e}"
+                        "azure-sql sink initialisation failed error_kind={} — anchor task not started",
+                        e.fixed_tag()
                     );
                     None
                 }
@@ -1286,7 +1490,8 @@ fn resolve_anchor_sink_desktop(
                 Ok(s) => Some(std::sync::Arc::new(s)),
                 Err(e) => {
                     log::warn!(
-                        "customer-body-store sink initialisation failed — anchor task not started: {e}"
+                        "customer-body-store sink initialisation failed error_kind={} — anchor task not started",
+                        e.fixed_tag()
                     );
                     None
                 }
@@ -1309,3 +1514,131 @@ fn resolve_anchor_sink_desktop(
 // loop (daemon-auth-resilience Wave B). This module's remaining logic
 // (`run_daemon`, `resolve_anchor_sink_desktop`) is exercised by the
 // desktop self-test + live desktop verification (Wave C).
+
+#[cfg(test)]
+mod supervisor_signal_tests {
+    use super::*;
+    use std::sync::{Condvar, Mutex};
+
+    fn new_signal() -> Arc<(Mutex<bool>, Condvar)> {
+        Arc::new((Mutex::new(false), Condvar::new()))
+    }
+
+    fn handle_over(finished: Arc<(Mutex<bool>, Condvar)>) -> SupervisorHandle {
+        SupervisorHandle {
+            shutdown: CancellationToken::new(),
+            finished,
+        }
+    }
+
+    /// Q6 R2 L-1: a supervisor body that PANICS still signals completion — the
+    /// guard fires on unwind, so the Exit handler is never left waiting out the
+    /// whole exit cap on a thread that is already gone.
+    #[test]
+    fn a_panicking_supervisor_body_still_signals_completion() {
+        let finished = new_signal();
+        let body_signal = Arc::clone(&finished);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_signaling_completion(body_signal, || panic!("selftest: supervisor body panic"));
+        }));
+        assert!(caught.is_err(), "the body must have panicked");
+        assert!(
+            handle_over(finished).wait_for_shutdown(Duration::from_secs(2)),
+            "completion was not signalled after a panicking body"
+        );
+    }
+
+    /// The same guard on a normal return, and the wait is BOUNDED: an
+    /// unsignalled handle returns false at its deadline instead of blocking
+    /// forever (the exit path must never hang — Q6 R1 L3).
+    #[test]
+    fn a_normal_body_signals_completion_and_the_wait_is_bounded() {
+        let finished = new_signal();
+        run_signaling_completion(Arc::clone(&finished), || {});
+        assert!(
+            handle_over(Arc::clone(&finished)).wait_for_shutdown(Duration::from_millis(10)),
+            "completion was not signalled after a normal return"
+        );
+
+        let pending = handle_over(new_signal());
+        let started = std::time::Instant::now();
+        assert!(
+            !pending.wait_for_shutdown(Duration::from_millis(50)),
+            "an unsignalled handle must report the cap, not an achieved drain"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the wait must return at its deadline"
+        );
+    }
+
+    /// The supervisor's JoinHandle is no longer discarded, so a panicking
+    /// supervisor task must be CLASSIFIED as a panic. A real
+    /// `tauri::async_runtime::spawn_blocking` body really unwinds here —
+    /// not a hand-built JoinError — so the test exercises the same await
+    /// shape `start`'s observer uses.
+    #[test]
+    fn supervisor_stop_cause_reports_a_real_panic() {
+        let result = tauri::async_runtime::block_on(async {
+            tauri::async_runtime::spawn_blocking(|| panic!("selftest: supervisor task panic")).await
+        });
+        assert_eq!(
+            supervisor_stop_cause(&result),
+            SupervisorStop::Panic,
+            "a panicking supervisor task must be classified panic"
+        );
+    }
+
+    /// The mirror case: a body that returns normally classifies as
+    /// `returned` (the clean-shutdown cause), never `panic`/`cancelled`.
+    #[test]
+    fn supervisor_stop_cause_reports_a_real_return() {
+        let result = tauri::async_runtime::block_on(async {
+            tauri::async_runtime::spawn_blocking(|| {}).await
+        });
+        assert_eq!(
+            supervisor_stop_cause(&result),
+            SupervisorStop::Returned,
+            "a normally-returning supervisor task must be classified returned"
+        );
+    }
+
+    /// Desktop startup installs the redacting panic hook with the DESKTOP
+    /// label. Order-independent: the assertion uses the helper's own
+    /// "did THIS call install" flag first, and the process-global read only
+    /// as a fallback for a test binary where an earlier test already
+    /// installed the hook. The prior hook is restored under the shared
+    /// env-test lock so this test neither leaks the global hook into sibling
+    /// tests nor races their hook swaps.
+    #[test]
+    fn startup_installs_the_redacting_panic_hook() {
+        let _guard = csq_core::platform::test_env::lock();
+        let prior = std::panic::take_hook();
+        let _installed_by_this_call = install_panic_hook();
+        let label = csq_core::daemon::panic_hook::active_label();
+        std::panic::set_hook(prior);
+        assert_eq!(
+            label,
+            Some("desktop_panic"),
+            "desktop startup must install the redacting panic hook under the desktop label"
+        );
+    }
+
+    /// The abort path: a task cancelled before it completes classifies as
+    /// `cancelled`, distinct from both a panic and a clean return. A real
+    /// task is spawned and aborted, so the test exercises the same
+    /// `JoinError::is_cancelled` branch production reads.
+    #[test]
+    fn supervisor_stop_cause_reports_a_cancelled_task() {
+        let result = tauri::async_runtime::block_on(async {
+            let handle = tauri::async_runtime::spawn(async { std::future::pending::<()>().await });
+            handle.abort();
+            handle.await
+        });
+        assert_eq!(
+            supervisor_stop_cause(&result),
+            SupervisorStop::Cancelled,
+            "an aborted supervisor task must be classified cancelled"
+        );
+    }
+}

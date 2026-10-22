@@ -281,6 +281,19 @@ fn get_pending_rescues_blocking(
     Ok(csq_core::credentials::rescue::pending_rescues(&base))
 }
 
+/// Fixed cause token for a Tauri-runtime join failure.
+///
+/// `tauri::async_runtime::spawn_blocking` awaits into `tauri::Error`, which
+/// WRAPS the tokio `JoinError`; a non-join Tauri error classifies as
+/// `unknown`. Every desktop command that awaits a Tauri handle uses this,
+/// never the error's Display (security.md MUST-2).
+pub(crate) fn tauri_join_cause(error: &tauri::Error) -> &'static str {
+    match error {
+        tauri::Error::JoinError(e) => csq_core::error::join_cause(e),
+        _ => "unknown",
+    }
+}
+
 // Filesystem discovery, ledger parsing and OS session enumeration must not
 // occupy Tauri's invoke thread. Keep their existing validation and results
 // together on a blocking-pool thread, including cold-cache reads.
@@ -290,7 +303,7 @@ async fn run_desktop_read<T: Send + 'static>(
 ) -> Result<T, String> {
     tauri::async_runtime::spawn_blocking(read)
         .await
-        .map_err(|e| format!("{command} task join error: {e}"))?
+        .map_err(|e| format!("{command} task join error: {}", tauri_join_cause(&e)))?
 }
 
 fn get_accounts_blocking(base_dir: String) -> Result<Vec<AccountView>, String> {
@@ -972,7 +985,7 @@ pub async fn remove_account(
 ) -> Result<RemoveAccountSummary, String> {
     tauri::async_runtime::spawn_blocking(move || remove_account_blocking(base_dir, account))
         .await
-        .map_err(|e| format!("remove_account task join error: {e}"))?
+        .map_err(|e| format!("remove_account task join error: {}", tauri_join_cause(&e)))?
 }
 
 fn remove_account_blocking(base_dir: String, account: u16) -> Result<RemoveAccountSummary, String> {
@@ -1414,7 +1427,12 @@ pub struct CodexAckView {
 pub async fn ack_codex_slot_raced(base_dir: String, slot: u16) -> Result<CodexAckView, String> {
     tauri::async_runtime::spawn_blocking(move || ack_codex_slot_raced_blocking(&base_dir, slot))
         .await
-        .map_err(|e| format!("ack_codex_slot_raced task join error: {e}"))?
+        .map_err(|e| {
+            format!(
+                "ack_codex_slot_raced task join error: {}",
+                tauri_join_cause(&e)
+            )
+        })?
 }
 
 fn ack_codex_slot_raced_blocking(base_dir: &str, slot: u16) -> Result<CodexAckView, String> {
@@ -2962,7 +2980,12 @@ pub async fn complete_native_login(
         })
     })
     .await
-    .map_err(|e| format!("complete_native_login task failed: {e}"))?;
+    .map_err(|e| {
+        format!(
+            "complete_native_login task failed: {}",
+            csq_core::error::join_cause(&e)
+        )
+    })?;
 
     login_result?;
 
@@ -3321,7 +3344,7 @@ pub async fn start_claude_login(base_dir: String, account: u16) -> Result<u16, S
         Ok(account_num.get())
     })
     .await
-    .map_err(|e| format!("login task failed: {e}"))?
+    .map_err(|e| format!("login task failed: {}", csq_core::error::join_cause(&e)))?
 }
 
 /// Submits a paste-code from Anthropic's OAuth callback page and
@@ -3417,7 +3440,7 @@ pub async fn submit_oauth_code(
         Ok(account.get())
     })
     .await
-    .map_err(|e| format!("exchange task failed: {e}"))?
+    .map_err(|e| format!("exchange task failed: {}", csq_core::error::join_cause(&e)))?
 }
 
 #[cfg(test)]
@@ -4019,7 +4042,7 @@ pub async fn pull_ollama_model(
         pull_ollama_model_blocking(app, child_slot, ollama_bin, model)
     })
     .await
-    .map_err(|e| format!("pull task join error: {e}"))?
+    .map_err(|e| format!("pull task join error: {}", tauri_join_cause(&e)))?
 }
 
 /// Pure-Rust body of `pull_ollama_model` (no Tauri traits) so it
@@ -4843,7 +4866,12 @@ pub async fn start_codex_login(
         })
     })
     .await
-    .map_err(|e| format!("start_codex_login task failed: {e}"))?
+    .map_err(|e| {
+        format!(
+            "start_codex_login task failed: {}",
+            csq_core::error::join_cause(&e)
+        )
+    })?
 }
 
 /// Fixed-vocabulary tag for the filesystem error [`AccountLoginLock::acquire`]
@@ -5078,7 +5106,12 @@ pub async fn complete_codex_login(
         Ok::<_, String>(result)
     })
     .await
-    .map_err(|e| format!("complete_codex_login task failed: {e}"))?
+    .map_err(|e| {
+        format!(
+            "complete_codex_login task failed: {}",
+            csq_core::error::join_cause(&e)
+        )
+    })?
 }
 
 /// Cancels an in-flight `codex login --device-auth` by killing the
@@ -5489,7 +5522,12 @@ pub async fn list_codex_models(
         Ok::<_, String>(list)
     })
     .await
-    .map_err(|e| format!("list_codex_models task failed: {e}"))?
+    .map_err(|e| {
+        format!(
+            "list_codex_models task failed: {}",
+            csq_core::error::join_cause(&e)
+        )
+    })?
 }
 
 /// Live fetcher used by [`list_codex_models`]. Picks the lowest-numbered
@@ -6231,7 +6269,12 @@ pub async fn gemini_provision_oauth(base_dir: String, slot: u16) -> Result<(), S
     let base_for_notify = base.clone();
     tokio::task::spawn_blocking(move || oauth_login::perform(&base, slot_num))
         .await
-        .map_err(|e| format!("internal: spawn_blocking join failed: {e}"))?
+        .map_err(|e| {
+            format!(
+                "internal: spawn_blocking join failed: {}",
+                csq_core::error::join_cause(&e)
+            )
+        })?
         .map_err(|e| csq_core::error::redact_tokens(&e.redacted_message()))?;
 
     // The binding has committed: wake the usage poller so the slot's quota

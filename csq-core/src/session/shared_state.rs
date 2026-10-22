@@ -18489,66 +18489,89 @@ mod tests {
             hold_test_migration_lock!();
             let _env = crate::platform::test_env::lock();
             for mode in ["hung", "stdout", "stderr"] {
-                let t = tempfile::Builder::new()
-                    .prefix("cr-")
-                    .tempdir_in("/tmp")
-                    .unwrap();
-                let lock = r9_test_lock(t.path());
-                let _held = lock.hold_for_children();
-                let bin = r9_native_fixture(t.path(), mode);
-                // Exercise the same deadline/output caps without executing a
-                // newly written shebang wrapper inside the short test budget.
-                let started = std::time::Instant::now();
-                let mut commit_unknown = false;
-                let result = codex_sqlite::run_repair_sqlite_bounded_tracking(
-                    &bin,
-                    &t.path().join("private.sqlite"),
-                    "SELECT 1;",
-                    false,
-                    started + std::time::Duration::from_secs(1),
-                    &mut commit_unknown,
-                );
-                // The pid comes from the RUNNER's spawn record, not from a
-                // file the child writes: a deadline can kill the child before
-                // its first scheduling, and then `owned-pid` never exists (the
-                // CI `fixture leader pid: NotFound` class).
-                let spawned = codex_sqlite::take_last_spawned_pid();
-                // A child that was spawned and never acknowledged may have
-                // committed: the classification must stay UNKNOWN on every
-                // post-spawn failure (deadline, output caps). With NO spawn
-                // (an expired pre-spawn budget) nothing could have committed,
-                // and this mode's property is not exercised — never silently
-                // asserted as if a child had run.
-                if spawned.is_some() {
-                    assert!(commit_unknown, "{mode}: post-spawn failure must be unknown");
-                } else {
+                // Only the hung mode can pass VACUOUSLY on a pre-spawn refusal:
+                // its expected detail ("deadline") is also what an expired
+                // pre-spawn budget returns. The flooding modes expect an output
+                // cap, which a pre-spawn refusal cannot produce, so their own
+                // assertion already rejects it. The hung mode therefore retries
+                // with fresh fixtures and FAILS as NOT EXERCISED when no
+                // attempt actually spawned a child (D237 R2 follow-up, rule 6).
+                let attempts = if mode == "hung" { 3 } else { 1 };
+                let mut exercised = false;
+                for attempt in 1..=attempts {
+                    let t = tempfile::Builder::new()
+                        .prefix("cr-")
+                        .tempdir_in("/tmp")
+                        .unwrap();
+                    let lock = r9_test_lock(t.path());
+                    let _held = lock.hold_for_children();
+                    let bin = r9_native_fixture(t.path(), mode);
+                    // Exercise the same deadline/output caps without executing a
+                    // newly written shebang wrapper inside the short test budget.
+                    let started = std::time::Instant::now();
+                    let mut commit_unknown = false;
+                    let result = codex_sqlite::run_repair_sqlite_bounded_tracking(
+                        &bin,
+                        &t.path().join("private.sqlite"),
+                        "SELECT 1;",
+                        false,
+                        started + std::time::Duration::from_secs(1),
+                        &mut commit_unknown,
+                    );
+                    // The pid comes from the RUNNER's spawn record, not from a
+                    // file the child writes: a deadline can kill the child
+                    // before its first scheduling, and then `owned-pid` never
+                    // exists (the CI `fixture leader pid: NotFound` class).
+                    let spawned = codex_sqlite::take_last_spawned_pid();
+                    // A child that was spawned and never acknowledged may have
+                    // committed: the classification must stay UNKNOWN on every
+                    // post-spawn failure (deadline, output caps). With NO spawn
+                    // (an expired pre-spawn budget) nothing could have
+                    // committed.
+                    if spawned.is_some() {
+                        assert!(commit_unknown, "{mode}: post-spawn failure must be unknown");
+                    } else {
+                        assert!(
+                            !commit_unknown,
+                            "{mode}: a pre-spawn refusal cannot be unknown"
+                        );
+                    }
+                    eprintln!(
+                        "native fixture mode={mode} elapsed={:?} result={result:?}",
+                        started.elapsed()
+                    );
+                    let expected = match mode {
+                        "hung" => "deadline",
+                        "stdout" => "stdout limit",
+                        _ => "stderr limit",
+                    };
                     assert!(
-                        !commit_unknown,
-                        "{mode}: a pre-spawn refusal cannot be unknown"
+                        matches!(result, Err(ShareError::SqliteCommandFailed { detail, .. }) if detail.contains(expected)),
+                        "{mode}"
+                    );
+                    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+                    if let Some(pid) = spawned.map(|pid| pid as i32) {
+                        assert!(pid > 1, "refusing to probe implausible fixture pid {pid}");
+                        // SAFETY: signal zero only checks the pid the RUNNER
+                        // recorded at spawn; it sends no signal. Drop already
+                        // reaped the owned child.
+                        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+                        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+                    }
+                    if spawned.is_some() {
+                        exercised = true;
+                        break;
+                    }
+                    eprintln!(
+                        "r9_platform_runner_bounds_hung_and_flooding_children mode={mode} \
+                         attempt {attempt}/{attempts} did NOT exercise a SPAWNED child: \
+                         pre-spawn deadline (the runner refused before spawning)"
                     );
                 }
-                eprintln!(
-                    "native fixture mode={mode} elapsed={:?} result={result:?}",
-                    started.elapsed()
-                );
-                let expected = match mode {
-                    "hung" => "deadline",
-                    "stdout" => "stdout limit",
-                    _ => "stderr limit",
-                };
                 assert!(
-                    matches!(result, Err(ShareError::SqliteCommandFailed { detail, .. }) if detail.contains(expected)),
-                    "{mode}"
+                    exercised,
+                    "{mode}: spawn NOT EXERCISED in {attempts} attempts"
                 );
-                assert!(started.elapsed() < std::time::Duration::from_secs(2));
-                if let Some(pid) = spawned.map(|pid| pid as i32) {
-                    assert!(pid > 1, "refusing to probe implausible fixture pid {pid}");
-                    // SAFETY: signal zero only checks the pid the RUNNER
-                    // recorded at spawn; it sends no signal. Drop already
-                    // reaped the owned child.
-                    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
-                    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
-                }
             }
         }
 
@@ -19657,9 +19680,9 @@ mod tests {
         /// left for a non-reaping init to collect.
         #[cfg(unix)]
         fn r9_descendant_gone(pid: i32) -> bool {
-            // kill(-1) signals every process the caller may signal, and
-            // kill(0) its own group: a test must never probe or signal either.
-            assert!(pid > 1, "refusing to signal implausible fixture pid {pid}");
+            // kill(-1) probes every process the caller may signal, and kill(0)
+            // its own group: a test must never probe either.
+            assert!(pid > 1, "refusing to probe implausible fixture pid {pid}");
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             loop {
                 // SAFETY: signal zero sends nothing; it only probes `pid`.
@@ -19678,20 +19701,19 @@ mod tests {
             }
         }
 
-        /// Read the fixture descendant's pid and assert it is dead. It is NEVER
-        /// signalled: the group kill lands it, init reaps the orphan, and a
-        /// reaped pid can be REUSED — signalling it could hit an unrelated
-        /// process. `Some(gone)` when the fixture forked (asserted gone here);
-        /// `None` when the child was killed before it forked and wrote the
-        /// file. A None attempt does NOT pass on its own: each caller retries
-        /// with a fresh fixture and FAILS as NOT EXERCISED when no attempt
-        /// produced a descendant. The descendant's 30 s sleep bounds the
-        /// orphan if this assertion ever fails.
+        /// Read the fixture descendant's pid and assert it is dead; returns
+        /// whether the fixture FORKED (false when the child died before it
+        /// wrote the pid file). It is NEVER signalled: the group kill lands it,
+        /// init reaps the orphan, and a reaped pid can be REUSED — signalling
+        /// it could hit an unrelated process. A false result does NOT pass on
+        /// its own: each caller retries with a fresh fixture and FAILS as NOT
+        /// EXERCISED when no attempt forked. The descendant's 30 s sleep bounds
+        /// the orphan if this assertion ever fails.
         #[cfg(unix)]
-        fn r9_reap_descendant(base: &Path) -> Option<bool> {
+        fn r9_assert_descendant_gone(base: &Path) -> bool {
             let pid: i32 = match fs::read_to_string(base.join("descendant-pid")) {
                 Ok(raw) => raw.trim().parse().expect("fixture descendant pid"),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
                 Err(error) => panic!("fixture descendant pid: {error}"),
             };
             assert!(
@@ -19704,7 +19726,7 @@ mod tests {
                 "the fixture descendant (pid {pid}) is still alive; it is an \
                  orphan bounded by its 30 s sleep"
             );
-            Some(gone)
+            true
         }
 
         /// A step whose shell exits but leaves a forked descendant holding
@@ -19734,30 +19756,23 @@ mod tests {
                     started + std::time::Duration::from_secs(1),
                 );
                 let spawned = codex_sqlite::take_last_spawned_pid();
-                let gone = r9_reap_descendant(t.path());
+                let forked = r9_assert_descendant_gone(t.path());
                 assert!(
                     matches!(&result, Err(ShareError::SqliteCommandFailed { detail, .. }) if detail.contains("deadline")),
                     "{result:?}"
                 );
-                match gone {
-                    Some(gone) => {
-                        assert!(gone, "the step's forked descendant survived its group kill");
-                        exercised = true;
-                        break;
-                    }
-                    None => {
-                        let cause = match spawned {
-                            Some(_) => {
-                                "spawned-but-pid-unwritten (the child died before it forked)"
-                            }
-                            None => "pre-spawn deadline (the runner refused before spawning)",
-                        };
-                        eprintln!(
-                            "r9_platform_runner_kills_the_step_process_group attempt \
-                             {attempt}/{ATTEMPTS} did NOT exercise the group kill: {cause}"
-                        );
-                    }
+                if forked {
+                    exercised = true;
+                    break;
                 }
+                let cause = match spawned {
+                    Some(_) => "spawned-but-pid-unwritten (the child died before it forked)",
+                    None => "pre-spawn deadline (the runner refused before spawning)",
+                };
+                eprintln!(
+                    "r9_platform_runner_kills_the_step_process_group attempt \
+                     {attempt}/{ATTEMPTS} did NOT exercise the group kill: {cause}"
+                );
             }
             assert!(
                 exercised,
@@ -19787,36 +19802,28 @@ mod tests {
                 let stops = codex_sqlite::probe_stops_at_first_error(&bin);
                 let elapsed = started.elapsed();
                 let started_child = t.path().join("owned-pid").exists();
-                let gone = r9_reap_descendant(t.path());
+                let forked = r9_assert_descendant_gone(t.path());
                 assert!(!stops, "a shell that exits 0 never passes the probe");
                 assert!(
                     elapsed < std::time::Duration::from_secs(10),
                     "probe drain was not bounded: {elapsed:?}"
                 );
-                match gone {
-                    Some(gone) => {
-                        assert!(
-                            gone,
-                            "the probe's forked descendant survived its group kill"
-                        );
-                        exercised = true;
-                        break;
-                    }
-                    None => {
-                        // The probe spawns outside the runner spawn record, so
-                        // the distinction comes from the fixture's own startup
-                        // file: `owned-pid` is written before the mode forks.
-                        let cause = if started_child {
-                            "spawned-but-pid-unwritten (the child started but died before it forked)"
-                        } else {
-                            "never scheduled (the probe window ended before the child ran)"
-                        };
-                        eprintln!(
-                            "r9_bail_probe_drain_is_bounded_against_a_descendant_holding_stdout \
-                             attempt {attempt}/{ATTEMPTS} did NOT exercise the group kill: {cause}"
-                        );
-                    }
+                if forked {
+                    exercised = true;
+                    break;
                 }
+                // The probe spawns outside the runner spawn record, so the
+                // distinction comes from the fixture's own startup file:
+                // `owned-pid` is written before the mode forks.
+                let cause = if started_child {
+                    "spawned-but-pid-unwritten (the child started but died before it forked)"
+                } else {
+                    "never scheduled (the probe window ended before the child ran)"
+                };
+                eprintln!(
+                    "r9_bail_probe_drain_is_bounded_against_a_descendant_holding_stdout \
+                     attempt {attempt}/{ATTEMPTS} did NOT exercise the group kill: {cause}"
+                );
             }
             assert!(
                 exercised,
@@ -20495,10 +20502,14 @@ mod tests {
         /// the deadline — and the child was SPAWNED (the runner's own record).
         /// Falsifying result with the former blocking `write_all` +
         /// `wait_with_output`: the call blocks until the hung child exits after
-        /// 10s, then fails with a write error. Group kill is NOT this row's
-        /// property: the leader is already reaped when the runner returns, and
-        /// this fixture never forks — `r9_platform_runner_kills_the_step_process_group`
-        /// covers it.
+        /// 10s, then fails with a write error.
+        ///
+        /// Group kill is NOT this row's property, and the mechanism is shared:
+        /// BOTH runners return at the deadline and DROP the child, and
+        /// `RepairChild::drop` performs the group kill. That is why a fixture
+        /// which never forks cannot observe it here, and why
+        /// `r9_platform_runner_kills_the_step_process_group` — whose fixture
+        /// forks a descendant — covers the property.
         #[cfg(unix)]
         #[test]
         fn r9_merge_runner_stdin_write_is_bounded() {

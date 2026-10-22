@@ -2764,18 +2764,20 @@ mod tests {
         assert_eq!(after.puniqueid, before.puniqueid, "its creator is the same");
     }
 
-    /// S2: the kernel property every descent verdict rests on. A process keeps the unique id
-    /// of the process that forked it AFTER that creator has exited and the process has been
-    /// reparented to launchd; the field is not rewritten to launchd's. If a macOS update
-    /// ever rewrote it, every orphan of a closed terminal would read as launchd-born and the
-    /// sweep would delete items such processes still use, so this test reds first.
+    /// S2: what every descent verdict must survive. When a process's creator exits and it is
+    /// reparented to launchd, the kernel SOMETIMES rewrites `p_puniqueid` to launchd's (1) and
+    /// sometimes keeps the creator's id; which one happens is not guaranteed and varies with
+    /// host load, so this test asserts neither. It asserts the PRODUCT property: a live
+    /// orphan of a (dead) launcher is never read as "no descendant of it" by BOTH witnesses.
+    /// Either its environment (here: names a test config dir) is found by the scan, or the
+    /// lineage says `Descendant` or `Unknown`; `Not` with no environment hit would let the
+    /// sweep delete a keychain item the orphan still uses.
     ///
-    /// `sh` forks a background `sleep` (the grandchild), prints its pid and waits on its
-    /// stdin; closing the stdin ends it. The grandchild's creator id is read while its
-    /// creator lives and again after the creator is gone, and a whole scan of the real table
-    /// must still find the grandchild as a descendant of the dead creator.
+    /// `sh` forks a background `sleep` (the grandchild) that carries the config dir, prints
+    /// its pid and waits on its stdin; closing the stdin ends it. The creator is reaped, then
+    /// a whole scan of the real table is asked about a launcher that was that creator.
     #[test]
-    fn a_reparented_process_keeps_its_dead_creators_unique_id() {
+    fn a_live_orphan_of_the_launcher_is_never_ruled_out_by_both_witnesses() {
         use std::io::BufRead;
         use std::process::{Command, Stdio};
 
@@ -2789,9 +2791,11 @@ mod tests {
             }
         }
 
+        let orphan_dir = format!("/csq-reparent-test/accounts/term-{}", std::process::id());
         let mut child = Command::new("/bin/sh")
             .arg("-c")
             .arg("/bin/sleep 600 & echo $!; read _")
+            .env("CLAUDE_CONFIG_DIR", &orphan_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -2821,23 +2825,34 @@ mod tests {
         let Probe::Got(after) = probe_uniq(grandchild) else {
             panic!("the grandchild outlives its creator");
         };
-        let Probe::Got(launchd) = probe_uniq(1) else {
-            panic!("launchd's unique id is readable");
-        };
         assert_eq!(after.uniqueid, before.uniqueid, "the same process");
-        assert_eq!(
-            after.puniqueid, creator.uniqueid,
-            "the creator's id is kept after its death"
-        );
-        assert_ne!(
-            after.puniqueid, launchd.uniqueid,
-            "not rewritten to launchd's when the process was reparented"
+        // Either outcome of the kernel is legal; observe which one this run got.
+        eprintln!(
+            "reparent: creator id kept={}",
+            after.puniqueid == creator.uniqueid
         );
 
-        // End to end: a whole scan of the live table places the grandchild under the dead
-        // creator, so a terminal whose launcher was that creator is held.
+        // End to end: a whole scan of the live table must keep the orphan placed by at least
+        // one witness. Its environment names `orphan_dir` unless macOS withholds it, and the
+        // lineage says Descendant (id kept) or Unknown (id rewritten, environment hidden).
         let scan = holders::scan_process_env(std::time::Duration::from_secs(30))
             .expect("process table readable");
-        assert_eq!(scan.descent(creator.uniqueid), holders::Descent::Descendant);
+        let by_env = scan
+            .config_dirs
+            .contains(&std::path::PathBuf::from(&orphan_dir));
+        let by_lineage = scan.descent(creator.uniqueid) != holders::Descent::Not;
+        // The grandchild's own lineage entry, so the old code (which read a rewritten id
+        // as "forked by launchd" and said Not) cannot pass on the env witness alone: the
+        // entry is the creator's id, or launchd's with the process recorded as opaque (or, when macOS shows its environment, found by it).
+        let g = scan.lineage.get(&after.uniqueid).copied();
+        assert!(
+            g == Some(creator.uniqueid)
+                || (g == Some(1) && (scan.opaque.contains(&after.uniqueid) || by_env)),
+            "grandchild lineage entry {g:?}: neither its creator's id nor an opaque launchd-born one"
+        );
+        assert!(
+            by_env || by_lineage,
+            "the orphan is ruled out by both witnesses (env found: {by_env})"
+        );
     }
 }

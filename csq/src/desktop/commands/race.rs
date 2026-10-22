@@ -1385,7 +1385,7 @@ async fn finalize_login(
 
     let exchange_outcome = join_res.map_err(|e| {
         (
-            format!("exchange task failed: {}", redact_tokens(&e.to_string())),
+            format!("exchange task failed: {}", super::tauri_join_cause(&e)),
             "exchange_failed",
         )
     })?;

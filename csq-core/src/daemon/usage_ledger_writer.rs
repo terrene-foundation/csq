@@ -346,9 +346,13 @@ where
                             manifest_load_failures = r.manifest_load_failures,
                             "usage-ledger-writer tick complete"
                         ),
-                        Err(e) => warn!(
+                        // `scan` is the oneshot receiver, so the only failure
+                        // here is the worker dropping its sender without
+                        // replying; `RecvError` carries no payload (unlike a
+                        // JoinError), which is why nothing is interpolated.
+                        Err(_closed) => warn!(
                             error_kind = "usage_ledger_writer_join",
-                            "usage-ledger-writer tick task failed: {e}"
+                            "usage-ledger-writer tick worker closed its result channel before replying"
                         ),
                     }
                 }

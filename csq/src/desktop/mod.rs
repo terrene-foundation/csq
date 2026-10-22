@@ -1592,6 +1592,14 @@ pub fn run() {
             // `log_gc` task GCs.
             init_logging_subscriber(&resolved_base_dir_for_logging());
 
+            // Replace the default panic hook BEFORE the supervisor thread (or
+            // any other thread) can panic: the default prints the panic payload
+            // verbatim to stderr, and a supervisor panic's message can embed
+            // upstream data. Installed after the subscriber so the hook's
+            // structured event is captured (`keychain-fix-r11.md` S-LOW-3; the
+            // CLI daemon session already installs the same hook).
+            daemon_supervisor::install_panic_hook();
+
             // Once per app launch, including login autostart. The shared check
             // mutates custody only when a previous boot is proven by Pool.
             if let Some(base) = base_dir() {
@@ -1936,10 +1944,37 @@ pub fn run() {
             // double-cancel an already-dropped token.
             if let RunEvent::Exit = event {
                 if let Some(state) = app.try_state::<AppState>() {
-                    if let Ok(mut guard) = state.daemon_supervisor.lock() {
-                        if let Some(handle) = guard.take() {
-                            log::info!("app exiting — cancelling in-process daemon");
-                            handle.shutdown();
+                    // TAKE THE HANDLE AND RELEASE THE STATE LOCK BEFORE WAITING
+                    // (Q6 R2 L-2): the wait below can run for the whole exit
+                    // cap, and holding AppState's mutex that long would block
+                    // every other reader of the handle. A stray second Exit
+                    // event (Tauri does not promise single delivery) finds
+                    // None and does nothing.
+                    let taken = state
+                        .daemon_supervisor
+                        .lock()
+                        .ok()
+                        .and_then(|mut guard| guard.take());
+                    if let Some(handle) = taken {
+                        log::info!("app exiting — cancelling in-process daemon");
+                        handle.shutdown();
+                        // THE 6 s IS A CAP ON APP EXIT, NOT A DRAIN
+                        // GUARANTEE (Q6 R1 L3 / R2 M-1). Each subsystem's
+                        // drain is capped at 5 s SEQUENTIALLY, so the total is
+                        // not bounded; the wait only gives the supervisor
+                        // thread a chance to return and release the PidFile.
+                        // At the cap the app leaves anyway and the OS releases
+                        // the lock when this process ends (the flock fd closes;
+                        // a Windows waiter takes the mutex as
+                        // WAIT_ABANDONED). Never hang the exit on the daemon.
+                        if !handle
+                            .wait_for_shutdown(std::time::Duration::from_secs(6))
+                        {
+                            log::warn!(
+                                "daemon_supervisor_exit_cap_reached: in-process daemon was \
+                                 still draining at the 6 s app-exit cap; leaving anyway (the \
+                                 OS releases the lock when this process ends)"
+                            );
                         }
                     }
                 }
@@ -2729,5 +2764,63 @@ mod tests {
             !final_state.disable_mcp_gate,
             "the user's tray click overwrote the concurrent write — this is the intended last-writer-wins behavior"
         );
+    }
+}
+
+#[cfg(test)]
+mod startup_wiring_tests {
+    /// Whether `src`'s setup closure contains a LIVE call (not a comment) to
+    /// `daemon_supervisor::install_panic_hook(`. The call must sit between
+    /// `.setup(...)` and the `.build(tauri::generate_context!())` that closes
+    /// the builder chain.
+    ///
+    /// A commented-out call does NOT satisfy this: the line is skipped when
+    /// its trimmed text starts with `//`, so disabling the install by
+    /// commenting it out reds the real-source test instead of passing it.
+    fn setup_calls_install_panic_hook(src: &str) -> bool {
+        let Some(setup_start) = src.find(".setup(|app| {") else {
+            return false;
+        };
+        let Some(relative_end) = src[setup_start..].find(".build(tauri::generate_context!())")
+        else {
+            return false;
+        };
+        src[setup_start..setup_start + relative_end]
+            .lines()
+            .any(|line| {
+                let trimmed = line.trim();
+                !trimmed.starts_with("//")
+                    && trimmed.starts_with("daemon_supervisor::install_panic_hook(")
+            })
+    }
+
+    /// The app's setup closure must install the redacting panic hook before
+    /// the supervisor thread starts. The Tauri app cannot be constructed in a
+    /// unit test, so this asserts the WIRING in the source. Removing the
+    /// call, moving it after the builder, or commenting it out reds this.
+    #[test]
+    fn setup_installs_the_redacting_panic_hook() {
+        assert!(
+            setup_calls_install_panic_hook(include_str!("mod.rs")),
+            "setup must call daemon_supervisor::install_panic_hook() so the \
+             default panic hook never prints a supervisor payload verbatim"
+        );
+    }
+
+    #[test]
+    fn a_commented_out_install_call_does_not_count() {
+        let src = ".setup(|app| {\n    // daemon_supervisor::install_panic_hook();\n})\n\
+                   .build(tauri::generate_context!())";
+        assert!(
+            !setup_calls_install_panic_hook(src),
+            "a commented-out call must NOT satisfy the wiring assertion"
+        );
+    }
+
+    #[test]
+    fn a_live_install_call_counts() {
+        let src = ".setup(|app| {\n    daemon_supervisor::install_panic_hook();\n})\n\
+                   .build(tauri::generate_context!())";
+        assert!(setup_calls_install_panic_hook(src));
     }
 }

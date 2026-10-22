@@ -5116,13 +5116,31 @@ mod tests {
         let mut rounds = Vec::new();
         let started = std::time::Instant::now();
         let admission_budget = LOCK_DELAY.saturating_mul(4);
-        let result = acquire_store_lock_policy_as("fixture", &path, 2, 2, &mut |round| {
-            rounds.push(round);
-            // The first round really exhausted contention. Release the lock only after
-            // the shared elapsed budget; old attempt-count-only code admits on retry.
-            std::thread::sleep(admission_budget.saturating_mul(2));
-            drop(held.take());
-        });
+        // Controlled clock. On a wall clock a slow runner can spend the whole admission
+        // budget inside round 0's attempts, so the policy refuses BEFORE the round hook
+        // ever runs and the falsifying release never executes (public an internal ticket macOS, 2/2
+        // attempts: `falsifying release point must execute`). The clock advances only
+        // past the budget, inside the hook, so the release point always runs and the
+        // late-admission refusal is decided deterministically. The wall-clock assert
+        // below still proves the hook's release happened after the shared budget.
+        let clock_base = std::time::Instant::now();
+        let clock_elapsed = std::cell::Cell::new(Duration::ZERO);
+        let result = acquire_store_lock_policy_with_clock_as(
+            "fixture",
+            &path,
+            2,
+            2,
+            LOCK_DELAY,
+            &mut |round| {
+                rounds.push(round);
+                // The first round really exhausted contention. Release the lock only after
+                // the shared elapsed budget; old attempt-count-only code admits on retry.
+                std::thread::sleep(admission_budget.saturating_mul(2));
+                clock_elapsed.set(admission_budget.saturating_mul(2));
+                drop(held.take());
+            },
+            &mut || clock_base + clock_elapsed.get(),
+        );
         assert!(held.is_none(), "falsifying release point must execute");
         assert!(started.elapsed() >= admission_budget);
         assert_eq!(

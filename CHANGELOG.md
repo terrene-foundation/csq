@@ -8,6 +8,21 @@ All notable changes to csq are documented here. Format follows [Keep a Changelog
 
 ---
 
+## [2.21.1] — 2026-10-21
+
+Patch release. Users upgrading from v2.20.2 (the last published release) receive
+everything in the v2.21.0 notes as well — v2.21.0 was tagged but never published.
+Desktop background failures now surface through one fixed-vocabulary
+cause (with the daemon's redacting panic hook installed at startup); the Windows lock
+guard is compile-time thread-affine and checks its release; release-pipeline steps use
+workspace-absolute script paths, with a structural workflow self-test and a
+fail-closed IPC-buffer gate; three RustSec advisory crates are bumped and the
+attribution bundles regenerated. Developer-facing: the sign-off/CI test harness fires
+on stalled progress, kills the observed group, and can no longer pass a stopped run.
+Full notes: `docs/releases/v2.21.1.md`.
+
+---
+
 ## [2.13.1] — 2026-05-27
 
 Patch release making `csq doctor` honest on healthy, fully-migrated hosts. Two diagnostics false-positived: `decimal_marker` flagged 3P API-key slots (which carry decimal ids by design) and modern OAuth slots whose marker never got rewritten; the legacy-terminal count flagged idle-but-migrated accounts on hosts that rotate between accounts. Both now consult the canonical identity-store membership predicate, so `csq doctor` reports a clean bill on a migrated host.

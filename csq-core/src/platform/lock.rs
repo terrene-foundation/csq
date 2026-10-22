@@ -281,6 +281,28 @@ impl std::fmt::Debug for FileLockGuard {
     }
 }
 
+// COMPILE-TIME ASSERTION: THE WINDOWS GUARD MUST STAY `!Send` (Q6 R1 L1).
+// Rust has no stable negative trait bound, so this uses the ambiguous-impl
+// technique (no new dependency): two candidate impls of a private trait that
+// differ only in their type parameter — one blanket, one bounded by `Send`.
+// `<FileLockGuard as AmbiguousIfSend<_>>::some_item` resolves only while the
+// type is NOT Send; re-adding `unsafe impl Send for InnerGuard` makes the
+// candidate ambiguous and REDS every Windows target (E0283), which is the
+// assertion firing. On Unix the guard IS Send by design (flock is fd-bound),
+// so the check is Windows-only.
+#[cfg(windows)]
+const _: fn() = || {
+    trait AmbiguousIfSend<A> {
+        // Never called; the resolution itself is the assertion.
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    #[allow(dead_code)]
+    struct Invalid;
+    impl<T: ?Sized + Send> AmbiguousIfSend<Invalid> for T {}
+    let _ = <FileLockGuard as AmbiguousIfSend<_>>::some_item;
+};
+
 // ── Lock order: the term mint lock is a LEAF ──────────────────────────
 
 /// The lock-order contract for the one lock that is a LEAF: the term mint lock
@@ -637,17 +659,57 @@ mod imp {
         handles: Vec<*mut std::ffi::c_void>,
     }
 
-    // SAFETY: The mutex handles are process-scoped and safe to send across threads.
-    unsafe impl Send for InnerGuard {}
+    // DELIBERATELY NOT `Send` (Q6). A Win32 mutex's ownership is bound to the
+    // THREAD that won `WaitForSingleObject`, not to the handle: `ReleaseMutex`
+    // must be called by that same thread, and any other thread fails with
+    // ERROR_NOT_OWNER. An `unsafe impl Send` let an acquired guard move to a
+    // different thread, where `Drop` could not release the mutex — it then
+    // stayed owned by the original thread (until that thread exits), so every
+    // other process waiting on the same named mutex blocked with no error
+    // anywhere. The former SAFETY note ("the mutex handles are process-scoped
+    // and safe to send across threads") was true of the HANDLES and false of
+    // the OWNERSHIP. Code that needs a lock held on another thread hands over
+    // an ACQUIRE-AND-RELEASE job for that thread (see `HeldOnOtherThread`
+    // below), never an acquired guard.
 
     impl Drop for InnerGuard {
         fn drop(&mut self) {
             for handle in self.handles.drain(..).rev() {
-                // SAFETY: each handle was acquired by this guard and is
-                // released/closed exactly once, last-acquired first.
+                // SAFETY: each handle was acquired by this guard on this
+                // thread and is released/closed exactly once, last-acquired
+                // first.
                 unsafe {
-                    ReleaseMutex(handle);
-                    CloseHandle(handle);
+                    // A FAILED RELEASE IS NEVER SILENT (Q6). `ReleaseMutex`
+                    // returns FALSE when the calling thread is not the mutex's
+                    // owner (ERROR_NOT_OWNER) or the handle is invalid; the
+                    // mutex then stays owned by the acquiring thread until
+                    // that thread exits, and every other process blocks on it.
+                    // The guard is `!Send`, so safe code can only drop it on
+                    // the acquiring thread; the check keeps any `unsafe` misuse
+                    // visible instead of silently holding a named mutex that no
+                    // error reports. `Drop` must not panic, so a failure is
+                    // reported in the fixed operator vocabulary and the handle
+                    // is closed either way.
+                    if ReleaseMutex(handle) == 0 {
+                        // READ THE ERROR FIRST (Q6 R1 L2): `warn!` goes through
+                        // tracing's machinery, which may itself issue syscalls
+                        // that clobber the thread's last-error before the
+                        // field would be evaluated — the sibling probe at
+                        // `probe_global_create` reads it into a local first.
+                        let error_code = GetLastError();
+                        warn!(
+                            error_code,
+                            "ReleaseMutex failed; the named mutex stays owned by its acquiring \
+                             thread until that thread exits"
+                        );
+                    }
+                    if CloseHandle(handle) == 0 {
+                        let error_code = GetLastError();
+                        warn!(
+                            error_code,
+                            "CloseHandle failed for a lock guard's mutex handle"
+                        );
+                    }
                 }
             }
         }
@@ -1198,8 +1260,12 @@ mod tests {
     }
 
     /// The order is per thread (another thread's swap lock is not this
-    /// thread's), and a guard dropped on a different thread than the one that
-    /// took it still leaves the registry (no stale "held" entry).
+    /// thread's), and — on Unix, where the guard is `Send` — a guard dropped on
+    /// a different thread than the one that took it still leaves the registry
+    /// (no stale "held" entry). The WINDOWS guard is `!Send` (Q6): a Win32
+    /// mutex's ownership is thread-affine, so a cross-thread drop cannot exist
+    /// there at all; the registry's global shape is exactly what keeps the Unix
+    /// property true.
     #[test]
     fn the_lock_order_is_per_thread_and_survives_a_cross_thread_drop() {
         let dir = TempDir::new().unwrap();
@@ -1222,12 +1288,17 @@ mod tests {
         go_tx.send(()).unwrap();
         other_thread.join().unwrap();
 
-        let guard = lock_file(&swap).unwrap();
-        std::thread::spawn(move || drop(guard)).join().unwrap();
-        assert!(
-            try_lock_file(&mint).unwrap().is_some(),
-            "a swap guard dropped on another thread must leave the registry"
-        );
+        // Unix only: the Windows guard cannot move across threads (Q6), and the
+        // type system — not this test — is what refuses it there.
+        #[cfg(unix)]
+        {
+            let guard = lock_file(&swap).unwrap();
+            std::thread::spawn(move || drop(guard)).join().unwrap();
+            assert!(
+                try_lock_file(&mint).unwrap().is_some(),
+                "a swap guard dropped on another thread must leave the registry"
+            );
+        }
     }
 
     #[test]

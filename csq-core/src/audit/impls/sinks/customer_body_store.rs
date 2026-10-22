@@ -220,7 +220,8 @@ impl LedgerSink for CustomerBodyStoreSink {
         .await
         .map_err(|e| SinkError::Internal {
             message: RedactedString::from_trusted(format!(
-                "customer body store transport task panicked: {e}"
+                "customer body store transport task panicked cause={}",
+                crate::error::join_cause(&e)
             )),
         })?
         .map_err(|e| SinkError::Unreachable {
@@ -256,7 +257,8 @@ impl LedgerSink for CustomerBodyStoreSink {
                 .await
                 .map_err(|e| SinkError::Internal {
                     message: RedactedString::from_trusted(format!(
-                        "customer body store transport task panicked: {e}"
+                        "customer body store transport task panicked cause={}",
+                        crate::error::join_cause(&e)
                     )),
                 })?
                 .map_err(|e| SinkError::Unreachable {

@@ -2028,9 +2028,10 @@ mod tests {
     fn next_request(
         listener: &UnixListener,
         home: &Path,
+        budget: Duration,
     ) -> (tungstenite::WebSocket<UnixStream>, serde_json::Value) {
         loop {
-            let mut socket = initialized(listener, home);
+            let mut socket = initialized(listener, home, budget);
             match socket.read() {
                 Ok(tungstenite::Message::Text(text)) => {
                     return (socket, serde_json::from_str(&text).unwrap());
@@ -2042,14 +2043,22 @@ mod tests {
         }
     }
 
-    fn initialized(listener: &UnixListener, home: &Path) -> tungstenite::WebSocket<UnixStream> {
+    /// The fixture's socket waits derive from the CALLER's enforced budget — the same
+    /// deadline the test gives the client for this connection. An independent 3s server
+    /// timer can expire before the client's own deadline under scheduler load, closing a
+    /// correct connection mid-handshake ("native RPC write failed", darwin lib-bins
+    /// 2026-10-21). NOTE the bound's reach: `set_read_timeout` is a PER-SYSCALL timeout,
+    /// so this removes the fixture's SEPARATE budget but does not bound the conversation
+    /// as one deadline — it cannot make a correct handshake fail earlier than the client's
+    /// own deadline, which is what the fixture must never do.
+    fn initialized(
+        listener: &UnixListener,
+        home: &Path,
+        budget: Duration,
+    ) -> tungstenite::WebSocket<UnixStream> {
         let stream = listener.accept().unwrap().0;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        stream
-            .set_write_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
+        stream.set_read_timeout(Some(budget)).unwrap();
+        stream.set_write_timeout(Some(budget)).unwrap();
         let mut socket = tungstenite::accept(stream).unwrap();
         let request = receive(&mut socket);
         assert_eq!(request["method"], "initialize");
@@ -2164,7 +2173,7 @@ mod tests {
         let listener = test_listener(&plan);
         let home = plan.handle_dir.clone();
         let server = std::thread::spawn(move || {
-            let (mut socket, request) = next_request(&listener, &home);
+            let (mut socket, request) = next_request(&listener, &home, Duration::from_secs(3));
             assert_eq!(request["method"], "thread/queue/start");
             assert_eq!(
                 request["params"],
@@ -2200,16 +2209,43 @@ mod tests {
         let listener = test_listener(&plan);
         let home = plan.handle_dir.clone();
         let server = std::thread::spawn(move || {
-            drop(initialized(&listener, &home));
+            drop(initialized(&listener, &home, Duration::from_secs(3)));
         });
-        plan.publish_binding(
+        let published = plan.publish_binding(
             &LauncherIdentity::capture(std::process::id()).unwrap(),
             Duration::from_secs(3),
-        )
-        .unwrap()
-        .publish_recipient(&LauncherIdentity::capture(std::process::id()).unwrap())
-        .unwrap();
-        server.join().unwrap();
+        );
+        // Report BOTH sides, and never hang reporting them. If the client failed BEFORE it
+        // connected (deadline, launcher verification, connect_checked), the fixture server
+        // is still blocked in `accept`; connect once and drop so the join below cannot
+        // block forever. The client error is printed before the join because a server
+        // panic at the join would otherwise be the only thing reported. On the normal
+        // path the join happens first, so a server-side panic reports itself instead of
+        // surfacing as the client's "native RPC write failed" — a client-only error cannot
+        // tell the two apart, and that ambiguity is what made the 2026-10-21 darwin
+        // failure unreadable.
+        if let Err(error) = &published {
+            eprintln!("publish_binding failed before the fixture server was joined: {error:?}");
+            let _unblock_accept = std::os::unix::net::UnixStream::connect(&plan.socket_path);
+        }
+        let server_result = server.join();
+        if let Err(panic) = &server_result {
+            // Both sides must be readable: the client unwrap below panics first when the
+            // client also failed, so the server's panic is printed here rather than lost.
+            let message = panic
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned());
+            eprintln!(
+                "fixture server failed: {}",
+                message.unwrap_or_else(|| "<non-string panic>".to_owned())
+            );
+        }
+        published
+            .unwrap()
+            .publish_recipient(&LauncherIdentity::capture(std::process::id()).unwrap())
+            .unwrap();
+        server_result.unwrap();
         let mut foreign = std::process::Command::new("/bin/sleep")
             .arg("30")
             .spawn()
@@ -2277,7 +2313,7 @@ mod tests {
         let home = plan.handle_dir.clone();
         let server = std::thread::spawn(move || {
             // Held open without a reply: the client must hit its own deadline.
-            let (_socket, request) = next_request(&listener, &home);
+            let (_socket, request) = next_request(&listener, &home, Duration::from_secs(3));
             assert_eq!(request["method"], "thread/loaded/list");
             std::thread::sleep(Duration::from_millis(200));
         });
@@ -2365,7 +2401,7 @@ mod tests {
         let listener = test_listener(&plan);
         let home = plan.handle_dir.clone();
         let server = std::thread::spawn(move || {
-            let (mut socket, add) = next_request(&listener, &home);
+            let (mut socket, add) = next_request(&listener, &home, Duration::from_secs(3));
             assert_eq!(add["method"], "thread/queue/add");
             assert_eq!(add["params"]["threadId"], MAIN);
             let input = add["params"]["input"].as_array().unwrap();
@@ -2423,7 +2459,7 @@ mod tests {
         let listener = test_listener(&plan);
         let home = plan.handle_dir.clone();
         let server = std::thread::spawn(move || {
-            let (mut socket, add) = next_request(&listener, &home);
+            let (mut socket, add) = next_request(&listener, &home, Duration::from_secs(3));
             assert_eq!(add["method"], "thread/queue/add");
             assert_eq!(add["params"]["threadId"], MAIN);
             assert_eq!(
@@ -2432,7 +2468,7 @@ mod tests {
             );
             socket.send(tungstenite::Message::Text(json!({"id":add["id"],"result":{"queuedSubmission":{"id":ITEM,"clientUserMessageId":add["params"]["clientUserMessageId"]}}}).to_string().into())).unwrap();
             drop(socket);
-            let (mut socket, list) = next_request(&listener, &home);
+            let (mut socket, list) = next_request(&listener, &home, Duration::from_secs(3));
             assert_eq!(list["method"], "thread/queue/list");
             socket.send(tungstenite::Message::Text(json!({"id":list["id"],"result":{"data":[{"id":ITEM,"input":add["params"]["input"]}],"nextCursor":null}}).to_string().into())).unwrap();
             let delete = receive(&mut socket);
@@ -2489,7 +2525,7 @@ mod tests {
         let listener = test_listener(&plan);
         let home = plan.handle_dir.clone();
         let server = std::thread::spawn(move || {
-            let (mut socket, add) = next_request(&listener, &home);
+            let (mut socket, add) = next_request(&listener, &home, Duration::from_secs(3));
             assert_eq!(add["method"], "thread/queue/add");
             send_result(
                 &mut socket,
@@ -2497,7 +2533,7 @@ mod tests {
                 json!({"queuedSubmission":{"id":ITEM,"clientUserMessageId":add["params"]["clientUserMessageId"]}}),
             );
             drop(socket);
-            let (mut socket, list) = next_request(&listener, &home);
+            let (mut socket, list) = next_request(&listener, &home, Duration::from_secs(3));
             assert_eq!(list["method"], "thread/queue/list");
             send_result(
                 &mut socket,
@@ -2566,7 +2602,7 @@ mod tests {
         let listener = test_listener(&plan);
         let home = plan.handle_dir.clone();
         let server = std::thread::spawn(move || {
-            let (mut socket, list) = next_request(&listener, &home);
+            let (mut socket, list) = next_request(&listener, &home, Duration::from_secs(3));
             assert_eq!(list["method"], "thread/queue/list");
             socket.send(tungstenite::Message::Text(json!({"id":list["id"],"result":{"data":[{"id":ITEM,"input":[{"type":"text","text":"user-owned message"}]}],"nextCursor":null}}).to_string().into())).unwrap();
             if let Ok(tungstenite::Message::Text(text)) = socket.read() {
@@ -2614,8 +2650,8 @@ mod tests {
         let listener = test_listener(&plan);
         let home = plan.handle_dir.clone();
         let server = std::thread::spawn(move || {
-            drop(initialized(&listener, &home));
-            drop(initialized(&listener, &home));
+            drop(initialized(&listener, &home, Duration::from_secs(3)));
+            drop(initialized(&listener, &home, Duration::from_secs(3)));
         });
         let native = LauncherIdentity::capture(std::process::id()).unwrap();
         let mut binding = plan
@@ -2733,10 +2769,8 @@ mod tests {
     /// Hold the connection open until the CLIENT closes it. A fixture that
     /// returns right after a reply drops the socket, and under full-suite load
     /// the peer can observe EOF before the last frame is consumed.
-    fn wait_for_client_close(socket: &mut tungstenite::WebSocket<UnixStream>) {
-        let _ = socket
-            .get_ref()
-            .set_read_timeout(Some(Duration::from_secs(3)));
+    fn wait_for_client_close(socket: &mut tungstenite::WebSocket<UnixStream>, budget: Duration) {
+        let _ = socket.get_ref().set_read_timeout(Some(budget));
         let _ = socket.read();
     }
 
@@ -2780,10 +2814,10 @@ mod tests {
         // BSD/macOS accept() INHERITS O_NONBLOCK from the listener (Linux does
         // not). The handshake below is blocking, so clear it explicitly.
         stream.set_nonblocking(false).ok()?;
-        stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(3)))
-            .ok()?;
+        // Same derivation as `initialized`: the socket waits ARE the caller's bound, never
+        // an independent 3s clock that can expire before the client's own deadline.
+        stream.set_read_timeout(Some(bound)).ok()?;
+        stream.set_write_timeout(Some(bound)).ok()?;
         let mut socket = tungstenite::accept(stream).ok()?;
         let request = receive(&mut socket);
         if request["method"] != "initialize" {
@@ -3492,8 +3526,8 @@ mod tests {
         let home = plan.handle_dir.clone();
         let server = std::thread::spawn(move || {
             // Connection 1 is the binding publication's handshake.
-            let _publish = initialized(&listener, &home);
-            let mut socket = initialized(&listener, &home);
+            let _publish = initialized(&listener, &home, Duration::from_secs(3));
+            let mut socket = initialized(&listener, &home, Duration::from_secs(6));
             let request = receive(&mut socket);
             assert_eq!(request["method"], "thread/queue/add");
             std::thread::sleep(Duration::from_millis(2500));
@@ -3503,7 +3537,7 @@ mod tests {
                 request["id"].clone(),
                 json!({"queuedSubmission":{"id":ITEM,"clientUserMessageId":message_id}}),
             );
-            wait_for_client_close(&mut socket);
+            wait_for_client_close(&mut socket, Duration::from_secs(6));
         });
         let launcher = LauncherIdentity::capture(std::process::id()).unwrap();
         plan.publish_binding(&launcher, Duration::from_secs(3))
@@ -3533,8 +3567,8 @@ mod tests {
         let server_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stream_stop = server_stop.clone();
         let server = std::thread::spawn(move || {
-            let _publish = initialized(&listener, &home);
-            let mut socket = initialized(&listener, &home);
+            let _publish = initialized(&listener, &home, Duration::from_secs(3));
+            let mut socket = initialized(&listener, &home, Duration::from_secs(30));
             socket
                 .get_ref()
                 .set_read_timeout(Some(Duration::from_millis(10)))
@@ -3657,8 +3691,8 @@ mod tests {
         let seen_start = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = seen_start.clone();
         let server = std::thread::spawn(move || {
-            let _publish = initialized(&listener, &home);
-            let mut socket = initialized(&listener, &home);
+            let _publish = initialized(&listener, &home, Duration::from_secs(3));
+            let mut socket = initialized(&listener, &home, Duration::from_secs(3));
             socket
                 .get_ref()
                 .set_read_timeout(Some(Duration::from_millis(600)))
@@ -3684,7 +3718,7 @@ mod tests {
                             "thread/queue/start" => {
                                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
                                 send_result(&mut socket, id, json!({"turn":{"id":TURN}}));
-                                wait_for_client_close(&mut socket);
+                                wait_for_client_close(&mut socket, Duration::from_secs(3));
                                 return;
                             }
                             _ => {}
@@ -3741,8 +3775,8 @@ mod tests {
         let listener = test_listener(&plan);
         let home = plan.handle_dir.clone();
         let server = std::thread::spawn(move || {
-            let _publish = initialized(&listener, &home);
-            let mut socket = initialized(&listener, &home);
+            let _publish = initialized(&listener, &home, Duration::from_secs(3));
+            let mut socket = initialized(&listener, &home, Duration::from_secs(3));
             let request = receive(&mut socket);
             assert_eq!(request["method"], "thread/read");
             send_result(
@@ -3755,7 +3789,7 @@ mod tests {
                 request["id"].clone(),
                 json!({"thread": thread_meta(MAIN, None, "idle", true)}),
             );
-            wait_for_client_close(&mut socket);
+            wait_for_client_close(&mut socket, Duration::from_secs(3));
         });
         let launcher = LauncherIdentity::capture(std::process::id()).unwrap();
         plan.publish_binding(&launcher, Duration::from_secs(3))
@@ -3791,8 +3825,8 @@ mod tests {
         let server_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stream_stop = server_stop.clone();
         let server = std::thread::spawn(move || {
-            let _publish = initialized(&listener, &home);
-            let mut socket = initialized(&listener, &home);
+            let _publish = initialized(&listener, &home, Duration::from_secs(3));
+            let mut socket = initialized(&listener, &home, Duration::from_secs(30));
             socket
                 .get_ref()
                 .set_read_timeout(Some(Duration::from_millis(20)))

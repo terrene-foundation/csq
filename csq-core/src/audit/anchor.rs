@@ -780,7 +780,12 @@ async fn append_outcome_record_signed_async(
         append_outcome_record_signed_inner(base_dir, now_ts, kind, payload, signing_key)
     })
     .await
-    .map_err(|e| AuditV2Error::Io(std::io::Error::other(format!("spawn_blocking join: {e}"))))?
+    .map_err(|e| {
+        AuditV2Error::Io(std::io::Error::other(format!(
+            "spawn_blocking join: {}",
+            crate::error::join_cause(&e)
+        )))
+    })?
 }
 
 // ---------------------------------------------------------------------------
@@ -1964,7 +1969,8 @@ mod tests {
                     }
                     Err(join_err) => panic!(
                         "PRECONDITION FAILED (not an N1 regression): the anchor task \
-                         failed to join ({join_err})."
+                         failed to join (cause={}).",
+                        crate::error::join_cause(&join_err)
                     ),
                 },
                 }
@@ -2213,7 +2219,8 @@ mod tests {
                     }
                     Err(join_err) => panic!(
                         "PRECONDITION FAILED (not an N1 regression): the anchor task \
-                         failed to join ({join_err})."
+                         failed to join (cause={}).",
+                        crate::error::join_cause(&join_err)
                     ),
                 },
                 }

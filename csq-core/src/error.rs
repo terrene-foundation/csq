@@ -84,6 +84,24 @@ fn sanitize_body(body: &str) -> String {
 // internal-design-docs
 pub use csq_redact::{redact_excerpt, redact_pem_blocks, redact_tokens};
 
+/// Maps a task-join failure to the fixed-vocabulary `cause` token that
+/// operator surfaces log.
+///
+/// NEVER format a `JoinError`'s `Display`: tokio's Display carries the panic
+/// payload, which the panic hook already redacted at panic time, so formatting
+/// it on a second surface re-emits the unredacted text (security.md MUST-2).
+/// Every join-error log line or error string goes through this function, and
+/// logs only the returned literal.
+pub fn join_cause(error: &tokio::task::JoinError) -> &'static str {
+    if error.is_panic() {
+        "panic"
+    } else if error.is_cancelled() {
+        "cancelled"
+    } else {
+        "unknown"
+    }
+}
+
 /// Top-level error type for csq operations.
 ///
 /// Used at CLI and Tauri command boundaries. Each variant wraps

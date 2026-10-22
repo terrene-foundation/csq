@@ -32,8 +32,12 @@
 //!
 //! * `p_uniqueid` is assigned from a counter that only grows, when a process is forked, and
 //!   is kept across `exec` (a live test). `p_puniqueid` is the id of the process that forked
-//!   it, fixed at fork time and kept after the creator dies and the process is reparented to
-//!   launchd (a live test). Both restart at boot, so an id means something within one boot
+//!   it. It is NOT reliably kept when the creator dies: the kernel SOMETIMES rewrites it to
+//!   launchd's id (1) shortly after the reparent. The typical case seen (an ad-hoc probe on
+//!   macOS 27, not a recorded instrument; the live test below prints which outcome a run
+//!   got) was a rewrite in about half of the loaded runs and none of the unloaded ones;
+//!   nothing guarantees either outcome. A creator id of 1 therefore means EITHER launchd forked the process OR its real
+//!   creator died and the field was rewritten; the id cannot tell them apart. Both restart at boot, so an id means something within one boot
 //!   session only. That the boot session id (`kern.bootsessionuuid`) is constant within a boot
 //!   and new at every boot is an ASSUMPTION (`session::term_mint::BootId`): the kernel's
 //!   source is not cited, a live test checks one boot only, and the owner is asked to accept
@@ -46,8 +50,20 @@
 //! and for a closed terminal's orphan alike. Let C be the first creator id on the chain:
 //!
 //! 1. `C == u_L`: P descends from L. HELD.
-//! 2. `C < u_L`, or the chain ends at launchd (id 1): P was forked by something older than
-//!    L, so it does not descend from L.
+//! 2. `C < u_L`: P was forked by something older than L, so it does not descend from L. The
+//!    chain ending at launchd (`C == 1`) is the same "no" EXCEPT for a leaf P that is OPAQUE:
+//!    P's own id is above `u_L`, P is the user's own (same uid), and P's environment is
+//!    hidden (an empty region, or unreadable). The kernel can rewrite a creator id to 1 at
+//!    ANY link of the chain, and a hidden environment is the one thing that cannot name
+//!    `term-N`, so for an opaque P the chain's end at launchd is no evidence, whatever the
+//!    links are (foreign, readable or hidden). That is UNKNOWN (fail closed), like case 4.
+//!    A foreign P, a same-uid P whose readable environment names no `term-N` (one that does
+//!    is a holder already), and a P with an id below `u_L` stay "does not descend". Every
+//!    ARRIVAL (a process forked after the scan listed the table, `with_arrivals`) is opaque
+//!    whatever its uid, because its environment and uid are never read.
+//!    Cost: a hidden-env same-uid agent launchd forks above `u_L` (Apple XPC agents are such)
+//!    pins every older terminal until it exits; no cheaper discriminator is sound (a Claude
+//!    Code tool shell is a session leader, as launchd services are).
 //! 3. `C > u_L` and C is in the table: continue from C's creator.
 //! 4. `C > u_L` and C is not in the table: C is dead, and its own creator is lost. C may be a
 //!    descendant of L (a double-forked daemon) or not. UNKNOWN for this terminal, and for this
@@ -125,7 +141,8 @@ pub(crate) enum Entry {
     Foreign,
     /// A same-uid process whose environment names no config dir, or whose environment region
     /// came back EMPTY (withheld by the kernel, or genuinely empty: they cannot be told
-    /// apart, and need not be, because descent does not read the environment).
+    /// apart). Descent does not read the environment's CONTENT, but it does use whether the
+    /// region was empty (`Classified::env_hidden`, the scan's `opaque` set).
     NotHolder,
     /// A same-uid process whose readable environment names these config dirs (one per
     /// non-empty `CLAUDE_CONFIG_DIR` entry, never empty), each ABSOLUTE.
@@ -159,11 +176,18 @@ pub(crate) struct Classified {
     /// environment). `None` for a process that is gone, foreign, a zombie, or whose
     /// record could not be read.
     pub facts: Option<BsdFacts>,
+    /// A live same-uid process whose environment is empty or could not be read: the
+    /// environment witness cannot place it.
+    pub env_hidden: bool,
 }
 
 /// Classify one pid. No terminal filter and no argv\[0\] filter, by design.
 pub(crate) fn entry_via(pid: u32, uid: u32, reads: &mut HolderReads<'_>) -> Classified {
-    let without_facts = |entry| Classified { entry, facts: None };
+    let without_facts = |entry| Classified {
+        entry,
+        facts: None,
+        env_hidden: false,
+    };
     let facts = match (reads.bsd)(pid) {
         Probe::Gone => return without_facts(Entry::Absent),
         Probe::Failed => return without_facts(Entry::Unreadable),
@@ -178,9 +202,11 @@ pub(crate) fn entry_via(pid: u32, uid: u32, reads: &mut HolderReads<'_>) -> Clas
     if facts.uid != uid {
         return without_facts(Entry::Foreign);
     }
+    let (entry, env_hidden) = env_entry(pid, reads);
     Classified {
-        entry: env_entry(pid, reads),
+        entry,
         facts: Some(facts),
+        env_hidden,
     }
 }
 
@@ -191,6 +217,8 @@ enum EnvRead {
     Unreadable,
     /// A readable or empty environment with no non-empty `CLAUDE_CONFIG_DIR` entry.
     NoDir,
+    /// The environment region is empty: withheld by the kernel, or genuinely empty.
+    Empty,
     /// Every non-empty `CLAUDE_CONFIG_DIR` value, raw, never empty.
     Values(Vec<PathBuf>),
 }
@@ -206,6 +234,9 @@ fn env_read(pid: u32, reads: &mut HolderReads<'_>) -> EnvRead {
     };
     // EVERY `CLAUDE_CONFIG_DIR` entry counts, not the first: a duplicated key is legal in a
     // raw environment block and which one a runtime honours is not ours to guess.
+    if parsed.env_is_empty() {
+        return EnvRead::Empty;
+    }
     let values = parsed.env_get_all("CLAUDE_CONFIG_DIR");
     if !values.is_empty() {
         use std::os::unix::ffi::OsStrExt;
@@ -223,12 +254,16 @@ fn env_read(pid: u32, reads: &mut HolderReads<'_>) -> EnvRead {
     EnvRead::NoDir
 }
 
-/// What the environment of a live same-uid process says.
-fn env_entry(pid: u32, reads: &mut HolderReads<'_>) -> Entry {
+/// What the environment of a live same-uid process says, and whether it is hidden (empty or
+/// unreadable).
+fn env_entry(pid: u32, reads: &mut HolderReads<'_>) -> (Entry, bool) {
+    let hidden = |entry| (entry, true);
+    let seen = |entry| (entry, false);
     match env_read(pid, reads) {
-        EnvRead::Gone => Entry::Absent,
-        EnvRead::NoDir => Entry::NotHolder,
-        EnvRead::Unreadable => Entry::Unreadable,
+        EnvRead::Gone => seen(Entry::Absent),
+        EnvRead::NoDir => seen(Entry::NotHolder),
+        EnvRead::Empty => hidden(Entry::NotHolder),
+        EnvRead::Unreadable => hidden(Entry::Unreadable),
         EnvRead::Values(values) => {
             let mut dirs = Vec::new();
             let mut unresolved = false;
@@ -249,15 +284,18 @@ fn env_entry(pid: u32, reads: &mut HolderReads<'_>) -> Entry {
                     _ => unresolved = true,
                 }
             }
-            match (dirs.is_empty(), unresolved, relative) {
+            seen(match (dirs.is_empty(), unresolved, relative) {
                 (true, _, _) => Entry::Unreadable,
                 (false, true, _) => Entry::PartiallyResolved(dirs),
                 (false, false, true) => Entry::RelativeDirs(dirs),
                 (false, false, false) => Entry::ConfigDirs(dirs),
-            }
+            })
         }
     }
 }
+
+/// launchd's unique id.
+const LAUNCHD_ID: u64 = 1;
 
 /// How a terminal's launcher relates to the processes of a scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,6 +331,11 @@ pub(crate) struct ProcessEnvScan {
     /// later re-list compares against.
     pub by_pid: HashMap<u32, u64>,
     pub listed: HashSet<u32>,
+    /// The unique ids of the live same-uid processes whose environment is hidden from the
+    /// scan (an empty region, which macOS 27 returns for shared-cache binaries, or an
+    /// unreadable one), and of every arrival (never read). Only these can be an orphan whose
+    /// creator id the kernel rewrote to launchd's and that nothing else places.
+    pub opaque: HashSet<u64>,
     /// The largest unique id in `lineage`: everything forked after this scan has a larger one.
     pub max_id: u64,
     /// The table contradicts itself, so no descent verdict may rest on it.
@@ -303,7 +346,10 @@ impl ProcessEnvScan {
     /// Add one live process to the lineage, marking the table damaged when it contradicts
     /// itself: one unique id on two pids, a creator id of 0 on anything but launchd (pid 1),
     /// or a creator id that is not below its child's.
-    fn add(&mut self, pid: u32, uniq: Uniq) {
+    fn add(&mut self, pid: u32, uniq: Uniq, env_hidden: bool) {
+        if env_hidden {
+            self.opaque.insert(uniq.uniqueid);
+        }
         use std::collections::hash_map::Entry as Slot;
         if pid != 1 && (uniq.puniqueid == 0 || uniq.puniqueid >= uniq.uniqueid) {
             self.damaged = true;
@@ -319,22 +365,30 @@ impl ProcessEnvScan {
 
     /// Whether the process chain starting at creator id `c` reaches `launcher`. Ids strictly
     /// decrease along a chain, so reaching an id at or below the launcher's settles it.
-    fn chain_reaches(&self, mut c: u64, launcher: u64) -> Option<bool> {
+    #[cfg(test)]
+    fn chain_reaches(&self, c: u64, launcher: u64) -> Option<bool> {
+        self.chain_walk(c, launcher).0
+    }
+
+    /// [`Self::chain_reaches`], plus whether a "no" ended at launchd (a creator id of 1). A
+    /// reparent can write that value in place of the real creator at ANY link of the chain,
+    /// so the end at launchd proves nothing about a hidden leaf, whatever the links are.
+    fn chain_walk(&self, mut c: u64, launcher: u64) -> (Option<bool>, bool) {
         for _ in 0..LINEAGE_HOP_CAP {
             if c == launcher {
-                return Some(true);
+                return (Some(true), false);
             }
             if c < launcher {
-                return Some(false);
+                return (Some(false), c == LAUNCHD_ID);
             }
             match self.lineage.get(&c) {
                 Some(&next) => c = next,
                 // Dead creator, above the launcher: it may be a descendant of the launcher
                 // whose own creator is lost.
-                None => return None,
+                None => return (None, false),
             }
         }
-        None
+        (None, false)
     }
 
     /// Does any live process descend from the launcher whose unique id is `launcher`?
@@ -347,10 +401,15 @@ impl ProcessEnvScan {
             if id == launcher {
                 return Descent::Descendant;
             }
-            match self.chain_reaches(creator, launcher) {
-                Some(true) => return Descent::Descendant,
-                Some(false) => {}
-                None => unknown += 1,
+            match self.chain_walk(creator, launcher) {
+                (Some(true), _) => return Descent::Descendant,
+                // A "no" that ends at launchd is proof only for a leaf the scan could read.
+                // A hidden-environment same-uid leaf (or an arrival) above the launcher may
+                // descend from it through a link whose creator id was rewritten to launchd's;
+                // the link may be foreign, readable or hidden, so the chain cannot clear it.
+                (Some(false), true) if self.opaque.contains(&id) => unknown += 1,
+                (Some(false), _) => {}
+                (None, _) => unknown += 1,
             }
         }
         if unknown == 0 {
@@ -386,7 +445,9 @@ impl ProcessEnvScan {
                         continue; // a process the scan has
                     }
                     if u.uniqueid > self.max_id {
-                        next.add(pid, u); // forked after the scan: an arrival
+                        // Forked after the scan: an arrival. Its environment is never read,
+                        // so it is as hidden as it gets.
+                        next.add(pid, u, true);
                     } else {
                         // Older than the scan's newest process yet absent from it.
                         next.unreadable += 1;
@@ -427,7 +488,7 @@ pub(crate) fn scan_via(
         if !matches!(entry, Entry::Absent) {
             let after = (reads.uniq)(pid);
             match (before, after) {
-                (Probe::Got(a), Probe::Got(b)) if a == b => scan.add(pid, a),
+                (Probe::Got(a), Probe::Got(b)) if a == b => scan.add(pid, a, classified.env_hidden),
                 // Gone: it died while being read, so it holds nothing now.
                 (Probe::Gone, _) | (_, Probe::Gone) => {}
                 // A live process of ANY user whose id cannot be read (or changed while it was
@@ -1097,9 +1158,106 @@ mod tests {
     fn a_process_forked_before_the_launcher_does_not_descend_from_it() {
         let scan = World::new(vec![(SHELL, withheld_shell(900, 400))]).scan_all();
         assert_eq!(scan.descent(L), Descent::Not);
-        // And one forked by launchd (a service): also older than any launcher.
-        let born = World::new(vec![(SHELL, withheld_shell(900, LAUNCHD))]).scan_all();
+        // And one forked by launchd before the launcher existed (id below it): also not.
+        // This holds whatever its environment shows: an id below the launcher's is a fact.
+        let born = World::new(vec![(SHELL, withheld_shell(400, LAUNCHD))]).scan_all();
         assert_eq!(born.descent(L), Descent::Not);
+        // A launchd-forked service with a READABLE environment that names no `term-N` and an
+        // id above the launcher's: the environment witness would have shown the terminal, so
+        // it is not a descendant.
+        let service = World::new(vec![(SHELL, proc(900, LAUNCHD, vec!["PATH=/usr/bin"]))]);
+        assert_eq!(service.scan_all().descent(L), Descent::Not);
+    }
+
+    /// RED against a descent that reads creator id 1 as proof of "forked by launchd". The
+    /// kernel SOMETIMES rewrites `p_puniqueid` to 1 when the creator dies and the process is
+    /// reparented (measured under load), so a same-uid process above the launcher's id whose
+    /// environment is hidden (empty or unreadable) and whose creator reads 1 may be a live
+    /// orphan of the launcher: UNKNOWN, never Not. The controls that stay Not: another
+    /// user's process, a readable environment that does not name `term-N`, an id below the
+    /// launcher's.
+    #[test]
+    fn a_hidden_env_same_uid_process_reparented_to_launchd_is_unknown() {
+        let scan = World::new(vec![(SHELL, withheld_shell(900, LAUNCHD))]).scan_all();
+        assert!(scan.complete && !scan.damaged && scan.unreadable == 0);
+        assert!(scan.opaque.contains(&900));
+        assert_eq!(scan.descent(L), Descent::Unknown { processes: 1 });
+        // For a launcher NEWER than the process, the process cannot descend from it.
+        assert_eq!(scan.descent(901), Descent::Not);
+        // The chain decides, not one link: a hidden leaf under a hidden link is unknown,
+        // and so is one under a foreign (root) link or a readable link, because the kernel
+        // may have rewritten the creator id at any link.
+        let chain = World::new(vec![
+            (MID, withheld_shell(800, LAUNCHD)),
+            (SHELL, withheld_shell(900, 800)),
+        ])
+        .scan_all();
+        assert_eq!(chain.descent(L), Descent::Unknown { processes: 2 });
+        let readable_link = World::new(vec![
+            (MID, proc(800, LAUNCHD, vec!["PATH=/usr/bin"])),
+            (SHELL, withheld_shell(900, 800)),
+        ])
+        .scan_all();
+        assert_eq!(
+            readable_link.descent(L),
+            Descent::Unknown { processes: 1 },
+            "a hidden leaf behind a readable link"
+        );
+        let foreign_link = World::new(vec![
+            (MID, root_proc(800, LAUNCHD)),
+            (SHELL, withheld_shell(900, 800)),
+        ])
+        .scan_all();
+        assert_eq!(
+            foreign_link.descent(L),
+            Descent::Unknown { processes: 1 },
+            "a hidden leaf behind a foreign link (zsh -> sudo -> sh)"
+        );
+        // Controls: a FOREIGN leaf, or a READABLE leaf, behind the same links stays Not.
+        let foreign_leaf = World::new(vec![
+            (MID, root_proc(800, LAUNCHD)),
+            (SHELL, root_proc(900, 800)),
+        ])
+        .scan_all();
+        assert_eq!(foreign_leaf.descent(L), Descent::Not, "foreign leaf");
+        let readable_leaf = World::new(vec![
+            (MID, root_proc(800, LAUNCHD)),
+            (SHELL, proc(900, 800, vec!["PATH=/usr/bin"])),
+        ])
+        .scan_all();
+        assert_eq!(readable_leaf.descent(L), Descent::Not, "readable leaf");
+        // An unreadable environment is hidden too.
+        let mut blind = withheld_shell(900, LAUNCHD);
+        blind.env = None;
+        let scan = World::new(vec![(SHELL, blind)]).scan_all();
+        assert_eq!(scan.unreadable, 1);
+        assert_eq!(scan.descent(L), Descent::Unknown { processes: 1 });
+    }
+
+    /// The controls of the test above, each differing from the unsafe case in exactly one
+    /// way, each `Not`.
+    #[test]
+    fn the_launchd_creator_rule_keeps_not_for_its_controls() {
+        let verdict = |p: Proc| World::new(vec![(SHELL, p)]).scan_all().descent(L);
+        // Control 1: another user's process (its keychain is not this user's).
+        let foreign = Proc {
+            uid: 0,
+            ..withheld_shell(900, LAUNCHD)
+        };
+        assert_eq!(verdict(foreign), Descent::Not);
+        // Control 2: a readable environment that does not name `term-N`.
+        let readable = Proc {
+            pgid: 93216,
+            ..proc(900, LAUNCHD, vec!["PATH=/usr/bin", "HOME=/Users/x"])
+        };
+        assert_eq!(verdict(readable), Descent::Not);
+        // Control 3: an id below the launcher's.
+        assert_eq!(verdict(withheld_shell(499, LAUNCHD)), Descent::Not);
+        // The unsafe case itself, on the same fixture shape.
+        assert_eq!(
+            verdict(withheld_shell(900, LAUNCHD)),
+            Descent::Unknown { processes: 1 }
+        );
     }
 
     /// `creator > u_L` and dead: it may be a descendant of the launcher (a double-forked
@@ -1295,7 +1453,7 @@ mod tests {
     /// process the scan has is.
     #[test]
     fn a_process_forked_after_the_scan_is_decided_by_its_creator() {
-        let world = World::new(vec![(MID, proc(600, LAUNCHD, vec![]))]);
+        let world = World::new(vec![(MID, proc(600, LAUNCHD, vec!["PATH=/usr/bin"]))]);
         let scan = world.scan_all();
         assert_eq!(scan.max_id, 600);
         let pids = |extra: &[u32]| {
@@ -1304,7 +1462,10 @@ mod tests {
             v
         };
         let extended = |arrival: Proc, blind: bool| {
-            let mut w = World::new(vec![(MID, proc(600, LAUNCHD, vec![])), (4242, arrival)]);
+            let mut w = World::new(vec![
+                (MID, proc(600, LAUNCHD, vec!["PATH=/usr/bin"])),
+                (4242, arrival),
+            ]);
             if blind {
                 w.blind_uniq.insert(4242);
             }
@@ -1313,10 +1474,19 @@ mod tests {
         // Nothing new: the same scan.
         let same = scan.with_arrivals(&pids(&[]), &|p| world.uniq(p));
         assert_eq!(same, scan);
-        // Forked by a process the scan has (older than the launcher): not a descendant.
+        // Forked by a process the scan has, which launchd forked: an arrival is never read,
+        // so it is opaque and the end at launchd cannot clear it (any uid: a foreign arrival
+        // is opaque too).
         let ok = extended(withheld_shell(1700, 600), false);
-        assert_eq!(ok.descent(L), Descent::Not);
+        assert_eq!(ok.descent(L), Descent::Unknown { processes: 1 });
         assert_eq!(ok.unreadable, 0);
+        assert_eq!(
+            extended(root_proc(1700, 600), false).descent(L),
+            Descent::Unknown { processes: 1 },
+            "a foreign arrival is opaque"
+        );
+        // Control: the same arrival for a launcher NEWER than it cannot descend from it.
+        assert_eq!(ok.descent(1701), Descent::Not);
         // Forked by the launcher itself, or by a dead creator above it.
         assert_eq!(
             extended(withheld_shell(1700, L), false).descent(L),
@@ -1324,6 +1494,12 @@ mod tests {
         );
         assert_eq!(
             extended(withheld_shell(1700, 1650), false).descent(L),
+            Descent::Unknown { processes: 1 }
+        );
+        // An arrival that reads launchd as its creator and is above the launcher: its
+        // environment was never read, so it may be a reparented orphan. Unknown.
+        assert_eq!(
+            extended(withheld_shell(1700, LAUNCHD), false).descent(L),
             Descent::Unknown { processes: 1 }
         );
         // An arrival whose id cannot be read.

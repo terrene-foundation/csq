@@ -4,6 +4,7 @@ import { resolve, join, delimiter, basename, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { capture, parseFooter, retainOutput } from './preflight-runtime.mjs';
+import { installStopHandlers, exitAfterBackstops, stopSignal } from './child-supervisor.mjs';
 
 // ── ALLOWLIST-ONLY OUTPUT HELPERS (shared with dev-preflight.mjs) ─────────────
 // Operator-facing preflight text is a fixed vocabulary plus values that pass one
@@ -63,6 +64,11 @@ export function testNames(root) {
   return readdirSync(join(root, 'scripts/tests')).filter((n) => n.endsWith('.test.sh')).sort();
 }
 function exitState(rows) {
+  // A LATCHED STOP IS NEVER GREEN (D237 R2 sec L5). A stop that lands after
+  // every started row has passed left exitState with no non-GREEN row, so the
+  // run printed GREEN although it was interrupted and the remaining work never
+  // ran. A real RED still wins; otherwise a stop is UNDETERMINED.
+  if (stopSignal()) return rows.some((r) => r.state === 'RED') ? 'RED' : 'UNDETERMINED';
   if (rows.some((r) => r.state === 'RED')) return 'RED';
   if (rows.some((r) => r.state === 'UNDETERMINED')) return 'UNDETERMINED';
   if (rows.some((r) => r.state === 'SKIPPED')) return 'SKIPPED';
@@ -239,8 +245,12 @@ export function stuckDiagnostics(child) {
 // ceiling its caller names: it is what actually kills a wedged wrapper, and it
 // is RECORDED on every row so each downstream detail names the bound that
 // fired rather than a bound the run never reached.
-export async function runLocalTests(root, names, perTestMs, { env = process.env } = {}) {
-  const policy = await capture('python3', ['scripts/ci/undetermined-allowlist.py'], { cwd: root, env });
+export async function runLocalTests(root, names, perTestMs, { env = process.env, stopWhen = () => false } = {}) {
+  // A stop must not be followed by a new detached wrapper: every start is
+  // gated on the caller's latch, and capture() registers each child with the
+  // stop set (D237 R2 HIGH-1/MED-A).
+  if (stopWhen()) return names.map((n) => ({ n, state: 'UNDETERMINED', rc: null, ms: 0, executed: false, out: 'stopped by signal before this test started' }));
+  const policy = await capture('python3', ['scripts/ci/undetermined-allowlist.py'], { cwd: root, env, stopWhen });
   const allowed = new Map();
   if (policy.status === 0 && !policy.error && !policy.signal) {
     for (const line of policy.stdout.split('\n')) {
@@ -250,10 +260,11 @@ export async function runLocalTests(root, names, perTestMs, { env = process.env 
   }
   const results = [];
   for (const n of names) {
+    if (stopWhen()) { results.push({ n, state: 'UNDETERMINED', rc: null, ms: 0, executed: false, out: 'stopped by signal before this test started' }); continue; }
     if (!existsSync(join(root, 'scripts/tests', n))) { results.push({ n, state: 'UNDETERMINED', rc: null, ms: 0, executed: false, out: 'missing enumerated test' }); continue; }
     const testEnv = { ...env, DEV_PREFLIGHT_IN_SELFTEST: '1' };
     for (const key of ['CSQ_PREFLIGHT_WORKER_TOKEN','CSQ_PREFLIGHT_PARENT_FINGERPRINT','CSQ_PREFLIGHT_CANONICAL_WORKER','DEV_PREFLIGHT_ONLY']) delete testEnv[key];
-    const r = await capture('bash', [join(root, 'scripts/tests', n)], { cwd: root, env: testEnv, timeoutMs: perTestMs, onTimeout: (child) => stuckDiagnostics(child) });
+    const r = await capture('bash', [join(root, 'scripts/tests', n)], { cwd: root, env: testEnv, timeoutMs: perTestMs, onTimeout: (child) => stuckDiagnostics(child), stopWhen });
     const out = r.stdout + r.stderr + (r.timeout_diagnostics ? `\n${r.timeout_diagnostics}\n` : '');
     let state = r.error || r.signal || r.timedOut ? 'UNDETERMINED' : r.status === 0 ? 'GREEN' : 'RED';
     if ((r.evidence_error || !r.evidence) && state === 'GREEN') state = 'UNDETERMINED';
@@ -297,7 +308,7 @@ export async function prepareShellTools(root, names, { env = process.env } = {})
 // wrapper consumed the whole set budget. The `perTestMs = ceilingMs` default
 // keeps the pre-split single-bound contract for callers that name only a
 // ceiling (scripts/tests drive this module directly with one number).
-export async function runShellGate(root, { local = false, ceilingMs = 900000, perTestMs = ceilingMs } = {}) {
+export async function runShellGate(root, { local = false, ceilingMs = 900000, perTestMs = ceilingMs, stopWhen = () => false } = {}) {
   const started = performance.now();
   let names;
   try { names = testNames(root); } catch { return { state: 'UNDETERMINED', detail: 'cannot enumerate scripts/tests/' }; }
@@ -309,17 +320,22 @@ export async function runShellGate(root, { local = false, ceilingMs = 900000, pe
   if (!Number.isFinite(perTestMs) || perTestMs <= 0 || perTestMs > ceilingMs) return { state: 'UNDETERMINED', detail: 'invalid per-test bound (must be finite, > 0 and no larger than the ceiling)' };
   const shards = Math.min(2, names.length), evidence = [];
   let results;
-  if (local) results = await runLocalTests(root, names, perTestMs);
+  if (local) results = await runLocalTests(root, names, perTestMs, { stopWhen });
   else {
     const parts = await Promise.all(Array.from({ length: shards }, async (_, shard) => {
       let last;
       for (let attempt = 0; attempt < 2; attempt++) {
+        // A stop during attempt 0 must never start attempt 1 (or a spawn that
+        // outlives the stop): the retry path is where a detached group used to
+        // be orphaned (D237 R2 HIGH-1/MED-A).
+        if (stopWhen()) return { error: 'self-test shard stopped by signal' };
         const args = ['run', '--os', 'linux', ...(attempt && last?.code === 116 ? ['--wait-s', '600'] : []), '--', 'node',
           'scripts/ci/preflight-shell-tests.mjs', '--shard', String(shard), '--shards', String(shards),
           '--ceiling-ms', String(ceilingMs), '--per-test-ms', String(perTestMs)];
-        const r = await capture('trestle', args, { cwd: root, timeoutMs: 30 * 60 * 1000 }); evidence.push(r.evidence);
+        const r = await capture('trestle', args, { cwd: root, timeoutMs: 30 * 60 * 1000, stopWhen }); evidence.push(r.evidence);
+        if (stopWhen()) return { error: 'self-test shard stopped by signal' };
         const f = parseFooter(r); last = f;
-        if (attempt === 0 && f?.kind === 'engine' && [2,114,116].includes(f.code)) continue;
+        if (attempt === 0 && f?.kind === 'engine' && [2,114,116].includes(f.code) && !stopWhen()) continue;
         if (r.error || r.signal || !f || f.kind !== 'command' || f.code !== r.status) return { error: 'self-test shard offload did not return a command verdict' };
         const frames = r.stdout.split('\n').filter((l) => l.startsWith('CSQ_SHELL_RESULT '));
         if (frames.length !== 1) return { error: 'self-test shard did not return one result frame' };
@@ -374,6 +390,11 @@ if (process.argv[1]) {
   try { invokedAsEntry = realpathSync(resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url)); } catch {}
 }
 if (invokedAsEntry) {
+  // ONE stop set (D237 R2 advisory LOW): the shard CLI runs supervised captures
+  // but installed no handlers, so a SIGTERM killed the CLI and left every
+  // wrapper it had started running, unsignalled. The handlers drain the captures
+  // and the latch refuses new wrappers below.
+  installStopHandlers({});
   const args = process.argv.slice(2), root = process.cwd();
   // TWO shapes, one contract, because the parent's argv must match this parser
   // EXACTLY or every offloaded shard dies on argv before printing a frame (a
@@ -388,11 +409,11 @@ if (invokedAsEntry) {
       (perTestShards && args[6] !== '--per-test-ms') ||
       !Number.isInteger(shard) || !Number.isInteger(shards) || shards < 1 || shards > 2 || shard < 0 || shard >= shards ||
       !Number.isFinite(ceilingMs) || ceilingMs <= 0 || ceilingMs > 900000 ||
-      !Number.isFinite(perTestMs) || perTestMs <= 0 || perTestMs > ceilingMs) process.exit(2);
+      !Number.isFinite(perTestMs) || perTestMs <= 0 || perTestMs > ceilingMs) await exitAfterBackstops(2);
   const names = testNames(root), assigned = names.filter((_,i) => i % shards === shard);
-  if (!assigned.length) process.exit(2);
+  if (!assigned.length) await exitAfterBackstops(2);
   const prepared = await prepareShellTools(root, assigned);
-  const results = prepared.error ? assigned.map((n) => ({ n, state: 'UNDETERMINED', rc: null, ms: 0, executed: false, out: prepared.error, setup_evidence: prepared.evidence })) : await runLocalTests(root, assigned, perTestMs, { env: prepared.env });
+  const results = prepared.error ? assigned.map((n) => ({ n, state: 'UNDETERMINED', rc: null, ms: 0, executed: false, out: prepared.error, setup_evidence: prepared.evidence })) : await runLocalTests(root, assigned, perTestMs, { env: prepared.env, stopWhen: () => !!stopSignal() });
   console.log('CSQ_SHELL_RESULT ' + JSON.stringify({ schema: 'csq-shell-shard-v1', shard, shards, all_names: names, results, prerequisite_evidence: prepared.evidence, prerequisite_setup: prepared.setup }));
   // Natural exit lets Node drain the complete JSON frame to a pipe.
   const state = exitState(results); process.exitCode = state === 'RED' ? 1 : state === 'UNDETERMINED' ? 2 : 0;

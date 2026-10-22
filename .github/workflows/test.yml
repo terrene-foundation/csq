@@ -90,6 +90,34 @@ jobs:
           PY
         timeout-minutes: 3
 
+      - name: Provide sqlite3 on Windows (codex share tests)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # Match test.yml's official archive + published SHA3-256 pattern.
+          # Job-local install: no administrator or shared host configuration.
+          python - <<'PY'
+          import hashlib, io, os, pathlib, urllib.request, zipfile
+          url = "https://sqlite.org/2026/sqlite-tools-win-x64-3530400.zip"
+          # https://sqlite.org/download.html — SQLite 3.53.4 Windows x64 tools.
+          want = "88b4659fe747896b853af10157316b4ade143553efb89c1c8ca7423a278dcc8b"
+          data = urllib.request.urlopen(url, timeout=60).read()
+          got = hashlib.sha3_256(data).hexdigest()
+          if got != want:
+              raise SystemExit(f"sqlite3 download SHA3-256 mismatch: {got}")
+          out_dir = pathlib.Path(os.environ["RUNNER_TEMP"]).resolve() / "csq-sqlite3"
+          out_dir.mkdir(parents=True, exist_ok=True)
+          out = out_dir / "sqlite3.exe"
+          with zipfile.ZipFile(io.BytesIO(data)) as archive:
+              out.write_bytes(archive.read("sqlite3.exe"))
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              env_file.write(f"CSQ_SQLITE3={out}\n")
+          with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as path_file:
+              path_file.write(f"{out_dir}\n")
+          print(f"Verified SQLite archive SHA3-256: {got}")
+          PY
+        timeout-minutes: 3
+
       # Split exactly as the enterprise test.yml splits it, plus doc-tests on
       # their own. ONE combined `cargo test --workspace` hands every doc-test the
       # union of every build script's native search paths, so the csq desktop

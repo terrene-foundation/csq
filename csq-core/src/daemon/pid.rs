@@ -40,6 +40,25 @@ pub struct PidFile {
     _lock: FileLockGuard,
 }
 
+// COMPILE-TIME ASSERTION: THE PID FILE MUST STAY `!Send` ON WINDOWS (Q6 R1
+// L1). It holds the guard for the daemon's whole session, so a `Send` PidFile
+// would let the same cross-thread release problem back in one level up (see
+// the assertion on FileLockGuard in `platform/lock.rs`). Same ambiguous-impl
+// technique, no dependency: the resolution below fails to compile (E0283) if
+// this type ever becomes `Send`.
+#[cfg(windows)]
+const _: fn() = || {
+    trait AmbiguousIfSend<A> {
+        // Never called; the resolution itself is the assertion.
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    #[allow(dead_code)]
+    struct Invalid;
+    impl<T: ?Sized + Send> AmbiguousIfSend<Invalid> for T {}
+    let _ = <PidFile as AmbiguousIfSend<_>>::some_item;
+};
+
 /// The sibling lock-file path for a PID file: `<path>.lock`. Never
 /// renamed (unlike the atomically-replaced PID file), so the flock on it
 /// is stable across PID-file rewrites.

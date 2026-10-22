@@ -907,7 +907,7 @@ async fn run_tick_supervised(
         tracing::error!(
             error_kind = "refresher_tick_panicked",
             panicked = join_err.is_panic(),
-            error = %crate::error::redact_tokens(&join_err.to_string()),
+            cause = crate::error::join_cause(&join_err),
             "refresher tick panicked; refresher loop survives and will retry at the next interval"
         );
 
@@ -1590,7 +1590,7 @@ async fn tick_impl(
                         account = info.id,
                         surface = "codex",
                         panicked = join_err.is_panic(),
-                        error = %crate::error::redact_tokens(&join_err.to_string()),
+                        cause = crate::error::join_cause(&join_err),
                         "codex refresh task panicked"
                     );
                     set_cooldown(cooldowns, info.id);
@@ -2044,7 +2044,7 @@ async fn tick_impl(
                 warn!(
                     account = info.id,
                     panicked = join_err.is_panic(),
-                    error = %crate::error::redact_tokens(&join_err.to_string()),
+                    cause = crate::error::join_cause(&join_err),
                     "refresh task panicked"
                 );
                 set_cooldown(cooldowns, info.id);

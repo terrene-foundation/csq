@@ -239,7 +239,12 @@ pub async fn start_claude_login_subprocess(
         finalize_verified_login(&base_for_finalize, account_num, committed)
     })
     .await
-    .map_err(|e| format!("INTERNAL: finalize task join failed: {e}"))?
+    .map_err(|e| {
+        format!(
+            "INTERNAL: finalize task join failed: {}",
+            csq_core::error::join_cause(&e)
+        )
+    })?
     .map_err(|e| format!("FINALIZE_FAILED: {}", redact_tokens(&e.to_string())))?;
 
     // login-followup HIGH-1: the commit + finalize above SUCCEEDED, so the

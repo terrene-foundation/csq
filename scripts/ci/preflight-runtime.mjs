@@ -1,11 +1,90 @@
-import { fork, spawn } from 'node:child_process';
-import { chmodSync, mkdtempSync, writeFileSync, mkdirSync, lstatSync, realpathSync, unlinkSync, rmdirSync, readdirSync, openSync, closeSync, fstatSync, readSync, constants } from 'node:fs';
+import { fork } from 'node:child_process';
+import { chmodSync, mkdtempSync, writeFileSync, mkdirSync, lstatSync, realpathSync, unlinkSync, rmdirSync, readdirSync, openSync, closeSync, fstatSync, readSync, rmSync, constants } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, delimiter } from 'node:path';
 import { performance } from 'node:perf_hooks';
 
 export const FLEET_SHARE_CAP = 6;
+// Captured-output cap for a supervised child's stdout+stderr, in CHARACTERS.
+// ONE cap for capture() and for gate workers: unbounded concatenation reaches
+// V8's string limit and crashes the supervisor with a RangeError — the crash
+// path would then have to drain what the crash itself caused (D237 R1 M3).
+// 64 Mi chars is far beyond any legitimate gate's output and far below the
+// limit; over the cap the child is stopped and the row is UNDETERMINED.
+const OUTPUT_CAP_CHARS = 64 * 1024 * 1024;
+// ── THE STOP LADDER. A leg runs in its OWN process group (detached), so a
+// signal to the worker's group reaches neither the launcher nor its helpers;
+// every stop therefore TERMs the LEG's group and arms ONE KILL backstop for the
+// same group after CALLER_KILL_GRACE_MS. The group is what a signal reaches: a
+// descendant that leaves it (setsid/setpgid) is NOT signalled — the
+// caller-timeout message discloses the resulting remote-orphan possibility. The
+// worker-level stop (the parent's SIGTERM/SIGINT handler, which supervises the
+// worker's group) uses WORKER_KILL_GRACE_MS, deliberately LONGER than the leg
+// KILL: the worker's own in-process leg backstop fires at CALLER_KILL_GRACE_MS
+// and must get to run before the worker is SIGKILLed. The watchdog is NOT a
+// worker-level stop — its own backstop is item 1 of the ladder below, with the
+// strictly shorter WATCHDOG_KILL_GRACE_MS.
+// kill(-pgid) on a group with no members is ESRCH, which every signal helper
+// here tolerates — "while it has members" needs no separate probe.
+export const CALLER_KILL_GRACE_MS = 2_000;
+// ── THE KILL LADDER, stated once and ASSERTED (D237 R1 M2). Three SIGKILLs can
+// be in flight for one leg; their order is the contract:
+//   1. the watchdog's own backstop (per-test timeout / stop), WATCHDOG_KILL_GRACE_MS
+//      — strictly BELOW the caller's leg grace, so a shared stop lets the
+//      watchdog finish its verdict and its KILL before the leg is SIGKILLed;
+//   2. the caller's leg-group KILL, CALLER_KILL_GRACE_MS;
+//   3. the worker-level KILL, WORKER_KILL_GRACE_MS — the LAST resort.
+// The margin is the worker's allowance to run its own SYNCHRONOUS sections
+// between (2) and (3): retainOutput writes and hashes up to the 64 Mi-char
+// capture cap, and treeFingerprint runs `spawnSync git` (R2-M5 — the earlier
+// wording credited the async samplers, which were never on this path). A
+// synchronous section longer than the margin must raise it here, not silently
+// eat the margin — the load-time assertion below rejects a drifted ordering.
+// WORKER is an INDEPENDENT constant, not `CALLER + MARGIN`: an identity cannot
+// fail its own assertion (D237 R2-M5 tautology), so raising CALLER or MARGIN
+// without also raising WORKER now throws at import.
+// LIMIT, stated not assumed: on a remote leg the WATCHDOG runs on the fleet
+// host while (2) is the LOCAL trestle client's group KILL. The assertion below
+// can only order the constants on one clock; the cross-host firing order is the
+// design's assumption (the client TERMs, the far-side watchdog stops itself on
+// its own SIGHUP/group signal) and is NOT machine-checkable here.
+export const WATCHDOG_KILL_GRACE_MS = 1_000;
+export const KILL_LADDER_MARGIN_MS = 1_000;
+export const WORKER_KILL_GRACE_MS = 3_000;
+if (!(WATCHDOG_KILL_GRACE_MS < CALLER_KILL_GRACE_MS
+  && CALLER_KILL_GRACE_MS + KILL_LADDER_MARGIN_MS <= WORKER_KILL_GRACE_MS)) {
+  throw new Error('kill ladder ordering violated (watchdog < caller and caller + margin <= worker)');
+}
+// Last-resort settlement bound if a worker's IPC channel never disconnects.
+// It SHOULD disconnect at exit (the worker's spawned children do not inherit
+// the IPC fd), so this only bounds a pathological channel and is deliberately
+// far longer than one turn of a blocked event loop. Exported so the self-test
+// derives its settlement bound instead of choosing one (D237 R2 corr L5).
+export const IPC_SETTLE_BOUND_MS = 2_000;
+// ── ONE PER-GATE DEADLINE, expressed ONCE (dev-preflight.mjs imports these; the
+// self-tests assert the arithmetic directly). A gate draws admission, each
+// attempt's bound and every retry wait from the same clock; the constants live
+// here so the rest of the expressions cannot drift.
+export const LEG_ATTEMPTS = 2;
+export const LEG_ADMISSION_WAIT_MS = 30 * 60 * 1000;
+export const LEG_RETRY_WAIT_S = 600;
+export function gateDeadlineMsFor(legMs) {
+  return LEG_ATTEMPTS * LEG_ADMISSION_WAIT_MS + legMs + (legMs + LEG_RETRY_WAIT_S * 1000);
+}
+// Attempt 0 pays only the leg; a retry also pays the --wait-s it spends INSIDE
+// the trestle invocation. Both are clamped to what remains of the deadline.
+export function attemptBoundMsFor(attempt, legMs, remainingMs) {
+  return Math.min(attempt === 0 ? legMs : legMs + LEG_RETRY_WAIT_S * 1000, Math.max(1, Math.round(remainingMs)));
+}
+// A retry starts ONLY when its admission wait, its retry wait and a FULL leg
+// still fit; a 114/2 engine retry pays no --wait-s, so it needs admission + leg.
+export function retryFits(remainingMs, legMs) {
+  return remainingMs >= LEG_ADMISSION_WAIT_MS + LEG_RETRY_WAIT_S * 1000 + legMs;
+}
+export function engineRetryFits(remainingMs, legMs) {
+  return remainingMs >= LEG_ADMISSION_WAIT_MS + legMs;
+}
 let defaultFleetScope;
 export function createFleetScope() {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), 'csq-preflight-fleet-')));
@@ -76,10 +155,15 @@ export function acquireFleetSlotSync({ env = process.env, waitMs = 30 * 60 * 100
   } while (performance.now() < deadline);
   throw new Error('caller fleet admission deadline exhausted');
 }
-async function acquireFleetSlot({ env, waitMs }) {
+// ASYNC admission (used by runHeavy): the wait slices yield to the event loop,
+// so a SIGTERM handler can run and `stopWhen` can interrupt the wait. The sync
+// variant below blocks the loop for its whole span and is kept only for callers
+// that cannot await (it cannot observe a signal).
+export async function acquireFleetSlot({ env = process.env, waitMs = 30 * 60 * 1000, stopWhen = () => false } = {}) {
   if (!Number.isFinite(waitMs) || waitMs <= 0 || waitMs > 30 * 60 * 1000) throw new Error('invalid fleet admission deadline');
   const directory = fleetScope(env), deadline = performance.now() + waitMs;
   do {
+    if (stopWhen()) throw new Error('caller fleet admission stopped by signal');
     const release = claimFleetSlot(directory); if (release) return release;
     await new Promise((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, deadline - performance.now()))));
   } while (performance.now() < deadline);
@@ -93,19 +177,96 @@ export function parseFooter(output) {
   const line = stream.replace(/(?:\r?\n[ \t]*)+$/, '').split(/\r?\n/).at(-1);
   const m = /^\[(trestle-run|trestle-remote-run)\] exit=([0-9]{1,3}) (command|engine:([a-z][a-z0-9-]{0,31})|arbiter:([a-z][a-z0-9-]{0,31}))((?: [a-z][a-z0-9_-]*=[^\s\x00]+)*)$/.exec(line);
   if (!m || Number(m[2]) > 255) return null;
-  // Accept only launcher-owned fields, once each, on this terminal footer.
+  // Accept only launcher-owned fields, once each, on this terminal footer. The
+  // set is the DOCUMENTED writer shapes (trestle run --help): 113/104/114/116
+  // footers carry cause=/requirement= and the host lists, and a reader that
+  // rejected them would call every real retryable footer unclassifiable
+  // (guard-reader-writer-parity MUST-1). Values are shape-checked, never free
+  // text, so a forged line still cannot smuggle attribution.
+  const HOST_LIST = /^[A-Za-z0-9_.-]+(?:,[A-Za-z0-9_.-]+)*$/;
+  const FIELD_SHAPES = {
+    tree: /^[0-9a-f]{40}$/, host: /^[A-Za-z0-9_.-]+$/, wall: /^[0-9]+(?:\.[0-9]+)?s$/,
+    lock: /^[A-Za-z0-9_.:-]+$/, cause: /^(deadline|interrupted)$/, requirement: /^[a-z][a-z0-9-]*$/,
+    busy: HOST_LIST, not_admitted: HOST_LIST, unreadable: HOST_LIST, mirror_full: HOST_LIST,
+    skipped: HOST_LIST, ci_busy: HOST_LIST, ci_unread: HOST_LIST,
+  };
   const metadata = {};
   for (const field of m[6].trim().split(/ +/).filter(Boolean)) {
     const at = field.indexOf('='), key = field.slice(0, at), value = field.slice(at + 1);
-    if (!['tree', 'host', 'wall', 'lock'].includes(key) || Object.hasOwn(metadata, key)) return null;
-    if (key === 'tree' && !/^[0-9a-f]{40}$/.test(value)) return null;
-    if (key === 'host' && !/^[A-Za-z0-9_.-]+$/.test(value)) return null;
-    if (key === 'wall' && !/^[0-9]+(?:\.[0-9]+)?s$/.test(value)) return null;
+    if (!Object.hasOwn(FIELD_SHAPES, key) || Object.hasOwn(metadata, key)) return null;
+    if (!FIELD_SHAPES[key].test(value)) return null;
     metadata[key] = value;
   }
-  if ((output?.signal || output?.timedOut) && m[3] === 'command') return null;
-  return { code: Number(m[2]), kind: m[3] === 'command' ? 'command' : m[4] ? 'engine' : 'arbiter',
+  // A footer written by a launcher that then DIED BY SIGNAL or under our
+  // timeout cannot be trusted as a terminal verdict: if trestle crashed before
+  // writing its own footer, the last stderr line is whatever the workload
+  // printed, and accepting it lets a workload line buy a retry (D237 R2
+  // LOW-D). The same holds for an engine/arbiter footer whose code is not the
+  // process's actual exit status.
+  if (output?.signal || output?.timedOut) return null;
+  const kind = m[3] === 'command' ? 'command' : m[4] ? 'engine' : 'arbiter';
+  if (kind !== 'command' && typeof output?.status === 'number' && Number(m[2]) !== output.status) return null;
+  return { code: Number(m[2]), kind,
     engine: m[4], arbiter: m[5], ...metadata };
+}
+// ── EVIDENCE RETENTION. retainOutput leaves one tmp dir per capture and nothing
+// reaped them (36k+ csq-preflight-output-* dirs on one host). The writer owns
+// the policy: at preflight start, prune THIS uid's dirs older than seven days.
+// The name must match mkdtemp's exact shape, the entry must be a real directory
+// (lstat — a symlink is never followed or removed), the pass is bounded, and a
+// fresh dir — including every dir this run will create — is untouched. Where
+// the platform has no uid (Windows), the ownership check is skipped; the name,
+// type, age and bound still apply.
+export const EVIDENCE_DIR_RE = /^csq-preflight-output-[A-Za-z0-9]{6}$/;
+const EVIDENCE_RETAIN_MS = 7 * 24 * 60 * 60 * 1000;
+const EVIDENCE_PRUNE_MAX = 2048;
+export function pruneEvidenceDirs({ tmpdirPath = tmpdir(), now = Date.now(), retainMs = EVIDENCE_RETAIN_MS,
+  maxCandidates = EVIDENCE_PRUNE_MAX, uid = process.getuid?.() } = {}) {
+  let names;
+  try { names = readdirSync(tmpdirPath); } catch { return { examined: 0, removed: 0 }; }
+  let examined = 0, removed = 0;
+  for (const name of names) {
+    if (examined >= maxCandidates) break;
+    if (!EVIDENCE_DIR_RE.test(name)) continue;
+    examined++;
+    const path = join(tmpdirPath, name);
+    let info;
+    try { info = lstatSync(path); } catch { continue; }
+    if (!info.isDirectory() || info.isSymbolicLink()) continue;
+    if (uid !== undefined && info.uid !== uid) continue;
+    if (now - info.mtimeMs < retainMs) continue;
+    try { rmSync(path, { recursive: true, force: true }); removed++; } catch { /* not removable: leave it */ }
+  }
+  return { examined, removed };
+}
+// The evidence dirs live under tmpdir(), but a writer that ran without TMPDIR
+// wrote under /tmp (measured: 5,929 there vs 29,187 in the account TMPDIR), so a
+// CANONICAL pass covers BOTH roots. On Windows only tmpdir() exists. A duplicate
+// root (TMPDIR=/tmp) is harmless: the second pass finds nothing left to remove.
+//
+// A FIXTURE run covers ONLY its own tmpdir: adding the operator's real /tmp
+// would let a self-test prune live evidence it never wrote (R1 LOW-5). The roots
+// are injectable through CSQ_PREFLIGHT_EVIDENCE_ROOTS for fixtures only; a
+// canonical run REFUSES the override, like the other fixture-only knobs.
+export function evidenceRoots(env = process.env) {
+  const canonical = env.CSQ_PREFLIGHT_CANONICAL_WORKER === "1";
+  const fixture = !!env.DEV_PREFLIGHT_ONLY && !canonical;
+  const override = env.CSQ_PREFLIGHT_EVIDENCE_ROOTS;
+  if (override !== undefined && override !== "") {
+    if (!fixture) throw new Error("CSQ_PREFLIGHT_EVIDENCE_ROOTS is refused outside a fixture run");
+    return override.split(delimiter).filter(Boolean);
+  }
+  const t = tmpdir();
+  if (fixture) return [t];
+  return process.platform === "win32" || t === "/tmp" ? [t] : [t, "/tmp"];
+}
+export function prunePreflightEvidence({ roots = evidenceRoots(), ...opts } = {}) {
+  let examined = 0, removed = 0;
+  for (const root of roots) {
+    const pass = pruneEvidenceDirs({ tmpdirPath: root, ...opts });
+    examined += pass.examined; removed += pass.removed;
+  }
+  return { examined, removed };
 }
 export function retainOutput(r, label) {
   const directory = mkdtempSync(join(tmpdir(), 'csq-preflight-output-'));
@@ -119,59 +280,109 @@ export function retainOutput(r, label) {
   chmodSync(path, 0o600);
   return { path, sha256: createHash('sha256').update(bytes).digest('hex') };
 }
-function killOwned(child, signal) {
-  try { process.kill(process.platform === 'win32' ? child.pid : -child.pid, signal); } catch {}
+// Process lifecycle — spawn, the one stop set, exit-keyed liveness, the group
+// probe, the owned KILL backstop and win32 handle-bound signals — lives in
+// child-supervisor.mjs, ONE implementation for every scripts/ci child (D237 R3
+// root-cause decision). capture() keeps only its own result collection and
+// evidence retention.
+import { supervise, adopt, stopAllLive } from './child-supervisor.mjs';
+export { groupHasMembers, shouldSignalGroup } from './child-supervisor.mjs';
+
+export function stopLiveCaptures() {
+  // Legacy alias kept for the pre-migration handlers: drains every live
+  // supervised child. dev-preflight's handlers move to installStopHandlers().
+  stopAllLive();
 }
-export async function capture(command, args, { cwd, env = process.env, timeoutMs = 0, onTimeout = null } = {}) {
+function stoppedResult(started) {
+  return { status: null, signal: null, error: { code: 'STOPPED' }, timedOut: false,
+    stdout: '', stderr: 'capture stopped by signal', elapsed_ms: performance.now() - started };
+}
+export async function capture(command, args, { cwd, env = process.env, timeoutMs = 0, onTimeout = null, stopWhen = () => false } = {}) {
   const started = performance.now();
+  // The latch is checked BEFORE admission and again before the spawn: a stop
+  // that lands during either window must never start a new detached group.
+  if (stopWhen()) return stoppedResult(started);
   let release;
-  try { if (command === 'trestle') release = await acquireFleetSlot({ env, waitMs: Math.min(timeoutMs || 30 * 60 * 1000, 30 * 60 * 1000) }); }
+  try { if (command === 'trestle') release = await acquireFleetSlot({ env, waitMs: Math.min(timeoutMs || 30 * 60 * 1000, 30 * 60 * 1000), stopWhen }); }
   catch (e) {
-    const r = { status: null, signal: null, error: { code: 'FLEET_ADMISSION' }, timedOut: false, stdout: '', stderr: String(e.message), elapsed_ms: performance.now() - started };
+    const r = { status: null, signal: null, error: { code: stopWhen() ? 'STOPPED' : 'FLEET_ADMISSION' }, timedOut: false, stdout: '', stderr: String(e.message), elapsed_ms: performance.now() - started };
     try { r.evidence = retainOutput(r, command); } catch { r.evidence_error = 'output-evidence-write-failed'; }
     return r;
   }
+  if (stopWhen()) { try { release?.(); } catch { /* best effort: the run is stopping */ } return stoppedResult(started); }
   return new Promise((resolve) => {
-    const child = spawn(command, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
-    let stdout = '', stderr = '', error = null, timedOut = false, bytes = 0;
+    const supervised = supervise(command, args, { spawn: { cwd, env, detached: process.platform !== 'win32' } });
+    const child = supervised.child;
+    let stdout = '', stderr = '', error = null, timedOut = false, bytes = 0, settled = false;
     let timeoutDiagnostics = '';
-    let killTimer;
-    const stop = () => { killOwned(child, 'SIGTERM'); if (!killTimer) killTimer = setTimeout(() => killOwned(child, 'SIGKILL'), 2000); };
+    let timeoutTimer = null, drainTimer = null;
+    const finish = (status, signal) => {
+      if (settled) return;
+      settled = true;
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (drainTimer) clearTimeout(drainTimer);
+      try { release?.(); } catch { error = { code: 'FLEET_LEASE_RELEASE' }; }
+      // Our stream ends are ours to close: a descendant that inherited them can
+      // keep `close` pending forever, and the caller needs its evidence now.
+      child.stdout?.destroy(); child.stderr?.destroy();
+      const r = { status, signal, error, timedOut, stdout, stderr, elapsed_ms: performance.now() - started, ...(timeoutDiagnostics ? { timeout_diagnostics: timeoutDiagnostics } : {}) };
+      try { r.evidence = retainOutput(r, command); } catch { r.evidence_error = 'output-evidence-write-failed'; }
+      // The supervisor keeps any armed backstop owned after dispose(), so the
+      // worker's awaitBackstops() before exit still sees it.
+      supervised.dispose();
+      resolve(r);
+    };
     const collect = (which, chunk) => {
       bytes += chunk.length;
-      if (bytes > 512 * 1024 * 1024) { error = { code: 'OUTPUT_LIMIT' }; stop(); return; }
+      if (bytes > OUTPUT_CAP_CHARS) { error = { code: 'OUTPUT_LIMIT' }; supervised.stop('SIGTERM'); return; }
       if (which === 'stdout') stdout += chunk.toString(); else stderr += chunk.toString();
     };
     child.stdout.on('data', (d) => collect('stdout', d)); child.stderr.on('data', (d) => collect('stderr', d));
-    child.on('error', (e) => { error = { code: e.code ?? 'SPAWN_ERROR' }; });
+    child.on('error', (e) => { error = { code: e.code ?? 'SPAWN_ERROR' }; if (child.pid === undefined) finish(null, null); });
     // The hook runs while the child is STILL ALIVE and before the first signal,
     // so a bound-kill can name what it killed (process tree, open files). It is
     // synchronous by contract (bounded internally) and never allowed to change
     // the verdict: a throwing or absent hook costs one fixed line, not a pass.
-    const timer = timeoutMs ? setTimeout(() => {
+    if (timeoutMs) timeoutTimer = setTimeout(() => {
       timedOut = true;
       if (typeof onTimeout === 'function') {
         try { timeoutDiagnostics = String(onTimeout(child) ?? ''); } catch { timeoutDiagnostics = 'CSQ_STUCK diagnostic_failed'; }
       }
-      stop();
-    }, timeoutMs) : null;
-    child.on('close', (status, signal) => {
-      if (timer) clearTimeout(timer);
-      if (killTimer) clearTimeout(killTimer);
-      try { release?.(); } catch { error = { code: 'FLEET_LEASE_RELEASE' }; }
-      const r = { status, signal, error, timedOut, stdout, stderr, elapsed_ms: performance.now() - started, ...(timeoutDiagnostics ? { timeout_diagnostics: timeoutDiagnostics } : {}) };
-      try { r.evidence = retainOutput(r, command); } catch { r.evidence_error = 'output-evidence-write-failed'; }
-      resolve(r);
+      supervised.stop('SIGTERM');
+    }, timeoutMs);
+    // SETTLE ON EXIT with a bounded drain, never on close alone: a descendant
+    // in another process group can hold the inherited stdio indefinitely, which
+    // leaves `close` pending with no bound. `close` settles at once if it does
+    // arrive first.
+    child.on('exit', (status, signal) => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (!drainTimer) drainTimer = setTimeout(() => finish(status, signal), 250);
     });
+    child.on('close', (status, signal) => finish(status, signal));
   });
 }
 // Fixed shell wrapper inserts --locked before lint's `--` separator. Cargo fmt
 // does not resolve a graph and deliberately receives no unsupported lock flag.
-export function lockedScript(command) {
+// `testWatchdogMs` (D237 rule 8, 2026-10-18): when non-zero, `cargo test` is run
+// under scripts/ci/test-watchdog.mjs, which NAMES a hung test, samples its stacks
+// BEFORE any signal, and then kills the group. The leg COMMAND stays
+// byte-identical — the bound is applied here, at the one place that already
+// rewrites the cargo invocation. A host with no node reports
+// WATCHDOG_UNAVAILABLE and runs the leg per-test-unbounded: a silently absent
+// bound would be worse than a loud one.
+export function lockedScript(command, { fixture = false, testWatchdogMs = 0 } = {}) {
   const flat = command.replace(/\\\r?\n/g, ' ').trim();
   const direct = /^cargo(?:[ \t]+\+[A-Za-z0-9_.-]+)?[ \t]+(?:build|check|clippy|doc|test|run|metadata|tree|fetch|update|generate-lockfile|fmt|clean|help|--help|-h|--version|-V)(?:[ \t]+(?:[A-Za-z0-9_./:=,+@%+-]+|'[^'\r\n]*'|"[^"$`\\\r\n]*"))*[ \t]*$/;
-  if (!direct.test(flat) && !(arguments[1]?.fixture && !/cargo|[$`]/i.test(flat))) throw new Error('unsupported command grammar: cannot prove direct locked Cargo argv');
-  return `cargo() { local tc="" sub; if [[ "\${1:-}" == +* ]]; then tc="$1"; shift; fi; sub="\${1:-}"; shift || return 125; case "$sub" in build|check|clippy|doc|test|run|metadata|tree|fetch|update|generate-lockfile) if [[ -n "$tc" ]]; then command cargo "$tc" "$sub" --locked "$@"; else command cargo "$sub" --locked "$@"; fi ;; fmt|clean|help|--help|-h|--version|-V) if [[ -n "$tc" ]]; then command cargo "$tc" "$sub" "$@"; else command cargo "$sub" "$@"; fi ;; *) printf '%s\\n' 'UNDETERMINED: unsupported Cargo subcommand' >&2; return 125 ;; esac; };\n${command}`;
+  if (!direct.test(flat) && !(fixture && !/cargo|[$`]/i.test(flat))) throw new Error('unsupported command grammar: cannot prove direct locked Cargo argv');
+  const bound = Number.isInteger(testWatchdogMs) && testWatchdogMs > 0 ? String(testWatchdogMs) : '';
+  const lockedCargo = 'if [[ -n "$tc" ]]; then command cargo "$tc" "$sub" --locked "$@"; else command cargo "$sub" --locked "$@"; fi';
+  // The watchdog's OWN grace is emitted explicitly (never left to its default):
+  // it must sit strictly below CALLER_KILL_GRACE_MS in the ladder above.
+  const watchedTest = `if [[ -n "$tc" ]]; then node scripts/ci/test-watchdog.mjs --per-test-ms ${bound} --kill-grace-ms ${WATCHDOG_KILL_GRACE_MS} -- cargo "$tc" "$sub" --locked "$@"; else node scripts/ci/test-watchdog.mjs --per-test-ms ${bound} --kill-grace-ms ${WATCHDOG_KILL_GRACE_MS} -- cargo "$sub" --locked "$@"; fi`;
+  const plainTest = bound
+    ? `if command -v node >/dev/null 2>&1; then ${watchedTest}; else printf '%s\\n' 'CSQ_TEST_WATCHDOG_UNAVAILABLE reason=node-missing (per-test bound NOT applied)' >&2; ${lockedCargo}; fi`
+    : lockedCargo;
+  return `cargo() { local tc="" sub; if [[ "\${1:-}" == +* ]]; then tc="$1"; shift; fi; sub="\${1:-}"; shift || return 125; case "$sub" in build|check|clippy|doc|run|metadata|tree|fetch|update|generate-lockfile) ${lockedCargo} ;; test) ${plainTest} ;; fmt|clean|help|--help|-h|--version|-V) if [[ -n "$tc" ]]; then command cargo "$tc" "$sub" "$@"; else command cargo "$sub" "$@"; fi ;; *) printf '%s\\n' 'UNDETERMINED: unsupported Cargo subcommand' >&2; return 125 ;; esac; };\n${command}`;
 }
 // Each sign-off leg prints its own status after its build and workload finish.
 export function measuredScript(command) {
@@ -186,10 +397,14 @@ export const COMMUNITY_EXTRACTION_COMMAND = `csq_extract_dir=$(mktemp -d "\${TMP
 trap 'csq_extract_rc=$?; rm -rf -- "$csq_extract_dir" || exit 125; exit "$csq_extract_rc"' EXIT
 for csq_extract_git_key in \${!GIT_@}; do unset "$csq_extract_git_key" || exit 125; done
 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 CARGO_NET_OFFLINE=true bash scripts/extract-community-edition.sh --no-build "$csq_extract_dir/tree"`;
-const BARE_SIGNOFF_SCRIPTS = new Set(['bash scripts/check-edition-leak.sh', 'bash scripts/check-third-party-licenses-fresh.sh', COMMUNITY_EXTRACTION_COMMAND]);
-export function signoffScript(command, { token, buildStub = false, fixture = false }) {
+// `test-targets-nonempty.sh` drives its own `cargo test --test <t> -- --list`
+// invocations exactly as CI's rust-test step runs it — the script is the unit
+// under test here, so rewriting its argv through the wrapper would measure a
+// command CI never runs.
+const BARE_SIGNOFF_SCRIPTS = new Set(['bash scripts/check-edition-leak.sh', 'bash scripts/check-third-party-licenses-fresh.sh', 'bash scripts/verify/test-targets-nonempty.sh .', COMMUNITY_EXTRACTION_COMMAND]);
+export function signoffScript(command, { token, buildStub = false, fixture = false, testWatchdogMs = 0 }) {
   if (!/^[a-z0-9-]+$/.test(token)) throw new Error('invalid leg marker token');
-  const body = BARE_SIGNOFF_SCRIPTS.has(command) ? command : lockedScript(command, { fixture });
+  const body = BARE_SIGNOFF_SCRIPTS.has(command) ? command : lockedScript(command, { fixture, testWatchdogMs });
   const build = buildStub ? `${lockedScript('cargo build -p csq-core --bin stub-cli --features test-utils')}\ncsq_build_rc=$?; if [ "$csq_build_rc" -ne 0 ]; then exit "$csq_build_rc"; fi\n` : '';
   // LEG-START SENTINEL, the very first action (Q8 sec H1). Launcher lines are
   // trusted only BEFORE this point: without it, the tree under test could print
@@ -354,39 +569,106 @@ export function aggregateExit(rows) {
 export async function runGateWorkers(names, { script, cwd, env, fingerprint, onComplete, timeoutMs = 35 * 60 * 1000 }) {
   const children = new Set();
   const fleetEnv = env.CSQ_PREFLIGHT_FLEET_DIR ? env : { ...env, ...(defaultFleetScope ||= createFleetScope()) };
-  const stop = () => { for (const child of children) killOwned(child, 'SIGTERM'); };
-  process.on('SIGTERM', stop); process.on('SIGINT', stop);
+  // Every worker is ADOPTED by the one supervisor: liveness (exit-keyed), the
+  // group probe and the KILL backstop are owned there, and the process-wide
+  // stop handlers drain this set too (D237 R3 — this site's own timer/probe
+  // logic is deleted).
   const launch = (name) => new Promise((resolve) => {
     const token = randomUUID(), started = performance.now();
     const childEnv = { ...fleetEnv, DEV_PREFLIGHT_ONLY: name, CSQ_PREFLIGHT_WORKER_TOKEN: token,
       CSQ_PREFLIGHT_PARENT_FINGERPRINT: fingerprint, CSQ_PREFLIGHT_CANONICAL_WORKER: env.DEV_PREFLIGHT_ONLY ? '0' : '1' };
     if (!env.DEV_PREFLIGHT_ONLY) {
-      for (const key of ['DEV_PREFLIGHT_SELFTEST_LOCAL','CSQ_PREFLIGHT_LOCAL','DEV_PREFLIGHT_SELFTEST_CEILING_MS','DEV_PREFLIGHT_SELFTEST_PER_TEST_MS','DEV_PREFLIGHT_FORCE_NO_BASH','DEV_PREFLIGHT_FORCE_WINGNU','DEV_PREFLIGHT_FORCE_NO_WINGNU']) delete childEnv[key];
+      for (const key of ['DEV_PREFLIGHT_SELFTEST_LOCAL','CSQ_PREFLIGHT_LOCAL','DEV_PREFLIGHT_SELFTEST_CEILING_MS','DEV_PREFLIGHT_SELFTEST_PER_TEST_MS','DEV_PREFLIGHT_FORCE_NO_BASH','DEV_PREFLIGHT_FORCE_WINGNU','DEV_PREFLIGHT_FORCE_NO_WINGNU','DEV_PREFLIGHT_LEG_TIMEOUT_MS']) delete childEnv[key];
     }
     const child = fork(script, [], { cwd, env: childEnv, execArgv: [], stdio: ['ignore', 'pipe', 'pipe', 'ipc'], detached: process.platform !== 'win32' });
+    const supervised = adopt(child, { graceMs: WORKER_KILL_GRACE_MS });
     children.add(child);
-    let stdout = '', stderr = '', frame = null, error = null, duplicate = false, killTimer;
-    const watchdog = setTimeout(() => { error = { code: 'WORKER_TIMEOUT' }; killOwned(child, 'SIGTERM'); killTimer = setTimeout(() => killOwned(child, 'SIGKILL'), 2000); }, timeoutMs);
-    child.stdout.on('data', (d) => { stdout += d.toString(); }); child.stderr.on('data', (d) => { stderr += d.toString(); });
-    child.on('error', (e) => { error = { code: e.code ?? 'SPAWN_ERROR' }; });
+    let stdout = '', stderr = '', bytes = 0, frame = null, error = null, duplicate = false, watchdog, drainTimer = null, settleTimer = null,
+      settled = false, exited = false, exitStatus = null, exitSignal = null, ipcClosed = false, stdioClosed = false;
+    // SETTLEMENT waits for the IPC channel to disconnect (bounded by the drain)
+    // before it reads the worker's frame. The old drain could fire first with
+    // the frame still queued behind a blocked loop, which both dropped the
+    // verdict and mislabeled the row pipe_held; a closed IPC channel means no
+    // message can still arrive.
+    //
+    // PIPE DIVISION (the runTrestleBounded rule in dev-preflight.mjs, one level
+    // up): settle on the worker's 'exit', NOT 'close'. A child the worker itself
+    // spawned can inherit its stdout/stderr and hold them open after the worker
+    // is gone, so 'close' may never fire — the row would hang with no bound.
+    // `pipe_held` is set ONLY when the IPC channel is closed AND our stdio ends
+    // are still open (a stream that ENDED is not holding the pipe, even if its
+    // 'close' event has not fired yet). The holder is the worker's descendant,
+    // not ours, so destroying our ends does not signal it.
+    const stdioOpen = () => !stdioClosed && !(child.stdout?.readableEnded && child.stderr?.readableEnded);
+    const settle = (status, signal, pipeHeld) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(watchdog); if (drainTimer) clearTimeout(drainTimer); if (settleTimer) clearTimeout(settleTimer);
+      // The supervisor already removed this child from the stop set on 'exit'
+      // (exit IS the removal); dispose() here is settle-time uniformity with
+      // capture()/runTrestleBounded and keeps an armed backstop owned.
+      supervised.dispose();
+      child.stdout?.destroy(); child.stderr?.destroy();
+      let row = frame?.gate;
+      if (duplicate || error || signal || !row || !['GREEN','RED','UNDETERMINED','SKIPPED','NOT_APPLICABLE'].includes(row.state) || status !== aggregateExit([row])) {
+        row = { name, state: 'UNDETERMINED', detail: 'gate worker did not return one consistent, source-bound verdict' };
+      }
+      if (error?.code === 'OUTPUT_LIMIT') {
+        row.detail = (row.detail || '') + `; worker output exceeded the ${Math.round(OUTPUT_CAP_CHARS / (1024 * 1024))} Mi captured-output cap — the worker was stopped`;
+      }
+      const r = { status, signal, error, stdout, stderr, elapsed_ms: performance.now() - started };
+      try { row.worker_output_evidence = retainOutput(r, name); } catch { if (row.state !== 'RED') row.state = 'UNDETERMINED'; row.detail = (row.detail || '') + '; could not retain worker output'; }
+      if (pipeHeld) {
+        row.pipe_held_after_exit = true;
+        row.detail = (row.detail || '') + '; worker stdio still open after exit and IPC disconnect — trailing worker output not captured';
+      }
+      row.elapsed_ms = r.elapsed_ms;
+      onComplete?.(row);
+      resolve(row);
+    };
+    const doSettleNow = () => { if (!settled) settle(exitStatus, exitSignal, ipcClosed && stdioOpen()); };
+    watchdog = setTimeout(() => { error = { code: 'WORKER_TIMEOUT' }; supervised.stop('SIGTERM'); }, timeoutMs);
+    // CAPPED (D237 R1 M3): an uncapped collector is one RangeError away from
+    // crashing the supervising worker; over the cap the worker is stopped and
+    // the row is UNDETERMINED with the named cause.
+    const collectWorker = (which, chunk) => {
+      bytes += chunk.length;
+      if (bytes > OUTPUT_CAP_CHARS) {
+        if (!error) error = { code: 'OUTPUT_LIMIT' };
+        supervised.stop('SIGTERM');
+        return;
+      }
+      if (which === 'stdout') stdout += chunk.toString(); else stderr += chunk.toString();
+    };
+    child.stdout.on('data', (d) => collectWorker('stdout', d));
+    child.stderr.on('data', (d) => collectWorker('stderr', d));
+    // A spawn failure with no pid (ENOENT) emits 'error' and never 'exit';
+    // settle there with the named cause rather than waiting out the watchdog.
+    child.on('error', (e) => { error = { code: e.code ?? 'SPAWN_ERROR' }; if (child.pid === undefined) settle(null, null, false); });
     child.on('message', (m) => {
       if (frame) duplicate = true;
       if (m && m.token === token && m.gate?.name === name && m.fingerprint === fingerprint && m.no_receipt === true) frame = m;
       else duplicate = true;
     });
-    child.on('close', (status, signal) => {
-      children.delete(child); clearTimeout(watchdog); if (killTimer) clearTimeout(killTimer);
-      let row = frame?.gate;
-      if (duplicate || error || signal || !row || !['GREEN','RED','UNDETERMINED','SKIPPED','NOT_APPLICABLE'].includes(row.state) || status !== aggregateExit([row])) {
-        row = { name, state: 'UNDETERMINED', detail: 'gate worker did not return one consistent, source-bound verdict' };
-      }
-      const r = { status, signal, error, stdout, stderr, elapsed_ms: performance.now() - started };
-      try { row.worker_output_evidence = retainOutput(r, name); } catch { if (row.state !== 'RED') row.state = 'UNDETERMINED'; row.detail = (row.detail || '') + '; could not retain worker output'; }
-      row.elapsed_ms = r.elapsed_ms;
-      onComplete?.(row);
-      resolve(row);
+    child.on('exit', (status, signal) => {
+      exited = true; exitStatus = status; exitSignal = signal;
+      children.delete(child); clearTimeout(watchdog);
+      // The supervisor's exit handler owns the empty-group backstop cancel
+      // (exit-keyed, shared with every other site).
+      // Settlement waits for the IPC 'disconnect' (see the handler below); this
+      // timer is the last-resort bound for a channel that never closes.
+      if (!settleTimer) settleTimer = setTimeout(doSettleNow, IPC_SETTLE_BOUND_MS);
     });
+    child.on('disconnect', () => {
+      ipcClosed = true;
+      // The IPC channel is closed, so every queued frame has been delivered.
+      // Wait one short drain before reading stdio: if our ends are still open,
+      // the worker left a descendant holding them (pipe_held); otherwise the
+      // 'end' events are already in flight and land inside this window.
+      if (stdioClosed) doSettleNow();
+      else if (!drainTimer) drainTimer = setTimeout(doSettleNow, 250);
+    });
+    child.on('close', () => { stdioClosed = true; children.delete(child); if (exited && ipcClosed) doSettleNow(); });
   });
-  const pending = Promise.all(names.map(launch));
-  try { return await pending; } finally { process.off('SIGTERM', stop); process.off('SIGINT', stop); }
+  return Promise.all(names.map(launch));
 }

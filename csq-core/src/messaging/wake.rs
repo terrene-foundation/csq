@@ -4219,24 +4219,44 @@ mod tests {
         let d = TempDir::new().unwrap();
         let c = queue_db(d.path());
         drop(c);
+        // ONE enforced deadline for the fixture, and every wait recomputes its remainder
+        // FROM it, so no second wall clock can decide an outcome. A CONSUMING fixture's
+        // production drain window is the remaining budget: the writer deletes the row only
+        // AFTER production signals first-seen, so a fixed window reds under scheduler load
+        // while production behaves correctly (linux lib-bins 2026-10-21). A `replace`
+        // fixture never takes the row — it swaps the database — so it keeps the short
+        // window: its test asserts the identity-change refusal, not a consumption.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        // The stub's wait for the inserted row is the SAME budget expressed in its 20ms
+        // ticks, fixed at construction before the clock starts (the shell cannot read the
+        // Rust clock), never an independent 12s count that load can exhaust first.
+        let wait_ticks = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            / 20;
         let s = stub(d.path(), &format!(
             "echo $$ > '{d}/started'\n\
-             tries=0; while [ ! -e '{d}/written' ] && [ \"$tries\" -lt 600 ]; do tries=$((tries+1)); sleep 0.02; done\n\
+             tries=0; while [ ! -e '{d}/written' ] && [ \"$tries\" -lt {wait_ticks} ]; do tries=$((tries+1)); sleep 0.02; done\n\
              echo 'Queued message ITEM1 for thread {TID}'\n{tail}",
             d = d.path().display(),
         ));
         let dir = d.path().to_path_buf();
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();
         let writer = std::thread::spawn(move || {
-            let pid = wait_for_pid(&dir.join("started"), Duration::from_secs(15))
-                .expect("child must start");
+            let pid = wait_for_pid(
+                &dir.join("started"),
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .expect("child must start");
             let started = crate::sessions::ancestor_start(pid as u32)
                 .expect("fixture child must still be live before its write");
             let c = rusqlite::Connection::open(dir.join(QUEUE_DB)).unwrap();
             add_row_raw(&c, "ITEM1", TID, REAL_PAYLOAD);
             std::fs::write(dir.join("written"), "").unwrap();
             if consume {
-                let signalled = seen_rx.recv_timeout(Duration::from_secs(15)).is_ok();
+                let signalled = seen_rx
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .is_ok();
                 // A probe after the timeout has killed/reaped the helper cannot stand in
                 // for observing a quick queue take while that helper was still running.
                 let seen =
@@ -4271,6 +4291,16 @@ mod tests {
                 false
             }
         });
+        // A consuming fixture's drain window is the enforced deadline's remainder: the
+        // observation it tests (row present, then taken) is the fixture writer's action,
+        // which is not scheduled on any clock production can name. A non-consuming
+        // fixture keeps the short window — it asserts the row is still present and has
+        // nothing to wait for.
+        let drain_wait = if consume && !replace {
+            deadline.saturating_duration_since(Instant::now())
+        } else {
+            Duration::from_millis(300)
+        };
         let delivery = with_first_seen_signal(seen_tx, || {
             deliver_with(
                 &spec_in(d.path()),
@@ -4283,8 +4313,8 @@ mod tests {
                     home: Some(d.path().as_os_str()),
                 },
                 Duration::from_secs(6),
-                Duration::from_millis(300),
-                Instant::now() + Duration::from_secs(15),
+                drain_wait,
+                deadline,
             )
         });
         let seen = writer.join().unwrap();

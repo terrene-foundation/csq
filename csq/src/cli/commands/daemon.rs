@@ -490,7 +490,8 @@ Run `csq audit verify --full` for diagnosis."
         Ok(Err(join_err)) => {
             tracing::error!(
                         error_kind = "audit_verify_task_panicked",
-                        "audit verify task panicked: {join_err} — \
+                        cause = csq_core::error::join_cause(&join_err),
+                        "audit verify task panicked — \
                          could not confirm chain soundness; audit subsystem will fail-closed; daemon proceeds"
                     );
             eprintln!(
@@ -708,9 +709,14 @@ retry does)."
         match anchor_join {
             Some(handle) => {
                 if let Err(e) = handle.await {
+                    // tokio's `JoinError` Display carries the panic payload —
+                    // the same text the panic hook redacted at panic time, so
+                    // formatting it here would re-emit it unredacted. Log only
+                    // the shared fixed cause token (security.md MUST-2).
                     tracing::error!(
                         error_kind = "audit_anchor_task_panicked_post_promotion",
-                        "audit anchor task (started post-promotion) exited: {e}"
+                        cause = csq_core::error::join_cause(&e),
+                        "audit anchor task (started post-promotion) exited without completing"
                     );
                 }
             }
@@ -728,7 +734,7 @@ async fn run_daemon_session(
     // `keychain-fix-r11.md` S-LOW-3: install the redacting panic hook before
     // any subsystem starts. Idempotent (`std::sync::Once`) so the supervised
     // loop's in-process session restarts never stack a second hook.
-    daemon::panic_hook::install();
+    daemon::panic_hook::install("daemon_panic");
 
     // Enterprise license gate for the daemon-hosted governance / audit /
     // EATP stack (task #77 shard 3). STARTUP variant (structural validity +
@@ -1352,7 +1358,7 @@ fn resolve_anchor_sink(
                     tracing::warn!(
                         event = "anchor_sink_init_failed",
                         sink = "rekor",
-                        error = %e,
+                        error_kind = e.fixed_tag(),
                         "rekor sink initialisation failed — anchor task not started"
                     );
                     None
@@ -1368,7 +1374,7 @@ fn resolve_anchor_sink(
                     tracing::warn!(
                         event = "anchor_sink_init_failed",
                         sink = "csq-ledger",
-                        error = %e,
+                        error_kind = e.fixed_tag(),
                         "csq-ledger sink initialisation failed — anchor task not started"
                     );
                     None
@@ -1397,7 +1403,7 @@ fn resolve_anchor_sink(
                 tracing::warn!(
                     event = "anchor_sink_init_failed",
                     sink = "s3",
-                    error = %e,
+                    error_kind = e.fixed_tag(),
                     "s3 sink initialisation failed — anchor task not started"
                 );
                 None
@@ -1423,7 +1429,7 @@ fn resolve_anchor_sink(
                     tracing::warn!(
                         event = "anchor_sink_init_failed",
                         sink = "azure",
-                        error = %e,
+                        error_kind = e.fixed_tag(),
                         "azure sink initialisation failed — anchor task not started"
                     );
                     None
@@ -1449,7 +1455,7 @@ fn resolve_anchor_sink(
                 tracing::warn!(
                     event = "anchor_sink_init_failed",
                     sink = "gcp",
-                    error = %e,
+                    error_kind = e.fixed_tag(),
                     "gcp sink initialisation failed — anchor task not started"
                 );
                 None
@@ -1475,7 +1481,7 @@ fn resolve_anchor_sink(
                     tracing::warn!(
                         event = "anchor_sink_init_failed",
                         sink = "azure-sql",
-                        error = %e,
+                        error_kind = e.fixed_tag(),
                         "azure-sql sink initialisation failed — anchor task not started"
                     );
                     None
@@ -1493,7 +1499,7 @@ fn resolve_anchor_sink(
                     tracing::warn!(
                         event = "anchor_sink_init_failed",
                         sink = "customer-body-store",
-                        error = %e,
+                        error_kind = e.fixed_tag(),
                         "customer-body-store sink initialisation failed — anchor task not started"
                     );
                     None

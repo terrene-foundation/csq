@@ -327,7 +327,12 @@ async fn fetch_projection_for_identity(
     let home_owned = home.to_path_buf();
     let creds_result = tokio::task::spawn_blocking(move || read_oauth_creds(&home_owned)).await;
     let creds = creds_result
-        .map_err(|e| format!("read_oauth_creds spawn_blocking: {e}"))?
+        .map_err(|e| {
+            format!(
+                "read_oauth_creds spawn_blocking: {}",
+                crate::error::join_cause(&e)
+            )
+        })?
         .map_err(|e| format!("oauth_creds: {e}"))?;
 
     let bearer = creds.access_token.expose_secret().to_string();
@@ -375,7 +380,12 @@ async fn fetch_projection_for_identity(
                 )
                 .await
                 .map_err(|_| "loadCodeAssist timed out".to_string())?
-                .map_err(|e| format!("loadCodeAssist spawn_blocking: {e}"))?
+                .map_err(|e| {
+                    format!(
+                        "loadCodeAssist spawn_blocking: {}",
+                        crate::error::join_cause(&e)
+                    )
+                })?
                 .map_err(|e| format!("loadCodeAssist transport: {e}"))?;
 
                 let (status, _h, body) = load_resp;
@@ -413,7 +423,12 @@ async fn fetch_projection_for_identity(
     )
     .await
     .map_err(|_| "retrieveUserQuota timed out".to_string())?
-    .map_err(|e| format!("retrieveUserQuota spawn_blocking: {e}"))?
+    .map_err(|e| {
+        format!(
+            "retrieveUserQuota spawn_blocking: {}",
+            crate::error::join_cause(&e)
+        )
+    })?
     .map_err(|e| format!("retrieveUserQuota transport: {e}"))?;
 
     let (status, _h, body) = quota_resp;

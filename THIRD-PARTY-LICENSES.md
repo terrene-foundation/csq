@@ -890,8 +890,8 @@ Apache License
 
 Used by:
 
-- [csq-redact 2.21.0](https://github.com/terrene-foundation/csq)
-- [csq-sdk 2.21.0](https://github.com/terrene-foundation/csq)
+- [csq-redact 2.21.1](https://github.com/terrene-foundation/csq)
+- [csq-sdk 2.21.1](https://github.com/terrene-foundation/csq)
 - [ryu 1.0.23](https://github.com/dtolnay/ryu)
 - [sync_wrapper 1.0.2](https://github.com/Actyx/sync_wrapper)
 
@@ -1149,7 +1149,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
 Used by:
 
-- [webpki-roots 1.0.6](https://github.com/rustls/webpki-roots)
+- [webpki-roots 1.0.10](https://github.com/rustls/webpki-roots)
 
 ```
 # Community Data License Agreement - Permissive - Version 2.0
@@ -1296,7 +1296,7 @@ THIS SOFTWARE.
 
 Used by:
 
-- [rustls-webpki 0.103.15](https://github.com/rustls/webpki)
+- [rustls-webpki 0.103.16](https://github.com/rustls/webpki)
 
 ```
 Except as otherwise noted, this project is licensed under the following

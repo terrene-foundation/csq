@@ -1701,13 +1701,13 @@ mod tests {
         // prior shape: acquire on the test thread, `drop` inside
         // `releaser`) violates Windows mutex ownership — `ReleaseMutex`
         // requires the CALLING thread to be the one that acquired the
-        // mutex (`platform/lock.rs`'s Windows `Drop` impl calls
-        // `ReleaseMutex` unconditionally, discarding the return value,
-        // so an ownership mismatch fails silently rather than panicking
-        // — but the mutex stays owned by the wrong thread). A readiness
-        // channel replaces the guard hand-off: the releaser thread
-        // acquires the lock itself, signals readiness, then sleeps and
-        // drops it — acquire and drop never leave that one thread.
+        // mutex. The Windows guard is now `!Send` and checks
+        // `ReleaseMutex`'s return (`platform/lock.rs`, Q6), so that shape
+        // is a compile error there rather than a silent failure; the
+        // readiness channel below keeps this fixture valid on every
+        // platform: the releaser thread acquires the lock itself, signals
+        // readiness, then sleeps and drops it — acquire and drop never
+        // leave that one thread.
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
         let releaser = std::thread::spawn(move || {
             let held = crate::platform::lock::lock_file(&lock_path).unwrap();

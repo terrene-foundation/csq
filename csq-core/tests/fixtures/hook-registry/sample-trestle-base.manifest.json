@@ -1,0 +1,4135 @@
+{
+  "$id": "loom.hook-registry/v1",
+  "version": "1.0.0",
+  "content_sha256": "58e45a01e67589db3abf709ede3f7b6eecdbfb9ce988b16c6177bc09119221e9",
+  "source_sha": "d3ee7dfc362b0f8cbec9c83ee3aaa07ed0a91552",
+  "generated_by": "authoring/.claude/bin/emit-hook-registry.mjs",
+  "unknown_major_policy": "fail-closed",
+  "default_on_incomplete": {
+    "PreToolUse": "deny",
+    "PostToolUse": "continue",
+    "UserPromptSubmit": "continue",
+    "Stop": "continue",
+    "SubagentStop": "continue",
+    "SessionStart": "continue",
+    "SessionEnd": "continue",
+    "PreCompact": "continue"
+  },
+  "precedence": "any deny wins; advise never downgrades a deny",
+  "hooks": [
+    {
+      "event": "PreToolUse",
+      "matcher": "Bash",
+      "file": ".claude/hooks/posture-gate.js",
+      "file_sha256": "66e79466a981d2fcad89b1d80485cd0772d788b61827ef5595534c0dc5b2ae5c",
+      "id": "hk_39ccea895b58a936",
+      "order": 1,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": true,
+          "decision_fields": [
+            "continue"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [
+            ".coc-clone-init-witness",
+            ".claude/learning/.coc-clone-init-witness"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Bash",
+      "file": ".claude/hooks/validate-bash-command.js",
+      "file_sha256": "8562daa135c528d0ac298ec6cd349643d1d14710947b597b29fd71aba88eb27b",
+      "id": "hk_0e434d53d2d0ae13",
+      "order": 2,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 10,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex",
+        "gemini"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json",
+          "gemini": "gemini-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            1
+          ],
+          "exit_codes_computed": true,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput",
+            "reason"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/observations.jsonl",
+            ".claude/learning/observations.archive/",
+            ".claude/learning/ci-cost-reach/<session-id>.marker",
+            ".claude/learning/test-scope-advisory/<session-id>.marker"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Bash",
+      "file": ".claude/hooks/ci-runner-saturation-guard.js",
+      "file_sha256": "122014d0d6c4af3ca715c4977c83e9d3db2746243cd271e66ad671674eabe44f",
+      "id": "hk_d05c4daa48279ea5",
+      "order": 3,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 8,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex",
+        "gemini"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json",
+          "gemini": "gemini-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Bash",
+      "file": ".claude/hooks/synthetic-load-guard.js",
+      "file_sha256": "1532d36056bf4f853e75cf7c6e8671036012c95e35593df648f8a756b4eba1a8",
+      "id": "hk_de7c59990753dcd1",
+      "order": 4,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 8,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex",
+        "gemini"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json",
+          "gemini": "gemini-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/load-authz/synthetic-load-allow"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Bash",
+      "file": ".claude/hooks/genesis-anchor-guard.js",
+      "file_sha256": "aab34b155be016ca1636da3a94480eb672a97a48463bfde8113698101fa9802f",
+      "id": "hk_b9eb5a74765b16d1",
+      "order": 5,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 30,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [
+            "<os.tmpdir()>/coc-sign-ssh-vfy-<rand>/",
+            "<os.tmpdir()>/coc-sign-gpg-vfy-<rand>/"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Bash",
+      "file": ".claude/hooks/signing-mutation-guard.js",
+      "file_sha256": "2afe57fcf3ba1631f38f0079491397928cc0c84afe9ba8d6e993c22ba8465f58",
+      "id": "hk_3c812f3e77288691",
+      "order": 6,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/operator-id"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Bash",
+      "file": ".claude/hooks/operator-gate.js",
+      "file_sha256": "5f9fd6e55d7ca8266b1b789367609418b76bcb2bba09546fb658848d0955d3de",
+      "id": "hk_a214ac66de749c2f",
+      "order": 7,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [
+            "<os.tmpdir()>/coc-sign-<mkdtemp-suffix>"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Bash",
+      "file": ".claude/hooks/worktree-forest-guard.js",
+      "file_sha256": "4025e97be57aec95c3cd257326daa55e820347e0126225fb78928c6fffeba854",
+      "id": "hk_3fba79be6aeea1f1",
+      "order": 8,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 20,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            "<sibling-worktree-path>/"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Bash",
+      "file": ".claude/hooks/stranded-artifact-guard.js",
+      "file_sha256": "30ab66b7aa6be3c9362abecc98e96b4b876ad2c0466c037e7d76c59fb71d255c",
+      "id": "hk_ad74cd5110ee3982",
+      "order": 9,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 10,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".git/landed-map-cache.json",
+            ".git/landed-map-cache.json.<pid>.tmp"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Bash",
+      "file": ".claude/hooks/rebase-content-loss-guard.js",
+      "file_sha256": "c3a40b0ceb9da5c685f32f020ab9ecfe9893b265c97e122cd33e6f59611c6052",
+      "id": "hk_0281365d477c88ac",
+      "order": 10,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 6,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": true,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            "<os.tmpdir()>/rebase-verify-<mkdtemp-suffix>/"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Bash",
+      "file": ".claude/hooks/wip-discipline-guard.js",
+      "file_sha256": "bb63d75298ac6b184a8a8d19ebb2fb1afa25887fa8d6ac6ed32f773121d715fb",
+      "id": "hk_41a189dd6ae28507",
+      "order": 11,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 10,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/wip-authz/override-ledger.jsonl",
+            ".claude/wip-authz/wip-limit-allow"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Bash",
+      "file": ".claude/hooks/triage-routing-guard.js",
+      "file_sha256": "568391bc63c34cb1d1418732e39c4cf8372ff7a580d7ea3f6c5667b259f62e7b",
+      "id": "hk_23c97aa0fcfcddd8",
+      "order": 12,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 6,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Bash",
+      "file": ".claude/hooks/push-preflight-guard.js",
+      "file_sha256": "4afb2a267410493cb522b0d6947824140e80d5c6880a485309707d0378a1737f",
+      "id": "hk_ef3d0bd579da8fc4",
+      "order": 13,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 8,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Edit|Write|NotebookEdit",
+      "file": ".claude/hooks/posture-gate.js",
+      "file_sha256": "66e79466a981d2fcad89b1d80485cd0772d788b61827ef5595534c0dc5b2ae5c",
+      "id": "hk_4b716a8be472e304",
+      "order": 14,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": true,
+          "decision_fields": [
+            "continue"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [
+            ".coc-clone-init-witness",
+            ".claude/learning/.coc-clone-init-witness"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Edit|Write|NotebookEdit",
+      "file": ".claude/hooks/gitignored-claude-warn.js",
+      "file_sha256": "880f9378e72491b2ce67bdd796f6b2d24b30d8fb6db687ec565a88367fd0332e",
+      "id": "hk_6b56766e159d163c",
+      "order": 15,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Edit|Write|NotebookEdit",
+      "file": ".claude/hooks/integrity-guard.js",
+      "file_sha256": "cc2d846d0fa606d3d3c5acf5d301d2aa1cf3ef223d8e6f6ecc008b7c3d375495",
+      "id": "hk_8e07c749f39afb97",
+      "order": 16,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1,
+            2
+          ],
+          "exit_codes_computed": true,
+          "decision_fields": [
+            "continue",
+            "hookSpecificOutput",
+            "permissionDecision",
+            "reason"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/operator-id",
+            "<os.tmpdir()>/coc-sign-ssh-vfy-<rand>/",
+            "<os.tmpdir()>/coc-sign-gpg-vfy-<rand>/",
+            "<os.tmpdir()>/coc-sign-gpg-fold-<rand>/"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Edit|Write|NotebookEdit",
+      "file": ".claude/hooks/adjacency-leasecheck.js",
+      "file_sha256": "0a06d0cc91388ce0a15a417385a17484d3395ca519e5da4de29f0a6f970497f1",
+      "id": "hk_3910ec967dee4951",
+      "order": 17,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/coordination-log.jsonl"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Edit|Write|NotebookEdit",
+      "file": ".claude/hooks/signing-mutation-guard.js",
+      "file_sha256": "2afe57fcf3ba1631f38f0079491397928cc0c84afe9ba8d6e993c22ba8465f58",
+      "id": "hk_3ccb075072ae631d",
+      "order": 18,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/operator-id"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Edit|Write|NotebookEdit",
+      "file": ".claude/hooks/journal-write-guard.js",
+      "file_sha256": "cf14231a1d86de0e8a75bad868c6f12301db214acb69c8ca26346606c5269cbe",
+      "id": "hk_7f9c1c3b6af1bd41",
+      "order": 19,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput",
+            "reason"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/operator-id",
+            "<os.tmpdir()>/coc-sign-ssh-vfy-<rand>/",
+            "<os.tmpdir()>/coc-sign-gpg-vfy-<rand>/",
+            "<os.tmpdir()>/coc-sign-gpg-fold-<rand>/"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Edit|Write|NotebookEdit",
+      "file": ".claude/hooks/operator-gate.js",
+      "file_sha256": "5f9fd6e55d7ca8266b1b789367609418b76bcb2bba09546fb658848d0955d3de",
+      "id": "hk_6549b1fd92a08ca1",
+      "order": 20,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [
+            "<os.tmpdir()>/coc-sign-<mkdtemp-suffix>"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Edit|Write|NotebookEdit",
+      "file": ".claude/hooks/cross-ecosystem-disclosure-guard.js",
+      "file_sha256": "d2897bfe275a5c86b1b3a3bec02e12988d3b9cda6fb5031a79917d7986504ea2",
+      "id": "hk_de372bca478e10a0",
+      "order": 21,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [
+            "<os.tmpdir()>/xeco-scan-<rand>/"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Edit|Write|NotebookEdit",
+      "file": ".claude/hooks/register-regression-guard.js",
+      "file_sha256": "447c448c46c683de390bca2d0165ec14a19ce7557cc304ea7bb03e0e4068f896",
+      "id": "hk_3e5b01912665f971",
+      "order": 22,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": true,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput",
+            "reason"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Read",
+      "file": ".claude/hooks/detect-violations.js",
+      "file_sha256": "6dc0fd277eded9810d08d79b0f60e0ae8aebf7e2461c2f53cbb8254b60973e1d",
+      "id": "hk_c956e011c919c4ea",
+      "order": 23,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput",
+            "reason"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/violations.jsonl",
+            ".claude/operator-id"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Read",
+      "file": ".claude/hooks/session-notes-guard.js",
+      "file_sha256": "0c4b0bb5405dad1a54ff198169df6ce10331347be5afe37b420e0c913fb24aca",
+      "id": "hk_886fefffbb99cd64",
+      "order": 24,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [
+            "<os.tmpdir()>/coc-notes-order-<repo-root-sha12>-<session-id>"
+          ],
+          "network": false,
+          "spawns": false,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Read|Grep|Glob|WebFetch",
+      "file": ".claude/hooks/probe-phase-guard.js",
+      "file_sha256": "cea947a442744ce165145426c3af25dd4817eb46255cd6f26dc2282988be3611",
+      "id": "hk_3bc52f7242f10f86",
+      "order": 25,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": null,
+      "file": ".claude/hooks/adjacency-heartbeat.js",
+      "file_sha256": "29fe4e453ff6f659795c7b8a6c794d18afb62547a382a4c74fdac798434163af",
+      "id": "hk_4aa7506699302c4c",
+      "order": 26,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/coordination-log.jsonl",
+            ".claude/learning/.heartbeat-cache",
+            ".claude/learning/.heartbeat-cache.s-<session-hash>.json"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit|Agent|Task",
+      "file": ".claude/hooks/provenance-capture-tool.js",
+      "file_sha256": "58e07ec1bee67de885fca4dd4c529926ac3cb4dd8edebd48348e4b31dedb5c23",
+      "id": "hk_fd0d9375b00d4702",
+      "order": 27,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex",
+        "gemini"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json",
+          "gemini": "gemini-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/provenance/<session>-<session-sha256-8>.jsonl"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Task|Agent|SendMessage",
+      "file": ".claude/hooks/emit-dispatch-ledger.js",
+      "file_sha256": "a6fa96bb9f1ceec62f11a71b1e0a266d78772230120fb55c711961a22cd3ad0f",
+      "id": "hk_edf23080ea1efdda",
+      "order": 28,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/dispatch-reconcile/<session-id>-<sha8>.jsonl"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Task|Agent",
+      "file": ".claude/hooks/dispatch-contract-guard.js",
+      "file_sha256": "3fd37d801c719349085e1eeb30d02b831e6d04ba0b1f747c4c748eb021152f8a",
+      "id": "hk_6f3c1fc5ee17acd8",
+      "order": 29,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/dispatch-authz/dispatch-contract-allow"
+          ],
+          "network": false,
+          "spawns": false,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Task|Agent",
+      "file": ".claude/hooks/dispatch-freshness-guard.js",
+      "file_sha256": "2d79c020d43e69702b55c84615767b1d697fad52309e8b2b196e04448475c993",
+      "id": "hk_270aeda382beb3b4",
+      "order": 30,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Task|Agent|EnterWorktree",
+      "file": ".claude/hooks/nested-worktree-guard.js",
+      "file_sha256": "6353d50ef6d8c01395366c8c009a20cffc24f4410326992837de986163b8b64a",
+      "id": "hk_908cb1af03343569",
+      "order": 31,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/worktree-authz/nested-worktree-allow"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Skill",
+      "file": ".claude/hooks/analyze-completeness-guard.js",
+      "file_sha256": "9181b9bd2acfecc504064a0c1819e899fa74004bda2c17d401584d4b4cecd260",
+      "id": "hk_7d7a9ee8b45f5b34",
+      "order": 32,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Edit|Write|NotebookEdit",
+      "file": ".claude/hooks/settings-deny-edit-guard.js",
+      "file_sha256": "0068c00b9a1746b73e7277027e474f3008a416fb122db31ae6b078e8ae2aa119",
+      "id": "hk_b970441a2024012e",
+      "order": 33,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "permission-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": false,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Bash",
+      "file": ".claude/hooks/detect-violations.js",
+      "file_sha256": "6dc0fd277eded9810d08d79b0f60e0ae8aebf7e2461c2f53cbb8254b60973e1d",
+      "id": "hk_0ce7e0cfec3bf5e6",
+      "order": 1,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput",
+            "reason"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/violations.jsonl",
+            ".claude/operator-id"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Bash",
+      "file": ".claude/hooks/fold-amendment-paired-with-helper.js",
+      "file_sha256": "8f075879ee2cbaf0fe9b97ee2970e5727846e8f13cc5d77108c646f4bb769ecf",
+      "id": "hk_4a917f3939c49bad",
+      "order": 2,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Bash",
+      "file": ".claude/hooks/wrapup-after-landing.js",
+      "file_sha256": "d33744e32b20fe87d67c4f59137e831db9dd9b818fa4a02b9fd44d32cdd8757e",
+      "id": "hk_8983a38295bea46a",
+      "order": 3,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": false,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Bash",
+      "file": ".claude/hooks/reap-on-landing-guard.js",
+      "file_sha256": "eb77e30654e5df51cfb28bac2e7cc5bb2eca4cbd76961e96407fc31cd7a38a16",
+      "id": "hk_c343d2377c1d91d5",
+      "order": 4,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".git/landed-map-cache.json",
+            "<os.tmpdir()>/landed-hermetic-<mkdtemp-suffix>/"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Bash",
+      "file": ".claude/hooks/session-notes-incorporation-guard.js",
+      "file_sha256": "f04eed7e2432ed657859b2ba35dc9422021be40b53b574ee883f262c7403f4ad",
+      "id": "hk_3a517d4c67af8e02",
+      "order": 5,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/operator-id"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Bash",
+      "file": ".claude/hooks/session-load-backstop.js",
+      "file_sha256": "1b34b4501b7e69f7411f5cfdeed1c0ae7820a917dabda400d1e0cd06bf11911f",
+      "id": "hk_c8129a4213b74793",
+      "order": 6,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 8,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex",
+        "gemini"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json",
+          "gemini": "gemini-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Edit|Write|NotebookEdit",
+      "file": ".claude/hooks/validate-workflow.js",
+      "file_sha256": "aa5de2d45b050e930bb6a90fa74f4436b2a16f78b118f08aec9372f74bed233f",
+      "id": "hk_8ecd33c6ff5ca46d",
+      "order": 7,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 15,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            1
+          ],
+          "exit_codes_computed": true,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/observations.jsonl",
+            ".claude/learning/observations.archive/"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Edit|Write|NotebookEdit",
+      "file": ".claude/hooks/codify-self-referential-guard.js",
+      "file_sha256": "e2ae91daa9080e0fc833943e48a4552e88effa5a06ae0b516084f0eedecd046a",
+      "id": "hk_0d622b2b320bd2a3",
+      "order": 8,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 6,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/codify-selfref/<session-id>-<sha8>.jsonl"
+          ],
+          "network": false,
+          "spawns": false,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Edit|Write|NotebookEdit",
+      "file": ".claude/hooks/validate-deployment.js",
+      "file_sha256": "4ab22393ec6bafb054fa23c87a83ae2d83daf41f3d77356a0208cc2df44ddacc",
+      "id": "hk_b4994f78ee68e08b",
+      "order": 9,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 10,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            1
+          ],
+          "exit_codes_computed": true,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": false,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Edit|Write|NotebookEdit",
+      "file": ".claude/hooks/integration-hygiene.js",
+      "file_sha256": "45b728668ce3b1caa6d2b561f9655aaa961f9f14086ae2ce48c24745f2d9a751",
+      "id": "hk_e60a9464d7dcdc91",
+      "order": 10,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex",
+        "gemini"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json",
+          "gemini": "gemini-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": false,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Edit|Write|NotebookEdit",
+      "file": ".claude/hooks/session-notes-guard.js",
+      "file_sha256": "0c4b0bb5405dad1a54ff198169df6ce10331347be5afe37b420e0c913fb24aca",
+      "id": "hk_d0fe99bcc626364d",
+      "order": 11,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [
+            "<os.tmpdir()>/coc-notes-order-<repo-root-sha12>-<session-id>"
+          ],
+          "network": false,
+          "spawns": false,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Edit|Write|NotebookEdit",
+      "file": ".claude/hooks/enforce-framework-first.js",
+      "file_sha256": "8ed7b336ed6b0446107ba3b4998f52072c91f3795b24a1eae7428f40a7d47eac",
+      "id": "hk_9f373cb7d922cff8",
+      "order": 12,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            1
+          ],
+          "exit_codes_computed": true,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": false,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Edit|Write|NotebookEdit",
+      "file": ".claude/hooks/detect-violations.js",
+      "file_sha256": "6dc0fd277eded9810d08d79b0f60e0ae8aebf7e2461c2f53cbb8254b60973e1d",
+      "id": "hk_086c692baa194e84",
+      "order": 13,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput",
+            "reason"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/violations.jsonl",
+            ".claude/operator-id"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Edit|Write|NotebookEdit",
+      "file": ".claude/hooks/burndown-quote-write-guard.js",
+      "file_sha256": "757e436ae6ad5ef894adb0ff4160524b4efdf374efdb9dcb3eb57e25af96ed57",
+      "id": "hk_8e1deda181f75b93",
+      "order": 14,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": true,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Edit|Write|NotebookEdit",
+      "file": ".claude/hooks/todo-durable-guard.js",
+      "file_sha256": "7dbf1ca09e3a2df32093d05738f8bd10d9db0f94c1f28cb67a8695715fce3b89",
+      "id": "hk_3b9484784de8fd51",
+      "order": 15,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            "burndown/events.jsonl"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Edit|Write|NotebookEdit",
+      "file": ".claude/hooks/burndown-trace-write-guard.js",
+      "file_sha256": "2c9bd399dd944c935515131c6d3f3f5987833b78bd866ff47b382a5b6643872e",
+      "id": "hk_ec6b359542b2cc45",
+      "order": 16,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 10,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": true,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Edit|Write|NotebookEdit",
+      "file": ".claude/hooks/ci-job-budget-guard.js",
+      "file_sha256": "f71f1a760f8c1c472df2da2e241daa91e80cfa8a61351f0e622001a0299ff538",
+      "id": "hk_570c335a623762c9",
+      "order": 17,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [
+            "<os.tmpdir()>/coc-cjb-engine-absent-<session-id>"
+          ],
+          "network": false,
+          "spawns": false,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Edit|Write",
+      "file": ".claude/hooks/kp-prefix-guard.js",
+      "file_sha256": "e892d5da4f3b4a8a66b8611f4a2ad30c31dd8aae5d9235059526b3d9d3f6cd69",
+      "id": "hk_034b9e5b0f6ff9ae",
+      "order": 18,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": false,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Edit|Write",
+      "file": ".claude/hooks/artifact-coverage-guard.js",
+      "file_sha256": "72f8d5e19517c662fe003496d4811b823891e31afda00219d3b65c30a3a3fa0b",
+      "id": "hk_68651b38cd794d41",
+      "order": 19,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 6,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "TodoWrite",
+      "file": ".claude/hooks/todo-tracker-guard.js",
+      "file_sha256": "ec984912ae9a64b96c1e81dc8d1928302f8ee14cfc4423f80e91857c3191a57b",
+      "id": "hk_79d8ea239726b98b",
+      "order": 20,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": true,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            "burndown/events.jsonl",
+            "workspaces/todo-tracker/todo-context.md",
+            "workspaces/todo-tracker/todo-context.md.tmp.*"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Write",
+      "file": ".claude/hooks/decision-packet-guard.js",
+      "file_sha256": "f2837f53ea8f64f07233d783088812c0e99bef2968f095fce39ddc30fff40241",
+      "id": "hk_b133af71ca3d9171",
+      "order": 21,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": false,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Write",
+      "file": ".claude/hooks/memory-cascade-guard.js",
+      "file_sha256": "bf86d17e725ae6d15ec1f44af810b5eb71bda099df2a52b68ee5765ea1be0ad7",
+      "id": "hk_e0318bee6a3eee0b",
+      "order": 22,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": true,
+          "decision_fields": [
+            "continue"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": false,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Edit|Write|NotebookEdit",
+      "file": ".claude/hooks/auto-format.js",
+      "file_sha256": "d0063d354981095f256113673bd72de869259ed74948299b7d294bf06896db61",
+      "id": "hk_effe64b149640146",
+      "order": 23,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 30,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "context-injection",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "hookSpecificOutput"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            "<edited-file>",
+            "<npm-cache>/_npx/<hash>/"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "UserPromptSubmit",
+      "matcher": null,
+      "file": ".claude/hooks/user-prompt-rules-reminder.js",
+      "file_sha256": "8f4c3da17485da97a182a4704f96d2a39116a6d00e4c512d22f2acd9463d0427",
+      "id": "hk_c64f4967aa4820ab",
+      "order": 1,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "prompt-gate",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".env",
+            ".claude/learning/observations.jsonl",
+            ".claude/learning/observations.archive/"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "UserPromptSubmit",
+      "matcher": null,
+      "file": ".claude/hooks/detect-violations.js",
+      "file_sha256": "6dc0fd277eded9810d08d79b0f60e0ae8aebf7e2461c2f53cbb8254b60973e1d",
+      "id": "hk_c9f5d2e292e58b0b",
+      "order": 2,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "prompt-gate",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput",
+            "reason"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/violations.jsonl",
+            ".claude/operator-id"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "UserPromptSubmit",
+      "matcher": null,
+      "file": ".claude/hooks/provenance-capture-prompt.js",
+      "file_sha256": "ff64fbe5d16f24763342229e2f0b9d28f0d95a1aa4b1fa460397b8f340d826ef",
+      "id": "hk_91c4f131dc37c6f4",
+      "order": 3,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "prompt-gate",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/provenance/<session>-<session-sha256-8>.jsonl"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "UserPromptSubmit",
+      "matcher": null,
+      "file": ".claude/hooks/emit-dispatch-ledger.js",
+      "file_sha256": "a6fa96bb9f1ceec62f11a71b1e0a266d78772230120fb55c711961a22cd3ad0f",
+      "id": "hk_0325d16f7728a662",
+      "order": 4,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "prompt-gate",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/dispatch-reconcile/<session-id>-<sha8>.jsonl"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "Stop",
+      "matcher": null,
+      "file": ".claude/hooks/stop.js",
+      "file_sha256": "9341307a3c60af95b9bc79d39fd6d7940849f2b5f7a862504dce98a1926dbe1e",
+      "id": "hk_a543e74c766e9ffe",
+      "order": 1,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "handback-decision",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            "~/.claude/checkpoints/",
+            "~/.claude/hook-state/stop-notes-lag/",
+            ".claude-tmp*",
+            ".claude/operator-id"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "Stop",
+      "matcher": null,
+      "file": ".claude/hooks/residual-figure-guard.js",
+      "file_sha256": "24eb6746903ce53d8b65da6c4265a1335671443dc7fd73a9bccb511b678490d3",
+      "id": "hk_fb921d9f447c0144",
+      "order": 2,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 6,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "handback-decision",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": false,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "Stop",
+      "matcher": null,
+      "file": ".claude/hooks/log-triage-gate.js",
+      "file_sha256": "e83bb8c0c9fd5150ce71bef6ae02ea370b10c529b52bb341c4af325cb9517b3f",
+      "id": "hk_b319438bc89dcfff",
+      "order": 3,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 7,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "handback-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "systemMessage"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "Stop",
+      "matcher": null,
+      "file": ".claude/hooks/adjacency-heartbeat.js",
+      "file_sha256": "29fe4e453ff6f659795c7b8a6c794d18afb62547a382a4c74fdac798434163af",
+      "id": "hk_74bb8bd254328a14",
+      "order": 4,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "handback-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/coordination-log.jsonl",
+            ".claude/learning/.heartbeat-cache",
+            ".claude/learning/.heartbeat-cache.s-<session-hash>.json"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "Stop",
+      "matcher": null,
+      "file": ".claude/hooks/multi-operator-sessionend.js",
+      "file_sha256": "1359b10efd6c5b5b6c09f9c5cbe8e3658efab43041c6d5e3c8ba8371b10c9d2b",
+      "id": "hk_b6c84fc60187c620",
+      "order": 5,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "handback-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/coordination-log.jsonl",
+            ".claude/learning/.session-end-cache",
+            ".claude/learning/observations.jsonl",
+            ".claude/learning/observations.archive/",
+            ".claude/learning/sessionend-release-lease-<verified_id-fingerprint>.json",
+            ".claude/learning/.tmp-sereleaselease-<pid>-<hex>",
+            ".claude/learning/sessionend-release-lease-<verified_id-fingerprint>.json.reap-<pid>-<hex>",
+            ".session-notes.d/<display_id>.md",
+            ".session-notes.shared.md",
+            "<os.tmpdir()>/coc-sign-<mkdtemp-suffix>"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "Stop",
+      "matcher": null,
+      "file": ".claude/hooks/detect-violations.js",
+      "file_sha256": "6dc0fd277eded9810d08d79b0f60e0ae8aebf7e2461c2f53cbb8254b60973e1d",
+      "id": "hk_e264d76f94c18411",
+      "order": 6,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "handback-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput",
+            "reason"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/violations.jsonl",
+            ".claude/operator-id"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "Stop",
+      "matcher": null,
+      "file": ".claude/hooks/delegation-default-guard.js",
+      "file_sha256": "a96d078f098dcb1f043eb0c78861d2d96e53ad07edc41a3184b6297b87b08a2b",
+      "id": "hk_f88e091ad417e8c4",
+      "order": 7,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "handback-decision",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/delegation-default/<session-id>-<sha8>.jsonl"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "Stop",
+      "matcher": null,
+      "file": ".claude/hooks/delegation-permission-guard.js",
+      "file_sha256": "da4ff5cbac95fcc2538b905be9b5528b796b8b1a2663ddaf2624b4751e39169a",
+      "id": "hk_e1993c55ab337bf3",
+      "order": 8,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "handback-decision",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/delegation-permission/<session-id>-<sha8>.jsonl"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "Stop",
+      "matcher": null,
+      "file": ".claude/hooks/burndown-quote-stop-guard.js",
+      "file_sha256": "f1366ba1cd59d71ee8e0b4527ef5d0747e11ff05b69a22a8fb600ddb944f01fb",
+      "id": "hk_845c758ebdd82020",
+      "order": 9,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "handback-decision",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": true,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "Stop",
+      "matcher": null,
+      "file": ".claude/hooks/fleet-drain-guard.js",
+      "file_sha256": "606c9553debf15a6d6a51aaa48d166af74122a1698163aeaec529205c3cf8272",
+      "id": "hk_b097b1d40b01f59b",
+      "order": 10,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "handback-decision",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/fleet-drain/<session-id>-<sha8>.jsonl"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "Stop",
+      "matcher": null,
+      "file": ".claude/hooks/worktree-conservation-guard.js",
+      "file_sha256": "a9364bac3f8e06b824f7827f12e8312b931cb25ff4fbee1e0ae3255fcdb2fd5e",
+      "id": "hk_eb1831874cbd7416",
+      "order": 11,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 10,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "handback-decision",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "refuseHandback"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/stop-refusal/",
+            ".claude/learning/stop-refusal/<session-id>.jsonl"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "Stop",
+      "matcher": null,
+      "file": ".claude/hooks/lane-completion-guard.js",
+      "file_sha256": "cf2e4ed6640735761348390d86bbb4351d75c5c477f7e51e7f4f9d07df12c8c8",
+      "id": "hk_7abbd22f81c4c9d0",
+      "order": 12,
+      "on_incomplete": "deny",
+      "on_crash": "deny",
+      "on_timeout": "deny",
+      "timeout": 10,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "handback-decision",
+          "exit_codes": [
+            1
+          ],
+          "exit_codes_computed": true,
+          "decision_fields": [
+            "continue",
+            "refuseHandback"
+          ],
+          "severity": "block"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/stop-refusal/<session-id>.jsonl"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "SubagentStop",
+      "matcher": null,
+      "file": ".claude/hooks/reconcile-dispatch-delivery.js",
+      "file_sha256": "68637b6e42377437754a24c120f3a603d2e6fe7129b2f0fd869849b0ede6db94",
+      "id": "hk_01f3c5574f96e855",
+      "order": 1,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "handback-decision",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/dispatch-reconcile/"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "SessionStart",
+      "matcher": null,
+      "file": ".claude/hooks/posture-gate.js",
+      "file_sha256": "66e79466a981d2fcad89b1d80485cd0772d788b61827ef5595534c0dc5b2ae5c",
+      "id": "hk_877141e45824b1ca",
+      "order": 1,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "advisory",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": true,
+          "decision_fields": [
+            "continue"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [
+            ".coc-clone-init-witness",
+            ".claude/learning/.coc-clone-init-witness"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "SessionStart",
+      "matcher": null,
+      "file": ".claude/hooks/multi-operator-sessionstart.js",
+      "file_sha256": "ad76b4f8b0d71af8eb04ab5b049183d0f47bc5ab94a35559f433d29dc1cc0557",
+      "id": "hk_4c4592cbfd836ab0",
+      "order": 2,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 10,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "advisory",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "hookSpecificOutput",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            "./",
+            ".git/",
+            ".claude/learning/.ss-banner-cache.json",
+            ".claude/learning/.ss-banner-tmp-<mkdtemp-suffix>/",
+            ".claude/learning/.ss-banner-rebuild.lock",
+            ".claude/learning/.worker-spawn.trace",
+            "<os.tmpdir()>/coc-ss-banner-<mkdtemp-suffix>/",
+            "<os.tmpdir()>/coc-sign-<mkdtemp-suffix>"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "SessionStart",
+      "matcher": null,
+      "file": ".claude/hooks/session-start.js",
+      "file_sha256": "3266c8ef33e583760a8d708ea0a90f46ae7fc38a294cdf67cda3174acc3da01b",
+      "id": "hk_cf8ed2704cd08d4d",
+      "order": 3,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": null,
+      "source": "loom-template",
+      "surfaces": [
+        "claude",
+        "codex",
+        "gemini"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json",
+          "codex": "codex-hook-json",
+          "gemini": "gemini-hook-json"
+        },
+        "protocol": {
+          "kind": "advisory",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "additionalContext",
+            "continue",
+            "hookSpecificOutput",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".env",
+            ".claude/learning/",
+            ".claude/learning/observations.jsonl",
+            ".claude/operator-id",
+            ".session-notes.d/",
+            ".session-notes.shared.md",
+            ".session-notes.aggregate.md",
+            ".session-notes.migrated",
+            ".session-notes.migrate.lock",
+            ".git/config",
+            "~/.claude/sessions/"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "SessionStart",
+      "matcher": null,
+      "file": ".claude/hooks/orphan-forest-guard.js",
+      "file_sha256": "dfd83b9e2b6c473e3f8962d2d106ab30e43d8ce94a69916c0c122b6771341231",
+      "id": "hk_c3f6bfbfbf71075a",
+      "order": 4,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 15,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "advisory",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/orphan-reap-refusals.jsonl"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "SessionStart",
+      "matcher": null,
+      "file": ".claude/hooks/wip-discipline-guard.js",
+      "file_sha256": "bb63d75298ac6b184a8a8d19ebb2fb1afa25887fa8d6ac6ed32f773121d715fb",
+      "id": "hk_fda32b974678925d",
+      "order": 5,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 15,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "advisory",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/wip-authz/override-ledger.jsonl",
+            ".claude/wip-authz/wip-limit-allow"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "SessionStart",
+      "matcher": null,
+      "file": ".claude/hooks/todo-durable-guard.js",
+      "file_sha256": "7dbf1ca09e3a2df32093d05738f8bd10d9db0f94c1f28cb67a8695715fce3b89",
+      "id": "hk_b62c6a46c0f213ff",
+      "order": 6,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 10,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "advisory",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            "burndown/events.jsonl"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "SessionStart",
+      "matcher": null,
+      "file": ".claude/hooks/settings-deny-drift-guard.js",
+      "file_sha256": "9abfeeda5c087e3ef5763879045f4feeb19e34040a8f8f244d14957460d56abf",
+      "id": "hk_c2c609b47cdebc88",
+      "order": 7,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "advisory",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue"
+          ],
+          "severity": "advise"
+        },
+        "form": "legacy",
+        "runtime": "node-subprocess",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/settings.json",
+            ".claude/settings.json.tmp.<pid>.<timestamp>"
+          ],
+          "network": false,
+          "spawns": false,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "SessionEnd",
+      "matcher": null,
+      "file": ".claude/hooks/session-end.js",
+      "file_sha256": "8ccf82ccfbcb71167b2a49c5ec7aba96dc11846734be4bda16a6e440b8a948e0",
+      "id": "hk_ab2bcc51d989c5af",
+      "order": 1,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": null,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "failure-report",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/",
+            ".claude/learning/observations.jsonl",
+            ".claude/learning/learning-digest.json",
+            "workspaces/<workspace>/journal/.pending/",
+            "workspaces/<workspace>/.journal-skipped.log",
+            "~/.claude/sessions/"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "SessionEnd",
+      "matcher": null,
+      "file": ".claude/hooks/multi-operator-sessionend.js",
+      "file_sha256": "1359b10efd6c5b5b6c09f9c5cbe8e3658efab43041c6d5e3c8ba8371b10c9d2b",
+      "id": "hk_cb774c9b2b7f3382",
+      "order": 2,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 5,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "failure-report",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/coordination-log.jsonl",
+            ".claude/learning/.session-end-cache",
+            ".claude/learning/observations.jsonl",
+            ".claude/learning/observations.archive/",
+            ".claude/learning/sessionend-release-lease-<verified_id-fingerprint>.json",
+            ".claude/learning/.tmp-sereleaselease-<pid>-<hex>",
+            ".claude/learning/sessionend-release-lease-<verified_id-fingerprint>.json.reap-<pid>-<hex>",
+            ".session-notes.d/<display_id>.md",
+            ".session-notes.shared.md",
+            "<os.tmpdir()>/coc-sign-<mkdtemp-suffix>"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "SessionEnd",
+      "matcher": null,
+      "file": ".claude/hooks/worktree-forest-guard.js",
+      "file_sha256": "4025e97be57aec95c3cd257326daa55e820347e0126225fb78928c6fffeba854",
+      "id": "hk_fb0c15c1272d5709",
+      "order": 3,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 45,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "failure-report",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            "<sibling-worktree-path>/"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "SessionEnd",
+      "matcher": null,
+      "file": ".claude/hooks/orphan-forest-guard.js",
+      "file_sha256": "dfd83b9e2b6c473e3f8962d2d106ab30e43d8ce94a69916c0c122b6771341231",
+      "id": "hk_2b212e8fab10a638",
+      "order": 4,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 30,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "failure-report",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/orphan-reap-refusals.jsonl"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    },
+    {
+      "event": "SessionEnd",
+      "matcher": null,
+      "file": ".claude/hooks/stranded-artifact-guard.js",
+      "file_sha256": "30ab66b7aa6be3c9362abecc98e96b4b876ad2c0466c037e7d76c59fb71d255c",
+      "id": "hk_c4cb82d13255ed80",
+      "order": 5,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 20,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "failure-report",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            ".git/landed-map-cache.json",
+            ".git/landed-map-cache.json.<pid>.tmp"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "SessionEnd",
+      "matcher": null,
+      "file": ".claude/hooks/todo-durable-guard.js",
+      "file_sha256": "7dbf1ca09e3a2df32093d05738f8bd10d9db0f94c1f28cb67a8695715fce3b89",
+      "id": "hk_32e45066a8617374",
+      "order": 6,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": 10,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "failure-report",
+          "exit_codes": [
+            0
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue",
+            "reason"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "process",
+        "side_effects": {
+          "fs_writes": [
+            "burndown/events.jsonl"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": true
+      }
+    },
+    {
+      "event": "PreCompact",
+      "matcher": null,
+      "file": ".claude/hooks/pre-compact.js",
+      "file_sha256": "ce8e9fac775d5ea8a9a8060f00f962ce7be4cd48c3821e2fdbb7436f9703dfb4",
+      "id": "hk_07974d745c2e20bb",
+      "order": 1,
+      "on_incomplete": "continue",
+      "on_crash": "continue",
+      "on_timeout": "continue",
+      "timeout": null,
+      "source": "loom-template",
+      "surfaces": [
+        "claude"
+      ],
+      "contract": {
+        "payload_stdin": {
+          "claude": "cc-hook-json"
+        },
+        "protocol": {
+          "kind": "compaction-instructions",
+          "exit_codes": [
+            0,
+            1
+          ],
+          "exit_codes_computed": false,
+          "decision_fields": [
+            "continue"
+          ],
+          "severity": "advise"
+        },
+        "form": "in-process",
+        "runtime": "hook-engine-worker",
+        "cwd_scope": "payload",
+        "side_effects": {
+          "fs_writes": [
+            ".claude/learning/observations.jsonl",
+            ".claude/learning/observations.archive/",
+            "~/.claude/checkpoints/<session_id>-<timestamp>.json"
+          ],
+          "network": false,
+          "spawns": true,
+          "declared_by": "author"
+        },
+        "idempotent": false
+      }
+    }
+  ]
+}

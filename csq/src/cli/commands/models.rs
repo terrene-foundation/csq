@@ -1,0 +1,1791 @@
+//! `csq models list [provider]` — list models. `csq models switch <provider> <model>` — switch.
+//!
+//! `--json` drives coverage from [`csq_core::providers::registry`] — THE canonical
+//! union of the wrapped-provider catalog and the native-CLI table — so every id
+//! `registry::known_ids()` reports is listable, not just the subset that happens
+//! to carry curated [`ModelCatalog`] rows. Dispatch keys off
+//! [`ProviderDescriptor::kind`] (`Wrapped` vs `Native`), never a per-id `if
+//! provider_id == "grok"` chain. Both kinds honor runtime manifest rows; a
+//! descriptor with zero catalog rows falls back to its synthesized default
+//! rather than an empty array. Ollama's live-pulled-model enumeration is the
+//! one kept id-check — it is a genuine runtime-vs-static distinction, not a
+//! provider-identity branch (`agents.md` "PRIMARY METHODOLOGICAL DIRECTIVE").
+
+use anyhow::{anyhow, Result};
+use csq_core::providers::catalog::ModelConfigTarget;
+use csq_core::providers::model_manifest::{self, ModelManifest};
+use csq_core::providers::registry::{self, ProviderDescriptor};
+use csq_core::providers::{self, ModelCatalog, ProviderKind};
+use csq_core::sdk::{
+    self, Envelope, ModelEntry, ModelsPayload, SdkError, SdkErrorCode, SCHEMA_MODELS_V1,
+};
+use std::path::Path;
+
+/// Local manifest maintenance. No HTTP fetching or session/configuration migration.
+pub enum ManifestAction {
+    Show,
+    Validate(std::path::PathBuf),
+    Install(std::path::PathBuf),
+    Reset,
+}
+
+pub fn handle_manifest(base_dir: &Path, action: ManifestAction, json: bool) -> Result<()> {
+    match action {
+        ManifestAction::Show => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&ModelManifest::load(base_dir)?)?
+            );
+        }
+        ManifestAction::Validate(file) => {
+            let manifest = model_manifest::validate_file(&file)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"valid": true, "revision": manifest.revision})
+                );
+            } else {
+                println!("Valid model manifest: {}", manifest.revision);
+            }
+        }
+        ManifestAction::Install(file) => {
+            let manifest = ModelManifest::install(base_dir, &file)?;
+            let path = model_manifest::manifest_path(base_dir);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"installed": true, "revision": manifest.revision, "path": path})
+                );
+            } else {
+                println!(
+                    "Installed model manifest {} at {}",
+                    manifest.revision,
+                    path.display()
+                );
+                println!("New model commands read it immediately; usage prices refresh on the daemon's next ledger cycle (up to 10 minutes). No restart required.");
+            }
+        }
+        ManifestAction::Reset => {
+            let removed = model_manifest::reset(base_dir)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"removed": removed, "source": "bundled"})
+                );
+            } else {
+                println!("Using bundled model manifest (local snapshot removed: {removed}).");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A row synthesized from `d.default_model` — never a bare-empty substitute.
+/// `default_model` is empty only for a native descriptor whose vendor CLI picks
+/// its own model with no fixed csq-visible default (doc'd on
+/// [`csq_core::providers::native::NativeCli::default_model`]); that case still
+/// reports one row with an explicit "vendor-selected" placeholder rather than
+/// silently contributing zero entries.
+fn default_entry(d: &ProviderDescriptor) -> ModelEntry {
+    let (model_id, model_name) = if d.default_model.is_empty() {
+        (
+            "(vendor-selected)".to_string(),
+            format!("{} picks its model automatically", d.name),
+        )
+    } else {
+        (d.default_model.to_string(), d.default_model.to_string())
+    };
+    ModelEntry::new(d.id, d.name, model_id, model_name, true)
+}
+
+/// This provider's curated [`ModelCatalog`] rows, mapped to [`ModelEntry`].
+fn catalog_entries(d: &ProviderDescriptor, catalog: &ModelCatalog) -> Vec<ModelEntry> {
+    catalog
+        .by_provider(d.id)
+        .into_iter()
+        .map(|m| {
+            ModelEntry::new(d.id, d.name, m.id.clone(), m.name.clone(), false)
+                .with_context_window(m.context_window)
+                .with_output_limit(m.output_limit)
+                .with_aliases(m.aliases.clone())
+        })
+        .collect()
+}
+
+/// Ollama's model space is whatever the user has pulled locally — queried live,
+/// never curated. Kept as an explicit id check (not a `kind` branch): this is a
+/// runtime-vs-static distinction orthogonal to wrapped/native classification.
+fn ollama_entries(d: &ProviderDescriptor, names: Vec<String>) -> Vec<ModelEntry> {
+    names
+        .into_iter()
+        .map(|name| ModelEntry::new(d.id, d.name, name.clone(), name, false))
+        .collect()
+}
+
+/// Both provider kinds honor runtime catalog rows. Wrapped Ollama also lists
+/// locally pulled models; a provider with no resulting entries uses its registry
+/// default, preserving native vendor-selected behavior when no manifest rows exist.
+fn entries_for(d: &ProviderDescriptor, catalog: &ModelCatalog) -> Vec<ModelEntry> {
+    entries_for_with_ollama(d, catalog, &mut providers::ollama::get_ollama_models)
+}
+
+fn entries_for_with_ollama(
+    d: &ProviderDescriptor,
+    catalog: &ModelCatalog,
+    ollama_models: &mut impl FnMut() -> Vec<String>,
+) -> Vec<ModelEntry> {
+    match d.kind {
+        ProviderKind::Native => {
+            let entries = catalog_entries(d, catalog);
+            if entries.is_empty() {
+                vec![default_entry(d)]
+            } else {
+                entries
+            }
+        }
+        ProviderKind::Wrapped => {
+            let mut entries = catalog_entries(d, catalog);
+            if d.id == "ollama" {
+                entries.extend(ollama_entries(d, ollama_models()));
+            }
+            if entries.is_empty() {
+                entries.push(default_entry(d));
+            }
+            entries
+        }
+    }
+}
+
+/// The fallible core of the `--json` path: resolve `provider_filter` against
+/// [`registry`] and build every listable row. Returns [`SdkError`] (never bails
+/// via `anyhow`) so the caller can wrap it directly in a failure envelope — the
+/// same shape as `exec::run_exec`. Split out from [`handle_list`] so it can be
+/// unit-tested without going through [`sdk::emit`] + `std::process::exit`.
+fn list_models_json(
+    provider_filter: &str,
+    catalog: &ModelCatalog,
+) -> Result<Vec<ModelEntry>, SdkError> {
+    list_models_json_with_ollama(
+        provider_filter,
+        catalog,
+        providers::ollama::get_ollama_models,
+    )
+}
+
+fn list_models_json_with_ollama(
+    provider_filter: &str,
+    catalog: &ModelCatalog,
+    mut ollama_models: impl FnMut() -> Vec<String>,
+) -> Result<Vec<ModelEntry>, SdkError> {
+    let descriptors: Vec<ProviderDescriptor> = if provider_filter == "all" {
+        registry::all()
+    } else {
+        match registry::lookup(provider_filter) {
+            Some(d) => vec![d],
+            None => {
+                let known: Vec<String> = registry::known_ids()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+                return Err(SdkError::trusted(
+                    SdkErrorCode::ProviderNotFound,
+                    format!("unknown provider: {provider_filter}"),
+                )
+                .with_known(known));
+            }
+        }
+    };
+
+    Ok(descriptors
+        .iter()
+        .flat_map(|d| entries_for_with_ollama(d, catalog, &mut ollama_models))
+        .collect())
+}
+
+fn runtime_models_json(
+    base_dir: &Path,
+    provider_filter: &str,
+) -> Result<Vec<ModelEntry>, SdkError> {
+    let manifest = ModelManifest::load(base_dir).map_err(|error| {
+        SdkError::trusted(
+            SdkErrorCode::InvalidInput,
+            format!("model manifest unavailable: {error}"),
+        )
+    })?;
+    list_models_json(provider_filter, &manifest.catalog())
+}
+
+pub fn handle_list(base_dir: &Path, provider_filter: &str, json: bool) -> Result<()> {
+    if json {
+        let code = match runtime_models_json(base_dir, provider_filter) {
+            Ok(models) => sdk::emit(&Envelope::success(
+                SCHEMA_MODELS_V1,
+                None,
+                ModelsPayload::new(models),
+            ))?,
+            Err(err) => sdk::emit(&Envelope::<ModelsPayload>::failure(
+                SCHEMA_MODELS_V1,
+                None,
+                err,
+            ))?,
+        };
+        std::process::exit(code);
+    }
+
+    let catalog = ModelManifest::load(base_dir)?.catalog();
+    println!();
+
+    let descriptors: Vec<ProviderDescriptor> = if provider_filter == "all" {
+        registry::all()
+    } else {
+        vec![registry::lookup(provider_filter)
+            .ok_or_else(|| anyhow!("unknown provider: {provider_filter}"))?]
+    };
+
+    for d in &descriptors {
+        let models = entries_for(d, &catalog);
+        if provider_filter == "all" && models.is_empty() {
+            continue;
+        }
+        println!("{} ({})", d.name, d.id);
+        for m in &models {
+            if m.is_default {
+                println!("  {} — {} (default)", m.model_id, m.model_name);
+            } else {
+                println!("  {} — {}", m.model_id, m.model_name);
+            }
+        }
+        println!();
+    }
+
+    Ok(())
+}
+
+pub fn handle_switch(
+    base_dir: &Path,
+    provider_id: &str,
+    model_query: &str,
+    slot: Option<csq_core::types::AccountNum>,
+    pull_if_missing: bool,
+    force: bool,
+) -> Result<()> {
+    let provider = providers::get_provider(provider_id)
+        .ok_or_else(|| anyhow!("unknown provider: {provider_id}"))?;
+
+    let catalog = ModelManifest::load(base_dir)?.catalog();
+
+    // Resolve the target model id. Three strategies by provider:
+    //
+    // - **Ollama** — the "catalog" is whatever the user has pulled
+    //   locally. Accept any non-empty id verbatim; when
+    //   `pull_if_missing` is set, fetch via `ollama pull`.
+    // - **Codex** — FR-CLI-04: the Codex default ships in the
+    //   catalog, but users can switch to any gpt-*/o*/codex-* model
+    //   OpenAI exposes on their subscription. Accept catalog
+    //   matches silently; accept non-catalog ids ONLY when `--force`
+    //   is set, because uncached models risk shipping a model id
+    //   the user's plan doesn't accept.
+    // - **Keyed providers (Claude / MiniMax / Z.AI)** — keep the
+    //   curated catalog so a typo can't brick the slot.
+    let model_id: String = if provider_id == "ollama" {
+        let trimmed = model_query.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("model id must not be empty"));
+        }
+        if pull_if_missing {
+            ensure_ollama_model_pulled(trimmed)?;
+        }
+        trimmed.to_string()
+    } else if provider_id == "codex" {
+        resolve_codex_model(model_query, force, &catalog)?
+    } else if provider_id == "gemini" && model_query.trim().eq_ignore_ascii_case("auto") {
+        // FR-G-CLI-04 special: `auto` is intentionally NOT in the
+        // catalog (it instructs gemini-cli to pick rather than
+        // pinning). Short-circuit before the catalog lookup so the
+        // suggestion fallback ("did you mean claude-opus...") does
+        // not surface a misleading rejection.
+        "auto".to_string()
+    } else {
+        let m = catalog.find(model_query).ok_or_else(|| {
+            let suggestion = catalog
+                .suggest(model_query)
+                .map(|m| format!(" (did you mean {}?)", m.id))
+                .unwrap_or_default();
+            anyhow!("unknown model: {model_query}{suggestion}")
+        })?;
+        if m.provider != provider_id {
+            return Err(anyhow!(
+                "model {} belongs to provider {}, not {}",
+                m.id,
+                m.provider,
+                provider_id
+            ));
+        }
+        with_context_annotation(provider_id, model_query, &m.id, m.context_window)
+    };
+
+    // INV-P06 write-path dispatch by `ModelConfigTarget`.
+    //
+    // - EnvInSettingsJson → `config-<N>/settings.json` `env.ANTHROPIC_MODEL`
+    //   (and all MODEL_KEYS siblings), or the global profile when no slot.
+    // - TomlModelKey → `config-<N>/config.toml` `model = "..."` via
+    //   `providers::codex::surface::write_config_toml`. No global
+    //   profile path for Codex — the model is a per-slot config.toml
+    //   concept and the provider has no settings-codex.json file.
+    match provider.model_config {
+        ModelConfigTarget::EnvInSettingsJson => {
+            if let Some(slot_num) = slot {
+                write_slot_model(base_dir, slot_num, &model_id)?;
+                println!(
+                    "Switched {} model on slot {} to {}",
+                    provider_id, slot_num, model_id
+                );
+            } else {
+                // Load-modify-write under ONE lock span (`update_settings`):
+                // a key written concurrently is never reverted by a stale load.
+                let window = catalog.find(&model_id).and_then(|m| m.context_window);
+                providers::settings::update_settings(base_dir, provider_id, |s| {
+                    s.set_model_with_window(&model_id, window);
+                    Ok(())
+                })?;
+                let display_name = catalog
+                    .find(&model_id)
+                    .map(|m| format!(" ({})", m.name))
+                    .unwrap_or_default();
+                println!(
+                    "Switched {} model to {}{}",
+                    provider_id, model_id, display_name
+                );
+            }
+        }
+        ModelConfigTarget::TomlModelKey => {
+            let slot_num = slot.ok_or_else(|| {
+                anyhow!(
+                    "--slot is required for {provider_id} — model lives in \
+                     config-<slot>/config.toml, there is no global profile"
+                )
+            })?;
+            // Explicit user choice → `Some`: written as the per-slot `model`
+            // key (takes precedence over any user-global `model`, preserved
+            // across launch re-merges). This is the ONLY path that writes a
+            // model; login/spawn/reconciler pass `None`.
+            providers::codex::surface::write_config_toml(base_dir, slot_num, Some(&model_id))
+                .map_err(|e| {
+                    anyhow!(
+                        "{} for slot {slot_num}: {}",
+                        providers::codex::surface::config_write_error_context(&e),
+                        providers::codex::surface::config_write_error_source(&e)
+                    )
+                })?;
+            println!(
+                "Switched {} model on slot {} to {}",
+                provider_id, slot_num, model_id
+            );
+        }
+        ModelConfigTarget::GeminiSettingsModelName => {
+            // FR-G-CLI-04: Gemini model lives in `binding.model_name`
+            // inside `credentials/gemini-<N>.json`. The settings
+            // reassertion writer (`reassert_settings_drift`) writes
+            // it into `<handle_dir>/.gemini/settings.json` on every
+            // spawn, so the next `csq run <slot>` picks up the new
+            // model with no extra glue.
+            let slot_num = slot.ok_or_else(|| {
+                anyhow!(
+                    "--slot is required for {provider_id} — model lives \
+                     in the per-slot binding marker, there is no global profile"
+                )
+            })?;
+            // Resolve `auto` first (not in catalog); for everything
+            // else the catalog hit above already pinned the
+            // canonical `gemini-*` id. Validate that the resolved
+            // id is a Gemini model.
+            let resolved = resolve_gemini_model(model_query, &model_id)?;
+            write_gemini_model_to_binding(base_dir, slot_num, &resolved)?;
+            if resolved.ends_with("-preview") {
+                eprintln!(
+                    "warning: preview tier may silently downgrade — csq will flag the actual served model after the first call"
+                );
+            }
+            println!(
+                "Switched {} model on slot {} to {}",
+                provider_id, slot_num, resolved
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolves a Gemini model query to a concrete model id (or the
+/// literal `"auto"`). The catalog has already been consulted by
+/// the caller for non-`auto` ids; this helper just adds the
+/// `auto` literal which is intentionally NOT in the catalog
+/// (it instructs gemini-cli to pick rather than pinning).
+///
+/// Returns the resolved id (one of: `auto`, `gemini-2.5-pro`,
+/// `gemini-2.5-flash`, `gemini-2.5-flash-lite`,
+/// `gemini-3-pro-preview`). Refuses anything else.
+fn resolve_gemini_model(query: &str, catalog_resolved: &str) -> Result<String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("model id must not be empty"));
+    }
+    if trimmed.eq_ignore_ascii_case("auto") {
+        return Ok("auto".to_string());
+    }
+    // Catalog already produced a canonical id (catalog `find` is
+    // case-insensitive). Pin the gemini-* prefix so a non-gemini
+    // model id passed in does not slip through the GeminiSettings
+    // dispatch path.
+    if !catalog_resolved.starts_with("gemini-") {
+        return Err(anyhow!(
+            "`{trimmed}` does not resolve to a Gemini model — supported: \
+             auto, pro, flash, flash-lite, 3-pro-preview, or a concrete \
+             `gemini-*` id"
+        ));
+    }
+    Ok(catalog_resolved.to_string())
+}
+
+/// Atomically updates `model_name` inside the slot's Gemini
+/// binding marker. The drift detector picks up the new value on
+/// the next `csq run <slot>` spawn.
+fn write_gemini_model_to_binding(
+    base_dir: &Path,
+    slot: csq_core::types::AccountNum,
+    model: &str,
+) -> Result<()> {
+    use csq_core::providers::gemini::provisioning::{set_model_name, ProvisionError};
+    set_model_name(base_dir, slot, model).map_err(|e| {
+        // `read_binding` inside `set_model_name` returns `ProvisionError::Io`
+        // with `ErrorKind::NotFound` when the marker is absent — translate to
+        // the actionable "run setkey first" message. All other errors (write
+        // failures, malformed marker) map to the generic update failure.
+        match &e {
+            ProvisionError::Io { source, .. }
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                anyhow!(
+                    "slot {slot} has no Gemini binding — run `csq setkey gemini --slot {slot}` (API key / Vertex SA) or `csq login {slot} --provider gemini` (Code Assist OAuth) first ({})",
+                    e.error_kind_tag()
+                )
+            }
+            _ => anyhow!("failed to update Gemini binding for slot {slot}: {e}"),
+        }
+    })
+}
+
+/// Resolves a user-supplied Codex model query to a concrete model id.
+///
+/// Catalog match wins; otherwise `--force` must be set to accept an
+/// arbitrary OpenAI model id. Empty input is always rejected. This
+/// mirrors the Ollama "user space" model for catalog-less providers
+/// while keeping the default path (catalog hit) typo-resistant.
+fn resolve_codex_model(query: &str, force: bool, catalog: &ModelCatalog) -> Result<String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("model id must not be empty"));
+    }
+
+    // Catalog hit is the happy path for csq-curated models.
+    if let Some(m) = catalog.find(trimmed) {
+        if m.provider == "codex" {
+            return Ok(m.id.clone());
+        }
+    }
+
+    // Also accept the provider's own `default_model` literal — it's
+    // always a valid Codex id even if ModelCatalog hasn't enumerated it.
+    if let Some(p) = providers::get_provider("codex") {
+        if trimmed == p.default_model {
+            return Ok(trimmed.to_string());
+        }
+    }
+
+    if force {
+        return Ok(trimmed.to_string());
+    }
+
+    Err(anyhow!(
+        "uncached codex model `{trimmed}` — pass `--force` to accept an \
+         arbitrary OpenAI model id (csq does not validate it against your \
+         ChatGPT subscription entitlements)"
+    ))
+}
+
+/// The id to write for a catalog hit, keeping the query's `[1m]` annotation.
+///
+/// Claude only. `ModelCatalog::find` strips `[1m]` to match, so writing the
+/// bare `m.id` silently turned `claude-opus-5-5[1m]` into `claude-opus-5-5` —
+/// and Claude Code sizes the window from that suffix: measured on a Vertex
+/// slot, the bare id ran with a 200000-token window and the annotated one with
+/// 1000000. The suffix is Claude Code's annotation, not part of any vendor's
+/// model id, so no other provider gets it (gemini-cli would send
+/// `gemini-2.5-pro[1m]` to Google verbatim). It is kept only when the catalog
+/// row has a 1M window, so it never promises context the model lacks.
+fn with_context_annotation(
+    provider_id: &str,
+    query: &str,
+    id: &str,
+    context_window: Option<u64>,
+) -> String {
+    const ONE_M: &str = "[1m]";
+    let asked = query.trim().to_ascii_lowercase().ends_with(ONE_M);
+    let has = id.to_ascii_lowercase().ends_with(ONE_M);
+    if provider_id == "claude" && asked && !has && context_window.is_some_and(|w| w >= 1_000_000) {
+        format!("{id}{ONE_M}")
+    } else {
+        id.to_string()
+    }
+}
+
+/// Rewrites every `ANTHROPIC_*_MODEL` key in the slot's settings.json to
+/// `model_id`, atomic temp-file + rename via the shared platform helpers.
+/// The file must already exist (slot must be bound via `csq setkey` first).
+/// M2-7: thin wrapper over the shared UUID-routing chokepoint in csq-core.
+///
+/// Both CLI and desktop use `csq_core::session::write_slot_model_with_uuid_routing`
+/// so the UUID resolution logic has a single source of truth.
+/// See `csq-core/src/session/settings.rs` for the implementation and
+/// `internal-design-docs § M2-7`.
+fn write_slot_model(
+    base_dir: &Path,
+    slot: csq_core::types::AccountNum,
+    model_id: &str,
+) -> Result<()> {
+    csq_core::session::write_slot_model_with_uuid_routing(base_dir, slot, model_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Ensures `model` is in the output of `ollama list`. If missing,
+/// runs `ollama pull <model>` with inherited stdio so the user
+/// sees the pull progress in the terminal.
+///
+/// Returns `Ok(())` when the model is (or becomes) locally available.
+/// Returns `Err` when:
+///   - `ollama` is not installed (exec failure)
+///   - the pull command exits non-zero
+///
+/// No network fetch happens when the model is already present.
+/// Pure function: given a user's requested model id and the
+/// locally-installed list, decide whether we need to pull.
+///
+/// - Exact match → already present.
+/// - Query has no `:tag` AND any installed model's bare name
+///   matches the query → already present (user typed `gemma4`,
+///   we have `gemma4:latest`).
+/// - Query has a `:tag` → require exact match. A user asking
+///   for `gemma4:13b` must get `gemma4:13b`; `gemma4:4b`
+///   installed does NOT satisfy it (different weights, CC
+///   would fail at inference time).
+pub(crate) fn model_is_installed(query: &str, installed: &[String]) -> bool {
+    if installed.iter().any(|m| m == query) {
+        return true;
+    }
+    if !query.contains(':') {
+        return installed.iter().any(|m| {
+            let m_bare = m.split(':').next().unwrap_or(m);
+            m_bare == query
+        });
+    }
+    false
+}
+
+fn ensure_ollama_model_pulled(model: &str) -> Result<()> {
+    use std::process::Command;
+
+    // Pre-check the ollama binary exists before invoking it
+    // indirectly. Fails with an actionable message instead of
+    // the confusing "No such file or directory" surfaced by a
+    // plain `Command::status()` on a missing binary.
+    if Command::new("ollama")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_err()
+    {
+        return Err(anyhow!(
+            "ollama is not installed. Install from https://ollama.com \
+             (or pass `--pull-if-missing=false` to skip the fetch)"
+        ));
+    }
+
+    let installed = csq_core::providers::ollama::get_ollama_models();
+    if model_is_installed(model, &installed) {
+        return Ok(());
+    }
+
+    eprintln!("Model {model} not found locally — running `ollama pull {model}`...");
+    let status = Command::new("ollama")
+        .arg("pull")
+        .arg(model)
+        .status()
+        .map_err(|e| {
+            anyhow!("failed to run `ollama pull`: {e}. Is Ollama installed and on PATH?")
+        })?;
+    if !status.success() {
+        return Err(anyhow!(
+            "`ollama pull {model}` exited with {}",
+            status.code().unwrap_or(-1)
+        ));
+    }
+    Ok(())
+}
+
+// Kept for backward compat with the old single-arg CLI entry
+#[allow(dead_code)]
+pub fn handle(base_dir: &Path, provider_filter: &str) -> Result<()> {
+    handle_list(base_dir, provider_filter, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use csq_core::accounts::third_party::bind_provider_to_slot;
+    use csq_core::types::AccountNum;
+    use serde_json::Value;
+    use tempfile::TempDir;
+
+    #[test]
+    fn model_manifest_cli_install_lists_and_switches_new_model_without_rebuild() {
+        let _guard = csq_core::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("reviewed.json");
+        let mut manifest = ModelManifest::bundled();
+        manifest.revision = "private-new-model".into();
+        let mut model = manifest.catalog().find("deepseek-flash").unwrap().clone();
+        model.id = "deepseek-private-next[1m]".into();
+        model.name = "Private next model".into();
+        model.aliases = vec!["private-next".into()];
+        manifest.models.push(model);
+        std::fs::write(&source, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        handle_manifest(dir.path(), ManifestAction::Validate(source.clone()), true).unwrap();
+        assert!(!model_manifest::manifest_path(dir.path()).exists());
+        handle_manifest(dir.path(), ManifestAction::Install(source), true).unwrap();
+        let entries = runtime_models_json(dir.path(), "deepseek").unwrap();
+        assert!(entries
+            .iter()
+            .any(|row| row.model_id == "deepseek-private-next[1m]"));
+        let config = dir.path().join("config-15");
+        std::fs::create_dir(&config).unwrap();
+        let settings = config.join("settings.json");
+        std::fs::write(&settings, r#"{"effortLevel":"max","env":{"ANTHROPIC_BASE_URL":"https://api.deepseek.com/anthropic","CLAUDE_CODE_SUBAGENT_MODEL_FORCE":"deepseek-flash[1m]"}}"#).unwrap();
+        handle_switch(
+            dir.path(),
+            "deepseek",
+            "private-next",
+            Some(AccountNum::try_from(15u16).unwrap()),
+            false,
+            false,
+        )
+        .unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+        assert_eq!(saved["env"]["ANTHROPIC_MODEL"], "deepseek-private-next[1m]");
+        assert_eq!(saved["effortLevel"], "max");
+        assert_eq!(
+            saved["env"]["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"],
+            "deepseek-flash[1m]"
+        );
+        handle_manifest(dir.path(), ManifestAction::Reset, true).unwrap();
+        assert!(!model_manifest::manifest_path(dir.path()).exists());
+        assert!(!runtime_models_json(dir.path(), "deepseek")
+            .unwrap()
+            .iter()
+            .any(|row| row.model_id == "deepseek-private-next[1m]"));
+    }
+
+    #[test]
+    fn model_manifest_invalid_configuration_fails_list_and_preserves_slot() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(model_manifest::manifest_path(dir.path()), b"{broken").unwrap();
+        let config = dir.path().join("config-15");
+        std::fs::create_dir(&config).unwrap();
+        let path = config.join("settings.json");
+        let original = br#"{"env":{"ANTHROPIC_MODEL":"do-not-change"}}"#;
+        std::fs::write(&path, original).unwrap();
+        let error = runtime_models_json(dir.path(), "deepseek").unwrap_err();
+        let envelope = Envelope::<ModelsPayload>::failure(SCHEMA_MODELS_V1, None, error);
+        let value: Value = serde_json::from_str(&envelope.to_line().unwrap()).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "invalid_input");
+        assert!(handle_switch(
+            dir.path(),
+            "deepseek",
+            "4.1",
+            Some(AccountNum::try_from(15u16).unwrap()),
+            false,
+            false
+        )
+        .is_err());
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn model_manifest_native_catalogue_rows_are_not_hidden_by_static_default() {
+        let dir = TempDir::new().unwrap();
+        let mut manifest = ModelManifest::bundled();
+        manifest
+            .models
+            .push(csq_core::providers::models::ModelInfo {
+                id: "grok-private-next".into(),
+                name: "Private Grok".into(),
+                provider: "grok".into(),
+                context_window: Some(900_000),
+                output_limit: Some(100_000),
+                aliases: vec![],
+            });
+        std::fs::write(
+            model_manifest::manifest_path(dir.path()),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let rows = runtime_models_json(dir.path(), "grok").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model_id, "grok-private-next");
+        assert_eq!(rows[0].context_window, Some(900_000));
+    }
+
+    #[test]
+    fn json_list_sdk_payload_preserves_default_row_wire_shape() {
+        let models = list_models_json("codex", &ModelCatalog::default_catalog()).unwrap();
+        let env = Envelope::success(SCHEMA_MODELS_V1, None, ModelsPayload::new(models));
+        let value: Value = serde_json::from_str(&env.to_line().unwrap()).unwrap();
+        assert_eq!(value["schema"], "csq.models.v1");
+        assert_eq!(value["ok"], true);
+        assert!(value.get("payload").is_none());
+        let row = value["models"][0].as_object().unwrap();
+        let keys: std::collections::BTreeSet<_> = row.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "provider_id",
+                "provider_name",
+                "model_id",
+                "model_name",
+                "is_default",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(row["provider_id"], "codex");
+        assert_eq!(row["is_default"], true);
+    }
+
+    // ── JSON registry-union coverage (GH an internal ticket, closes an internal ticket) ──────────
+
+    #[test]
+    fn deepseek_v41_json_list_exposes_canonical_flash_and_preserves_pro() {
+        let entries = list_models_json("deepseek", &ModelCatalog::default_catalog()).unwrap();
+        let envelope = Envelope::success(SCHEMA_MODELS_V1, None, ModelsPayload::new(entries));
+        let value: Value = serde_json::from_str(&envelope.to_line().unwrap()).unwrap();
+        assert_eq!(value["schema"], "csq.models.v1");
+        assert_eq!(value["ok"], true);
+        let rows = value["models"].as_array().unwrap();
+        let flash = rows
+            .iter()
+            .find(|row| row["model_id"] == "deepseek-flash")
+            .unwrap();
+        assert_eq!(flash["model_name"], "DeepSeek V4.1 Flash");
+        assert_eq!(flash["context_window"], 1_000_000);
+        assert_eq!(flash["output_limit"], 384_000);
+        assert!(flash["aliases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|alias| alias == "deepseek-v4-flash"));
+        assert!(rows.iter().any(|row| row["model_id"] == "deepseek-v4-pro"));
+        assert!(!rows
+            .iter()
+            .any(|row| row["model_id"] == "deepseek-v4-flash"));
+    }
+
+    /// `csq models switch kimi k3.1-pro` selects the 262,144-token K3.1 Pro
+    /// row (Plus/Moderato cap), never the 1M `k3.1-pro[1m]` default, and the
+    /// model-dependent settings follow: the subagent equals the model (Kimi
+    /// guide) and both window keys take the manifest window. Round trip
+    /// 1M -> 256K -> 1M, on the slot file and on the global profile.
+    #[test]
+    fn kimi_switch_round_trip_moves_subagent_and_window_keys_with_the_model() {
+        let _env_guard = csq_core::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(14u16).unwrap();
+        let config = dir.path().join("config-14");
+        std::fs::create_dir_all(&config).unwrap();
+        let slot_path = config.join("settings.json");
+        let global_path = dir.path().join("settings-kimi.json");
+        let original = serde_json::json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding",
+                "ANTHROPIC_MODEL": "k3.1-pro[1m]",
+                "CLAUDE_CODE_SUBAGENT_MODEL": "k3.1-pro[1m]",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1048576",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1048576",
+                "KEEP_FIXTURE_SETTING": "preserved"
+            }
+        });
+        std::fs::write(&slot_path, serde_json::to_vec(&original).unwrap()).unwrap();
+        std::fs::write(&global_path, serde_json::to_vec(&original).unwrap()).unwrap();
+        for (query, want, window) in [
+            ("k3.1-pro", "k3.1-pro", "262144"),
+            ("k3.1-pro[1m]", "k3.1-pro[1m]", "1048576"),
+        ] {
+            handle_switch(dir.path(), "kimi", query, Some(slot), false, false).unwrap();
+            handle_switch(dir.path(), "kimi", query, None, false, false).unwrap();
+            for path in [&slot_path, &global_path] {
+                let actual: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                let env = &actual["env"];
+                for key in csq_core::session::merge::MODEL_KEYS {
+                    assert_eq!(env[*key], want, "{query} -> {key}");
+                }
+                assert_eq!(env["CLAUDE_CODE_SUBAGENT_MODEL"], want, "{query}");
+                for key in csq_core::session::merge::WINDOW_KEYS {
+                    assert_eq!(env[*key], window, "{query} -> {key}");
+                }
+                assert_eq!(env["KEEP_FIXTURE_SETTING"], "preserved");
+            }
+        }
+        // A profile without the window keys never gains them from a switch.
+        let bare = serde_json::json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding",
+                "ANTHROPIC_MODEL": "k3.1-pro[1m]"
+            }
+        });
+        std::fs::write(&slot_path, serde_json::to_vec(&bare).unwrap()).unwrap();
+        handle_switch(dir.path(), "kimi", "k3.1-pro", Some(slot), false, false).unwrap();
+        let actual: Value = serde_json::from_slice(&std::fs::read(&slot_path).unwrap()).unwrap();
+        for key in csq_core::session::merge::WINDOW_KEYS
+            .iter()
+            .chain(&["CLAUDE_CODE_SUBAGENT_MODEL"])
+        {
+            assert!(actual["env"].get(*key).is_none(), "{key} invented");
+        }
+    }
+
+    /// Stale-load class, through a real caller: a global `csq models switch`
+    /// that starts while another writer holds the profile's `<file>.lock`,
+    /// and lands a key before releasing it, must apply ON TOP of that write.
+    /// The old `load_settings` (before the lock) + `save_settings` shape read
+    /// the pre-key file and its whole-file write dropped the key.
+    #[cfg(unix)]
+    #[test]
+    fn global_switch_loads_under_the_lock_so_a_concurrent_key_write_survives() {
+        let _env_guard = csq_core::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().to_path_buf();
+        let path = base.join("settings-kimi.json");
+        let original = serde_json::json!({"env": {
+            "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding",
+            "ANTHROPIC_MODEL": "k3.1-pro[1m]"
+        }});
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        let held = csq_core::platform::lock::lock_credential_file(&path.with_extension("lock"))
+            .unwrap()
+            .expect("writer A takes the lock first");
+        let switch = {
+            let base = base.clone();
+            std::thread::spawn(move || {
+                handle_switch(&base, "kimi", "k3.1-pro", None, false, false)
+                    .map_err(|e| e.to_string())
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let mut with_key = original.clone();
+        with_key["env"]["ANTHROPIC_AUTH_TOKEN"] = Value::String("fixture-a".into());
+        std::fs::write(&path, serde_json::to_vec(&with_key).unwrap()).unwrap();
+        drop(held);
+        switch
+            .join()
+            .unwrap()
+            .expect("switch acquires the lock within its budget");
+        let actual: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            actual["env"]["ANTHROPIC_AUTH_TOKEN"], "fixture-a",
+            "key dropped"
+        );
+        assert_eq!(actual["env"]["ANTHROPIC_MODEL"], "k3.1-pro");
+    }
+
+    #[test]
+    fn deepseek_v41_switch_aliases_write_only_selected_private_slot() {
+        let _env_guard = csq_core::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(15u16).unwrap();
+        let config = dir.path().join("config-15");
+        std::fs::create_dir_all(&config).unwrap();
+        // This path exercises the settings writer, not discovery/login. No key
+        // or host account is needed, and no live provider command is spawned.
+        let original = serde_json::json!({
+            "effortLevel": "max",
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+                "ANTHROPIC_MODEL": "deepseek-v4-flash",
+                "CLAUDE_CODE_SUBAGENT_MODEL": "explicit-user-choice",
+                "KEEP_FIXTURE_SETTING": "preserved"
+            }
+        });
+        let path = config.join("settings.json");
+        let other = dir.path().join("settings-deepseek.json");
+        std::fs::write(&other, b"private-global-sentinel").unwrap();
+        for subagent in [
+            "explicit-user-choice",
+            "deepseek-v4-pro",
+            "deepseek-v4-flash",
+        ] {
+            let mut original = original.clone();
+            original["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] = Value::String(subagent.to_string());
+            for query in [
+                "deepseek-flash",
+                "deepseek-flash[1m]",
+                "4.1",
+                "deepseek-v4-flash",
+                "deepseek-v4-flash-vision-exp",
+            ] {
+                std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+                handle_switch(dir.path(), "deepseek", query, Some(slot), false, false).unwrap();
+                let actual: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                let mut expected = original.clone();
+                for key in csq_core::session::merge::MODEL_KEYS {
+                    expected["env"][*key] = Value::String("deepseek-flash[1m]".to_string());
+                }
+                if subagent == "deepseek-v4-flash" {
+                    expected["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] =
+                        Value::String("deepseek-flash[1m]".to_string());
+                }
+                assert_eq!(
+                    actual, expected,
+                    "query {query} must change only model-selector keys"
+                );
+                assert_eq!(std::fs::read(&other).unwrap(), b"private-global-sentinel");
+            }
+        }
+    }
+
+    #[test]
+    fn deepseek_v41_global_switch_preserves_context_annotation_and_effort() {
+        let _env_guard = csq_core::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("settings-deepseek.json");
+        let original = serde_json::json!({
+            "effortLevel": "max",
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+                "ANTHROPIC_MODEL": "deepseek-v4-flash",
+                "CLAUDE_CODE_SUBAGENT_MODEL": "deepseek-v4-flash",
+                "CLAUDE_CODE_EFFORT_LEVEL": "max"
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        handle_switch(dir.path(), "deepseek", "4.1", None, false, false).unwrap();
+        let actual: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut expected = original;
+        for key in csq_core::session::merge::MODEL_KEYS {
+            expected["env"][*key] = Value::String("deepseek-flash[1m]".to_string());
+        }
+        expected["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] =
+            Value::String("deepseek-flash[1m]".to_string());
+        assert_eq!(actual, expected);
+    }
+
+    /// The regression this module was built to fix: `csq models list --json
+    /// grok` used to fail `Error: unknown provider: grok` (rc=1) — `grok` is
+    /// native-only and absent from `catalog::PROVIDERS`. It must now resolve
+    /// and report a default row.
+    #[test]
+    fn json_list_grok_resolves_and_returns_default_entry() {
+        let catalog = ModelCatalog::default_catalog();
+        let entries = list_models_json("grok", &catalog).expect("grok must resolve");
+        assert_eq!(
+            entries.len(),
+            1,
+            "grok has no catalog rows — one default row"
+        );
+        assert_eq!(entries[0].provider_id, "grok");
+        assert_eq!(entries[0].model_id, "grok-4.5");
+        assert!(entries[0].is_default, "grok's row is a synthesized default");
+        assert!(entries[0].context_window.is_none());
+    }
+
+    /// The second regression: `csq models list --json codex` returned a bare
+    /// `[]` (rc=0) with no indication why — `ModelCatalog` has zero Codex
+    /// rows. It must now report the provider's default model instead of an
+    /// empty array.
+    #[test]
+    fn json_list_codex_is_never_a_bare_empty_array() {
+        let catalog = ModelCatalog::default_catalog();
+        let entries = list_models_json("codex", &catalog).expect("codex must resolve");
+        assert!(!entries.is_empty(), "codex must not report a bare []");
+        assert!(
+            entries.iter().all(|e| e.is_default),
+            "every codex row is a synthesized default (no curated catalog rows)"
+        );
+        assert_eq!(entries[0].provider_id, "codex");
+    }
+
+    /// The third regression: `csq models list --json kimi` dropped
+    /// `context_window` / `output_limit` / `aliases` — the old `ModelEntry`
+    /// carried only id/name pairs. Kimi K3's 1,048,576-token window (and its
+    /// `k3` alias) must survive into the JSON row.
+    #[test]
+    fn json_list_kimi_preserves_context_window_output_limit_and_aliases() {
+        let catalog = ModelCatalog::default_catalog();
+        let entries = list_models_json("kimi", &catalog).expect("kimi must resolve");
+        let k3 = entries
+            .iter()
+            .find(|e| e.model_id == "kimi-k3[1m]")
+            .expect("kimi-k3[1m] row present");
+        assert_eq!(k3.context_window, Some(1_048_576));
+        assert_eq!(k3.output_limit, Some(8_192));
+        assert!(k3.aliases.contains(&"k3".to_string()));
+        assert!(
+            !k3.is_default,
+            "a genuine catalog row, not a synthesized default"
+        );
+    }
+
+    /// Every id `registry::known_ids()` reports MUST be listable — asserted
+    /// over the WHOLE set, not a sample (`autonomous-execution.md`
+    /// "sampling" is not this rule, but the spirit applies: a partial check
+    /// would have missed exactly the grok/codex gaps this module fixes).
+    #[test]
+    fn json_list_all_covers_every_known_id() {
+        let catalog = ModelCatalog::default_catalog();
+        // Production still performs live Ollama discovery. This registry
+        // coverage test injects the producer instead of consulting OLLAMA_HOST
+        // or a maintainer's local/remote server.
+        let mut calls = 0;
+        let entries = list_models_json_with_ollama("all", &catalog, || {
+            calls += 1;
+            vec!["synthetic-private-model:latest".to_string()]
+        })
+        .expect("`all` never fails");
+        assert_eq!(calls, 1);
+        assert!(entries
+            .iter()
+            .any(|row| row.provider_id == "ollama"
+                && row.model_id == "synthetic-private-model:latest"));
+        let covered: std::collections::HashSet<&str> =
+            entries.iter().map(|e| e.provider_id.as_str()).collect();
+        for id in registry::known_ids() {
+            assert!(
+                covered.contains(id),
+                "provider `{id}` from registry::known_ids() has no row in `models list --json all`"
+            );
+        }
+    }
+
+    /// An unknown `--json` provider filter must return a typed
+    /// `provider_not_found` error carrying the full known-id set — never a
+    /// bare `anyhow!` string (the pre-fix behavior).
+    #[test]
+    fn json_list_unknown_provider_returns_typed_error_with_known_ids() {
+        let catalog = ModelCatalog::default_catalog();
+        let err =
+            list_models_json("nosuchprovider", &catalog).expect_err("bogus id must not resolve");
+        assert_eq!(err.code, SdkErrorCode::ProviderNotFound);
+        let known = err.known.expect("known ids must be attached");
+        assert!(known.contains(&"grok".to_string()));
+        assert!(known.contains(&"claude".to_string()));
+        assert!(known.contains(&"codex".to_string()));
+    }
+
+    /// Dispatch is keyed off `ProviderDescriptor::kind`, not a per-id string
+    /// chain: EVERY native descriptor (not just grok) reports a
+    /// default-marked row when the bundled catalog has no native entries,
+    /// driven by `kind == ProviderKind::Native`. Runtime rows are tested above.
+    #[test]
+    fn entries_for_dispatches_every_native_descriptor_by_kind_not_id() {
+        let catalog = ModelCatalog::default_catalog();
+        for d in registry::all() {
+            if d.kind != ProviderKind::Native {
+                continue;
+            }
+            let entries = entries_for(&d, &catalog);
+            assert_eq!(
+                entries.len(),
+                1,
+                "{}: native providers report exactly one row",
+                d.id
+            );
+            assert!(
+                entries[0].is_default,
+                "{}: native row is a default row",
+                d.id
+            );
+        }
+    }
+
+    // ── Ollama-specific paths ───────────────────────────────
+
+    #[test]
+    fn switch_ollama_global_accepts_any_model_id() {
+        // Pre-alpha.21, passing a non-catalog model id to the
+        // global ollama profile (e.g. a user-pulled `qwen3:latest`)
+        // failed with "unknown model". Now it must succeed since
+        // the Ollama model space is user-defined.
+        let dir = TempDir::new().unwrap();
+        // `pull_if_missing = false` so the test never calls the
+        // `ollama` binary (may not exist on CI).
+        handle_switch(dir.path(), "ollama", "qwen3:latest", None, false, false).unwrap();
+
+        let path = dir.path().join("settings-ollama.json");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            v.pointer("/env/ANTHROPIC_MODEL").and_then(|x| x.as_str()),
+            Some("qwen3:latest")
+        );
+    }
+
+    #[test]
+    fn switch_ollama_slot_writes_config_dir_not_global() {
+        // Slot-bound ollama: model must land in
+        // `config-N/settings.json`, NOT in the global profile.
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(5u16).unwrap();
+        bind_provider_to_slot(dir.path(), "ollama", slot, None, None).unwrap();
+
+        handle_switch(
+            dir.path(),
+            "ollama",
+            "gpt-oss:20b",
+            Some(slot),
+            false,
+            false,
+        )
+        .unwrap();
+
+        // Slot's settings.json carries the new model across every
+        // MODEL_KEYS entry.
+        let slot_path = dir.path().join("config-5/settings.json");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&slot_path).unwrap()).unwrap();
+        for key in csq_core::session::merge::MODEL_KEYS {
+            assert_eq!(
+                v.pointer(&format!("/env/{}", key)).and_then(|x| x.as_str()),
+                Some("gpt-oss:20b"),
+                "{key} should reflect the switched model"
+            );
+        }
+        // Global profile must NOT have been touched.
+        let global = dir.path().join("settings-ollama.json");
+        assert!(
+            !global.exists(),
+            "slot switch must not touch the global profile"
+        );
+    }
+
+    #[test]
+    fn switch_ollama_slot_errors_when_not_bound() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(9u16).unwrap();
+        let err = handle_switch(dir.path(), "ollama", "gemma4", Some(slot), false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not bound"), "got: {err}");
+    }
+
+    #[test]
+    fn switch_ollama_empty_model_rejected() {
+        let dir = TempDir::new().unwrap();
+        let err = handle_switch(dir.path(), "ollama", "   ", None, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must not be empty"), "got: {err}");
+    }
+
+    // ── Keyed provider paths (catalog still enforced) ───────
+
+    #[test]
+    fn switch_claude_still_uses_catalog() {
+        let dir = TempDir::new().unwrap();
+        handle_switch(dir.path(), "claude", "opus", None, false, false).unwrap();
+
+        let path = dir.path().join("settings.json");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let model = v
+            .pointer("/env/ANTHROPIC_MODEL")
+            .and_then(|x| x.as_str())
+            .unwrap();
+        assert!(model.starts_with("claude-opus-4-"), "got: {model}");
+    }
+
+    /// Asking for the `[1m]` form must write the `[1m]` form: Claude Code
+    /// sizes the window from the suffix (200000 without it, 1000000 with it).
+    /// Falsifying result: `claude-opus-5-5`, which is what the catalog-id
+    /// write produced before `with_context_annotation`.
+    #[test]
+    fn switch_claude_keeps_the_1m_annotation() {
+        let dir = TempDir::new().unwrap();
+        handle_switch(
+            dir.path(),
+            "claude",
+            "claude-opus-5-5[1m]",
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            v.pointer("/env/ANTHROPIC_MODEL").and_then(|x| x.as_str()),
+            Some("claude-opus-5-5[1m]")
+        );
+    }
+
+    #[test]
+    fn context_annotation_is_kept_only_where_the_window_exists() {
+        let one_m = Some(1_000_000);
+        assert_eq!(
+            with_context_annotation("claude", "claude-opus-5-5", "claude-opus-5-5", one_m),
+            "claude-opus-5-5"
+        );
+        // A 200K model never gets a 1M promise, whatever was asked.
+        assert_eq!(
+            with_context_annotation(
+                "claude",
+                "haiku[1m]",
+                "claude-haiku-4-5-20251001",
+                Some(200_000)
+            ),
+            "claude-haiku-4-5-20251001"
+        );
+        // An id carrying the annotation natively is not doubled.
+        assert_eq!(
+            with_context_annotation("zai", "glm-5.3[1m]", "glm-5.3[1m]", one_m),
+            "glm-5.3[1m]"
+        );
+        assert_eq!(
+            with_context_annotation("claude", "opus[1M]", "claude-opus-4-8", one_m),
+            "claude-opus-4-8[1m]"
+        );
+    }
+
+    #[test]
+    fn switch_claude_rejects_unknown_model() {
+        let dir = TempDir::new().unwrap();
+        let err = handle_switch(
+            dir.path(),
+            "claude",
+            "nonexistent-model",
+            None,
+            false,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown model"), "got: {err}");
+    }
+
+    // ── model_is_installed (bare-name vs tagged match) ──────
+
+    #[test]
+    fn model_is_installed_exact_match() {
+        let installed = vec!["gemma4:latest".to_string(), "llama3:8b".to_string()];
+        assert!(model_is_installed("gemma4:latest", &installed));
+        assert!(model_is_installed("llama3:8b", &installed));
+    }
+
+    #[test]
+    fn model_is_installed_bare_name_matches_latest_tag() {
+        // User types `gemma4` — should match installed `gemma4:latest`.
+        let installed = vec!["gemma4:latest".to_string()];
+        assert!(model_is_installed("gemma4", &installed));
+    }
+
+    #[test]
+    fn model_is_installed_bare_name_matches_any_tag() {
+        // `gemma4:4b` installed, user asks for `gemma4` (bare).
+        // Bare-name match accepts any tag of the same family.
+        let installed = vec!["gemma4:4b".to_string()];
+        assert!(model_is_installed("gemma4", &installed));
+    }
+
+    #[test]
+    fn model_is_installed_tagged_query_requires_exact_match() {
+        // H3 regression: user asks for `gemma4:13b` but only
+        // `gemma4:4b` is installed. Must NOT treat as present —
+        // different weights, CC would fail at inference.
+        let installed = vec!["gemma4:4b".to_string()];
+        assert!(!model_is_installed("gemma4:13b", &installed));
+    }
+
+    #[test]
+    fn model_is_installed_no_match_when_family_missing() {
+        let installed = vec!["llama3:8b".to_string()];
+        assert!(!model_is_installed("gemma4", &installed));
+        assert!(!model_is_installed("gemma4:latest", &installed));
+    }
+
+    #[test]
+    fn model_is_installed_empty_list() {
+        let installed: Vec<String> = Vec::new();
+        assert!(!model_is_installed("anything", &installed));
+    }
+
+    #[test]
+    fn switch_keyed_slot_retargets_config_dir() {
+        // MM slot switch — same slot semantics as Ollama slot
+        // switch, but the catalog lookup still fires because
+        // MM's model space is curated.
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(7u16).unwrap();
+        bind_provider_to_slot(dir.path(), "mm", slot, Some("sk-test-minimax-12345"), None).unwrap();
+
+        handle_switch(dir.path(), "mm", "m3", Some(slot), false, false).unwrap();
+
+        let slot_path = dir.path().join("config-7/settings.json");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&slot_path).unwrap()).unwrap();
+        let model = v
+            .pointer("/env/ANTHROPIC_MODEL")
+            .and_then(|x| x.as_str())
+            .unwrap();
+        assert!(
+            model.contains("MiniMax"),
+            "alias `m3` should resolve to the catalog's MiniMax id, got: {model}"
+        );
+    }
+
+    // ── PR-C7 Codex TomlModelKey dispatch ──────────────────
+
+    #[test]
+    fn switch_codex_default_model_writes_config_toml_on_slot() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(4u16).unwrap();
+        std::fs::create_dir_all(dir.path().join(format!("config-{slot}"))).unwrap();
+        let default = csq_core::providers::get_provider("codex")
+            .unwrap()
+            .default_model;
+        handle_switch(dir.path(), "codex", default, Some(slot), false, false).unwrap();
+
+        let toml =
+            std::fs::read_to_string(dir.path().join(format!("config-{slot}/config.toml"))).unwrap();
+        assert!(
+            toml.contains(&format!("model = \"{default}\"")),
+            "expected model line for {default}, got: {toml}"
+        );
+        assert!(
+            toml.contains("cli_auth_credentials_store = \"file\""),
+            "expected cli_auth_credentials_store directive, got: {toml}"
+        );
+    }
+
+    #[test]
+    fn switch_codex_arbitrary_model_requires_force() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(5u16).unwrap();
+        std::fs::create_dir_all(dir.path().join(format!("config-{slot}"))).unwrap();
+
+        let err = handle_switch(
+            dir.path(),
+            "codex",
+            "gpt-5-turbo-ultra-plus",
+            Some(slot),
+            false,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--force"), "got: {err}");
+        assert!(err.contains("uncached"), "got: {err}");
+    }
+
+    #[test]
+    fn switch_codex_arbitrary_model_accepted_with_force() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(6u16).unwrap();
+        std::fs::create_dir_all(dir.path().join(format!("config-{slot}"))).unwrap();
+
+        handle_switch(
+            dir.path(),
+            "codex",
+            "gpt-5-turbo-ultra-plus",
+            Some(slot),
+            false,
+            true,
+        )
+        .unwrap();
+
+        let toml =
+            std::fs::read_to_string(dir.path().join(format!("config-{slot}/config.toml"))).unwrap();
+        assert!(
+            toml.contains("model = \"gpt-5-turbo-ultra-plus\""),
+            "got: {toml}"
+        );
+    }
+
+    #[test]
+    fn switch_codex_requires_slot() {
+        let dir = TempDir::new().unwrap();
+        let default = csq_core::providers::get_provider("codex")
+            .unwrap()
+            .default_model;
+        let err = handle_switch(dir.path(), "codex", default, None, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--slot is required"), "got: {err}");
+    }
+
+    #[test]
+    fn switch_codex_empty_model_rejected() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(8u16).unwrap();
+        std::fs::create_dir_all(dir.path().join(format!("config-{slot}"))).unwrap();
+        let err = handle_switch(dir.path(), "codex", "   ", Some(slot), false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn switch_codex_rewrite_preserves_auth_store_directive() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(9u16).unwrap();
+        std::fs::create_dir_all(dir.path().join(format!("config-{slot}"))).unwrap();
+
+        let default = csq_core::providers::get_provider("codex")
+            .unwrap()
+            .default_model;
+        handle_switch(dir.path(), "codex", default, Some(slot), false, false).unwrap();
+        handle_switch(
+            dir.path(),
+            "codex",
+            "gpt-6-preview",
+            Some(slot),
+            false,
+            true,
+        )
+        .unwrap();
+
+        let toml =
+            std::fs::read_to_string(dir.path().join(format!("config-{slot}/config.toml"))).unwrap();
+        assert!(
+            toml.contains("cli_auth_credentials_store = \"file\""),
+            "got: {toml}"
+        );
+        assert!(toml.contains("model = \"gpt-6-preview\""), "got: {toml}");
+    }
+
+    // ── Gemini paths (PR-G4b — FR-G-CLI-04) ───────────────
+
+    /// Provisions a fresh Gemini binding marker so the model-switch
+    /// path has something to update. Mirrors what
+    /// `csq setkey gemini --slot N` writes (vault entry omitted —
+    /// the writer never touches the vault).
+    fn provision_gemini_marker(base: &std::path::Path, slot: u16, model: &str) {
+        use csq_core::providers::gemini::provisioning::{write_binding, AuthMode, GeminiBinding};
+        let n = AccountNum::try_from(slot).unwrap();
+        let binding = GeminiBinding::new(AuthMode::ApiKey, model);
+        write_binding(base, n, &binding).unwrap();
+    }
+
+    fn read_gemini_model(base: &std::path::Path, slot: u16) -> String {
+        use csq_core::providers::gemini::provisioning::read_binding;
+        let n = AccountNum::try_from(slot).unwrap();
+        read_binding(base, n).unwrap().model_name
+    }
+
+    /// Switching by alias (`pro`) writes `gemini-2.5-pro` into
+    /// the binding marker. Atomic write — verifies the next read
+    /// observes the change in full.
+    #[test]
+    fn switch_gemini_alias_pro_writes_canonical_id_to_marker() {
+        let dir = TempDir::new().unwrap();
+        provision_gemini_marker(dir.path(), 4, "auto");
+        handle_switch(
+            dir.path(),
+            "gemini",
+            "pro",
+            Some(AccountNum::try_from(4u16).unwrap()),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(read_gemini_model(dir.path(), 4), "gemini-2.5-pro");
+    }
+
+    /// `[1m]` is Claude Code's annotation. A Gemini slot asked for
+    /// `gemini-2.5-pro[1m]` must still write the vendor id, or gemini-cli
+    /// sends the suffixed id to Google. Falsifying result: `gemini-2.5-pro[1m]`.
+    #[test]
+    fn switch_gemini_never_writes_the_1m_annotation() {
+        let dir = TempDir::new().unwrap();
+        provision_gemini_marker(dir.path(), 4, "auto");
+        handle_switch(
+            dir.path(),
+            "gemini",
+            "gemini-2.5-pro[1m]",
+            Some(AccountNum::try_from(4u16).unwrap()),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(read_gemini_model(dir.path(), 4), "gemini-2.5-pro");
+    }
+
+    /// `auto` is intentionally NOT in the catalog (it tells gemini-cli
+    /// to pick rather than pinning). The model-switch path must accept
+    /// it as a literal AND write it verbatim to the binding.
+    #[test]
+    fn switch_gemini_auto_writes_literal_auto_to_marker() {
+        let dir = TempDir::new().unwrap();
+        provision_gemini_marker(dir.path(), 4, "gemini-2.5-pro");
+        handle_switch(
+            dir.path(),
+            "gemini",
+            "auto",
+            Some(AccountNum::try_from(4u16).unwrap()),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(read_gemini_model(dir.path(), 4), "auto");
+    }
+
+    /// Concrete `gemini-2.5-flash-lite` round-trips through the
+    /// catalog and lands in the marker unchanged.
+    #[test]
+    fn switch_gemini_concrete_flash_lite_writes_to_marker() {
+        let dir = TempDir::new().unwrap();
+        provision_gemini_marker(dir.path(), 7, "auto");
+        handle_switch(
+            dir.path(),
+            "gemini",
+            "gemini-2.5-flash-lite",
+            Some(AccountNum::try_from(7u16).unwrap()),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(read_gemini_model(dir.path(), 7), "gemini-2.5-flash-lite");
+    }
+
+    /// Preview-tier id (`gemini-3-pro-preview`) is accepted; the CLI
+    /// surface emits a stderr warning, but the binding marker still
+    /// records the request verbatim.
+    #[test]
+    fn switch_gemini_preview_model_accepted_and_recorded() {
+        let dir = TempDir::new().unwrap();
+        provision_gemini_marker(dir.path(), 8, "auto");
+        handle_switch(
+            dir.path(),
+            "gemini",
+            "3-pro-preview",
+            Some(AccountNum::try_from(8u16).unwrap()),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(read_gemini_model(dir.path(), 8), "gemini-3-pro-preview");
+    }
+
+    /// Unknown model id is refused with a `did you mean` suggestion
+    /// (catalog-driven via the existing `suggest` helper).
+    #[test]
+    fn switch_gemini_unknown_model_rejected() {
+        let dir = TempDir::new().unwrap();
+        provision_gemini_marker(dir.path(), 4, "auto");
+        let err = handle_switch(
+            dir.path(),
+            "gemini",
+            "gemini-9000-overdrive",
+            Some(AccountNum::try_from(4u16).unwrap()),
+            false,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown model"), "got: {err}");
+    }
+
+    /// `--slot` is mandatory for Gemini — no global Gemini profile
+    /// exists. Refuse with an actionable error.
+    #[test]
+    fn switch_gemini_without_slot_refused() {
+        let dir = TempDir::new().unwrap();
+        let err = handle_switch(dir.path(), "gemini", "pro", None, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--slot is required"), "got: {err}");
+    }
+
+    /// Slot with no Gemini binding marker refuses cleanly — points
+    /// the user at `csq setkey gemini --slot N` instead of writing
+    /// a half-bound state.
+    #[test]
+    fn switch_gemini_unprovisioned_slot_refused() {
+        let dir = TempDir::new().unwrap();
+        let err = handle_switch(
+            dir.path(),
+            "gemini",
+            "pro",
+            Some(AccountNum::try_from(9u16).unwrap()),
+            false,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("csq setkey gemini --slot 9"), "got: {err}");
+    }
+
+    /// FR-G-CLI-04: marker write is atomic. Concrete check — the
+    /// existing marker survives if the writer ever crashed mid-
+    /// rename. Simulates the post-condition: the marker file always
+    /// has 0o600 permissions and contains the new model.
+    #[cfg(unix)]
+    #[test]
+    fn switch_gemini_marker_remains_0o600_after_update() {
+        use csq_core::providers::gemini::provisioning::binding_path;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        provision_gemini_marker(dir.path(), 4, "auto");
+        handle_switch(
+            dir.path(),
+            "gemini",
+            "flash",
+            Some(AccountNum::try_from(4u16).unwrap()),
+            false,
+            false,
+        )
+        .unwrap();
+        let path = binding_path(dir.path(), AccountNum::try_from(4u16).unwrap());
+        let perms = std::fs::metadata(&path).unwrap().permissions();
+        assert_eq!(
+            perms.mode() & 0o777,
+            0o600,
+            "marker must stay 0o600 after model switch"
+        );
+    }
+
+    // ── §5a regression helper (inline; csq-cli cannot reach pub(crate)) ──
+    //
+    // Mirrors `csq_core::platform::fs::assert_no_tmp_leak_on_readonly_parent`.
+    // Origin: security.md §5a, an internal journal entry B2, /redteam round 3 (2026-05-09).
+    #[cfg(unix)]
+    fn assert_no_tmp_leak_on_readonly_parent_inline<F, E>(dir: &std::path::Path, op: F)
+    where
+        F: FnOnce() -> Result<(), E>,
+        E: std::fmt::Debug,
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = op();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            result.is_err(),
+            "op must fail under read-only parent; got Ok"
+        );
+        let leaked: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|n| n.contains(".tmp."))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(leaked.is_empty(), "§5a leaked tmp files: {leaked:?}");
+    }
+
+    /// §5a regression — site 9 (security.md MUST Rule 5a, an internal journal entry B2,
+    /// /redteam round 3 2026-05-09): when `write_slot_model` fails after
+    /// the tmp file would have been created (settings dir read-only →
+    /// write fails), no `.tmp.` file must remain.
+    ///
+    /// The slot's settings.json may carry an ANTHROPIC_AUTH_TOKEN;
+    /// partial-failure must not leave it at umask 0o644.
+    #[cfg(unix)]
+    #[test]
+    fn write_slot_model_partial_failure_cleans_tmp_file() {
+        // Arrange: bind an Ollama slot so config-N/settings.json exists
+        // with the required `env` object.
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(3u16).unwrap();
+        bind_provider_to_slot(dir.path(), "ollama", slot, None, None).unwrap();
+
+        // Confirm the happy path works.
+        write_slot_model(dir.path(), slot, "llama3.2:latest").unwrap();
+
+        // Act + Assert: read-only config dir → write fails → no tmp leak.
+        let config_dir = dir.path().join(format!("config-{}", slot));
+        assert_no_tmp_leak_on_readonly_parent_inline(&config_dir, || {
+            write_slot_model(dir.path(), slot, "llama3.2:latest")
+        });
+    }
+
+    // ── M2-7 Phase 2 reader routing ────────────────────────────────────────
+
+    /// M2-7 (Phase 2 READER routing): when `identities/<UUID>/settings.json`
+    /// is present for a slot, `write_slot_model` MUST read from and write to
+    /// the UUID-canonical path — not the legacy `config-N/settings.json`.
+    ///
+    /// Pins the Phase 2 reader-switchover contract: the UUID path is the
+    /// authoritative settings location once Phase 2 materialization runs.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[test]
+    fn models_command_resolves_settings_from_uuid_when_present() {
+        use csq_core::accounts::identity_store::settings_path_for;
+        use csq_core::credentials::write_uuid_settings;
+        use csq_core::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+
+        // Arrange: use coexisting_fixture to set up both the legacy config-N/ and
+        // the identities/<UUID>/ layouts with consistent profiles.json mapping.
+        // Slot 4 is the one under test; coexisting_fixture(4) creates slots 1–4.
+        let slot_num: u16 = 4;
+        let slot = AccountNum::try_from(slot_num).unwrap();
+        let dir = coexisting_fixture(slot_num);
+        let base = dir.path();
+        let uuid = fixture_uuid_for_slot(slot_num);
+
+        // Write legacy config-N/settings.json with a sentinel "legacy-model" value
+        // so we can verify it is NOT overwritten when the UUID path is present.
+        let legacy_settings_path = base
+            .join(format!("config-{slot_num}"))
+            .join("settings.json");
+        std::fs::write(
+            &legacy_settings_path,
+            r#"{"env":{"ANTHROPIC_MODEL":"legacy-model","CLAUDE_MODEL":"legacy-model"}}"#,
+        )
+        .unwrap();
+
+        // Write identities/<UUID>/settings.json with a sentinel "uuid-model" value.
+        // This is the Phase 2 canonical path that write_slot_model must use.
+        let uuid_settings_path = settings_path_for(base, uuid);
+        write_uuid_settings(
+            base,
+            uuid,
+            br#"{"env":{"ANTHROPIC_MODEL":"uuid-model","CLAUDE_MODEL":"uuid-model"}}"#,
+        )
+        .unwrap();
+
+        // Act: switch model via write_slot_model (the CLI chokepoint).
+        write_slot_model(base, slot, "switched-model").unwrap();
+
+        // Assert: UUID settings.json has the new model (routing went through UUID path).
+        let uuid_content = std::fs::read_to_string(&uuid_settings_path).unwrap();
+        let uuid_val: Value = serde_json::from_str(&uuid_content).unwrap();
+        for key in csq_core::session::merge::MODEL_KEYS {
+            assert_eq!(
+                uuid_val
+                    .pointer(&format!("/env/{key}"))
+                    .and_then(|x| x.as_str()),
+                Some("switched-model"),
+                "UUID settings.json must have the switched model for {key}"
+            );
+        }
+
+        // Assert: legacy settings.json is NOT updated (routing sourced from UUID).
+        let legacy_content = std::fs::read_to_string(&legacy_settings_path).unwrap();
+        let legacy_val: Value = serde_json::from_str(&legacy_content).unwrap();
+        assert_eq!(
+            legacy_val
+                .pointer("/env/ANTHROPIC_MODEL")
+                .and_then(|x| x.as_str()),
+            Some("legacy-model"),
+            "legacy config-N/settings.json must NOT be updated when UUID path is present"
+        );
+    }
+}

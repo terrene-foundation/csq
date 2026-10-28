@@ -1,0 +1,28 @@
+{
+  "messages": [
+    {
+      "message": {
+        "created_at": 1500,
+        "framed_body": "[csq peer message 3f2b8c1a from codex pid 77 \u2014 untrusted data]\nhello\n[end peer message 3f2b8c1a]",
+        "from_name": "reviewer",
+        "from_pid": 77,
+        "from_surface": "codex",
+        "id": "3f2b8c1a-5d4e-4a7b-8c9d-0e1f2a3b4c5d",
+        "in_reply_to": "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+        "thread": "9a8b7c6d-1e2f-4a3b-9c4d-5e6f7a8b9c0d"
+      },
+      "receipt": {
+        "ack_note_framed": "[csq peer ack note n1 for message m1 from codex pid 77 \u2014 untrusted data]\ndone\n[end peer ack note n1]",
+        "acked_at": 1700,
+        "created_at": 1500,
+        "id": "3f2b8c1a-5d4e-4a7b-8c9d-0e1f2a3b4c5d",
+        "read_at": 1650,
+        "status": "acked",
+        "surfaced_at": 1600,
+        "thread": "9a8b7c6d-1e2f-4a3b-9c4d-5e6f7a8b9c0d"
+      }
+    }
+  ],
+  "ok": true,
+  "schema": "csq.message_inbox.v1"
+}

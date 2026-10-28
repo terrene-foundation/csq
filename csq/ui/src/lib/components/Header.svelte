@@ -1,0 +1,229 @@
+<script lang="ts">
+  import { invoke } from '@tauri-apps/api/core';
+  import { getVersion } from '@tauri-apps/api/app';
+  import { homeDir, join } from '@tauri-apps/api/path';
+  import SettingsPopover from './SettingsPopover.svelte';
+
+  interface KeychainOrphansView {
+    level: 'ok' | 'info' | 'warn' | 'needs_action';
+    summary: string;
+  }
+
+  interface DaemonStatusView {
+    running: boolean;
+    pid: number | null;
+    keychain_orphans?: KeychainOrphansView;
+  }
+
+  let daemonRunning = $state(false);
+  // The keychain orphan sweep's state (same accessor as `csq status`/`csq doctor`).
+  // Only a warning or an action-needed state is surfaced in the header.
+  let orphans = $state<KeychainOrphansView | null>(null);
+  let appVersion = $state<string | null>(null);
+  // Build edition: 'community' | 'enterprise' (from the compile-time
+  // crate::BUILD_EDITION const). null until loaded — guard the badge with
+  // {#if} so a failed/pending fetch renders nothing rather than a wrong label.
+  let edition = $state<string | null>(null);
+
+  $effect(() => {
+    let active = true;
+    let statusInFlight = false;
+
+    async function fetchEdition() {
+      try {
+        const next = await invoke<string>('get_build_edition');
+        if (active) edition = next;
+      } catch {
+        if (active) edition = null;
+      }
+    }
+
+    async function fetchDaemonStatus() {
+      // A slow read must not accumulate another request every poll tick.
+      if (!active || statusInFlight) return;
+      statusInFlight = true;
+      try {
+        // Use `join` so the platform's path separator is honored.
+        // Tauri 2.10's `homeDir()` returns a path without a trailing
+        // separator, so naive concatenation produces an invalid path
+        // like `/Users/example.claude/accounts` (path-joining regression).
+        const home = await homeDir();
+        if (!active) return;
+        const baseDir = await join(home, '.claude', 'accounts');
+        if (!active) return;
+        const status = await invoke<DaemonStatusView>('get_daemon_status', { baseDir });
+        if (active) {
+          daemonRunning = status.running;
+          orphans = status.keychain_orphans ?? null;
+        }
+      } catch {
+        if (active) {
+          daemonRunning = false;
+          orphans = null;
+        }
+      } finally {
+        statusInFlight = false;
+      }
+    }
+
+    async function fetchVersion() {
+      try {
+        const next = await getVersion();
+        if (active) appVersion = next;
+      } catch {
+        // Version lookup should never fail — but if it does, hide
+        // the span rather than show misleading text (the version-display regression:
+        // alpha.21 shipped with a literal that drifted).
+        if (active) appVersion = null;
+      }
+    }
+
+    void fetchDaemonStatus();
+    void fetchVersion();
+    void fetchEdition();
+    const interval = setInterval(() => void fetchDaemonStatus(), 10000);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  });
+</script>
+
+<header>
+  <div class="left">
+    <h1>Code Squad Q</h1>
+    {#if appVersion}<span class="version">v{appVersion}</span>{/if}
+    {#if edition}
+      <span
+        class="edition"
+        class:enterprise={edition === 'enterprise'}
+        title={edition === 'enterprise'
+          ? 'Enterprise edition (csq-ee)'
+          : 'Community edition (csq)'}
+      >
+        {edition === 'enterprise' ? 'Enterprise' : 'Community'}
+      </span>
+    {/if}
+  </div>
+  <div class="right">
+    <div
+      class="status"
+      title={daemonRunning ? 'Daemon running' : 'Daemon stopped'}
+      aria-label={daemonRunning ? 'Daemon running' : 'Daemon stopped'}
+    >
+      <span class="dot" class:running={daemonRunning}></span>
+      <span class="status-label">{daemonRunning ? 'Running' : 'Stopped'}</span>
+    </div>
+    {#if orphans && (orphans.level === 'warn' || orphans.level === 'needs_action')}
+      <span
+        class="orphans"
+        class:needs-action={orphans.level === 'needs_action'}
+        title={orphans.summary}
+        aria-label={orphans.summary}
+        data-testid="keychain-orphans"
+      >
+        {orphans.level === 'needs_action' ? 'Keychain: action needed' : 'Keychain: orphans'}
+      </span>
+    {/if}
+    <SettingsPopover {daemonRunning} />
+  </div>
+</header>
+
+<style>
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.6rem 1rem;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    /* Single row, never wrap — the prior layout packed five elements into
+       this row and wrapped on narrow widths (the user's reported "squeezy"
+       title). Toggles now live in the SettingsPopover. */
+    flex-wrap: nowrap;
+    gap: 1rem;
+    min-height: 2.5rem;
+    -webkit-app-region: drag;
+  }
+  .left {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    flex-shrink: 0;
+    min-width: 0;
+    white-space: nowrap;
+  }
+  h1 {
+    font-size: 0.9rem;
+    font-weight: 600;
+    margin: 0;
+    white-space: nowrap;
+  }
+  .version {
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    white-space: nowrap;
+  }
+
+  /* Edition badge. Community is subtle (neutral chip); enterprise is
+     prominent (accent) so the distinction is unmistakable at a glance. */
+  .edition {
+    font-size: 0.66rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    padding: 0.1rem 0.4rem;
+    border-radius: 999px;
+    white-space: nowrap;
+    color: var(--text-secondary);
+    background: var(--surface-2, rgba(127, 127, 127, 0.15));
+    border: 1px solid var(--border, rgba(127, 127, 127, 0.25));
+  }
+
+  .edition.enterprise {
+    /* F3 (i-audit/i-harden) — white-on-accent measured 2.21:1 in the
+       default dark theme (AA needs 4.5:1). var(--bg-primary) flips per
+       theme (#1A1918 dark / #FFFFFF light) and clears AA on both:
+       dark 7.93:1, light 6.20:1. See app.css for the full rationale. */
+    color: var(--bg-primary, #1a1918);
+    background: var(--accent, #6366f1);
+    border-color: var(--accent, #6366f1);
+  }
+  .right {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-shrink: 0;
+    -webkit-app-region: no-drag;
+  }
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    white-space: nowrap;
+  }
+  .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--red);
+    flex-shrink: 0;
+  }
+  .dot.running {
+    background: var(--green);
+  }
+  .status-label {
+    white-space: nowrap;
+  }
+  .orphans {
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    white-space: nowrap;
+  }
+  .orphans.needs-action {
+    color: var(--red);
+    font-weight: 600;
+  }
+</style>

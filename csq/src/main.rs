@@ -1,0 +1,168 @@
+//! csq — single-binary dispatcher.
+//!
+//! Detects the runtime mode (CLI vs desktop) and routes to the appropriate
+//! entry point. Mode detection logic lives in `mode.rs`. Mode bodies live in
+//! `cli/` and `desktop/`, both gated by Cargo features so a `--features cli`
+//! release strips Tauri/WebView entirely (and vice versa).
+
+#![cfg_attr(
+    all(feature = "desktop", not(any(feature = "cli", debug_assertions))),
+    windows_subsystem = "windows"
+)]
+
+mod mode;
+
+/// #1a-2 (daemon-auth-resilience Wave A2) — the daemon's persistent rolling
+/// file log, wired into whichever surface hosts a daemon (CLI foreground /
+/// background `csq daemon start`, or the desktop in-process supervisor).
+/// See `csq_core::daemon::log_gc` for the paired 14-day GC. Gated on
+/// `any(cli, desktop)` — those are the only two surfaces that ever host a
+/// daemon and reference this module.
+#[cfg(any(feature = "cli", feature = "desktop"))]
+mod daemon_log;
+
+#[cfg(any(feature = "cli", feature = "desktop"))]
+mod daemon_host;
+
+#[cfg(any(feature = "cli", feature = "desktop"))]
+mod login_child_custody;
+
+#[cfg(feature = "cli")]
+mod login_cancel_guard;
+
+#[cfg(feature = "cli")]
+mod cli;
+
+#[cfg(feature = "desktop")]
+mod desktop;
+
+/// The edition this binary was BUILT as — a compile-time, unspoofable const
+/// driven by the `enterprise` Cargo feature. This is the "which edition did I
+/// install" signal, surfaced in `csq --version`, `csq doctor`, and the desktop
+/// header badge. It is DISTINCT from the runtime audit dialect selected by
+/// `CSQ_AUDIT_EDITION` (`csq_core::audit::multi_sig::Edition`): that env var
+/// picks the 4-level vs 6-level audit grammar at run time, whereas this reflects
+/// what was actually compiled. Names per `rules/terrene-naming.md`: community =
+/// `csq`, enterprise = `csq-ee`; the invoked command stays `csq` for both.
+/// Defined at the crate root (not under the feature-gated `cli`/`desktop`
+/// modules) so either compiled surface can read it; omitted when neither is built.
+#[cfg(all(any(feature = "cli", feature = "desktop"), feature = "enterprise"))]
+pub(crate) const BUILD_EDITION: &str = "enterprise";
+#[cfg(all(any(feature = "cli", feature = "desktop"), not(feature = "enterprise")))]
+pub(crate) const BUILD_EDITION: &str = "community";
+
+/// Human-readable edition label, e.g. `Enterprise (csq-ee)` / `Community (csq)`.
+#[cfg(feature = "cli")]
+pub(crate) fn edition_label() -> &'static str {
+    match BUILD_EDITION {
+        "enterprise" => "Enterprise (csq-ee)",
+        _ => "Community (csq)",
+    }
+}
+
+/// `--version` string carrying the edition suffix, e.g. `2.16.2 (community)`.
+/// `concat!(env!(...), ...)` resolves at compile time to a single `&'static str`.
+#[cfg(all(any(feature = "cli", feature = "desktop"), feature = "enterprise"))]
+pub(crate) const VERSION_LINE: &str = concat!(env!("CARGO_PKG_VERSION"), " (enterprise)");
+#[cfg(all(any(feature = "cli", feature = "desktop"), not(feature = "enterprise")))]
+pub(crate) const VERSION_LINE: &str = concat!(env!("CARGO_PKG_VERSION"), " (community)");
+
+fn main() {
+    // S2 admission must precede self-test, mode detection and every early CLI route.
+    #[cfg(windows)]
+    let _installer_admission = match csq_core::update::installer_admission::windows::enter_process()
+    {
+        Ok(registration) => registration,
+        Err(error) => {
+            // Admission runs before tracing initialization. Emit only the
+            // classifier's fixed vocabulary, never the error chain or paths.
+            eprintln!(
+                "csq: installer admission refused; error_kind={}",
+                csq_core::update::installer_admission::windows::classify(&error)
+            );
+            eprintln!("csq: installation in progress or admission unavailable; retry after the installer exits");
+            std::process::exit(2);
+        }
+    };
+
+    // an internal ticket headless self-test short-circuit. The self-test lives at the top of
+    // `desktop::run()`, but `mode::detect()` only resolves `Desktop` from the
+    // `.app` bundle sentinel / `--desktop` — so `--self-test` on a raw binary
+    // would otherwise route to CLI and never reach it. Route to `desktop::run()`
+    // directly whenever the self-test is requested, so the flag reliably works on
+    // every desktop-feature build (the bundled binary AND a plain `cargo build`).
+    #[cfg(feature = "desktop")]
+    {
+        // `--self-test` is honored ONLY as the sole argument (not `.any(argv)`,
+        // which would misfire if a future flag or a `csq://` deep-link argv merely
+        // contained the token — R1 LOW-1). The env path stays precise.
+        let argv: Vec<String> = std::env::args().collect();
+        if std::env::var("CSQ_DESKTOP_SELFTEST").as_deref() == Ok("1")
+            || (argv.len() == 2 && argv[1] == "--self-test")
+        {
+            desktop::run(); // runs the self-test block at its top, then exits
+            return;
+        }
+    }
+
+    match mode::detect() {
+        mode::Mode::Cli => {
+            #[cfg(feature = "cli")]
+            {
+                // clap builds and renders the ENTIRE subcommand tree recursively on
+                // any parse (including `--help`). csq's tree is large; on Windows the
+                // default 1 MiB main-thread stack overflows during that recursion
+                // (`STATUS_STACK_OVERFLOW` on e.g. `csq run --help` — surfaced by
+                // an internal ticket adding roster subcommands), while macOS/Linux (8 MiB
+                // default) are fine. Run the CLI on a thread with a generous stack —
+                // the canonical remedy (rustc/cargo do the same). Applies on every
+                // platform for uniform headroom; the join propagates the exit code.
+                let code = std::thread::Builder::new()
+                    .name("csq-cli".into())
+                    .stack_size(32 * 1024 * 1024)
+                    .spawn(|| match cli::run() {
+                        Ok(()) => 0,
+                        Err(e) => {
+                            // L3: `{e:?}` renders anyhow's FULL causal chain —
+                            // every `.context()` layer plus the root cause —
+                            // which can embed a raw absolute path from deep
+                            // inside csq-core (e.g. `CredentialError::RepointFailed`'s
+                            // `{path}`, `CredentialError::Io`'s `{path}`, or a
+                            // `PlatformError::LockContention`/`LockTimeout`
+                            // folded into an `io::Error::other(other.to_string())`
+                            // by `session::handle_dir::commit_prepared_handle_settings`).
+                            // Redacting the operator's `$HOME` prefix at THIS
+                            // single chokepoint — every CLI command's error
+                            // exit, not just `csq swap`'s — is simpler and
+                            // more complete than hunting down every nested
+                            // `Display` impl that might embed a path.
+                            eprintln!("Error: {}", cli::render_error_for_terminal(&e));
+                            login_cancel_guard::cli_error_exit_code(&e)
+                        }
+                    })
+                    .expect("failed to spawn csq-cli worker thread")
+                    .join()
+                    .unwrap_or(101); // panic hook already printed the message
+                std::process::exit(code);
+            }
+            #[cfg(not(feature = "cli"))]
+            {
+                eprintln!(
+                    "csq: CLI mode requested but this binary was built without --features cli"
+                );
+                std::process::exit(2);
+            }
+        }
+        mode::Mode::Desktop => {
+            #[cfg(feature = "desktop")]
+            desktop::run();
+            #[cfg(not(feature = "desktop"))]
+            {
+                eprintln!(
+                    "csq: desktop mode requested but this binary was built without --features desktop"
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+}

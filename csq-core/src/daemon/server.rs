@@ -1,0 +1,7241 @@
+//! Unix socket IPC server for the daemon.
+//!
+//! Serves a minimal axum HTTP/1.1 router over a Unix domain socket.
+//! M8.3 only wires the `GET /api/health` route — additional routes
+//! (accounts, usage, refresh, OAuth callback) land in M8.4+.
+//!
+//! # Platform scope
+//!
+//! The Unix-socket bind/accept loop in this module is `cfg(unix)`; the
+//! router, `RouterState`, and handlers are cross-platform and shared with
+//! the Windows named-pipe listener (`server_windows.rs`), which is wired
+//! end to end as of an internal ticket.
+//!
+//! # Security model
+//!
+//! Three defensive layers protect the IPC surface. Any single layer
+//! breaking should not expose the daemon; together they match the
+//! hardening baseline sshd and systemd use for local sockets.
+//!
+//! ## Layer 1 — socket file permissions (0o600)
+//!
+//! The socket file is created with `0o600` permissions. To close the
+//! microsecond window between `bind(2)` and `chmod(2)` during which
+//! the socket would otherwise inherit the process umask (typically
+//! 0o644 or 0o755), [`serve`] temporarily sets the thread's umask to
+//! `0o077` immediately before bind and restores it immediately after.
+//! The explicit `set_permissions(0o600)` call remains as
+//! defense-in-depth.
+//!
+//! ## Layer 2 — `SO_PEERCRED` / `LOCAL_PEERCRED` peer UID check
+//!
+//! Every accepted connection is checked against `geteuid()` before
+//! the HTTP router sees the request. Linux uses `SO_PEERCRED` to
+//! read `struct ucred.uid`; macOS uses `LOCAL_PEERCRED` to read
+//! `struct xucred.cr_uid`. Connections from other UIDs are closed
+//! immediately with no HTTP response. This catches the case where
+//! a file-permission bug (incorrect chmod, symlink swap, race) lets
+//! a different-UID process connect.
+//!
+//! ## Layer 3 — per-user socket directory
+//!
+//! The socket path itself lives under a per-user directory:
+//! `$XDG_RUNTIME_DIR` on Linux (tmpfs, 0o700), `~/.claude/accounts`
+//! on macOS (0o755 but inside the user's HOME), or
+//! `/tmp/csq-{uid}.sock` as the Linux fallback (uid in the name so
+//! different-UID collisions are harmless).
+//!
+//! ## HTTP request authentication
+//!
+//! There is no application-layer authentication on the HTTP
+//! requests because the three layers above establish that any
+//! caller is the owning user. Anyone who can open the socket is
+//! already the same UID, which is exactly the threat model for a
+//! per-user daemon.
+
+// This module is shared by both the Unix-socket listener (cfg(unix))
+// and the Windows named-pipe listener (cfg(windows) — see
+// `server_windows.rs`). The router definition, RouterState, request
+// handlers, and request/response types are cross-platform. Only the
+// Unix-specific bind/accept loop and SO_PEERCRED helpers are gated
+// behind `#[cfg(unix)]` further down.
+
+use super::cache::TtlCache;
+use super::refresher::RefreshStatus;
+use super::usage_poller::gemini::GeminiConsumerState;
+use crate::accounts::{discovery, AccountInfo};
+use crate::credentials;
+#[cfg(unix)]
+use crate::error::DaemonError;
+use crate::error::OAuthError;
+use crate::oauth::{exchange_code, LoginRequest, OAuthStateStore, PASTE_CODE_REDIRECT_URI};
+use crate::types::AccountNum;
+#[cfg(feature = "enterprise")]
+use axum::http::HeaderMap;
+use axum::{
+    body::Bytes,
+    extract::{DefaultBodyLimit, Path as AxumPath, State},
+    http::StatusCode,
+    routing::{get, post},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+#[cfg(unix)]
+use tokio::net::UnixListener;
+use tokio_util::sync::CancellationToken;
+
+// an internal ticket / an internal ticket — interactive per-turn enforcement surface (enterprise-only). The
+// dispatch registry + request/response types live in the enterprise-gated
+// `interactive_ipc` module; `server.rs` registers the routes + holds the live
+// registry behind the same feature gate. The community build compiles none of it.
+#[cfg(feature = "enterprise")]
+use crate::daemon::interactive_ipc::{
+    AuthorizeOverrideRequest, InteractiveSessionRegistry, OpenSessionResponse, SessionKey,
+    SessionOpenParams, SessionOptionsResponse, SessionStateView, SubmitInputRequest,
+};
+
+/// Shared router state — cache + base_dir paths + OAuth state
+/// store. Cloned cheaply (every field is an `Arc` / `PathBuf`
+/// inside) for each request via axum's `State` extractor.
+#[derive(Clone)]
+pub struct RouterState {
+    /// Refresh-status cache owned by the daemon lifecycle. The
+    /// refresher writes; HTTP routes only read.
+    pub cache: Arc<TtlCache<u16, RefreshStatus>>,
+    /// Short-TTL cache of the full discovered account list. Used
+    /// by `/api/accounts` and `/api/refresh-status` to avoid a
+    /// full filesystem scan on every request. Bounded to
+    /// [`DISCOVERY_CACHE_MAX_AGE`]. Single-entry — the key is
+    /// `()` because discovery is per-base-dir and the base dir
+    /// is constant for the life of the daemon.
+    ///
+    /// Addresses M8.5 security review MED #1 (full fs scan per
+    /// request is a DoS vector once the statusline starts
+    /// polling on a tight interval).
+    pub discovery_cache: Arc<TtlCache<(), Vec<AccountInfo>>>,
+    /// csq base directory, passed through for account discovery.
+    pub base_dir: Arc<PathBuf>,
+    /// OAuth state store for pending paste-code logins. The daemon
+    /// keeps this in memory — `start_login` inserts an entry keyed
+    /// by a random state token, and the subsequent
+    /// `/api/oauth/exchange` call consumes it when the user submits
+    /// their copied authorization code.
+    ///
+    /// `None` when the daemon was started without OAuth support
+    /// (tests, custom builds). In that case both `/api/login/{N}`
+    /// and `/api/oauth/exchange` return 503.
+    pub oauth_store: Option<Arc<OAuthStateStore>>,
+    /// Gemini event-consumer state — shared with the NDJSON drain
+    /// task so the live IPC route AND the drainer dedup against
+    /// the same applied-set and serialise quota writes through the
+    /// same per-process mutex (spec 05 §5.8.1 single-writer
+    /// invariant). Cloned cheaply (every field is an `Arc`).
+    pub gemini_consumer: GeminiConsumerState,
+    /// Audit-chain health as determined at daemon startup by
+    /// `verify_chain` — and possibly PROMOTED afterward by a bounded
+    /// background retry when startup produced `Unknown` (see
+    /// `crate::audit::health`'s module doc and
+    /// `csq/src/cli/commands/daemon.rs::spawn_audit_verify_retry`). Every
+    /// handler reads this through the shared lock, so a post-startup
+    /// promotion is visible on the very next request. Gates the audit
+    /// subsystem:
+    /// - Anchor task skips anchoring when `!is_operational()` (re-armed on
+    ///   promotion — see `spawn_audit_verify_retry`).
+    /// - `POST /api/audit/record` rejects emits when `!is_operational()`.
+    ///
+    /// Other subsystems (token-refresh, usage-poller, IPC server itself)
+    /// are NEVER gated on this — see spec 12 §12.13.5.
+    pub audit_health: crate::audit::SharedAuditHealth,
+    /// Records the daemon's startup `verify_chain` call SKIPPED because
+    /// the chain exceeded the run's configured `record_limit` (the oldest
+    /// records, including possibly the genesis — `verify.rs`'s
+    /// tail-window behaviour). `0` means the daemon's own startup verify
+    /// covered the whole chain.
+    ///
+    /// Exposed via `GET /api/audit/health` alongside `audit_health` so
+    /// `csq doctor` can report the DAEMON's actual coverage instead of
+    /// recomputing a possibly-different answer with its own env-derived
+    /// `record_limit` (`diagnostic-surface-parity.md` MUST NOT Rule 4) —
+    /// `AuditHealth::Verified` is a unit variant and cannot carry this by
+    /// itself, the same reason `csq doctor`'s own local check carries it
+    /// as a sibling field rather than folding it into the enum.
+    pub audit_records_unverified: u64,
+    /// an internal ticket — the interactive per-turn enforcement session registry
+    /// (enterprise-only). Seeded at daemon startup by
+    /// `crate::daemon::interactive_live::seed_registry`: a LIVE registry when the
+    /// fail-closed activation gate
+    /// is present + valid, otherwise `InteractiveSessionRegistry::empty()` (every
+    /// `/api/interactive/*` route returns `503 Unavailable`). The daemon cannot
+    /// re-derive the four §10.5 conditions (offline bench artifacts; `specs/10`
+    /// §10.5.1) — the activation signal is operator-owned go-live authorization.
+    #[cfg(feature = "enterprise")]
+    pub interactive: Arc<InteractiveSessionRegistry>,
+    /// Active transparency-log sink for `POST /api/audit/anchor` (an internal ticket S3 /
+    /// an internal ticket). `None` in the default local-only build — either no external sink
+    /// is configured (`audit-sink.json` `sink = "none"`) or the requested sink's
+    /// feature was not compiled in, in which case `resolve_anchor_sink` returns
+    /// `None`. When `Some`, the anchor handler appends the freshly-signed record
+    /// and projects the returned
+    /// [`crate::audit::types::LedgerInclusionProof`] into the `AnchorPayload`
+    /// `inclusion_proof` field. Append is best-effort / fail-open: a sink error
+    /// yields a `null` proof (the local chain append already succeeded and is
+    /// authoritative), never a 5xx. DAEMON IS SOLE SIGNER is preserved — the
+    /// proof is READ from the receipt, never computed client-side.
+    ///
+    /// Resolved UNCONDITIONALLY at daemon startup (independent of `audit_health`);
+    /// the operative protection when the chain is not operational is the anchor
+    /// handler's own 503 gate, not the absence of a resolved sink (an internal ticket redteam).
+    pub anchor_sink: Option<Arc<dyn crate::audit::LedgerSink>>,
+    /// Rebind wake channel — the SAME `Arc<tokio::sync::Notify>` the
+    /// usage poller's run loop waits on (`usage_poller::spawn`'s `wake`
+    /// parameter; see `RunLoopConfig::wake`). `POST /api/slot-rebind`
+    /// calls `notify_one()` here after a successful Anthropic
+    /// login/rebind so the just-bound slot's quota row is refreshed on
+    /// an immediate tick instead of up to `POLL_INTERVAL` later.
+    ///
+    /// Shared, not per-request: both the CLI daemon
+    /// (`csq/src/cli/commands/daemon.rs`) and the desktop in-process
+    /// daemon (`csq/src/desktop/daemon_supervisor.rs`) create ONE
+    /// `Arc<Notify>` before constructing this state and hand the same
+    /// `Arc` to `spawn_usage_poller`. Cloned cheaply per request.
+    pub usage_poller_wake: Arc<crate::daemon::usage_poller::WakeChannel>,
+}
+
+/// Maximum staleness for the discovery cache: 5 seconds.
+///
+/// Chosen so that:
+///
+/// 1. A statusline polling every 1–2 seconds pays the fs-scan
+///    cost at most once per 5s window, not on every render.
+/// 2. A new account added via OAuth callback becomes visible to
+///    the rest of the API within 5s without any explicit
+///    invalidation wiring.
+/// 3. Stale reads are bounded — no user-visible "ghost account"
+///    lingers beyond the TTL even if the underlying credentials
+///    file is deleted out of band.
+///
+/// Dogpile race: two concurrent handlers may both miss the cache
+/// and both run discovery. This is acceptable at 5s TTL because
+/// the cost is exactly one extra fs scan per race, and the
+/// filesystem scan at realistic account counts (<= 100) is a
+/// few milliseconds. Adding single-flight coordination would
+/// require holding an async lock across spawn_blocking, which
+/// is strictly worse than the bounded dogpile.
+pub const DISCOVERY_CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Maximum request body size accepted by the daemon HTTP router.
+/// M8.3 has no body-accepting routes, but the limit is set now so
+/// every future route (M8.5 `/api/login`, `/api/refresh-token/:id`,
+/// etc.) inherits it automatically. 1 MiB is generous for JSON
+/// command payloads while still bounding worst-case allocation.
+const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+
+/// Health endpoint response body. Deliberately minimal — the client
+/// only cares that the endpoint responds with 200 and valid JSON.
+#[derive(Debug, Clone, Serialize)]
+pub struct HealthResponse {
+    pub status: &'static str,
+    pub version: &'static str,
+    pub pid: u32,
+}
+
+/// Builds the axum router for the daemon HTTP API.
+///
+/// Routes mounted:
+/// - `GET /api/health` — liveness probe (M8.3)
+/// - `GET /api/accounts` — discovered accounts (M8.5)
+/// - `GET /api/refresh-status` — all refresh statuses from the cache (M8.5)
+/// - `GET /api/refresh-status/:id` — one account's refresh status (M8.5)
+/// - `GET /api/login/:id` — initiate a paste-code OAuth flow
+/// - `POST /api/oauth/exchange` — submit the paste-code and exchange it
+/// - `POST /api/invalidate-cache` — clear all caches (M8-10c)
+/// - `GET /api/audit/health` — the daemon's own startup `AuditHealth` +
+///   `audit_records_unverified`, so `csq doctor` can read the same answer
+///   the daemon gates anchoring/emit on instead of recomputing locally
+///   (`diagnostic-surface-parity.md` MUST NOT Rule 4)
+///
+/// (This list predates several routes — `/api/slot-swap`,
+/// `/api/gemini/event`, `/api/audit/{record,anchor}`,
+/// `/api/provenance/anchor` — not re-enumerated here; see the `router`
+/// body below for the authoritative route table.)
+///
+/// `#[cfg(feature = "enterprise")]` also mounts (spec 21 §21.7, an internal ticket/an internal ticket):
+/// - `POST /api/interactive/open` — open a new governed session → `OpenSessionResponse`
+/// - `POST /api/interactive/submit` — submit one governed turn (key via header)
+/// - `POST /api/interactive/override` — authorize a blocked turn (key via header)
+/// - `POST /api/interactive/abandon` — abandon a blocked turn (key via header)
+/// - `POST /api/interactive/close` — close a session and free its slot (key via header)
+///
+/// (Fail-closed `503` unless the §10.5 activation gate is open.)
+///
+/// The [`DefaultBodyLimit`] layer is installed here so every future
+/// route inherits the 1 MiB cap without having to remember. State
+/// is shared via `with_state` so each handler gets a cheap clone
+/// of the [`RouterState`].
+pub fn router(state: RouterState) -> Router {
+    let app = Router::new()
+        .route("/api/health", get(health_handler))
+        .route("/api/accounts", get(accounts_handler))
+        .route("/api/refresh-status", get(refresh_status_all_handler))
+        .route("/api/refresh-status/{id}", get(refresh_status_one_handler))
+        .route("/api/login/{id}", get(login_handler))
+        .route("/api/oauth/exchange", post(oauth_exchange_handler))
+        .route("/api/invalidate-cache", post(invalidate_cache_handler))
+        .route("/api/slot-swap", post(slot_swap_handler))
+        .route("/api/slot-rebind", post(slot_rebind_handler))
+        .route("/api/harvest-account", post(harvest_account_handler))
+        .route("/api/gemini/event", post(gemini_event_handler))
+        .route("/api/audit/record", post(audit_record_handler))
+        .route("/api/audit/anchor", post(audit_anchor_handler))
+        .route("/api/audit/health", get(audit_health_handler))
+        .route("/api/provenance/anchor", post(provenance_anchor_handler));
+
+    // an internal ticket/an internal ticket — interactive per-turn enforcement routes (enterprise-only,
+    // spec 21 §21.7). Registered in the enterprise build; the seeded registry is
+    // fail-closed (empty → 503) unless the §10.5 activation gate is present. The
+    // SO_PEERCRED same-UID socket auth + 1 MiB body cap apply to these routes too
+    // (no per-route auth — security.md §7; the enforcement decision originates in
+    // the daemon — account-terminal-separation.md MUST Rule 1).
+    //
+    // Session lifecycle: open → key in X-CSQ-Session-Key → submit/override/abandon
+    //                         → close.  Key is daemon-minted CSPRNG; clients echo it.
+    #[cfg(feature = "enterprise")]
+    let app = app
+        .route("/api/interactive/open", post(interactive_open_handler))
+        .route("/api/interactive/submit", post(interactive_submit_handler))
+        .route(
+            "/api/interactive/override",
+            post(interactive_override_handler),
+        )
+        .route(
+            "/api/interactive/abandon",
+            post(interactive_abandon_handler),
+        )
+        .route("/api/interactive/close", post(interactive_close_handler))
+        .route(
+            "/api/interactive/options",
+            post(interactive_options_handler),
+        )
+        // T-M4.5: signed posture-reset (the only loosening path) + the read-only
+        // sealed-audit-proof retrieval surface.
+        .route(
+            "/api/interactive/posture-reset",
+            post(interactive_posture_reset_handler),
+        )
+        .route(
+            "/api/interactive/audit-proof/{session_id}",
+            get(interactive_audit_proof_handler),
+        )
+        // M6 T6.2 Shard 4 — spawn-boundary MCP gate decision attestation. The
+        // `csq mcp-proxy` POSTs each gated tools/call decision here; the daemon
+        // builds + signs + appends the McpGateDecision chain record server-side
+        // (a subprocess never supplies a SignedRecord — account-terminal-
+        // separation.md MUST Rule 1). Same SO_PEERCRED same-UID socket auth +
+        // 1 MiB body cap as the sibling routes.
+        .route("/api/audit/mcp-gate", post(mcp_gate_handler));
+
+    app.with_state(state)
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+}
+
+async fn health_handler() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+        pid: std::process::id(),
+    })
+}
+
+/// Body of `GET /api/audit/health` — the daemon's OWN startup audit-verify
+/// result, read directly from [`RouterState`] (no re-verification, no
+/// re-derivation). This is the wire type `diagnostic-surface-parity.md`
+/// MUST NOT Rule 4 exists to make possible: a diagnostic surface
+/// (`csq doctor`) that reads the SAME channel the daemon gates
+/// anchoring/emit on, rather than recomputing a possibly-different answer
+/// with its own `record_limit` config.
+///
+/// Also `Deserialize` (see [`crate::audit::AuditHealth`]'s own doc for why)
+/// so the CLIENT side (`csq doctor`) can parse the daemon's response body
+/// back into this same type via `daemon::http_get_unix`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditHealthResponse {
+    /// Mirrors [`RouterState::audit_health`] verbatim.
+    #[serde(flatten)]
+    pub health: crate::audit::AuditHealth,
+    /// Mirrors [`RouterState::audit_records_unverified`] verbatim.
+    pub records_unverified: u64,
+}
+
+async fn audit_health_handler(State(state): State<RouterState>) -> Json<AuditHealthResponse> {
+    Json(AuditHealthResponse {
+        health: state
+            .audit_health
+            .read()
+            .expect("audit health lock poisoned")
+            .clone(),
+        records_unverified: state.audit_records_unverified,
+    })
+}
+
+/// Fixed-vocabulary error body for the `/api/interactive/*` routes (an internal ticket).
+///
+/// The `error` field carries ONLY the stable `InteractiveIpcError::tag()` or a
+/// deserialize tag — never the request body or an upstream payload
+/// (`rules/security.md` §2; `rules/tauri-commands.md` MUST-6). The renderer-bound
+/// success view (`SessionStateView`) is already token-redacted at the IPC boundary
+/// inside `interactive_ipc`.
+#[cfg(feature = "enterprise")]
+#[derive(Debug, Clone, Serialize)]
+pub struct InteractiveError {
+    pub error: &'static str,
+}
+
+/// Map an [`crate::daemon::interactive_ipc::InteractiveIpcError`] to its HTTP
+/// status + fixed-vocabulary body. `from_u16` cannot fail for the variants'
+/// status set (400/409/502/503), but the fallback keeps the handler panic-free
+/// (`rules/tauri-commands.md` MUST Rule 1 / MUST NOT Rule 2).
+#[cfg(feature = "enterprise")]
+fn interactive_err_response(
+    e: crate::daemon::interactive_ipc::InteractiveIpcError,
+) -> (StatusCode, Json<InteractiveError>) {
+    let code = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (code, Json(InteractiveError { error: e.tag() }))
+}
+
+/// Extract the `X-CSQ-Session-Key` header and validate its format.
+///
+/// Returns 400 `session_key_invalid` (via [`interactive_err_response`]) for
+/// both an ABSENT header and a syntactically malformed one — the
+/// `InteractiveIpcError` vocabulary is the single source of truth for error tags
+/// (`rules/tauri-commands.md` MUST Rule 6).  Distinct `session_key_missing`
+/// literals are intentionally NOT used: the client sees an invalid/absent key as
+/// the same actionable error ("provide a valid key from a prior `open` call").
+#[cfg(feature = "enterprise")]
+fn extract_session_key(
+    headers: &HeaderMap,
+) -> Result<SessionKey, (StatusCode, Json<InteractiveError>)> {
+    let raw = headers
+        .get("x-csq-session-key")
+        .ok_or_else(|| {
+            interactive_err_response(
+                crate::daemon::interactive_ipc::InteractiveIpcError::InvalidSessionKey,
+            )
+        })?
+        .to_str()
+        .map_err(|_| {
+            interactive_err_response(
+                crate::daemon::interactive_ipc::InteractiveIpcError::InvalidSessionKey,
+            )
+        })?;
+    SessionKey::try_from_client(raw).map_err(interactive_err_response)
+}
+
+/// `POST /api/interactive/open` — open a new governed session (an internal ticket).
+///
+/// Body: `SessionOpenParams` (all fields optional; unset → gate template values).
+/// Returns `OpenSessionResponse { session_key, state: Idle }`.  The client MUST
+/// echo the `session_key` in the `X-CSQ-Session-Key` header on all subsequent
+/// calls for this session.
+#[cfg(feature = "enterprise")]
+async fn interactive_open_handler(
+    State(state): State<RouterState>,
+    body: Bytes,
+) -> Result<Json<OpenSessionResponse>, (StatusCode, Json<InteractiveError>)> {
+    // Empty body → default (all-None) params; non-empty → parse.
+    let params: SessionOpenParams = if body.is_empty() {
+        SessionOpenParams {
+            provider: None,
+            schema: None,
+            max_tokens: None,
+            coc_dir: None,
+            terminal_label: None,
+            terminal_pid: None,
+            slot: None,
+        }
+    } else {
+        serde_json::from_slice(&body).map_err(|_| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(InteractiveError {
+                    error: "interactive_deserialize_error",
+                }),
+            )
+        })?
+    };
+    state
+        .interactive
+        .open(params)
+        .await
+        .map(Json)
+        .map_err(interactive_err_response)
+}
+
+/// `POST /api/interactive/submit` — submit one user input turn (an internal ticket/an internal ticket).
+///
+/// Header: `X-CSQ-Session-Key` — the daemon-minted session capability key.
+/// Body: `SubmitInputRequest { input }`. Drives one governed turn end-to-end
+/// (`GovernanceLoop::execute` via `InteractiveSession::run_turn`) and returns the
+/// resulting `SessionStateView` (`Complete` / `Blocked`). Fail-closed `503`
+/// (`interactive_unavailable`) when the activation gate is not open.
+#[cfg(feature = "enterprise")]
+async fn interactive_submit_handler(
+    State(state): State<RouterState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<SessionStateView>, (StatusCode, Json<InteractiveError>)> {
+    let key = extract_session_key(&headers)?;
+    let req: SubmitInputRequest = serde_json::from_slice(&body).map_err(|_| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(InteractiveError {
+                error: "interactive_deserialize_error",
+            }),
+        )
+    })?;
+    state
+        .interactive
+        .submit(&key, req)
+        .await
+        .map(Json)
+        .map_err(interactive_err_response)
+}
+
+/// `POST /api/interactive/override` — authorize a blocked turn (an internal ticket/an internal ticket).
+///
+/// Header: `X-CSQ-Session-Key` — the daemon-minted session capability key.
+/// Body: `AuthorizeOverrideRequest { justification }`. The override event is
+/// emitted (emit-before-execute) ahead of the corrective turn. Returns the
+/// resulting `SessionStateView`.
+#[cfg(feature = "enterprise")]
+async fn interactive_override_handler(
+    State(state): State<RouterState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<SessionStateView>, (StatusCode, Json<InteractiveError>)> {
+    let key = extract_session_key(&headers)?;
+    let req: AuthorizeOverrideRequest = serde_json::from_slice(&body).map_err(|_| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(InteractiveError {
+                error: "interactive_deserialize_error",
+            }),
+        )
+    })?;
+    state
+        .interactive
+        .authorize_override(&key, req)
+        .await
+        .map(Json)
+        .map_err(interactive_err_response)
+}
+
+/// `POST /api/interactive/abandon` — abandon a blocked turn; session returns to
+/// `Idle` (an internal ticket/an internal ticket).
+///
+/// Header: `X-CSQ-Session-Key` — the daemon-minted session capability key.
+/// No request body.
+#[cfg(feature = "enterprise")]
+async fn interactive_abandon_handler(
+    State(state): State<RouterState>,
+    headers: HeaderMap,
+) -> Result<Json<SessionStateView>, (StatusCode, Json<InteractiveError>)> {
+    let key = extract_session_key(&headers)?;
+    state
+        .interactive
+        .abandon(&key)
+        .await
+        .map(Json)
+        .map_err(interactive_err_response)
+}
+
+/// `POST /api/interactive/close` — close a session and free its slot (an internal ticket).
+///
+/// Header: `X-CSQ-Session-Key` — the daemon-minted session capability key.
+/// No request body. On success returns `Idle` state view. Does NOT emit any
+/// synthetic chain record (directive 4: no `resolve(Abandon)` on close).
+#[cfg(feature = "enterprise")]
+async fn interactive_close_handler(
+    State(state): State<RouterState>,
+    headers: HeaderMap,
+) -> Result<Json<SessionStateView>, (StatusCode, Json<InteractiveError>)> {
+    let key = extract_session_key(&headers)?;
+    state
+        .interactive
+        .close(&key)
+        .await
+        .map(Json)
+        .map_err(interactive_err_response)
+}
+
+/// `POST /api/interactive/posture-reset` — apply a SIGNED operator posture-reset
+/// authorization (T-M4.5), the only path that loosens a session's posture ratchet.
+///
+/// Header: `X-CSQ-Session-Key`. Body: `PostureResetAuthorization { nonce_hex,
+/// target_posture, signature_hex }`. The renderer merely TRANSPORTS the
+/// operator-signed blob; the daemon verifies it against the daemon-held org-root
+/// verifying key over a preimage it reconstructs from its OWN session key (R1-S7 —
+/// the renderer cannot forge or replay a reset). Fail-closed: `503` when no reset
+/// key is configured; `403` (`action_denied`) on a bad / forged / replayed
+/// signature; `409` (`session_wrong_state`) on a session with no posture ratchet.
+#[cfg(feature = "enterprise")]
+async fn interactive_posture_reset_handler(
+    State(state): State<RouterState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<SessionStateView>, (StatusCode, Json<InteractiveError>)> {
+    let key = extract_session_key(&headers)?;
+    let auth: csq_trust_contract::PostureResetAuthorization = serde_json::from_slice(&body)
+        .map_err(|_| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(InteractiveError {
+                    error: "interactive_deserialize_error",
+                }),
+            )
+        })?;
+    state
+        .interactive
+        .reset_posture(&key, auth)
+        .await
+        .map(Json)
+        .map_err(interactive_err_response)
+}
+
+/// `GET /api/interactive/audit-proof/{session_id}` — read a sealed lifecycle audit
+/// proof (T-M4.5).
+///
+/// Returns the persisted `SealedAuditProof` (only PUBLIC bytes — sealed head hash,
+/// signature, verifying key — non-secret, so no session key is required; the
+/// `SO_PEERCRED` same-UID socket auth already restricts callers). `404` when
+/// absent. The `session_id` path param is validated (charset `[A-Za-z0-9_-]`, no
+/// `..`, length-bounded) BEFORE any filesystem join so it cannot traverse out of
+/// the proofs directory.
+#[cfg(feature = "enterprise")]
+async fn interactive_audit_proof_handler(
+    State(state): State<RouterState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+) -> Result<Json<csq_trust_contract::SealedAuditProof>, (StatusCode, Json<InteractiveError>)> {
+    // Validate the path param BEFORE any filesystem join (traversal defense — the
+    // same charset discipline as `SessionKey::try_from_client`, length-relaxed for
+    // the longer `interactive-live-{label}-{pid}-{ulid}` session_id form).
+    let valid = !session_id.is_empty()
+        && session_id.len() <= 128
+        && !session_id.contains("..")
+        && session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !valid {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(InteractiveError {
+                error: "audit_proof_session_id_invalid",
+            }),
+        ));
+    }
+    let dir = state
+        .base_dir
+        .join(crate::daemon::interactive_ipc::AUDIT_PROOF_SUBDIR);
+    match crate::daemon::interactive_ipc::read_sealed_proof(&dir, &session_id) {
+        Some(proof) => Ok(Json(proof)),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(InteractiveError {
+                error: "audit_proof_not_found",
+            }),
+        )),
+    }
+}
+
+/// `POST /api/interactive/options` — list the subscription accounts the operator
+/// may pick BEFORE opening a session, plus the gate's default provider (an internal ticket
+/// Enforcement-tab picker, an internal journal entry §FD1).
+///
+/// Fail-closed: returns `503 interactive_unavailable` when the activation gate is
+/// closed (`registry.is_active()` false) OR the gate file is no longer readable.
+/// No session key required — this is a pre-open query that reveals only account
+/// labels (no credentials, no secrets — `rules/security.md` §2). The provider is
+/// the gate template's default; the candidate slots are the provider-matching
+/// accounts with credentials, lowest-first (the exact set the minter validates
+/// `SessionOpenParams.slot` against).
+#[cfg(feature = "enterprise")]
+async fn interactive_options_handler(
+    State(state): State<RouterState>,
+) -> Result<Json<SessionOptionsResponse>, (StatusCode, Json<InteractiveError>)> {
+    let unavailable = || {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(InteractiveError {
+                error: "interactive_unavailable",
+            }),
+        )
+    };
+    // Authoritative open/closed signal — same gate every other interactive route
+    // checks (the registry was seeded from it at startup).
+    if !state.interactive.is_active() {
+        return Err(unavailable());
+    }
+    // The gate's default provider. is_active() ⟹ this was present at seed; map a
+    // since-removed/unreadable gate to the same fail-closed 503.
+    let provider = match crate::daemon::interactive_live::load_gate(&state.base_dir) {
+        Some(cfg) => cfg.provider,
+        None => return Err(unavailable()),
+    };
+    let candidate_slots =
+        crate::daemon::interactive_live::candidate_subscription_slots(&state.base_dir, &provider);
+    Ok(Json(SessionOptionsResponse {
+        provider,
+        candidate_slots,
+    }))
+}
+
+/// Runs account discovery, hitting [`RouterState::discovery_cache`]
+/// first and only falling through to a real filesystem scan on
+/// cache miss or expiry.
+///
+/// Returns an empty `Vec` if the underlying spawn_blocking task
+/// panics — the error is logged with a fixed tag (no `%e` per
+/// RISK-0007) and the handler continues to serve an empty list
+/// rather than surfacing a 500. This matches the behavior of
+/// `refresh_status_all_handler` before the cache was added.
+async fn cached_discovery(
+    base_dir: Arc<PathBuf>,
+    cache: Arc<TtlCache<(), Vec<AccountInfo>>>,
+) -> Vec<AccountInfo> {
+    // Fast path: the cached entry is live.
+    if let Some(cached) = cache.get(&()) {
+        return cached;
+    }
+
+    // Cold path: run discovery on a blocking worker. Concurrent
+    // callers may both land here (bounded dogpile); see
+    // DISCOVERY_CACHE_MAX_AGE docstring.
+    //
+    // Uses `discover_all` so Codex + third-party (MiniMax/Z.AI/
+    // Ollama) + manual slots are visible to /api/accounts
+    // consumers (statusline, `csq status`, Tauri dashboard). Prior
+    // to this change the route returned Anthropic-only and the
+    // CLI rendered an incomplete view for mixed setups.
+    let base_for_task = Arc::clone(&base_dir);
+    let accounts =
+        match tokio::task::spawn_blocking(move || discovery::discover_all(&base_for_task)).await {
+            Ok(a) => a,
+            Err(_join_err) => {
+                // JoinError may include a panic payload — do NOT
+                // format it with `%` per RISK-0007. Log only the
+                // fixed tag.
+                tracing::warn!(
+                    error_kind = "discovery_task_panic",
+                    "accounts discovery task panicked"
+                );
+                Vec::new()
+            }
+        };
+
+    cache.set((), accounts.clone());
+    accounts
+}
+
+/// GET /api/accounts — returns the full discovered account list.
+///
+/// Reads from [`RouterState::discovery_cache`] when warm; runs
+/// `discovery::discover_anthropic` inside `spawn_blocking` on
+/// cache miss. For realistic account counts (<= 100) the response
+/// size is well under the 1 MiB body cap.
+async fn accounts_handler(State(state): State<RouterState>) -> Json<AccountsResponse> {
+    let accounts = cached_discovery(
+        Arc::clone(&state.base_dir),
+        Arc::clone(&state.discovery_cache),
+    )
+    .await;
+    Json(AccountsResponse { accounts })
+}
+
+/// GET /api/refresh-status — returns every currently-cached
+/// `RefreshStatus` entry as a map keyed by account ID.
+async fn refresh_status_all_handler(
+    State(state): State<RouterState>,
+) -> Json<RefreshStatusListResponse> {
+    // Walk known account IDs via the short-TTL discovery cache
+    // and look up each in the refresh-status cache. We do NOT
+    // expose the refresh-status cache's internal HashMap directly
+    // because that couples the IPC schema to the cache's internal
+    // layout. A linear lookup over discovered accounts is fine
+    // for the realistic account count.
+    let accounts = cached_discovery(
+        Arc::clone(&state.base_dir),
+        Arc::clone(&state.discovery_cache),
+    )
+    .await;
+
+    let mut entries = Vec::new();
+    for info in accounts {
+        if let Some(status) = state.cache.get(&info.id) {
+            entries.push(status);
+        }
+    }
+
+    Json(RefreshStatusListResponse { statuses: entries })
+}
+
+/// GET /api/refresh-status/:id — returns one account's cached
+/// refresh status, or 404 if no cached entry exists.
+///
+/// The path parameter `{id}` is validated via
+/// `AccountNum::try_from` — values outside 1..=999 are rejected
+/// with 400 so path-injection attempts like `/api/refresh-status/
+/// ../../etc` fail at deserialization (u16 parse) or the range
+/// guard before touching the cache.
+async fn refresh_status_one_handler(
+    State(state): State<RouterState>,
+    AxumPath(id): AxumPath<u16>,
+) -> Result<Json<RefreshStatus>, (StatusCode, String)> {
+    // Validate account number. This also defends against negative
+    // or out-of-range values that slipped past the u16 decode.
+    let account = AccountNum::try_from(id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid account id: {e}")))?;
+
+    match state.cache.get(&account.get()) {
+        Some(status) => Ok(Json(status)),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            format!("no cached refresh status for account {id}"),
+        )),
+    }
+}
+
+/// GET /api/login/:id — initiates a paste-code OAuth login for
+/// the given account slot.
+///
+/// Generates a fresh PKCE verifier + state token, records them in
+/// the shared [`OAuthStateStore`], and returns a [`LoginRequest`]
+/// containing the authorize URL the caller should open in a
+/// browser. After the user authorizes, Anthropic displays an
+/// authorization code on its callback page; the caller then POSTs
+/// that code to `/api/oauth/exchange` to complete the login.
+///
+/// # Errors
+///
+/// - **400 Bad Request** — account id is outside 1..=999.
+/// - **503 Service Unavailable** — the daemon was started without
+///   an OAuth state store (`oauth_store: None`). Tests and custom
+///   builds can disable OAuth; real daemons always enable it.
+/// - **500 Internal Server Error** — unexpected failure in
+///   `start_login` (impossible on supported platforms — it only
+///   fails if the OS CSPRNG is unavailable).
+async fn login_handler(
+    State(state): State<RouterState>,
+    AxumPath(id): AxumPath<u16>,
+) -> Result<Json<LoginRequest>, (StatusCode, String)> {
+    let account = AccountNum::try_from(id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid account id: {e}")))?;
+
+    let Some(store) = state.oauth_store.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "oauth support is not available on this daemon".to_string(),
+        ));
+    };
+
+    let base = Arc::clone(&state.base_dir);
+    let store = Arc::clone(store);
+    let request = tokio::task::spawn_blocking(move || {
+        let base = std::fs::canonicalize(&*base).map_err(|_| "identity base refused")?;
+        let prior = crate::accounts::anthropic_identity::capture_login_prior(&base, account)
+            .map_err(|_| "identity capture failed")?;
+        crate::oauth::login::start_login_with_prior(&store, account, base, prior)
+            .map_err(|_| "login initiation failed")
+    })
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "login initiation failed".to_string(),
+        )
+    })?;
+    request.map(Json).map_err(|e| {
+        // start_login is effectively infallible for valid
+        // AccountNum on supported platforms; if it ever errors we
+        // map to 500 without echoing internal details.
+        tracing::warn!(error = %e, "start_login failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "oauth login initiation failed".to_string(),
+        )
+    })
+}
+
+/// Request body for `POST /api/oauth/exchange`.
+#[derive(Debug, Deserialize)]
+pub struct OAuthExchangeRequest {
+    /// State token returned by the preceding `GET /api/login/{N}`.
+    pub state: String,
+    /// Authorization code displayed by Anthropic on its callback
+    /// page after the user authorizes.
+    pub code: String,
+}
+
+/// Response body for `POST /api/oauth/exchange`.
+#[derive(Debug, Clone, Serialize)]
+pub struct OAuthExchangeResponse {
+    /// The account slot that was authenticated — echoes
+    /// [`crate::oauth::PendingState::account`] so callers can
+    /// confirm without re-parsing the state token.
+    pub account: u16,
+}
+
+// Synchronous producer boundary used by oauth_exchange_handler's blocking save task.
+fn save_oauth_login_credentials(
+    base: &Path,
+    account: AccountNum,
+    credential: &credentials::CredentialFile,
+    prior: crate::accounts::anthropic_identity::LoginPrior,
+) -> Result<(), String> {
+    finish_oauth_login_credentials(
+        base,
+        account,
+        crate::accounts::anthropic_identity::commit_anthropic_login(
+            base, account, credential, None, prior,
+        ),
+    )
+}
+
+#[cfg(all(test, unix))]
+fn save_oauth_login_credentials_with(
+    base: &Path,
+    account: AccountNum,
+    credential: &credentials::CredentialFile,
+    profile: &crate::daemon::usage_poller::HttpGetFn,
+    prior: crate::accounts::anthropic_identity::LoginPrior,
+) -> Result<(), String> {
+    finish_oauth_login_credentials(
+        base,
+        account,
+        crate::accounts::anthropic_identity::commit_anthropic_login_with(
+            base, account, credential, profile, None, prior,
+        ),
+    )
+}
+
+fn finish_oauth_login_credentials(
+    base: &Path,
+    account: AccountNum,
+    committed: Result<
+        crate::accounts::anthropic_identity::CommittedAnthropicLogin,
+        crate::accounts::anthropic_identity::IdentityError,
+    >,
+) -> Result<(), String> {
+    let committed = committed.map_err(|e| {
+        // corr LOW-1: the daemon's reply is a fixed error_kind vocabulary, so
+        // the operator line goes to its log (same fixed text, no payload).
+        if let Some(notice) = crate::credentials::rescue::take_refusal_not_durable_notice() {
+            tracing::warn!(error_kind = "login_refusal_not_durable", "{notice}");
+        }
+        crate::accounts::login::LoginCommitOutcome::from_identity_error(&e)
+            .error_kind()
+            .to_string()
+    })?;
+    crate::accounts::login::finalize_verified_login(base, account, committed).map_err(|error| {
+        match error {
+            crate::error::ConfigError::InvalidJson { reason, .. }
+                if reason == "anthropic_identity_finalization_refused" =>
+            {
+                crate::accounts::login::LoginCommitOutcome::FinalizationRefused
+                    .error_kind()
+                    .to_string()
+            }
+            _ => crate::accounts::login::LoginCommitOutcome::PublicationFailed
+                .error_kind()
+                .to_string(),
+        }
+    })?;
+    Ok(())
+}
+
+/// HTTP status for a failed verified-login commit. The error_kind and message
+/// come from the shared [`crate::accounts::login::LoginCommitOutcome`] so the
+/// daemon, CLI and desktop report one vocabulary. A busy profiles store is a
+/// 409 retry; a refused organization identity is a 400; a publication failure
+/// (including one after the target's canonical credentials advanced) is a 500.
+fn login_outcome_response(
+    reason: &str,
+) -> (StatusCode, crate::accounts::login::LoginCommitOutcome) {
+    use crate::accounts::login::LoginCommitOutcome as O;
+    let outcome = O::from_error_kind(reason);
+    let status = match outcome {
+        O::IdentityChanged | O::Busy | O::FinalizationRefused => StatusCode::CONFLICT,
+        O::Refused | O::IndexDamaged => StatusCode::BAD_REQUEST,
+        O::PublicationFailed | O::TargetAdvancedPublicationFailed => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    (status, outcome)
+}
+
+/// POST /api/oauth/exchange — submits the paste-code from the
+/// browser and exchanges it for a credential file.
+///
+/// Flow:
+///
+/// 1. Looks up the pending PKCE state keyed by `state` in the
+///    [`OAuthStateStore`] — this is the authentication boundary.
+///    Missing, expired, or already-consumed tokens map to 400.
+/// 2. Calls [`exchange_code`] against the Anthropic token endpoint
+///    with the recovered verifier and the paste-code redirect URI
+///    (must be byte-identical to what the authorize URL advertised).
+/// 3. Verifies the exact grant's complete account/organization profile, stages
+///    its UUID-keyed credentials, then publishes the verified slot binding.
+/// 4. Returns the validated account number.
+///
+/// # Errors
+///
+/// - **400 Bad Request** — empty code, or state token not found /
+///   expired / already consumed.
+/// - **502 Bad Gateway** — Anthropic rejected the code or returned
+///   a malformed token response.
+/// - **500 Internal Server Error** — disk write failed.
+/// - **503 Service Unavailable** — daemon started without OAuth
+///   support.
+///
+/// All error messages are redacted by `OAuthError` / `CsqError`
+/// before surfacing — the upstream response body (which may echo
+/// the submitted code) is never included.
+async fn oauth_exchange_handler(
+    state: State<RouterState>,
+    body: Json<OAuthExchangeRequest>,
+) -> Result<Json<OAuthExchangeResponse>, (StatusCode, String)> {
+    oauth_exchange_handler_using(
+        state,
+        body,
+        crate::http::post_json_node,
+        save_oauth_login_credentials,
+    )
+    .await
+}
+
+#[cfg(all(test, unix))]
+async fn oauth_exchange_handler_with_transport(
+    state: State<RouterState>,
+    body: Json<OAuthExchangeRequest>,
+    exchange: impl Fn(&str, &str) -> Result<Vec<u8>, String> + Send + 'static,
+    profile: crate::daemon::usage_poller::HttpGetFn,
+) -> Result<Json<OAuthExchangeResponse>, (StatusCode, String)> {
+    oauth_exchange_handler_using(
+        state,
+        body,
+        exchange,
+        move |base, account, credential, prior| {
+            save_oauth_login_credentials_with(base, account, credential, &profile, prior)
+        },
+    )
+    .await
+}
+
+async fn oauth_exchange_handler_using(
+    State(state): State<RouterState>,
+    Json(body): Json<OAuthExchangeRequest>,
+    exchange: impl Fn(&str, &str) -> Result<Vec<u8>, String> + Send + 'static,
+    save: impl FnOnce(
+            &Path,
+            AccountNum,
+            &credentials::CredentialFile,
+            crate::accounts::anthropic_identity::LoginPrior,
+        ) -> Result<(), String>
+        + Send
+        + 'static,
+) -> Result<Json<OAuthExchangeResponse>, (StatusCode, String)> {
+    let Some(store) = state.oauth_store.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "oauth support is not available on this daemon".to_string(),
+        ));
+    };
+
+    // Clean the code: strip surrounding whitespace / CRs a shell
+    // caller may have included.
+    let code = body.code.trim().trim_end_matches('\r').to_string();
+    if code.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "code must not be empty".to_string(),
+        ));
+    }
+
+    // Consume the pending entry — single-use.
+    let pending = store.consume(&body.state).map_err(|e| match e {
+        OAuthError::StateMismatch => (
+            StatusCode::BAD_REQUEST,
+            "state token not recognized".to_string(),
+        ),
+        OAuthError::StateExpired { .. } => {
+            (StatusCode::BAD_REQUEST, "state token expired".to_string())
+        }
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "state lookup failed".to_string(),
+        ),
+    })?;
+
+    let pending_login = pending.verified_login.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "identity authority missing".to_string(),
+        )
+    })?;
+    let prior_base = Arc::clone(&state.base_dir);
+    let prior = tokio::task::spawn_blocking(move || {
+        let base = std::fs::canonicalize(&*prior_base).map_err(|_| "identity base refused")?;
+        if base != pending_login.base {
+            return Err("identity base changed");
+        }
+        Ok::<_, &str>(pending_login.prior)
+    })
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "identity authority failed".to_string(),
+        )
+    })?
+    .map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "identity authority refused".to_string(),
+        )
+    })?;
+
+    // The injected exchange is a synchronous HTTP round-trip. Production uses
+    // the Node transport; run it on a blocking worker so we don't stall
+    // the tokio runtime.
+    let verifier = pending.code_verifier.clone();
+    let account = pending.account;
+    let exchange_result = tokio::task::spawn_blocking(move || {
+        exchange_code(&code, &verifier, PASTE_CODE_REDIRECT_URI, exchange)
+    })
+    .await;
+
+    let credential = match exchange_result {
+        Ok(Ok(c)) => c,
+        Ok(Err(OAuthError::Exchange(_))) => {
+            tracing::warn!(
+                account = account.get(),
+                error_kind = "exchange",
+                "oauth exchange failed"
+            );
+            return Err((StatusCode::BAD_GATEWAY, "code exchange failed".to_string()));
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                account = account.get(),
+                error_kind = e.kind(),
+                "oauth exchange unexpected error"
+            );
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal oauth error".to_string(),
+            ));
+        }
+        Err(_join_err) => {
+            tracing::warn!(
+                account = account.get(),
+                error_kind = "join_err",
+                "oauth exchange task panicked"
+            );
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal oauth error".to_string(),
+            ));
+        }
+    };
+
+    // Verify the exact exchanged grant independently of native metadata, then
+    // stage and publish its organization-bound identity before finalizing.
+    let base_dir = Arc::clone(&state.base_dir);
+    let save_result =
+        tokio::task::spawn_blocking(move || save(&base_dir, account, &credential, prior)).await;
+
+    match save_result {
+        Ok(Ok(())) => {
+            // Invalidate caches so the next /api/accounts call
+            // shows the new row without waiting for the TTL.
+            state.discovery_cache.clear();
+            state.cache.clear();
+            // login-followup: this path IS the daemon's own login
+            // completion, so wake the usage poller in-process (the twin of
+            // the CLI/desktop clients' POST /api/slot-rebind; `notify_one`
+            // coalesces with any such request that also arrives).
+            state.usage_poller_wake.wake_slot(account.get());
+            tracing::debug!(
+                error_kind = "usage_poller_wake_rebind",
+                slot = account.get(),
+                "oauth login complete — usage poller woken for an immediate tick"
+            );
+            tracing::info!(account = account.get(), "oauth login complete");
+            Ok(Json(OAuthExchangeResponse {
+                account: account.get(),
+            }))
+        }
+        Ok(Err(reason)) => {
+            let (status, outcome) = login_outcome_response(reason.as_str());
+            let error_kind = outcome.error_kind();
+            let message = outcome.message();
+            tracing::warn!(
+                account = account.get(),
+                error_kind,
+                "verified oauth login refused"
+            );
+            Err((status, message.to_string()))
+        }
+        Err(_join_err) => {
+            tracing::warn!(
+                account = account.get(),
+                error_kind = "join_err",
+                "credential save task panicked"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal save error".to_string(),
+            ))
+        }
+    }
+}
+
+/// Helper trait — keeps `error_kind = ...` tags small so the
+/// exchange handler can classify errors for structured logging
+/// without leaking details into the tag string.
+trait OAuthErrorKind {
+    fn kind(&self) -> &'static str;
+}
+
+impl OAuthErrorKind for OAuthError {
+    fn kind(&self) -> &'static str {
+        match self {
+            OAuthError::Http { .. } => "http",
+            OAuthError::StateExpired { .. } => "state_expired",
+            OAuthError::StateMismatch => "state_mismatch",
+            OAuthError::PkceVerification => "pkce_verification",
+            OAuthError::Exchange(_) => "exchange",
+            OAuthError::Cancelled => "cancelled",
+            OAuthError::StoreAtCapacity { .. } => "store_at_capacity",
+            OAuthError::ExchangeTimeout { .. } => "exchange_timeout",
+            OAuthError::LoginInProgressElsewhere { .. } => "login_in_progress",
+        }
+    }
+}
+
+/// POST /api/invalidate-cache — clears all daemon caches.
+///
+/// Called by `csq swap` after a successful account switch so that
+/// subsequent `/api/accounts` and `/api/refresh-status` calls
+/// reflect the new active account immediately instead of waiting
+/// for the 5-second TTL to expire.
+///
+/// Returns `200 {"cleared": true}` unconditionally.
+async fn invalidate_cache_handler(
+    State(state): State<RouterState>,
+) -> Json<InvalidateCacheResponse> {
+    state.discovery_cache.clear();
+    state.cache.clear();
+    tracing::debug!("cache invalidated by client request");
+    Json(InvalidateCacheResponse { cleared: true })
+}
+
+/// Response body for `POST /api/invalidate-cache`.
+#[derive(Debug, Clone, Serialize)]
+pub struct InvalidateCacheResponse {
+    pub cleared: bool,
+}
+
+/// Request body for `POST /api/slot-swap`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SlotSwapRequest {
+    pub from: u16,
+    pub to: u16,
+}
+
+/// Response body for `POST /api/slot-swap`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SlotSwapResponse {
+    pub invalidated: bool,
+}
+
+/// POST /api/slot-swap — targeted per-slot cache invalidation after `csq move`.
+///
+/// Called by `csq move FROM TO` after the on-disk rename completes. The daemon
+/// must drop any cached refresh-status entries keyed by the FROM and TO slot
+/// numbers so that subsequent `/api/refresh-status` calls reflect the new slot
+/// assignment (SEC-2.11).
+///
+/// The discovery cache is also cleared because account discovery reads
+/// `config-N/` directory names, which have changed after a rename.
+///
+/// Returns `200 {"invalidated": false}` when `from == to` (no-op swap —
+/// request anomaly; silently discarded per fire-and-forget semantics).
+/// Returns `200 {"invalidated": true}` on a valid swap. Validation failures
+/// (out-of-range slot) are logged and the in-range slot is still invalidated.
+async fn slot_swap_handler(
+    State(state): State<RouterState>,
+    Json(req): Json<SlotSwapRequest>,
+) -> Json<SlotSwapResponse> {
+    use crate::types::AccountNum;
+    // MED-3 guard: from == to is a no-op request anomaly (nothing was renamed).
+    if req.from == req.to {
+        tracing::warn!(
+            error_kind = "slot_swap_noop",
+            from = req.from,
+            "slot_swap: from == to — no-op; returning invalidated=false"
+        );
+        return Json(SlotSwapResponse { invalidated: false });
+    }
+    if let Ok(from_num) = AccountNum::try_from(req.from) {
+        state.cache.delete(&from_num.get());
+    } else {
+        tracing::warn!(
+            error_kind = "slot_swap_invalid_from",
+            from = req.from,
+            "slot_swap: from slot out of range — cache entry not deleted"
+        );
+    }
+    if let Ok(to_num) = AccountNum::try_from(req.to) {
+        state.cache.delete(&to_num.get());
+    } else {
+        tracing::warn!(
+            error_kind = "slot_swap_invalid_to",
+            to = req.to,
+            "slot_swap: to slot out of range — cache entry not deleted"
+        );
+    }
+    // Clear discovery cache — config-N/ dirs have been renamed.
+    state.discovery_cache.clear();
+    tracing::debug!(
+        from = req.from,
+        to = req.to,
+        "slot-swap cache invalidation applied"
+    );
+    Json(SlotSwapResponse { invalidated: true })
+}
+
+/// Request body for `POST /api/slot-rebind`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SlotRebindRequest {
+    pub slot: u16,
+}
+
+/// Response body for `POST /api/slot-rebind`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SlotRebindResponse {
+    pub woken: bool,
+}
+
+/// POST /api/slot-rebind — immediate usage-poller wake after a successful
+/// Anthropic login / re-auth of that slot (login-followup).
+///
+/// Called best-effort by `csq login`/the desktop Add-Account and Re-auth
+/// flows AND by the daemon's own `/api/oauth/exchange` success path, once
+/// the on-disk commit + finalize have SUCCEEDED, so the slot's quota row
+/// refreshes within milliseconds of the binding landing instead of up to
+/// `POLL_INTERVAL` (5 min) later. It also fires directly in-process from
+/// [`oauth_exchange_handler_using`]'s success arm — this route is the
+/// channel for clients that commit outside the daemon.
+///
+/// The slot is validated at THIS boundary via `AccountNum::try_from`
+/// (`account-terminal-separation.md` MUST-1 channel (b): the daemon
+/// validates what the client sends and derives nothing from
+/// terminal/env/CLI context). An out-of-range slot → 400 and the wake is
+/// NOT sent.
+///
+/// `WakeChannel::wake_slot` records the slot in a pending SET and stores a
+/// notify permit: a wake that races an in-flight poll is consumed by the
+/// loop's next `select!` instead of being dropped, and N wakes for one slot
+/// coalesce into ONE targeted re-poll of that slot (never a full sweep, and
+/// never over an active cooldown).
+async fn slot_rebind_handler(
+    State(state): State<RouterState>,
+    Json(req): Json<SlotRebindRequest>,
+) -> Result<Json<SlotRebindResponse>, (StatusCode, String)> {
+    use crate::types::AccountNum;
+    let slot = AccountNum::try_from(req.slot)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid account id: {e}")))?;
+    state.usage_poller_wake.wake_slot(slot.get());
+    tracing::debug!(
+        error_kind = "usage_poller_wake_rebind",
+        slot = slot.get(),
+        "slot rebind — usage poller woken for an immediate tick"
+    );
+    Ok(Json(SlotRebindResponse { woken: true }))
+}
+
+/// Request body for `POST /api/harvest-account`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HarvestAccountRequest {
+    pub account: u16,
+}
+
+/// Response body for `POST /api/harvest-account` — `outcome` is one of
+/// `"adopted"`, `"nothing_to_harvest"`, `"ownership_unknown"`, `"busy"`
+/// (fixed vocabulary; carries no token material).
+#[derive(Debug, Clone, Serialize)]
+pub struct HarvestAccountResponse {
+    pub outcome: &'static str,
+}
+
+/// POST /api/harvest-account — round 7c D3: run the custodian's existing
+/// harvest→validate→adopt path (`custodian::reconcile_account`) for `account`
+/// SYNCHRONOUSLY, on request, rather than waiting for the next refresh tick.
+///
+/// This scans EVERY live handle dir bound to `account` — including the
+/// caller's own — which is simpler than a per-dir harvest route and correct:
+/// `csq swap`/`auto_rotate`'s D4/D5 callers ask this BEFORE taking their
+/// per-dir swap lock, so there is no harvest-vs-lock ordering hazard here
+/// (the lock only needs to exclude a CONCURRENT daemon custodian tick, which
+/// `reconcile_account`'s own per-account write path already serializes
+/// against via the store lock it takes internally).
+///
+/// Blocking (subprocess `security` reads + a synchronous validation HTTP
+/// call) — dispatched via `spawn_blocking` so it does not tie up the async
+/// runtime's worker threads, mirroring every other daemon route that does
+/// real I/O.
+async fn harvest_account_handler(
+    State(state): State<RouterState>,
+    Json(req): Json<HarvestAccountRequest>,
+) -> Result<Json<HarvestAccountResponse>, (StatusCode, String)> {
+    let account = AccountNum::try_from(req.account)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid account id: {e}")))?;
+    let Some(uuid) =
+        crate::accounts::profiles::resolve_slot_to_uuid(&state.base_dir, account.get())
+    else {
+        // No identity-store UUID mapping — a pure-legacy slot has no
+        // harvest binding key at all (`reconcile_account`'s doc: "the
+        // harvest binding key"), so there is nothing this route can do.
+        return Ok(Json(HarvestAccountResponse {
+            outcome: "nothing_to_harvest",
+        }));
+    };
+    let base_dir = state.base_dir.as_ref().clone();
+    let uuid_s = uuid.to_string();
+    let http_get: crate::daemon::usage_poller::HttpGetFn =
+        std::sync::Arc::new(|url: &str, token: &str, headers: &[(&str, &str)]| {
+            crate::http::get_bearer_node(url, token, headers)
+        });
+    harvest_account_reconcile_and_respond(
+        base_dir,
+        account,
+        uuid_s,
+        http_get,
+        harvest_gate::real_reconcile(),
+        &harvest_gate::ip_rate_limit_gate(),
+    )
+    .await
+}
+
+/// The part of [`harvest_account_handler`] downstream of account/UUID
+/// resolution, with the [`harvest_gate::ReconcileFn`] and
+/// [`harvest_gate::IpRateLimitGate`] taken as parameters rather than hardcoded
+/// — the test seam for the `Err(e)` (`JoinError`/panic) arm below, which no
+/// test previously exercised. Production always calls this with
+/// [`harvest_gate::real_reconcile`] and the process-wide
+/// [`harvest_gate::ip_rate_limit_gate`] (exactly as the inlined call used to);
+/// tests pass a reconcile closure that panics and a fresh
+/// [`harvest_gate::new_ip_rate_limit_gate`] so the panic path is reachable
+/// without a real keychain or network call.
+async fn harvest_account_reconcile_and_respond(
+    base_dir: PathBuf,
+    account: AccountNum,
+    uuid_s: String,
+    http_get: crate::daemon::usage_poller::HttpGetFn,
+    reconcile: harvest_gate::ReconcileFn,
+    gate: &harvest_gate::IpRateLimitGate,
+) -> Result<Json<HarvestAccountResponse>, (StatusCode, String)> {
+    // C-F5 (`keychain-fix-r8.md`): coordinated through `harvest_gate` —
+    // concurrent callers for the SAME account join the in-flight call
+    // rather than each starting their own; the gate is also where the
+    // refresher shares its own RateLimited observations, so an on-demand
+    // harvest during the refresher's cooldown returns `busy` with no HTTP.
+    let result = harvest_gate::run_with(base_dir, account, uuid_s, http_get, reconcile, gate).await;
+    match result {
+        Ok(harvest_gate::GatedResult::Ran(outcome)) => Ok(Json(HarvestAccountResponse {
+            outcome: map_reconcile_outcome(outcome),
+        })),
+        Ok(harvest_gate::GatedResult::Busy) => {
+            // NIT (`keychain-fix-r8.md`): the handler previously logged
+            // `error_kind` ONLY on the JoinError arm below — the busy/
+            // rate-limited path is a normal, expected outcome (not a
+            // panic), but it is still useful telemetry, so it gets its own
+            // fixed tag at DEBUG rather than staying silent.
+            tracing::debug!(
+                account = account.get(),
+                error_kind = "harvest_account_busy",
+                "harvest-account: rate-limited or too-soon; returning busy with no HTTP call"
+            );
+            Ok(Json(HarvestAccountResponse { outcome: "busy" }))
+        }
+        Err(e) => {
+            // `keychain-fix-r10.md` S-L-2: a JoinError's Display can carry
+            // the panic's own message (tokio includes it when the payload
+            // downcasts to `String`/`&str`) — not opaque; redact before
+            // logging, same as the refresher's own JoinError sites.
+            tracing::warn!(
+                error = %crate::error::redact_tokens(&e.to_string()),
+                error_kind = "harvest_account_task_panicked",
+                panicked = e.is_panic(),
+                "harvest-account task panicked"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "harvest failed".to_string(),
+            ))
+        }
+    }
+}
+
+/// Crate-visible entrypoint into [`harvest_gate`]'s shared, IP-wide
+/// rate-limit gate (D-F6, `keychain-fix-r9.md`) — a thin convenience wrapper
+/// around the process-wide singleton for callers that always want THAT gate,
+/// never an injected one. `refresher.rs` calls this to FEED an observed 429
+/// into the shared gate, and calls [`harvest_gate_is_rate_limited`] to
+/// HONOUR a 429 observed elsewhere before making its own call.
+///
+/// `keychain-fix-r10.md` S-M-1/C-B2 (item 2), C-B1/S-L-5: `harvest_gate`
+/// itself is now `pub(crate)` (no longer private to this module), so
+/// `auto_rotate.rs`'s `tick_with_deps` and `daemon::custodian`'s
+/// `adopt_single_candidate_before_delete_with_gate` call
+/// [`harvest_gate::gate_mark_rate_limited`]/[`harvest_gate::gate_is_rate_limited`]
+/// DIRECTLY against an explicit, injectable `IpRateLimitGate` parameter
+/// (production passes [`harvest_gate::ip_rate_limit_gate`], the SAME
+/// singleton this wrapper reaches — tests pass a fresh one) — mirroring
+/// [`run_with`]'s own split, rather than going through this wrapper. Sync —
+/// see [`harvest_gate::mark_rate_limited_from_refresher`]'s doc for why no
+/// `.await` (and no `blocking_lock`) is needed here.
+pub(crate) fn harvest_gate_mark_rate_limited(account: AccountNum) {
+    harvest_gate::mark_rate_limited_from_refresher(account);
+}
+
+/// Crate-visible entrypoint into [`harvest_gate`]'s shared, IP-wide
+/// rate-limit gate (D-F6) — the read half of
+/// [`harvest_gate_mark_rate_limited`]. `true` iff a 429 observed on ANY
+/// account, by ANY of the FOUR production surfaces that share this gate —
+/// this on-demand harvest route (`run_with`), the refresher's own custodian
+/// call, auto-rotate's opportunistic harvest, or the dead-handle-dir
+/// reaper / pending-clear retry queue's single-candidate adopt
+/// (`daemon::custodian::adopt_single_candidate_before_delete`) — is still
+/// within its cooldown window.
+pub(crate) fn harvest_gate_is_rate_limited() -> bool {
+    harvest_gate::is_rate_limited()
+}
+
+/// C-F5 (`keychain-fix-r8.md`): per-account coordination for
+/// `harvest_account_handler` — single-flight (a concurrent request joins
+/// the in-flight call rather than launching a second one), a rate-limited
+/// gate shared with the refresher (`refresher.rs`'s own custodian call), and
+/// a small minimum interval between two on-demand harvests for the same
+/// account.
+///
+/// Module-static rather than a [`RouterState`] field: `RouterState` is
+/// constructed by EXHAUSTIVE struct literals in four call sites outside this
+/// module (`daemon/detect.rs`, `daemon/server_windows.rs`,
+/// `csq/src/cli/commands/daemon.rs`, `csq/src/desktop/daemon_supervisor.rs`)
+/// — every one would need a new field threaded through for a
+/// `RouterState`-resident version of this state, and there is exactly ONE
+/// daemon process per machine, so a process-wide static carries the same
+/// semantics with none of that coordination cost.
+///
+/// `keychain-fix-r10.md` S-M-1/C-B2 (item 2), C-B1/S-L-5: `pub(crate)`
+/// (rather than private) so `daemon::auto_rotate`'s `tick_with_deps` and
+/// `daemon::custodian`'s `adopt_single_candidate_before_delete` can take
+/// [`harvest_gate::IpRateLimitGate`] as an explicit, injectable parameter —
+/// mirroring [`run_with`]'s own production-singleton-vs-fresh-gate split —
+/// rather than being hardwired to the crate-visible
+/// [`harvest_gate_is_rate_limited`]/[`harvest_gate_mark_rate_limited`]
+/// wrappers, which read/write the process-wide singleton unconditionally
+/// and are UNSAFE to call from a test (see [`ip_rate_limit_gate`]'s own doc:
+/// shared with every other test in this binary for the gate's 600s
+/// cooldown).
+pub(crate) mod harvest_gate {
+    use crate::daemon::custodian::ReconcileOutcome;
+    use crate::daemon::usage_poller::HttpGetFn;
+    use crate::types::AccountNum;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+    use std::time::{Duration, Instant};
+    use tokio::sync::Mutex as AsyncMutex;
+
+    /// Minimum spacing between two on-demand harvests for the SAME
+    /// account. `reconcile_account` does a keychain `security` subprocess
+    /// read plus (when a candidate exists) a live validation HTTPS call —
+    /// hammering it faster than this does not surface a fresher token (the
+    /// refresher itself only reconciles every 5 minutes) and only spends
+    /// more of the same per-IP Cloudflare budget the refresher's own
+    /// backoff exists to protect. Typical case: an account with no pending
+    /// harvest and no recent call pays only the reconcile's own cost
+    /// (usually a fraction of a second — see `client::HARVEST_TIMEOUT`'s
+    /// doc for the WORST case, which this constant is not sized against).
+    const MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+    /// How long a `RateLimited` observation — from THIS route or from the
+    /// refresher's own custodian call — gates further on-demand harvests
+    /// for the account. Mirrors the refresher's base `FAILURE_COOLDOWN`
+    /// (`refresher.rs`) so the two surfaces agree on how long a 429 against
+    /// this account's validation endpoint should be respected.
+    const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(600);
+
+    #[derive(Default)]
+    struct AccountState {
+        last_completed_at: Option<Instant>,
+        last_outcome: Option<ReconcileOutcome>,
+        /// `keychain-fix-r9.md` S-L-1: `Some(started_at)` while a reconcile
+        /// is running for this account — set BEFORE `spawn_blocking`, and
+        /// cleared INSIDE that spawned task (never by the awaiting caller's
+        /// own continuation). See [`AccountGate`]'s doc for why.
+        in_flight_since: Option<Instant>,
+    }
+
+    /// S-L-1: the per-account single-flight mutex PLUS the notification
+    /// primitive that lets a concurrent caller JOIN an in-flight reconcile
+    /// without busy-polling. Bundled together (rather than a second
+    /// process-wide map keyed by account) so `state_for` hands out one
+    /// `Arc` per account covering both.
+    ///
+    /// **Why the prior design lost single-flight state on a client
+    /// disconnect.** The PRIOR `run_with` held the per-account
+    /// `tokio::sync::Mutex` guard across the ENTIRE `spawn_blocking(...)
+    /// .await?` — that was how a second concurrent caller "joined": it
+    /// blocked trying to acquire the SAME guard. But an axum handler future
+    /// is dropped the instant its client disconnects, and dropping the
+    /// future drops every local it owns, INCLUDING that guard — releasing
+    /// the per-account lock immediately, well before the underlying
+    /// `spawn_blocking` task (which keeps running independently; dropping a
+    /// `JoinHandle` does not cancel it) actually finishes. The final state
+    /// write (`guard.last_completed_at = ...`) lived in the CALLER's own
+    /// continuation after that `.await?` — code that, for a dropped future,
+    /// never runs. A second request arriving in that window found the lock
+    /// free and `last_completed_at`/`last_outcome` untouched from this
+    /// attempt, and launched an entirely redundant SECOND reconcile — the
+    /// exact duplicate-live-network-call single-flight exists to prevent.
+    ///
+    /// **The fix.** The per-account lock is now held only for the quick,
+    /// synchronous state CHECK/MARK before spawning (see `run_with`) — never
+    /// across the blocking reconcile itself — so dropping the caller's
+    /// future cannot strand it. `in_flight_since` is set before spawning and
+    /// is the signal a concurrent caller joins on; the SPAWNED TASK (which
+    /// is not tied to the caller future's lifetime) does the final state
+    /// write and calls [`tokio::sync::Notify::notify_waiters`] on `notify`,
+    /// guaranteed to run to completion even if every caller who ever awaited
+    /// it has since disconnected.
+    struct AccountGate {
+        state: AsyncMutex<AccountState>,
+        notify: tokio::sync::Notify,
+    }
+
+    static PER_ACCOUNT: OnceLock<StdMutex<HashMap<u16, Arc<AccountGate>>>> = OnceLock::new();
+
+    fn state_for(account: u16) -> Arc<AccountGate> {
+        let map = PER_ACCOUNT.get_or_init(|| StdMutex::new(HashMap::new()));
+        let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(guard.entry(account).or_insert_with(|| {
+            Arc::new(AccountGate {
+                state: AsyncMutex::new(AccountState::default()),
+                notify: tokio::sync::Notify::new(),
+            })
+        }))
+    }
+
+    /// `keychain-fix-r9.md` D-F6: Anthropic's `/api/oauth/profile` 429 is
+    /// IP-wide (Cloudflare's per-IP throttle), never per-account — a 429
+    /// validating account 3's token means account 7's validate call would
+    /// 429 too. `AccountState`'s PRIOR per-account `rate_limited_until`
+    /// field (removed above) modeled a per-account limit that does not
+    /// exist, which let every OTHER account's on-demand harvest keep
+    /// hammering an endpoint already known to be throttling this daemon's
+    /// IP. This shared (never per-account) cooldown is fed by every surface
+    /// that can observe a 429 here — this route's own call
+    /// ([`run_with`]), the refresher's own custodian call
+    /// (`refresher.rs`'s `tick`, via [`super::harvest_gate_mark_rate_limited`]),
+    /// and auto-rotate's opportunistic harvest (`auto_rotate.rs`'s `tick`,
+    /// via the same wrapper) — and honoured by all three before making a
+    /// validate call.
+    ///
+    /// A plain `std::sync::Mutex`, not the per-account map's
+    /// `tokio::sync::Mutex`: the critical section is a single
+    /// `Option<Instant>` read/write, cheap enough to lock synchronously
+    /// from EITHER an async context (the route, the refresher) or a
+    /// genuinely synchronous one (`auto_rotate::tick`, which runs on a
+    /// blocking OS thread and cannot `.await` at all) without ever needing
+    /// `blocking_lock` — sidestepping the whole bug class that `blocking_lock`
+    /// on a `tokio::sync::Mutex` from a runtime worker created (round 9,
+    /// S-C-1 / D-F1).
+    pub(crate) type IpRateLimitGate = Arc<StdMutex<Option<Instant>>>;
+
+    pub(crate) fn new_ip_rate_limit_gate() -> IpRateLimitGate {
+        Arc::new(StdMutex::new(None))
+    }
+
+    static IP_RATE_LIMIT_GATE: OnceLock<IpRateLimitGate> = OnceLock::new();
+
+    /// The ONE process-wide gate every PRODUCTION surface shares — the same
+    /// "exactly one daemon process per machine" reasoning the module doc
+    /// above already gives for [`PER_ACCOUNT`]. Tests MUST NOT call this: it
+    /// is shared with every OTHER test in this binary, and a truly global
+    /// (not per-account-keyed) scalar has no per-test key to avoid
+    /// collisions with — construct a fresh [`new_ip_rate_limit_gate`]
+    /// instead, exactly as [`run_with`]'s own tests do.
+    pub(crate) fn ip_rate_limit_gate() -> IpRateLimitGate {
+        Arc::clone(IP_RATE_LIMIT_GATE.get_or_init(new_ip_rate_limit_gate))
+    }
+
+    /// True iff a 429 observed on ANY account, from ANY of the three
+    /// surfaces above, is still within its cooldown window. Pure over the
+    /// injected gate: unit-testable with a fresh gate and zero risk of
+    /// cross-test races.
+    pub(crate) fn gate_is_rate_limited(gate: &IpRateLimitGate) -> bool {
+        let guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+        matches!(*guard, Some(until) if Instant::now() < until)
+    }
+
+    /// Records a 429 observed anywhere against the shared cooldown.
+    pub(crate) fn gate_mark_rate_limited(gate: &IpRateLimitGate) {
+        let mut guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(Instant::now() + RATE_LIMIT_COOLDOWN);
+    }
+
+    /// The two shapes a gated call can return: it actually ran the
+    /// custodian (`Ran`), or it was suppressed entirely — rate-limited or
+    /// too soon after the last call (`Busy`, mapped to the wire outcome
+    /// `"busy"`, same vocabulary [`super::map_reconcile_outcome`] already
+    /// uses for `SkippedUnknown`/`RateLimited`/`NotAdopted`).
+    pub(super) enum GatedResult {
+        Ran(ReconcileOutcome),
+        Busy,
+    }
+
+    /// Injectable seam for the actual reconcile call (Transport Injection
+    /// Pattern — see the daemon-architecture skill's table, and
+    /// `daemon::auto_rotate`'s `ReconcileAccountFn`, the same pattern
+    /// applied to the SAME underlying call). Production passes
+    /// [`real_reconcile`]; tests pass a call-counting closure so the
+    /// single-flight/min-interval/rate-limit coordination is directly
+    /// testable without a live keychain or network call.
+    pub(super) type ReconcileFn = std::sync::Arc<
+        dyn Fn(&std::path::Path, AccountNum, &str, &HttpGetFn) -> ReconcileOutcome + Send + Sync,
+    >;
+
+    /// `pub(super)`, not private: [`super::harvest_account_reconcile_and_respond`]
+    /// (the parent module's test seam for the panic/`JoinError` arm) needs to
+    /// pass this SAME production reconcile fn when a test wants everything
+    /// EXCEPT the reconcile call itself to be real — no test in this crate
+    /// currently does that, but the visibility is the minimal seam
+    /// (`user-path-verification.md`-style: least surface, not "make it all
+    /// public").
+    pub(super) fn real_reconcile() -> ReconcileFn {
+        // On-demand harvest: shared Mismatch, call-local Dead (see
+        // `custodian::NegativeCache::on_demand_view`).
+        std::sync::Arc::new(crate::daemon::custodian::reconcile_account_on_demand)
+    }
+
+    /// Runs `custodian::reconcile_account` for `account`, coordinated
+    /// through the per-account gate. See the module doc for what each
+    /// coordination axis buys.
+    pub(super) async fn run_with(
+        base_dir: PathBuf,
+        account: AccountNum,
+        uuid: String,
+        http_get: HttpGetFn,
+        reconcile: ReconcileFn,
+        gate: &IpRateLimitGate,
+    ) -> Result<GatedResult, tokio::task::JoinError> {
+        let request_start = Instant::now();
+
+        // D-F6: the shared IP-wide gate is checked FIRST, before ever taking
+        // the per-account lock below — a 429 observed against ANY account
+        // (by this route, the refresher, or auto-rotate) means this account's
+        // call would 429 too, so there is nothing account-specific left to
+        // decide.
+        if gate_is_rate_limited(gate) {
+            return Ok(GatedResult::Busy);
+        }
+
+        let acc_gate = state_for(account.get());
+
+        // S-L-1: join loop. The per-account lock is held ONLY for this
+        // quick synchronous check-and-mark — never across the blocking
+        // reconcile below (see `AccountGate`'s doc for why that matters).
+        // `notified()` is created BEFORE re-locking on each iteration
+        // (tokio's documented race-free pattern: a notification fired
+        // between our check and the `.await` below is still caught, because
+        // the `Notified` future already registered interest at creation).
+        loop {
+            // `keychain-fix-r10.md` S-M-1/C-B2 (item 2), C-B1/S-L-5: re-check
+            // the shared gate on EVERY iteration, not just before the loop.
+            // A caller that joined the `notified.await` wait below can sleep
+            // through a 429 observed by a DIFFERENT account's `run_with` (or
+            // by the refresher/auto-rotate) while it waits — the pre-loop
+            // check above only catches a 429 that landed before this call
+            // started. Without this re-check, a request that starts clean,
+            // waits out an in-flight reconcile, and wakes up AFTER the gate
+            // was marked mid-wait would still proceed to spawn a fresh
+            // reconcile against an endpoint already known to be throttling
+            // this daemon's IP.
+            if gate_is_rate_limited(gate) {
+                return Ok(GatedResult::Busy);
+            }
+
+            let notified = acc_gate.notify.notified();
+            let mut guard = acc_gate.state.lock().await;
+
+            if let Some(completed_at) = guard.last_completed_at {
+                // A call that COMPLETED after this request started waiting
+                // is the in-flight call this request joined — reuse its
+                // outcome rather than reconciling again.
+                if completed_at >= request_start {
+                    let outcome = guard
+                        .last_outcome
+                        .expect("last_completed_at implies last_outcome is set");
+                    return Ok(GatedResult::Ran(outcome));
+                }
+                // Minimum interval: a call that completed BEFORE this
+                // request started, but too recently, is throttled rather
+                // than re-run.
+                if completed_at.elapsed() < MIN_INTERVAL {
+                    return Ok(GatedResult::Busy);
+                }
+            }
+
+            if guard.in_flight_since.is_some() {
+                // Someone else's reconcile is running RIGHT NOW (possibly
+                // one whose ORIGINAL caller has since disconnected — S-L-1:
+                // that caller's future being dropped does not affect this
+                // one). Wait for it to finish and loop to re-check, rather
+                // than busy-polling.
+                drop(guard);
+                notified.await;
+                continue;
+            }
+
+            // No one in flight, nothing recent enough to reuse — this
+            // caller starts the reconcile. Mark in-flight BEFORE spawning,
+            // then release the lock: it must NOT be held across the
+            // blocking call below.
+            guard.in_flight_since = Some(Instant::now());
+            break;
+        }
+
+        let acc_gate_for_task = Arc::clone(&acc_gate);
+        let gate_for_task = Arc::clone(gate);
+        let outcome = tokio::task::spawn_blocking(move || {
+            // S-L-1: `catch_unwind` so the in-flight marker and the notify
+            // are ALWAYS cleared/fired — success or panic — never left
+            // clearing to a caller continuation that a disconnect can
+            // prevent from ever running. A stuck `in_flight_since` would
+            // wedge every future caller for this account permanently (the
+            // join loop above would `notified().await` forever, since
+            // nothing would ever call `notify_waiters` again).
+            let reconcile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reconcile(&base_dir, account, &uuid, &http_get)
+            }));
+            {
+                // Genuine OS thread (spawn_blocking), never a tokio runtime
+                // worker — `blocking_lock` is the correct, safe primitive
+                // here (contrast the ASYNC-context misuse this same round
+                // fixed in `mark_rate_limited_from_refresher`, D-F1).
+                let mut guard = acc_gate_for_task.state.blocking_lock();
+                guard.in_flight_since = None;
+                if let Ok(outcome) = &reconcile_result {
+                    guard.last_completed_at = Some(Instant::now());
+                    guard.last_outcome = Some(*outcome);
+                    if matches!(outcome, ReconcileOutcome::RateLimited) {
+                        gate_mark_rate_limited(&gate_for_task);
+                    }
+                }
+            }
+            acc_gate_for_task.notify.notify_waiters();
+            match reconcile_result {
+                Ok(outcome) => outcome,
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        })
+        .await?;
+
+        Ok(GatedResult::Ran(outcome))
+    }
+
+    /// Called by the refresher (`refresher.rs`) whenever ITS OWN custodian
+    /// call for `account` comes back `RateLimited` — marks the SAME shared,
+    /// IP-wide gate [`run_with`] reads (D-F6), so an on-demand harvest, a
+    /// later refresher tick, a later auto-rotate tick, or the reaper/retry
+    /// queue's single-candidate adopt during this cooldown window all
+    /// return `busy`/skip with no further HTTP call against an endpoint
+    /// already known to be throttling this daemon's IP.
+    ///
+    /// `keychain-fix-r10.md` item 2: auto-rotate and the reaper/retry queue
+    /// no longer route through this function — they call
+    /// [`gate_mark_rate_limited`] directly against an injected
+    /// [`IpRateLimitGate`] (production: [`ip_rate_limit_gate`], the SAME
+    /// singleton this function marks), so their own tests can inject a
+    /// fresh gate instead of mutating process-wide state shared with every
+    /// other test in this binary.
+    ///
+    /// Sync, not async: this is a plain `std::sync::Mutex` critical section
+    /// (see [`IpRateLimitGate`]'s doc), so it needs no `.await` and is safe
+    /// to call from EITHER an async context (the refresher, after it has
+    /// already `.await`-ed the custodian's own `spawn_blocking` JoinHandle)
+    /// or a genuinely synchronous one (`auto_rotate::tick`, which cannot
+    /// `.await` at all). The PRIOR implementation locked a per-account
+    /// `tokio::sync::Mutex` with `blocking_lock`, which panics with "Cannot
+    /// block the current thread from within a runtime" when called from a
+    /// tokio worker thread — exactly the refresher's own call shape,
+    /// silently killing the refresher's `run_loop` task and stopping ALL
+    /// token refresh with no further trace (round 9, S-C-1 / D-F1). Moving
+    /// this state onto a `std::sync::Mutex` instead removes the whole
+    /// blocking-lock-on-a-worker footgun class rather than merely working
+    /// around the one call site that hit it. See `run_tick_supervised` in
+    /// `refresher.rs` for the independent backstop that now also survives a
+    /// panic anywhere on the tick call graph.
+    ///
+    /// `account` is accepted (rather than a bare `()`) purely for the
+    /// caller-identifying log line below — the effect itself is IP-wide, not
+    /// account-scoped.
+    pub(crate) fn mark_rate_limited_from_refresher(account: AccountNum) {
+        gate_mark_rate_limited(&ip_rate_limit_gate());
+        tracing::debug!(
+            account = account.get(),
+            "shared IP-wide rate-limit gate marked (D-F6)"
+        );
+    }
+
+    /// True iff the shared IP-wide gate (D-F6) is currently within its
+    /// cooldown window, from ANY observation on ANY account. Consulted by
+    /// the refresher (`refresher.rs`, via [`harvest_gate_is_rate_limited`])
+    /// before making its own opportunistic custodian call. `keychain-fix-r10.md`
+    /// item 2: auto-rotate (`auto_rotate.rs`) and the reaper/retry queue's
+    /// single-candidate adopt (`daemon::custodian`) consult the SAME
+    /// singleton too, but via an injected [`IpRateLimitGate`] parameter
+    /// (production: [`ip_rate_limit_gate`]) and [`gate_is_rate_limited`]
+    /// directly, not this function — so a 429 observed on any of the four
+    /// surfaces stops the others from immediately re-hitting the same
+    /// throttled endpoint.
+    pub(crate) fn is_rate_limited() -> bool {
+        gate_is_rate_limited(&ip_rate_limit_gate())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Every test picks a UNIQUE account number — `PER_ACCOUNT` is a
+        /// process-wide static, so two tests sharing an account number
+        /// would observe each other's gate state under `cargo test`'s
+        /// default parallel test execution. The D-F6 IP-wide rate-limit
+        /// gate has no per-account key at all, so every test below
+        /// constructs its OWN [`new_ip_rate_limit_gate`] via
+        /// [`fresh_gate`] rather than touching [`ip_rate_limit_gate`]'s
+        /// process-wide singleton — that singleton is reserved for
+        /// production wiring ONLY (see its own doc, and the note at the
+        /// bottom of this module explaining why NO test here touches it:
+        /// `refresher.rs`'s `tick` reads the same singleton on every
+        /// invocation, including every refresher test in this process).
+        fn fresh_gate() -> IpRateLimitGate {
+            new_ip_rate_limit_gate()
+        }
+
+        fn noop_http_get() -> HttpGetFn {
+            Arc::new(|_url: &str, _token: &str, _headers: &[(&str, &str)]| {
+                Err("unused: the injected reconcile never calls it".to_string())
+            })
+        }
+
+        fn counting_reconcile(
+            counter: Arc<AtomicUsize>,
+            outcome: ReconcileOutcome,
+            delay: Duration,
+        ) -> ReconcileFn {
+            Arc::new(move |_base, _account, _uuid, _http_get| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                // Forces the two concurrent callers below to overlap: the
+                // SECOND call's `request_start` must be captured (and it
+                // must reach the point of trying to acquire the gate's
+                // lock) WHILE the first call's reconcile is still running,
+                // or the "joined an in-flight call" branch is never
+                // exercised — the two calls would simply run sequentially,
+                // each doing its own reconcile, and the test would pass for
+                // the wrong reason (`instrument-discipline.md` MUST-2).
+                std::thread::sleep(delay);
+                outcome
+            })
+        }
+
+        /// C-F5 (`keychain-fix-r8.md`): two concurrent `run_with` calls for
+        /// the SAME account must result in exactly ONE reconcile call — the
+        /// second joins the in-flight call rather than launching its own.
+        ///
+        /// RED: reverting to "call reconcile unconditionally, never check
+        /// `last_completed_at`" makes `calls.load(..)` come back `2`
+        /// instead of the required `1`.
+        #[tokio::test]
+        async fn concurrent_calls_for_same_account_join_into_one_reconcile() {
+            let account = AccountNum::try_from(981u16).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let reconcile = counting_reconcile(
+                Arc::clone(&calls),
+                ReconcileOutcome::NoCandidates,
+                Duration::from_millis(80),
+            );
+
+            let base = PathBuf::from("/nonexistent/fixture-base");
+            let gate = fresh_gate();
+            let (r1, r2) = tokio::join!(
+                run_with(
+                    base.clone(),
+                    account,
+                    "uuid-fixture".to_string(),
+                    noop_http_get(),
+                    Arc::clone(&reconcile),
+                    &gate,
+                ),
+                async {
+                    // Give the first call time to acquire the gate lock
+                    // and enter its (slow, 80ms) reconcile before this one
+                    // starts trying to acquire it too.
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    run_with(
+                        base.clone(),
+                        account,
+                        "uuid-fixture".to_string(),
+                        noop_http_get(),
+                        reconcile,
+                        &gate,
+                    )
+                    .await
+                }
+            );
+            assert!(matches!(
+                r1,
+                Ok(GatedResult::Ran(ReconcileOutcome::NoCandidates))
+            ));
+            assert!(matches!(
+                r2,
+                Ok(GatedResult::Ran(ReconcileOutcome::NoCandidates))
+            ));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "exactly one reconcile call should have run for the two concurrent callers"
+            );
+        }
+
+        /// S-L-1: a dropped CALLER future (the axum-handler analogue of a
+        /// client disconnecting mid-request) must NOT lose the in-flight
+        /// marker or prevent the underlying reconcile from finishing and
+        /// recording its outcome. Proven end-to-end: abort the first
+        /// caller's task while its reconcile is provably still running
+        /// (blocked on a channel this test controls, not a sleep — an
+        /// ordering proof, not a timing guess), unblock it, then show a
+        /// SECOND caller for the same account joins the abandoned call's
+        /// result via the notify path rather than launching a duplicate
+        /// reconcile.
+        ///
+        /// RED: reverting `run_with` to hold the per-account guard across
+        /// the `spawn_blocking(...).await?` (the pre-S-L-1 shape) makes the
+        /// second caller below launch its OWN reconcile —
+        /// `calls.load(..)` comes back `2`, not `1` — because dropping the
+        /// first caller's task releases that guard immediately, well before
+        /// the still-running blocking task ever writes `last_completed_at`.
+        #[tokio::test]
+        async fn dropped_caller_future_does_not_lose_the_in_flight_marker() {
+            let account = AccountNum::try_from(996u16).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (unblock_tx, unblock_rx) = std::sync::mpsc::channel::<()>();
+            let unblock_rx = Arc::new(std::sync::Mutex::new(Some(unblock_rx)));
+            // Signals "the reconcile closure has actually started (and is
+            // now blocked on `unblock_rx`)" — awaited below so the abort is
+            // an ORDERING PROOF, not a timing guess
+            // (`instrument-discipline.md` MUST-2): a sleep-based or
+            // yield-count-based version would pass identically whether or
+            // not the closure had genuinely started before the abort.
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+            let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
+            let reconcile: ReconcileFn = {
+                let calls = Arc::clone(&calls);
+                let unblock_rx = Arc::clone(&unblock_rx);
+                let started_tx = Arc::clone(&started_tx);
+                Arc::new(
+                    move |_base: &std::path::Path,
+                          _account: AccountNum,
+                          _uuid: &str,
+                          _http_get: &HttpGetFn| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        if let Some(tx) = started_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        // Block until the test explicitly releases us.
+                        if let Some(rx) = unblock_rx.lock().unwrap().take() {
+                            let _ = rx.recv();
+                        }
+                        ReconcileOutcome::NoCandidates
+                    },
+                )
+            };
+            let gate = fresh_gate();
+            let base = PathBuf::from("/nonexistent/fixture-base");
+
+            // Drive the first caller on its OWN task, then abort that task —
+            // simulating the axum handler future being dropped mid-request.
+            let gate_for_first = Arc::clone(&gate);
+            let base_for_first = base.clone();
+            let reconcile_for_first = Arc::clone(&reconcile);
+            let first_task = tokio::spawn(async move {
+                run_with(
+                    base_for_first,
+                    account,
+                    "uuid-fixture".to_string(),
+                    noop_http_get(),
+                    reconcile_for_first,
+                    &gate_for_first,
+                )
+                .await
+            });
+            // Deterministically wait for proof the closure is running (and
+            // therefore blocked in it, not merely "probably" so) before
+            // aborting — `abort()` only takes effect at the task's next
+            // await point, which by now is provably the `spawn_blocking`
+            // JoinHandle `.await`, not an earlier one.
+            started_rx.await.unwrap();
+            first_task.abort();
+            let first_result = first_task.await;
+            assert!(
+                matches!(&first_result, Err(e) if e.is_cancelled()),
+                "the first caller's task must actually have been cancelled \
+                 (dropped mid-flight), or this test proves nothing"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "the reconcile closure must have started (and be blocked in \
+                 it) before the abort — otherwise nothing was in flight to lose"
+            );
+
+            // Ordering proof, not a timing guess: poll the second caller
+            // ONCE while the abandoned reconcile is still provably blocked.
+            // That single poll stamps its `request_start`, finds
+            // `in_flight_since` set, registers its `Notified` and parks —
+            // so it has joined the in-flight call BEFORE that call can
+            // complete. Only then is the reconcile released. Previously the
+            // release came first, and the reconcile could finish before the
+            // second caller started; it then saw "completed just before I
+            // arrived" and returned `Busy` under MIN_INTERVAL (measured: 2
+            // of 300 runs on a measured slow host).
+            let mut second_fut = Box::pin(run_with(
+                base,
+                account,
+                "uuid-fixture".to_string(),
+                noop_http_get(),
+                reconcile,
+                &gate,
+            ));
+            let first_poll_ready = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(
+                    std::future::Future::poll(second_fut.as_mut(), cx).is_ready(),
+                )
+            })
+            .await;
+            assert!(
+                !first_poll_ready,
+                "the second caller must park on the in-flight call, not \
+                 finish (or start its own reconcile) on its first poll"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "joining the in-flight call must not have started a second reconcile"
+            );
+
+            // Release the blocked reconcile — it keeps running on its OWN
+            // spawn_blocking thread, independent of the aborted task above,
+            // records its outcome and wakes the parked second caller.
+            unblock_tx.send(()).unwrap();
+            let second = second_fut.await;
+            assert!(matches!(
+                second,
+                Ok(GatedResult::Ran(ReconcileOutcome::NoCandidates))
+            ));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "the second caller must NOT have triggered its own reconcile \
+                 call — it joins the first (abandoned-by-its-caller, but \
+                 still-running-to-completion) call's result"
+            );
+        }
+
+        /// `keychain-fix-r10.md` S-M-1/C-B2 (item 2), C-B1/S-L-5: the gate is
+        /// re-checked on EVERY loop iteration, not just once before the loop
+        /// — a caller that JOINS an in-flight call (via `notified.await`)
+        /// must not proceed to reuse that call's outcome (or launch its own)
+        /// if the gate was marked WHILE it was waiting. Two calls for the
+        /// SAME account: the first (A) is spawned on its own task and blocks
+        /// mid-reconcile on a channel this test controls (an ordering proof,
+        /// per `instrument-discipline.md` MUST-2 — never a timing guess);
+        /// once A's reconcile is provably running (and therefore
+        /// `in_flight_since` is provably set), the second call (B) is
+        /// spawned and cooperatively yielded to until it has provably
+        /// entered the join wait (`notified.await`) — B's OWN reconcile
+        /// closure must NEVER run, so its only observable progress is via
+        /// the loop's pre-lock gate check, proven below by mutation. THEN,
+        /// and only then, the gate is marked and A is released.
+        ///
+        /// RED: reverting the loop-top `if gate_is_rate_limited(gate) {
+        /// return Ok(GatedResult::Busy) }` re-check (this round's fix) makes
+        /// B fall through to `last_completed_at >= request_start` once A
+        /// completes, returning `Ran(NoCandidates)` instead of the required
+        /// `Busy` — proceeding to reuse an outcome produced entirely AFTER
+        /// this daemon's IP was already known to be throttled.
+        #[tokio::test]
+        async fn run_with_re_checks_gate_after_joining_an_in_flight_call() {
+            let account = AccountNum::try_from(998u16).unwrap();
+            let base = PathBuf::from("/nonexistent/fixture-base");
+            let gate = fresh_gate();
+
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+            let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
+            let (unblock_tx, unblock_rx) = std::sync::mpsc::channel::<()>();
+            let unblock_rx = Arc::new(std::sync::Mutex::new(Some(unblock_rx)));
+            let reconcile_a: ReconcileFn = {
+                let started_tx = Arc::clone(&started_tx);
+                let unblock_rx = Arc::clone(&unblock_rx);
+                Arc::new(
+                    move |_base: &std::path::Path, _account, _uuid: &str, _http_get: &HttpGetFn| {
+                        if let Some(tx) = started_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        if let Some(rx) = unblock_rx.lock().unwrap().take() {
+                            let _ = rx.recv();
+                        }
+                        ReconcileOutcome::NoCandidates
+                    },
+                )
+            };
+
+            let gate_for_a = Arc::clone(&gate);
+            let base_for_a = base.clone();
+            let task_a = tokio::spawn(async move {
+                run_with(
+                    base_for_a,
+                    account,
+                    "uuid-fixture".to_string(),
+                    noop_http_get(),
+                    reconcile_a,
+                    &gate_for_a,
+                )
+                .await
+            });
+
+            // A is provably running (and therefore in_flight_since is
+            // provably set) before B is even spawned.
+            started_rx.await.unwrap();
+
+            let gate_for_b = Arc::clone(&gate);
+            let base_for_b = base.clone();
+            let reconcile_b: ReconcileFn = Arc::new(
+                |_base: &std::path::Path, _account, _uuid: &str, _http_get: &HttpGetFn| {
+                    panic!(
+                        "B's own reconcile must never run — it must either join A's \
+                         result or (with the gate marked mid-wait) return Busy"
+                    );
+                },
+            );
+            let task_b = tokio::spawn(async move {
+                run_with(
+                    base_for_b,
+                    account,
+                    "uuid-fixture".to_string(),
+                    noop_http_get(),
+                    reconcile_b,
+                    &gate_for_b,
+                )
+                .await
+            });
+
+            // Cooperatively yield so B's task actually runs up to its
+            // genuine pending await point (`notified.await` — A still holds
+            // `in_flight_since`, so B cannot take any other branch). This is
+            // a scheduler-fairness yield, not a wall-clock timing guess: B
+            // has nothing else to wait on except A's completion, which we
+            // have not yet permitted.
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+
+            // Mark the gate WHILE B is still waiting, THEN release A.
+            gate_mark_rate_limited(&gate);
+            unblock_tx.send(()).unwrap();
+
+            let result_a = task_a.await.unwrap();
+            let result_b = task_b.await.unwrap();
+
+            assert!(matches!(
+                result_a,
+                Ok(GatedResult::Ran(ReconcileOutcome::NoCandidates))
+            ));
+            assert!(
+                matches!(result_b, Ok(GatedResult::Busy)),
+                "B must re-check the gate on waking from the join wait and \
+                 return Busy, not reuse A's outcome or launch its own reconcile"
+            );
+        }
+
+        /// C-F5/S-MEDIUM-2, D-F6: once a call comes back `RateLimited`, a
+        /// LATER call — for the SAME account, or ANY OTHER account, since
+        /// the gate is IP-wide (D-F6) — within the cooldown window must
+        /// return `Busy` WITHOUT invoking reconcile again: no further HTTP
+        /// validation call against an endpoint already known to be
+        /// throttling this daemon's IP.
+        #[tokio::test]
+        async fn rate_limited_outcome_gates_the_next_call_with_no_further_reconcile() {
+            let account = AccountNum::try_from(982u16).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let reconcile = counting_reconcile(
+                Arc::clone(&calls),
+                ReconcileOutcome::RateLimited,
+                Duration::ZERO,
+            );
+            let base = PathBuf::from("/nonexistent/fixture-base");
+            let gate = fresh_gate();
+
+            let first = run_with(
+                base.clone(),
+                account,
+                "uuid-fixture".to_string(),
+                noop_http_get(),
+                Arc::clone(&reconcile),
+                &gate,
+            )
+            .await;
+            assert!(matches!(
+                first,
+                Ok(GatedResult::Ran(ReconcileOutcome::RateLimited))
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            // D-F6: a DIFFERENT account, same shared gate — must also see
+            // Busy, proving the cooldown is IP-wide and not keyed by
+            // account 982 specifically. 995, not 983 — 983 is used by
+            // `refresher_rate_limit_observation_gates_a_later_on_demand_call`
+            // below, and reusing it would let the two tests' PER_ACCOUNT
+            // single-flight/min-interval state collide under parallel
+            // execution.
+            let other_account = AccountNum::try_from(995u16).unwrap();
+            let second = run_with(
+                base,
+                other_account,
+                "uuid-fixture-2".to_string(),
+                noop_http_get(),
+                reconcile,
+                &gate,
+            )
+            .await;
+            assert!(
+                matches!(second, Ok(GatedResult::Busy)),
+                "a call within the RateLimited cooldown must return Busy"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "the gated call must not have invoked reconcile a second time"
+            );
+        }
+
+        /// The refresher's OWN observation feeds the SAME shared, IP-wide
+        /// gate (D-F6) `run_with` reads — an on-demand harvest arriving
+        /// after the refresher's own custodian call was rate-limited must
+        /// also see `Busy`, with no reconcile call at all, for ANY account
+        /// (not just the one the refresher happened to observe the 429 on).
+        ///
+        /// Exercises [`gate_mark_rate_limited`] directly against a FRESH
+        /// injected gate rather than [`mark_rate_limited_from_refresher`]
+        /// (which always writes the process-wide [`ip_rate_limit_gate`]
+        /// singleton) — see [`fresh_gate`]'s doc for why: a truly global,
+        /// non-per-account-keyed scalar has no per-test isolation key, so
+        /// every test in this module other than the ONE dedicated
+        /// singleton-wiring test below stays off the real singleton
+        /// entirely. `gate_mark_rate_limited` IS
+        /// `mark_rate_limited_from_refresher`'s real body (the singleton
+        /// pass-through is a one-line, untested-by-design wrapper), so this
+        /// exercises the identical logic the production call path runs.
+        #[tokio::test]
+        async fn refresher_rate_limit_observation_gates_a_later_on_demand_call() {
+            let gate = fresh_gate();
+            // Mirrors the real caller: `refresher.rs`'s `tick` invokes
+            // `mark_rate_limited_from_refresher` directly from its own async
+            // body, AFTER it has already `.await`-ed the custodian's
+            // `spawn_blocking` JoinHandle — a tokio runtime worker, not a
+            // blocking OS thread. `auto_rotate.rs`'s `tick` invokes the SAME
+            // wrapper from a genuinely synchronous body (round 9, S-C-1 /
+            // D-F1 for the async-context bug this fixes; D-F6 for the
+            // IP-wide sharing this test exercises).
+            gate_mark_rate_limited(&gate);
+
+            let account = AccountNum::try_from(984u16).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let reconcile = counting_reconcile(
+                Arc::clone(&calls),
+                ReconcileOutcome::NoCandidates,
+                Duration::ZERO,
+            );
+            let result = run_with(
+                PathBuf::from("/nonexistent/fixture-base"),
+                account,
+                "uuid-fixture".to_string(),
+                noop_http_get(),
+                reconcile,
+                &gate,
+            )
+            .await;
+            assert!(matches!(result, Ok(GatedResult::Busy)));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "no reconcile call may occur once the shared gate observation is set"
+            );
+        }
+
+        // No test in this file calls `mark_rate_limited_from_refresher` or
+        // `is_rate_limited` (the crate-visible pair that always writes/reads
+        // the process-wide `ip_rate_limit_gate()` singleton) — deliberately.
+        // `refresher.rs`'s `tick` reads that SAME singleton via
+        // `harvest_gate_is_rate_limited()` on every invocation, including
+        // every refresher test in this binary, and the mark's cooldown is
+        // 600s: a test that legitimately marked the real singleton would
+        // silently flip `rate_limited_this_tick` to `true` for every OTHER
+        // refresher test in this process for the next 10 minutes,
+        // reclassifying their expected `"refreshed"` outcomes as
+        // `"rate_limited"`. Both wrappers are one-line pass-throughs to
+        // `gate_mark_rate_limited`/`gate_is_rate_limited` via
+        // `ip_rate_limit_gate()` — already exercised, injected, above — so
+        // the wiring is visible by inspection and does not need a test that
+        // would introduce exactly the hazard this file's own design (fresh
+        // gate per test) exists to avoid.
+    }
+}
+
+/// Pure mapping from the custodian's internal [`ReconcileOutcome`] to the
+/// wire-level outcome string — factored out of [`harvest_account_handler`]
+/// so every variant is directly unit-testable without driving the full
+/// HTTP/custodian machinery (which needs live keychain harvesting).
+fn map_reconcile_outcome(outcome: crate::daemon::custodian::ReconcileOutcome) -> &'static str {
+    use crate::daemon::custodian::ReconcileOutcome;
+    match outcome {
+        ReconcileOutcome::Adopted => "adopted",
+        ReconcileOutcome::StoreFreshest
+        | ReconcileOutcome::NoCandidates
+        | ReconcileOutcome::NoEligibleCandidate
+        | ReconcileOutcome::AllDead => "nothing_to_harvest",
+        ReconcileOutcome::IdentityUnconfirmed => "ownership_unknown",
+        ReconcileOutcome::SkippedUnknown
+        | ReconcileOutcome::RateLimited
+        | ReconcileOutcome::NotAdopted => "busy",
+    }
+}
+
+/// POST /api/gemini/event — accepts a single [`EventEnvelope`] from
+/// csq-cli and applies it to `quota.json`.
+///
+/// This is the **live IPC path** for Gemini events. The csq-cli
+/// emitter writes the event to its NDJSON log first (durability
+/// floor) then attempts this POST with a 50ms connect ceiling. The
+/// daemon dedups via `id`: if the same envelope arrives twice
+/// (live IPC + later NDJSON drain), only the first apply mutates
+/// `quota.json`. Per spec 05 §5.8.1.
+///
+/// Always returns 204 (no body) on accept-or-dedup; structured-log
+/// records the outcome via `error_kind` tags. On serialisation
+/// failure or invalid slot, returns 400 with a fixed-vocabulary
+/// error tag (no upstream body echoes — see security.md §2).
+async fn gemini_event_handler(
+    State(state): State<RouterState>,
+    Json(envelope): Json<crate::providers::gemini::capture::EventEnvelope>,
+) -> Result<StatusCode, (StatusCode, Json<GeminiEventError>)> {
+    use crate::providers::gemini::capture::{EVENT_SCHEMA_VERSION, EVENT_SURFACE_GEMINI};
+
+    if envelope.v != EVENT_SCHEMA_VERSION {
+        tracing::debug!(
+            error_kind = "gemini_event_unsupported_version",
+            v = envelope.v,
+            slot = envelope.slot,
+            "gemini IPC event with unsupported schema version"
+        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(GeminiEventError {
+                error: "unsupported_version",
+            }),
+        ));
+    }
+
+    // PR-G3 redteam H1: reject envelopes claiming a non-Gemini
+    // surface. Without this gate, a same-UID caller could POST
+    // `surface: "anthropic"` and `apply_event` would clobber the
+    // Anthropic slot's row (forcing surface back to "gemini" and
+    // mutating counter/rate_limit fields the Anthropic UI doesn't
+    // expect). Same-UID threat-model bound is real but per
+    // zero-tolerance Rule 5 the cheap surface check closes it
+    // structurally.
+    if envelope.surface != EVENT_SURFACE_GEMINI {
+        tracing::warn!(
+            error_kind = "gemini_event_invalid_surface",
+            slot = envelope.slot,
+            received_surface = %envelope.surface,
+            "gemini IPC event with non-gemini surface tag refused"
+        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(GeminiEventError {
+                error: "invalid_surface",
+            }),
+        ));
+    }
+
+    let slot = match crate::types::AccountNum::try_from(envelope.slot) {
+        Ok(s) => s,
+        Err(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(GeminiEventError {
+                    error: "invalid_slot",
+                }),
+            ));
+        }
+    };
+
+    // PR-G4a — H2 resolution. PR-G3 deferred this gate because no
+    // binding marker existed yet; PR-G4a writes
+    // `credentials/gemini-<N>.json` from `csq setkey gemini`, so
+    // the daemon can now authoritatively reject IPC traffic for an
+    // unprovisioned slot. Single `symlink_metadata` syscall per
+    // event — no JSON parse, no vault touch — keeps the live IPC
+    // hot path under its 50 ms budget per spec 07 §7.2.3.1.
+    if !crate::providers::gemini::provisioning::is_gemini_bound_slot(&state.base_dir, slot) {
+        tracing::warn!(
+            error_kind = "gemini_event_unbound_slot",
+            slot = slot.get(),
+            "gemini IPC event for slot with no binding marker — refusing 404"
+        );
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(GeminiEventError {
+                error: "slot_not_provisioned",
+            }),
+        ));
+    }
+
+    let consumer = state.gemini_consumer.clone();
+    let base_dir = Arc::clone(&state.base_dir);
+    let result = tokio::task::spawn_blocking(move || {
+        let _q_guard = consumer
+            .quota_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut applied = consumer.applied.lock().unwrap_or_else(|p| p.into_inner());
+        if !applied.insert(envelope.id.clone()) {
+            return Ok::<bool, String>(false);
+        }
+        drop(applied);
+        let mut quota = crate::quota::state::load_state_or_skip(&base_dir)
+            .map_err(|e| format!("quota load: {e}"))?;
+        // PR-G3 redteam H2: structured-log when IPC creates a quota
+        // row for a previously-unseen slot. Same-UID caller can still
+        // do this (and we accept it — the live IPC path needs to work
+        // for newly-provisioned accounts before the discovery cache
+        // refreshes), but operators see the anomaly via log query.
+        let new_slot = !quota.accounts.contains_key(&slot.get().to_string());
+        if new_slot {
+            tracing::warn!(
+                error_kind = "gemini_event_first_time_slot",
+                slot = slot.get(),
+                "live IPC event for previously-unseen slot — verify provisioning"
+            );
+        }
+        let mut breakers = consumer.breakers.lock().unwrap_or_else(|p| p.into_inner());
+        let breaker = breakers.entry(slot.get()).or_default();
+        // PR-G3 redteam M3: IPC-source events do NOT count toward
+        // the schema-drift breaker — only csq-cli's NDJSON drain
+        // (which observed a real malformed response) trips it.
+        // Stops a same-UID caller from forcing kind=unknown via
+        // drift POSTs.
+        crate::daemon::usage_poller::gemini::apply_event_with_source(
+            &mut quota,
+            &envelope,
+            breaker,
+            crate::daemon::usage_poller::gemini::EventSource::Ipc,
+        );
+        crate::quota::state::save_state(&base_dir, &quota)
+            .map_err(|e| format!("quota save: {e}"))?;
+        Ok::<bool, String>(true)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(_applied)) => Ok(StatusCode::NO_CONTENT),
+        Ok(Err(reason)) => {
+            tracing::warn!(
+                error_kind = "gemini_event_apply_failed",
+                slot = slot.get(),
+                reason = %reason,
+                "gemini IPC event apply failed"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(GeminiEventError {
+                    error: "apply_failed",
+                }),
+            ))
+        }
+        Err(_join) => {
+            tracing::warn!(
+                error_kind = "gemini_event_apply_panicked",
+                slot = slot.get(),
+                "gemini IPC event apply panicked"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(GeminiEventError {
+                    error: "apply_panicked",
+                }),
+            ))
+        }
+    }
+}
+
+/// Error body for `POST /api/gemini/event`. Fixed-vocabulary tag —
+/// caller cannot trigger arbitrary strings here per security.md §2.
+#[derive(Debug, Clone, Serialize)]
+pub struct GeminiEventError {
+    pub error: &'static str,
+}
+
+/// Error body for `POST /api/audit/record`. Fixed-vocabulary tag —
+/// caller cannot trigger arbitrary strings here per security.md §2.
+/// The `error` field maps to one of: `invalid_rule_id`,
+/// `audit_deserialize_error`, `audit_io_error`, `audit_serialize_error`,
+/// `audit_chain_broken`.
+/// Note: `record_too_large` is now emitted as a router-level 413 (via
+/// `DefaultBodyLimit`) before this handler runs, not from the handler itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditRecordError {
+    pub error: &'static str,
+}
+
+/// Handler for `POST /api/audit/record`.
+///
+/// Accepts a JSON body matching `csq-runs-schema-v1.json`, validates
+/// RULE_ID strings, serializes, and persists to
+/// `~/.claude/accounts/csq-runs/<run_id>.jsonl` via the single write site
+/// `audit::persist::write_record`.
+///
+/// **Audit-subsystem fail-closed gate:** when `RouterState::audit_health` is
+/// `Broken` or `Unknown`, this handler rejects all emit requests with
+/// `503 Service Unavailable` and the fixed-vocabulary tag `audit_chain_broken`.
+/// No new records are appended to a chain that failed verification.
+/// (`Verified` and `Degraded` both pass through normally.)
+///
+/// Inherits the three-layer Unix socket security per `rules/security.md`
+/// §7 — no per-route auth needed.
+///
+/// Returns 204 on success; 400 with a fixed-vocabulary error tag on any
+/// write failure; 503 with `audit_chain_broken` when the audit chain is broken.
+/// No upstream body is echoed per `rules/security.md` §2.
+async fn audit_record_handler(
+    State(state): State<RouterState>,
+    body: Bytes,
+) -> Result<StatusCode, (StatusCode, Json<AuditRecordError>)> {
+    // Audit-subsystem fail-closed: reject new appends when the chain is broken.
+    // Health check MUST run before body deserialization so Broken/Unknown health
+    // returns 503 even when the request body would be malformed (422).
+    if !state
+        .audit_health
+        .read()
+        .expect("audit health lock poisoned")
+        .is_operational()
+    {
+        tracing::warn!(
+            error_kind = "audit_chain_broken",
+            "audit emit rejected — chain is not operational (audit_health={:?})",
+            state
+                .audit_health
+                .read()
+                .expect("audit health lock poisoned")
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(AuditRecordError {
+                error: "audit_chain_broken",
+            }),
+        ));
+    }
+
+    // Deserialize after health gate passes.
+    let record: crate::audit::AuditRecord = serde_json::from_slice(&body).map_err(|_| {
+        // Fixed-vocabulary tag only — no `{e}` interpolation (security.md §2;
+        // serde_json::Error Display can echo input fragments). The tag is the signal.
+        tracing::warn!(
+            error_kind = "audit_deserialize_error",
+            "audit record deserialize failed"
+        );
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(AuditRecordError {
+                error: "audit_deserialize_error",
+            }),
+        )
+    })?;
+
+    // M19b: capture the run_id BEFORE the record is moved into the writer so we
+    // can emit the chain-level session-floor record after the v1 write succeeds.
+    let run_id = record.run_id.clone();
+
+    // Write via the single audited write site, anchored to the daemon's
+    // base_dir so integration tests with a TempDir base see the file
+    // under their temp path rather than $HOME/.claude/accounts.
+    match crate::audit::persist::write_record_to(record, Some(&state.base_dir)) {
+        Ok(_) => {
+            // M19b: emit the signed chain-level session-floor record. This is
+            // DEFENSE-IN-DEPTH on top of the (already-durable) v1 record, so it
+            // runs OFF the response path via `spawn_blocking` — the floor emit
+            // acquires the `.chain-lock` (up to 5s under contention) and may load
+            // the signing key, neither of which should delay the 204 that
+            // unblocks the user's `csq run`. The emit is idempotent
+            // (`run:<run_id>` dedup), so the rare overlap with the `.pending`
+            // reconciler drain appends exactly one floor record. Failures are
+            // logged, never surfaced — the v1 record is already persisted.
+            let base = state.base_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = crate::audit::run_floor::emit_csq_run_record(&base, &run_id) {
+                    // Fixed-vocabulary tag only — no `{e}` interpolation per
+                    // security.md §2 (AuditV2Error Display carries no secrets, but
+                    // OAuth-adjacent modules keep the fixed-tag discipline). The
+                    // typed error is intentionally dropped; the tag is the signal.
+                    let _ = e;
+                    tracing::warn!(
+                        error_kind = "csq_run_floor_emit_failed",
+                        "M19b: csq-run session-floor record emit failed (non-fatal)"
+                    );
+                }
+            });
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(e) => {
+            let tag = e.fixed_tag();
+            tracing::warn!(error_kind = tag, "audit record write failed");
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(AuditRecordError { error: tag }),
+            ))
+        }
+    }
+}
+
+/// Request body for `POST /api/audit/mcp-gate` (M6 T6.2 Shard 4).
+///
+/// The `csq mcp-proxy` supplies ONLY these minimal decision fields; the daemon
+/// builds, signs, and appends the `McpGateDecision` `SignedRecord` server-side.
+/// A spawned subprocess NEVER supplies a `SignedRecord` (it cannot sign, and
+/// per `account-terminal-separation.md` MUST Rule 1 the enforcement record must
+/// originate daemon-side, not from a process the renderer/CLI could influence).
+#[cfg(feature = "enterprise")]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct McpGateRequest {
+    /// Per-proxy-process nonce — the dedup-key namespace component.
+    pub session_nonce: String,
+    /// Proxy-session-monotonic decision ordinal (second dedup-key component).
+    pub record_seq: u64,
+    /// The spawned CLI whose MCP traffic was gated (`"codex"` | `"gemini"`).
+    pub cli: String,
+    /// The MCP-declared tool identifier that was gated.
+    pub tool: String,
+    /// Fixed-vocabulary gate verdict (`"pass"` | `"block"` | `"escalate"`).
+    pub verdict: String,
+}
+
+/// Error body for `POST /api/audit/mcp-gate`. Fixed-vocabulary tag — the handler
+/// never echoes upstream request content per `rules/security.md` §2 +
+/// `rules/tauri-commands.md` MUST-6. Tags: `audit_chain_broken`,
+/// `mcp_gate_deserialize_error`, `mcp_gate_invalid_field`, `mcp_gate_write_error`,
+/// `mcp_gate_unconfirmed` (503 — the emit did not record the decision on the
+/// chain, e.g. a signing-cutoff skip; the proxy queues it to its durable outbox),
+/// `mcp_gate_intent_queued` (503 — the chain is uninitialised AND attestation
+/// intent is set, so the proxy queues the decision to preserve it until
+/// `csq audit init`; shard C decision 1).
+#[cfg(feature = "enterprise")]
+#[derive(Debug, Clone, Serialize)]
+pub struct McpGateError {
+    pub error: &'static str,
+}
+
+/// Handler for `POST /api/audit/mcp-gate` (M6 T6.2 Shard 4).
+///
+/// Accepts a minimal [`McpGateRequest`], validates the fixed-vocabulary fields,
+/// and appends a signed `McpGateDecision` chain record via the single daemon-side
+/// emitter [`crate::audit::mcp_gate_floor::emit_mcp_gate_record`] (which owns the
+/// `.chain-lock` + signing key — the proxy subprocess cannot).
+///
+/// **Audit-subsystem fail-closed gate:** when `audit_health` is not operational,
+/// rejects with `503` + `audit_chain_broken` (mirrors `audit_record_handler`).
+/// The health check runs BEFORE body deserialization so a broken chain returns
+/// 503 even for a malformed body.
+///
+/// Returns `204` on success (including a deduped/skipped emit — the decision is
+/// already on the chain or the chain is uninitialised, neither an error); `422`
+/// on a malformed body or invalid field; `503` on a hard chain-write error
+/// (a server-side I/O failure — the proxy queues the decision to its durable
+/// outbox). No upstream body is echoed (`rules/security.md` §2).
+#[cfg(feature = "enterprise")]
+async fn mcp_gate_handler(
+    State(state): State<RouterState>,
+    body: Bytes,
+) -> Result<StatusCode, (StatusCode, Json<McpGateError>)> {
+    // Fail-closed: reject new appends when the chain is not operational. Runs
+    // before deserialization so a broken chain returns 503 even for a bad body.
+    if !state
+        .audit_health
+        .read()
+        .expect("audit health lock poisoned")
+        .is_operational()
+    {
+        // Proxy queues on this 503 too — mark the outbox maybe-dirty so that once
+        // `audit_health` is re-armed operational — via a daemon restart OR an
+        // in-process bounded-retry promotion (`crate::audit::health`'s module
+        // doc; `spawn_audit_verify_retry`) — the first confirmed-on-chain emit
+        // drains it event-driven (shard B). The periodic backstop is the
+        // belt-and-braces backstop. No extra wiring is needed here: this gate
+        // re-reads the shared `audit_health` cell on every request, so
+        // promotion alone is sufficient to re-arm this path.
+        crate::audit::mcp_gate_outbox::mark_outbox_maybe_dirty();
+        tracing::warn!(
+            error_kind = "audit_chain_broken",
+            "mcp-gate emit rejected — chain is not operational (audit_health={:?})",
+            state
+                .audit_health
+                .read()
+                .expect("audit health lock poisoned")
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(McpGateError {
+                error: "audit_chain_broken",
+            }),
+        ));
+    }
+
+    let req: McpGateRequest = serde_json::from_slice(&body).map_err(|_| {
+        // Fixed-vocabulary tag only — no `{e}` interpolation (security.md §2;
+        // serde_json::Error Display can echo input fragments). The tag is the signal.
+        tracing::warn!(
+            error_kind = "mcp_gate_deserialize_error",
+            "mcp-gate request deserialize failed"
+        );
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(McpGateError {
+                error: "mcp_gate_deserialize_error",
+            }),
+        )
+    })?;
+
+    // Fixed-vocabulary validation via the SHARED authority (the outbox drain
+    // validates against the same function, so the two ingestion paths onto the
+    // signed chain can never diverge). Any out-of-vocab value is fail-closed
+    // rejected (the daemon is the enforcement boundary — never trust the field
+    // shape).
+    let field_ok = crate::audit::mcp_gate_floor::mcp_gate_fields_valid(
+        &req.session_nonce,
+        &req.tool,
+        &req.cli,
+        &req.verdict,
+    );
+    if !field_ok {
+        tracing::warn!(
+            error_kind = "mcp_gate_invalid_field",
+            "mcp-gate request rejected — field failed fixed-vocabulary validation"
+        );
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(McpGateError {
+                error: "mcp_gate_invalid_field",
+            }),
+        ));
+    }
+
+    match crate::audit::mcp_gate_floor::emit_mcp_gate_record(
+        &state.base_dir,
+        &req.session_nonce,
+        req.record_seq,
+        &req.cli,
+        &req.tool,
+        &req.verdict,
+    ) {
+        // The emit's Ok(true)/Ok(false) does NOT distinguish "recorded" from
+        // "skipped without recording" — Ok(false) collapses a confirmed Duplicate
+        // (on chain), a signing-cutoff skip (chain exists, keychain unavailable →
+        // NOT on chain), and the uninitialised-chain case. Classify via the
+        // authoritative dedup-index confirmation so the route honors the SAME
+        // "204 ⟺ actually on the chain" contract the outbox drain enforces
+        // (redteam an internal ticket R3). Without this a cutoff-skip returns a false 204 and the
+        // decision is lost with no fallback — the daemon-UP twin of the gap an internal ticket
+        // closes on the daemon-down path.
+        Ok(_) => {
+            use crate::audit::mcp_gate_floor::McpGateConfirm;
+            match crate::audit::mcp_gate_floor::mcp_gate_confirm(
+                &state.base_dir,
+                &req.session_nonce,
+                req.record_seq,
+            ) {
+                // On chain (appended or confirmed Duplicate): 204. M6 an internal ticket shard B —
+                // the live path is confirmed healthy, so fire an event-driven drain
+                // of any backlog queued during a prior outage/cutoff. The cheap
+                // relaxed maybe-dirty load is a fast-path filter: the common
+                // steady-state (nothing ever queued) skips the spawn entirely, so a
+                // burst of gated calls does not spawn a blocking task per call. The
+                // authoritative consume is the swap inside `drain_on_live_recovery`.
+                // The drain runs on a blocking thread so the 204 is not delayed by
+                // its chain I/O; the join is awaited in a detached task ONLY to log a
+                // (documented-unreachable) panic as a JoinError — symmetric with the
+                // periodic tick's panic handling, so an event-drain panic is never
+                // silently dropped.
+                McpGateConfirm::OnChain => {
+                    if crate::audit::mcp_gate_outbox::outbox_maybe_dirty() {
+                        let base = state.base_dir.as_ref().clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = tokio::task::spawn_blocking(move || {
+                                crate::audit::mcp_gate_outbox::drain_on_live_recovery(&base);
+                            })
+                            .await
+                            {
+                                tracing::warn!(
+                                    error_kind = "mcp_gate_event_drain_task_panicked",
+                                    error = %e,
+                                    "event-driven mcp-gate outbox drain task panicked"
+                                );
+                            }
+                        });
+                    }
+                    Ok(StatusCode::NO_CONTENT)
+                }
+                // No chain to record to (uninitialised). M6 an internal ticket shard C
+                // (decision 1): whether this decision is DROPPED or PRESERVED
+                // depends on the durable attestation-intent marker —
+                //   - intent SET (`csq audit intent on`): the operator will run
+                //     `csq audit init`; the decision MUST NOT be silently lost.
+                //     Return 503 so the proxy queues it to the durable outbox, and
+                //     mark the outbox maybe-dirty so shard B's continuous drain
+                //     flushes it within one interval of `csq audit init` (until
+                //     then the drain defers on the un-appendable chain and PRESERVES
+                //     the file — the pre-init queue is bounded + VISIBLE via the
+                //     recurring deferred-drain WARN + `csq doctor`, never
+                //     silently dropped).
+                //   - intent UNSET (default — non-audit host): 204, drop as the
+                //     pre-an internal ticket uninit contract, so a host that will never init a
+                //     chain does not accumulate an unbounded outbox.
+                // A drain is NOT triggered here regardless: an uninitialised chain
+                // is not appendable, so a drain would only defer.
+                McpGateConfirm::NoChain => {
+                    if crate::audit::outbox_paths::attestation_intent_is_set(&state.base_dir) {
+                        crate::audit::mcp_gate_outbox::mark_outbox_maybe_dirty();
+                        tracing::warn!(
+                            error_kind = "mcp_gate_intent_queued",
+                            "mcp-gate decision on an uninitialised chain with attestation \
+                             intent SET; signalling the proxy to queue it to the durable \
+                             outbox (run `csq audit init` to drain the pre-init queue)"
+                        );
+                        return Err((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(McpGateError {
+                                error: "mcp_gate_intent_queued",
+                            }),
+                        ));
+                    }
+                    Ok(StatusCode::NO_CONTENT)
+                }
+                // Chain exists but the decision did not land (signing-cutoff skip):
+                // signal the proxy to queue it to its durable outbox for a
+                // next-start drain. A re-queued genuine Duplicate is harmless (the
+                // drain re-confirms on-chain and deletes). Mark the outbox
+                // maybe-dirty so the next confirmed-on-chain emit drains it
+                // event-driven (shard B) instead of waiting for the periodic tick.
+                McpGateConfirm::Unrecorded => {
+                    crate::audit::mcp_gate_outbox::mark_outbox_maybe_dirty();
+                    tracing::warn!(
+                        error_kind = "mcp_gate_unconfirmed",
+                        "mcp-gate emit did not record the decision (signing skip); \
+                         signalling the proxy to queue it to the durable outbox"
+                    );
+                    Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(McpGateError {
+                            error: "mcp_gate_unconfirmed",
+                        }),
+                    ))
+                }
+            }
+        }
+        Err(e) => {
+            let tag = e.fixed_tag();
+            // Mark the outbox maybe-dirty: the proxy queues on a server-side failure
+            // (this 503, and the sibling `mcp_gate_unconfirmed` 503) — NOT on the two
+            // 422 client-rejection arms (`mcp_gate_deserialize_error`,
+            // `mcp_gate_invalid_field`), whose records are permanently unprocessable
+            // (the drain would `invalid`-delete them, never a retryable backlog). So
+            // the next confirmed-on-chain emit fires an event-driven drain (shard B).
+            crate::audit::mcp_gate_outbox::mark_outbox_maybe_dirty();
+            tracing::warn!(error_kind = tag, "mcp-gate record write failed");
+            // 503 (not 400): a hard emit I/O failure is a SERVER-side error, not a
+            // malformed client request. Consistent with the two sibling
+            // server-side failure arms (`mcp_gate_unconfirmed` and the
+            // `audit_chain_broken` fail-closed gate) that already return 503.
+            // Functionally the proxy queues on any non-204, so this is an
+            // accuracy fix for operator diagnosis, not a behaviour change.
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(McpGateError {
+                    error: "mcp_gate_write_error",
+                }),
+            ))
+        }
+    }
+}
+
+/// Error body for `POST /api/provenance/anchor`.
+///
+/// Fixed-vocabulary tags — the handler never echoes upstream request content
+/// per `rules/security.md` §2 and `rules/tauri-commands.md` MUST-6.
+///
+/// Tags:
+/// - `"audit_chain_broken"` — chain broken sentinel present; write refused (503).
+/// - `"seam_io_error"`      — quarantine or pending-dir I/O failed (503).
+/// - `"seam_chain_write_error"` — chain write failed post-cutoff (503).
+/// - `"seam_registry_load_failed"` — operator surface-registry.json is corrupt;
+///   non-retryable (500). Operator: fix or delete the file.
+/// - `"seam_internal_error"` — internal error (500).
+#[derive(Debug, Clone, Serialize)]
+pub struct ProvenanceAnchorError {
+    pub error: &'static str,
+}
+
+/// Handler for `POST /api/provenance/anchor`.
+///
+/// Accepts a raw F101-1 provenance event body and routes it through the
+/// M18 seam ingest pipeline:
+///
+/// - **204 No Content**: event anchored into the audit chain (KnownVersion path).
+/// - **202 Accepted**: event quarantined (frontier rejection) or parked
+///   (unknown schema version). Daemon accepted custody — caller does not retry.
+/// - **503 Service Unavailable**: chain broken, signing failure post-cutoff, or
+///   I/O failure writing to custody dirs. Caller MAY retry after operator repair.
+///
+/// **Audit-subsystem fail-closed gate**: when `audit_health` is `Broken` or
+/// `Unknown`, the handler returns `503` before reading the body. This mirrors
+/// `audit_record_handler` — a broken chain blocks all audit appends.
+///
+/// **IPC security**: this route inherits the three-layer Unix socket security
+/// (SO_PEERCRED same-UID, 0o600 socket, per-user dir). No per-route auth
+/// is needed per `rules/security.md` §7. The inbound body is treated as
+/// UNTRUSTED (self-declared actor is UNTRUSTED metadata; validation at the
+/// frontier does not trust the emitter's claimed fields beyond what csq can verify).
+///
+/// **MAX_BODY_BYTES**: the router-level `DefaultBodyLimit` layer (1 MiB) caps
+/// the raw body before this handler runs. The seam frontier also enforces its
+/// own 256 KiB cap as defense-in-depth.
+///
+/// No upstream request body is echoed in any response or log.
+async fn provenance_anchor_handler(
+    State(state): State<RouterState>,
+    body: Bytes,
+) -> Result<StatusCode, (StatusCode, Json<ProvenanceAnchorError>)> {
+    use crate::audit::seam::{ingest_provenance_event, IngestOutcome, SeamError};
+
+    // Audit-subsystem fail-closed: reject appends when chain is broken.
+    // Health gate MUST run before body processing.
+    if !state
+        .audit_health
+        .read()
+        .expect("audit health lock poisoned")
+        .is_operational()
+    {
+        tracing::warn!(
+            error_kind = "seam_chain_broken",
+            "provenance/anchor rejected — audit chain not operational"
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ProvenanceAnchorError {
+                error: "audit_chain_broken",
+            }),
+        ));
+    }
+
+    // Wall-clock for skew validation. Computed here (trusted daemon clock)
+    // rather than trusting any timestamp in the request body.
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let base_dir = Arc::clone(&state.base_dir);
+    let raw = body.to_vec();
+
+    // Offload blocking I/O (chain lock, quarantine write, optional signing) to
+    // the blocking thread pool — must not block the axum runtime.
+    let result =
+        tokio::task::spawn_blocking(move || ingest_provenance_event(&base_dir, &raw, now_unix))
+            .await
+            .map_err(|_| {
+                tracing::warn!(
+                    error_kind = "seam_internal_error",
+                    "provenance/anchor spawn_blocking panicked"
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ProvenanceAnchorError {
+                        error: "seam_internal_error",
+                    }),
+                )
+            })?;
+
+    match result {
+        Ok(IngestOutcome::Anchored { .. }) => {
+            tracing::debug!(error_kind = "seam_anchored", "provenance event anchored");
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Ok(IngestOutcome::Rejected { reason }) => {
+            // Frontier rejection or quarantine. Daemon accepted custody (202).
+            // Fixed-vocab reason tag — no upstream content echoed.
+            tracing::info!(
+                error_kind = "seam_rejected",
+                reason = reason,
+                "provenance event quarantined"
+            );
+            Ok(StatusCode::ACCEPTED)
+        }
+        Ok(IngestOutcome::ParkedUnknownVersion { .. }) => {
+            // Unknown schema version — parked in .pending/provenance/. 202.
+            tracing::info!(
+                error_kind = "seam_parked",
+                "provenance event parked (unknown schema version)"
+            );
+            Ok(StatusCode::ACCEPTED)
+        }
+        Ok(IngestOutcome::DuplicateSuppressed { .. }) => {
+            // Duplicate decision_id — first record is authoritative. 202.
+            // The caller need not retry; the first anchor is the canonical one.
+            tracing::debug!(
+                error_kind = "seam_duplicate_suppressed",
+                "provenance event duplicate suppressed (decision_id already in chain)"
+            );
+            Ok(StatusCode::ACCEPTED)
+        }
+        Ok(IngestOutcome::HeldPendingPredecessor { .. }) => {
+            // Intra-source counter gap — held in .pending/provenance-ordered/
+            // until the predecessor drains or a bounded timeout fires (M20,
+            // F-SEAM-09). Custody accepted; the caller need not retry. 202.
+            tracing::info!(
+                error_kind = "seam_held_predecessor_gap",
+                "provenance event held pending intra-source predecessor"
+            );
+            Ok(StatusCode::ACCEPTED)
+        }
+        Err(SeamError::Io(_)) => {
+            tracing::warn!(
+                error_kind = "seam_io_error",
+                "provenance/anchor custody write failed"
+            );
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ProvenanceAnchorError {
+                    error: "seam_io_error",
+                }),
+            ))
+        }
+        Err(SeamError::ChainWrite(_)) => {
+            tracing::warn!(
+                error_kind = "seam_chain_write_error",
+                "provenance/anchor chain write failed (cutoff active or chain broken)"
+            );
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ProvenanceAnchorError {
+                    error: "seam_chain_write_error",
+                }),
+            ))
+        }
+        Err(SeamError::AnchorRequiresInit) => {
+            // Pre-`audit init`: the anchored path fails closed (no unsigned
+            // provenance), but with an actionable tag so the operator knows to
+            // run `csq audit init` (R2 LOW-3).
+            tracing::warn!(
+                error_kind = "seam_anchor_requires_init",
+                "provenance/anchor refused: no signing key — run `csq audit init`"
+            );
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ProvenanceAnchorError {
+                    error: "seam_anchor_requires_init",
+                }),
+            ))
+        }
+        Err(SeamError::RegistryLoad) => {
+            tracing::warn!(
+                error_kind = "seam_registry_load_failed",
+                "provenance/anchor surface registry load failed"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ProvenanceAnchorError {
+                    error: "seam_registry_load_failed",
+                }),
+            ))
+        }
+        Err(SeamError::CustodyFull) => {
+            tracing::warn!(
+                error_kind = "seam_custody_full",
+                "provenance/anchor refused: custody directory at hard cap"
+            );
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ProvenanceAnchorError {
+                    error: "seam_custody_full",
+                }),
+            ))
+        }
+        Err(SeamError::Internal) => {
+            tracing::warn!(
+                error_kind = "seam_internal_error",
+                "provenance/anchor internal error"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ProvenanceAnchorError {
+                    error: "seam_internal_error",
+                }),
+            ))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/audit/anchor
+// ---------------------------------------------------------------------------
+
+/// Error body for `POST /api/audit/anchor`.
+///
+/// Fixed-vocabulary tags — the handler never echoes upstream request content
+/// per `rules/security.md` §2 and `rules/tauri-commands.md` MUST-6.
+///
+/// Tags:
+/// - `"audit_chain_broken"` — chain not operational (503).
+/// - `"anchor_deserialize_error"` — body is not valid anchor request JSON (422).
+/// - `"anchor_no_signing_key"` — chain is initialised but signing key is absent;
+///   operator must run `csq audit migrate-keys` (503).
+/// - `"anchor_write_error"` — chain I/O failed (503).
+#[derive(Debug, Clone, Serialize)]
+struct AuditAnchorError {
+    error: &'static str,
+}
+
+/// Minimal request body for `POST /api/audit/anchor` (an internal ticket S3).
+///
+/// Only `run_id` is required — all other fields are metadata that the daemon
+/// reconstructs into a `CsqRun` audit record before signing.  Unknown fields
+/// are silently ignored (additive schema: future clients may send extra metadata
+/// without breaking older daemons).
+#[derive(Debug, Deserialize)]
+struct AuditAnchorRequest {
+    /// The run identifier — the daemon uses this as the signed record's identity.
+    run_id: String,
+}
+
+/// Handler for `POST /api/audit/anchor` (an internal ticket S3, an internal ticket).
+///
+/// **DAEMON IS SOLE SIGNER** per `account-terminal-separation.md` MUST Rule 1:
+/// the CLI MUST NOT compute `canonical_hash` client-side. This handler accepts
+/// an [`AuditAnchorRequest`] body (minimal: only `run_id` required), signs+appends
+/// it to the Op chain via
+/// [`crate::audit::anchor::sign_audit_record_v1`], and returns the on-chain
+/// projection as `AnchorPayload` JSON:
+///
+/// ```json
+/// {
+///   "canonical_hash": "<64-hex>",
+///   "chain_id":       "<26-char ULID>",
+///   "seq":            42,
+///   "verification_level": "AUTO_APPROVED",
+///   "inclusion_proof": null
+/// }
+/// ```
+///
+/// The `inclusion_proof` field is `null` when no external transparency-log sink
+/// is active ([`RouterState::anchor_sink`] is `None` — the default local-only
+/// build). When a `csq-ledger` sink IS configured (an internal ticket), the handler appends
+/// the freshly-signed record to it and projects the returned structured
+/// [`crate::audit::types::LedgerInclusionProof`] (`leaf_index`/`tree_size`/
+/// `audit_path`) into this field. Append is best-effort / fail-open: a sink
+/// error yields `null` (the local chain append is authoritative), never a 5xx.
+///
+/// **Audit-subsystem fail-closed gate**: returns 503 when `audit_health` is not
+/// operational (mirrors `audit_record_handler`).
+///
+/// **Signing-key gate**: returns 503 when the chain is initialised but the key is
+/// absent (keychain inaccessible, key not yet migrated). Callers should retry
+/// after `csq audit migrate-keys`.
+///
+/// Returns 200 + JSON `AnchorPayload` on success, never 204 (the payload IS the
+/// response; dropping it would require the CLI to re-compute it, violating DAEMON
+/// IS SOLE SIGNER).
+async fn audit_anchor_handler(
+    State(state): State<RouterState>,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<AuditAnchorError>)> {
+    // Fail-closed: reject when the chain is not operational. Health check
+    // runs BEFORE body deserialization so a broken chain returns 503 even
+    // for a malformed body (mirrors audit_record_handler).
+    if !state
+        .audit_health
+        .read()
+        .expect("audit health lock poisoned")
+        .is_operational()
+    {
+        tracing::warn!(
+            error_kind = "audit_chain_broken",
+            "audit anchor rejected — chain is not operational (audit_health={:?})",
+            state
+                .audit_health
+                .read()
+                .expect("audit health lock poisoned")
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(AuditAnchorError {
+                error: "audit_chain_broken",
+            }),
+        ));
+    }
+
+    // Deserialize the minimal anchor request — only `run_id` is required.
+    // All other fields (ts, surface, decision, reason, result) are metadata that
+    // the daemon ignores when building the signed record; unknown fields are
+    // silently dropped (additive schema per the AuditAnchorRequest doc).
+    // Fixed-vocabulary tag only — no `{e}` interpolation per security.md §2.
+    let req: AuditAnchorRequest = serde_json::from_slice(&body).map_err(|_| {
+        tracing::warn!(
+            error_kind = "anchor_deserialize_error",
+            "audit anchor: request deserialize failed"
+        );
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(AuditAnchorError {
+                error: "anchor_deserialize_error",
+            }),
+        )
+    })?;
+
+    // Build a minimal AuditRecord from the request for sign_audit_record_v1.
+    // The daemon uses only the `run_id`; the signing function generates all
+    // chain-assigned fields (canonical_hash, chain_id, seq) internally.
+    let record = crate::audit::AuditRecord {
+        schema_version: "1".to_string(),
+        run_id: req.run_id,
+        fixture_sha256: String::new(),
+        coc_sha256: String::new(),
+        csq_version: String::new(),
+        cli_version: String::new(),
+        surface: crate::audit::Surface::Cc,
+        model: String::new(),
+        start_ts: String::new(),
+        end_ts: String::new(),
+        result_state: crate::audit::ResultState::Pass,
+        score_delta_vs_baseline: None,
+        rule_ids_cited_original: Vec::new(),
+        rule_ids_cited_after_repair: Vec::new(),
+        rule_ids_dropped_invalid_format: 0,
+        decision: crate::audit::Decision::Accept,
+        spawn_gate: None,
+    };
+
+    // Sign + append via the daemon-sole-signer path. This encapsulates key
+    // loading, skeleton building, and write_record_v2_signed. Offloaded to a
+    // blocking thread because write_record_v2_signed acquires a POSIX flock.
+    let base = state.base_dir.clone();
+    let signed = tokio::task::spawn_blocking(move || {
+        crate::audit::anchor::sign_audit_record_v1(record, &base)
+    })
+    .await
+    .map_err(|e| {
+        // spawn_blocking JoinError — treat as internal server error.
+        let _ = e;
+        tracing::warn!(
+            error_kind = "anchor_spawn_error",
+            "audit anchor: spawn_blocking panicked"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AuditAnchorError {
+                error: "anchor_write_error",
+            }),
+        )
+    })?
+    .map_err(|tag| {
+        tracing::warn!(
+            error_kind = tag,
+            "audit anchor: sign_audit_record_v1 failed"
+        );
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(AuditAnchorError { error: tag }),
+        )
+    })?;
+
+    // Project the finalized SignedRecord → AnchorPayload JSON.
+    // DAEMON IS SOLE SIGNER: canonical_hash comes from the returned signed record,
+    // never computed by the CLI.
+    let vl = signed
+        .verification_level
+        .map(|v| v.as_canonical_str().to_string())
+        .unwrap_or_else(|| "AUTO_APPROVED".to_string());
+
+    // an internal ticket — when an external transparency-log sink is active, append the
+    // freshly-signed record and project its structured Merkle inclusion proof
+    // into the AnchorPayload. Best-effort / fail-open: the local chain append
+    // (sign_audit_record_v1 above) already succeeded and is authoritative, so a
+    // sink error/miss yields a null proof rather than failing the op. DAEMON IS
+    // SOLE SIGNER is preserved — the proof is READ from the sink receipt.
+    let inclusion_proof = match state.anchor_sink.as_ref() {
+        Some(sink) => project_inclusion_proof(sink.as_ref(), &signed).await,
+        None => serde_json::Value::Null,
+    };
+
+    let payload = serde_json::json!({
+        "canonical_hash": signed.canonical_hash.as_str(),
+        "chain_id":       signed.chain_id.as_str(),
+        "seq":            signed.seq,
+        "verification_level": vl,
+        "inclusion_proof": inclusion_proof,
+    });
+
+    Ok(Json(payload))
+}
+
+/// Appends `signed` to `sink` and projects the receipt's structured Merkle proof
+/// into a JSON value for the `AnchorPayload.inclusion_proof` field (an internal ticket).
+///
+/// Fail-open: any sink error, a receipt with no proof, a proof string that does
+/// not parse as [`crate::audit::types::LedgerInclusionProof`], OR a proof that is
+/// not structurally sound (an internal ticket redteam F1/F2 — see
+/// [`inclusion_proof_is_structurally_sound`]) yields [`serde_json::Value::Null`]
+/// (the local chain append is authoritative — the external witness is additive,
+/// not load-bearing for the op's success). Fixed-vocabulary WARN tags only — no
+/// `{e}` interpolation per `security.md` §2 (a sink error body could echo a
+/// request field).
+///
+/// NOTE (an internal ticket redteam F3): the projected proof is the sink's returned proof
+/// FORWARDED VERBATIM after a structural-soundness check — it is NOT re-verified
+/// against `signed.canonical_hash` (no Merkle-root recomputation). The trust
+/// model is out-of-band server pinning (see `csq_ledger_sink` module note);
+/// `DAEMON IS SOLE SIGNER` holds for the RECORD (the local chain append is
+/// authoritative), and the proof is a best-effort external witness. Independent
+/// verification against the server's signed checkpoint is a Phase-B follow-up.
+async fn project_inclusion_proof(
+    sink: &dyn crate::audit::LedgerSink,
+    signed: &crate::audit::types::SignedRecord,
+) -> serde_json::Value {
+    let receipt = match sink.append(signed).await {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::warn!(
+                error_kind = "anchor_sink_append_failed",
+                "audit anchor: sink append failed — returning null inclusion_proof"
+            );
+            return serde_json::Value::Null;
+        }
+    };
+    let Some(proof_str) = receipt.inclusion_proof else {
+        // Sink acknowledged the append but returns no per-entry proof — honest null.
+        return serde_json::Value::Null;
+    };
+    match serde_json::from_str::<crate::audit::types::LedgerInclusionProof>(&proof_str) {
+        Ok(proof) if inclusion_proof_is_structurally_sound(&proof) => {
+            serde_json::to_value(proof).unwrap_or(serde_json::Value::Null)
+        }
+        Ok(_) => {
+            // Parsed but structurally impossible (leaf outside tree, empty path
+            // for a multi-leaf tree, non-hex sibling, absurd length). Emitting it
+            // would present a fabricated-looking proof to an auditor — honest null.
+            tracing::warn!(
+                error_kind = "anchor_proof_inconsistent",
+                "audit anchor: sink inclusion_proof failed the structural-soundness check — returning null"
+            );
+            serde_json::Value::Null
+        }
+        Err(_) => {
+            tracing::warn!(
+                error_kind = "anchor_proof_parse_failed",
+                "audit anchor: sink receipt inclusion_proof did not parse as a structured proof"
+            );
+            serde_json::Value::Null
+        }
+    }
+}
+
+/// Structural-soundness gate for a ledger [`crate::audit::types::LedgerInclusionProof`]
+/// before it is surfaced in an `AnchorPayload` (an internal ticket redteam F1/F2 + security-LOW).
+///
+/// This is a CHEAP, conservative RFC6962 shape check — NOT a cryptographic
+/// verification (the audit path is not replayed against a root). It rejects the
+/// structurally-impossible shapes a buggy or hostile ledger server could return:
+///
+/// - `leaf_index >= tree_size` — a leaf cannot sit at/after the end of the tree
+///   (also catches the `tree_size == 0` "empty tree containing a leaf" case).
+/// - single-leaf tree (`tree_size == 1`) ⟺ empty `audit_path`; any other tree
+///   size REQUIRES a non-empty path (RFC6962), and a single-leaf tree forbids one.
+/// - `audit_path.len() > 64` — a tree of 2^64 leaves is the ceiling; also bounds
+///   the relayed-data size (security-LOW: unvalidated ledger response amplification).
+/// - every sibling hash is a 64-char lowercase-hex string (a Merkle node hash).
+///
+/// The bounds are deliberately loose (`len <= 64`, not the exact
+/// `ceil(log2(tree_size))`) so a genuinely valid proof is never rejected; the
+/// goal is to null out the *impossible* shapes, not to re-verify the tree.
+fn inclusion_proof_is_structurally_sound(p: &crate::audit::types::LedgerInclusionProof) -> bool {
+    if p.leaf_index >= p.tree_size {
+        return false;
+    }
+    let single_leaf = p.tree_size == 1;
+    if single_leaf != p.audit_path.is_empty() {
+        return false;
+    }
+    if p.audit_path.len() > 64 {
+        return false;
+    }
+    p.audit_path.iter().all(|h| {
+        h.len() == 64
+            && h.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// Response body for `GET /api/accounts`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountsResponse {
+    pub accounts: Vec<AccountInfo>,
+}
+
+/// Response body for `GET /api/refresh-status`.
+#[derive(Debug, Clone, Serialize)]
+pub struct RefreshStatusListResponse {
+    pub statuses: Vec<RefreshStatus>,
+}
+
+/// Handle to a running daemon HTTP server. Dropping this handle
+/// does NOT stop the server — use [`ServerHandle::shutdown`] to
+/// initiate graceful shutdown and await the join handle.
+pub struct ServerHandle {
+    /// Path to the socket file. Removed on shutdown.
+    socket_path: PathBuf,
+    /// Triggered to start graceful shutdown.
+    shutdown: CancellationToken,
+}
+
+impl ServerHandle {
+    /// Signals the server to shut down. The accept loop exits on the
+    /// next poll, and in-flight connections are allowed to complete.
+    /// Removes the socket file.
+    pub fn shutdown(&self) {
+        self.shutdown.cancel();
+        // Best-effort socket file cleanup. If the server loop is
+        // already removing it, the error is ignored.
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+
+    /// Returns a clone of the shutdown token so sibling subsystems
+    /// (refresher, poller, future HTTP handlers) can cancel on the
+    /// same signal. Cloning a `CancellationToken` is cheap — it's
+    /// just an Arc bump.
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
+    }
+
+    /// Returns the socket path the server is bound to.
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+}
+
+/// Binds a Unix domain socket at `socket_path` and serves the daemon
+/// HTTP router on it until `shutdown` fires.
+///
+/// `state` is the shared router state: cache + base_dir. The accept
+/// loop clones `state` per-connection so handlers get independent
+/// axum `State` extractor instances.
+///
+/// # Behavior
+///
+/// 1. Removes any existing file at `socket_path` (cleanup of stale
+///    sockets from previous crashed daemons). If a live daemon is
+///    bound there, the `try_lock`/PID file guard in
+///    [`super::pid::PidFile::acquire`] should have failed already —
+///    we trust that guard and overwrite.
+/// 2. Binds a `tokio::net::UnixListener`.
+/// 3. `chmod` the socket file to `0o600` so only the owning UID can
+///    connect. Done via `std::fs::set_permissions` on the path — the
+///    kernel honors this on macOS and modern Linux.
+/// 4. Spawns the accept loop, which waits for connections and
+///    dispatches each to a tokio task running the axum service.
+/// 5. On `shutdown.cancelled()`, the accept loop exits. In-flight
+///    connections are allowed to complete on their own tasks.
+/// 6. Removes the socket file on exit (best-effort).
+///
+/// Returns a [`ServerHandle`] the caller can use to trigger
+/// shutdown, and an awaitable future that resolves when the accept
+/// loop has exited.
+#[cfg(unix)]
+pub async fn serve(
+    socket_path: &Path,
+    state: RouterState,
+) -> Result<(ServerHandle, tokio::task::JoinHandle<()>), DaemonError> {
+    // Cleanup stale socket file (previous crash).
+    if socket_path.exists() {
+        std::fs::remove_file(socket_path).map_err(|_| DaemonError::SocketConnect {
+            path: socket_path.to_path_buf(),
+        })?;
+    }
+
+    // Ensure parent directory exists.
+    if let Some(parent) = socket_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|_| DaemonError::SocketConnect {
+                path: parent.to_path_buf(),
+            })?;
+        }
+    }
+
+    // Tighten umask to 0o077 so the socket file bind(2) creates has
+    // 0o600 mode from the very first syscall — closing the
+    // bind→chmod race window where an unprivileged local process
+    // could otherwise racy-connect(2) to a world-readable socket.
+    // umask(2) is process-global on Unix; we restore the previous
+    // value immediately after bind. The window is bounded to a
+    // single syscall and no other daemon work races it because
+    // `serve()` is called from the single-threaded startup path
+    // before any background tokio tasks are spawned.
+    //
+    // SAFETY: libc::umask is always safe to call; we restore the
+    // previous mask on all paths via the explicit guard below.
+    let old_umask = unsafe { libc::umask(0o077) };
+
+    let bind_result = UnixListener::bind(socket_path);
+
+    // Restore the original umask before handling errors so a bind
+    // failure does not leave the process with a tightened mask.
+    unsafe {
+        libc::umask(old_umask);
+    }
+
+    let listener = bind_result.map_err(|e| {
+        tracing::debug!(error = %e, path = ?socket_path, "UnixListener::bind failed");
+        DaemonError::SocketConnect {
+            path: socket_path.to_path_buf(),
+        }
+    })?;
+
+    // Defense-in-depth: explicit set_permissions even after the
+    // umask-controlled bind. If the filesystem or kernel behaved
+    // unexpectedly (NFS, container layer), this catches it.
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+        tracing::debug!(error = %e, "chmod socket 0o600 failed");
+        DaemonError::SocketConnect {
+            path: socket_path.to_path_buf(),
+        }
+    })?;
+
+    let shutdown = CancellationToken::new();
+    let handle = ServerHandle {
+        socket_path: socket_path.to_path_buf(),
+        shutdown: shutdown.clone(),
+    };
+
+    // One noninteractive prior-boot custody check; never block server readiness.
+    tokio::spawn(recover_pool_after_startup((*state.base_dir).clone()));
+    let app = Arc::new(router(state));
+    let sock_for_cleanup = socket_path.to_path_buf();
+    let join = tokio::spawn(async move {
+        accept_loop(listener, app, shutdown, sock_for_cleanup).await;
+    });
+
+    Ok((handle, join))
+}
+
+/// One restart-only pool custody check for a product startup channel.
+/// Callers spawn this future exactly once and never wait for it during startup.
+/// The deadline bounds observation, not cancellation of a native blocking call;
+/// custody and prior-boot admission remain enforced by the Pool API.
+pub async fn recover_pool_after_startup(base_dir: PathBuf) {
+    let outcome = recover_pool_after_startup_with(std::time::Duration::from_secs(5), move || {
+        pool_startup_recovery_checked(crate::pool::Pool::new(&base_dir).recover_after_restart())
+    })
+    .await;
+    if outcome != "pool_restart_recovery_checked" {
+        tracing::warn!(
+            error_kind = outcome,
+            "pool restart recovery check incomplete"
+        );
+    }
+}
+
+fn pool_startup_recovery_checked(
+    outcome: std::result::Result<crate::pool::RestartRecovery, crate::pool::PoolError>,
+) -> bool {
+    matches!(
+        outcome,
+        Ok(crate::pool::RestartRecovery::NotNeeded | crate::pool::RestartRecovery::Recovered)
+    )
+}
+
+async fn recover_pool_after_startup_with(
+    budget: std::time::Duration,
+    recover: impl FnOnce() -> bool + Send + 'static,
+) -> &'static str {
+    match tokio::time::timeout(budget, tokio::task::spawn_blocking(recover)).await {
+        Ok(Ok(true)) => "pool_restart_recovery_checked",
+        Ok(Ok(false)) => "pool_restart_recovery_refused",
+        Ok(Err(_)) => "pool_restart_recovery_worker_failed",
+        Err(_) => "pool_restart_recovery_timed_out",
+    }
+}
+
+/// The accept loop. Exits when the shutdown token is cancelled.
+///
+/// Each accepted connection is handed to a fresh tokio task running
+/// the hyper connection service. In-flight tasks are NOT awaited on
+/// shutdown — the daemon's main loop (in lifecycle.rs) is
+/// responsible for the wider graceful-shutdown deadline via
+/// `JoinHandle::abort` or a tokio `timeout`.
+#[cfg(unix)]
+async fn accept_loop(
+    listener: UnixListener,
+    app: Arc<Router>,
+    shutdown: CancellationToken,
+    socket_path: PathBuf,
+) {
+    use hyper::service::service_fn;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto;
+    use tower::ServiceExt;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                tracing::info!("daemon server: shutdown signaled, exiting accept loop");
+                break;
+            }
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((stream, _addr)) => {
+                        // Verify the connecting peer runs as our own
+                        // UID. Any mismatch is closed immediately —
+                        // the HTTP router is never invoked. This is
+                        // the second defensive layer after socket
+                        // file permissions.
+                        if let Err(e) = verify_peer_uid(&stream) {
+                            tracing::warn!(error = %e, "rejecting cross-UID connection");
+                            drop(stream);
+                            continue;
+                        }
+
+                        let app = Arc::clone(&app);
+                        tokio::spawn(async move {
+                            let io = TokioIo::new(stream);
+                            let service = service_fn(move |req| {
+                                let app = Arc::clone(&app);
+                                async move {
+                                    let router = (*app).clone();
+                                    router.oneshot(req).await
+                                }
+                            });
+                            if let Err(e) = auto::Builder::new(TokioExecutor::new())
+                                .serve_connection(io, service)
+                                .await
+                            {
+                                tracing::debug!(error = %e, "connection service error");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "accept failed, continuing");
+                        // A short pause avoids hot-spinning on
+                        // persistent accept errors (e.g., EMFILE).
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
+            }
+        }
+    }
+
+    // Best-effort socket cleanup on exit.
+    let _ = std::fs::remove_file(&socket_path);
+    tracing::info!(path = ?socket_path, "daemon server: accept loop exited");
+}
+
+/// Verifies the peer at the other end of a Unix domain socket is
+/// running under the same effective UID as this daemon.
+///
+/// On Linux this uses `getsockopt(SO_PEERCRED)` which returns a
+/// `struct ucred` with the peer's PID, UID, and GID. On macOS this
+/// uses `getsockopt(LOCAL_PEERCRED)` which returns a `struct xucred`
+/// with `cr_uid` (among other fields).
+///
+/// Any getsockopt failure or UID mismatch returns `Err` — the
+/// caller drops the stream without invoking the HTTP router.
+#[cfg(all(unix, target_os = "linux"))]
+fn verify_peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<()> {
+    // `libc::ucred` layout: { pid: pid_t, uid: uid_t, gid: gid_t }
+    let fd = stream.as_raw_fd();
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+
+    // SAFETY: fd is a valid Unix-domain socket fd; cred is a valid
+    // stack allocation of the right type; len matches its size.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let our_uid = unsafe { libc::geteuid() };
+    if cred.uid != our_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("peer UID {} != daemon UID {}", cred.uid, our_uid),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+fn verify_peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<()> {
+    // macOS `struct xucred` from <sys/ucred.h>:
+    //   cr_version: u32
+    //   cr_uid:     uid_t
+    //   cr_ngroups: i16
+    //   cr_groups:  [gid_t; NGROUPS]  (NGROUPS = 16)
+    #[repr(C)]
+    struct XUcred {
+        cr_version: u32,
+        cr_uid: libc::uid_t,
+        cr_ngroups: libc::c_short,
+        cr_groups: [libc::gid_t; 16],
+    }
+
+    // From <sys/un.h>: SOL_LOCAL = 0, LOCAL_PEERCRED = 1.
+    const SOL_LOCAL: libc::c_int = 0;
+    const LOCAL_PEERCRED: libc::c_int = 1;
+
+    let fd = stream.as_raw_fd();
+    let mut cred: XUcred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<XUcred>() as libc::socklen_t;
+
+    // SAFETY: fd is a valid Unix-domain socket fd; cred is a valid
+    // stack allocation matching struct xucred; len reflects size.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            SOL_LOCAL,
+            LOCAL_PEERCRED,
+            &mut cred as *mut XUcred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let our_uid = unsafe { libc::geteuid() };
+    if cred.cr_uid != our_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("peer UID {} != daemon UID {}", cred.cr_uid, our_uid),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn verify_peer_uid(_stream: &tokio::net::UnixStream) -> std::io::Result<()> {
+    // Other Unixes: no portable peer-credential API. The 0o600
+    // socket permission is the sole boundary; log a warning so
+    // operators on BSD/Illumos/etc. are aware.
+    tracing::warn!(
+        "peer UID verification not implemented on this platform — \
+         relying solely on socket file permissions"
+    );
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::testing::socket_fixture::UnixSocketFixture;
+
+    #[test]
+    fn oauth_login_outcomes_map_busy_to_409_retry_and_target_advance_to_explicit_500() {
+        use crate::accounts::anthropic_identity::IdentityError as E;
+        let dir = tempfile::TempDir::new().unwrap();
+        let account = AccountNum::try_from(1).unwrap();
+        let busy =
+            finish_oauth_login_credentials(dir.path(), account, Err(E::BindingBusy)).unwrap_err();
+        assert_eq!(busy, "oauth_identity_busy");
+        let (status, outcome) = login_outcome_response(&busy);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(outcome.message().contains("retry"), "{}", outcome.message());
+        let advanced = finish_oauth_login_credentials(
+            dir.path(),
+            account,
+            Err(E::TargetAdvancedPublicationFailed),
+        )
+        .unwrap_err();
+        assert_eq!(advanced, "oauth_login_target_advanced_publication_failed");
+        let (status, outcome) = login_outcome_response(&advanced);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            outcome
+                .message()
+                .contains("existing credentials were advanced"),
+            "{}",
+            outcome.message()
+        );
+        let refused = finish_oauth_login_credentials(dir.path(), account, Err(E::ProfileRefused))
+            .unwrap_err();
+        assert_eq!(login_outcome_response(&refused).0, StatusCode::BAD_REQUEST);
+    }
+
+    /// Builds a minimal RouterState for tests. Both caches start
+    /// empty; base_dir points at the provided temp directory. The
+    /// OAuth store is present so the `/api/login/{id}` tests
+    /// exercise the success path; individual tests that want to
+    /// exercise the 503 path pass `oauth_store: None` via
+    /// `test_state_no_oauth`. The discovery cache uses the
+    /// production 5-second TTL — tests that need a shorter TTL
+    /// use `test_state_with_discovery_ttl`.
+    ///
+    /// `audit_health` defaults to `AuditHealth::Verified` so tests
+    /// that don't care about audit gating get the clean path.
+    /// Acquires the shared env lock and awaits `fut` with it held: serve()
+    /// flips the process umask around bind(2) outside any lock, and the flip
+    /// window is entirely inside the served future, so the guard MUST span
+    /// this await. Allowed deliberately — a test-only serialization mutex on
+    /// a current_thread runtime (same disposition as daemon/detect.rs and
+    /// usage_poller/kimi.rs); the guard drops when the future returns.
+    #[allow(clippy::await_holding_lock)]
+    async fn with_serve_env_lock<T>(fut: impl std::future::Future<Output = T>) -> T {
+        let _env = crate::platform::test_env::lock();
+        fut.await
+    }
+
+    fn test_state(base: &Path) -> RouterState {
+        RouterState {
+            cache: Arc::new(TtlCache::with_default_age()),
+            discovery_cache: Arc::new(TtlCache::new(DISCOVERY_CACHE_MAX_AGE)),
+            base_dir: Arc::new(base.to_path_buf()),
+            oauth_store: Some(Arc::new(OAuthStateStore::new())),
+            gemini_consumer: GeminiConsumerState::default(),
+            audit_health: crate::audit::new_shared(crate::audit::AuditHealth::Verified),
+            audit_records_unverified: 0,
+            anchor_sink: None,
+            usage_poller_wake: Arc::new(crate::daemon::usage_poller::WakeChannel::new()),
+            #[cfg(feature = "enterprise")]
+            interactive: Arc::new(InteractiveSessionRegistry::empty()),
+        }
+    }
+
+    /// Builds a RouterState with `oauth_store: None` so the
+    /// `/api/login/{id}` handler returns 503.
+    fn test_state_no_oauth(base: &Path) -> RouterState {
+        RouterState {
+            cache: Arc::new(TtlCache::with_default_age()),
+            discovery_cache: Arc::new(TtlCache::new(DISCOVERY_CACHE_MAX_AGE)),
+            base_dir: Arc::new(base.to_path_buf()),
+            oauth_store: None,
+            gemini_consumer: GeminiConsumerState::default(),
+            audit_health: crate::audit::new_shared(crate::audit::AuditHealth::Verified),
+            audit_records_unverified: 0,
+            anchor_sink: None,
+            usage_poller_wake: Arc::new(crate::daemon::usage_poller::WakeChannel::new()),
+            #[cfg(feature = "enterprise")]
+            interactive: Arc::new(InteractiveSessionRegistry::empty()),
+        }
+    }
+
+    /// Builds a RouterState with an explicit discovery-cache TTL.
+    /// Used by tests that verify expiry behavior without waiting
+    /// the full 5 seconds.
+    fn test_state_with_discovery_ttl(
+        base: &Path,
+        discovery_ttl: std::time::Duration,
+    ) -> RouterState {
+        RouterState {
+            cache: Arc::new(TtlCache::with_default_age()),
+            discovery_cache: Arc::new(TtlCache::new(discovery_ttl)),
+            base_dir: Arc::new(base.to_path_buf()),
+            oauth_store: Some(Arc::new(OAuthStateStore::new())),
+            gemini_consumer: GeminiConsumerState::default(),
+            audit_health: crate::audit::new_shared(crate::audit::AuditHealth::Verified),
+            audit_records_unverified: 0,
+            anchor_sink: None,
+            usage_poller_wake: Arc::new(crate::daemon::usage_poller::WakeChannel::new()),
+            #[cfg(feature = "enterprise")]
+            interactive: Arc::new(InteractiveSessionRegistry::empty()),
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_binds_and_sets_permissions() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
+        assert!(sock.exists(), "socket file should be created");
+
+        // Verify 0o600 permissions.
+        let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "socket must be 0o600 (owner-only)");
+
+        handle.shutdown();
+        // Give the accept loop a moment to exit.
+        tokio::time::timeout(std::time::Duration::from_secs(1), join)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Socket file should be cleaned up.
+        assert!(!sock.exists(), "socket file should be removed on shutdown");
+    }
+
+    #[tokio::test]
+    async fn serve_cleans_stale_socket_file() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+
+        // Pretend a stale socket file exists (regular file, not a real socket).
+        std::fs::write(&sock, "stale").unwrap();
+        assert!(sock.exists());
+
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
+        assert!(sock.exists());
+
+        handle.shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(1), join)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_over_real_socket() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
+
+        // Connect and send a minimal HTTP/1.1 GET.
+        let mut stream = UnixStream::connect(&sock).await.unwrap();
+        stream
+            .write_all(b"GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+
+        // Read the full response.
+        let mut buf = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_to_end(&mut buf),
+        )
+        .await
+        .expect("health response within timeout")
+        .unwrap();
+
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.contains("200 OK"),
+            "expected 200 OK in response, got: {text}"
+        );
+        assert!(
+            text.contains(r#""status":"ok""#),
+            "expected JSON body, got: {text}"
+        );
+        assert!(
+            text.contains(r#""version":""#),
+            "expected version field, got: {text}"
+        );
+
+        handle.shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(1), join)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_route_returns_404() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
+
+        let mut stream = UnixStream::connect(&sock).await.unwrap();
+        stream
+            .write_all(b"GET /api/nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+
+        let mut buf = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_to_end(&mut buf),
+        )
+        .await
+        .expect("response within timeout")
+        .unwrap();
+
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.contains("404"),
+            "expected 404 for unknown route, got: {text}"
+        );
+
+        handle.shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(1), join)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn health_response_serializes() {
+        let r = HealthResponse {
+            status: "ok",
+            version: "2.0.0-alpha.1",
+            pid: 42,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"status\":\"ok\""));
+        assert!(json.contains("\"pid\":42"));
+    }
+
+    /// Sends a minimal HTTP/1.1 GET over a Unix socket and reads
+    /// the full response. Returns (status_line, body) where body
+    /// is everything after the blank CRLF-CRLF.
+    async fn http_get(sock: &std::path::Path, path: &str) -> (String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let mut stream = UnixStream::connect(sock).await.unwrap();
+        let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut buf = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_to_end(&mut buf),
+        )
+        .await
+        .expect("response within timeout")
+        .unwrap();
+
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let status_line = text.lines().next().unwrap_or("").to_string();
+        // Find the blank line separating headers from body.
+        let body = text
+            .find("\r\n\r\n")
+            .map(|i| text[i + 4..].to_string())
+            .unwrap_or_default();
+        (status_line, body)
+    }
+
+    /// Issues a raw HTTP POST with a JSON body against the daemon's
+    /// Unix socket and returns (status_line, body).
+    async fn http_post_json(sock: &std::path::Path, path: &str, body: &str) -> (String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let mut stream = UnixStream::connect(sock).await.unwrap();
+        let req = format!(
+            "POST {path} HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {len}\r\n\
+             Connection: close\r\n\r\n{body}",
+            len = body.len(),
+            body = body
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut buf = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_to_end(&mut buf),
+        )
+        .await
+        .expect("response within timeout")
+        .unwrap();
+
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let status_line = text.lines().next().unwrap_or("").to_string();
+        let body = text
+            .find("\r\n\r\n")
+            .map(|i| text[i + 4..].to_string())
+            .unwrap_or_default();
+        (status_line, body)
+    }
+
+    /// Issues a raw HTTP POST with a JSON body AND an `X-CSQ-Session-Key` header
+    /// against the daemon's Unix socket; returns (status_line, body).
+    #[cfg(feature = "enterprise")]
+    async fn http_post_json_with_key(
+        sock: &std::path::Path,
+        path: &str,
+        body: &str,
+        session_key: &str,
+    ) -> (String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let mut stream = UnixStream::connect(sock).await.unwrap();
+        let req = format!(
+            "POST {path} HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Content-Type: application/json\r\n\
+             X-CSQ-Session-Key: {session_key}\r\n\
+             Content-Length: {len}\r\n\
+             Connection: close\r\n\r\n{body}",
+            len = body.len(),
+            body = body
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut buf = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_to_end(&mut buf),
+        )
+        .await
+        .expect("response within timeout")
+        .unwrap();
+
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let status_line = text.lines().next().unwrap_or("").to_string();
+        let body = text
+            .find("\r\n\r\n")
+            .map(|i| text[i + 4..].to_string())
+            .unwrap_or_default();
+        (status_line, body)
+    }
+
+    // ── an internal ticket/an internal ticket interactive route integration (enterprise-only) ─────────────
+    //
+    // These exercise the FULL production path: the registered `/api/interactive/*`
+    // routes → `RouterState::interactive` registry → `InteractiveSession::run_turn`
+    // → `GovernanceLoop::execute`, over a real Unix socket. Only the provider
+    // network is mocked (the live golden-3 leg is the §10.5 maintainer task).
+
+    #[cfg(feature = "enterprise")]
+    fn it_answer_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "required": ["answer"],
+            "properties": { "answer": { "type": "string" } },
+            "additionalProperties": true
+        })
+    }
+
+    /// RouterState whose interactive registry is SEEDED over a mock `factory`.
+    ///
+    /// Uses [`InteractiveSessionRegistry::seeded_compat`] so the registry holds
+    /// exactly one pre-built session; returns both the state AND the session key
+    /// so tests can route subsequent dispatch calls to the right session.
+    #[cfg(feature = "enterprise")]
+    fn seeded_interactive_state(
+        base: &std::path::Path,
+        factory: crate::edition_ext::interactive::ProviderFactory,
+    ) -> (RouterState, crate::daemon::interactive_ipc::SessionKey) {
+        let session = crate::edition_ext::interactive::InteractiveSession::new(
+            factory,
+            it_answer_schema(),
+            256,
+            Some("route-it".into()),
+        );
+        let (reg, key) = InteractiveSessionRegistry::seeded_compat(session);
+        let state = RouterState {
+            interactive: Arc::new(reg),
+            ..test_state(base)
+        };
+        (state, key)
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn interactive_route_submit_blocked_override_complete() {
+        use crate::edition_ext::provider_client::{MockProviderClient, ProviderClient, ProviderId};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Turn 1 returns schema-failing content (block); the override's corrective
+        // turn returns passing content (complete). Fresh client per turn via counter.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let factory: crate::edition_ext::interactive::ProviderFactory = {
+            let counter = counter.clone();
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let content = if n == 0 {
+                    serde_json::json!("not an object")
+                } else {
+                    serde_json::json!({ "answer": "ok" })
+                };
+                vec![Box::new(MockProviderClient::passing(
+                    ProviderId("mock".into()),
+                    content,
+                )) as Box<dyn ProviderClient>]
+            })
+        };
+
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let (state, key) = seeded_interactive_state(dir.path(), factory);
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+        let key_str = key.as_str().to_owned();
+
+        let (status, body) = http_post_json_with_key(
+            &sock,
+            "/api/interactive/submit",
+            r#"{"input":"do the risky thing"}"#,
+            &key_str,
+        )
+        .await;
+        assert!(
+            status.contains("200"),
+            "submit status: {status} body: {body}"
+        );
+        assert!(
+            body.contains(r#""state":"blocked""#),
+            "expected blocked: {body}"
+        );
+
+        let (status, body) = http_post_json_with_key(
+            &sock,
+            "/api/interactive/override",
+            r#"{"justification":"operator accepts the risk"}"#,
+            &key_str,
+        )
+        .await;
+        assert!(
+            status.contains("200"),
+            "override status: {status} body: {body}"
+        );
+        assert!(
+            body.contains(r#""state":"complete""#),
+            "expected complete: {body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn interactive_route_fail_closed_503_on_empty_registry() {
+        // Default `test_state` seeds an EMPTY registry (production fail-closed).
+        // Probe via `POST /api/interactive/open` (no key required) — the route
+        // returns 503 `interactive_unavailable` — NOT 404 (route is present) and
+        // NOT a panic.
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
+
+        let (status, body) = http_post_json(&sock, "/api/interactive/open", "{}").await;
+        assert!(
+            status.contains("503"),
+            "expected 503 on empty registry, got: {status} body: {body}"
+        );
+        assert!(
+            body.contains("interactive_unavailable"),
+            "expected fail-closed tag: {body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn interactive_route_options_fail_closed_503_on_empty_registry() {
+        // Default `test_state` seeds an EMPTY registry (gate closed). The options
+        // pre-open query is fail-closed identically to the keyed routes (an internal ticket).
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
+
+        let (status, body) = http_post_json(&sock, "/api/interactive/options", "").await;
+        assert!(
+            status.contains("503"),
+            "expected 503 on closed gate, got: {status} body: {body}"
+        );
+        assert!(
+            body.contains("interactive_unavailable"),
+            "expected fail-closed tag: {body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn interactive_route_options_lists_candidate_slots() {
+        // Full path: write a valid gate (provider=claude) + stage two credentialed
+        // Anthropic accounts, seed a LIVE registry, then the options route returns
+        // the provider + both slots lowest-first (an internal ticket §FD1).
+        use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
+        use crate::types::{AccessToken, RefreshToken};
+
+        let dir = UnixSocketFixture::new().unwrap();
+        // Gate: provider=claude with a minimal valid schema.
+        let gate = serde_json::json!({
+            "provider": "claude",
+            "schema": it_answer_schema(),
+        });
+        std::fs::write(
+            dir.path()
+                .join(crate::daemon::interactive_live::GATE_FILENAME),
+            gate.to_string(),
+        )
+        .unwrap();
+        // Stage two credentialed accounts (out of order → expect lowest-first).
+        for id in [4u16, 2u16] {
+            let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
+                claude_ai_oauth: OAuthPayload {
+                    access_token: AccessToken::new(format!("at-{id}")),
+                    refresh_token: RefreshToken::new(format!("rt-{id}")),
+                    expires_at: 9999999999999,
+                    scopes: vec![],
+                    subscription_type: None,
+                    rate_limit_tier: None,
+                    extra: std::collections::HashMap::new(),
+                },
+                extra: std::collections::HashMap::new(),
+            });
+            credentials::save(
+                &dir.path().join("credentials").join(format!("{id}.json")),
+                &creds,
+            )
+            .unwrap();
+        }
+
+        let reg = crate::daemon::interactive_live::seed_registry(dir.path(), None, None, None);
+        let state = RouterState {
+            interactive: Arc::new(reg),
+            ..test_state(dir.path())
+        };
+        let sock = dir.socket_path();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let (status, body) = http_post_json(&sock, "/api/interactive/options", "").await;
+        assert!(
+            status.contains("200"),
+            "options status: {status} body: {body}"
+        );
+        assert!(
+            body.contains(r#""provider":"claude""#),
+            "expected provider claude: {body}"
+        );
+        // Both staged slots present, lowest-first (slot 2 before slot 4).
+        let two = body.find(r#""slot":2"#).expect("slot 2 present");
+        let four = body.find(r#""slot":4"#).expect("slot 4 present");
+        assert!(two < four, "candidates must be lowest-first: {body}");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn interactive_route_abandon_returns_idle() {
+        use crate::edition_ext::provider_client::{MockProviderClient, ProviderClient, ProviderId};
+
+        // Always-failing factory → submit blocks; abandon → idle (no body needed).
+        let factory: crate::edition_ext::interactive::ProviderFactory = Box::new(|| {
+            vec![Box::new(MockProviderClient::passing(
+                ProviderId("mock".into()),
+                serde_json::json!("not an object"),
+            )) as Box<dyn ProviderClient>]
+        });
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let (state, key) = seeded_interactive_state(dir.path(), factory);
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+        let key_str = key.as_str().to_owned();
+
+        let (_s1, b1) = http_post_json_with_key(
+            &sock,
+            "/api/interactive/submit",
+            r#"{"input":"risky"}"#,
+            &key_str,
+        )
+        .await;
+        assert!(
+            b1.contains(r#""state":"blocked""#),
+            "expected blocked: {b1}"
+        );
+
+        let (s2, b2) =
+            http_post_json_with_key(&sock, "/api/interactive/abandon", "", &key_str).await;
+        assert!(s2.contains("200"), "abandon status: {s2} body: {b2}");
+        assert!(b2.contains(r#""state":"idle""#), "expected idle: {b2}");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn interactive_route_malformed_body_422() {
+        use crate::edition_ext::provider_client::{MockProviderClient, ProviderClient, ProviderId};
+
+        // A malformed JSON body on `submit` is rejected at the handler boundary with
+        // 422 `interactive_deserialize_error` (spec 21 §21.7), BEFORE the registry
+        // is touched. We send a valid key so the key-extraction step passes.
+        let factory: crate::edition_ext::interactive::ProviderFactory = Box::new(|| {
+            vec![Box::new(MockProviderClient::passing(
+                ProviderId("mock".into()),
+                serde_json::json!({ "answer": "ok" }),
+            )) as Box<dyn ProviderClient>]
+        });
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let (state, key) = seeded_interactive_state(dir.path(), factory);
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+        let key_str = key.as_str().to_owned();
+
+        let (status, body) =
+            http_post_json_with_key(&sock, "/api/interactive/submit", "{ not json", &key_str).await;
+        assert!(
+            status.contains("422"),
+            "expected 422, got: {status} body: {body}"
+        );
+        assert!(
+            body.contains("interactive_deserialize_error"),
+            "expected deserialize tag: {body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn interactive_route_missing_key_header_400() {
+        use crate::edition_ext::provider_client::{MockProviderClient, ProviderClient, ProviderId};
+
+        // POST /api/interactive/submit with NO X-CSQ-Session-Key header must
+        // return 400 `session_key_invalid` (FIX 3: absent header → same
+        // InteractiveIpcError::InvalidSessionKey path as a malformed key).
+        let factory: crate::edition_ext::interactive::ProviderFactory = Box::new(|| {
+            vec![Box::new(MockProviderClient::passing(
+                ProviderId("mock".into()),
+                serde_json::json!({ "answer": "ok" }),
+            )) as Box<dyn ProviderClient>]
+        });
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let (state, _key) = seeded_interactive_state(dir.path(), factory);
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        // Send submit with no header — extract_session_key must reject it.
+        let (status, body) =
+            http_post_json(&sock, "/api/interactive/submit", r#"{"input":"hi"}"#).await;
+        assert!(
+            status.contains("400"),
+            "expected 400 for missing key header, got: {status} body: {body}"
+        );
+        assert!(
+            body.contains("session_key_invalid"),
+            "expected session_key_invalid tag: {body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn accounts_route_returns_empty_list_on_empty_base() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
+
+        let (status, body) = http_get(&sock, "/api/accounts").await;
+        assert!(status.contains("200"), "status: {status}");
+        assert!(
+            body.contains(r#""accounts":[]"#),
+            "body should have empty accounts array: {body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn accounts_route_lists_discovered_accounts() {
+        use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
+        use crate::types::{AccessToken, RefreshToken};
+
+        let dir = UnixSocketFixture::new().unwrap();
+
+        // Install a valid credentials/1.json so discover_anthropic picks it up.
+        let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("at".into()),
+                refresh_token: RefreshToken::new("rt".into()),
+                expires_at: 9_999_999_999_999,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        let num = AccountNum::try_from(1u16).unwrap();
+        credentials::save(
+            &crate::credentials::file::canonical_path(dir.path(), num),
+            &creds,
+        )
+        .unwrap();
+
+        let sock = dir.socket_path();
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
+
+        let (status, body) = http_get(&sock, "/api/accounts").await;
+        assert!(status.contains("200"), "status: {status}");
+        assert!(body.contains(r#""id":1"#), "body: {body}");
+        assert!(body.contains(r#""source":"Anthropic""#), "body: {body}");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_status_one_returns_404_when_absent() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
+
+        let (status, body) = http_get(&sock, "/api/refresh-status/1").await;
+        assert!(status.contains("404"), "status: {status}");
+        assert!(body.contains("no cached refresh status"), "body: {body}");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_status_one_rejects_out_of_range_id() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
+
+        // 0 is out of the 1..=999 range so AccountNum::try_from rejects it.
+        let (status, body) = http_get(&sock, "/api/refresh-status/0").await;
+        assert!(status.contains("400"), "status: {status}");
+        assert!(body.contains("invalid account id"), "body: {body}");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_status_one_returns_cached_entry() {
+        use crate::daemon::refresher::RefreshStatus;
+
+        let dir = UnixSocketFixture::new().unwrap();
+        let state = test_state(dir.path());
+
+        // Pre-populate the cache with a known status.
+        state.cache.set(
+            1,
+            RefreshStatus {
+                account: 1,
+                last_result: "refreshed".to_string(),
+                expires_at_ms: 1_234_567_890,
+                checked_at_secs: 42,
+            },
+        );
+
+        let sock = dir.socket_path();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let (status, body) = http_get(&sock, "/api/refresh-status/1").await;
+        assert!(status.contains("200"), "status: {status}");
+        assert!(body.contains(r#""account":1"#), "body: {body}");
+        assert!(
+            body.contains(r#""last_result":"refreshed""#),
+            "body: {body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_status_all_returns_only_accounts_in_cache() {
+        use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
+        use crate::daemon::refresher::RefreshStatus;
+        use crate::types::{AccessToken, RefreshToken};
+
+        let dir = UnixSocketFixture::new().unwrap();
+
+        // Install account 1 and account 2, but only populate the
+        // cache for account 1.
+        for id in [1u16, 2] {
+            let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
+                claude_ai_oauth: OAuthPayload {
+                    access_token: AccessToken::new("at".into()),
+                    refresh_token: RefreshToken::new("rt".into()),
+                    expires_at: 9_999_999_999_999,
+                    scopes: vec![],
+                    subscription_type: None,
+                    rate_limit_tier: None,
+                    extra: Default::default(),
+                },
+                extra: Default::default(),
+            });
+            let num = AccountNum::try_from(id).unwrap();
+            credentials::save(
+                &crate::credentials::file::canonical_path(dir.path(), num),
+                &creds,
+            )
+            .unwrap();
+        }
+
+        let state = test_state(dir.path());
+        state.cache.set(
+            1,
+            RefreshStatus {
+                account: 1,
+                last_result: "valid".to_string(),
+                expires_at_ms: 9_999_999_999_999,
+                checked_at_secs: 99,
+            },
+        );
+
+        let sock = dir.socket_path();
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let (status, body) = http_get(&sock, "/api/refresh-status").await;
+        assert!(status.contains("200"), "status: {status}");
+        assert!(body.contains(r#""account":1"#), "body: {body}");
+        // Account 2 is not in the cache, so it must not appear.
+        assert!(!body.contains(r#""account":2"#), "body: {body}");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn login_route_returns_authorize_url() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        // Remember the store so we can verify the pending entry.
+        let store = Arc::clone(state.oauth_store.as_ref().unwrap());
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let (status, body) = http_get(&sock, "/api/login/3").await;
+        assert!(status.contains("200"), "status: {status}");
+        // Paste-code flow: authorize URL is the current Anthropic
+        // endpoint and the redirect_uri embedded in it is the
+        // paste-code callback page, not a loopback URL.
+        assert!(
+            body.contains(r#""auth_url":"https://claude.com/cai/oauth/authorize"#),
+            "body: {body}"
+        );
+        assert!(
+            body.contains("platform.claude.com%2Foauth%2Fcode%2Fcallback"),
+            "redirect_uri must be the paste-code callback, body: {body}"
+        );
+        assert!(body.contains(r#""account":3"#), "body: {body}");
+        assert!(body.contains(r#""state":""#));
+        assert_eq!(store.len(), 1, "state store should have one pending entry");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn login_route_returns_503_when_oauth_unavailable() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state_no_oauth(dir.path());
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let (status, body) = http_get(&sock, "/api/login/1").await;
+        assert!(status.contains("503"), "status: {status}");
+        assert!(body.contains("oauth support is not available"));
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    fn exchanged_grant_fixture(token: &str) -> credentials::CredentialFile {
+        // A year-2100 expiry isolates identity validation from expiration.
+        serde_json::from_value(serde_json::json!({"claudeAiOauth": {
+            "accessToken": token, "refreshToken": "fixture-server-refresh",
+            "expiresAt": 4102444800000_u64, "scopes": ["user:profile", "user:inference"],
+        }}))
+        .unwrap()
+    }
+
+    #[test]
+    fn oauth_browser_wait_rebind_refuses_original_handler_authority() {
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let state = test_state(dir.path());
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let account = AccountNum::try_from(1).unwrap();
+                let Json(initial) = login_handler(State(state.clone()), AxumPath(account.get())).await.unwrap();
+                let Json(winner) = login_handler(State(state.clone()), AxumPath(account.get())).await.unwrap();
+                let Json(committed_winner) = oauth_exchange_handler_with_transport(State(state.clone()), Json(OAuthExchangeRequest {
+                    state: winner.state, code: "fixture-winner-code".into(),
+                }), |_, _| Ok(br#"{"access_token":"fixture-browser-winning-token","refresh_token":"fixture-browser-refresh","expires_in":3153600000}"#.to_vec()),
+                    oauth_profile_fixture("fixture-browser-winning-token")).await.unwrap();
+                assert_eq!(committed_winner.account, account.get(), "winner completion must report the verified slot");
+                let identity = crate::accounts::profiles::resolve_slot_to_uuid(dir.path(), account.get()).unwrap();
+                let path = crate::accounts::identity_store::credentials_path_for(dir.path(), identity);
+                let before = std::fs::read(&path).unwrap();
+                let err = oauth_exchange_handler_with_transport(State(state), Json(OAuthExchangeRequest {
+                    state: initial.state, code: "fixture-stale-code".into(),
+                }), |_, _| Ok(br#"{"access_token":"fixture-browser-stale-token","refresh_token":"fixture-browser-stale-refresh","expires_in":3153600000}"#.to_vec()),
+                    oauth_profile_fixture("fixture-browser-stale-token")).await.unwrap_err();
+                assert_eq!(err.0, StatusCode::CONFLICT,
+                    "browser-wait winner must invalidate original pending authority");
+                assert_eq!(crate::accounts::profiles::resolve_slot_to_uuid(dir.path(), account.get()), Some(identity));
+                assert_eq!(std::fs::read(&path).unwrap(), before, "winner grant must survive stale browser completion");
+            });
+        });
+    }
+
+    #[test]
+    fn oauth_exchange_unknown_profile_refuses_without_publishing() {
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let account = AccountNum::try_from(1).unwrap();
+            let prior =
+                crate::accounts::anthropic_identity::capture_login_prior(dir.path(), account)
+                    .unwrap();
+            let credential = exchanged_grant_fixture("fixture-server-unknown-token");
+            let profile: crate::daemon::usage_poller::HttpGetFn = Arc::new(|url, token, _| {
+                assert_eq!(url, "https://api.anthropic.com/api/oauth/profile");
+                assert_eq!(token, "fixture-server-unknown-token");
+                Ok((
+                    200,
+                    br#"{"account":{"email":"fixture-slot-1@test.invalid"}}"#.to_vec(),
+                ))
+            });
+            assert!(save_oauth_login_credentials_with(
+                dir.path(),
+                account,
+                &credential,
+                &profile,
+                prior
+            )
+            .is_err());
+            assert!(
+                crate::accounts::profiles::resolve_slot_to_uuid(dir.path(), account.get())
+                    .is_none()
+            );
+            assert!(!dir.path().join("config-1/.csq-account").exists());
+        });
+    }
+
+    #[test]
+    fn oauth_exchange_profile_transport_error_does_not_leak_grant_or_body() {
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let account = AccountNum::try_from(1).unwrap();
+            let credential = exchanged_grant_fixture("fixture-server-private-token");
+            let profile: crate::daemon::usage_poller::HttpGetFn =
+                Arc::new(|_, token, _| Err(format!("{token}: fixture-private-profile-body")));
+            let err = save_oauth_login_credentials_with(
+                dir.path(),
+                account,
+                &credential,
+                &profile,
+                crate::accounts::anthropic_identity::capture_login_prior(dir.path(), account)
+                    .unwrap(),
+            )
+            .unwrap_err();
+            assert!(!err.contains("fixture-server-private-token"));
+            assert!(!err.contains("fixture-private-profile-body"));
+            assert!(
+                crate::accounts::profiles::resolve_slot_to_uuid(dir.path(), account.get())
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn oauth_exchange_profile_context_does_not_inherit_ambient_native_metadata() {
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let account = AccountNum::try_from(1).unwrap();
+            let config = dir.path().join("config-1");
+            std::fs::create_dir(&config).unwrap();
+            std::fs::write(
+                config.join(".claude.json"),
+                serde_json::json!({"oauthAccount": {
+                    "emailAddress": "stale-personal@test.invalid",
+                    "accountUuid": "33333333-3333-4333-8333-333333333333",
+                    "organizationUuid": "44444444-4444-4444-8444-444444444444",
+                }})
+                .to_string(),
+            )
+            .unwrap();
+            let prior =
+                crate::accounts::anthropic_identity::capture_login_prior(dir.path(), account)
+                    .unwrap();
+            let credential = exchanged_grant_fixture("fixture-server-exact-token");
+            save_oauth_login_credentials_with(
+                dir.path(),
+                account,
+                &credential,
+                &oauth_profile_fixture("fixture-server-exact-token"),
+                prior,
+            )
+            .unwrap();
+            let identity =
+                crate::accounts::profiles::resolve_slot_to_uuid(dir.path(), account.get()).unwrap();
+            let stored = crate::accounts::anthropic_identity::read_stored_anthropic_context(
+                dir.path(),
+                identity,
+            )
+            .unwrap();
+            match stored {
+                crate::accounts::anthropic_identity::StoredAnthropicContext::Known(context) => {
+                    assert_eq!(context.email(), "fixture-slot-1@test.invalid");
+                    assert_eq!(
+                        context.organization_uuid().to_string(),
+                        "22222222-2222-4222-8222-222222222222"
+                    );
+                }
+                _ => panic!("exchanged grant must publish a known verified context"),
+            }
+        });
+    }
+
+    #[test]
+    fn oauth_exchange_prior_unbound_refuses_an_interleaved_winning_login() {
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let account = AccountNum::try_from(1).unwrap();
+            let stale_prior =
+                crate::accounts::anthropic_identity::capture_login_prior(dir.path(), account)
+                    .unwrap();
+            let winner = exchanged_grant_fixture("fixture-server-winning-token");
+            let winner_prior =
+                crate::accounts::anthropic_identity::capture_login_prior(dir.path(), account)
+                    .unwrap();
+            save_oauth_login_credentials_with(
+                dir.path(),
+                account,
+                &winner,
+                &oauth_profile_fixture("fixture-server-winning-token"),
+                winner_prior,
+            )
+            .unwrap();
+            let identity =
+                crate::accounts::profiles::resolve_slot_to_uuid(dir.path(), account.get()).unwrap();
+            let path = crate::accounts::identity_store::credentials_path_for(dir.path(), identity);
+            let before = std::fs::read(&path).unwrap();
+            let stale = exchanged_grant_fixture("fixture-server-stale-token");
+            assert!(save_oauth_login_credentials_with(dir.path(), account, &stale,
+                &oauth_profile_fixture("fixture-server-stale-token"), stale_prior).is_err(),
+                "an initially unbound ingress must not overwrite a winner published during exchange");
+            assert_eq!(
+                crate::accounts::profiles::resolve_slot_to_uuid(dir.path(), account.get()),
+                Some(identity)
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "winner credential bytes must survive"
+            );
+        });
+    }
+
+    fn oauth_profile_fixture(
+        expected_token: &'static str,
+    ) -> crate::daemon::usage_poller::HttpGetFn {
+        Arc::new(move |url, token, _| {
+            assert_eq!(url, "https://api.anthropic.com/api/oauth/profile");
+            assert_eq!(
+                token, expected_token,
+                "profile must verify the exact exchanged grant"
+            );
+            Ok((200, serde_json::json!({
+                "account": {"uuid": "11111111-1111-4111-8111-111111111111", "email": "fixture-slot-1@test.invalid"},
+                "organization": {"uuid": "22222222-2222-4222-8222-222222222222"},
+            }).to_string().into_bytes()))
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn seed_verified_oauth_profile(
+        base: &Path,
+        identity: crate::accounts::identity_store::IdentityId,
+    ) {
+        // The Known writer and its pre-login mirror witness require private
+        // identity directories; coexisting_fixture predates that boundary.
+        for directory in [
+            base.join("identities"),
+            crate::accounts::identity_store::identity_path(base, identity),
+        ] {
+            crate::platform::fs::secure_dir(&directory).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "verified OAuth fixture identity directories must be private"
+            );
+        }
+        let account_uuid = uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let organization_uuid =
+            uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+        let path = crate::accounts::profiles::profiles_path(base);
+        let mut pf = crate::accounts::profiles::load(&path).unwrap();
+        pf.anthropic_contexts
+            .push(crate::accounts::anthropic_identity::AnthropicContextEntry {
+                email: "fixture-slot-1@test.invalid".into(),
+                account_uuid,
+                organization_uuid,
+                identity_uuid: identity,
+                extra: Default::default(),
+            });
+        crate::accounts::profiles::save(&path, &pf).unwrap();
+        let path = crate::accounts::identity_store::identity_json_path_for(base, identity);
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        metadata["account_uuid"] = serde_json::json!(account_uuid);
+        metadata["organization_uuid"] = serde_json::json!(organization_uuid);
+        std::fs::write(&path, metadata.to_string()).unwrap();
+        crate::platform::fs::secure_file(&path).unwrap();
+        assert!(matches!(
+            crate::accounts::anthropic_identity::read_stored_anthropic_context(base, identity)
+                .unwrap(),
+            crate::accounts::anthropic_identity::StoredAnthropicContext::Known(context)
+                if context.account_uuid() == account_uuid
+                    && context.organization_uuid() == organization_uuid
+                    && context.email() == "fixture-slot-1@test.invalid"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn oauth_exchange_response_is_prompt_while_mirror_is_blocked() {
+        oauth_background_http_case(false);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn oauth_exchange_background_mirrors_after_client_history_reset() {
+        oauth_background_http_case(true);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn oauth_background_http_case(reset_first: bool) {
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            use crate::credentials::keychain::{
+                clear_test_keychain_executor, set_test_keychain_executor, KeychainExecutor,
+                RawContentClassification, ScriptedKeychainExecutor,
+            };
+            use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+            use std::os::unix::fs::symlink;
+            use std::rc::Rc;
+            struct Clear;
+            impl Drop for Clear {
+                fn drop(&mut self) {
+                    clear_test_keychain_executor();
+                }
+            }
+            struct Blocked {
+                entered: std::sync::mpsc::Sender<()>,
+                release: std::cell::RefCell<Option<std::sync::mpsc::Receiver<()>>>,
+                old: String,
+                mutation_attempted: Arc<std::sync::atomic::AtomicBool>,
+            }
+            impl KeychainExecutor for Blocked {
+                fn find(&self, _: &str, _: &str) -> RawContentClassification {
+                    if let Some(release) = self.release.borrow_mut().take() {
+                        self.entered.send(()).unwrap();
+                        release
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .unwrap();
+                    }
+                    RawContentClassification::Content(self.old.clone().into())
+                }
+                fn add(
+                    &self,
+                    _: &str,
+                    _: &str,
+                    _: &str,
+                ) -> Result<(), crate::error::PlatformError> {
+                    self.mutation_attempted
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    panic!("the old admitted target must not publish after a new login");
+                }
+                fn delete(&self, _: &str, _: &str) -> bool {
+                    self.mutation_attempted
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    panic!("no delete admitted");
+                }
+            }
+            let dir = coexisting_fixture(1);
+            let base = dir.path();
+            let account = AccountNum::try_from(1u16).unwrap();
+            let uuid = fixture_uuid_for_slot(1);
+            seed_verified_oauth_profile(base, uuid);
+            let config = base.join("config-1");
+            std::fs::write(
+                config.join(".claude.json"),
+                r#"{"oauthAccount":{"emailAddress":"fixture-slot-1@test.invalid"}}"#,
+            )
+            .unwrap();
+            // Year 2100 keeps the original grant live at the actual policy decision.
+            let old_raw = r#"{"claudeAiOauth":{"accessToken":"fixture-http-old-at","refreshToken":"fixture-http-old-rt","expiresAt":4102444800000,"scopes":["user:inference"],"subscriptionType":"max"}}"#;
+            std::fs::write(config.join(".credentials.json"), old_raw).unwrap();
+            let old = credentials::load(&config.join(".credentials.json")).unwrap();
+            credentials::file::save(
+                &crate::accounts::identity_store::credentials_path_for(base, uuid),
+                &old,
+            )
+            .unwrap();
+            let old_fp =
+                crate::credentials::token_history::fingerprint_from_raw_json(old_raw).unwrap();
+            let handle = base.join(format!("term-{}", std::process::id()));
+            std::fs::create_dir(&handle).unwrap();
+            crate::accounts::markers::write_csq_account(&config, uuid).unwrap();
+            symlink(
+                crate::accounts::identity_store::credentials_path_for(base, uuid),
+                handle.join(".credentials.json"),
+            )
+            .unwrap();
+            symlink(config.join(".csq-account"), handle.join(".csq-account")).unwrap();
+            std::fs::write(handle.join(".live-pid"), std::process::id().to_string()).unwrap();
+            assert!(crate::session::handle_dir::handle_dir_symlinks_are_consistent(base, &handle));
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let socket = UnixSocketFixture::new().unwrap();
+                let sock = socket.socket_path();
+                let state = test_state(base);
+                let login = crate::oauth::login::start_login_with_prior(
+                    state.oauth_store.as_ref().unwrap(), account, std::fs::canonicalize(base).unwrap(),
+                    crate::accounts::anthropic_identity::capture_login_prior(base, account).unwrap()).unwrap();
+                let app = Router::new().route("/api/oauth/exchange", post(
+                    |state: State<RouterState>, body: Json<OAuthExchangeRequest>| async move {
+                        oauth_exchange_handler_with_transport(state, body, |_, _| {
+                            // A century of fixture lifetime avoids real-time expiry races.
+                            Ok(br#"{"access_token":"fixture-http-new-at","refresh_token":"fixture-http-new-rt","expires_in":3153600000}"#.to_vec())
+                        }, oauth_profile_fixture("fixture-http-new-at")).await
+                    })).with_state(state);
+                let listener = UnixListener::bind(&sock).unwrap();
+                std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
+                let stop = CancellationToken::new();
+                let server = tokio::spawn(accept_loop(listener, Arc::new(app), stop.clone(), sock.clone()));
+                crate::credentials::keychain::queue_login_mirror(base, account, None);
+                let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let prior_base = base.to_path_buf();
+                let release = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+                let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let mutation_attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let worker_completed = completed.clone();
+                let worker_mutation = mutation_attempted.clone();
+                let blocked = tokio::spawn(async move {
+                    loop {
+                        let release = release.clone();
+                        let entered = entered_tx.clone();
+                        let completed = worker_completed.clone();
+                        let mutation = worker_mutation.clone();
+                        let outcome = crate::daemon::refresher::run_pending_mirror_retry_with(
+                            prior_base.clone(), CancellationToken::new(), move |base| {
+                                set_test_keychain_executor(Rc::new(Blocked {
+                                    entered, release: std::cell::RefCell::new(release.lock().unwrap().take()),
+                                    old: old_raw.to_string(), mutation_attempted: mutation,
+                                }));
+                                let _clear = Clear;
+                                let status = crate::credentials::keychain::sync_pending_login_handle_dirs_status(base);
+                                completed.store(true, std::sync::atomic::Ordering::SeqCst);
+                                status
+                            }).await;
+                        if worker_completed.load(std::sync::atomic::Ordering::SeqCst)
+                            || worker_mutation.load(std::sync::atomic::Ordering::SeqCst) {
+                            break outcome;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                });
+                tokio::task::spawn_blocking(move || entered_rx.recv_timeout(std::time::Duration::from_secs(30))).await.unwrap().unwrap();
+                let concurrent_admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let admitted = concurrent_admitted.clone();
+                let concurrent = crate::daemon::refresher::run_pending_mirror_retry_with(
+                    base.to_path_buf(), CancellationToken::new(), move |_| {
+                        admitted.store(true, std::sync::atomic::Ordering::SeqCst);
+                        panic!("second background sweep must not be admitted while gate is held")
+                    }
+                ).await;
+                assert_eq!(concurrent, crate::daemon::refresher::MirrorRetryOutcome::Unavailable);
+                assert!(!concurrent_admitted.load(std::sync::atomic::Ordering::SeqCst), "gate refusal must precede actual sweep callback");
+                let body = serde_json::json!({"state": login.state, "code":"fixture-code"}).to_string();
+                let request_sock = sock.clone();
+                let started = std::time::Instant::now();
+                let response = tokio::task::spawn_blocking(move || {
+                    crate::daemon::client::http_post_unix_json(&request_sock, "/api/oauth/exchange", &body)
+                }).await.unwrap().expect("unchanged 2s client timeout must receive saved response");
+                assert!(started.elapsed() < crate::daemon::client::DEFAULT_TIMEOUT);
+                assert_eq!(response.status, 200);
+                assert_eq!(serde_json::from_str::<serde_json::Value>(&response.body).unwrap(), serde_json::json!({"account":1}));
+                assert!(!blocked.is_finished(), "response must return while mirror remains blocked");
+                let fresh = std::fs::read_to_string(crate::accounts::identity_store::credentials_path_for(base, uuid)).unwrap();
+                std::fs::write(config.join(".credentials.json"), &fresh).unwrap();
+                let finalizer_mutated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let finalizer = if reset_first {
+                    let finalizer_base = base.to_path_buf();
+                    let attempted = finalizer_mutated.clone();
+                    let task = tokio::task::spawn_blocking(move || {
+                        let exec = Rc::new(ScriptedKeychainExecutor::scripted(
+                            RawContentClassification::Content(old_raw.to_string().into())));
+                        set_test_keychain_executor(exec.clone());
+                        let _clear = Clear;
+                        let incoming = credentials::load(&crate::accounts::identity_store::credentials_path_for(&finalizer_base, uuid)).unwrap();
+                        let prior = crate::accounts::anthropic_identity::capture_login_prior(&finalizer_base, account).unwrap();
+                        save_oauth_login_credentials_with(&finalizer_base, account, &incoming,
+                            &oauth_profile_fixture("fixture-http-new-at"), prior).unwrap();
+                        attempted.store(exec.last_add_payload().is_some(), std::sync::atomic::Ordering::SeqCst);
+                    });
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        let fresh_fp = crate::credentials::token_history::fingerprint_from_raw_json(&fresh).unwrap();
+                        loop {
+                            let history = crate::credentials::token_history::read_history(base, uuid);
+                            if history.contains(&fresh_fp) && !history.contains(&old_fp) { break; }
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
+                    }).await.expect("client history reset must occur before delayed mirror resumes");
+                    assert!(!blocked.is_finished());
+                    Some(task)
+                } else { None };
+                release_tx.send(()).unwrap();
+                blocked.await.unwrap();
+                assert!(completed.load(std::sync::atomic::Ordering::SeqCst), "blocked sweep must finish normally rather than hide a caught panic");
+                assert!(!mutation_attempted.load(std::sync::atomic::Ordering::SeqCst));
+                if let Some(task) = finalizer { task.await.unwrap(); }
+                assert!(!finalizer_mutated.load(std::sync::atomic::Ordering::SeqCst), "ordinary client finalizer must not consume retained daemon ancestry");
+                assert!(crate::credentials::keychain::mirror_sync_retry_requested(base));
+                let payload = Arc::new(std::sync::Mutex::new(None));
+                let captured = payload.clone();
+                crate::daemon::refresher::run_pending_mirror_retry_with(base.to_path_buf(), CancellationToken::new(), move |base| {
+                    let exec = Rc::new(ScriptedKeychainExecutor::scripted(RawContentClassification::Content(old_raw.to_string().into())));
+                    set_test_keychain_executor(exec.clone());
+                    let _clear = Clear;
+                    let status = crate::credentials::keychain::sync_pending_login_handle_dirs_status(base);
+                    *captured.lock().unwrap() = exec.last_add_payload();
+                    status
+                }).await;
+                let written = payload.lock().unwrap().take().expect("retained pre-save witness must deliver fresh grant after blocked work");
+                assert_eq!(crate::credentials::token_history::fingerprint_from_raw_json(&written), crate::credentials::token_history::fingerprint_from_raw_json(&fresh));
+                stop.cancel();
+                tokio::time::timeout(std::time::Duration::from_secs(1), server).await.unwrap().unwrap();
+            });
+        });
+    }
+
+    // Exercise the actual save task boundary with fixture credentials, never OAuth HTTP.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn oauth_exchange_save_queues_bound_mirror_for_existing_retry() {
+        crate::platform::test_env::with_in_memory_secret_backend(|| {
+            use crate::credentials::keychain::{
+                clear_test_keychain_executor, set_test_keychain_executor, RawContentClassification,
+                ScriptedKeychainExecutor,
+            };
+            use crate::testing::identity_fixtures::{coexisting_fixture, fixture_uuid_for_slot};
+            use std::os::unix::fs::symlink;
+            use std::rc::Rc;
+            struct ResetExecutor;
+            impl Drop for ResetExecutor {
+                fn drop(&mut self) {
+                    clear_test_keychain_executor();
+                }
+            }
+            let dir = coexisting_fixture(1);
+            let base = dir.path();
+            let account = AccountNum::try_from(1u16).unwrap();
+            let uuid = fixture_uuid_for_slot(1);
+            seed_verified_oauth_profile(base, uuid);
+            let config = base.join("config-1");
+            std::fs::write(
+                config.join(".claude.json"),
+                r#"{"oauthAccount":{"emailAddress":"fixture-slot-1@test.invalid"}}"#,
+            )
+            .unwrap();
+            // Year 2100 keeps both fixture grants valid for real mirror policy.
+            let old_raw = r#"{"claudeAiOauth":{"accessToken":"fixture-daemon-old-at","refreshToken":"fixture-daemon-old-rt","expiresAt":4102444800000,"scopes":["user:inference"],"subscriptionType":"max"}}"#;
+            std::fs::write(config.join(".credentials.json"), old_raw).unwrap();
+            let old = credentials::load(&config.join(".credentials.json")).unwrap();
+            credentials::file::save(
+                &crate::accounts::identity_store::credentials_path_for(base, uuid),
+                &old,
+            )
+            .unwrap();
+            let old_fp =
+                crate::credentials::token_history::fingerprint_from_raw_json(old_raw).unwrap();
+            let handle = base.join(format!("term-{}", std::process::id()));
+            std::fs::create_dir(&handle).unwrap();
+            crate::accounts::markers::write_csq_account(&config, uuid).unwrap();
+            symlink(
+                crate::accounts::identity_store::credentials_path_for(base, uuid),
+                handle.join(".credentials.json"),
+            )
+            .unwrap();
+            symlink(config.join(".csq-account"), handle.join(".csq-account")).unwrap();
+            std::fs::write(handle.join(".live-pid"), std::process::id().to_string()).unwrap();
+            assert!(crate::session::handle_dir::handle_dir_symlinks_are_consistent(base, &handle));
+            let exec = Rc::new(ScriptedKeychainExecutor::scripted(
+                RawContentClassification::Content(old_raw.to_string().into()),
+            ));
+            set_test_keychain_executor(exec.clone());
+            let _reset = ResetExecutor;
+            let new_raw = old_raw
+                .replace("fixture-daemon-old-at", "fixture-daemon-new-at")
+                .replace("fixture-daemon-old-rt", "fixture-daemon-new-rt")
+                .replace("4102444800000", "4102444800001");
+            std::fs::write(config.join(".credentials.json"), &new_raw).unwrap();
+            let new = credentials::load(&config.join(".credentials.json")).unwrap();
+            let prior =
+                crate::accounts::anthropic_identity::capture_login_prior(base, account).unwrap();
+            save_oauth_login_credentials_with(
+                base,
+                account,
+                &new,
+                &oauth_profile_fixture("fixture-daemon-new-at"),
+                prior,
+            )
+            .unwrap();
+            assert!(
+                exec.last_add_payload().is_none(),
+                "producer must enqueue without mirror work"
+            );
+            crate::credentials::keychain::sync_pending_login_handle_dirs_status(base);
+            assert!(
+                !crate::credentials::token_history::read_history(base, uuid).contains(&old_fp),
+                "verified daemon finalization must reset history without consuming mirror ancestry"
+            );
+            let written = exec
+                .last_add_payload()
+                .expect("daemon save must mirror the fresh grant");
+            assert_eq!(
+                crate::credentials::token_history::fingerprint_from_raw_json(&written),
+                crate::credentials::token_history::fingerprint_from_raw_json(&new_raw)
+            );
+            assert!(exec.calls().iter().any(|(verb, _, _)| *verb == "find"));
+            let adds = exec
+                .calls()
+                .iter()
+                .filter(|(verb, _, _)| *verb == "add")
+                .count();
+            let prior =
+                crate::accounts::anthropic_identity::capture_login_prior(base, account).unwrap();
+            save_oauth_login_credentials_with(
+                base,
+                account,
+                &new,
+                &oauth_profile_fixture("fixture-daemon-new-at"),
+                prior,
+            )
+            .unwrap();
+            crate::credentials::keychain::sync_pending_login_handle_dirs_status(base);
+            assert!(!crate::credentials::token_history::read_history(base, uuid).contains(&old_fp));
+            assert_eq!(
+                exec.calls()
+                    .iter()
+                    .filter(|(verb, _, _)| *verb == "add")
+                    .count(),
+                adds,
+                "client finalization must not write the already mirrored grant again"
+            );
+            assert_eq!(
+                serde_json::to_value(OAuthExchangeResponse {
+                    account: account.get()
+                })
+                .unwrap(),
+                serde_json::json!({"account": 1})
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn oauth_exchange_rejects_empty_code() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
+
+        let req_body = r#"{"state":"anything","code":"   "}"#;
+        let (status, body) = http_post_json(&sock, "/api/oauth/exchange", req_body).await;
+        assert!(status.contains("400"), "status: {status}");
+        assert!(body.contains("code must not be empty"), "body: {body}");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn oauth_exchange_rejects_unknown_state() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let (handle, join) = with_serve_env_lock(serve(&sock, test_state(dir.path())))
+            .await
+            .unwrap();
+
+        // Send a state token that was never issued — the consume
+        // step must reject it as state_mismatch and return 400.
+        let req_body = r#"{"state":"never-issued-this-token","code":"some-code"}"#;
+        let (status, body) = http_post_json(&sock, "/api/oauth/exchange", req_body).await;
+        assert!(status.contains("400"), "status: {status}");
+        assert!(body.contains("state token"), "body: {body}");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn oauth_exchange_returns_503_when_oauth_unavailable() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state_no_oauth(dir.path());
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let req_body = r#"{"state":"any","code":"any"}"#;
+        let (status, body) = http_post_json(&sock, "/api/oauth/exchange", req_body).await;
+        assert!(status.contains("503"), "status: {status}");
+        assert!(body.contains("oauth support is not available"));
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn oauth_exchange_route_consumes_state_on_success_path_shape() {
+        // The exchange handler pulls the pending state from the
+        // store *before* making the HTTP round-trip. This test
+        // verifies that the state_mismatch branch drops the entry
+        // so a subsequent retry with the same token fails the
+        // same way — i.e. state is single-use even on failure.
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        let store = Arc::clone(state.oauth_store.as_ref().unwrap());
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        // Seed one pending entry so we have a valid state token.
+        let account = AccountNum::try_from(1u16).unwrap();
+        let verifier = crate::oauth::CodeVerifier::new("test-verifier".into());
+        let state_token = store.insert(verifier, account).unwrap();
+        assert_eq!(store.len(), 1);
+
+        // First call with a wrong state token — should 400 and
+        // leave the pending entry alone.
+        let req_body = r#"{"state":"not-the-real-one","code":"dummy"}"#;
+        let (status, _body) = http_post_json(&sock, "/api/oauth/exchange", req_body).await;
+        assert!(status.contains("400"));
+        assert_eq!(
+            store.len(),
+            1,
+            "wrong state token must not consume the legitimate entry"
+        );
+
+        // Second call with the real state token and a dummy code:
+        // the state gets consumed even though the HTTP exchange
+        // will fail (no real token endpoint reachable). We only
+        // verify the store length here — the actual exchange
+        // failure mode is covered by the csq_core::oauth::exchange
+        // unit tests.
+        //
+        // IMPORTANT: We send the request but do NOT wait for the
+        // full HTTP response. The exchange handler calls Anthropic's
+        // real token endpoint (no mock injected), which either
+        // times out or returns an error. Waiting for that response
+        // causes the test to time out at the 2s deadline in
+        // http_post_json. Instead, we send the request over the
+        // Unix socket and give the handler enough time to consume
+        // the state entry (which happens BEFORE the HTTP call).
+        {
+            use tokio::io::AsyncWriteExt;
+            use tokio::net::UnixStream;
+
+            let real_body = format!(r#"{{"state":"{state_token}","code":"some-code"}}"#);
+            let req = format!(
+                "POST /api/oauth/exchange HTTP/1.1\r\n\
+                 Host: localhost\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {len}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                len = real_body.len(),
+                body = real_body,
+            );
+            let mut stream = UnixStream::connect(&sock).await.unwrap();
+            stream.write_all(req.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+            // Give the handler time to parse the request and consume
+            // the state entry. The consume call is synchronous and
+            // happens before spawn_blocking, so 200ms is generous.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // Drop the stream — we don't need the response.
+        }
+
+        assert_eq!(
+            store.len(),
+            0,
+            "successful state lookup must consume the entry"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), join).await;
+    }
+
+    #[tokio::test]
+    async fn accounts_handler_uses_discovery_cache() {
+        // Verify the second GET /api/accounts hits the cache
+        // rather than doing a fresh filesystem scan. We do this
+        // by deleting the credentials file between calls — if
+        // discovery were re-running, the second call would see
+        // an empty list, but the cache should still return the
+        // pre-deletion state until the TTL elapses.
+        use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
+        use crate::types::{AccessToken, RefreshToken};
+
+        let dir = UnixSocketFixture::new().unwrap();
+        let num = AccountNum::try_from(1u16).unwrap();
+        let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("at".into()),
+                refresh_token: RefreshToken::new("rt".into()),
+                expires_at: 9_999_999_999_999,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        let cred_path = credentials::file::canonical_path(dir.path(), num);
+        credentials::save(&cred_path, &creds).unwrap();
+
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        // First call: runs discovery, finds account 1, caches.
+        let (status1, body1) = http_get(&sock, "/api/accounts").await;
+        assert!(status1.contains("200"), "status1: {status1}");
+        assert!(body1.contains(r#""id":1"#), "body1: {body1}");
+
+        // Delete the credentials file. Discovery would now return
+        // an empty list — but the cache should still serve the
+        // pre-deletion entry.
+        std::fs::remove_file(&cred_path).unwrap();
+
+        // Second call: must hit the cache.
+        let (status2, body2) = http_get(&sock, "/api/accounts").await;
+        assert!(status2.contains("200"), "status2: {status2}");
+        assert!(
+            body2.contains(r#""id":1"#),
+            "second call must serve cached list, got: {body2}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn accounts_handler_cache_expires_after_ttl() {
+        use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
+        use crate::types::{AccessToken, RefreshToken};
+
+        let dir = UnixSocketFixture::new().unwrap();
+        let num = AccountNum::try_from(1u16).unwrap();
+        let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("at".into()),
+                refresh_token: RefreshToken::new("rt".into()),
+                expires_at: 9_999_999_999_999,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        let cred_path = credentials::file::canonical_path(dir.path(), num);
+        credentials::save(&cred_path, &creds).unwrap();
+
+        // Very short TTL so the test doesn't wait 5 seconds.
+        let sock = dir.socket_path();
+        let state = test_state_with_discovery_ttl(dir.path(), std::time::Duration::from_millis(50));
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        // Populate the cache.
+        let (status1, _) = http_get(&sock, "/api/accounts").await;
+        assert!(status1.contains("200"));
+
+        // Delete the file so a fresh discovery would return empty.
+        std::fs::remove_file(&cred_path).unwrap();
+
+        // Wait past the TTL.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        // Third call: cache expired → fresh discovery → empty list.
+        let (status3, body3) = http_get(&sock, "/api/accounts").await;
+        assert!(status3.contains("200"), "status3: {status3}");
+        assert!(
+            body3.contains(r#""accounts":[]"#),
+            "expired cache should fall through to fresh discovery, got: {body3}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_status_all_uses_cached_discovery() {
+        // Verify refresh_status_all_handler also uses the discovery
+        // cache — not just accounts_handler. Two calls in a row
+        // must hit the cache on the second even if the underlying
+        // filesystem changed.
+        use crate::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
+        use crate::daemon::refresher::RefreshStatus;
+        use crate::types::{AccessToken, RefreshToken};
+
+        let dir = UnixSocketFixture::new().unwrap();
+        let num = AccountNum::try_from(1u16).unwrap();
+        let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("at".into()),
+                refresh_token: RefreshToken::new("rt".into()),
+                expires_at: 9_999_999_999_999,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        let cred_path = credentials::file::canonical_path(dir.path(), num);
+        credentials::save(&cred_path, &creds).unwrap();
+
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        // Pre-populate the refresh-status cache so the aggregated
+        // response has something to return.
+        state.cache.set(
+            1,
+            RefreshStatus {
+                account: 1,
+                last_result: "valid".to_string(),
+                expires_at_ms: 9_999_999_999_999,
+                checked_at_secs: 0,
+            },
+        );
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let (status1, body1) = http_get(&sock, "/api/refresh-status").await;
+        assert!(status1.contains("200"), "status1: {status1}");
+        assert!(body1.contains(r#""account":1"#), "body1: {body1}");
+
+        // Delete the credential file — discovery on a miss would
+        // return empty, which would produce an empty statuses
+        // list. The cache must prevent that.
+        std::fs::remove_file(&cred_path).unwrap();
+
+        let (status2, body2) = http_get(&sock, "/api/refresh-status").await;
+        assert!(status2.contains("200"), "status2: {status2}");
+        assert!(
+            body2.contains(r#""account":1"#),
+            "refresh-status must serve cached discovery, got: {body2}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn login_route_rejects_out_of_range_id() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        // 0 is out of range (AccountNum requires >=1)
+        let (status, body) = http_get(&sock, "/api/login/0").await;
+        assert!(status.contains("400"), "status: {status}");
+        assert!(body.contains("invalid account id"));
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// MED-3 regression: `POST /api/slot-swap` with `from == to` is a no-op
+    /// request anomaly. The handler MUST return `{"invalidated": false}` and
+    /// MUST NOT clear the discovery cache (no-op means no rename happened).
+    #[tokio::test]
+    async fn slot_swap_handler_rejects_from_equals_to() {
+        // Arrange: start a live server.
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        // Act: POST /api/slot-swap with from == to (request anomaly).
+        let (status, body) = http_post_json(&sock, "/api/slot-swap", r#"{"from":3,"to":3}"#).await;
+
+        // Assert: HTTP 200, invalidated = false.
+        assert!(status.contains("200"), "expected 200, got: {status}");
+        assert!(
+            body.contains("\"invalidated\":false"),
+            "expected invalidated=false for from==to noop, got: {body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // ── login-followup — POST /api/slot-rebind ────────────────────────────
+
+    /// A `POST /api/slot-rebind` with an in-range slot MUST reach the SAME
+    /// `Notify` the usage poller blocks on. The test holds the other end of
+    /// that `Arc`, so the wake is observed directly: `notify_one` stores a
+    /// permit, making a `notified()` awaited AFTER the POST complete
+    /// immediately. Dropping the handler's `notify_one()` makes this test
+    /// time out.
+    #[tokio::test]
+    async fn slot_rebind_route_wakes_the_shared_poller_notify() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let wake = Arc::new(crate::daemon::usage_poller::WakeChannel::new());
+        let mut state = test_state(dir.path());
+        state.usage_poller_wake = Arc::clone(&wake);
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let (status, body) = http_post_json(&sock, "/api/slot-rebind", r#"{"slot":3}"#).await;
+        assert!(status.contains("200"), "expected 200, got: {status}");
+        assert!(
+            body.contains("\"woken\":true"),
+            "expected woken=true, got: {body}"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+            .await
+            .expect("POST /api/slot-rebind must notify_one() the shared poller Notify");
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// Negative control for the test above: an out-of-range slot is
+    /// rejected 400 AND no wake is sent — without this, a handler that
+    /// notified unconditionally before validating would still pass the
+    /// positive test.
+    #[tokio::test]
+    async fn slot_rebind_route_rejects_out_of_range_slot_without_waking() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let wake = Arc::new(crate::daemon::usage_poller::WakeChannel::new());
+        let mut state = test_state(dir.path());
+        state.usage_poller_wake = Arc::clone(&wake);
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        // 0 is out of range (AccountNum requires >= 1).
+        let (status, body) = http_post_json(&sock, "/api/slot-rebind", r#"{"slot":0}"#).await;
+        assert!(status.contains("400"), "status: {status} body: {body}");
+        assert!(body.contains("invalid account id"), "body: {body}");
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), wake.notified())
+                .await
+                .is_err(),
+            "a rejected slot must NOT wake the poller"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// Writes `credentials/<N>.json` so the poller's discovery finds slot
+    /// `account` and `anthropic::tick` polls it (mirrors
+    /// `usage_poller::wake_channel_tests::install_account`).
+    fn install_anthropic_slot_for_wake_test(base: &Path, account: u16) {
+        use crate::credentials::{
+            self, file as cred_file, AnthropicCredentialFile, CredentialFile, OAuthPayload,
+        };
+        use crate::types::{AccessToken, AccountNum, RefreshToken};
+        let num = AccountNum::try_from(account).unwrap();
+        let creds = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("sk-ant-oat01-FAKETESTen".into()),
+                refresh_token: RefreshToken::new("sk-ant-ort01-FAKETESTresh".into()),
+                expires_at: 9_999_999_999_999,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        credentials::save(&cred_file::canonical_path(base, num), &creds).unwrap();
+    }
+
+    /// Bounded wait for an atomic counter to reach `target`; the panic names
+    /// the count actually observed.
+    async fn wait_for_wake_count(
+        counter: &Arc<std::sync::atomic::AtomicU32>,
+        target: u32,
+        bound: std::time::Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + bound;
+        loop {
+            if counter.load(std::sync::atomic::Ordering::SeqCst) >= target {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "waited past {bound:?} for the poller's tick count to reach {target}; saw {}",
+                counter.load(std::sync::atomic::Ordering::SeqCst)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// login-followup R1 LOW-7(b): the ROUTE and the POLLER must share ONE
+    /// `Arc<Notify>` — the single wiring both daemon entry points perform
+    /// (`cli/commands/daemon.rs`, `desktop/daemon_supervisor.rs`): one Arc,
+    /// cloned into `RouterState::usage_poller_wake` and into
+    /// `usage_poller::spawn`. This test constructs that pair exactly, serves
+    /// the real router, POSTs `/api/slot-rebind`, and asserts the REAL poller
+    /// run loop ticks a second time. A fresh `Notify::new()` handed to either
+    /// side reds this test (the route's wake would reach nothing, or the
+    /// poller would wait on an Arc nobody notifies).
+    ///
+    /// The first tick is the startup tick (`startup_delay = ZERO`); the tick
+    /// count comes from the Anthropic transport mock, which
+    /// `anthropic::tick` calls exactly once per eligible account per tick —
+    /// one seeded slot, so the count IS the tick count. The wake floor
+    /// (`WAKE_FLOOR`, 5 s) may defer the wake-triggered tick; the bound below
+    /// covers it.
+    #[tokio::test]
+    async fn rebind_route_and_real_poller_share_one_notify() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let base = dir.path();
+        install_anthropic_slot_for_wake_test(base, 3);
+
+        let tick_counter = Arc::new(AtomicU32::new(0));
+        let wake = Arc::new(crate::daemon::usage_poller::WakeChannel::new());
+        let mut state = test_state(base);
+        state.usage_poller_wake = Arc::clone(&wake);
+
+        let shutdown = CancellationToken::new();
+        let counting: crate::daemon::usage_poller::HttpGetWithRetryAfterFn = {
+            let counter = Arc::clone(&tick_counter);
+            Arc::new(move |_url, _token, _headers| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok((
+                    200,
+                    None,
+                    br#"{"five_hour":{"utilization":42.0,"resets_at":"2099-01-01T00:00:00Z"}}"#
+                        .to_vec(),
+                ))
+            })
+        };
+        let http_get: crate::daemon::usage_poller::HttpGetFn =
+            Arc::new(|_url, _token, _headers| Ok((200, Vec::new())));
+        let http_post_probe: crate::daemon::usage_poller::HttpPostProbeFn =
+            Arc::new(|_url, _headers, _body| {
+                Ok((200, std::collections::HashMap::new(), String::new()))
+            });
+        let poller = crate::daemon::usage_poller::spawn_with_config(
+            base.to_path_buf(),
+            http_get,
+            counting,
+            http_post_probe,
+            crate::daemon::usage_poller::gemini::GeminiConsumerState::default(),
+            shutdown.clone(),
+            // The SAME Arc the RouterState holds — the wiring under test.
+            Arc::clone(&wake),
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::ZERO,
+            // The PRODUCTION wake floor — a first wake for a slot is never deferred.
+            crate::daemon::usage_poller::WAKE_FLOOR,
+        );
+
+        // Startup tick (startup_delay = ZERO), so the next tick can only be
+        // the wake's.
+        wait_for_wake_count(&tick_counter, 1, std::time::Duration::from_secs(10)).await;
+
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+        let (status, body) = http_post_json(&sock, "/api/slot-rebind", r#"{"slot":3}"#).await;
+        assert!(status.contains("200"), "status: {status} body: {body}");
+
+        // The route's notify_one must reach the poller's run loop through
+        // the shared Arc and buy one more tick (targeted re-poll of slot 3 (first wake for the slot: not deferred).        // floor).
+        wait_for_wake_count(&tick_counter, 2, std::time::Duration::from_secs(15)).await;
+
+        handle.shutdown();
+        shutdown.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+        poller.join.abort();
+    }
+
+    /// login-followup R1 LOW-7(c): the daemon's OWN `/api/oauth/exchange`
+    /// success arm wakes the shared poller Notify in-process (the twin of the
+    /// clients' `POST /api/slot-rebind`). Drives the REAL handler with a stub
+    /// exchange + stub save, so the arm that runs after a committed paste-code
+    /// login is what notifies.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oauth_exchange_success_arm_wakes_the_shared_poller_notify() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let mut state = test_state(&base);
+        let wake = Arc::new(crate::daemon::usage_poller::WakeChannel::new());
+        state.usage_poller_wake = Arc::clone(&wake);
+        let store = Arc::clone(state.oauth_store.as_ref().unwrap());
+
+        let account = crate::types::AccountNum::try_from(1u16).unwrap();
+        let prior =
+            crate::accounts::anthropic_identity::capture_login_prior(&base, account).unwrap();
+        let login =
+            crate::oauth::login::start_login_with_prior(&store, account, base.clone(), prior)
+                .unwrap();
+
+        let req = Json(
+            serde_json::from_value::<OAuthExchangeRequest>(
+                serde_json::json!({"state": login.state, "code": "fixture-code"}),
+            )
+            .unwrap(),
+        );
+        let resp = oauth_exchange_handler_using(
+            State(state),
+            req,
+            |_code, _verifier| {
+                Ok(br#"{"access_token":"fixture-exchange-at","refresh_token":"fixture-exchange-rt","expires_in":3153600000}"#.to_vec())
+            },
+            |_base, _account, _credential, _prior| Ok(()),
+        )
+        .await
+        .expect("stub exchange + stub save must reach the success arm");
+        assert_eq!(resp.0.account, 1);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+            .await
+            .expect("the exchange success arm must notify_one() the shared poller Notify");
+    }
+
+    // ── round 7c D3 — POST /api/harvest-account ───────────────────────────
+
+    /// Every `ReconcileOutcome` variant maps to exactly one of the four wire
+    /// outcomes, and none maps outside that set.
+    #[test]
+    fn map_reconcile_outcome_covers_every_variant() {
+        use crate::daemon::custodian::ReconcileOutcome::*;
+        let cases = [
+            (Adopted, "adopted"),
+            (StoreFreshest, "nothing_to_harvest"),
+            (NoCandidates, "nothing_to_harvest"),
+            (NoEligibleCandidate, "nothing_to_harvest"),
+            (AllDead, "nothing_to_harvest"),
+            (IdentityUnconfirmed, "ownership_unknown"),
+            (SkippedUnknown, "busy"),
+            (RateLimited, "busy"),
+            (NotAdopted, "busy"),
+        ];
+        for (variant, expected) in cases {
+            assert_eq!(
+                map_reconcile_outcome(variant),
+                expected,
+                "{variant:?} must map to {expected}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn harvest_account_handler_rejects_invalid_account() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        // account 0 is out of AccountNum's 1..=999 range.
+        let (status, body) =
+            http_post_json(&sock, "/api/harvest-account", r#"{"account":0}"#).await;
+        assert!(status.contains("400"), "expected 400, got: {status}");
+        assert!(
+            body.contains("invalid account id"),
+            "expected the invalid-account message, got: {body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    #[tokio::test]
+    async fn harvest_account_handler_no_uuid_mapping_is_nothing_to_harvest() {
+        // A fresh base with no `profiles.json`/`by_slot` mapping at all —
+        // `resolve_slot_to_uuid` returns `None`, so there is no harvest
+        // binding key and the route must not attempt one.
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let (status, body) =
+            http_post_json(&sock, "/api/harvest-account", r#"{"account":5}"#).await;
+        assert!(status.contains("200"), "expected 200, got: {status}");
+        assert!(
+            body.contains("\"outcome\":\"nothing_to_harvest\""),
+            "expected nothing_to_harvest, got: {body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // Test-only structured capture for the harvest-account panic-arm test
+    // below. Mirrors `refresh::check`'s `BrokerCapture` (private to that
+    // module, so not reusable here) — never installs a global subscriber,
+    // reads RUST_LOG, emits the expected event itself, or captures
+    // credential payloads.
+    #[derive(Clone, Debug, Default)]
+    struct HarvestEvent {
+        level: Option<tracing::Level>,
+        error: Option<String>,
+        error_kind: Option<String>,
+        panicked: Option<bool>,
+    }
+
+    impl tracing::field::Visit for HarvestEvent {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "error_kind" {
+                self.error_kind = Some(value.to_owned());
+            }
+        }
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            if field.name() == "panicked" {
+                self.panicked = Some(value);
+            }
+        }
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            // `error = %redact_tokens(..)` dispatches through `record_debug`:
+            // `tracing::field::display()`'s `Value` impl calls
+            // `visitor.record_debug(key, self)` against a wrapper whose OWN
+            // `Debug` impl delegates to the inner value's `Display` — so
+            // `{value:?}` here reproduces the exact Display string, same as
+            // the crate's other capture (`BrokerEvent::record_debug` on
+            // `account`).
+            if field.name() == "error" {
+                self.error = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    struct HarvestCapture {
+        events: Arc<std::sync::Mutex<Vec<HarvestEvent>>>,
+        next_span: std::sync::atomic::AtomicU64,
+    }
+
+    impl tracing::Subscriber for HarvestCapture {
+        // Capture all levels: a WARN->DEBUG mutation on the panic arm must
+        // fail the level assertion, not be silently hidden by a filter.
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(
+                self.next_span
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            )
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut captured = HarvestEvent {
+                level: Some(*event.metadata().level()),
+                ..Default::default()
+            };
+            event.record(&mut captured);
+            self.events.lock().unwrap().push(captured);
+        }
+    }
+
+    /// Serialises this capture against every OTHER scoped-dispatcher capture
+    /// in the binary — see `refresh::check`'s `BROKER_CAPTURE_LOCK` doc for
+    /// why a dedicated lock is required: `with_default` also mutates
+    /// tracing's PROCESS-GLOBAL max-level filter, so two captures racing
+    /// across threads can transiently filter each other's events out.
+    static HARVEST_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn capture_harvest_events<T>(run: impl FnOnce() -> T) -> (T, Vec<HarvestEvent>) {
+        let _capture_guard = HARVEST_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = HarvestCapture {
+            events: Arc::clone(&events),
+            next_span: std::sync::atomic::AtomicU64::new(1),
+        };
+        let result = tracing::subscriber::with_default(subscriber, run);
+        let captured = events.lock().unwrap().clone();
+        (result, captured)
+    }
+
+    /// The `JoinError` arm of [`harvest_account_reconcile_and_respond`] (fed
+    /// by a panicking reconcile) had NO test before this one. Drives it
+    /// through the same seam [`harvest_gate::run_with`]'s own tests use — an
+    /// injected [`harvest_gate::ReconcileFn`] and a fresh
+    /// [`harvest_gate::new_ip_rate_limit_gate`] — and asserts both halves of
+    /// `keychain-fix-r10.md` S-L-2: the route answers 500 `"harvest failed"`,
+    /// and the WARN it logs carries `panicked: true` with the panic message
+    /// run through [`crate::error::redact_tokens`] — no token bytes reach
+    /// the log even though the panic payload contains one.
+    ///
+    /// RED (mutation 1 — status): change the `Err(e)` arm to
+    /// `Ok(Json(HarvestAccountResponse { outcome: "busy" }))` (return 200
+    /// instead of the 500) — `result.expect_err(..)` panics because the
+    /// call now returns `Ok`.
+    /// RED (mutation 2 — redaction): change `%crate::error::redact_tokens(&e.to_string())`
+    /// back to `%e` — the token-bytes assertion below fails because the
+    /// full panic message (with the token) reaches the captured `error`
+    /// field.
+    #[test]
+    fn harvest_account_handler_panic_arm_returns_500_and_redacts_panic_message() {
+        let account = AccountNum::try_from(842u16).unwrap();
+        let gate = harvest_gate::new_ip_rate_limit_gate();
+        let leaked_token = "sk-ant-oat01-FAKETESTKTESTTOKEN0123456789";
+        let panic_message = format!("upstream response echoed the token: {leaked_token}");
+        let panicking_reconcile: harvest_gate::ReconcileFn = {
+            let panic_message = panic_message.clone();
+            Arc::new(
+                move |_base: &Path,
+                      _account: AccountNum,
+                      _uuid: &str,
+                      _http_get: &crate::daemon::usage_poller::HttpGetFn| {
+                    panic!("{panic_message}");
+                },
+            )
+        };
+        let http_get: crate::daemon::usage_poller::HttpGetFn =
+            Arc::new(|_url: &str, _token: &str, _headers: &[(&str, &str)]| {
+                Err("unused: the injected reconcile never calls it".to_string())
+            });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (result, events) = capture_harvest_events(|| {
+            rt.block_on(harvest_account_reconcile_and_respond(
+                PathBuf::from("/nonexistent/fixture-base"),
+                account,
+                "uuid-fixture".to_string(),
+                http_get,
+                panicking_reconcile,
+                &gate,
+            ))
+        });
+
+        let (status, body) = result.expect_err("a panicked reconcile must surface as an Err");
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the JoinError arm must answer 500, got {status:?}"
+        );
+        assert_eq!(
+            body, "harvest failed",
+            "the JoinError arm's body is a fixed, token-free string"
+        );
+
+        let warn = events
+            .iter()
+            .find(|e| e.error_kind.as_deref() == Some("harvest_account_task_panicked"))
+            .expect("the panic arm must log error_kind=harvest_account_task_panicked");
+        assert_eq!(
+            warn.level,
+            Some(tracing::Level::WARN),
+            "the panic-arm log must be a WARN"
+        );
+        assert_eq!(
+            warn.panicked,
+            Some(true),
+            "JoinError::is_panic() must be true for a genuine panic"
+        );
+        let logged_error = warn.error.as_deref().unwrap_or("");
+        assert!(
+            !logged_error.is_empty(),
+            "the panic arm must log a non-empty `error` field"
+        );
+        assert!(
+            !logged_error.contains(leaked_token),
+            "token bytes leaked into the logged error field: {logged_error}"
+        );
+    }
+
+    // ── Audit-health gate tests ──────────────────────────────────────────────
+
+    /// `POST /api/audit/record` is accepted when `audit_health` is Verified.
+    #[tokio::test]
+    async fn audit_record_accepted_when_health_verified() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path()); // Verified by default
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        // Minimal valid v1 audit record body.
+        let body = r#"{"run_id":"r1","ts":"2026-06-05T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
+        let (status, _resp) = http_post_json(&sock, "/api/audit/record", body).await;
+        // 204 = accepted; 400 = write error (no chain yet in tempdir is fine —
+        // we only care the gate did NOT return 503.
+        assert!(
+            !status.contains("503"),
+            "verified health must not return 503, got: {status}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// `POST /api/audit/record` is rejected (503) when `audit_health` is Broken.
+    #[tokio::test]
+    async fn audit_record_rejected_when_health_broken() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        *state
+            .audit_health
+            .write()
+            .expect("audit health lock poisoned") = crate::audit::AuditHealth::Broken {
+            error_kind: "audit_chain_broken_at_seq_0".to_string(),
+            reason: "test broken chain".to_string(),
+        };
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let body = r#"{"run_id":"r2","ts":"2026-06-05T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
+        let (status, resp_body) = http_post_json(&sock, "/api/audit/record", body).await;
+        assert!(
+            status.contains("503"),
+            "broken health must return 503, got: {status}"
+        );
+        assert!(
+            resp_body.contains("audit_chain_broken"),
+            "response body must contain audit_chain_broken tag, got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// `POST /api/audit/record` is rejected (503) when `audit_health` is Unknown.
+    #[tokio::test]
+    async fn audit_record_rejected_when_health_unknown() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        *state
+            .audit_health
+            .write()
+            .expect("audit health lock poisoned") = crate::audit::AuditHealth::Unknown {
+            reason: "audit_verify_timeout".to_string(),
+        };
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let body = r#"{"run_id":"r3","ts":"2026-06-05T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
+        let (status, resp_body) = http_post_json(&sock, "/api/audit/record", body).await;
+        assert!(
+            status.contains("503"),
+            "unknown health must return 503, got: {status}"
+        );
+        assert!(
+            resp_body.contains("audit_chain_broken"),
+            "response body must contain audit_chain_broken tag, got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// `POST /api/audit/record` is accepted when `audit_health` is Degraded.
+    #[tokio::test]
+    async fn audit_record_accepted_when_health_degraded() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        *state
+            .audit_health
+            .write()
+            .expect("audit health lock poisoned") = crate::audit::AuditHealth::Degraded {
+            gaps: vec![crate::audit::KeyGap {
+                key_id: format!("ed25519:{}", "a".repeat(64)),
+                first_seq: 0,
+                last_seq: 5,
+                count: 6,
+            }],
+        };
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let body = r#"{"run_id":"r4","ts":"2026-06-05T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
+        let (status, _resp) = http_post_json(&sock, "/api/audit/record", body).await;
+        assert!(
+            !status.contains("503"),
+            "degraded health must not return 503, got: {status}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // ── M6 T6.2 Shard 4 — MCP gate decision route tests ──────────────────────
+
+    /// A well-formed MCP gate decision is accepted (not 503) under verified
+    /// health. With an uninitialised chain in the tempdir the emit skips
+    /// (`Ok(false)` — no genesis minting), which still returns 204: the route
+    /// contract is "accepted", the append is best-effort.
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn mcp_gate_accepted_when_health_verified() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path()); // Verified by default
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let body = r#"{"session_nonce":"mcp-proxy-1-ab","record_seq":0,"cli":"codex","tool":"mcp__shell__exec","verdict":"block"}"#;
+        let (status, _resp) = http_post_json(&sock, "/api/audit/mcp-gate", body).await;
+        assert!(
+            status.contains("204"),
+            "verified health + valid body must return 204, got: {status}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// Shard C (decision 1): on an uninitialised chain with attestation intent SET,
+    /// a well-formed decision returns 503 `mcp_gate_intent_queued` (signalling the
+    /// proxy to QUEUE it to the durable outbox) instead of the default 204-drop.
+    /// This is the setup-ordering window — the operator declared intent before
+    /// `csq audit init`, so the decision must be preserved, not lost. Complements
+    /// `mcp_gate_accepted_when_health_verified` (uninit + NO intent → 204 drop).
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn mcp_gate_uninit_with_intent_returns_503_intent_queued() {
+        let dir = UnixSocketFixture::new().unwrap();
+        // Declare attestation intent BEFORE any decision (pre-init window).
+        crate::audit::outbox_paths::set_attestation_intent(dir.path()).unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path()); // Verified health, chain uninitialised.
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let body = r#"{"session_nonce":"mcp-proxy-9-cd","record_seq":0,"cli":"codex","tool":"mcp__shell__exec","verdict":"block"}"#;
+        let (status, resp) = http_post_json(&sock, "/api/audit/mcp-gate", body).await;
+        assert!(
+            status.contains("503"),
+            "uninit chain + intent SET must return 503 (queue), got: {status}"
+        );
+        assert!(
+            resp.contains("mcp_gate_intent_queued"),
+            "the 503 tag must be mcp_gate_intent_queued, got: {resp}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// Shard C: the DEFAULT (no intent marker) uninit path still returns 204 — a
+    /// non-audit host does not queue. Explicit regression guard that intent is
+    /// OPT-IN (the `mcp_gate_accepted_when_health_verified` sibling shares the
+    /// behaviour but this pins the intent-unset precondition by name).
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn mcp_gate_uninit_without_intent_returns_204_drop() {
+        let dir = UnixSocketFixture::new().unwrap();
+        assert!(
+            !crate::audit::outbox_paths::attestation_intent_is_set(dir.path()),
+            "precondition: no intent marker"
+        );
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let body = r#"{"session_nonce":"mcp-proxy-9-ef","record_seq":0,"cli":"codex","tool":"mcp__shell__exec","verdict":"block"}"#;
+        let (status, _resp) = http_post_json(&sock, "/api/audit/mcp-gate", body).await;
+        assert!(
+            status.contains("204"),
+            "uninit chain + NO intent must drop (204), got: {status}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// R3/R4: with an INITIALISED chain a well-formed decision is appended and
+    /// CONFIRMED on chain (`mcp_gate_confirm` → OnChain) → 204, and the record is
+    /// actually present. Complements `mcp_gate_accepted_when_health_verified`
+    /// (which exercises the uninitialised NoChain → 204 path). The `Unrecorded →
+    /// 503 mcp_gate_unconfirmed` arm requires a signing-cutoff + keychain-
+    /// unavailable state that is not hermetic; it is covered by the floor unit test
+    /// `mcp_gate_floor::tests::decision_on_chain_reflects_actual_landing` (all three
+    /// `McpGateConfirm` states) plus the handler's exhaustive (wildcard-free) match.
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn mcp_gate_confirmed_on_initialised_chain_returns_204_and_records() {
+        use crate::audit::persist::write_record_v2;
+        use crate::audit::types::{
+            Ed25519Signature, EventKind, EventPayload, KeyId, McpGateDecisionPayload, RecordId,
+            Sha256Hex, SignedRecord,
+        };
+
+        let dir = UnixSocketFixture::new().unwrap();
+        // Bootstrap a chain genesis so the decision has a real chain to land on.
+        let boot = SignedRecord {
+            schema_version: crate::audit::persist::AUDIT_SCHEMA_VERSION_TEST.to_string(),
+            record_id: RecordId::try_new(crate::audit::persist::gen_chain_id()).unwrap(),
+            chain_id: RecordId::try_new(crate::audit::persist::gen_chain_id()).unwrap(),
+            seq: 0,
+            prev_hash: Sha256Hex::genesis(),
+            kind: EventKind::McpGateDecision,
+            payload: EventPayload::McpGateDecision(McpGateDecisionPayload {
+                session_nonce: "bootstrap".to_string(),
+                record_seq: 0,
+                cli: "codex".to_string(),
+                tool: "bootstrap_tool".to_string(),
+                verdict: "pass".to_string(),
+                enforcement_fidelity: crate::audit::mcp_gate_floor::MCP_ENFORCEMENT_FIDELITY
+                    .to_string(),
+            }),
+            ts: crate::audit::persist::current_iso8601_utc_persist(),
+            key_id: KeyId::try_new(format!("ed25519:{}", "0".repeat(64))).unwrap(),
+            canonical_hash: Sha256Hex::genesis(),
+            signature: Ed25519Signature::new([0u8; 64]),
+            actor: None,
+            authority: None,
+            trust: None,
+            eatp_start_ts: None,
+            eatp_end_ts: None,
+            op_phase: None,
+            verification_level: None,
+        };
+        write_record_v2(boot, Some(dir.path())).unwrap();
+
+        let sock = dir.socket_path();
+        let state = test_state(dir.path()); // Verified
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let body = r#"{"session_nonce":"mcp-proxy-9-cafe","record_seq":1,"cli":"codex","tool":"mcp__fs__read","verdict":"pass"}"#;
+        let (status, _resp) = http_post_json(&sock, "/api/audit/mcp-gate", body).await;
+        assert!(
+            status.contains("204"),
+            "a decision confirmed on an initialised chain must return 204, got: {status}"
+        );
+
+        // The decision is actually on the chain (OnChain, not a false 204).
+        assert!(
+            crate::audit::mcp_gate_floor::mcp_gate_decision_on_chain(
+                dir.path(),
+                "mcp-proxy-9-cafe",
+                1
+            ),
+            "the confirmed decision must be present on the chain"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// Fail-closed: an MCP gate decision is rejected (503) when the chain is
+    /// broken — no new attestation appends to a chain that failed verification.
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn mcp_gate_rejected_when_health_broken() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        *state
+            .audit_health
+            .write()
+            .expect("audit health lock poisoned") = crate::audit::AuditHealth::Broken {
+            error_kind: "audit_chain_broken_at_seq_0".to_string(),
+            reason: "test broken chain".to_string(),
+        };
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let body = r#"{"session_nonce":"mcp-proxy-1-ab","record_seq":0,"cli":"codex","tool":"t","verdict":"block"}"#;
+        let (status, resp_body) = http_post_json(&sock, "/api/audit/mcp-gate", body).await;
+        assert!(
+            status.contains("503"),
+            "broken health must return 503, got: {status}"
+        );
+        assert!(
+            resp_body.contains("audit_chain_broken"),
+            "response must carry audit_chain_broken tag, got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// An out-of-vocabulary verdict is rejected fail-closed (422
+    /// `mcp_gate_invalid_field`) — the daemon never trusts the field shape.
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn mcp_gate_rejects_invalid_verdict() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        // verdict "allow" is NOT in the fixed vocabulary {pass,block,escalate}.
+        let body = r#"{"session_nonce":"mcp-proxy-1-ab","record_seq":0,"cli":"codex","tool":"t","verdict":"allow"}"#;
+        let (status, resp_body) = http_post_json(&sock, "/api/audit/mcp-gate", body).await;
+        assert!(
+            status.contains("422"),
+            "invalid verdict must return 422, got: {status}"
+        );
+        assert!(
+            resp_body.contains("mcp_gate_invalid_field"),
+            "response must carry mcp_gate_invalid_field tag, got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// An unknown `cli` value is rejected fail-closed (422) — only codex/gemini
+    /// are attributable spawn surfaces.
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn mcp_gate_rejects_unknown_cli() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let body = r#"{"session_nonce":"mcp-proxy-1-ab","record_seq":0,"cli":"claude","tool":"t","verdict":"block"}"#;
+        let (status, resp_body) = http_post_json(&sock, "/api/audit/mcp-gate", body).await;
+        assert!(
+            status.contains("422"),
+            "unknown cli must return 422, got: {status}"
+        );
+        assert!(
+            resp_body.contains("mcp_gate_invalid_field"),
+            "got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // M5 — provenance anchor handler tests.
+
+    /// M5(a): POST /api/provenance/anchor with a well-formed body whose
+    /// schema version is not in the production registry returns 202 (event
+    /// parked in `.pending/provenance/`).
+    ///
+    /// The production version dispatcher has ZERO registered arms (ADR-B2).
+    /// Every well-formed inbound event hits `ParkedUnknownVersion` → 202
+    /// until M18-bind registers the first decoder arm. This test verifies
+    /// the handler maps `ParkedUnknownVersion` correctly to 202 and does
+    /// NOT return 503 or 500.
+    #[tokio::test]
+    async fn provenance_anchor_wellformed_unknown_version_parked_202() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        // A body that passes frontier validation (well-formed UUID, ts within skew,
+        // registered surface "cc") but has an unknown schema version.
+        // Production dispatcher → ParkedUnknownVersion → 202.
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let ts = crate::audit::seam::frontier::canonical_ts_for_test(now_unix);
+        let decision_id = "12345678-1234-1234-1234-123456789012";
+        let body = format!(
+            r#"{{"f101_schema_version":"unknown-v99","decision_id":"{decision_id}","claimed_decision_ts":"{ts}","surface":"cc","source_counter":1,"payload":"{{}}"}}"#,
+        );
+        let (status, resp) = http_post_json(&sock, "/api/provenance/anchor", &body).await;
+        assert!(
+            status.contains("202"),
+            "provenance/anchor with unknown-version body must return 202 (parked); got: {status}, body: {resp}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// M5(b): POST /api/provenance/anchor with a completely malformed body
+    /// returns 202 (event quarantined, not a hard error to the caller).
+    ///
+    /// Malformed bodies hit the frontier-rejection path → quarantine →
+    /// `seam_event_rejected` chain record attempt (which may produce 503 if
+    /// no signing key is present for the rejection record). The seam IPC
+    /// contract returns 202 for `Rejected` outcomes so the emitter doesn't retry.
+    ///
+    /// Note: the rejection path writes an unsigned record pre-`audit init`,
+    /// so it succeeds without a signing key.
+    #[tokio::test]
+    async fn provenance_anchor_accepts_malformed_with_202() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        // Completely malformed body — not valid JSON.
+        let (status, _resp) = http_post_json(&sock, "/api/provenance/anchor", "not-json").await;
+        assert!(
+            status.contains("202"),
+            "provenance/anchor with malformed body must return 202 (quarantined); got: {status}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // ── POST /api/audit/anchor tests (an internal ticket S3, an internal ticket) ─────────────────
+
+    /// Helper: initialise a chain in `base_dir` via the file-store path (no
+    /// OS keychain prompt). Mirrors `seed_chain` from anchor tests but also
+    /// sets the signing cutoff so `sign_audit_record_v1` finds an active key.
+    ///
+    /// Uses `init_mock_keyring()` to redirect keychain I/O to the in-process
+    /// shared store (per `audit/key_custody/mod.rs::test_helpers`).
+    fn init_signed_chain(base_dir: &std::path::Path) {
+        use crate::audit::anchor::test_helpers::sample_signed_record;
+        use crate::audit::key_custody::init_mock_keyring;
+        use crate::audit::persist::write_record_v2;
+
+        // Redirect keychain I/O away from the OS keychain.
+        init_mock_keyring();
+
+        // Seed the chain with a genesis record so csq-runs/ + chain.json exist.
+        let csq_runs = base_dir.join("csq-runs");
+        std::fs::create_dir_all(&csq_runs).unwrap();
+        let genesis = sample_signed_record(0, "01JZ00000000000000000000A0");
+        write_record_v2(genesis, Some(base_dir)).expect("seed genesis record");
+
+        // Run audit_init to mint + store the signing key and set the cutoff.
+        crate::audit::audit_init(base_dir, crate::audit::AUDIT_SIGNING_SERVICE_NAME)
+            .expect("audit_init must succeed with mock keyring");
+    }
+
+    // T1: success path — 200 + AnchorPayload JSON on valid AuditRecord with
+    // initialised chain and active signing key.
+    #[tokio::test]
+    async fn audit_anchor_returns_200_and_anchor_payload_on_signed_chain() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        init_signed_chain(dir.path());
+        let state = test_state(dir.path());
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let body = r#"{"run_id":"anchor-t1","ts":"2026-07-12T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
+        let (status, resp_body) = http_post_json(&sock, "/api/audit/anchor", body).await;
+
+        assert!(
+            status.contains("200"),
+            "audit anchor signed chain must return 200; got: {status}"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&resp_body).expect("response must be valid JSON");
+        assert!(
+            v.get("canonical_hash").is_some(),
+            "response must contain canonical_hash; got: {resp_body}"
+        );
+        assert!(
+            v.get("chain_id").is_some(),
+            "response must contain chain_id; got: {resp_body}"
+        );
+        assert!(
+            v.get("seq").is_some(),
+            "response must contain seq; got: {resp_body}"
+        );
+        assert_eq!(
+            v.get("inclusion_proof"),
+            Some(&serde_json::Value::Null),
+            "inclusion_proof must be null (no ledger sink wired); got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// A test `LedgerSink` whose `append` returns a receipt carrying a fixed
+    /// structured [`crate::audit::types::LedgerInclusionProof`] — the substrate
+    /// for `anchor_proof_present_with_sink` (an internal ticket). It exercises the handler's
+    /// receipt→AnchorPayload projection without needing the `csq-ledger-sink`
+    /// feature or a live ledger server.
+    struct StructuredProofSink;
+
+    #[async_trait::async_trait]
+    impl crate::audit::LedgerSink for StructuredProofSink {
+        fn name(&self) -> &str {
+            "structured-proof-test"
+        }
+
+        async fn append(
+            &self,
+            record: &crate::audit::types::SignedRecord,
+        ) -> Result<crate::audit::types::SinkReceipt, crate::audit::types::SinkError> {
+            let proof = crate::audit::types::LedgerInclusionProof {
+                leaf_index: 3,
+                tree_size: 8,
+                audit_path: vec!["a".repeat(64), "b".repeat(64)],
+            };
+            Ok(crate::audit::types::SinkReceipt {
+                sink: crate::audit::types::SinkName::try_new("structured-proof-test").unwrap(),
+                sink_id: crate::audit::types::SinkId::try_new("structured-proof-1").unwrap(),
+                anchored_at: record.ts.clone(),
+                inclusion_proof: Some(serde_json::to_string(&proof).unwrap()),
+            })
+        }
+
+        async fn verify_at(
+            &self,
+            id: &crate::audit::types::RecordId,
+        ) -> Result<crate::audit::types::SignedRecord, crate::audit::types::SinkError> {
+            Err(crate::audit::types::SinkError::NotFound {
+                record_id: id.clone(),
+            })
+        }
+    }
+
+    // T1b (an internal ticket): success path WITH an active sink — the AnchorPayload's
+    // `inclusion_proof` is the structured `{leaf_index, tree_size, audit_path}`
+    // read back from the sink receipt (NOT null, NOT client-computed).
+    #[tokio::test]
+    async fn anchor_proof_present_with_sink() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        init_signed_chain(dir.path());
+        let mut state = test_state(dir.path());
+        state.anchor_sink = Some(std::sync::Arc::new(StructuredProofSink));
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let body = r#"{"run_id":"anchor-proof-t1b"}"#;
+        let (status, resp_body) = http_post_json(&sock, "/api/audit/anchor", body).await;
+        assert!(
+            status.contains("200"),
+            "anchor with active sink must return 200; got: {status}"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&resp_body).expect("response must be valid JSON");
+        let ip = v
+            .get("inclusion_proof")
+            .expect("inclusion_proof field must be present");
+        assert!(
+            !ip.is_null(),
+            "inclusion_proof must be populated when a sink is active; got: {resp_body}"
+        );
+        assert_eq!(
+            ip.get("leaf_index").and_then(|x| x.as_u64()),
+            Some(3),
+            "leaf_index projected from receipt; got: {resp_body}"
+        );
+        assert_eq!(
+            ip.get("tree_size").and_then(|x| x.as_u64()),
+            Some(8),
+            "tree_size projected from receipt; got: {resp_body}"
+        );
+        assert_eq!(
+            ip.get("audit_path")
+                .and_then(|x| x.as_array())
+                .map(|a| a.len()),
+            Some(2),
+            "audit_path projected from receipt; got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // T1c (an internal ticket): a sink that errors on append MUST fail open — the op still
+    // returns 200 with a null proof (the local chain append is authoritative).
+    #[tokio::test]
+    async fn anchor_proof_null_when_sink_append_fails() {
+        struct FailingSink;
+        #[async_trait::async_trait]
+        impl crate::audit::LedgerSink for FailingSink {
+            fn name(&self) -> &str {
+                "failing-sink-test"
+            }
+            async fn append(
+                &self,
+                _record: &crate::audit::types::SignedRecord,
+            ) -> Result<crate::audit::types::SinkReceipt, crate::audit::types::SinkError>
+            {
+                Err(crate::audit::types::SinkError::Unreachable {
+                    message: crate::audit::types::RedactedString::from_trusted(
+                        "test sink unreachable".to_string(),
+                    ),
+                })
+            }
+            async fn verify_at(
+                &self,
+                id: &crate::audit::types::RecordId,
+            ) -> Result<crate::audit::types::SignedRecord, crate::audit::types::SinkError>
+            {
+                Err(crate::audit::types::SinkError::NotFound {
+                    record_id: id.clone(),
+                })
+            }
+        }
+
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        init_signed_chain(dir.path());
+        let mut state = test_state(dir.path());
+        state.anchor_sink = Some(std::sync::Arc::new(FailingSink));
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let body = r#"{"run_id":"anchor-failopen"}"#;
+        let (status, resp_body) = http_post_json(&sock, "/api/audit/anchor", body).await;
+        assert!(
+            status.contains("200"),
+            "sink append failure must fail OPEN (200), not 5xx; got: {status}"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&resp_body).expect("response must be valid JSON");
+        assert_eq!(
+            v.get("inclusion_proof"),
+            Some(&serde_json::Value::Null),
+            "inclusion_proof must be null on sink error; got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // T1d (an internal ticket redteam F1/F2): a sink returning a PARSEABLE but structurally
+    // impossible proof (leaf_index >= tree_size, empty path for a multi-leaf
+    // tree) must be nulled at the daemon boundary, not surfaced as valid.
+    #[tokio::test]
+    async fn anchor_proof_null_when_proof_structurally_unsound() {
+        struct UnsoundProofSink;
+        #[async_trait::async_trait]
+        impl crate::audit::LedgerSink for UnsoundProofSink {
+            fn name(&self) -> &str {
+                "unsound-proof-test"
+            }
+            async fn append(
+                &self,
+                record: &crate::audit::types::SignedRecord,
+            ) -> Result<crate::audit::types::SinkReceipt, crate::audit::types::SinkError>
+            {
+                // leaf_index 5 >= tree_size 2, and empty path for a 2-leaf tree.
+                let bad = r#"{"leaf_index":5,"tree_size":2,"audit_path":[]}"#;
+                Ok(crate::audit::types::SinkReceipt {
+                    sink: crate::audit::types::SinkName::try_new("unsound-proof-test").unwrap(),
+                    sink_id: crate::audit::types::SinkId::try_new("unsound-1").unwrap(),
+                    anchored_at: record.ts.clone(),
+                    inclusion_proof: Some(bad.to_string()),
+                })
+            }
+            async fn verify_at(
+                &self,
+                id: &crate::audit::types::RecordId,
+            ) -> Result<crate::audit::types::SignedRecord, crate::audit::types::SinkError>
+            {
+                Err(crate::audit::types::SinkError::NotFound {
+                    record_id: id.clone(),
+                })
+            }
+        }
+
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        init_signed_chain(dir.path());
+        let mut state = test_state(dir.path());
+        state.anchor_sink = Some(std::sync::Arc::new(UnsoundProofSink));
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let (status, resp_body) =
+            http_post_json(&sock, "/api/audit/anchor", r#"{"run_id":"anchor-unsound"}"#).await;
+        assert!(status.contains("200"), "got: {status}");
+        let v: serde_json::Value = serde_json::from_str(&resp_body).unwrap();
+        assert_eq!(
+            v.get("inclusion_proof"),
+            Some(&serde_json::Value::Null),
+            "structurally-impossible proof must be nulled; got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // Unit coverage for the structural-soundness gate (an internal ticket redteam F1/F2).
+    #[test]
+    fn inclusion_proof_soundness_accepts_valid_and_rejects_impossible() {
+        use crate::audit::types::LedgerInclusionProof;
+        let hex = "a".repeat(64);
+        // Valid: single-leaf tree, empty path.
+        assert!(inclusion_proof_is_structurally_sound(
+            &LedgerInclusionProof {
+                leaf_index: 0,
+                tree_size: 1,
+                audit_path: vec![],
+            }
+        ));
+        // Valid: multi-leaf tree, non-empty 64-hex path, leaf in range.
+        assert!(inclusion_proof_is_structurally_sound(
+            &LedgerInclusionProof {
+                leaf_index: 3,
+                tree_size: 8,
+                audit_path: vec![hex.clone(), hex.clone()],
+            }
+        ));
+        // Reject: empty tree containing a leaf (the tree_size:0 fabrication).
+        assert!(!inclusion_proof_is_structurally_sound(
+            &LedgerInclusionProof {
+                leaf_index: 0,
+                tree_size: 0,
+                audit_path: vec![],
+            }
+        ));
+        // Reject: leaf_index >= tree_size.
+        assert!(!inclusion_proof_is_structurally_sound(
+            &LedgerInclusionProof {
+                leaf_index: 5,
+                tree_size: 2,
+                audit_path: vec![hex.clone()],
+            }
+        ));
+        // Reject: multi-leaf tree with an empty path.
+        assert!(!inclusion_proof_is_structurally_sound(
+            &LedgerInclusionProof {
+                leaf_index: 1,
+                tree_size: 4,
+                audit_path: vec![],
+            }
+        ));
+        // Reject: single-leaf tree with a non-empty path.
+        assert!(!inclusion_proof_is_structurally_sound(
+            &LedgerInclusionProof {
+                leaf_index: 0,
+                tree_size: 1,
+                audit_path: vec![hex.clone()],
+            }
+        ));
+        // Reject: non-hex sibling (uppercase is not lowercase-hex).
+        assert!(!inclusion_proof_is_structurally_sound(
+            &LedgerInclusionProof {
+                leaf_index: 0,
+                tree_size: 2,
+                audit_path: vec!["A".repeat(64)],
+            }
+        ));
+        // Reject: wrong-length sibling.
+        assert!(!inclusion_proof_is_structurally_sound(
+            &LedgerInclusionProof {
+                leaf_index: 0,
+                tree_size: 2,
+                audit_path: vec!["ab".to_string()],
+            }
+        ));
+        // Reject: absurd path length (> 64).
+        assert!(!inclusion_proof_is_structurally_sound(
+            &LedgerInclusionProof {
+                leaf_index: 0,
+                tree_size: 2,
+                audit_path: vec![hex.clone(); 65],
+            }
+        ));
+    }
+
+    // T2: 422 on malformed body — body is not a valid AuditRecord JSON.
+    #[tokio::test]
+    async fn audit_anchor_returns_422_on_malformed_body() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path()); // Verified by default
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let (status, resp_body) =
+            http_post_json(&sock, "/api/audit/anchor", "not-json-at-all").await;
+        assert!(
+            status.contains("422"),
+            "malformed body must return 422; got: {status}"
+        );
+        assert!(
+            resp_body.contains("anchor_deserialize_error"),
+            "422 body must contain anchor_deserialize_error tag; got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // T3: 503 when audit_health is Broken — fail-closed gate fires before signing.
+    #[tokio::test]
+    async fn audit_anchor_returns_503_when_chain_health_broken() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        *state
+            .audit_health
+            .write()
+            .expect("audit health lock poisoned") = crate::audit::AuditHealth::Broken {
+            error_kind: "anchor_chain_broken_test".to_string(),
+            reason: "injected broken health for T3".to_string(),
+        };
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let body = r#"{"run_id":"anchor-t3","ts":"2026-07-12T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
+        let (status, resp_body) = http_post_json(&sock, "/api/audit/anchor", body).await;
+        assert!(
+            status.contains("503"),
+            "broken chain health must return 503; got: {status}"
+        );
+        assert!(
+            resp_body.contains("audit_chain_broken"),
+            "503 body must contain audit_chain_broken tag; got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // T4: 503 when no signing key is active — chain exists but signing cutoff
+    // not set (pre-`csq audit init` state).
+    #[tokio::test]
+    async fn audit_anchor_returns_503_when_no_signing_key() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        // Seed a chain WITHOUT calling audit_init — no signing cutoff set.
+        {
+            use crate::audit::anchor::test_helpers::sample_signed_record;
+            use crate::audit::persist::write_record_v2;
+            std::fs::create_dir_all(dir.path().join("csq-runs")).unwrap();
+            let genesis = sample_signed_record(0, "01JZ00000000000000000000B0");
+            write_record_v2(genesis, Some(dir.path())).expect("seed genesis");
+        }
+        let state = test_state(dir.path());
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let body = r#"{"run_id":"anchor-t4","ts":"2026-07-12T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
+        let (status, resp_body) = http_post_json(&sock, "/api/audit/anchor", body).await;
+        assert!(
+            status.contains("503"),
+            "no signing key must return 503; got: {status}"
+        );
+        assert!(
+            resp_body.contains("anchor_no_signing_key"),
+            "503 body must contain anchor_no_signing_key tag; got: {resp_body}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // T5: DAEMON IS SOLE SIGNER — canonical_hash in the response is a
+    // non-empty hex string assigned by the daemon, not the CLI.
+    #[tokio::test]
+    async fn audit_anchor_canonical_hash_is_nonempty_hex_from_daemon() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        init_signed_chain(dir.path());
+        let state = test_state(dir.path());
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let body = r#"{"run_id":"anchor-t5","ts":"2026-07-12T00:00:00Z","surface":"anthropic","decision":"allow","reason":"test","result":"success"}"#;
+        let (status, resp_body) = http_post_json(&sock, "/api/audit/anchor", body).await;
+        assert!(status.contains("200"), "T5 expected 200; got: {status}");
+
+        let v: serde_json::Value = serde_json::from_str(&resp_body).expect("response must be JSON");
+        let hash = v["canonical_hash"]
+            .as_str()
+            .expect("canonical_hash must be a string");
+
+        // DAEMON IS SOLE SIGNER: canonical_hash must be a non-empty hex string
+        // (64 hex chars for SHA-256). The CLI never computes this — it reads
+        // it verbatim from this response.
+        assert!(
+            !hash.is_empty(),
+            "canonical_hash must not be empty; got: {resp_body}"
+        );
+        assert!(
+            hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "canonical_hash must be a 64-char hex string; got: {hash}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+}
+
+#[cfg(test)]
+mod pool_startup_tests {
+    #[tokio::test]
+    async fn both_product_startups_schedule_one_bounded_restart_check() {
+        // Source wiring binds the exercised helper to all actual startup paths,
+        // without opening sockets, a WebView, or any native credential backend.
+        let unix_source = include_str!("server.rs");
+        let unix_start = unix_source
+            .split("pub async fn serve(")
+            .nth(1)
+            .unwrap()
+            .split("/// The accept loop.")
+            .next()
+            .unwrap();
+        assert_eq!(
+            unix_start
+                .matches("tokio::spawn(recover_pool_after_startup(")
+                .count(),
+            1
+        );
+        let windows_source = include_str!("server_windows.rs");
+        let windows_start = windows_source
+            .split("pub async fn serve(")
+            .nth(1)
+            .unwrap()
+            .split("Ok((handle, join))")
+            .next()
+            .unwrap();
+        assert_eq!(
+            windows_start
+                .matches("super::server::recover_pool_after_startup(")
+                .count(),
+            1
+        );
+        let desktop_source = include_str!("../../../csq/src/desktop/mod.rs");
+        let desktop_start = desktop_source
+            .split(".setup(|app| {")
+            .nth(1)
+            .unwrap()
+            .split("let log_level")
+            .next()
+            .unwrap();
+        assert_eq!(
+            desktop_start
+                .matches("csq_core::daemon::server::recover_pool_after_startup(")
+                .count(),
+            1
+        );
+
+        assert!(super::pool_startup_recovery_checked(Ok(
+            crate::pool::RestartRecovery::NotNeeded
+        )));
+        assert!(super::pool_startup_recovery_checked(Ok(
+            crate::pool::RestartRecovery::Recovered
+        )));
+        assert!(
+            !super::pool_startup_recovery_checked(Ok(crate::pool::RestartRecovery::Deferred)),
+            "deferred cleanup must not be reported checked"
+        );
+        for _product_start in ["daemon", "desktop"] {
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = calls.clone();
+            assert_eq!(
+                super::recover_pool_after_startup_with(
+                    std::time::Duration::from_secs(1),
+                    move || {
+                        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        true
+                    },
+                )
+                .await,
+                "pool_restart_recovery_checked"
+            );
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+        assert_eq!(
+            super::recover_pool_after_startup_with(std::time::Duration::from_secs(1), || false,)
+                .await,
+            "pool_restart_recovery_refused"
+        );
+        let (release, blocked) = std::sync::mpsc::channel();
+        let result = super::recover_pool_after_startup_with(
+            std::time::Duration::from_millis(10),
+            move || {
+                let _ = blocked.recv_timeout(std::time::Duration::from_secs(2));
+                true
+            },
+        )
+        .await;
+        // Free even a queued worker before dropping the runtime. Timeout does
+        // not certify cancellation of an already-running blocking operation.
+        let _ = release.send(());
+        assert_eq!(result, "pool_restart_recovery_timed_out");
+    }
+}

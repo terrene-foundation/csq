@@ -1,0 +1,62 @@
+{
+  "$comment": [
+    "Declaration for scripts/verify/merge-added-files.sh — edit THIS, never the",
+    "script's internals, so there is exactly one place a number lives.",
+    "",
+    "WHY THIS EXISTS. A branch copied a workflow file WITHOUT renaming it. At",
+    "merge, `git merge-tree` reported ZERO conflicts — the branch had rewritten",
+    "the whole file rather than editing part of it, and a whole-file rewrite",
+    "conflicts with nothing. The merge silently DELETED a CI job.",
+    "",
+    "The class, stated once: merge cleanliness answers 'do the texts conflict',",
+    "NEVER 'is the result still correct'. The danger lives in the files that do",
+    "NOT conflict, and an ADDED file is the sharpest instance — it collides with",
+    "nothing by construction, so it is invisible to every conflict-based check,",
+    "while still being able to shadow, duplicate, or wholesale-replace something",
+    "that already exists."
+  ],
+  "sensitive_prefixes": [
+    ".github/workflows/",
+    "scripts/verify/",
+    "scripts/ci/",
+    ".claude/rules/"
+  ],
+  "$why_prefixes": [
+    "These four hold files whose EXISTENCE is the mechanism: a workflow that",
+    "runs jobs, a gate that must be enrolled and invoked, a declaration another",
+    "gate reads, a rule an agent loads. An addition here is never merely a new",
+    "source file — it changes what runs. The operator lesson this gate encodes",
+    "is literally 'if your branch adds a workflow, ls the filename first', so",
+    "the gate does the ls and asks for the adjudication.",
+    "",
+    "Deliberately SHORT. Every prefix added here costs a review prompt on every",
+    "addition beneath it, and a gate that fires on ordinary work is one",
+    "operators learn to override — after which they override the next gate too",
+    "(tooling-self-verification.md Rule 5)."
+  ],
+  "duplicate_similarity_pct": 85,
+  "$why_similarity": [
+    "The duplicate-basename axis is worthless as a bare name comparison and",
+    "actively harmful as one. MEASURED on csq at 9e00e231: 679 of 3622 tracked",
+    "files (18.7%) share a basename with another file — 47 mod.rs, 52 SKILL.md,",
+    "36 README.md. A name-only check would fire on roughly one addition in five,",
+    "which is the override-habit shape above.",
+    "",
+    "So CONTENT decides, and the threshold separates two MEASURED outcomes",
+    "rather than being picked (tooling-self-verification.md Rule 3). Over the",
+    "191 same-basename groups in this tree, difflib line-ratio of the most",
+    "similar pair in each group: MEDIAN 26% (unrelated files that merely share a",
+    "name — the outcome that must NOT fire), while 19 groups sit at >=90% and 12",
+    "are byte-identical copies (the outcome that MUST fire). 85 sits in the gap:",
+    "~59 points above the unrelated median, 5 below the copy cluster. The",
+    "bracketing counts either side are 35 groups at >=80% and 19 at >=90%."
+  ],
+  "duplicate_min_lines": 3,
+  "$why_min_lines": [
+    "Two 1-line files with the same name are identical by coincidence, not by",
+    "copying, and a ratio computed on them carries no information. Files shorter",
+    "than this are reported as NOT ADJUDICABLE on the duplicate axis (counted",
+    "and printed), never silently passed — the abstention is visible so it",
+    "cannot be mistaken for a clean verdict."
+  ]
+}

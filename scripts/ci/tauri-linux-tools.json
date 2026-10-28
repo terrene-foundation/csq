@@ -1,0 +1,82 @@
+{
+  "schema": 1,
+  "tauri_cli_version": "2.11.5",
+  "tauri_bundler_version": "2.9.4",
+  "tauri_commit": "9452ddee5ebefd9b678a94ff003521379df6c9ae",
+  "arch": "x86_64",
+  "source": "https://github.com/tauri-apps/tauri/blob/9452ddee5ebefd9b678a94ff003521379df6c9ae/crates/tauri-bundler/src/bundle/linux/appimage/linuxdeploy.rs",
+  "cache_contract": "Five tauri-prepare-tool records exactly match prepare_tools; appimage-runtime is an explicit extra selected by LDAI_RUNTIME_FILE, not downloaded by Tauri prepare_tools.",
+  "normalization": "upstream prepare_tools zeros linuxdeploy bytes 8..10 with dd; installed_sha256 includes exactly this normalization",
+  "observed_at": "2026-10-23",
+  "tools": [
+    {
+      "name": "AppRun-x86_64",
+      "url": "https://github.com/tauri-apps/binary-releases/releases/download/apprun-old/AppRun-x86_64",
+      "size": 31552,
+      "sha256": "f30140a43a0a59e46db21bdefdf749b9e9f2c6946e92afabbacf98b8ae73fb4f",
+      "installed_sha256": "f30140a43a0a59e46db21bdefdf749b9e9f2c6946e92afabbacf98b8ae73fb4f",
+      "version": "apprun-old; content-sha256:f30140a43a0a59e46db21bdefdf749b9e9f2c6946e92afabbacf98b8ae73fb4f",
+      "role": "tauri-prepare-tool"
+    },
+    {
+      "name": "linuxdeploy-x86_64.AppImage",
+      "url": "https://github.com/tauri-apps/binary-releases/releases/download/linuxdeploy/linuxdeploy-x86_64.AppImage",
+      "size": 13264064,
+      "sha256": "e762bea85c8eb0d4b3508d46e5c1f037f717d0f9303ae3b4aafc8b04991fa1ef",
+      "installed_sha256": "20eebde3c18ae2e44279bd624fc72482503aece216d5d77f10932235342f71c1",
+      "version": "linuxdeploy; content-sha256:e762bea85c8eb0d4b3508d46e5c1f037f717d0f9303ae3b4aafc8b04991fa1ef",
+      "role": "tauri-prepare-tool"
+    },
+    {
+      "name": "linuxdeploy-plugin-gtk.sh",
+      "url": "https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gtk/dda522bce37387f1b853d9095713bfaa924c8423/linuxdeploy-plugin-gtk.sh",
+      "size": 14622,
+      "sha256": "7804c9eef13e59bf2783aad9882ef9db8f3f3f9e8d631874b1d348d550a3693f",
+      "installed_sha256": "7804c9eef13e59bf2783aad9882ef9db8f3f3f9e8d631874b1d348d550a3693f",
+      "revision": "dda522bce37387f1b853d9095713bfaa924c8423",
+      "version": "git:dda522bce37387f1b853d9095713bfaa924c8423",
+      "role": "tauri-prepare-tool"
+    },
+    {
+      "name": "linuxdeploy-plugin-gstreamer.sh",
+      "url": "https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gstreamer/2a2e67491c32995a3f279ad0ecbe77abd512b42a/linuxdeploy-plugin-gstreamer.sh",
+      "size": 4857,
+      "sha256": "c107b49d84edbffc6ab226ed1007e0626a4f7aa2c3a36b7782bef62351d49e94",
+      "installed_sha256": "c107b49d84edbffc6ab226ed1007e0626a4f7aa2c3a36b7782bef62351d49e94",
+      "revision": "2a2e67491c32995a3f279ad0ecbe77abd512b42a",
+      "version": "git:2a2e67491c32995a3f279ad0ecbe77abd512b42a",
+      "role": "tauri-prepare-tool"
+    },
+    {
+      "name": "linuxdeploy-plugin-appimage.AppImage",
+      "url": "https://api.github.com/repos/linuxdeploy/linuxdeploy-plugin-appimage/releases/assets/602435573",
+      "size": 16488952,
+      "sha256": "49d6a17160675a6bd1781699aae6bdf7692d98552e02a3671d2183d10547842e",
+      "installed_sha256": "49d6a17160675a6bd1781699aae6bdf7692d98552e02a3671d2183d10547842e",
+      "version": "asset:602435573; git:536b068787179ea901964bd7dabc7bf61e4941c3",
+      "role": "tauri-prepare-tool",
+      "asset_id": 602435573,
+      "asset_name": "linuxdeploy-plugin-appimage-x86_64.AppImage",
+      "revision": "536b068787179ea901964bd7dabc7bf61e4941c3"
+    },
+    {
+      "name": "runtime-x86_64",
+      "role": "appimage-runtime",
+      "url": "https://api.github.com/repos/AppImage/type2-runtime/releases/assets/657374641",
+      "asset_id": 657374641,
+      "asset_name": "runtime-x86_64",
+      "size": 944632,
+      "sha256": "617aa77314d57c8b8e4fae9c3f0b35af7b30d5529cb69e98f64f92510ed98a46",
+      "installed_sha256": "617aa77314d57c8b8e4fae9c3f0b35af7b30d5529cb69e98f64f92510ed98a46",
+      "revision": "fedfad51acc2860b2916a1eef32ba4a500ff31ef",
+      "version": "asset:657374641; git:fedfad51acc2860b2916a1eef32ba4a500ff31ef"
+    }
+  ],
+  "runtime_contract": {
+    "env": "LDAI_RUNTIME_FILE",
+    "cache_name": "runtime-x86_64",
+    "plugin_source": "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/blob/536b068787179ea901964bd7dabc7bf61e4941c3/src/main.cpp#L186",
+    "appimagetool_source": "https://github.com/AppImage/appimagetool/blob/8c8c91f762b412a19f4e8d2c4b35afb98f2d7c81/src/appimagetool.c#L911",
+    "behavior": "Plugin passes --runtime-file; this appimagetool reads the explicit file and fails if unreadable. Runtime fetch exists only in the else branch when no file is specified."
+  }
+}

@@ -1,0 +1,133 @@
+name: Test
+
+# Github-hosted CI for the community edition. Every PR and push to main runs
+# formatting, lint, and the full test suite on Linux + macOS + Windows. No
+# secrets and no real OAuth: the suite is hermetic (sandbox HOME, stub spawns).
+# Windows coverage replaces the stripped enterprise Windows workflow — the
+# community workspace pulls no private enterprise dependencies, so no
+# private-auth step is needed.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUST_VERSION: "1.98.1"
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Install Linux system deps (Tauri)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libgtk-3-dev
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --features csq/test-utils,csq-core/test-utils -- -D warnings
+
+      # The codex share tests shell out to `sqlite3` and FAIL under CI when it is
+      # missing (csq-core `sqlite3_required_in_ci`): a skip reports `ok`, and
+      # libtest hides a passing test's output, so a skip is invisible in this log.
+      # The self-hosted Linux runner has no sqlite3, so these 40 tests had never
+      # run on Linux. Pinned download, SHA3-256 checked (sqlite.org's published
+      # hash for 3.53.4), no package install on the shared host.
+      - name: Provide sqlite3 (codex share tests)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if [ -x /usr/bin/sqlite3 ]; then exit 0; fi
+          python3 - "$RUNNER_TEMP/csq-sqlite3" >> "$GITHUB_ENV" <<'PY'
+          import hashlib, io, os, sys, urllib.request, zipfile
+          url = "https://sqlite.org/2026/sqlite-tools-linux-x64-3530400.zip"
+          want = "6eeb57e8f2aef7687f9f016a980992cf2799c8c07a87c5e21495530f91915047"
+          data = urllib.request.urlopen(url, timeout=60).read()
+          got = hashlib.sha3_256(data).hexdigest()
+          if got != want:
+              sys.exit(f"sqlite3 download SHA3-256 mismatch: {got}")
+          os.makedirs(sys.argv[1], exist_ok=True)
+          out = os.path.join(sys.argv[1], "sqlite3")
+          with zipfile.ZipFile(io.BytesIO(data)) as z, open(out, "wb") as f:
+              f.write(z.read("sqlite3"))
+          os.chmod(out, 0o755)
+          print(f"CSQ_SQLITE3={out}")
+          PY
+        timeout-minutes: 3
+
+      - name: Provide sqlite3 on Windows (codex share tests)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # Match test.yml's official archive + published SHA3-256 pattern.
+          # Job-local install: no administrator or shared host configuration.
+          python - <<'PY'
+          import hashlib, io, os, pathlib, urllib.request, zipfile
+          url = "https://sqlite.org/2026/sqlite-tools-win-x64-3530400.zip"
+          # https://sqlite.org/download.html — SQLite 3.53.4 Windows x64 tools.
+          want = "88b4659fe747896b853af10157316b4ade143553efb89c1c8ca7423a278dcc8b"
+          data = urllib.request.urlopen(url, timeout=60).read()
+          got = hashlib.sha3_256(data).hexdigest()
+          if got != want:
+              raise SystemExit(f"sqlite3 download SHA3-256 mismatch: {got}")
+          out_dir = pathlib.Path(os.environ["RUNNER_TEMP"]).resolve() / "csq-sqlite3"
+          out_dir.mkdir(parents=True, exist_ok=True)
+          out = out_dir / "sqlite3.exe"
+          with zipfile.ZipFile(io.BytesIO(data)) as archive:
+              out.write_bytes(archive.read("sqlite3.exe"))
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              env_file.write(f"CSQ_SQLITE3={out}\n")
+          with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as path_file:
+              path_file.write(f"{out_dir}\n")
+          print(f"Verified SQLite archive SHA3-256: {got}")
+          PY
+        timeout-minutes: 3
+
+      # Split exactly as the enterprise test.yml splits it, plus doc-tests on
+      # their own. ONE combined `cargo test --workspace` hands every doc-test the
+      # union of every build script's native search paths, so the csq desktop
+      # build script's stub msvcrt.lib (tauri-build static C runtime) shadowed
+      # the real CRT in csq_core's doc-test link on Windows. `shell: bash` makes
+      # the first failing line fail the step on windows-latest too.
+      - name: Test
+        shell: bash
+        run: |
+          cargo build -p csq-core --bin stub-cli --features test-utils
+          cargo test --workspace --lib --bins --no-fail-fast --features csq/test-utils,csq-core/test-utils
+          cargo test --workspace --test '*' --no-fail-fast --features csq/test-utils,csq-core/test-utils -- --test-threads=2
+          cargo test --workspace --doc --no-fail-fast --features csq/test-utils,csq-core/test-utils

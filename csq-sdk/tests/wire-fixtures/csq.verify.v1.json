@@ -1,0 +1,29 @@
+{
+  "edition": "enterprise",
+  "failure_detail": {
+    "kind": "chain_broken",
+    "message": "chain break at seq 41"
+  },
+  "historical_key_gaps": [
+    {
+      "count": 3,
+      "first_seq": 10,
+      "key_id": "ed25519:aa11",
+      "last_seq": 12
+    }
+  ],
+  "id": "corr-id-3",
+  "ok": false,
+  "record_verification_level": "HUMAN_REVIEWED",
+  "schema": "csq.verify.v1",
+  "skipped_truncated_count": 5,
+  "skipped_v1_count": 2,
+  "status": "integrity_failure",
+  "trust_plane_grade": "CONFORMANT",
+  "unknown_kind_count": 1,
+  "verification_level_summary": {
+    "AUTO_APPROVED": 12,
+    "HUMAN_REVIEWED": 3
+  },
+  "verified_count": 40
+}

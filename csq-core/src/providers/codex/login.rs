@@ -1,0 +1,2391 @@
+//! Codex `csq login --provider codex` orchestrator.
+//!
+//! Implements spec 07 §7.3.3 for the `Surface::Codex` login. The
+//! ordered sequence:
+//!
+//! 1. `mkdir -p config-<N>/` and `mkdir -p config-<N>/codex-sessions/`.
+//! 2. Probe the macOS login keychain for a stale `com.openai.codex`
+//!    entry (spec step 6). If present, prompt the user; bail on
+//!    decline so we do not proceed with a dual-storage codex-cli
+//!    state that `config.toml` cannot retroactively migrate.
+//! 3. Write `config-<N>/config.toml` with `cli_auth_credentials_store
+//!    = "file"` (and NO `model` key — CC-parity, csq does not force a
+//!    model; the user-global `~/.codex` model propagates at spawn).
+//!    **MUST happen BEFORE step 4** per INV-P03.
+//! 4. Shell out: `CODEX_HOME=config-<N> codex login --device-auth`.
+//!    codex-cli drives the device-code flow; csq inherits stdio so
+//!    the user sees the code + browser opens.
+//! 5. Parse `config-<N>/auth.json` as a `CodexCredentialFile`.
+//!    Relocate to `identities/<UUID>/credentials-codex.json` at 0o600 via
+//!    [`crate::credentials::file::save_canonical_for`] (M4-12: UUID-keyed write,
+//!    numeric `credentials/codex-<N>.json` retired). Delete the original raw
+//!    auth.json since the handle dir will symlink to the canonical from now on.
+//! 6. Write the `.csq-account` marker and a best-effort profile
+//!    entry (label derived from `account_id`, not `id_token` — spec
+//!    forbids decoding id_token JWT claims for data minimisation).
+//!
+//! Daemon registration (refresher + usage poller) is NOT part of
+//! this PR — PR-C3c chains `discover_codex` into the refresher;
+//! PR-C4 implements `broker_codex_check`. A freshly-logged-in Codex
+//! slot sits idle in `identities/<UUID>/credentials-codex.json` until those land,
+//! which is acceptable because codex-cli's own in-process refresh
+//! path still works (INV-P01 only becomes load-bearing when the
+//! daemon owns refresh cadence).
+
+use super::keychain::ProbeResult;
+use super::surface;
+use crate::accounts::markers;
+use crate::accounts::profiles;
+use crate::accounts::profiles_lock::ProfilesFileLock;
+use crate::credentials::{self, file as cred_file, CredentialFile};
+use crate::daemon::identity_mint;
+use crate::error::redact_tokens;
+use crate::types::AccountNum;
+use anyhow::{anyhow, Context, Result};
+use std::io::{BufRead, Write};
+use std::path::Path;
+use std::process::ExitStatus;
+
+/// What the caller (CLI + desktop) wants back after a successful
+/// device-auth login.
+#[derive(Debug, Clone)]
+pub struct LoginOutcome {
+    /// Human-readable label derived from `tokens.account_id`. Matches
+    /// [`discover_codex`](crate::accounts::discovery::discover_codex)'s
+    /// label format so post-login listing displays consistently.
+    pub label: String,
+}
+
+/// Only after the canonical commit/finalization succeeds. Never used on refusal.
+pub(crate) fn remove_retired_slot_raw_after_commit(base: &Path, account: AccountNum) -> Result<()> {
+    match std::fs::remove_file(surface::written_auth_json_path(base, account)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(anyhow!(
+            "Codex account WAS signed in; prior raw auth cleanup unconfirmed"
+        )),
+    }
+}
+
+/// User's response to the keychain-residue prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResidueDecision {
+    Purge,
+    Decline,
+}
+
+/// Share the bound-identity remedy across CLI and desktop without passing
+/// arbitrary mint error bodies to the operator.
+pub(crate) fn mint_error_message(account: AccountNum, reason: &str) -> String {
+    if reason.starts_with("identity_mint_failed: bound_identity_removed;") {
+        format!("identity_mint_failed: bound_identity_removed; run csq logout {account} then csq login {account}")
+    } else {
+        format!("could not mint identity UUID for Codex slot {account} — check profiles.json permissions and disk space")
+    }
+}
+
+/// Dependency-injected core. Exposed to unit tests so the
+/// write-order, residue-prompt, and keychain-decline paths can be
+/// exercised without spawning a real `codex` binary or touching the
+/// user's keychain.
+///
+/// Also exposed `pub` (was `pub(crate)`) so the CLI handler can pass
+/// a custom `spawn_codex` that pipes stdout, parses the verification
+/// URL via `desktop_login::parse_device_code_line`, and auto-launches
+/// the URL in the user's default browser. Without this, codex-cli
+/// inherits stdio and prints the URL to the terminal but never
+/// opens it — the user has to copy/paste manually. Round-7 UX fix.
+pub fn perform_with<R, W, P, U, S>(
+    base_dir: &Path,
+    account: AccountNum,
+    reader: &mut R,
+    writer: &mut W,
+    probe_keychain: P,
+    purge_keychain: U,
+    spawn_codex: S,
+) -> Result<LoginOutcome>
+where
+    R: BufRead,
+    W: Write,
+    P: FnOnce() -> ProbeResult,
+    U: FnOnce() -> std::result::Result<bool, String>,
+    S: FnOnce(&Path) -> Result<ExitStatus>,
+{
+    perform_with_seal(
+        base_dir,
+        account,
+        (reader, writer),
+        probe_keychain,
+        purge_keychain,
+        spawn_codex,
+        || Ok(()),
+    )
+}
+
+/// Seal immediately before canonical publication. `io` pairs the reader and
+/// writer of the same interactive residue prompt.
+pub fn perform_with_seal<R, W, P, U, S, F>(
+    base_dir: &Path,
+    account: AccountNum,
+    io: (&mut R, &mut W),
+    probe_keychain: P,
+    purge_keychain: U,
+    spawn_codex: S,
+    seal: F,
+) -> Result<LoginOutcome>
+where
+    F: FnOnce() -> Result<()>,
+    R: BufRead,
+    W: Write,
+    P: FnOnce() -> ProbeResult,
+    U: FnOnce() -> std::result::Result<bool, String>,
+    S: FnOnce(&Path) -> Result<ExitStatus>,
+{
+    let grant = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::accounts::credential_transaction::VendorLoginGrant::new(base_dir)?,
+    ));
+    perform_with_seal_and_grant(
+        base_dir,
+        account,
+        io,
+        probe_keychain,
+        purge_keychain,
+        spawn_codex,
+        (seal, grant),
+    )
+}
+
+/// The caller clones this same grant into the actual child custody tuple.
+/// `io` is one prompt exchange; `publication` pairs its authorization seal with
+/// the grant retained by the writer's actual process custody.
+pub fn perform_with_seal_and_grant<R, W, P, U, S, F>(
+    base_dir: &Path,
+    account: AccountNum,
+    io: (&mut R, &mut W),
+    probe_keychain: P,
+    purge_keychain: U,
+    spawn_codex: S,
+    publication: (
+        F,
+        std::sync::Arc<std::sync::Mutex<crate::accounts::credential_transaction::VendorLoginGrant>>,
+    ),
+) -> Result<LoginOutcome>
+where
+    F: FnOnce() -> Result<()>,
+    R: BufRead,
+    W: Write,
+    P: FnOnce() -> ProbeResult,
+    U: FnOnce() -> std::result::Result<bool, String>,
+    S: FnOnce(&Path) -> Result<ExitStatus>,
+{
+    let (reader, writer) = io;
+    let (seal, grant) = publication;
+    let config_dir = base_dir.join(format!("config-{}", account));
+    let vendor_home = {
+        let grant = grant
+            .lock()
+            .map_err(|_| anyhow!("vendor grant lock poisoned"))?;
+        grant.prepare_codex(base_dir, account)?;
+        grant.config_dir().to_path_buf()
+    };
+    // Step 2: keychain residue probe BEFORE we write anything else.
+    // Bail on decline — prevents an in-flight login when codex would
+    // otherwise see a stale keychain entry and ignore our pre-seeded
+    // `cli_auth_credentials_store = "file"` directive.
+    match probe_keychain() {
+        ProbeResult::Present => {
+            writeln!(
+                writer,
+                "Found an existing Codex keychain entry (service: com.openai.codex)."
+            )?;
+            writeln!(
+                writer,
+                "  codex-cli writes to the keychain by default when this entry exists."
+            )?;
+            writeln!(
+                writer,
+                "  csq needs a file-backed auth store. Purge the keychain entry and continue?"
+            )?;
+
+            match prompt_yes_no(reader, writer, "Purge keychain entry? [y/N]: ")? {
+                ResidueDecision::Purge => match purge_keychain() {
+                    Ok(true) => {
+                        writeln!(writer, "Purged stale com.openai.codex keychain entry.")?;
+                    }
+                    Ok(false) => {
+                        writeln!(
+                            writer,
+                            "No keychain entry to purge (vanished between probe and delete)."
+                        )?;
+                    }
+                    Err(e) => {
+                        return Err(anyhow!(
+                            "could not purge keychain entry: {e} — delete it manually with `security delete-generic-password -s com.openai.codex` and retry"
+                        ));
+                    }
+                },
+                ResidueDecision::Decline => {
+                    return Err(anyhow!(
+                        "Codex login aborted — purge the com.openai.codex keychain entry before retrying, or run `security delete-generic-password -s com.openai.codex` yourself"
+                    ));
+                }
+            }
+        }
+        ProbeResult::Absent | ProbeResult::Unsupported => {}
+        ProbeResult::ProbeFailed => {
+            // Do not block login — `security` may be unavailable on a
+            // misconfigured macOS box that genuinely has no residue.
+            // Emit a warning so the user has a breadcrumb if login
+            // later fails for a keychain reason.
+            writeln!(
+                writer,
+                "warning: could not probe macOS keychain for codex residue — proceeding"
+            )?;
+        }
+    }
+
+    // Step 3: pre-seed config.toml BEFORE shelling out. INV-P03.
+    // `model = None`: csq does NOT force a model at login (CC-parity — csq does
+    // not own the model key). The user-global `~/.codex/config.toml` `model`
+    // propagates via the merge; absent that, codex uses its built-in default.
+    // Private Codex config was prepared from a strict benign allowlist.
+
+    // Step 4: shell out to `codex login --device-auth`.
+    writeln!(
+        writer,
+        "Starting Codex device-auth login for account {}...",
+        account
+    )?;
+    writeln!(
+        writer,
+        "codex-cli will display a device code and open your browser.",
+    )?;
+    writer.flush().ok();
+
+    grant
+        .lock()
+        .map_err(|_| anyhow!("vendor grant lock poisoned"))?
+        .begin_launch()?;
+    let status = spawn_codex(&vendor_home).with_context(|| {
+        grant
+            .lock()
+            .map(|grant| grant.quarantine_message())
+            .unwrap_or_else(|_| "vendor login quarantine state unavailable".into())
+    })?;
+    grant
+        .lock()
+        .map_err(|_| anyhow!("vendor grant lock poisoned"))?
+        .mark_completed()?;
+    if !status.success() {
+        return Err(anyhow!(
+            "codex login exited with non-zero status — inspect codex-cli output above and retry"
+        ));
+    }
+
+    // Step 5: parse config-<N>/auth.json and relocate it.
+    //
+    // Security: `credentials::load` wraps serde_json errors via
+    // `CredentialError::Corrupt { reason: e.to_string() }`. serde's
+    // type-mismatch messages echo field values (`invalid type: string
+    // "<value>", expected …`) — and the file we're parsing is the
+    // codex auth.json with live `access_token` / `refresh_token` /
+    // `id_token` values. Route the error through `redact_tokens`
+    // before any log or user-facing anyhow context so a malformed
+    // codex-cli output can never leak a JWT fragment to stderr.
+    // Origin: PR-C3b security review H1.
+    let written = vendor_home.join(surface::CODEX_WRITTEN_AUTH_JSON);
+
+    // The shared cleanup was armed before spawn and stays alive through publication.
+    let creds_from_codex = match credentials::load(&written) {
+        Ok(c) => c,
+        Err(e) => {
+            let redacted = redact_tokens(&e.to_string());
+            tracing::warn!(
+                account = %account,
+                error_kind = "codex_login_auth_json_parse_failed",
+                reason = %redacted,
+                "codex auth.json could not be parsed after device-auth"
+            );
+            // _auth_json_guard dropped here: cleanup runs on this error exit.
+            return Err(anyhow!(
+                "could not parse auth.json after `codex login` — re-run `csq login {} --provider codex`",
+                account
+            ));
+        }
+    };
+
+    // Codex wrote a Codex-shape file (spec 07 §7.3.3 step 4). If not,
+    // something external has already corrupted the path — bail rather
+    // than try to recover.
+    let codex_creds = creds_from_codex
+        .codex()
+        .ok_or_else(|| anyhow!("auth.json written by codex is not a Codex credential file"))?
+        .clone();
+
+    // IR-L5: filter empty-string hints at the boundary so that
+    // `mint_for_codex_login` only ever sees `Some(non_empty)` or `None`.
+    // If codex-cli writes `"account_id": ""`, treat it as absent — do not
+    // fall through to the empty-string special-case inside the match.
+    let account_id_hint = codex_creds
+        .tokens
+        .account_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned());
+    let canonical_creds = CredentialFile::Codex(codex_creds);
+
+    // GH an internal ticket: CAPTURE (do not act on) any stale ADDITIVE marker
+    // binding (Gemini / native Kimi-Grok) BEFORE the identity mint below.
+    // `detect_stale_marker_binding` sources detection directly from the
+    // Gemini/native marker predicates (an internal ticket regression fix — see its doc
+    // comment) rather than `detect_bound_surface`'s precedence-ordered union
+    // detector, so this call is not ordering-sensitive relative to
+    // `mint_for_codex_login`. It stays here, ahead of the mint, to mirror the
+    // CLI Anthropic path's `finalize_verified_login` layout.
+    //
+    // Security review (GH an internal ticket): the ACTION is deferred to just after
+    // `update_profile` succeeds below — the last fallible step in this
+    // function — so a login that fails partway through (mint, save,
+    // marker/profile write) never destroys the prior binding it did not
+    // actually replace. `detect_stale_marker_binding` is pure — nothing is
+    // deleted by this call.
+    let stale_marker_binding =
+        crate::accounts::binding_guard::detect_stale_marker_binding(base_dir, account);
+
+    // Task 2: Mint a UUID for this slot when none exists.
+    //
+    // Root-cause fix for the slot-12 `refresh_token_reused` bug: daemon
+    // Pass 0 only mints UUIDs for Anthropic accounts; Codex-only slots
+    // (never touched by `csq login N` on the Anthropic surface) have no
+    // `by_slot[N]` entry.  `save_canonical_for` is fail-closed without
+    // one. We call `mint_for_codex_login` HERE (after parsing auth.json,
+    // before save_canonical_for) so the UUID is guaranteed by the time
+    // the write is attempted.
+    //
+    // IR-M5: acquire the lock ONCE here and hold it across both
+    // `mint_for_codex_login` and `save_canonical_for` so both writes are
+    // atomic from a cross-process perspective. `mint_for_codex_login` now
+    // takes `&ProfilesFileLock` as a type-witness.
+    //
+    // CRIT-2: if `save_canonical_for` fails after `mint_for_codex_login`
+    // succeeds, roll back the `by_slot[N]` mapping so the next `csq run N`
+    // does not enter a partial-mint state. `by_email[synthetic_key]` is
+    // preserved so a retry reuses the same UUID (idempotency).
+    let mint_lock = match ProfilesFileLock::acquire(base_dir) {
+        Ok(l) => l,
+        Err(_) => {
+            tracing::warn!(
+                account = %account,
+                error_kind = "codex_login_profiles_lock_failed",
+                "could not acquire profiles lock for UUID mint — login cannot complete"
+            );
+            return Err(anyhow!(
+                "could not acquire profiles.json lock for Codex slot {} — \
+                 check profiles.json permissions",
+                account
+            ));
+        }
+    };
+
+    seal()?;
+    if let Err(e) = identity_mint::mint_for_codex_login(
+        &mint_lock,
+        base_dir,
+        account.get(),
+        account_id_hint.as_deref(),
+    ) {
+        tracing::warn!(
+            account = %account,
+            error_kind = "codex_login_uuid_mint_failed",
+            reason = %e,
+            "could not mint UUID for Codex slot — login cannot complete"
+        );
+        // auth_json_guard dropped here: cleanup runs on this error exit.
+        return Err(anyhow!(mint_error_message(account, &e)));
+    }
+
+    // M4-12: `save_canonical_for` writes `identities/<UUID>/credentials-codex.json`
+    // under the per-(Surface, AccountNum) mutex at 0o600 (UUID-keyed write via
+    // `save_codex_canonical_for_uuid`). The numeric `credentials/codex-<N>.json`
+    // write path and 0o400 flip are retired. The pre-M3-7
+    // `config-<N>/codex-auth.json` mirror write is also retired; handle dirs read
+    // Codex credentials through their identity-keyed symlink (spec 07 §7.2.2).
+    // `save_canonical_for` is fail-closed: absent UUID mapping returns
+    // `CredentialError::NoCredentials` (M4-12 Finding 1.1 fix). The mint call
+    // above guarantees the UUID exists before we reach here.
+    //
+    // Security: `save_canonical_for`'s `CredentialError` Display
+    // composes a format string that could include a serde reason.
+    // Redact before user-facing chain. Origin: PR-C3b security review H1.
+    if let Err(e) = cred_file::save_canonical_for(base_dir, account, &canonical_creds) {
+        let redacted = redact_tokens(&e.to_string());
+        tracing::warn!(
+            account = %account,
+            error_kind = "codex_login_canonical_save_failed",
+            reason = %redacted,
+            "could not persist codex canonical credential"
+        );
+        // CRIT-2: roll back the by_slot mapping written by mint_for_codex_login
+        // so the slot is not left in a partial-mint state. by_email is preserved
+        // so a retry reuses the same UUID (idempotency). Best-effort — log on
+        // failure but propagate the original save error.
+        if let Err(rb_err) = profiles::remove_slot_mapping(&mint_lock, base_dir, account.get()) {
+            tracing::warn!(
+                account = %account,
+                error_kind = "codex_login_rollback_failed",
+                reason = %redact_tokens(&rb_err.to_string()),
+                "could not roll back partial-mint by_slot mapping after save_canonical_for failure"
+            );
+        }
+        // auth_json_guard dropped here: cleanup runs on this error exit.
+        return Err(anyhow!(
+            "could not write identities/<UUID>/credentials-codex.json for account {} \
+             — check `identities/` permissions",
+            account
+        ));
+    }
+    // Lock released after save_canonical_for completes (minted + written atomically).
+    drop(mint_lock);
+
+    // Step 1: create config-<N>/ + codex-sessions/.
+    crate::platform::fs::ensure_private_dir(&config_dir)?;
+    // Link a genuinely fresh slot before creating an ordinary empty sessions
+    // directory. This publishes only absent local symlinks to existing shared
+    // targets; it never merges or rewrites history while other slots are live.
+    // Existing local entries remain ineligible and retain the migration guard.
+    if crate::session::shared_state::attach_slot_to_existing_shared(
+        base_dir,
+        crate::providers::catalog::Surface::Codex,
+        account,
+        false,
+    )
+    .is_err()
+    {
+        // Session sharing is advisory, never an authentication prerequisite.
+        // Keep any published links; never fall back to destructive migration.
+        tracing::warn!("fresh Codex shared-store attachment deferred");
+    }
+    let sessions_dir = surface::sessions_dir(base_dir, account);
+    std::fs::create_dir_all(&sessions_dir)
+        .with_context(|| format!("create {}", sessions_dir.display()))?;
+
+    surface::write_config_toml(base_dir, account, None)
+        .map_err(|error| anyhow::Error::new(error).context("publish Codex slot config"))?;
+
+    // Clear any stale broker_failed sentinel — the fresh chain just minted by
+    // codex-cli supersedes any prior `codex_token_expired` / `refresh_reused` /
+    // `codex_token_invalidated` flag. Without this, `csq doctor` reports the
+    // pre-login LOGIN-NEEDED status until the daemon's next pre-expiry refresh
+    // (~10 days away for fresh codex tokens), which contradicts the just-
+    // completed user-visible login. The sentinel's doc string ("on successful
+    // refresh or login") already declared this intent.
+    crate::refresh::sentinel::clear_broker_failed(base_dir, account);
+
+    // Step 6: mark + profile update.
+    //
+    // M4-7 (an internal ticket Phase 4, spec 02 §INV-03 + §2.3.1): the marker
+    // content is the slot's identity UUID when a `by_slot` mapping
+    // exists. After the `mint_for_codex_login` call above, `by_slot[N]`
+    // is guaranteed to be present, so this always takes the UUID branch.
+    // The fallback to the legacy decimal slot id is retained for defensive
+    // correctness but will not be reached in practice after this fix.
+    // The filename `.csq-account` is unchanged per OQ #3.
+    match profiles::resolve_slot_to_uuid(base_dir, account.get()) {
+        Some(uuid) => markers::write_csq_account(&config_dir, uuid)
+            .with_context(|| format!(".csq-account marker in {}", config_dir.display()))?,
+        None => markers::write_csq_account_legacy(&config_dir, account)
+            .with_context(|| format!(".csq-account marker in {}", config_dir.display()))?,
+    }
+
+    let label = format_label(account, account_id_hint.as_deref());
+    update_profile(base_dir, account, &label)
+        .with_context(|| "update profiles.json with the new Codex account entry")?;
+
+    // GH an internal ticket (CLOSED, shipped): ACT on the marker binding captured
+    // earlier — left un-acted until this point — before the mint above.
+    // This is the point right after the LAST fallible
+    // step (`update_profile`'s `?`) in this function — everything remaining
+    // below is non-fatal. Acting here rather than at detection time means a
+    // login that fails earlier (mint, save_canonical_for, marker/profile
+    // write) leaves the prior Gemini/native binding untouched, exactly like
+    // the pre-fix refuse behaviour did on failure.
+    if let Some(surface) = stale_marker_binding {
+        crate::accounts::binding_guard::clear_detected_marker_binding(base_dir, account, surface);
+    }
+
+    // M4-2: pair `identities/<UUID>/settings.json` when a UUID mapping exists
+    // for this slot. Codex does NOT use `config-<N>/settings.json` (Codex's
+    // per-slot config lives in `config-<N>/config.toml`), so the source-of-truth
+    // bytes are simply `{}` — an empty JSON object. The pair makes handle-dir
+    // materialization see a consistent UUID-first layout for Codex slots that
+    // share a slot number with an Anthropic identity (cross-surface UUID reuse).
+    //
+    // Non-fatal: settings pairing failure does not block login. If no UUID
+    // mapping exists (daemon Pass 0 has not run, or no prior Anthropic login
+    // on the same slot), the pair is skipped — the daemon's next Pass 0 will
+    // mint the UUID and seed the settings file from scratch.
+    if let Some(uuid) = profiles::resolve_slot_to_uuid(base_dir, account.get()) {
+        let bytes = b"{}";
+        if let Err(e) = credentials::save_uuid_settings(base_dir, uuid, bytes) {
+            tracing::warn!(
+                account = %account,
+                error_kind = "codex_uuid_settings_pair_failed",
+                "codex finalize_login: could not pair UUID settings.json (non-fatal): {}",
+                redact_tokens(&e.to_string())
+            );
+        } else {
+            tracing::debug!(
+                account = %account,
+                "codex finalize_login: paired UUID settings.json"
+            );
+        }
+    }
+
+    writeln!(writer, "Codex account {} logged in as {}.", account, label)?;
+
+    remove_retired_slot_raw_after_commit(base_dir, account)?;
+    Ok(LoginOutcome { label })
+}
+
+/// Reads a `[yY]` or `[nN]` line (trailing newline stripped) from
+/// `reader`, writing the prompt to `writer` first. Empty input
+/// defaults to `Decline` — matches Unix-ergonomic "[y/N]" shape
+/// where the capital letter is the default.
+fn prompt_yes_no<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    prompt: &str,
+) -> Result<ResidueDecision> {
+    write!(writer, "{prompt}")?;
+    writer.flush()?;
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .context("failed to read residue-prompt response from stdin")?;
+    let trimmed = line.trim();
+    match trimmed {
+        "y" | "Y" | "yes" | "Yes" | "YES" => Ok(ResidueDecision::Purge),
+        _ => Ok(ResidueDecision::Decline),
+    }
+}
+
+/// Formats the profiles.json label for a newly-logged-in Codex slot.
+/// Uses `account_id` when present (consistent with the discovery path
+/// in PR-C3a which falls back to `codex-<N>` when it cannot decode
+/// labels). `id_token` is deliberately NOT decoded — spec 07 §7.3.3
+/// banner + `CodexTokensFile::fmt` both enforce that id_token stays
+/// opaque inside csq.
+///
+/// SR-M1: the hint is validated for control characters before use. A
+/// hint containing bytes < 0x20 (control chars) is treated as absent and
+/// the fallback label is used, preventing injection into operator-facing
+/// terminal output and `profiles.json`.
+fn format_label(account: AccountNum, account_id_hint: Option<&str>) -> String {
+    // SR-M1: validate at the label-formatting boundary. The call site in
+    // perform_with already filters empty strings, but format_label may be
+    // called from other contexts; the guard here is the final defence.
+    let valid_hint = account_id_hint.filter(|id| !id.is_empty() && !id.bytes().any(|b| b < 0x20));
+    match valid_hint {
+        Some(id) => {
+            // Keep the label short — account_id is a UUID, so drop the
+            // trailing suffix after the first dash-block.
+            let prefix = id.split('-').next().unwrap_or(id);
+            format!("codex-{}/{}", account, prefix)
+        }
+        None => format!("codex-{}", account),
+    }
+}
+
+/// Codex login `profiles.json` hook — writes `by_slot_identity[N]`.
+///
+/// **M8 (an internal workspace, an internal ticket Phase 4 → RN1-E):**
+/// records the canonical Codex identity-class label for this slot in
+/// `profiles.json::by_slot_identity`. The label comes from
+/// [`format_label`] (e.g. `"codex-3/abc12345"` when `account_id_hint`
+/// is present, `"codex-3"` otherwise).
+///
+/// ## Channel relationship
+///
+/// - `by_slot_identity[N]` (written here via `set_slot_identity` — M3)
+///   is the non-OAuth identity channel. It is distinct from
+///   `by_slot_label[N]` (user-chosen rename) so that a user rename
+///   always takes precedence over the backfilled identity.
+/// - `get_email` step 1.5 reads this field after checking
+///   `by_slot_label` (step 1), so a rename silently wins without any
+///   coordination required here.
+///
+/// ## Lock discipline
+///
+/// Acquires `ProfilesFileLock` locally before calling `set_slot_identity`.
+/// The `_lock` type-witness on `set_slot_identity` (M3) mandates that the
+/// caller hold the lock; acquiring it here satisfies that precondition
+/// without changing `update_profile`'s signature (widening the signature
+/// to accept a lock parameter is a larger refactor deferred to M13+).
+///
+/// ## Idempotency
+///
+/// Delegated to `set_slot_identity`: if `by_slot_identity[N]` already
+/// equals `label`, the function returns `Ok(())` without touching disk.
+fn update_profile(
+    base_dir: &Path,
+    account: AccountNum,
+    label: &str,
+) -> std::result::Result<(), crate::error::ConfigError> {
+    let lock = crate::accounts::profiles_lock::ProfilesFileLock::acquire(base_dir)?;
+    crate::accounts::profiles::set_slot_identity(&lock, base_dir, account.get(), label)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::test_env::with_in_memory_secret_backend;
+    use std::io::Cursor;
+    use tempfile::TempDir;
+
+    #[test]
+    fn shared_cleanup_waits_for_last_custody_owner() {
+        let dir = TempDir::new().unwrap();
+        let grant = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::accounts::credential_transaction::VendorLoginGrant::new(dir.path()).unwrap(),
+        ));
+        let home = grant.lock().unwrap().config_dir().to_path_buf();
+        grant.lock().unwrap().begin_launch().unwrap();
+        stub_codex_auth_json(&home, "synthetic-shared");
+        let custody = grant.clone();
+        drop(grant);
+        assert!(home.join("auth.json").exists());
+        custody.lock().unwrap().mark_completed().unwrap();
+        drop(custody);
+        assert!(!home.exists());
+    }
+
+    #[test]
+    fn rejected_seal_preserves_prior_profiles_and_removes_new_raw_grant() {
+        let dir = TempDir::new().unwrap();
+        provision_uuid_for_account(dir.path(), 2);
+        let path = profiles::profiles_path(dir.path());
+        let before = std::fs::read(&path).unwrap();
+        let known = dir.path().join("config-2");
+        std::fs::create_dir(&known).unwrap();
+        std::fs::write(known.join("auth.json"), b"synthetic-prior-raw").unwrap();
+        let mut vendor_auth = None;
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let result = perform_with_seal(
+            dir.path(),
+            acc(2),
+            (&mut input, &mut output),
+            || ProbeResult::Absent,
+            || Ok(false),
+            |home| {
+                vendor_auth = Some(home.join("auth.json"));
+                stub_codex_auth_json(home, "synthetic-preseal");
+                Ok(fake_success())
+            },
+            || Err(anyhow!("synthetic pre-seal cancellation")),
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert_eq!(
+            std::fs::read(known.join("auth.json")).unwrap(),
+            b"synthetic-prior-raw"
+        );
+        assert!(
+            !vendor_auth.unwrap().exists(),
+            "completed vendor output cleaned on seal refusal"
+        );
+        assert!(!crate::accounts::identity_store::store_version_path(dir.path()).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_home_stub_reads_config_and_writes_only_shared_private_home() {
+        let dir = TempDir::new().unwrap();
+        let grant = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::accounts::credential_transaction::VendorLoginGrant::new(dir.path()).unwrap(),
+        ));
+        let home = grant.lock().unwrap().config_dir().to_path_buf();
+        let custody = grant.clone();
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let result = perform_with_seal_and_grant(
+            dir.path(),
+            acc(2),
+            (&mut input, &mut output),
+            || ProbeResult::Absent,
+            || Ok(false),
+            |vendor_home| {
+                assert_eq!(vendor_home, home);
+                std::process::Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(
+                        r#"test -r "$CODEX_HOME/config.toml" || exit 18
+cat "$CODEX_HOME/config.toml" > "$CODEX_HOME/vendor-observed-config"
+printf 'synthetic-private-grant' > "$CODEX_HOME/auth.json"
+exit 17"#,
+                    )
+                    .env("CODEX_HOME", vendor_home)
+                    .status()
+                    .map_err(anyhow::Error::from)
+            },
+            (|| panic!("nonzero vendor must never seal"), custody),
+        );
+        assert!(result.is_err());
+        assert!(home.join("vendor-observed-config").is_file());
+        assert_eq!(
+            std::fs::read(home.join("auth.json")).unwrap(),
+            b"synthetic-private-grant"
+        );
+        assert!(!dir.path().join("config-2").exists());
+        grant.lock().unwrap().cleanup().unwrap();
+        assert!(!home.exists());
+    }
+
+    fn assert_canonical_success(base: &Path, account: AccountNum) {
+        let identity =
+            profiles::resolve_slot_to_uuid(base, account.get()).expect("canonical profile binding");
+        assert!(
+            crate::accounts::identity_store::credentials_codex_path_for(base, identity).is_file()
+        );
+        let config = base.join(format!("config-{account}"));
+        assert_eq!(markers::read_csq_account_uuid(&config), Some(identity));
+        assert!(config.join("config.toml").is_file());
+        assert!(config.join("codex-sessions").is_dir());
+        assert!(
+            !config.join("auth.json").exists(),
+            "known raw removed only after success"
+        );
+    }
+
+    fn acc(n: u16) -> AccountNum {
+        AccountNum::try_from(n).unwrap()
+    }
+
+    /// M4-12: insert `profiles.json::by_slot[account] = fixture_uuid_for_slot(account)`
+    /// so that `save_canonical_for` (now fail-closed) can resolve the UUID-keyed write
+    /// path for the given slot. Must be called before any `perform_with` invocation.
+    fn provision_uuid_for_account(base: &std::path::Path, account: u16) {
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(account);
+        let profiles_path = crate::accounts::profiles::profiles_path(base);
+        let mut profiles = if profiles_path.exists() {
+            crate::accounts::profiles::load(&profiles_path)
+                .unwrap_or_else(|_| crate::accounts::profiles::ProfilesFile::empty())
+        } else {
+            crate::accounts::profiles::ProfilesFile::empty()
+        };
+        profiles.by_slot.insert(account.to_string(), uuid);
+        crate::accounts::profiles::save(&profiles_path, &profiles).unwrap();
+    }
+
+    #[test]
+    fn refused_vendor_write_keeps_prior_slot_auth_and_config_byte_identical() {
+        let dir = TempDir::new().unwrap();
+        let canonical = dir.path().join("config-2");
+        std::fs::create_dir(&canonical).unwrap();
+        let auth = canonical.join("auth.json");
+        let config = canonical.join("config.toml");
+        let prior_auth = b"synthetic-prior-raw-grant";
+        let prior_config = b"model = \"synthetic-model\"\nmodel_reasoning_effort = \"high\"\n[mcp_servers.secret]\ncommand = \"synthetic-secret-command\"\n[mcp_servers.secret.env]\nAPI_KEY = \"synthetic-nested-secret\"\n[unknown]\nvalue = \"synthetic-unknown\"\n";
+        std::fs::write(&auth, prior_auth).unwrap();
+        std::fs::write(&config, prior_config).unwrap();
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let mut written_home = None;
+        let result = perform_with(
+            dir.path(),
+            acc(2),
+            &mut input,
+            &mut output,
+            || ProbeResult::Absent,
+            || Ok(false),
+            |home| {
+                written_home = Some(home.to_path_buf());
+                // This is what a CODEX_HOME-respecting vendor does before an
+                // unresolved observer error. No canonical write is authorized.
+                std::fs::write(home.join("auth.json"), b"synthetic-unresolved-new-grant").unwrap();
+                Err(anyhow!("synthetic custody unresolved"))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(&auth).ok().as_deref(),
+            Some(prior_auth.as_slice())
+        );
+        assert_eq!(std::fs::read(&config).unwrap(), prior_config);
+        let home = written_home.unwrap();
+        assert_ne!(home, canonical);
+        assert!(home.starts_with(dir.path().canonicalize().unwrap().join(".login-grants")));
+        assert_eq!(
+            std::fs::read(home.join("auth.json")).unwrap(),
+            b"synthetic-unresolved-new-grant"
+        );
+        let text = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        let copied: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(
+            copied.get("model").and_then(toml::Value::as_str),
+            Some("synthetic-model")
+        );
+        assert_eq!(
+            copied
+                .get("model_reasoning_effort")
+                .and_then(toml::Value::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            copied
+                .get("cli_auth_credentials_store")
+                .and_then(toml::Value::as_str),
+            Some("file")
+        );
+        assert_eq!(copied.as_table().unwrap().len(), 3);
+        assert!(!text.contains("synthetic-nested-secret"));
+        assert!(!text.contains("mcp_servers"));
+        assert!(!text.contains("unknown"));
+        assert!(!profiles::profiles_path(dir.path()).exists());
+    }
+
+    // `ExitStatus` has no stable cross-platform constructor; pull the
+    // right `ExitStatusExt` per target so PR-C3b's tests compile on
+    // both Unix (Ubuntu / macOS CI) and Windows (Windows CI).
+    #[cfg(unix)]
+    fn fake_success() -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(0)
+    }
+
+    #[cfg(unix)]
+    fn fake_failure() -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(1 << 8)
+    }
+
+    #[cfg(windows)]
+    fn fake_success() -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(0)
+    }
+
+    #[cfg(windows)]
+    fn fake_failure() -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(1)
+    }
+
+    /// Writes a valid Codex auth.json into `<config_dir>/auth.json`, as
+    /// codex-cli would after a successful device-auth login. Mirrors
+    /// the shape documented on `CodexCredentialFile`.
+    fn stub_codex_auth_json(config_dir: &Path, account_id: &str) {
+        assert_eq!(
+            config_dir
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
+            Some(".login-grants"),
+            "vendor fixture must write callback-provided private home"
+        );
+        let body = serde_json::json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "account_id": account_id,
+                "access_token": "eyJhbGciOiJIUzI1NiJ9.test-at.sig",
+                "refresh_token": "rt_test",
+                "id_token": "eyJhbGciOiJIUzI1NiJ9.test-id.sig",
+            },
+            "last_refresh": "2026-04-22T00:00:00Z",
+        });
+        std::fs::write(
+            config_dir.join("auth.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn refused_spawn_preserves_prior_and_distinguishes_unknown_quarantine() {
+        for nonzero in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let account = acc(2);
+            let mut input = Cursor::new(Vec::<u8>::new());
+            let mut output = Vec::new();
+            let known = dir.path().join("config-2");
+            std::fs::create_dir(&known).unwrap();
+            std::fs::write(known.join("auth.json"), b"synthetic-prior-raw").unwrap();
+            let mut vendor_home = None;
+            let result = perform_with(
+                dir.path(),
+                account,
+                &mut input,
+                &mut output,
+                || ProbeResult::Absent,
+                || Ok(false),
+                |home| {
+                    vendor_home = Some(home.to_path_buf());
+                    stub_codex_auth_json(home, "synthetic-refused");
+                    if nonzero {
+                        Ok(fake_failure())
+                    } else {
+                        Err(anyhow!("synthetic cancellation after vendor write"))
+                    }
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(
+                std::fs::read(known.join("auth.json")).unwrap(),
+                b"synthetic-prior-raw"
+            );
+            let home = vendor_home.unwrap();
+            assert_ne!(home, known);
+            if nonzero {
+                assert!(
+                    !home.exists(),
+                    "known completed refusal cleans the private grant"
+                );
+            } else {
+                assert!(
+                    home.join("auth.json").exists(),
+                    "unproven custody stays quarantined"
+                );
+                let lease: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(home.join("lease.json")).unwrap())
+                        .unwrap();
+                assert_eq!(
+                    lease.get("state").and_then(serde_json::Value::as_str),
+                    Some("Spawning")
+                );
+            }
+            assert!(!profiles::profiles_path(dir.path()).exists());
+        }
+    }
+
+    #[test]
+    fn success_path_writes_canonical_and_mirror_and_profile() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(2);
+
+        // M4-12: provision UUID mapping so save_canonical_for can locate
+        // the UUID-keyed identity write path (fail-closed without mapping).
+        provision_uuid_for_account(base, 2);
+
+        let known = base.join("config-2");
+        std::fs::create_dir_all(&known).unwrap();
+        std::fs::write(known.join("auth.json"), b"synthetic-prior-raw").unwrap();
+        let mut vendor_home = None;
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+
+        let outcome = perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || Ok(false),
+            |config_dir| {
+                vendor_home = Some(config_dir.to_path_buf());
+                // Honour the contract: codex writes auth.json inside CODEX_HOME.
+                stub_codex_auth_json(config_dir, "acct-uuid-1234-xyz");
+                Ok(fake_success())
+            },
+        )
+        .expect("login should succeed");
+
+        assert_canonical_success(base, account);
+        assert!(
+            !vendor_home.unwrap().exists(),
+            "completed private grant must be cleaned"
+        );
+        // M4-12: numeric path `credentials/codex-2.json` is retired as a write
+        // destination. Assert the UUID-keyed identity path instead.
+        let uuid2 = crate::testing::identity_fixtures::fixture_uuid_for_slot(2);
+        let uuid_codex_path =
+            crate::accounts::identity_store::credentials_codex_path_for(base, uuid2);
+        assert!(
+            uuid_codex_path.exists(),
+            "M4-12: identities/<UUID>/credentials-codex.json must exist after login; \
+             path: {uuid_codex_path:?}"
+        );
+        assert!(
+            !base.join("credentials/codex-2.json").exists(),
+            "M4-12: numeric credentials/codex-2.json must NOT be written post-M4-12"
+        );
+        // M3-7: config-N/codex-auth.json live mirror is retired (OQ #3 — Codex
+        // handle dirs symlink auth.json to identities/<UUID>/credentials-codex.json
+        // post-M3-3/M3-4). Codex login no longer materializes the mirror.
+        assert!(
+            !base.join("config-2/codex-auth.json").exists(),
+            "M3-7: config-N/codex-auth.json mirror MUST NOT be written"
+        );
+        assert!(base.join("config-2/.csq-account").exists());
+        assert!(base.join("config-2/codex-sessions").is_dir());
+        // The raw auth.json codex wrote is cleaned up.
+        assert!(!base.join("config-2/auth.json").exists());
+        // Label carries the account-id prefix.
+        assert_eq!(outcome.label, "codex-2/acct");
+    }
+
+    /// Pins ambient configuration and the secret backend for these login fixtures.
+    /// Restores both overrides on unwind while holding the workspace env lock.
+    struct FreshSlotTestEnv {
+        _lock: crate::platform::test_env::EnvTestGuard,
+        previous: [Option<std::ffi::OsString>; 2],
+    }
+
+    impl FreshSlotTestEnv {
+        fn new(base: &std::path::Path) -> Self {
+            let lock = crate::platform::test_env::lock();
+            let previous = [
+                std::env::var_os("CODEX_USER_CONFIG"),
+                std::env::var_os("CSQ_SECRET_BACKEND"),
+            ];
+            let config = base.join("TEST-INPUT-user-config.toml");
+            std::fs::write(&config, "# TEST INPUT: isolated user configuration\n").unwrap();
+            // SAFETY: the shared workspace env lock is held until Drop restores values.
+            unsafe {
+                std::env::set_var("CODEX_USER_CONFIG", config);
+                std::env::set_var("CSQ_SECRET_BACKEND", "in-memory");
+            }
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for FreshSlotTestEnv {
+        fn drop(&mut self) {
+            for (name, previous) in ["CODEX_USER_CONFIG", "CSQ_SECRET_BACKEND"]
+                .into_iter()
+                .zip(self.previous.iter())
+            {
+                // SAFETY: the shared workspace env lock remains held during restoration.
+                unsafe {
+                    match previous {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    // Native Unix fixture; Windows symlink privilege/runtime is a separate contract.
+    #[cfg(unix)]
+    #[test]
+    fn fresh_slot_links_existing_shared_store_only_after_publication() {
+        let dir = TempDir::new().unwrap();
+        let _env = FreshSlotTestEnv::new(dir.path());
+        let base = dir.path();
+        let account = acc(22);
+        provision_uuid_for_account(base, 22);
+        let shared = base.join("shared-state/codex");
+        for entry in crate::session::shared_state::CODEX_SHARED.shared {
+            let target = shared.join(entry.relpath);
+            match entry.kind {
+                crate::session::shared_state::EntryKind::Dir => {
+                    std::fs::create_dir_all(target).unwrap()
+                }
+                crate::session::shared_state::EntryKind::File => {
+                    std::fs::create_dir_all(&shared).unwrap();
+                    std::fs::write(target, b"TEST INPUT shared history\n").unwrap();
+                }
+            }
+        }
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+        perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || panic!("must not purge keychain"),
+            |config_dir| {
+                assert!(
+                    !base.join(format!("config-{account}")).exists(),
+                    "canonical home must not be created before seal"
+                );
+                for entry in crate::session::shared_state::CODEX_SHARED.shared {
+                    assert!(
+                        !config_dir.join(entry.relpath).exists(),
+                        "quarantine must not expose shared history before seal"
+                    );
+                }
+                stub_codex_auth_json(config_dir, "TEST-INPUT-fresh-slot");
+                Ok(fake_success())
+            },
+        )
+        .unwrap();
+        for entry in crate::session::shared_state::CODEX_SHARED.shared {
+            let local = base.join(format!("config-{account}")).join(entry.relpath);
+            assert!(
+                local.is_symlink(),
+                "successful sealed publication attaches shared entry"
+            );
+            assert_eq!(
+                std::fs::read_link(&local).unwrap(),
+                shared.join(entry.relpath)
+            );
+            if entry.kind == crate::session::shared_state::EntryKind::File {
+                assert_eq!(
+                    std::fs::read(shared.join(entry.relpath)).unwrap(),
+                    b"TEST INPUT shared history\n"
+                );
+            }
+        }
+    }
+
+    // Native Unix fixture; Windows symlink privilege/runtime is a separate contract.
+    #[cfg(unix)]
+    #[test]
+    fn shared_attachment_error_does_not_block_vendor_login() {
+        let dir = TempDir::new().unwrap();
+        let _env = FreshSlotTestEnv::new(dir.path());
+        let base = dir.path();
+        let account = acc(23);
+        provision_uuid_for_account(base, 23);
+        // Deterministic ENOTDIR at shared-target metadata lookup, not a
+        // permission test that can vacuously pass under a privileged runner.
+        std::fs::write(
+            base.join("shared-state"),
+            b"TEST INPUT wrong-shaped shared root",
+        )
+        .unwrap();
+        let spawned = std::cell::Cell::new(false);
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+        perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || panic!("must not purge keychain"),
+            |config_dir| {
+                spawned.set(true);
+                assert!(!config_dir.join("codex-sessions").exists());
+                assert!(!base.join(format!("config-{account}")).exists());
+                stub_codex_auth_json(config_dir, "TEST-INPUT-sharing-error");
+                Ok(fake_success())
+            },
+        )
+        .unwrap();
+        assert!(spawned.get());
+        let sessions = base.join(format!("config-{account}/codex-sessions"));
+        assert!(sessions.is_dir());
+        assert!(!sessions.is_symlink());
+        assert_eq!(
+            std::fs::read(base.join("shared-state")).unwrap(),
+            b"TEST INPUT wrong-shaped shared root"
+        );
+    }
+
+    #[test]
+    fn existing_slot_history_is_not_migrated_before_vendor_login() {
+        let dir = TempDir::new().unwrap();
+        let _env = FreshSlotTestEnv::new(dir.path());
+        let base = dir.path();
+        let account = acc(22);
+        provision_uuid_for_account(base, 22);
+        let shared = base.join("shared-state/codex");
+        for entry in crate::session::shared_state::CODEX_SHARED.shared {
+            let target = shared.join(entry.relpath);
+            match entry.kind {
+                crate::session::shared_state::EntryKind::Dir => {
+                    std::fs::create_dir_all(target).unwrap()
+                }
+                crate::session::shared_state::EntryKind::File => {
+                    std::fs::create_dir_all(&shared).unwrap();
+                    std::fs::write(target, b"TEST INPUT shared history\n").unwrap();
+                }
+            }
+        }
+        let local_sessions = base.join("config-22/codex-sessions");
+        std::fs::create_dir_all(&local_sessions).unwrap();
+        std::fs::write(
+            local_sessions.join("TEST-INPUT-local.jsonl"),
+            b"TEST INPUT private history\n",
+        )
+        .unwrap();
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+        perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || panic!("must not purge keychain"),
+            |config_dir| {
+                assert!(
+                    !config_dir.join("codex-sessions").exists(),
+                    "private vendor home must not receive prior history"
+                );
+                let local = local_sessions.clone();
+                assert!(!local.is_symlink());
+                assert_eq!(
+                    std::fs::read(local.join("TEST-INPUT-local.jsonl")).unwrap(),
+                    b"TEST INPUT private history\n"
+                );
+                assert!(!shared
+                    .join("codex-sessions/TEST-INPUT-local.jsonl")
+                    .exists());
+                stub_codex_auth_json(config_dir, "TEST-INPUT-existing-slot");
+                Ok(fake_success())
+            },
+        )
+        .unwrap();
+        assert!(!local_sessions.is_symlink());
+        assert_eq!(
+            std::fs::read(local_sessions.join("TEST-INPUT-local.jsonl")).unwrap(),
+            b"TEST INPUT private history\n"
+        );
+        assert!(!shared
+            .join("codex-sessions/TEST-INPUT-local.jsonl")
+            .exists());
+    }
+
+    #[test]
+    fn perform_with_clears_stale_gemini_marker_after_login() {
+        // GH an internal ticket: a slot previously bound to Gemini that then logs
+        // in as Codex must not carry BOTH bindings afterward.
+        use crate::providers::gemini::provisioning::{
+            write_binding as gemini_write, AuthMode, GeminiBinding,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(20);
+        provision_uuid_for_account(base, 20);
+
+        gemini_write(base, account, &GeminiBinding::new(AuthMode::ApiKey, "auto")).unwrap();
+        assert!(
+            crate::providers::gemini::provisioning::is_gemini_bound_slot(base, account),
+            "pre: slot must be Gemini-bound before the Codex login"
+        );
+
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+        // Pin the vault backend: `clear_detected_marker_binding` deletes the
+        // Gemini vault entry BEFORE the marker and is fail-closed on any
+        // vault-step failure, so an ambient-resolved vault makes this test
+        // platform-dependent — GREEN on macOS/Windows (their vaults always
+        // open) and RED on a bus-less Linux CI runner, where the marker is
+        // deliberately left in place. See
+        // `platform::test_env::with_in_memory_secret_backend`.
+        with_in_memory_secret_backend(|| {
+            perform_with(
+                base,
+                account,
+                &mut reader,
+                &mut writer,
+                || ProbeResult::Absent,
+                || Ok(false),
+                |config_dir| {
+                    stub_codex_auth_json(config_dir, "acct-uuid-gemini-cleanup");
+                    Ok(fake_success())
+                },
+            )
+        })
+        .expect("codex login should succeed");
+
+        assert!(
+            !crate::providers::gemini::provisioning::is_gemini_bound_slot(base, account),
+            "the stale Gemini marker must be removed after the Codex login replaces the slot"
+        );
+        assert!(
+            crate::accounts::identity_store::is_codex_bound_slot_identity_aware(base, account),
+            "the slot must now read as Codex-bound"
+        );
+    }
+
+    /// Security review regression (GH an internal ticket): a `perform_with` that
+    /// FAILS after the stale-marker DETECTION point must NOT have deleted the
+    /// prior Gemini binding. `.profiles.lock` pre-created as a DIRECTORY
+    /// makes the mint's `ProfilesFileLock::acquire` fail deterministically —
+    /// mirrors `accounts::login::tests::finalize_login_failure_preserves_prior_gemini_binding`.
+    // UNIX-ONLY FIXTURE, not a unix-only property. The failure this test needs
+    // is injected by creating `.profiles.lock` as a DIRECTORY, so that
+    // `ProfilesFileLock::acquire`'s `OpenOptions::write(true).open(path)` fails
+    // EISDIR. Windows does not share those semantics — the open does not fail
+    // the same way, so `finalize_login` SUCCEEDS and the fixture never creates
+    // the condition under test (CI: `Rust tests (windows-latest)`, 4 tests, all
+    // on the `result.is_err()` assertion).
+    //
+    // The behaviour being pinned — a login that fails must not destroy a
+    // binding it never replaced — is platform-independent and lives in
+    // ordinary control flow. Only the failure INJECTION is Unix-specific, so
+    // the test is gated rather than weakened into something that passes
+    // everywhere by asserting less.
+    #[cfg(unix)]
+    #[test]
+    fn perform_with_failure_preserves_prior_gemini_binding() {
+        use crate::providers::gemini::provisioning::{
+            is_gemini_bound_slot, write_binding as gemini_write, AuthMode, GeminiBinding,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(22);
+        provision_uuid_for_account(base, 22);
+
+        gemini_write(base, account, &GeminiBinding::new(AuthMode::ApiKey, "auto")).unwrap();
+        assert!(
+            is_gemini_bound_slot(base, account),
+            "pre: slot must be Gemini-bound before the Codex login attempt"
+        );
+
+        let marker = crate::providers::gemini::provisioning::binding_path(base, account);
+        let marker_before = std::fs::read(&marker).unwrap();
+        let profiles_path = crate::accounts::profiles::profiles_path(base);
+        let profiles_before = std::fs::read(&profiles_path).unwrap();
+        // Gemini publication now creates the cooperative authority lockfile.
+        // Replace only this temp fixture's regular file with a directory to
+        // inject the same real mint-acquisition failure (EISDIR) as before.
+        std::fs::remove_file(base.join(".profiles.lock")).unwrap();
+        std::fs::create_dir_all(base.join(".profiles.lock")).unwrap();
+
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+        // Pinned for the same reason as the sibling cleanup test, and for one
+        // more: with an ambient vault that cannot open, the cleanup is blocked
+        // by the environment rather than by the capture/act split, so the
+        // survival assertion would hold even if that split regressed.
+        let result = with_in_memory_secret_backend(|| {
+            perform_with(
+                base,
+                account,
+                &mut reader,
+                &mut writer,
+                || ProbeResult::Absent,
+                || Ok(false),
+                |config_dir| {
+                    stub_codex_auth_json(config_dir, "acct-uuid-gemini-failure");
+                    Ok(fake_success())
+                },
+            )
+        });
+
+        assert!(
+            result.is_err(),
+            "perform_with must fail when the profiles lock cannot be acquired: {result:?}"
+        );
+        assert!(
+            is_gemini_bound_slot(base, account),
+            "the Gemini marker must SURVIVE a perform_with that fails after the \
+             detect point — a failed login must not destroy a binding it never \
+             actually replaced"
+        );
+        assert_eq!(std::fs::read(marker).unwrap(), marker_before);
+        assert_eq!(std::fs::read(profiles_path).unwrap(), profiles_before);
+    }
+
+    #[test]
+    fn perform_with_clears_stale_native_marker_after_login() {
+        // GH an internal ticket: a slot previously bound to a native CLI (Kimi/Grok)
+        // that then logs in as Codex must not carry BOTH bindings afterward.
+        use crate::providers::catalog::Surface;
+        use crate::providers::native;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(21);
+        provision_uuid_for_account(base, 21);
+
+        native::write_binding(base, account, Surface::Kimi).unwrap();
+        assert!(native::marker_exists(base, account, Surface::Kimi));
+
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+        perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || Ok(false),
+            |config_dir| {
+                stub_codex_auth_json(config_dir, "acct-uuid-native-cleanup");
+                Ok(fake_success())
+            },
+        )
+        .expect("codex login should succeed");
+
+        assert!(
+            !native::marker_exists(base, account, Surface::Kimi),
+            "the stale native marker must be removed after the Codex login replaces the slot"
+        );
+        assert!(
+            crate::accounts::identity_store::is_codex_bound_slot_identity_aware(base, account),
+            "the slot must now read as Codex-bound"
+        );
+    }
+
+    #[test]
+    fn config_toml_written_before_codex_invocation() {
+        // Write-order regression: spec 07 §7.3.3 step 2 MUST precede
+        // step 3; a reversed order would let codex-cli fall through
+        // to the keychain default.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(3);
+
+        // M4-12: provision UUID mapping so save_canonical_for can locate
+        // the UUID-keyed identity write path (fail-closed without mapping).
+        provision_uuid_for_account(base, 3);
+
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+        let observed = std::cell::Cell::new(false);
+
+        perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || Ok(false),
+            |config_dir| {
+                // By the time codex runs, config.toml must exist with
+                // the `file` auth-store directive.
+                assert_eq!(
+                    config_dir
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .and_then(|n| n.to_str()),
+                    Some(".login-grants")
+                );
+                let toml = config_dir.join("config.toml");
+                assert!(
+                    toml.exists(),
+                    "config.toml must be written before codex is invoked (INV-P03)"
+                );
+                let body = std::fs::read_to_string(&toml).unwrap();
+                let parsed: toml::Value = toml::from_str(&body).unwrap();
+                assert_eq!(
+                    parsed
+                        .get("cli_auth_credentials_store")
+                        .and_then(toml::Value::as_str),
+                    Some("file")
+                );
+                assert!(
+                    body.contains("cli_auth_credentials_store = \"file\""),
+                    "config.toml must pin file-backed auth store: {body}"
+                );
+                observed.set(true);
+                stub_codex_auth_json(config_dir, "id");
+                Ok(fake_success())
+            },
+        )
+        .unwrap();
+
+        assert!(
+            observed.get(),
+            "codex-spawn hook should have observed config.toml"
+        );
+    }
+
+    #[test]
+    fn keychain_residue_decline_aborts_before_spawn() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(4);
+
+        let mut reader = Cursor::new(b"n\n".to_vec());
+        let mut writer = Vec::<u8>::new();
+        let spawn_called = std::cell::Cell::new(false);
+
+        let err = perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Present,
+            || Ok(true),
+            |_| {
+                spawn_called.set(true);
+                Ok(fake_success())
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("aborted"),
+            "decline must carry an abort message: {err}"
+        );
+        assert!(
+            !spawn_called.get(),
+            "decline must short-circuit BEFORE codex is invoked"
+        );
+        assert!(
+            !base.join("credentials/codex-4.json").exists(),
+            "decline must not leave any canonical credential behind"
+        );
+    }
+
+    #[test]
+    fn keychain_residue_accept_purges_then_proceeds() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(5);
+
+        // M4-12: provision UUID mapping so save_canonical_for can locate
+        // the UUID-keyed identity write path (fail-closed without mapping).
+        provision_uuid_for_account(base, 5);
+
+        let mut reader = Cursor::new(b"y\n".to_vec());
+        let mut writer = Vec::<u8>::new();
+        let purged = std::cell::Cell::new(false);
+
+        let outcome = perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Present,
+            || {
+                purged.set(true);
+                Ok(true)
+            },
+            |config_dir| {
+                stub_codex_auth_json(config_dir, "id");
+                Ok(fake_success())
+            },
+        )
+        .unwrap();
+
+        assert!(purged.get(), "accept must invoke purge before proceeding");
+        assert_eq!(outcome.label, "codex-5/id");
+        // M4-12: numeric path retired; assert UUID-keyed path instead.
+        let uuid5 = crate::testing::identity_fixtures::fixture_uuid_for_slot(5);
+        let uuid_path5 = crate::accounts::identity_store::credentials_codex_path_for(base, uuid5);
+        assert!(
+            uuid_path5.exists(),
+            "M4-12: UUID codex cred must exist; path: {uuid_path5:?}"
+        );
+        assert!(
+            !base.join("credentials/codex-5.json").exists(),
+            "M4-12: numeric path must NOT be written"
+        );
+    }
+
+    /// Regression: a successful `csq login N --provider codex` MUST clear
+    /// any pre-existing `broker_failed` sentinel for slot N. Otherwise the
+    /// daemon's stale flag persists until the next pre-expiry refresh
+    /// (~10 days for a fresh codex chain), and `csq doctor` keeps
+    /// reporting LOGIN-NEEDED for a slot the user just logged into.
+    /// Origin: 2026-05-22 — slot 12 sentinel from earlier refresh
+    /// attempt survived a successful re-login.
+    #[test]
+    fn login_success_clears_stale_broker_failed_sentinel() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(8);
+
+        provision_uuid_for_account(base, 8);
+
+        // Seed a stale sentinel as if a prior refresh tick had set one.
+        crate::refresh::sentinel::set_broker_failed(base, account, "codex_token_invalidated")
+            .unwrap();
+        assert!(crate::refresh::sentinel::is_broker_failed(base, account));
+
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+
+        let outcome = perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || Ok(false),
+            |config_dir| {
+                stub_codex_auth_json(config_dir, "id");
+                Ok(fake_success())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.label, "codex-8/id");
+        assert!(
+            !crate::refresh::sentinel::is_broker_failed(base, account),
+            "successful login MUST clear the stale broker_failed sentinel"
+        );
+    }
+
+    #[test]
+    fn codex_spawn_failure_bubbles_up() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(6);
+
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+
+        let err = perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || Ok(false),
+            |_| Ok(fake_failure()),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("non-zero"),
+            "spawn failure must name exit status: {err}"
+        );
+        assert!(!base.join("credentials/codex-6.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_is_mode_0400_after_login() {
+        // M4-12: the UUID-keyed `identities/<UUID>/credentials-codex.json` is
+        // written at 0o600 (secure_file). The 0o400 flip on the numeric
+        // `credentials/codex-<N>.json` is retired alongside the numeric write
+        // path (see `save_canonical_for_codex_uuid_path_at_0o600_with_uuid` in
+        // file.rs tests). Test updated to assert 0o600 on the UUID path.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(7);
+
+        // M4-12: provision UUID mapping so save_canonical_for can locate
+        // the UUID-keyed identity write path (fail-closed without mapping).
+        provision_uuid_for_account(base, 7);
+
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+
+        perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || Ok(false),
+            |config_dir| {
+                stub_codex_auth_json(config_dir, "id");
+                Ok(fake_success())
+            },
+        )
+        .unwrap();
+
+        let uuid7 = crate::testing::identity_fixtures::fixture_uuid_for_slot(7);
+        let uuid_path = crate::accounts::identity_store::credentials_codex_path_for(base, uuid7);
+        let mode = std::fs::metadata(&uuid_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "M4-12: UUID-keyed codex canonical must be at 0o600 (numeric 0o400 flip retired)"
+        );
+        assert!(
+            !base.join("credentials/codex-7.json").exists(),
+            "M4-12: numeric credentials/codex-7.json must NOT be written post-M4-12"
+        );
+    }
+
+    #[test]
+    fn probe_failed_proceeds_with_warning() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(8);
+
+        // M4-12: provision UUID mapping so save_canonical_for can locate
+        // the UUID-keyed identity write path (fail-closed without mapping).
+        provision_uuid_for_account(base, 8);
+
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+
+        perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::ProbeFailed,
+            || Ok(false),
+            |config_dir| {
+                stub_codex_auth_json(config_dir, "id");
+                Ok(fake_success())
+            },
+        )
+        .unwrap();
+
+        let out = String::from_utf8_lossy(&writer);
+        assert!(
+            out.contains("warning"),
+            "probe-failed path emits a warning breadcrumb: {out}"
+        );
+        // M4-12: numeric path retired; assert UUID-keyed path instead.
+        let uuid8 = crate::testing::identity_fixtures::fixture_uuid_for_slot(8);
+        let uuid_path8 = crate::accounts::identity_store::credentials_codex_path_for(base, uuid8);
+        assert!(
+            uuid_path8.exists(),
+            "M4-12: UUID codex cred must exist; path: {uuid_path8:?}"
+        );
+        assert!(
+            !base.join("credentials/codex-8.json").exists(),
+            "M4-12: numeric path must NOT be written"
+        );
+    }
+
+    #[test]
+    fn format_label_uses_account_id_prefix_when_available() {
+        assert_eq!(
+            format_label(acc(9), Some("abc123-xyz-rest")),
+            "codex-9/abc123"
+        );
+        assert_eq!(format_label(acc(9), None), "codex-9");
+        assert_eq!(format_label(acc(9), Some("")), "codex-9");
+    }
+
+    /// M8 acceptance: `update_profile` (called by `perform_with`) writes
+    /// `by_slot_identity[N]` when `account_id_hint` is present.
+    ///
+    /// Arrange: tempdir base with a valid UUID mapping (required for
+    /// `save_canonical_for` to succeed in `perform_with`).  Drive
+    /// `perform_with` to completion using a stub auth.json that carries
+    /// `account_id = "abc12345-some-uuid-tail"`.
+    ///
+    /// Assert: after login, `profiles.json::by_slot_identity["12"]`
+    /// equals `"codex-12/abc12345"` — matching `format_label`'s
+    /// first-dash-block prefix logic.
+    #[test]
+    fn codex_finalize_login_writes_by_slot_identity() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(12);
+
+        // Arrange: provision UUID mapping so save_canonical_for can resolve
+        // the UUID-keyed identity write path (fail-closed without mapping).
+        provision_uuid_for_account(base, 12);
+
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+
+        perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || Ok(false),
+            |config_dir| {
+                // account_id = "abc12345-some-uuid-tail"
+                // format_label strips to "abc12345" (first dash-block)
+                stub_codex_auth_json(config_dir, "abc12345-some-uuid-tail");
+                Ok(fake_success())
+            },
+        )
+        .expect("perform_with should succeed");
+
+        // Assert: by_slot_identity["12"] == "codex-12/abc12345"
+        let pf = profiles::load(&profiles::profiles_path(base))
+            .expect("profiles.json must be readable after login");
+        assert_eq!(
+            pf.by_slot_identity.get("12").map(|s| s.as_str()),
+            Some("codex-12/abc12345"),
+            "M8: by_slot_identity[\"12\"] must equal \"codex-12/abc12345\" after codex login \
+             with account_id_hint=\"abc12345-some-uuid-tail\"; got: {:?}",
+            pf.by_slot_identity.get("12")
+        );
+    }
+
+    /// M8 acceptance: `update_profile` writes `by_slot_identity[N]` with
+    /// the fallback `"codex-{N}"` label when no `account_id_hint` is
+    /// available (i.e. `tokens.account_id` is absent or empty in the
+    /// auth.json that codex-cli wrote).
+    ///
+    /// Arrange: auth.json with `account_id = ""` (empty string triggers
+    /// the `_ => format!("codex-{}", account)` arm in `format_label`).
+    ///
+    /// Assert: `by_slot_identity["12"] == "codex-12"`.
+    #[test]
+    fn codex_finalize_login_writes_by_slot_identity_without_id_token() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(12);
+
+        // Arrange: provision UUID mapping (required for save_canonical_for).
+        provision_uuid_for_account(base, 12);
+
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+
+        perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || Ok(false),
+            |config_dir| {
+                // Empty account_id triggers the fallback arm in format_label.
+                stub_codex_auth_json(config_dir, "");
+                Ok(fake_success())
+            },
+        )
+        .expect("perform_with should succeed");
+
+        // Assert: by_slot_identity["12"] == "codex-12"
+        let pf = profiles::load(&profiles::profiles_path(base))
+            .expect("profiles.json must be readable after login");
+        assert_eq!(
+            pf.by_slot_identity.get("12").map(|s| s.as_str()),
+            Some("codex-12"),
+            "M8: by_slot_identity[\"12\"] must equal \"codex-12\" when account_id_hint is absent/empty; \
+             got: {:?}",
+            pf.by_slot_identity.get("12")
+        );
+    }
+
+    #[test]
+    fn prompt_yes_no_defaults_to_decline_on_blank_input() {
+        let mut reader = Cursor::new(b"\n".to_vec());
+        let mut writer = Vec::<u8>::new();
+        let decision = prompt_yes_no(&mut reader, &mut writer, "go?").unwrap();
+        assert_eq!(decision, ResidueDecision::Decline);
+    }
+
+    #[test]
+    fn prompt_yes_no_accepts_y_variants() {
+        for s in ["y\n", "Y\n", "yes\n", "Yes\n", "YES\n"] {
+            let mut reader = Cursor::new(s.as_bytes().to_vec());
+            let mut writer = Vec::<u8>::new();
+            let decision = prompt_yes_no(&mut reader, &mut writer, "go?").unwrap();
+            assert_eq!(decision, ResidueDecision::Purge, "input {s:?} should purge");
+        }
+    }
+
+    #[test]
+    fn malformed_auth_json_error_does_not_echo_tokens() {
+        // Origin: PR-C3b security review H1. serde_json echoes field
+        // values in type-mismatch errors (`invalid type: string
+        // "<value>", expected struct …`). If a codex-cli variant
+        // writes a malformed auth.json whose `tokens` field is a
+        // stringified token instead of a struct, the naive error
+        // chain would surface the raw value to the user's terminal.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(7);
+
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+
+        let err = perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || Ok(false),
+            |config_dir| {
+                // Hand-crafted malformed auth.json whose `tokens`
+                // field is a refresh-token-shaped string rather than
+                // an object. serde will complain, echoing the value.
+                let poisoned = r#"{
+                    "auth_mode": "chatgpt",
+                    "tokens": "rt_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                }"#;
+                std::fs::write(config_dir.join("auth.json"), poisoned).unwrap();
+                Ok(fake_success())
+            },
+        )
+        .unwrap_err();
+
+        let chain = format!("{err:#}");
+        assert!(
+            !chain.contains("rt_AAAA"),
+            "error chain must not echo the raw refresh-token-shaped value: {chain}"
+        );
+    }
+
+    #[test]
+    fn missing_auth_json_bubbles_up_readable_error() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(1);
+
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+
+        let err = perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || Ok(false),
+            // Pretend codex exited 0 but wrote nothing. Simulates the
+            // user cancelling out of the device-code page but the
+            // codex-cli process still terminating normally.
+            |_| Ok(fake_success()),
+        )
+        .unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("auth.json") || msg.contains("device-auth"),
+            "error should hint at the missing auth.json: {msg}"
+        );
+    }
+
+    /// M4-2 Criterion: `finalize_codex_login` (the close of `perform_with`)
+    /// pairs an `identities/<UUID>/settings.json` write when a UUID mapping
+    /// exists in `profiles.json::by_slot` for the slot.
+    ///
+    /// Codex does NOT use `config-<N>/settings.json` (Codex's per-slot
+    /// config lives in `config-<N>/config.toml`), so the source bytes are
+    /// `{}` — an empty JSON object. The pair is a structural invariant for
+    /// handle-dir materialization which expects UUID-first layout uniform
+    /// across surfaces.
+    ///
+    /// Arrange: seed `profiles.json` with a `by_slot["3"] → UUID` mapping so
+    /// the codex login's `resolve_slot_to_uuid` succeeds. Drive `perform_with`
+    /// to completion via the stub codex auth.json.
+    ///
+    /// Assert: after login, `identities/<UUID>/settings.json` exists with the
+    /// `{}` payload.
+    #[test]
+    fn finalize_codex_login_writes_uuid_settings() {
+        use crate::accounts::identity_store::settings_path_for;
+        use crate::accounts::identity_store::IdentityId;
+        use std::str::FromStr;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(3);
+
+        // Arrange: write a profiles.json mapping slot 3 → a deterministic UUID.
+        let uuid = IdentityId::from_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let mut profiles_file = profiles::ProfilesFile::empty();
+        profiles_file.by_slot.insert("3".to_string(), uuid);
+        profiles_file
+            .by_email
+            .insert("codex-pair-test@example.com".to_string(), uuid);
+        profiles::save(&profiles::profiles_path(base), &profiles_file).unwrap();
+
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+
+        let outcome = perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || Ok(false),
+            |config_dir| {
+                stub_codex_auth_json(config_dir, "acct-uuid-7777-zzz");
+                Ok(fake_success())
+            },
+        )
+        .expect("codex login should succeed");
+
+        // Sanity: the standard codex login bookkeeping still ran. The label
+        // is `codex-<slot>/<first-dash-block>` per `format_label`.
+        // M4-12: numeric `credentials/codex-3.json` is retired; assert UUID-keyed path.
+        let uuid_cred = crate::accounts::identity_store::credentials_codex_path_for(base, uuid);
+        assert!(
+            uuid_cred.exists(),
+            "M4-12: identities/<UUID>/credentials-codex.json must exist after login; \
+             path: {uuid_cred:?}"
+        );
+        assert!(
+            !base.join("credentials/codex-3.json").exists(),
+            "M4-12: numeric path must NOT be written"
+        );
+        assert_eq!(outcome.label, "codex-3/acct");
+
+        // M4-2 Assert: identities/<UUID>/settings.json exists with `{}` bytes.
+        let uuid_settings = settings_path_for(base, uuid);
+        assert!(
+            uuid_settings.exists(),
+            "M4-2: identities/<UUID>/settings.json must be written by codex finalize_login \
+             when by_slot mapping is present; path: {uuid_settings:?}"
+        );
+        let written = std::fs::read(&uuid_settings).expect("UUID settings readable");
+        assert_eq!(
+            written.as_slice(),
+            b"{}".as_slice(),
+            "M4-2: Codex pair-write must seed UUID settings.json with empty JSON object; \
+             actual bytes: {written:?}"
+        );
+    }
+
+    /// M4-7 acceptance: `finalize_codex_login` (the marker-write step of
+    /// `perform_with`) emits the slot's identity UUID as the
+    /// `.csq-account` marker content when `profiles.json::by_slot`
+    /// carries a mapping for the slot. Filename `.csq-account` is
+    /// unchanged per OQ #3.
+    #[test]
+    fn finalize_codex_login_writes_uuid_to_csq_account_marker() {
+        use crate::accounts::identity_store::IdentityId;
+        use std::str::FromStr;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(3);
+
+        // Seed profiles.json with a by_slot mapping so resolve_slot_to_uuid
+        // returns Some(uuid) inside the codex login flow.
+        let uuid = IdentityId::from_str("22222222-3333-4444-5555-666666666666").unwrap();
+        let mut profiles_file = profiles::ProfilesFile::empty();
+        profiles_file.by_slot.insert("3".to_string(), uuid);
+        profiles::save(&profiles::profiles_path(base), &profiles_file).unwrap();
+
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+
+        perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || Ok(false),
+            |config_dir| {
+                stub_codex_auth_json(config_dir, "acct-codex-m47-marker");
+                Ok(fake_success())
+            },
+        )
+        .expect("codex login should succeed");
+
+        let config_dir = base.join("config-3");
+        assert_eq!(
+            crate::accounts::markers::read_csq_account_uuid(&config_dir),
+            Some(uuid),
+            "M4-7: Codex finalize_login must write UUID content to .csq-account \
+             when by_slot maps the slot"
+        );
+        // Numeric reader (M1-5 contract) returns None for UUID content.
+        assert_eq!(
+            crate::accounts::markers::read_csq_account(&config_dir),
+            None,
+            "M4-7: numeric reader rejects UUID-content markers"
+        );
+    }
+
+    /// M4-9 (release N affordance, an internal ticket Phase 4):
+    /// `finalize_codex_login` (and the broader `perform_with` flow) MUST
+    /// NOT populate the v1 `profiles.json::accounts[N]` map. The slot's
+    /// Codex identity is now carried by `by_slot` + `by_email` +
+    /// `identities/<UUID>/identity.json`; the old `extra.surface` Codex
+    /// disambiguation tag in the v1 row is retired.
+    #[test]
+    fn finalize_codex_login_does_not_populate_v1_accounts_map() {
+        use crate::accounts::identity_store::IdentityId;
+        use std::str::FromStr;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(4);
+
+        // Seed by_slot so the codex login can resolve UUID for the pair-write.
+        let uuid = IdentityId::from_str("33333333-4444-5555-6666-777777777777").unwrap();
+        let mut profiles_file = profiles::ProfilesFile::empty();
+        profiles_file.by_slot.insert("4".to_string(), uuid);
+        // Accounts intentionally empty before the test runs.
+        profiles::save(&profiles::profiles_path(base), &profiles_file).unwrap();
+
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+
+        perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || Ok(false),
+            |config_dir| {
+                stub_codex_auth_json(config_dir, "acct-codex-m4-9-test");
+                Ok(fake_success())
+            },
+        )
+        .expect("codex login should succeed");
+
+        // Assert: profiles.json must NOT carry a populated v1 `accounts` key.
+        // M4-13: the `accounts` struct field is removed; verify the key is
+        // absent from `extra` (or is an empty object if present) — this
+        // confirms finalize_login does not write v1 accounts entries.
+        let pf = profiles::load(&profiles::profiles_path(base)).unwrap();
+        let accounts_in_extra = pf.extra.get("accounts").and_then(|v| v.as_object());
+        assert!(
+            accounts_in_extra.is_none() || accounts_in_extra.is_some_and(|m| m.is_empty()),
+            "M4-9/M4-13: Codex finalize_login MUST NOT populate v1 accounts map; \
+             got extra[\"accounts\"]: {:?}",
+            pf.extra.get("accounts")
+        );
+    }
+
+    // ── Task 2: mint_for_codex_login wired into perform_with ─────────────────
+
+    #[test]
+    fn perform_with_removed_identity_reports_logout_login_remedy() {
+        let dir = TempDir::new().unwrap();
+        let _env = FreshSlotTestEnv::new(dir.path());
+        let base = dir.path();
+        let account = acc(12);
+        provision_uuid_for_account(base, 12);
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(12);
+        crate::accounts::identity_store::mark_identity_removed(base, uuid);
+        let path = profiles::profiles_path(base);
+        let before = std::fs::read(&path).unwrap();
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::new();
+        let mut vendor_auth = None;
+        let error = perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || panic!("must not purge"),
+            |config_dir| {
+                vendor_auth = Some(config_dir.join("auth.json"));
+                stub_codex_auth_json(config_dir, "removed-bound-fixture");
+                Ok(fake_success())
+            },
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("bound_identity_removed"),
+            "bound identity remedy lost: {message}"
+        );
+        assert!(message.contains("csq logout 12 then csq login 12"));
+        assert!(!message.contains("disk space"));
+        assert!(!base.join("config-12/auth.json").exists());
+        assert!(
+            !vendor_auth.unwrap().exists(),
+            "actual completed vendor grant cleaned"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert!(crate::accounts::identity_store::is_identity_removed(
+            base, uuid
+        ));
+    }
+
+    /// Root-cause regression: `perform_with` on a slot with NO prior UUID mapping
+    /// (codex-only slot, daemon Pass 0 not yet run) must succeed by calling
+    /// `mint_for_codex_login` to provision the UUID before `save_canonical_for`.
+    #[test]
+    fn perform_with_succeeds_without_prior_uuid_mapping() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(12);
+
+        // CRITICAL: do NOT provision a UUID. This is the regression case —
+        // a slot that had no UUID in profiles.json would previously fail with
+        // CredentialError::NoCredentials from save_canonical_for.
+        assert!(
+            profiles::resolve_slot_to_uuid(base, 12).is_none(),
+            "pre-condition: slot 12 must have NO UUID before login"
+        );
+
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+
+        let mut vendor_auth = None;
+        let outcome = perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || Ok(false),
+            |config_dir| {
+                vendor_auth = Some(config_dir.join("auth.json"));
+                stub_codex_auth_json(config_dir, "acct-regression-fix");
+                Ok(fake_success())
+            },
+        )
+        .expect(
+            "perform_with must succeed even without a pre-existing UUID mapping \
+             (root-cause fix: mint_for_codex_login called before save_canonical_for)",
+        );
+
+        // UUID must now exist in profiles.json.
+        let uuid = profiles::resolve_slot_to_uuid(base, 12);
+        assert!(
+            uuid.is_some(),
+            "mint_for_codex_login must have written by_slot[12] after login"
+        );
+
+        // Canonical credentials-codex.json must exist at the UUID-keyed path.
+        let uuid = uuid.unwrap();
+        let uuid_cred = crate::accounts::identity_store::credentials_codex_path_for(base, uuid);
+        assert!(
+            uuid_cred.exists(),
+            "identities/<UUID>/credentials-codex.json must exist after login; path: {uuid_cred:?}"
+        );
+
+        // auth.json must have been cleaned up.
+        let auth_json = vendor_auth.unwrap();
+        assert!(
+            !auth_json.exists(),
+            "auth.json must be removed after successful login"
+        );
+
+        assert_eq!(outcome.label, "codex-12/acct");
+    }
+
+    // ── Task 2: CRIT-2 rollback regression test ───────────────────────────────
+
+    /// CRIT-2 regression: when `mint_for_codex_login` succeeds (writes
+    /// `by_slot[N] = UUID`) but `save_canonical_for` subsequently fails,
+    /// the `by_slot[N]` mapping MUST be removed (rolled back) so the slot
+    /// is not left in a partial-mint state on the next `csq run N`.
+    ///
+    /// `by_email[synthetic_key]` MUST be preserved so a retry reuses the
+    /// same UUID (idempotency guarantee for the repair path).
+    ///
+    /// ## Failure mechanism
+    ///
+    /// We force `save_canonical_for` to fail by pre-creating the target
+    /// `identities/<uuid>/credentials-codex.json` as a **directory**.
+    /// `atomic_replace` (rename) cannot replace a directory with a file,
+    /// so it returns an error. The presence of `identity.json` in the same
+    /// directory means `mint_for_codex_login`'s fast-path returns the
+    /// pre-seeded UUID without re-minting — confirming that the rollback
+    /// code path in `perform_with` (not the mint) is exercised.
+    ///
+    /// This mechanism is cross-platform: on both Unix and Windows the OS
+    /// rejects renaming a regular file over an existing directory.
+    #[test]
+    fn crit2_rollback_removes_by_slot_when_save_canonical_fails() {
+        use crate::accounts::identity_store::{credentials_codex_path_for, identity_json_path_for};
+        use crate::accounts::profiles::{load as load_profiles, profiles_path};
+        use crate::testing::identity_fixtures::fixture_uuid_for_slot;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(20);
+        let slot: u16 = 20;
+
+        // Step 1: seed `by_slot[20] = uuid` AND `by_email[synthetic_key] = uuid`
+        // in profiles.json so `mint_for_codex_login` takes the fast path
+        // (UUID already mapped + identity.json present → returns UUID without
+        // re-minting). We use the same deterministic UUID the helper produces.
+        let uuid = fixture_uuid_for_slot(slot);
+        let synthetic_key = format!("codex:slot-{slot}");
+        let mut profiles_file = profiles::ProfilesFile::empty();
+        profiles_file.by_slot.insert(slot.to_string(), uuid);
+        profiles_file.by_email.insert(synthetic_key.clone(), uuid);
+        profiles::save(&profiles_path(base), &profiles_file).unwrap();
+
+        // Step 2: create `identities/<uuid>/identity.json` so the fast-path
+        // `identity_path.exists()` check succeeds (mint returns the UUID
+        // immediately without writing anything new).
+        let identity_dir = identity_json_path_for(base, uuid)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::fs::create_dir_all(&identity_dir).unwrap();
+        let identity_json_path = identity_json_path_for(base, uuid);
+        std::fs::write(&identity_json_path, b"{}").unwrap();
+
+        // Step 3: create the CREDENTIALS TARGET as a directory so
+        // `atomic_replace` fails when `save_canonical_for` tries to rename
+        // the temp file into place. A directory cannot be replaced by a
+        // regular-file rename on any OS (Unix: EISDIR / ENOTDIR; Windows:
+        // ERROR_ACCESS_DENIED / ERROR_ALREADY_EXISTS).
+        let cred_dir_as_dir = credentials_codex_path_for(base, uuid);
+        std::fs::create_dir_all(&cred_dir_as_dir).unwrap();
+
+        // Step 4: call perform_with. It MUST fail because save_canonical_for
+        // cannot write over the directory.
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+
+        let result = perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || Ok(false),
+            |config_dir| {
+                stub_codex_auth_json(config_dir, "acct-crit2-rollback-test");
+                Ok(fake_success())
+            },
+        );
+
+        // Step 5: assert perform_with returned Err.
+        assert!(
+            result.is_err(),
+            "CRIT-2: perform_with must return Err when save_canonical_for fails"
+        );
+
+        // Step 6: assert by_slot[20] is NOT present (rollback worked).
+        let pf = load_profiles(&profiles_path(base))
+            .expect("profiles.json must be readable after rollback");
+        assert!(
+            !pf.by_slot.contains_key(&slot.to_string()),
+            "CRIT-2: by_slot[{slot}] must be removed by rollback after save_canonical_for \
+             failure; profiles.by_slot = {:?}",
+            pf.by_slot
+        );
+
+        // Step 7: assert by_email[synthetic_key] IS still present (preserved
+        // for retry idempotency — the next login attempt reuses the same UUID).
+        assert!(
+            pf.by_email.contains_key(&synthetic_key),
+            "CRIT-2: by_email[\"{synthetic_key}\"] must be preserved after rollback \
+             (idempotency); profiles.by_email = {:?}",
+            pf.by_email
+        );
+    }
+
+    // ── Task 3: cleanup-on-error ──────────────────────────────────────────────
+
+    /// Cleanup guard: when auth.json parsing fails (malformed file),
+    /// auth.json must be cleaned up (removed) even though the function
+    /// returns an error. This verifies that the RAII guard runs on error exits.
+    #[test]
+    fn auth_json_cleaned_up_on_parse_error() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = acc(9);
+
+        let mut written = None;
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut writer = Vec::<u8>::new();
+
+        let result = perform_with(
+            base,
+            account,
+            &mut reader,
+            &mut writer,
+            || ProbeResult::Absent,
+            || Ok(false),
+            |config_dir| {
+                written = Some(config_dir.join("auth.json"));
+                // Write a syntactically invalid JSON file. credentials::load
+                // will fail, causing perform_with to return Err before
+                // save_canonical_for is reached. This exercises the cleanup
+                // guard on an error exit BEFORE the UUID mint step.
+                std::fs::write(config_dir.join("auth.json"), b"not valid json").unwrap();
+                Ok(fake_success())
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "perform_with must return Err on malformed auth.json"
+        );
+
+        // CRITICAL: auth.json must be cleaned up even though login failed.
+        let auth_json = written.unwrap();
+        assert!(
+            !auth_json.exists(),
+            "auth.json must be removed by the cleanup guard on error exit; \
+             file still exists at {auth_json:?}"
+        );
+    }
+}

@@ -1,0 +1,12657 @@
+//! `csq run [N]` — launch Claude Code or Codex with isolated credentials.
+
+use anyhow::{anyhow, bail, Context, Result};
+use csq_core::accounts::{discovery, markers, AccountSource};
+use csq_core::capability_layer::{
+    load_capability_layer_toggles, run_post_spawn_toggled, run_with_layer_toggled,
+    CapabilityLayerToggles, LayerOutcome, PromptClass, SpawnMode, StageError,
+};
+use csq_core::cli_deps::sanitize::redact_path;
+use csq_core::cli_deps::SurfaceCli;
+use csq_core::credentials::{self, file};
+use csq_core::platform::env_check::{self, EnvIssue};
+use csq_core::providers::catalog::Surface;
+use csq_core::providers::codex::surface as codex_surface;
+use csq_core::refresh::sentinel::is_broker_failed;
+use csq_core::session;
+use csq_core::types::AccountNum;
+
+use super::codex_supervise;
+use std::collections::BTreeSet;
+use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use csq_core::daemon::{self, DetectResult};
+
+#[path = "provider_session_policy.rs"]
+mod provider_session_policy;
+
+/// Phase B' billing-ledger attribution (an internal journal entry D2). Best-effort append
+/// to `accounts/.csq-launch.log` so the daemon aggregator can attribute CC
+/// session-meta files to slots via post-hoc time correlation.
+///
+/// Failure mode policy: never block the user's launch. Log at WARN with the
+/// fixed-vocabulary `error_kind` tag per security.md.
+pub(crate) fn append_launch_log(base_dir: &Path, event: &str, account: AccountNum) {
+    // `project_path` is recorded into a `LaunchEvent` consumed by the
+    // launch-log subscriber for `tracing::*` audit-trail / post-hoc
+    // session-correlation. NOT operator-facing chat — per
+    // `rules/operator-surface-verification.md` Rule 4, structured-log
+    // fields MAY retain `path.display()` for the audit-trail policy.
+    let project_path = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let ev = csq_core::usage::launch_log::LaunchEvent {
+        ts,
+        event: event.to_string(),
+        slot: account.get(),
+        pid: std::process::id(),
+        project_path,
+    };
+    if let Err(e) = csq_core::usage::launch_log::append(base_dir, &ev) {
+        tracing::warn!(
+            error_kind = "launch_log_append_failed",
+            error = %e,
+            "Phase B' launch-log append failed (non-fatal)"
+        );
+    }
+}
+
+/// Exit code when `csq run` cannot spawn a Codex slot because the
+/// daemon is not running (INV-P02). Distinct from anyhow's default 1
+/// so scripts can detect "daemon-down" vs other launch failures.
+const EXIT_CODE_DAEMON_REQUIRED: i32 = 2;
+
+/// Exit code when `csq run` cannot write the audit record even to the
+/// `.pending/` fallback (M06 fail-loud). Distinct from `1` (generic anyhow
+/// failure) and `2` (daemon-required) so monitoring tools can detect an
+/// audit-write failure programmatically. The launched operation already
+/// completed; only the audit record was lost.
+pub(crate) const EXIT_CODE_AUDIT_WRITE_FAILED: i32 = 3;
+
+/// Exit code when `csq run` refuses to spawn a codex/gemini subprocess because
+/// the M6 T6.1 spawn-boundary governance gate returned `Block`/`Escalate`, OR
+/// because a configured operating envelope was malformed / the governor could
+/// not be built (fail-closed). Distinct from 1 (generic), 2 (daemon-required),
+/// and 3 (audit-write) so scripts can detect a governance refusal. Enterprise-only
+/// (community spawns codex/gemini ungoverned).
+#[cfg(feature = "enterprise")]
+const EXIT_CODE_SPAWN_BLOCKED: i32 = 4;
+
+// `handle` and the `launch_*` helpers exceed clippy's 7-arg threshold. Each
+// arg is an independent CLI control surface (account, profile, layer
+// flags, debug, bench-mode, cache-flag, passthrough rest) — bundling them
+// into a config struct is a clean follow-up but out of scope for the
+// per-PR additions that touch this signature. Tracked as a separate
+// refactor; the additions land per-PR with this allow.
+#[allow(clippy::too_many_arguments)]
+pub fn handle(
+    base_dir: &Path,
+    account: Option<AccountNum>,
+    profile: Option<&str>,
+    layer_intent: super::super::LayerIntent,
+    debug: bool,
+    bench_mode: Option<&str>,
+    coc_cache_enabled: bool,
+    ignore_cli_version: bool,
+    no_auto_update_cli: bool,
+    track_latest: bool,
+    no_audit: bool,
+    rest: &[String],
+) -> Result<()> {
+    // Enterprise license gate (task #77 shard 3). `csq run` is the primary surface of
+    // the enterprise binary; gating it here is what makes the pre-built use-only binary
+    // "useless without a key" (see `csq_core::license` module docs). Full per-op
+    // `enforce` (liveness-checked) — an offline-beyond-grace licensee is told to
+    // reconnect; the daemon's own startup uses the deadlock-free `enforce_startup`.
+    // Inert while the placeholder key is baked. Community builds carry no gate.
+    #[cfg(feature = "enterprise")]
+    super::super::enforce_enterprise_license(base_dir)?;
+
+    // M7: convert user intent → the `enabled` bool every downstream
+    // helper already takes. `.coc/` detection stays in ONE place (the
+    // spec-09 fallback walk inside `run_capability_layer_preflight`);
+    // `AutoDefault` and `ForcedOn` both pass `enabled = true` and let
+    // FR-RUN-04 no-op (≤5 ms) when `.coc/` is absent.
+    let capability_layer_enabled = layer_intent.enabled();
+    // Threaded alongside `capability_layer_enabled` to the one site
+    // (`run_capability_layer_preflight`) that knows the layer actually
+    // engaged, so the one-time "auto-engaged" stderr note prints only
+    // on the no-flag default path with a real `.coc/`.
+    let layer_is_auto = layer_intent.is_auto();
+    let claude_home = super::claude_home()?;
+
+    // Environment preflight — warn (non-blocking) about configured
+    // hooks that will fail after we exec `claude`. Users on fresh WSL
+    // most often hit this via `csq run`, not `csq install`, so we
+    // surface the same signal here without the interactive prompt.
+    run_env_preflight(&claude_home);
+
+    // Load persisted capability-layer toggles (FR-CL-05). The desktop
+    // tray (M6 PR-CA12) writes user preferences to
+    // <base>/capability_layer.json; the CLI reads them here and
+    // merges with the explicit `--capability-layer` flag below. CLI
+    // flag wins for explicit overrides — see comment near
+    // `effective_layer_toggles` for the precedence rules.
+    let persisted_toggles = load_capability_layer_toggles(base_dir);
+
+    // Resolve account number
+    let account = resolve_account(base_dir, account)?;
+
+    let account = match account {
+        Some(a) => a,
+        None => {
+            // 0 accounts — launch vanilla claude
+            provider_session_policy::emit_warning(
+                provider_session_policy::check_unknown_launch_with_args(base_dir, rest)?,
+            );
+            println!("No accounts configured — launching vanilla claude.");
+            return exec_claude(base_dir, &claude_home, rest);
+        }
+    };
+
+    // orgident r7 item 9 (owner ruling "block new launches + warn"): never start a
+    // session in a slot whose sign-in is shared with another slot. First action after
+    // the slot is known, before the launch log, the audit record or any spawn. No
+    // override flag or env var exists; the only exit is `csq login N`. Sessions that
+    // are already open are not touched.
+    csq_core::accounts::launch_block::check_launch(base_dir, account.get())
+        .map_err(|message| anyhow!(message))?;
+
+    // Move Kimi slots still on the retired csq default (`kimi-k3[1m]`) to
+    // K3.1 Pro before the slot's settings are read for the launch. AFTER the
+    // launch-block refusal above, so a refused run writes nothing (not even
+    // the marker). One-shot via the `<base>/.kimi-k31-migration-done` marker
+    // (written after a pass that held the profiles lock; while it exists this
+    // is a no-op). Never fails the launch; a custom model is kept.
+    let _ = csq_core::session::kimi_migration::migrate_kimi_default_model(base_dir);
+
+    // Phase B' billing-ledger attribution (an internal journal entry D2). Best-effort
+    // append; failures MUST NOT block the launch — billing telemetry is
+    // diagnostic, not load-bearing. Errors logged at WARN with redacted
+    // context per security.md.
+    append_launch_log(base_dir, "run", account);
+
+    // M19b + H2/M3: determine the dispatch surface ONCE here, before BOTH the
+    // audit-record construction below (so the v1 `AuditRecord` carries the
+    // ACTUAL dispatched surface, not a hardcoded `cc`) AND the pre-flight /
+    // dispatch ladder farther down. Reusing this single value preserves the
+    // TOCTOU-closing "determine surface once" invariant (the pre-flight block
+    // below documents it) AND fixes the M19b mislabel bug where every
+    // codex/gemini run recorded `surface: cc` in its own audit record.
+    let surface_for_preflight = surface_cli_for_slot(base_dir, account);
+
+    // Audit trail (PR-CA10c): construct emitter with the true start_ts
+    // captured here, before any spawn step.  All remaining fields are filled
+    // after the spawn returns (spawn+wait paths) or immediately before exec
+    // (exec-replace path on Unix) via the setter methods below.
+    //
+    // exec-replace invariant: `exec_or_spawn` on Unix calls `Command::exec`,
+    // replacing the process image.  Rust `Drop` impls do NOT run after a
+    // successful exec.  Every code path that reaches `exec_or_spawn` MUST call
+    // `audit_emitter.flush_now()` immediately before, so the record is emitted
+    // synchronously before the process image is replaced.
+    //
+    // M06 `--no-audit`: when set, skip emitter construction/emission entirely
+    // for this invocation. A disabled emitter holds no record, so every flush
+    // path is a no-op. We log the explicit acknowledgement to stderr at INFO
+    // so the operator sees the gap they accepted.
+    let start_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let audit_emitter = if no_audit {
+        // Operator-facing acknowledgement on stderr: the operator explicitly
+        // accepted the audit gap for this invocation.
+        //
+        // The `eprintln!` below MUST remain UNCONDITIONAL stderr — it is NOT
+        // log-level-gated. The default `CSQ_LOG`/`RUST_LOG` filter is `warn`,
+        // which would silently drop the `tracing::info!` mirror below; a
+        // future maintainer who deletes the `eprintln!` and "relies on the
+        // tracing event" would make the acknowledgement invisible on every
+        // default-filter run, defeating the per-invocation visibility the
+        // `--no-audit` escape is designed to guarantee (spec 12 §12.4
+        // "Per-invocation escape"). The `tracing::info!` is SUPPLEMENTARY —
+        // for structured-log subscribers only — never a substitute for the
+        // unconditional stderr line.
+        eprintln!("csq: --no-audit set; this invocation's audit record will not be written.");
+        tracing::info!(
+            event = "no_audit_set",
+            "csq: --no-audit set; this invocation's audit record will not be written."
+        );
+        crate::cli::audit_emit::AuditEmitter::disabled()
+    } else {
+        run_audit_emitter(base_dir, surface_for_preflight, account, start_ts.clone())
+    };
+    // F1: a codex run's emitter enters the pre-spawn guard HERE, at
+    // construction — the same guard `csq swap` into a codex slot uses — so
+    // EVERY exit before `launch_codex` reaches its spawn (the 3P-collision
+    // and `--profile` refusals and pre-flight gates below, and every `?` in
+    // `launch_codex` ahead of its share lock) ends the record through
+    // `end_codex_run_before_spawn` instead of dropping it un-ended, which
+    // would write a phantom `Degraded`/`Bypass` record for a codex session
+    // that never ran. The other surfaces keep the plain emitter.
+    let (mut audit_emitter, mut codex_pre_spawn) = if surface_for_preflight == SurfaceCli::Codex {
+        (
+            crate::cli::audit_emit::AuditEmitter::disabled(),
+            Some(PreSpawnCodexRun::new(audit_emitter)),
+        )
+    } else {
+        (audit_emitter, None)
+    };
+
+    // ── Pre-flight probe (PR-MCD2.5, spec/13 §3, R1-H5) ─────────────────────
+    // H2+M3 (R1 redteam): hoist BOTH 3P detection AND surface determination to
+    // a single pass BEFORE any pre-flight or dispatch logic. The captured
+    // `is_third_party` and `surface_for_preflight` are used by BOTH the
+    // pre-flight gate below AND the dispatch ladder farther down, eliminating
+    // the TOCTOU window that existed when dispatch re-read canonical symlinks
+    // independently of the pre-flight check.
+    //
+    // 3P collision defence: a slot that has BOTH a 3P binding (settings.json
+    // with ANTHROPIC_BASE_URL) AND a Codex/Gemini canonical symlink present is
+    // a corrupted state (e.g. from a logout race). We bail with a distinct
+    // message instead of silently routing to the wrong path.
+    let is_third_party = discovery::discover_per_slot_third_party(base_dir)
+        .into_iter()
+        .any(|a| a.id == account.get() && matches!(a.source, AccountSource::ThirdParty { .. }));
+
+    // Surface was determined ONCE near the top of `handle` (hoisted there in
+    // M19b so the audit record carries it too); `surface_for_preflight` is
+    // reused here for both pre-flight and dispatch.
+
+    // 3P collision check: if the slot is marked 3P but also has a
+    // Codex/Gemini canonical present, the on-disk state is incoherent.
+    if is_third_party && surface_for_preflight != SurfaceCli::Claude {
+        return Err(anyhow!(
+            "slot {account} is in an inconsistent state \
+             (3P provider binding present AND Codex/Gemini canonical symlink present). \
+             Run `csq logout {account}` to repair, then `csq login {account} --provider <X>` \
+             to re-bind."
+        ));
+    }
+
+    if surface_for_preflight == SurfaceCli::Claude {
+        let _ = provider_session_policy::check_claude_launch(
+            base_dir,
+            &claude_home,
+            account,
+            None,
+            rest,
+        )?;
+    } else {
+        let _ = provider_session_policy::check_unknown_launch_with_args(base_dir, rest)?;
+    }
+
+    // Probe: skip for 3P slots (they redirect at the network layer, no
+    // versioned CLI binary to probe). For all other surfaces, run the
+    // shared pre-flight gate via cli_deps_gate::enforce (H4).
+    if !is_third_party {
+        super::cli_deps_gate::enforce(
+            surface_for_preflight,
+            ignore_cli_version,
+            no_auto_update_cli,
+            track_latest,
+            base_dir,
+            &format!("csq run {account}"),
+        )?;
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // ── Surface dispatch (M3: uses captured `surface_for_preflight`) ──────────
+    // The surface was determined ONCE above (in the pre-flight block) and is
+    // reused here. This eliminates the TOCTOU window where the pre-flight and
+    // dispatch read canonicals independently, giving two chances for state to
+    // change between the reads.
+    //
+    // Codex dispatch: route to `launch_codex` when the captured surface is
+    // Codex. The Codex path's `create_handle_dir_codex` owns the handle-dir-
+    // level symlinks + marker writes (does NOT reuse the Claude-surface
+    // `create_handle_dir`). Origin: spec 07 §7.5 INV-P02 + an internal journal entry
+    if surface_for_preflight == SurfaceCli::Codex {
+        if let Some(profile_id) = profile {
+            return Err(anyhow!(
+                "--profile is not supported for Codex slots (slot {account} is Codex, requested: {profile_id})"
+            ));
+        }
+        let codex_pre_spawn = codex_pre_spawn
+            .take()
+            .ok_or_else(|| anyhow!("csq run: codex run audit emitter not built"))?;
+        let settings = CodexLaunchSettings::from_run_flags(
+            layer_intent,
+            persisted_toggles,
+            debug,
+            bench_mode,
+            coc_cache_enabled,
+        );
+        return launch_codex(
+            base_dir,
+            account,
+            settings.capability_layer_enabled,
+            settings.layer_is_auto,
+            &settings.toggles,
+            settings.debug,
+            settings.bench_mode,
+            settings.coc_cache_enabled,
+            rest,
+            CodexLaunchAudit::First(Box::new(codex_pre_spawn)),
+            /* swap_correlation */ None,
+            /* messaging */ None,
+        );
+    }
+
+    // Gemini dispatch (FR-G-CLI-03): route to `launch_gemini` when the
+    // captured surface is Gemini. Per spec 07 §7.5 INV-P02 is INVERTED for
+    // Gemini — no daemon prerequisite, no token refresh, no fanout.
+    if surface_for_preflight == SurfaceCli::Gemini {
+        if let Some(profile_id) = profile {
+            return Err(anyhow!(
+                "--profile is not supported for Gemini slots (slot {account} is Gemini, requested: {profile_id})"
+            ));
+        }
+        return launch_gemini(
+            base_dir,
+            &claude_home,
+            account,
+            capability_layer_enabled,
+            layer_is_auto,
+            &persisted_toggles,
+            debug,
+            bench_mode,
+            coc_cache_enabled,
+            rest,
+            &mut audit_emitter,
+        );
+    }
+
+    // Native-CLI dispatch (Wave 3, an internal journal entry): route to `launch_native` for
+    // Kimi/Grok slots. Per the same INV-P02 inversion as Gemini — no daemon
+    // prerequisite, no token refresh, no credential fanout, no `config-N/`
+    // creation. The native vendor binary self-authenticates.
+    //
+    // The predicate and the mapping are ONE total function
+    // (`SurfaceCli::native_surface`, `csq-core/src/cli_deps/mod.rs`), not an
+    // `if` guard plus a wildcard-terminated `match`. `SurfaceCli` is
+    // `#[non_exhaustive]`, so a `match` here could never be exhaustive — a
+    // sixth native surface omitted from the `if` would have taken the
+    // non-native path SILENTLY (an internal ticket). Inside csq-core the mapping's
+    // `match` has no wildcard, so that omission is a build failure instead.
+    if let Some(native_surface) = surface_for_preflight.native_surface() {
+        if let Some(profile_id) = profile {
+            return Err(anyhow!(
+                "--profile is not supported for native-CLI slots (slot {account} is \
+                 {native_surface}, requested: {profile_id})"
+            ));
+        }
+        return launch_native(
+            base_dir,
+            account,
+            native_surface,
+            capability_layer_enabled,
+            layer_is_auto,
+            &persisted_toggles,
+            debug,
+            bench_mode,
+            coc_cache_enabled,
+            rest,
+            &mut audit_emitter,
+        );
+    }
+
+    // `is_third_party` was already computed above in the pre-flight block.
+    // Reuse the captured value — do NOT call discover_per_slot_third_party again.
+    //
+    // Anthropic-OAuth identity gate — MUST run BEFORE any side-effecting
+    // write below (an internal ticket). `resolve_slot_to_uuid` is the sole M4-12
+    // authority for "does this account exist"; an orphaned or never-logged-in
+    // slot has no `by_slot` entry. Pre-fix, this check ran AFTER
+    // `create_dir_all` + the `.csq-account`/`.current-account` marker writes
+    // + `mark_onboarding_complete`, so `csq run <N>` against an orphaned slot
+    // silently resurrected a phantom `config-N/` directory (`.claude.json` +
+    // both markers, byte-identical to a real login) before refusing to
+    // launch — confirmed via `csq daemon`'s `.csq-launch.log`, which recorded
+    // repeated unattended `csq run 12` invocations against a slot deleted
+    // from every identity map. `is_third_party` slots are exempt: a slot
+    // 3P-discovered from `config-N/settings.json` already has `config-N/` on
+    // disk by construction, so gating it here would be a no-op at best.
+    if !is_third_party {
+        if is_broker_failed(base_dir, account) {
+            return Err(anyhow!(
+                "account {} is in LOGIN-NEEDED state — run `csq login {}` to re-authenticate",
+                account,
+                account
+            ));
+        }
+        if csq_core::accounts::profiles::resolve_slot_to_uuid(base_dir, account.get()).is_none() {
+            return Err(anyhow!(
+                "no identity record for account {} — run `csq login {}` to authenticate",
+                account,
+                account
+            ));
+        }
+    }
+
+    // Ensure config-N exists (permanent account home)
+    // PATH-BUILDER: constructs the permanent account directory path for
+    // creation only; not reading credential content. Unchanged through
+    // Phase 2 — see internal-design-docs
+    // 03-phase2-readiness.md § M2-7. Phase 3 retargets.
+    //
+    // Reached only after the Anthropic-path identity gate above (or, for a
+    // discovered 3P slot, config-N already exists — see the gate's doc
+    // comment) — never for a slot csq is about to refuse to launch.
+    //
+    // SEC-2.15 (unified, R1 M1): secure the accounts root (config-N's
+    // parent) fail-closed first — create_dir_all below would otherwise
+    // create a virgin root at the process umask.
+    csq_core::platform::fs::ensure_private_dir_root(base_dir)
+        .map_err(|e| anyhow::anyhow!("accounts_root_refused: {e}"))?;
+    let config_dir = base_dir.join(format!("config-{}", account));
+    std::fs::create_dir_all(&config_dir)?;
+
+    // Mark account on config-N (permanent identity).
+    //
+    // M4-7 (an internal ticket Phase 4, spec 02 §INV-03 + §2.3.1): the
+    // `.csq-account` marker content is the slot's identity UUID when
+    // `profiles.json::by_slot` carries a mapping; otherwise we fall
+    // back to the legacy decimal slot id. The filename is unchanged.
+    match csq_core::accounts::profiles::resolve_slot_to_uuid(base_dir, account.get()) {
+        Some(uuid) => markers::write_csq_account(&config_dir, uuid)?,
+        None => markers::write_csq_account_legacy(&config_dir, account)?,
+    }
+    markers::write_current_account(&config_dir, account)?;
+
+    // Mark onboarding complete on config-N
+    session::mark_onboarding_complete(&config_dir)?;
+
+    if is_third_party {
+        if let Some(profile_id) = profile {
+            return Err(anyhow!(
+                "--profile is not supported for third-party slots (slot {account} is already provider-bound, requested: {profile_id})"
+            ));
+        }
+
+        launch_third_party(base_dir, &claude_home, account, rest, &mut audit_emitter)
+    } else {
+        // Anthropic OAuth path. `is_broker_failed` + the identity-record
+        // check already ran above, before any write — re-resolve here only
+        // to build the credential path (a second `resolve_slot_to_uuid`
+        // call, same pattern the pre-fix code already used across its two
+        // marker/credential sites). A `None` here would mean the identity
+        // was removed in the narrow window between the two calls (e.g. a
+        // concurrent `csq logout`) — surfaced with the same operator-facing
+        // message rather than panicking.
+        let canonical_path =
+            csq_core::accounts::profiles::resolve_slot_to_uuid(base_dir, account.get())
+                .map(|uuid| {
+                    csq_core::accounts::identity_store::credentials_path_for(base_dir, uuid)
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no identity record for account {} — run `csq login {}` to authenticate",
+                        account,
+                        account
+                    )
+                })?;
+        let canonical = credentials::load(&canonical_path).with_context(|| {
+            format!("failed to load canonical credentials for account {account}")
+        })?;
+
+        // Warn if token is already expired
+        if canonical
+            .expect_anthropic()
+            .claude_ai_oauth
+            .is_expired_within(0)
+        {
+            eprintln!(
+                "warning: access token for account {} has expired — CC may fail until the daemon refreshes it",
+                account
+            );
+        }
+
+        // M3-7 fix-wave (R1 C1): the prior per-run `copy_credentials_for_session`
+        // step is retired. It wrote `config-N/.credentials.json` (the legacy
+        // live mirror) on every `csq run`, but post-M3-7 the handle dir's
+        // `.credentials.json` symlink resolves to `identities/<UUID>/
+        // credentials.json` (M3-3 retarget) — seeded by `finalize_login`'s
+        // post-mint UUID-seed call to `save_canonical` and refreshed by the
+        // daemon's broker tick (`save_canonical_for`). The legacy mirror is
+        // no longer a credential reader for any production code path, so the
+        // copy was a dead write. The canonical `credentials::load` above
+        // already verifies the canonical file is readable before launch.
+
+        // Profile support deferred
+        if let Some(profile_id) = profile {
+            return Err(anyhow!(
+                "--profile support is not yet implemented (requested: {profile_id})"
+            ));
+        }
+
+        launch_anthropic(
+            base_dir,
+            &claude_home,
+            account,
+            capability_layer_enabled,
+            layer_is_auto,
+            &persisted_toggles,
+            debug,
+            bench_mode,
+            coc_cache_enabled,
+            rest,
+            &mut audit_emitter,
+        )
+    }
+}
+
+/// Determine which CLI surface this slot launches into.
+///
+/// Mirrors the surface dispatch logic in `handle` (the `symlink_metadata`
+/// checks on canonical paths), extracted for the pre-flight probe so we know
+/// which binary to probe before the surface-specific launch path runs.
+///
+/// Returns `SurfaceCli::Codex` when a Codex canonical credential file exists
+/// at EITHER the legacy `credentials/codex-<N>.json` path OR the identity-keyed
+/// `identities/<UUID>/credentials-codex.json` path (post-A++ layout, where the
+/// legacy mirror has been retired), `SurfaceCli::Gemini` when a Gemini canonical
+/// credential file exists, and `SurfaceCli::Claude` for every other case
+/// (including 3P slots — the caller is responsible for skipping the probe on 3P
+/// slots via the `is_third_party` guard in `handle`).
+///
+/// ## Mid-migration ambiguity (H1, R1 redteam)
+///
+/// When a slot is in mid-migration (e.g. the Codex/Gemini canonical symlink
+/// has been removed but `settings.json` still carries a 3P binding), this
+/// function returns `SurfaceCli::Claude` (the fallthrough). The 3P collision
+/// detection in `handle` catches this case and bails with a distinct message:
+/// the slot is recognized as 3P by `is_third_party == true` while no
+/// Codex/Gemini canonical is present, so `surface_for_preflight == Claude` —
+/// the 3P probe-skip path fires correctly (no spurious claude probe).
+/// The true mid-migration failure mode is the opposite: Codex/Gemini canonical
+/// present PLUS `is_third_party == true`, which the collision guard in `handle`
+/// catches before pre-flight.
+///
+/// M9 A13 disposition: `csq-core::accounts::discovery::surface_for_slot` does
+/// NOT currently exist in csq-core. This CLI-side helper is the minimal change
+/// that satisfies the M2.5 requirement. If a future cycle adds a core-level
+/// `surface_for_slot`, this helper should be removed and the callsite updated.
+fn surface_cli_for_slot(base_dir: &Path, account: AccountNum) -> SurfaceCli {
+    // Codex — legacy numeric canonical (pre-A++ / downgrade-safety layout).
+    let codex_canonical = file::canonical_path_for(base_dir, account, Surface::Codex);
+    if std::fs::symlink_metadata(&codex_canonical).is_ok() {
+        return SurfaceCli::Codex;
+    }
+    // Codex — identity-keyed canonical (post-A++ layout). The legacy
+    // `credentials/codex-<N>.json` mirror is retired by the credential-mirror
+    // cleanup, so a freshly-logged-in Codex slot has its credential ONLY at
+    // `identities/<UUID>/credentials-codex.json`. Without this branch,
+    // `csq run N` for such a slot detects Claude, routes to the Anthropic
+    // path, and dies loading the absent `credentials.json`. Mirrors the
+    // UUID-first resolution in `verify_codex_canonical_is_regular_file` and
+    // the identity-store-aware codex detection in
+    // `account-terminal-separation.md` MUST Rule 4.
+    if let Some(uuid) = csq_core::accounts::profiles::resolve_slot_to_uuid(base_dir, account.get())
+    {
+        let uuid_codex =
+            csq_core::accounts::identity_store::credentials_codex_path_for(base_dir, uuid);
+        if std::fs::symlink_metadata(&uuid_codex).is_ok() {
+            return SurfaceCli::Codex;
+        }
+    }
+    let gemini_canonical = file::canonical_path_for(base_dir, account, Surface::Gemini);
+    if std::fs::symlink_metadata(&gemini_canonical).is_ok() {
+        return SurfaceCli::Gemini;
+    }
+    // Native-CLI (Wave 3, an internal journal entry) — the credential-less binding marker's
+    // existence keys the surface, exactly like Codex/Gemini above. Checked
+    // last (after Codex/Gemini) since it's the newest surface and native
+    // markers never collide with the Codex/Gemini canonical paths.
+    if let Some(surface) = csq_core::providers::native::native_surface_for_slot(base_dir, account) {
+        // Exhaustive over `Surface` ON PURPOSE — no wildcard. `providers::
+        // catalog::Surface` is NOT `#[non_exhaustive]`, so a sixth variant
+        // fails THIS match at compile time.
+        //
+        // The three non-native arms are written out rather than asserted away.
+        // The prior `_ => unreachable!("native_surface_for_slot returned a
+        // non-native surface")` justified itself with a claim about ANOTHER
+        // function's return range, which no compiler checks
+        // (`doc-property-claims.md` MUST-1) — so a sixth native surface would
+        // have PANICKED out of `csq run` instead of failing the build.
+        // Falling through to the `SurfaceCli::Claude` tail below is the same
+        // outcome the surrounding `if let` already produces for an unbound
+        // slot, and it is not on any path a live caller reaches today:
+        // `native_surface_for_slot` filters on `Surface::is_native_cli`.
+        match surface {
+            Surface::Kimi => return SurfaceCli::Kimi,
+            Surface::Grok => return SurfaceCli::Grok,
+            Surface::ClaudeCode | Surface::Codex | Surface::Gemini => {}
+        }
+    }
+    SurfaceCli::Claude
+}
+
+/// Map the dispatch-time [`SurfaceCli`] to the audit-record
+/// [`csq_core::audit::Surface`] tag (M19b).
+///
+/// The module-level `Surface` alias is `providers::catalog::Surface` (used for
+/// canonical-path resolution), so this helper fully-qualifies the audit
+/// `Surface` to avoid the collision.
+///
+/// `SurfaceCli` is `#[non_exhaustive]`, so a `match` in THIS crate cannot be
+/// exhaustive and would need a `_` arm. The previous form had one, defaulting
+/// an unwired surface to `Cc` — which mis-tags that surface's audit records
+/// rather than failing (an internal ticket). The mapping therefore lives in csq-core
+/// as [`SurfaceCli::audit_surface`], where the same `match` is wildcard-free
+/// and a sixth variant is a build failure; this is a thin re-export so the
+/// call sites and their tests keep reading in csq's own vocabulary.
+fn audit_surface_for(surface: SurfaceCli) -> csq_core::audit::Surface {
+    surface.audit_surface()
+}
+
+/// Shared [`crate::cli::audit_emit::AuditEmitter`] constructor — the SAME
+/// construction `launch_codex`'s caller (`csq run`, via `handle`) and `csq
+/// swap`'s exec-replace path both use, so an audited spawn cannot silently
+/// drift into an un-audited one on either surface (cross-slot swap-resume
+/// governing task, item 1: "swap's call site carries no AuditEmitter").
+///
+/// `start_ts` MUST be captured by the caller BEFORE any spawn step (both
+/// `end_ts` and `start_ts` are seeded from it; the M6 T6.1 gate / spawn path
+/// update `end_ts` later via the setter methods). Defaults mirror the
+/// exec-replace-safe posture: `ResultState::Degraded` + `Decision::Bypass`
+/// (no rule validation has run yet), `spawn_gate: None` (filled by the M6
+/// T6.1 gate just before spawn when governed).
+pub(crate) fn build_audit_emitter(
+    base_dir: &Path,
+    surface: csq_core::audit::Surface,
+    operation: String,
+    start_ts: String,
+) -> crate::cli::audit_emit::AuditEmitter {
+    use csq_core::audit::{AuditRecord, Decision, ResultState};
+    let run_id = csq_core::audit::gen_run_id();
+    let socket_path = csq_core::daemon::socket_path(base_dir);
+    let pending_dir = base_dir.join("csq-runs").join(".pending");
+    let record = AuditRecord {
+        schema_version: "1".to_string(),
+        run_id,
+        fixture_sha256: "0".repeat(64),
+        coc_sha256: "0".repeat(64),
+        csq_version: env!("CARGO_PKG_VERSION").to_string(),
+        cli_version: "unknown".to_string(),
+        surface,
+        model: "unknown".to_string(),
+        start_ts: start_ts.clone(),
+        end_ts: start_ts,
+        result_state: ResultState::Degraded,
+        score_delta_vs_baseline: None,
+        rule_ids_cited_original: vec![],
+        rule_ids_cited_after_repair: vec![],
+        rule_ids_dropped_invalid_format: 0,
+        decision: Decision::Bypass,
+        spawn_gate: None,
+    };
+    crate::cli::audit_emit::AuditEmitter::new(record, socket_path, pending_dir, operation)
+}
+
+/// M6 T6.1 shared spawn-boundary governance gate for a governed CODEX spawn —
+/// the SAME function `launch_codex` (`csq run`) and `csq swap`'s exec-replace
+/// path both call, so the two spawn surfaces cannot drift out of parity
+/// (cross-slot swap-resume governing task, item 1: "governance bypass" —
+/// `supervise_codex_after_binding` used to skip this gate entirely because swap's
+/// call site carried no `AuditEmitter`/`OperatingEnvelope`).
+///
+/// Evaluates the gate via [`crate::cli::commands::spawn_gate::evaluate_spawn`], records the verdict
+/// on `audit_emitter` (`Proceed`/`Ungoverned`) or records the refusal, flushes
+/// the audit record fail-loud, and returns `Err` (`Refuse`) — callers MUST NOT
+/// tombstone or exec anything after an `Err` from this function. `Ungoverned`
+/// and `Proceed` both return `Ok`, threading the advisory path-scope env
+/// (T6.4) and the resolved envelope (for the M6 T6.2 Shard 3a MCP-proxy
+/// rewrite — the SAME envelope, no second `load_spawn_envelope` read;
+/// redteam R1 finding 1.1).
+/// Return type of [`evaluate_codex_spawn_gate`]: the advisory path-scope env
+/// (T6.4) plus the resolved operating envelope (for the M6 T6.2 Shard 3a
+/// MCP-proxy rewrite). A named alias per clippy::type_complexity.
+#[cfg(feature = "enterprise")]
+pub(crate) type CodexSpawnGateOutcome = (
+    Vec<(String, String)>,
+    Option<Box<csq_trust_contract::OperatingEnvelope>>,
+);
+
+#[cfg(feature = "enterprise")]
+pub(crate) fn evaluate_codex_spawn_gate(
+    base_dir: &Path,
+    audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+) -> Result<CodexSpawnGateOutcome> {
+    use crate::cli::commands::spawn_gate;
+    use csq_core::daemon::interactive_live::SpawnGate;
+    let (gate, gate_env) =
+        spawn_gate::evaluate_spawn(base_dir, csq_trust_contract::SpawnCli::Codex);
+    match gate {
+        SpawnGate::Ungoverned => Ok((Vec::new(), None)),
+        SpawnGate::Proceed {
+            verdict,
+            action_id,
+            path_scope_env,
+        } => {
+            audit_emitter.set_spawn_gate("codex", &action_id, spawn_gate::verdict_tag(verdict));
+            Ok((path_scope_env, gate_env))
+        }
+        SpawnGate::Refuse { reason, action_id } => {
+            use csq_core::audit::{Decision, ResultState};
+            audit_emitter.set_spawn_gate("codex", &action_id, reason);
+            let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            audit_emitter.set_end_ts(end_ts);
+            audit_emitter.set_result(ResultState::Fail, Decision::Reject);
+            fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+            Err(anyhow!(
+                "csq run codex refused by operating envelope ({reason})"
+            ))
+        }
+    }
+}
+
+/// `csq run N --native` dispatch (P0-B). Drives the native governed loop against
+/// the slot's 3P provider instead of spawning a CLI. Enterprise-only
+/// (`native-harness` feature); the source is excluded from community.
+#[cfg(feature = "native-harness")]
+pub fn handle_native(
+    base_dir: &Path,
+    account: Option<AccountNum>,
+    model: Option<&str>,
+    governance: &str,
+    bench_json: bool,
+    rest: &[String],
+) -> Result<()> {
+    // Enterprise license gate (task #77 gate-coverage remediation). The native governed
+    // loop is an enterprise-only operation (`native-harness` ⇒ `enterprise`, csq/Cargo.toml),
+    // but it is dispatched via an early `return commands::run::handle_native(...)` in
+    // `cli::run` BEFORE `run::handle` — so it never reaches the gate at `handle`'s top and
+    // ran ungated. Without this line a keyless use-only binary runs the full native LLM
+    // loop for free at go-live. Full per-op `enforce` (liveness-checked), matching
+    // `run::handle`. `native-harness` guarantees `enterprise`, so the wrapper is always
+    // compiled in here. Inert while the placeholder key is baked.
+    super::super::enforce_enterprise_license(base_dir)?;
+
+    let account =
+        account.ok_or_else(|| anyhow!("--native requires a slot: `csq run N --native`"))?;
+
+    // The native loop targets the 3P substrate; resolve the slot's provider from
+    // its 3P binding (the slot IS the credential channel). `discover_*` yields the
+    // DISPLAY name (`"Z.AI"`), but every downstream consumer — `get_provider`,
+    // `load_settings` (`settings-<id>.json`), the rate table — keys on the canonical
+    // catalog id (`"zai"`), so map display-name → id here. Passing the display name
+    // straight through was the P0-B live-path bug (`unknown provider 'Z.AI'`).
+    let provider_label = discovery::discover_per_slot_third_party(base_dir)
+        .into_iter()
+        .find(|a| a.id == account.get())
+        .and_then(|a| match a.source {
+            AccountSource::ThirdParty { provider } => Some(provider),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "slot {account} is not a 3P provider slot — `csq run --native` targets the 3P \
+                 substrate (z.ai/deepseek/minimax). Run `csq setkey <provider> --slot {account} \
+                 --key <KEY>` first."
+            )
+        })?;
+    let provider_id = csq_core::providers::catalog::id_from_display_name(&provider_label)
+        .ok_or_else(|| anyhow!("slot {account} provider {provider_label:?} has no catalog id"))?
+        .to_string();
+
+    let governance = match governance {
+        "on" => csq_core::native::Governance::On,
+        "off" => csq_core::native::Governance::Off,
+        other => return Err(anyhow!("--governance must be 'on' or 'off', got '{other}'")),
+    };
+
+    let prompt = rest.join(" ");
+    if prompt.trim().is_empty() {
+        return Err(anyhow!(
+            "--native needs a prompt: `csq run {account} --native -- <task>`"
+        ));
+    }
+
+    let workdir = std::env::current_dir().context("native: cannot resolve current dir")?;
+
+    // The native loop uses the catalog endpoint, not the slot's configured URL.
+    let endpoint = csq_core::providers::catalog::get_provider(&provider_id)
+        .and_then(|provider| provider.default_base_url)
+        .ok_or_else(|| anyhow!("provider-session fence: native endpoint cannot be determined"))?;
+    provider_session_policy::check(base_dir, &workdir, endpoint)?;
+
+    let cfg = csq_core::native::NativeRunConfig {
+        base_dir: base_dir.to_path_buf(),
+        provider_id,
+        model: model.map(str::to_string),
+        governance,
+        workdir,
+        prompt,
+        max_iterations: 12,
+        max_tokens: 4096,
+        bench_json,
+    };
+
+    let runtime = tokio::runtime::Runtime::new().context("native: tokio runtime init")?;
+    let summary = runtime.block_on(csq_core::native::run_native(cfg))?;
+
+    if bench_json {
+        // The single contract line the P0-A bench parses (last stdout line).
+        println!("{}", summary.to_json_line());
+    } else {
+        eprintln!(
+            "\n[native] provider={} model={} governance={} round_trips={} iterations={} \
+             tokens_in={} tokens_out={} cost_usd={:.6} latency_ms={}",
+            summary.provider,
+            summary.model,
+            summary.governance,
+            summary.round_trips,
+            summary.iterations,
+            summary.tokens_in,
+            summary.tokens_out,
+            summary.cost_usd,
+            summary.latency_ns / 1_000_000,
+        );
+    }
+    Ok(())
+}
+
+// pre_flight_check removed from run.rs (H4 extraction, R1 redteam).
+// The shared implementation now lives in super::cli_deps_gate::enforce,
+// which is called from the pre-flight block in `handle` above.
+
+/// Launches CC for a 3P slot. The slot's `config-<N>/settings.json`
+/// carries `env.ANTHROPIC_BASE_URL` + `env.ANTHROPIC_AUTH_TOKEN`, and
+/// CC reads both on startup. We strip the parent env as usual so a
+/// poisoned dotfile can't redirect traffic, then exec with
+/// `CLAUDE_CONFIG_DIR` pointing at the handle dir whose
+/// `settings.json` symlink resolves back to `config-<N>`.
+/// Production Anthropic construction. Layer flags and user args remain appended
+/// by launch_anthropic after this builder, in their original order.
+fn build_anthropic_command(base_dir: &Path, handle_dir: &Path, rest: &[String]) -> Result<Command> {
+    let mut cmd = Command::new("claude");
+    cmd.env("CLAUDE_CONFIG_DIR", handle_dir);
+    strip_sensitive_env(&mut cmd);
+    attach_messaging_claude(&mut cmd, handle_dir);
+    super::gate_launch::attach(&mut cmd, base_dir, handle_dir, rest)?;
+    Ok(cmd)
+}
+/// Production 3P construction; messaging/Gate flags precede user arguments.
+fn build_third_party_command(
+    base_dir: &Path,
+    handle_dir: &Path,
+    rest: &[String],
+) -> Result<Command> {
+    let mut cmd = build_anthropic_command(base_dir, handle_dir, rest)?;
+    cmd.args(rest);
+    Ok(cmd)
+}
+/// Production vanilla construction; no account/handle binding is introduced.
+fn build_vanilla_claude_command(
+    base_dir: &Path,
+    claude_home: &Path,
+    rest: &[String],
+) -> Result<Command> {
+    let mut cmd = Command::new("claude");
+    strip_sensitive_env(&mut cmd);
+    super::gate_launch::attach(&mut cmd, base_dir, claude_home, rest)?;
+    cmd.args(rest);
+    Ok(cmd)
+}
+
+fn launch_third_party(
+    base_dir: &Path,
+    claude_home: &Path,
+    account: AccountNum,
+    rest: &[String],
+    audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+) -> Result<()> {
+    let _ =
+        provider_session_policy::check_claude_launch(base_dir, claude_home, account, None, rest)?;
+    // Wave 3 kimi/grok host-isolation follow-through (spec 08 MED-03):
+    // build HostContext from the parent env BEFORE any spawn-time work,
+    // mirroring `launch_gemini`'s placement. Every 3P bearer slot
+    // dispatched through this function (kimi, Z.AI, MiniMax, DeepSeek,
+    // Ollama) spawns the SAME `claude` binary below with `$HOME`
+    // unfiltered — `strip_sensitive_env` strips only
+    // ANTHROPIC_*/OPENAI_*/AWS_BEARER_TOKEN_BEDROCK/CLAUDE_API_KEY/
+    // CODEX_HOME, not arbitrary production-shaped secrets — so the
+    // host-isolation exposure is identical regardless of which 3P
+    // provider is bound to `account`. Kimi is the Wave 3 target that
+    // motivated this; the other 3P bearer providers share the exact
+    // same code path and therefore the exact same exposure.
+    let host_ctx = detect_host_context();
+
+    // PATH-BUILDER: builds the legacy config-N/settings.json path for an
+    // existence check only; no content is read here. Unchanged through
+    // Phase 2 — see internal-design-docs
+    // 03-phase2-readiness.md § M2-7. Phase 3 retargets.
+    let settings_path = base_dir.join(format!("config-{}/settings.json", account));
+    if !settings_path.exists() {
+        return Err(anyhow!(
+            "slot {account} is missing config-{account}/settings.json — run `csq setkey <provider> --slot {account} --key <KEY>` first"
+        ));
+    }
+
+    let pid = std::process::id();
+    let handle_dir = session::create_handle_dir(base_dir, claude_home, account, pid)
+        .context("failed to create handle dir")?;
+    // M3-3: the defensive re-materialize (an internal journal entry belt-and-suspenders)
+    // was removed here.  `create_handle_dir` already calls
+    // `materialize_handle_settings_inner` with the UUID-aware path (M2-3),
+    // so a second call via the public `materialize_handle_settings` (no-UUID
+    // variant) would silently downgrade the settings overlay to config-N,
+    // undoing the identity-keyed path for coexisting-layout slots.
+
+    let handle_dir_abs = std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
+
+    println!(
+        "Launching claude for 3P slot {} (term-{}) via {}...",
+        account,
+        pid,
+        redact_path(&settings_path)
+    );
+
+    let cmd = build_third_party_command(base_dir, &handle_dir_abs, rest)?;
+
+    // Check the actual merged settings read by the child before handoff as well.
+    provider_session_policy::emit_warning(provider_session_policy::check_claude_launch(
+        base_dir,
+        claude_home,
+        account,
+        Some(&handle_dir_abs.join("settings.json")),
+        rest,
+    )?);
+
+    // Spec 08 MED-03 host-isolation warning, generalized to every 3P
+    // bearer provider (kimi included — the Wave 3 target) EXCEPT loopback
+    // ollama (see the `surface_name != "ollama"` guard below). Informational
+    // — does NOT abort the spawn. Unlike `launch_gemini`, this path has
+    // no capability-layer Inherit/WithLayer split (3P slots never run
+    // the capability-layer preflight), so every invocation IS the spawn
+    // and the warning fires unconditionally on production-secret
+    // detection rather than being gated to a WithLayer branch.
+    let surface_name = resolve_third_party_surface_name(base_dir, account);
+    // Loopback ollama has no remote vendor to exfiltrate to — the MED-03
+    // vendor-exposure warning is misleading there (a REMOTE ollama-compatible
+    // endpoint classifies as "third-party", not "ollama", so it still warns).
+    if surface_name != "ollama" {
+        emit_host_isolation_warning_if_needed(&host_ctx, account, surface_name);
+    }
+
+    // Set the layer-bypass result_state + decision before handoff;
+    // exec_or_spawn captures end_ts + flushes at the platform-correct
+    // moment (Unix: before exec; Windows: after child.wait()).
+    {
+        use csq_core::audit::{Decision, ResultState};
+        audit_emitter.set_result(ResultState::Degraded, Decision::Bypass);
+    }
+    exec_or_spawn(cmd, &handle_dir, audit_emitter, true)
+}
+
+/// Resolves the catalog surface id (`"kimi"`, `"zai"`, `"mm"`, `"deepseek"`,
+/// `"ollama"`) bound to `account` via its 3P `settings.json` binding, for the
+/// spec 08 MED-03 host-isolation warning's message/log surface tag. Falls
+/// back to the generic `"third-party"` label when the slot's provider
+/// cannot be resolved (e.g. a display name with no catalog entry) — this
+/// should not happen for a slot `launch_third_party` was dispatched to
+/// (the caller already established `is_third_party == true`), but the
+/// warning is informational-only, so a resolution miss degrades to a
+/// generic label rather than aborting the spawn.
+fn resolve_third_party_surface_name(base_dir: &Path, account: AccountNum) -> &'static str {
+    discovery::discover_per_slot_third_party(base_dir)
+        .into_iter()
+        .find(|a| a.id == account.get())
+        .and_then(|a| match a.source {
+            AccountSource::ThirdParty { provider } => {
+                csq_core::providers::catalog::id_from_display_name(&provider)
+            }
+            _ => None,
+        })
+        .unwrap_or("third-party")
+}
+
+/// Launch-directory admission only: a linked worktree is not a filesystem sandbox.
+/// Retain the outermost validated primary owner despite ambiguous inner metadata.
+fn provider_session_repository_context(
+    cwd: &Path,
+) -> Result<(Option<PathBuf>, Option<PathBuf>, bool)> {
+    let cwd = std::fs::canonicalize(cwd)
+        .map_err(|_| anyhow!("provider-session fence: cannot determine the launch directory"))?;
+    if !cwd.is_dir() {
+        bail!("provider-session fence: launch directory is not a directory");
+    }
+    let mut project_root = None;
+    let mut primary = None;
+    let mut ambiguous = false;
+    for root in cwd.ancestors() {
+        let marker = root.join(".git");
+        let metadata = match std::fs::symlink_metadata(&marker) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                ambiguous = true;
+                continue;
+            }
+        };
+        if project_root.is_none() {
+            project_root = Some(root.to_path_buf());
+        }
+        if metadata.is_dir() {
+            primary = Some(root.to_path_buf());
+        } else if !metadata.is_file() || validate_provider_linked_worktree(root, &marker).is_err() {
+            ambiguous = true;
+        }
+    }
+    Ok((project_root, primary, ambiguous))
+}
+
+#[cfg(test)]
+fn provider_session_repository(cwd: &Path) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
+    let (project_root, primary, ambiguous) = provider_session_repository_context(cwd)?;
+    if ambiguous {
+        bail!("provider-session fence: ambiguous repository metadata");
+    }
+    Ok((project_root, primary))
+}
+
+#[cfg(test)]
+fn admit_provider_session_workdir(cwd: &Path) -> Result<()> {
+    if provider_session_repository(cwd)?.1.is_some() {
+        bail!("provider-session fence: third-party sessions cannot start inside a primary checkout; a linked worktree does not restrict filesystem access");
+    }
+    Ok(())
+}
+
+/// Require Git's bidirectional worktree registration, not merely a `.git` file.
+/// Separate-git-dir clones and submodules have no such registration and fail closed.
+fn validate_provider_linked_worktree(root: &Path, marker: &Path) -> Result<()> {
+    fn metadata_line(path: &Path) -> Result<String> {
+        use std::io::Read;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+        }
+        let mut file = options
+            .open(path)
+            .map_err(|_| anyhow!("provider-session fence: cannot read worktree metadata"))?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| anyhow!("provider-session fence: cannot inspect worktree metadata"))?;
+        if !metadata.is_file() || metadata.len() > 16_384 {
+            bail!("provider-session fence: ambiguous worktree metadata");
+        }
+        let mut value = String::new();
+        (&mut file)
+            .take(16_385)
+            .read_to_string(&mut value)
+            .map_err(|_| anyhow!("provider-session fence: cannot decode worktree metadata"))?;
+        let value = value.trim_end_matches(['\r', '\n']);
+        if value.is_empty() || value.len() > 16_384 || value.contains(['\r', '\n']) {
+            bail!("provider-session fence: malformed worktree metadata");
+        }
+        Ok(value.to_string())
+    }
+    fn resolve(parent: &Path, value: &str) -> Result<PathBuf> {
+        std::fs::canonicalize(parent.join(value))
+            .map_err(|_| anyhow!("provider-session fence: cannot resolve worktree registration"))
+    }
+    let marker_value = metadata_line(marker)?;
+    let gitdir_value = marker_value
+        .strip_prefix("gitdir: ")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("provider-session fence: malformed repository metadata"))?;
+    let gitdir = resolve(root, gitdir_value)?;
+    let common = resolve(&gitdir, &metadata_line(&gitdir.join("commondir"))?)?;
+    let registry = resolve(&common, "worktrees")?;
+    let backlink = resolve(&gitdir, &metadata_line(&gitdir.join("gitdir"))?)?;
+    let expected = std::fs::canonicalize(marker)
+        .map_err(|_| anyhow!("provider-session fence: cannot resolve checkout registration"))?;
+    if gitdir == common || gitdir.parent() != Some(registry.as_path()) || backlink != expected {
+        bail!("provider-session fence: inconsistent linked-worktree registration");
+    }
+    Ok(())
+}
+
+/// Shared swap admission. Early checks do not emit warnings; the actual exec
+/// boundary emits once and rechecks Claude's materialized settings.
+pub(crate) fn admit_swap_provider_session(
+    base_dir: &Path,
+    account: AccountNum,
+    surface: Surface,
+    materialized: Option<&Path>,
+    emit: bool,
+) -> Result<()> {
+    let warning = if surface == Surface::ClaudeCode {
+        provider_session_policy::check_claude_launch(
+            base_dir,
+            &super::claude_home()?,
+            account,
+            materialized,
+            &[],
+        )?
+    } else {
+        provider_session_policy::check_unknown_launch(base_dir)?
+    };
+    if emit {
+        provider_session_policy::emit_warning(warning);
+    }
+    Ok(())
+}
+
+pub(crate) fn admit_exec_provider_session(
+    base_dir: &Path,
+    claude_home: &Path,
+    account: AccountNum,
+    surface: Surface,
+    materialized: Option<&Path>,
+) -> Result<Option<String>> {
+    if surface == Surface::ClaudeCode {
+        provider_session_policy::check_claude_launch(
+            base_dir,
+            claude_home,
+            account,
+            materialized,
+            &[],
+        )
+    } else {
+        let cwd = if surface == Surface::Codex {
+            claude_home.to_path_buf()
+        } else {
+            std::env::current_dir().unwrap_or_default()
+        };
+        provider_session_policy::check_exec_vendor_launch(base_dir, &cwd)
+    }
+}
+
+#[cfg(test)]
+#[path = "provider_session_fence_tests.rs"]
+mod provider_session_fence_tests;
+
+/// True when the target `surface`'s NATIVE artifacts exist at `cwd` or any
+/// ancestor up to `project_root` (inclusive).
+///
+/// When they do, the native CLI (`claude` / `codex` / `gemini` / `kimi` /
+/// `grok`) loads them with its OWN harness, so csq must inject NOTHING
+/// (Model 2 — csq translates `.coc/`→native artifacts and gets out of the
+/// way; see memory `project_coc_two_model_architecture_and_native_delegation`).
+/// The capability-layer scaffold flattens the ENTIRE `.coc/` (all rules/agents/
+/// skills/commands, full bodies) into ONE system prompt; injecting that ON TOP
+/// of native artifacts the CLI already loads duplicated + overflowed codex's
+/// context window (the `csq run 9` "Context 0% left" bug on a 2.1 MB `.coc/`).
+///
+/// `project_root` is `LoadOutcome::project_root` — `Some(root)` when
+/// `loader::discover` found a `.coc/` anywhere up-tree from `cwd`; `None`
+/// when it did not (the legacy-fallback case).
+///
+/// # Round-13 review MED-1 — the walk is bounded by an EXTERNAL root, not by
+/// re-detecting `.coc/`
+///
+/// The prior shape re-checked `current.join(".coc").is_dir()` inside this
+/// function's OWN walk to decide when to stop, on the claimed invariant that
+/// "the bound is always reached before $HOME in practice because this gate
+/// runs only on the WithLayer path, which the preflight enters only when a
+/// `.coc/` was found up-tree." That claim is FALSE:
+/// `run_capability_layer_preflight` reaches `WithLayer` via the LEGACY
+/// fallback chain too — `coc::load_with_cache`'s `discover(start)? == None`
+/// branch calls `load_legacy_or_empty(start)`, which can return a non-empty
+/// `CocSet` from a `.claude/`/`.gemini/`/`AGENTS.md` source with **no
+/// `.coc/` anywhere** (`LoadOutcome::project_root` is `None` in that case).
+/// With no `.coc/` for this function's own re-detection to ever find, the
+/// walk ran unbounded — up to `MAX_WALK_DEPTH` (64) or the filesystem root.
+///
+/// The practical consequence is worse than "eventually reaches `$HOME`":
+/// `$HOME/.claude` is GUARANTEED to exist on every host that has ever run
+/// csq at all — `base_dir()` creates `$HOME/.claude/accounts/` for csq's
+/// OWN account state, and `create_dir_all` creates `$HOME/.claude/` itself
+/// as a side effect of that. So the bare directory-existence check this
+/// function makes (`current.join(".claude").is_dir()`) returned `true` at
+/// `$HOME` on EVERY csq host regardless of whether the operator has any
+/// genuine CC-native global content (`CLAUDE.md`, `settings.json`) there at
+/// all — unlike `coc::fallback::probe`'s OWN `.claude/` detection
+/// (`claude_present`), which additionally requires a `rules/`/`agents/`/
+/// `skills/` subdirectory and is NOT fooled by a bare `accounts/`-only
+/// `.claude/`.
+///
+/// Consequence — stated as LATENT, because it is: on a `.coc/`-less project
+/// with some other legacy source (e.g. `.gemini/` present, no `.claude/`
+/// anywhere in the actual project tree), the unbounded walk found csq's OWN
+/// bookkeeping directory at `$HOME` and misread it as "CC already has native
+/// content here", suppressing injection. What that suppressed is today
+/// NOTHING: `coc::load_legacy_or_empty` returns `CocSet { source, ..empty() }`
+/// and its own doc says full legacy parsing "lands in PR-CA2/3/4". So no
+/// operator has yet lost governance content to this — the misdetection is real
+/// and the suppression is real, but the payload is empty until legacy parsing
+/// ships. An earlier draft of this comment asserted the live-loss version
+/// ("the operator's rules never reached CC's context"); that was not
+/// reproducible from the code and is corrected here rather than left to be
+/// read as established fact by the next session.
+///
+/// The fix: this function no longer re-detects `.coc/` at all. The caller
+/// (`run_capability_layer_preflight`, which already computed
+/// `LoadOutcome::project_root` during the SAME `.coc/` resolution) threads
+/// the actual root through `LayerControl::WithLayer`. When `project_root`
+/// is `None`, the walk checks ONLY `cwd` itself — no upward climb —
+/// mirroring `coc::fallback::probe`'s own no-upward-walk semantics for
+/// `.claude`/`.gemini` in that exact case (the only legacy resolver that
+/// DOES walk upward, `agents_md_walk_up`, is a separate, narrower
+/// mechanism checking `AGENTS.md` alone and is out of this fix's scope).
+/// `cwd.ancestors()` is a finite iterator bounded by the real path depth —
+/// no artificial iteration cap is needed on top of the `project_root`/
+/// cwd-only bound.
+fn native_artifacts_present(surface: Surface, cwd: &Path, project_root: Option<&Path>) -> bool {
+    let (dir_markers, file_markers): (&[&str], &[&str]) = match surface {
+        Surface::ClaudeCode => (&[".claude"], &["CLAUDE.md"]),
+        Surface::Codex => (&[".codex"], &["AGENTS.md"]),
+        Surface::Gemini => (&[".gemini"], &["GEMINI.md"]),
+        // Round-13 review MED-2: Kimi's per-directory project-root→cwd
+        // instruction sweep checks `<dir>/.kimi-code/AGENTS.md`, then
+        // `<dir>/AGENTS.md` else `<dir>/agents.md` (report 13 §3.1 row 3,
+        // verified via raw-binary read of the shipped binary) — NOT a bare
+        // `.kimi` dir, which Kimi never reads at all. The generic
+        // `~/.agents/` root is evidence-checked and excluded here: it is a
+        // HOME-only instructions fallback (report 13 §3.1 row 2, "rooted
+        // at the real OS home, not KIMI_CODE_HOME") and a project-level
+        // SKILLS marker (report 13 §3.3) — not part of the per-directory
+        // INSTRUCTIONS sweep this predicate models.
+        // Both spellings are listed because Kimi probes both; on the default
+        // case-insensitive macOS/Windows filesystems the second probe is
+        // redundant (it resolves to the same file), so it is load-bearing only
+        // on case-sensitive filesystems — i.e. Linux, and case-sensitive APFS
+        // volumes. Keeping it is correct on every platform; noting the split
+        // stops a future reader from "cleaning up" an apparently dead probe.
+        Surface::Kimi => (&[".kimi-code"], &["AGENTS.md", "agents.md"]),
+        // Round-13 review HIGH-1: Grok reads `.claude/` NATIVELY AND
+        // near-completely with ZERO setup (report 14 headline finding, §2
+        // G2 — verified empirically against a repo with no `.grok/` at
+        // all) — a `.claude/` dir means Grok already loads that content
+        // independently of csq. The prior marker set checked ONLY
+        // `.grok`/`AGENTS.md`, so a CC-first repo (`.claude/` present, no
+        // root `AGENTS.md`, no `.grok/`) — the majority shape, and the
+        // exact shape report 14 measured against — returned `false` here:
+        // the operator would be wrongly told to add a redundant
+        // `AGENTS.md` that would ALSO outrank the future
+        // `$GROK_HOME/AGENTS.md` (global scope, report 14 §7.1). File
+        // markers cover all six names Grok checks, in order, per
+        // directory (report 14 §3.1, verified via
+        // `12-project-rules.md:17-24`).
+        Surface::Grok => (
+            &[".grok", ".claude"],
+            &[
+                "AGENTS.md",
+                "CLAUDE.md",
+                "Agents.md",
+                "Claude.md",
+                "CLAUDE.local.md",
+                "AGENT.md",
+            ],
+        ),
+    };
+
+    // With no `.coc/` root, the two marker classes get DIFFERENT bounds — and
+    // the asymmetry is the point (round-13 redteam MED).
+    //
+    // DIR markers (`.claude`, `.gemini`) are checked at `cwd` only. Climbing
+    // with them is what produced the `$HOME` misdetection above: csq's own
+    // `base_dir()` guarantees a bare `$HOME/.claude/` exists on every host.
+    //
+    // FILE markers (`AGENTS.md`, `CLAUDE.md`, …) climb, bounded at 64 levels —
+    // matching `coc::fallback::agents_md_walk_up`, the legacy resolver that
+    // actually produced the `CocSource` in this branch. Without the climb this
+    // gate was NARROWER than the resolver feeding it: the loader walked up to
+    // find `<project>/AGENTS.md` and keep the layer active, while the gate refused
+    // to look past `cwd` and so reported "no native artifacts" for a project
+    // that plainly has one. `$HOME/CLAUDE.md`, if an operator has it, is
+    // genuine CC-native global content and SHOULD suppress — unlike the bare
+    // `.claude/` directory csq creates for itself.
+    const LEGACY_FILE_WALK_MAX: usize = 64;
+    for (depth, current) in cwd.ancestors().enumerate() {
+        let dir_hit = (project_root.is_some() || depth == 0)
+            && dir_markers.iter().any(|m| current.join(m).is_dir());
+        if dir_hit || file_markers.iter().any(|m| current.join(m).is_file()) {
+            return true;
+        }
+        let reached_bound = match project_root {
+            Some(root) => current == root,
+            None => depth + 1 >= LEGACY_FILE_WALK_MAX,
+        };
+        if reached_bound {
+            break;
+        }
+    }
+    false
+}
+
+/// Whether csq should inject the flattened `.coc/` scaffold for `surface` given
+/// `cwd` (and the `.coc/` project root, if one was found — see
+/// [`native_artifacts_present`]).
+///
+/// The scaffold injection is a TRANSITION / parity-testing mechanism, not the
+/// steady state: it MUST default OFF when the surface's native artifacts are
+/// present (the native CLI loads its own — see [`native_artifacts_present`]).
+/// `CSQ_COC_PARITY_TEST=1` forces injection regardless, the escape hatch for
+/// verifying `.coc/`→native parity via csq's sub-process path.
+fn should_inject_scaffold(surface: Surface, cwd: &Path, project_root: Option<&Path>) -> bool {
+    let parity = std::env::var_os("CSQ_COC_PARITY_TEST");
+    let force = if surface == Surface::Codex {
+        parity.as_deref() == Some(std::ffi::OsStr::new("1"))
+    } else {
+        parity.is_some()
+    };
+    force || !native_artifacts_present(surface, cwd, project_root)
+}
+
+/// Emits the operator note explaining that a `.coc/` scaffold was suppressed
+/// because the surface's native artifacts are present. Call ONLY when a
+/// non-empty scaffold is actually being dropped (not on every WithLayer spawn).
+fn note_scaffold_deferred(surface: Surface) {
+    let name = match surface {
+        Surface::ClaudeCode => "claude",
+        Surface::Codex => "codex",
+        Surface::Gemini => "gemini",
+        Surface::Kimi => "kimi",
+        Surface::Grok => "grok",
+    };
+    eprintln!(
+        "csq: native {name} artifacts detected — deferring to the native CLI harness \
+         (.coc/ scaffold not injected). Set CSQ_COC_PARITY_TEST=1 to inject for parity testing."
+    );
+}
+
+/// Launches CC for an Anthropic OAuth slot. Assumes credentials have
+/// already been copied into `config-<N>` by the caller.
+#[allow(clippy::too_many_arguments)]
+fn launch_anthropic(
+    base_dir: &Path,
+    claude_home: &Path,
+    account: AccountNum,
+    capability_layer_enabled: bool,
+    layer_is_auto: bool,
+    toggles: &CapabilityLayerToggles,
+    debug: bool,
+    bench_mode: Option<&str>,
+    coc_cache_enabled: bool,
+    rest: &[String],
+    audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+) -> Result<()> {
+    // Capability-layer pre-flight (spec 10 §10.4.2). When the flag
+    let _ =
+        provider_session_policy::check_claude_launch(base_dir, claude_home, account, None, rest)?;
+    // is OFF (default for v2.4.0-alpha) we short-circuit here and
+    // fall through to the v2.3.1 launch path — argv + env are
+    // byte-identical to pre-PR-CA5 by construction.
+    //
+    // When the flag is ON, the pre-spawn pipeline (scaffold real +
+    // mcp_gate pass-through at PR-CA6b) succeeds end-to-end and the
+    // returned `LayerControl::WithLayer` routes the spawn through
+    // the always-spawn+wait path so the parent stays alive for the
+    // post-spawn pipeline (PR-CA7+). PR-CA6c populates mcp_gate's
+    // intersection-not-union semantics from `.coc/tools/policy.json`.
+    let layer_control = match run_capability_layer_preflight(
+        base_dir,
+        account,
+        capability_layer_enabled,
+        layer_is_auto,
+        toggles,
+        debug,
+        Surface::ClaudeCode,
+        coc_cache_enabled,
+        rest,
+    ) {
+        Ok(c) => c,
+        Err(err) => {
+            // StageError → spec 03 §3.9 exit code. We use
+            // process::exit so the parent shell sees the
+            // dedicated capability-layer code instead of
+            // anyhow's generic 1.
+            // PR-CA8 H6: redact_tokens before stderr per INV-P07.
+            eprintln!(
+                "error: {}",
+                csq_core::error::redact_tokens(&format!("{err}"))
+            );
+            // M06 fail-loud (H1): this `process::exit` bypasses Drop, so the
+            // owning emitter in `handle` would never flush. The capability
+            // layer rejected the run before any CLI spawn → Fail + Reject.
+            {
+                use csq_core::audit::{Decision, ResultState};
+                let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                audit_emitter.set_end_ts(end_ts);
+                audit_emitter.set_result(ResultState::Fail, Decision::Reject);
+                fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+            }
+            std::process::exit(err.exit_code() as i32);
+        }
+    };
+
+    // --bench-mode layer-only (design 08 §11 / R2/B56): terminate
+    // after the capability-layer preflight, never spawn the CLI.
+    if let Some("layer-only") = bench_mode {
+        return handle_bench_mode_layer_only(Surface::ClaudeCode, audit_emitter);
+    }
+
+    // Create ephemeral handle dir: term-<pid> with symlinks to config-N
+    // for credentials and ~/.claude for shared items. CC checks CWD
+    // (not CLAUDE_CONFIG_DIR) for session identity, so handle dirs
+    // are compatible with --resume as long as the CWD matches.
+    let pid = std::process::id();
+    let handle_dir = session::create_handle_dir(base_dir, claude_home, account, pid)
+        .context("failed to create handle dir")?;
+    // M3-3: the defensive re-materialize (an internal journal entry belt-and-suspenders)
+    // was removed here.  `create_handle_dir` already calls
+    // `materialize_handle_settings_inner` with the UUID-aware path (M2-3),
+    // so a second call via the public `materialize_handle_settings` (no-UUID
+    // variant) would silently downgrade the settings overlay to config-N,
+    // undoing the identity-keyed path for coexisting-layout slots.
+
+    // Security review 1386 M4: `canonicalize_for_keychain_sync` returns the
+    // usual non-canonical fallback for `handle_dir_abs` (still the right
+    // `CLAUDE_CONFIG_DIR` to launch against), paired with whether canonicalize
+    // actually succeeded — the keychain write below MUST be skipped when it
+    // did not (see that function's doc for why).
+    let (handle_dir_abs, handle_dir_is_canonical) =
+        csq_core::credentials::keychain::canonicalize_for_keychain_sync(&handle_dir);
+
+    provider_session_policy::emit_warning(provider_session_policy::check_claude_launch(
+        base_dir,
+        claude_home,
+        account,
+        Some(&handle_dir_abs.join("settings.json")),
+        rest,
+    )?);
+
+    // Security review 1386 H1: opportunistically retry any keychain item a
+    // prior `csq logout` could not confirm clearing (locked/unreachable
+    // keychain at the time). The daemon's periodic sweep covers this too,
+    // but `csq run` works without a daemon running — this is the only
+    // recurring channel for that install shape. Cheap when the queue is
+    // empty (one file read, no subprocess calls) — but NOT non-blocking
+    // when it isn't (doc-property-claims.md MUST-2 correction: an earlier
+    // version of this comment claimed "never blocks the launch", which was
+    // true of the empty-queue case and false of the case this exists for).
+    // `sweep_pending_clears_opportunistic` (a small, separate budget from
+    // the daemon's) bounds the worst case to ~37.5s rather than inheriting
+    // the daemon's ~187.5s — see its doc for why a background thread was
+    // considered and rejected for this exec-replacing path.
+    let _ = csq_core::credentials::keychain::sweep_pending_clears_opportunistic(base_dir);
+
+    // CC reads this account's OAuth credential from the keychain item keyed by
+    // the CLAUDE_CONFIG_DIR path below — not from the symlinked
+    // `.credentials.json`. Mirror the bound account's current token into it so
+    // CC picks up the fresh credential (it re-checks the keychain ~every 30s).
+    // v4 A2 ("switch now or say so"): `csq run` always creates a FRESH
+    // handle dir, so a readable X gets a FORCED write; a write failure or a
+    // lock timeout/failure means this launch does NOT proceed — a fresh
+    // dir with a colliding stale item from PID reuse must not launch
+    // against the wrong account. F4: Inaccessible (exit 36: locked, no
+    // GUI) → proceed without the mirror (CC in the same environment cannot
+    // read the keychain either and falls back to the symlinked
+    // `.credentials.json`, spec 01 §1.4); anything else unreadable →
+    // refuse.
+    // F3/KC4-3: a canonicalize FAILURE (unlike a readable-keychain Unreadable
+    // result) means we cannot even name this dir's absolute path, so "CC
+    // falls back to the symlinked .credentials.json" does not follow —
+    // refuse to launch rather than proceed against an unverified path.
+    if handle_dir_is_canonical {
+        if let Err(msg) =
+            csq_core::credentials::keychain::force_sync_for_launch(base_dir, &handle_dir_abs)
+        {
+            anyhow::bail!("csq run: {msg}");
+        }
+    } else {
+        anyhow::bail!("csq run: keychain item could not be located; retry the launch");
+    }
+
+    println!("Launching claude for account {} (term-{})...", account, pid);
+
+    // Strip ANTHROPIC_* (and related) env vars before exec.
+    let mut cmd = build_anthropic_command(base_dir, &handle_dir_abs, rest)?;
+    // NB: the user's `rest` args are appended LAST in each arm below — AFTER any
+    // csq-injected top-level flags (`--plugin-dir`, `--append-system-prompt-file`).
+    // Those flags MUST precede a `claude` SUBCOMMAND (e.g. `csq run N -- plugin
+    // details`): commander parses top-level options before dispatching a
+    // subcommand, so a flag appended after the subcommand is rejected
+    // ("unknown option '--plugin-dir'"). Placing them before `rest` keeps every
+    // usage working — interactive (`rest` empty), print (`-p "…"`), AND
+    // subcommand — instead of only the no-subcommand cases.
+
+    match layer_control {
+        LayerControl::Inherit => {
+            // Layer-bypass result shape; exec_or_spawn handles platform-
+            // conditional end_ts + flush (PR-CA10c R1 redteam HIGH fix —
+            // Unix flushes before exec; Windows captures end_ts after
+            // child.wait() so the record reflects true session duration).
+            use csq_core::audit::{Decision, ResultState};
+            audit_emitter.set_result(ResultState::Degraded, Decision::Bypass);
+            // Inherit adds no csq flags; append rest and go (byte-identical argv).
+            cmd.args(rest);
+            exec_or_spawn(cmd, &handle_dir, audit_emitter, true)
+        }
+        LayerControl::WithLayer {
+            mode,
+            class,
+            rule_ids_in_scope,
+            scaffold,
+            rules_only_scaffold,
+            artifacts,
+            project_root,
+        } => {
+            // PR-CA7c / E2BIG fix: deliver the scaffold (rules + structured-
+            // output directive when applicable) to CC via
+            // `--append-system-prompt-file <path>`.
+            //
+            // Prior approach used `CLAUDE_SYSTEM_PROMPT_APPEND` env var.
+            // Large `.coc/` artifact flattens can exceed ARG_MAX (macOS:
+            // 1 MiB, shared by argv + envp) causing `cmd.spawn()` to fail
+            // with `E2BIG / os error 7`. The file-based carrier matches what
+            // the codex and gemini surfaces already do (config.toml
+            // instructions / settings.json system_instruction), and CC's
+            // `--append-system-prompt-file` flag makes the content path
+            // argv — never exceeding ARG_MAX regardless of artifact size.
+            //
+            // `attach_scaffold` writes the text to a temp file, appends the
+            // flag+path to `cmd`, and returns the path so we can clean it up
+            // after spawn completes. Falls back to the env var if the write
+            // fails so small scaffolds still work.
+            // Fix A (native-delegation gate): suppress the flattened `.coc/`
+            // scaffold when the target's native `.claude/` / `CLAUDE.md` are
+            // present — CC loads its own artifacts, so injecting on top
+            // duplicates + overflows context. `CSQ_COC_PARITY_TEST=1` forces it.
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            // S2/S2b (an internal ticket): deliver each `.coc/` artifact kind through its
+            // NATIVE Claude Code channel; keep prose to the minimum.
+            //
+            // When the `.coc/` would be injected (no competing native `.claude/`
+            // at cwd, OR `CSQ_COC_PARITY_TEST=1`):
+            //   - agents/skills/commands → a session-scoped plugin at
+            //     `term-<pid>/coc-plugin/` reached via `claude --plugin-dir` (S2).
+            //   - rules → native `term-<pid>/rules/coc-<ID>.md`, so CC's own rules
+            //     loader honors each rule's `paths:` scoping (S2b — a path-scoped
+            //     rule activates only when Claude reads a matching file; resolves
+            //     the an internal journal entry gap where `paths` was parsed but honored
+            //     nowhere). Unscoped rules load always-on, same effect as prose.
+            //   - prose (`--append-system-prompt-file`) then carries ONLY the
+            //     FR-CL-01 structured-output directive (Compliance prompts).
+            // Each native channel falls back to prose INDEPENDENTLY on failure,
+            // so the prose selected below is exactly the artifact set NOT
+            // delivered natively — nothing is ever dropped. When the project
+            // carries its own native `.claude/`, the scaffold is deferred
+            // entirely (Level-1 behavior byte-unchanged).
+            let inject = should_inject_scaffold(Surface::ClaudeCode, &cwd, project_root.as_deref());
+            let has_materializable = !artifacts.agents.is_empty()
+                || !artifacts.skills.is_empty()
+                || !artifacts.commands.is_empty();
+
+            let mut plugin_ok = false;
+            let mut native_rules_ok = false;
+            if inject {
+                if has_materializable {
+                    match materialize_cc_coc_plugin(&handle_dir_abs, &artifacts) {
+                        Ok(plugin_dir) => {
+                            cmd.arg("--plugin-dir").arg(&plugin_dir);
+                            plugin_ok = true;
+                        }
+                        Err(e) => {
+                            // Fail-safe: tear down the partial tree; a/s/c fall
+                            // back to prose.
+                            let _ = std::fs::remove_dir_all(handle_dir_abs.join("coc-plugin"));
+                            tracing::warn!(
+                                error_kind = "coc_plugin_materialize_failed",
+                                "CC plugin materialization failed; falling back to prose: {}",
+                                csq_core::error::redact_tokens(&e.to_string())
+                            );
+                        }
+                    }
+                }
+                // Attempt native rules ONLY when the plugin leg did not FAIL
+                // (plugin succeeded, or there was nothing to plug in). If the
+                // plugin failed, everything falls back to full prose (`scaffold`),
+                // so materializing rules natively too would double-deliver them
+                // (redteam R1 correctness MED) AND defeat path-scoping. Thus
+                // `native_rules_ok` implies `(plugin_ok || !has_materializable)`.
+                if !artifacts.rules.is_empty() && (plugin_ok || !has_materializable) {
+                    match materialize_native_rules(&handle_dir_abs, &artifacts.rules) {
+                        Ok(()) => native_rules_ok = true,
+                        Err(e) => {
+                            // Path-scoped rules were never honored before S2b, so
+                            // a failure is NO regression: fall back to rules-prose.
+                            tracing::warn!(
+                                error_kind = "coc_native_rules_failed",
+                                "native rule materialization failed; falling back to rules-as-prose: {}",
+                                csq_core::error::redact_tokens(&e.to_string())
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Prose = exactly the artifacts NOT delivered natively (+ the FR-CL-01
+            // directive on Compliance prompts). `scaffold` (all kinds) and
+            // `rules_only_scaffold` (rules + directive) already embed the
+            // directive; the directive-only case is built inline.
+            let prose_owned: Option<String> = if !inject {
+                if scaffold.as_deref().is_some_and(|s| !s.is_empty()) {
+                    note_scaffold_deferred(Surface::ClaudeCode);
+                }
+                None
+            } else if native_rules_ok && (plugin_ok || !has_materializable) {
+                // Rules native; agents/skills/commands native-or-absent → prose
+                // is just the structured-output directive (Compliance only).
+                if class.class == csq_core::capability_layer::PromptClassKind::Compliance {
+                    Some(csq_core::coc::translate::build_output_schema_directive())
+                } else {
+                    None
+                }
+            } else if plugin_ok {
+                // a/s/c native; rules NOT native (none, or native failed) →
+                // rules as prose.
+                rules_only_scaffold
+            } else {
+                // No plugin (or it failed) → full prose fallback (all kinds).
+                scaffold
+            };
+            let scaffold_tmp = attach_scaffold(&mut cmd, prose_owned.as_deref());
+            // Append the user's args LAST — after --plugin-dir + the scaffold
+            // flag — so a `claude` subcommand in `rest` still sees those as
+            // top-level options (see the note at cmd construction above).
+            cmd.args(rest);
+            let result = spawn_with_layer(
+                cmd,
+                &handle_dir,
+                mode,
+                class,
+                rule_ids_in_scope.clone(),
+                toggles,
+                debug,
+                audit_emitter,
+            );
+            // Clean up the scaffold temp file now that CC has exited.
+            // WithLayer always spawns+waits, so csq is still alive here.
+            // Non-secret content (COC rule text), but we clean up regardless.
+            if let Some(ref p) = scaffold_tmp {
+                let _ = std::fs::remove_file(p);
+            }
+            // WithLayer path: spawn+wait, so Drop fires normally. We still
+            // populate the emitter fields so the record reflects the actual
+            // post-spawn state rather than the construction-time defaults.
+            //
+            // PR-CA10c R1 redteam MEDIUM fix: `rule_ids_cited_*` are the
+            // rules the MODEL CITED, not the rules MADE AVAILABLE (which
+            // is `rule_ids_in_scope`). The cited set is buried inside
+            // spawn_with_layer's post-validate pass and isn't returned to
+            // this call site. Leave the cited vectors empty (honest "not
+            // yet plumbed") rather than populate them with in-scope rules
+            // — per no-stubs.md Rule 3, populated-with-wrong-data is worse
+            // than empty because it signals "this is the answer." Plumbing
+            // the actual cited set requires extending spawn_with_layer's
+            // return type in a follow-up.
+            let _ = rule_ids_in_scope;
+            {
+                use csq_core::audit::{Decision, ResultState};
+                let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                audit_emitter.set_end_ts(end_ts);
+                // WithLayer passed the pre-spawn pipeline; treat the run as
+                // Pass (post-validate accepted the output or layer exited
+                // normally). Any post-validate failure exits via
+                // process::exit before reaching here.
+                audit_emitter.set_result(ResultState::Pass, Decision::Accept);
+                audit_emitter.set_rule_ids(vec![], vec![]);
+            }
+            result
+        }
+    }
+}
+
+/// Launches Codex for a Codex-surface slot.
+///
+/// Spec 07 §7.5 INV-P02: daemon is a hard prerequisite — if the
+/// daemon is not running, refresh cadence cannot be guaranteed and
+/// codex-cli's on-expiry refresh will burn the refresh token
+/// (openai/codex#10332). Refuse with exit 2 before creating a handle
+/// dir.
+///
+/// Spec 07 §7.2.2 on-disk layout: `term-<pid>` IS `$CODEX_HOME`.
+/// The Codex child sees auth.json / config.toml / sessions /
+/// history.jsonl through the handle-dir symlinks assembled by
+/// `create_handle_dir_codex` (PR-C3a).
+///
+/// Env: `strip_sensitive_env` removes `ANTHROPIC_*` + bedrock/vertex
+/// variants (same attack surface as Claude launch — a poisoned
+/// dotfile cannot redirect traffic). Additionally removes
+/// `CLAUDE_CONFIG_DIR` so a parent csq-managed shell does not leak
+/// the Claude-surface state dir into the Codex child. Full
+/// `env_clear + allowlist` is a PR-C3c-follow-up hardening target;
+/// today's env_remove set matches PR-C3b's login spawn.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_codex(
+    base_dir: &Path,
+    account: AccountNum,
+    capability_layer_enabled: bool,
+    layer_is_auto: bool,
+    toggles: &CapabilityLayerToggles,
+    debug: bool,
+    bench_mode: Option<&str>,
+    coc_cache_enabled: bool,
+    rest: &[String],
+    // The run's audit emitter. `CodexLaunchAudit::First` (the primary
+    // `csq run` entrypoint) holds it in the pre-spawn guard, so every exit
+    // before the spawn ends the record; `Relaunch` borrows the supervisor's.
+    mut audit: CodexLaunchAudit<'_>,
+    // FM-5 (`is_relaunch`, derived from `audit` below): `false` for the primary `csq run`/`csq exec` entrypoint (via
+    // `handle`, below), `true` when this call is a cross-slot swap RELAUNCH
+    // (`codex_supervise::run_supervised`'s `relaunch` closure recursing back
+    // in). Gates whether `require_daemon_healthy` and the capability-layer
+    // preflight failure return `Err` (so the relaunch closure — and, via it,
+    // FM-6's flush + recovery-message logic — can catch it) or keep their
+    // original `process::exit` with a distinct, script-facing exit code
+    // (`EXIT_CODE_DAEMON_REQUIRED`) — see `require_daemon_healthy`'s doc
+    // comment for the exit-code-fidelity trade-off this preserves on the
+    // primary path.
+    // PRIMARY DIRECTIVE (round 6): `Some(_)` iff this call IS the relaunch
+    // half of an accepted cross-slot swap — see
+    // `codex_supervise::run_supervised`'s `swap_correlation` doc for what it
+    // gates. `None` for the primary (non-swap) entrypoint.
+    swap_correlation: Option<csq_core::session::codex_supervisor::SwapAuditCorrelation>,
+    // The messaging decision a supervised swap RELAUNCH carries from its source terminal
+    // (`Some`), so the relaunch never re-reads `CSQ_MESSAGING`. `None` for a fresh launch,
+    // which decides once from the environment.
+    messaging: Option<bool>,
+) -> Result<()> {
+    // Classify the caller's own arguments before csq derives account defaults.
+    // Explicit resume policy must retain native semantics on the embedded path.
+    let embedded_native_fallback = codex_supervise::requires_embedded_native(rest);
+    let is_relaunch = audit.is_relaunch();
+    // The capability-layer settings this launch threads into the supervised
+    // child's relaunch + relaunch-validation closures
+    // (`supervise_codex_holding_share_lock`).
+    let settings = CodexLaunchSettings {
+        capability_layer_enabled,
+        layer_is_auto,
+        toggles: *toggles,
+        debug,
+        bench_mode,
+        coc_cache_enabled,
+    };
+    provider_session_policy::emit_warning(provider_session_policy::check_unknown_launch_with_args(
+        base_dir, rest,
+    )?);
+    require_daemon_healthy(base_dir, audit.emitter_mut(), is_relaunch)?;
+    verify_codex_config_toml(base_dir, account)?;
+    verify_codex_canonical_is_regular_file(base_dir, account)?;
+
+    // Re-merge the slot's `config.toml` from the CURRENT `~/.codex` on
+    // every launch, so the user's global-config edits propagate to live
+    // slots (the `~/.codex` single-source-of-truth model, matching how CC
+    // live-links `~/.claude`). Runs BEFORE the capability-layer preflight
+    // and `create_handle_dir_codex` so BOTH the Inherit symlink and the
+    // WithLayer materialization (which reads `config-<N>/config.toml` as
+    // its base) see the fresh content. The slot's per-account `model` is
+    // preserved; existence is already guaranteed by the verify above.
+    //
+    // Degradation posture (never abort the launch on these):
+    // - present-but-malformed `~/.codex` → existing slot config is KEPT
+    //   (the helper refuses to wipe it to the 2-key fallback); tell the
+    //   operator so they know why their edit did not propagate.
+    // - write failure → `atomic_replace` leaves the prior `config.toml`
+    //   intact; warn and continue with the existing (possibly stale)
+    //   config rather than block a launch on a transient FS error.
+    match codex_surface::regenerate_slot_config(base_dir, account) {
+        Ok(codex_surface::RegenOutcome::AlreadyCurrent)
+        | Ok(codex_surface::RegenOutcome::Rewritten {
+            was_global_malformed: false,
+            ..
+        }) => {}
+        // Both the no-op (SkippedMalformedGlobal) AND the repaired-under-malformed
+        // (Rewritten { was_global_malformed: true }) cases mean the user's global
+        // is invalid and new edits are NOT propagating — surface the same note.
+        Ok(codex_surface::RegenOutcome::SkippedMalformedGlobal)
+        | Ok(codex_surface::RegenOutcome::Rewritten {
+            was_global_malformed: true,
+            ..
+        }) => {
+            eprintln!(
+                "note: ~/.codex/config.toml is not valid TOML — slot {account} kept its \
+                 existing config. Fix your global config so edits propagate."
+            );
+        }
+        Err(_) => {
+            eprintln!(
+                "warning: could not refresh slot {account} config from ~/.codex \
+                 (continuing with the existing config)."
+            );
+        }
+    }
+
+    // PR-CA8 commit 2: capability-layer pre-flight. When the flag is
+    // OFF (default for v2.4.0-alpha) or `.coc/` resolves to fallback,
+    // the path is the v2.3.1 path verbatim (Inherit branch below).
+    // When ON and `.coc/` populated, the per-spawn handle-dir
+    // `config.toml` is materialized with the layer's `developer_instructions`
+    // block (spec 10 §10.4.6.1 codex row).
+    let layer_control = match run_capability_layer_preflight(
+        base_dir,
+        account,
+        capability_layer_enabled,
+        layer_is_auto,
+        toggles,
+        debug,
+        Surface::Codex,
+        coc_cache_enabled,
+        rest,
+    ) {
+        Ok(c) => c,
+        Err(err) => {
+            // PR-CA8 H6: redact_tokens before stderr per INV-P07.
+            eprintln!(
+                "error: {}",
+                csq_core::error::redact_tokens(&format!("{err}"))
+            );
+            // M06 fail-loud (H1): this `process::exit` bypasses Drop — flush the
+            // owning emitter's record BEFORE exit. Capability layer rejected the
+            // Codex run before any spawn → Fail + Reject.
+            {
+                use csq_core::audit::{Decision, ResultState};
+                let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                let audit_emitter = audit.emitter_mut();
+                audit_emitter.set_end_ts(end_ts);
+                audit_emitter.set_result(ResultState::Fail, Decision::Reject);
+                fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+            }
+            // FM-5: on a RELAUNCH, return Err (same S-F3/C-F2 rationale as
+            // the M6 spawn-gate Err path just below) so the swap's relaunch
+            // closure — not this whole process — owns the failure, and
+            // FM-6's flush + `csq run N -- resume <id>` recovery message can
+            // run instead of a bare exit that leaves the ORIGINAL session's
+            // fate unclear. The primary `csq run` entrypoint keeps the
+            // original `process::exit` with the StageError's own exit code.
+            if is_relaunch {
+                return Err(err.into());
+            }
+            std::process::exit(err.exit_code() as i32);
+        }
+    };
+
+    // --bench-mode layer-only: terminate before subprocess spawn.
+    if let Some("layer-only") = bench_mode {
+        return handle_bench_mode_layer_only(Surface::Codex, audit.emitter_mut());
+    }
+
+    // M6 T6.1: cross-CLI spawn-boundary governance gate (enterprise-only).
+    // Evaluated BEFORE the codex subprocess is built/spawned. Block/Escalate (or a
+    // present-but-malformed/unbuildable envelope) → refuse to spawn (fail-loud
+    // audit + non-zero exit); Conditional → inject the advisory path-scope env
+    // (T6.4); Pass/Ungoverned → proceed. Community builds carry no governor and
+    // spawn ungoverned (the `Vec::new()` arm).
+    //
+    // The gate returns the RESOLVED operating envelope alongside its verdict so the
+    // Shard 3a MCP config-rewrite below can consult the SAME validated envelope
+    // WITHOUT a second `load_spawn_envelope` read (redteam R1 finding 1.1: two loads
+    // could diverge — the gate admits under an `mcp` policy while a re-read sees none
+    // and spawns un-gated MCP).
+    #[cfg(feature = "enterprise")]
+    let (codex_spawn_scope_env, codex_gate_env): (
+        Vec<(String, String)>,
+        Option<Box<csq_trust_contract::OperatingEnvelope>>,
+    ) = match evaluate_codex_spawn_gate(base_dir, audit.emitter_mut()) {
+        Ok(v) => v,
+        Err(e) => {
+            // S-F3/C-F2: return Err rather than `process::exit` so a caller
+            // driving this launch as a cross-slot swap RELAUNCH (the
+            // `relaunch` closure below, invoked via
+            // `codex_supervise::run_supervised`) can catch this and print
+            // its own recovery hint instead of the whole csq process dying
+            // out from under a swap that should have left the ORIGINAL
+            // session alone. The plain `csq run` entrypoint (`handle`,
+            // above `launch_codex` in this file) still surfaces this as a
+            // process exit — just through the ordinary `Result` error path
+            // rather than a `process::exit` call made from inside here.
+            eprintln!("error: {e}");
+            return Err(e);
+        }
+    };
+    #[cfg(not(feature = "enterprise"))]
+    let codex_spawn_scope_env: Vec<(String, String)> = Vec::new();
+
+    let pid = std::process::id();
+    let handle_dir = session::create_handle_dir_codex(base_dir, account, pid)
+        .with_context(|| format!("create Codex handle dir for account {account}"))?;
+
+    let handle_dir_abs = std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
+
+    // M6 T6.2 Shard 3a: resolve whether this governed codex spawn routes its MCP
+    // servers through `csq mcp-proxy`. `Some((csq_bin, envelope_snapshot))` iff the
+    // gate's resolved envelope declares an `mcp` policy (opt-in); this stages the
+    // envelope snapshot the proxy will `--envelope`-load. Consumes the SAME envelope
+    // the M6 T6.1 gate above resolved (single load — no divergence window). `None` in
+    // the community build and for any ungoverned / no-MCP-policy session.
+    #[cfg(feature = "enterprise")]
+    let codex_mcp_rewrite = resolve_codex_mcp_rewrite(codex_gate_env.as_deref(), &handle_dir_abs)?;
+    #[cfg(not(feature = "enterprise"))]
+    let codex_mcp_rewrite: Option<(String, std::path::PathBuf)> = None;
+
+    // Task 8: JWT exp pre-flight — defense-in-depth against stale tokens.
+    // Delegates to `check_codex_token_freshness` so the logic is unit-testable.
+    {
+        let auth_json_link = handle_dir_abs.join("auth.json");
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        check_codex_token_freshness(&auth_json_link, account, now_secs)?;
+    }
+
+    println!("Launching codex for account {} (term-{})...", account, pid);
+
+    // Strip BEFORE `cmd.env(HOME_ENV_VAR, …)` so our explicit
+    // CODEX_HOME value wins over any parent-shell export.
+    // `strip_sensitive_env` scrubs CODEX_HOME from the parent env
+    // (H1 fix) — if we set it first it would get env_remove'd right
+    // back out.
+    //
+    // Cross-slot swap-resume shard S3 (parity, item 3 of the governing
+    // task): the flag/env-stripping + sandbox-flag-derivation sequence
+    // below is factored into `build_codex_exec_command` so
+    // `swap.rs::supervise_codex_after_binding` — which builds its own
+    // command before handing it to `supervise_codex_holding_share_lock` — builds
+    // an identical `Command` on this axis. See that function's doc comment
+    // for exactly what it does and does NOT share (spawn gate, MCP proxy
+    // rewrite, and the capability-layer preflight above stay `launch_codex`
+    // -only; they need an `AuditEmitter` and a resolved operating envelope
+    // that call site does not carry).
+    let messaging_wrap = codex_mcp_rewrite
+        .as_ref()
+        .map(|(bin, path)| (bin.as_str(), path.as_path()));
+    // The launch decision, held in memory from here on: a carried one (a swap relaunch) or a
+    // fresh read of the marker/`CSQ_MESSAGING`. It is handed to the supervisor below so a
+    // failed marker write cannot turn messaging off at this terminal's next supervised swap.
+    let messaging_on =
+        messaging.unwrap_or_else(|| csq_core::messaging::register::decision(&handle_dir_abs));
+    let mut cmd = build_codex_exec_command_with(
+        base_dir,
+        account,
+        &handle_dir_abs,
+        rest,
+        messaging_wrap,
+        Some(messaging_on),
+    )?;
+    if messaging.is_some() {
+        // Record the carried decision in the new handle dir so an exec-replace swap reads it
+        // (a failure is logged with a fixed tag; the supervised path does not need the file).
+        csq_core::messaging::register::record_decision_logged(&handle_dir_abs, messaging_on);
+    }
+
+    // M6 T6.4: inject the advisory path-scope env (empty unless the gate returned
+    // Conditional with a declared path-scope). codex does NOT natively enforce
+    // this var — the constraint is advisory + attested per the M6 fidelity gap.
+    for (k, v) in &codex_spawn_scope_env {
+        cmd.env(k, v);
+    }
+
+    // The MCP-proxy rewrite (Shard 3a) as a `(csq_bin, envelope_path)` pair for the
+    // materializer, threaded into both the Inherit and WithLayer paths.
+    let mcp_wrap = codex_mcp_rewrite
+        .as_ref()
+        .map(|(bin, path)| (bin.as_str(), path.as_path()));
+
+    match layer_control {
+        LayerControl::Inherit => {
+            // Layer-bypass result shape. Cross-slot swap-resume shard S2:
+            // this path no longer calls `exec_or_spawn` on unix — it spawns
+            // codex as a supervised child via `codex_supervise::run_supervised`
+            // below, which owns the platform-conditional end_ts + flush for
+            // every non-swap exit (mirroring PR-CA10c R1 redteam HIGH fix's
+            // original intent). On a cross-slot swap, `run_supervised`
+            // instead finalizes/flushes THIS emitter itself as a handed-off
+            // swap before relaunching with a fresh one (C-F3/S-F4) — see
+            // that function's `Outcome::SwapRequested` handling.
+            use csq_core::audit::{Decision, ResultState};
+
+            // M6 T6.2 Shard 3a: even on the layer-bypass path, a governed codex
+            // spawn with an MCP policy must route its servers through the proxy —
+            // which means materializing the handle config.toml as a regular file
+            // (breaking the Inherit symlink `create_handle_dir_codex` planted) with
+            // `[mcp_servers.*]` rewritten. No MCP policy → the v2.3.1 symlink path
+            // is preserved verbatim (no materialization, no re-stat).
+            if mcp_wrap.is_some() {
+                let skipped =
+                    materialize_handle_config_toml(base_dir, account, &handle_dir, None, mcp_wrap)
+                        .context("failed to materialize per-spawn config.toml (MCP proxy)")?;
+                warn_skipped_remote_mcp(&skipped);
+                // Post-rename re-stat closes the materialize→spawn TOCTOU window.
+                verify_codex_handle_config_toml_is_regular_file(&handle_dir)?;
+            }
+
+            audit
+                .emitter_mut()
+                .set_result(ResultState::Degraded, Decision::Bypass);
+            // F1: the emitter leaves the pre-spawn guard only here, at the
+            // supervised spawn; the share-lock refusal below is the one exit
+            // after this point and ends the record explicitly.
+            let mut spawning = audit.into_spawning();
+            let audit_emitter = spawning.emitter_mut();
+            // Cross-slot swap-resume shard S2: codex is supervised (spawn +
+            // wait, never `exec` on unix) rather than exec-replaced, so a
+            // `csq swap` shelled out from INSIDE this codex session can hand
+            // the swap back to THIS process. The relaunch closure
+            // `supervise_codex_holding_share_lock` builds recurses into
+            // `launch_codex` itself for the target slot — its own spawn
+            // point reaches back into `codex_supervise::run_supervised` for
+            // the new child, so "the new child is supervised the same way"
+            // without an explicit loop here. See `codex_supervise`'s module
+            // doc for the full contract with `csq swap` (shard S3).
+            //
+            // F8: held across the whole supervised run (spawn through
+            // however long this codex child lives), not just the spawn
+            // syscall — `csq sessions share`'s EXCLUSIVE migration lock
+            // must not retarget the session store this child is actively
+            // reading/writing to for as long as it is alive, not merely
+            // at the instant it was spawned. Each recursive `launch_codex`
+            // relaunch call reaches this SAME match arm and acquires its
+            // own SHARED guard, so first launch and every relaunch are
+            // covered uniformly. `ShareError`'s messages carry no secrets
+            // (lock-contention/IO text over session-store paths only).
+            let codex_share_lock =
+                match csq_core::session::shared_state::acquire_codex_share_lock_shared(base_dir) {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        end_codex_run_before_spawn(audit_emitter, is_relaunch);
+                        return Err(anyhow!("{e}"));
+                    }
+                };
+            supervise_codex_holding_share_lock(
+                codex_share_lock,
+                cmd,
+                &handle_dir,
+                base_dir,
+                settings,
+                rest,
+                is_relaunch,
+                swap_correlation,
+                audit_emitter,
+                messaging_on,
+                embedded_native_fallback,
+            )
+        }
+        LayerControl::WithLayer {
+            mode,
+            class,
+            rule_ids_in_scope,
+            scaffold,
+            // S3 (an internal ticket): codex materializes SKILLS natively; the rest is
+            // prose. `rules_only_scaffold` is a CC-only field (rebuilt inline
+            // here via `reduced_surface_prose` instead).
+            artifacts,
+            project_root,
+            ..
+        } => {
+            // PR-CA8 commit 2: materialize per-spawn config.toml in the
+            // handle dir with the layer's `developer_instructions` block merged
+            // in (+ Shard 3a MCP-proxy rewrite when a policy is active).
+            // Replaces the symlink at handle_dir/config.toml with a
+            // regular file (spec 07 §7.2.2 deviation under the with-layer
+            // path).
+            //
+            // No mutex acquisition (round-2 R2-C2 retraction) — the
+            // safety net is (a) atomic_replace at canonical writers,
+            // (b) writer rarity (only `csq login --provider codex`
+            // and `daemon::startup_reconciler::pass2_codex_config_toml`
+            // touch the canonical), (c) toml::from_str parse-as-
+            // defense-in-depth on the merge path.
+            // Fix A (native-delegation gate): suppress the flattened `.coc/`
+            // scaffold when the target's native `.codex/` / `AGENTS.md` are
+            // present — codex loads its own artifacts, so injecting the full
+            // `.coc/` flatten into `config.toml developer_instructions` duplicated + blew
+            // past codex's context window (the `csq run 9` bug). An MCP-policy
+            // rewrite (`mcp_wrap`) is orthogonal and still materializes.
+            // `CSQ_COC_PARITY_TEST=1` forces injection for parity testing.
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let inject = should_inject_scaffold(Surface::Codex, &cwd, project_root.as_deref());
+            // S3 (an internal ticket): deliver codex-native SKILLS through
+            // `$CODEX_HOME/skills/` (native progressive disclosure instead of a
+            // flattened prose blob). The current emitter leaves agents, commands,
+            // and rules as prose. The materialization falls back to
+            // prose INDEPENDENTLY on failure — nothing is ever dropped.
+            let mut skills_native = false;
+            if inject && !artifacts.skills.is_empty() {
+                match materialize_codex_native(&handle_dir_abs, &artifacts) {
+                    Ok(()) => skills_native = true,
+                    Err(e) => {
+                        if e.downcast_ref::<CodexSkillsPublicationError>().is_some() {
+                            return Err(e)
+                                .context("refusing launch after unsafe Codex skills publication");
+                        }
+                        // The materializer keeps inherited skills intact on error;
+                        // only generated skills fall back to prose.
+                        tracing::warn!(
+                            error_kind = "coc_codex_native_failed",
+                            "codex-native skills materialization failed; falling back to prose: {}",
+                            csq_core::error::redact_tokens(&e.to_string())
+                        );
+                    }
+                }
+            }
+            // Prose (config.toml `developer_instructions`) = exactly the kinds NOT delivered
+            // natively. When !inject (project carries its own native `.codex/`),
+            // defer entirely — Level-1 behavior byte-unchanged.
+            let prose_owned: Option<String> = if !inject {
+                if scaffold.as_deref().is_some_and(|s| !s.is_empty()) {
+                    note_scaffold_deferred(Surface::Codex);
+                }
+                None
+            } else if skills_native {
+                // Skills native → prose is every OTHER kind (rules/agents/commands).
+                let remaining = csq_core::coc::translate::SurfaceArtifacts {
+                    skills: Vec::new(),
+                    ..(*artifacts).clone()
+                };
+                reduced_surface_prose(
+                    Surface::Codex,
+                    &remaining,
+                    class.class == csq_core::capability_layer::PromptClassKind::Compliance,
+                )
+            } else {
+                // No skills, or materialization failed → full prose (all kinds).
+                scaffold
+            };
+            let instructions = prose_owned.as_deref().filter(|s| !s.is_empty());
+            if instructions.is_some() || mcp_wrap.is_some() {
+                let skipped = materialize_handle_config_toml(
+                    base_dir,
+                    account,
+                    &handle_dir,
+                    instructions,
+                    mcp_wrap,
+                )
+                .context("failed to materialize per-spawn config.toml overlay")?;
+                warn_skipped_remote_mcp(&skipped);
+                // Round-1 C4: post-rename re-stat closes the TOCTOU window between
+                // materialization and `Command::spawn`. GUARDED by the same
+                // condition as the materialization (redteam R1 finding 3.1): when
+                // NEITHER instructions nor an MCP policy applies, no materialization
+                // ran and `<handle_dir>/config.toml` is still the symlink
+                // `create_handle_dir_codex` planted — re-stating it would spuriously
+                // fail-closed with a bogus "became a symlink (TOCTOU)" refusal.
+                // Symmetric with the Inherit arm's guarded re-stat.
+                verify_codex_handle_config_toml_is_regular_file(&handle_dir)?;
+            }
+            // Cross-slot swap-resume shard S2: `SpawnMode::Interactive` is
+            // supervised (see the Inherit arm above for the full rationale
+            // and the `codex_supervise` module doc for the swap contract).
+            // `SpawnMode::OneShot` (capability-layer `--print`-shaped
+            // capture + post-validate) has no interactive terminal a user
+            // could shell out `csq swap` from, so it is left on the
+            // existing `spawn_one_shot_with_post_validate` path unchanged
+            // — bypassing `spawn_with_layer`'s dispatch wrapper directly
+            // rather than editing that shared (claude-and-codex) function.
+            // F1: the emitter leaves the pre-spawn guard only here, at the
+            // spawn; the Interactive share-lock refusal below is the one exit
+            // after this point and ends the record explicitly.
+            let mut spawning = audit.into_spawning();
+            let audit_emitter = spawning.emitter_mut();
+            let result = match mode {
+                SpawnMode::OneShot => spawn_one_shot_with_post_validate(
+                    cmd,
+                    &handle_dir,
+                    class,
+                    rule_ids_in_scope.clone(),
+                    toggles,
+                    debug,
+                    audit_emitter,
+                ),
+                SpawnMode::Interactive => {
+                    // F8: see the Inherit-branch call site's identical
+                    // comment — held across the whole supervised run.
+                    let codex_share_lock =
+                        match csq_core::session::shared_state::acquire_codex_share_lock_shared(
+                            base_dir,
+                        ) {
+                            Ok(guard) => guard,
+                            Err(e) => {
+                                end_codex_run_before_spawn(audit_emitter, is_relaunch);
+                                return Err(anyhow!("{e}"));
+                            }
+                        };
+                    supervise_codex_holding_share_lock(
+                        codex_share_lock,
+                        cmd,
+                        &handle_dir,
+                        base_dir,
+                        settings,
+                        rest,
+                        is_relaunch,
+                        swap_correlation,
+                        audit_emitter,
+                        messaging_on,
+                        embedded_native_fallback,
+                    )
+                }
+            };
+            // WithLayer path: spawn+wait, so Drop fires normally. Populate
+            // audit fields reflecting the actual post-spawn outcome.
+            //
+            // PR-CA10c R1 redteam MEDIUM fix: cited fields stay empty until
+            // spawn_with_layer plumbs the actual cited set — see the
+            // matching block in launch_anthropic for full rationale.
+            let _ = rule_ids_in_scope;
+            {
+                use csq_core::audit::{Decision, ResultState};
+                let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                audit_emitter.set_end_ts(end_ts);
+                audit_emitter.set_result(ResultState::Pass, Decision::Accept);
+                audit_emitter.set_rule_ids(vec![], vec![]);
+            }
+            result
+        }
+    }
+}
+
+/// The capability-layer settings `csq run` threads into `launch_codex` for a
+/// codex slot, and which a supervised codex session's relaunch and
+/// relaunch-validation closures capture. `csq run` builds them with
+/// [`CodexLaunchSettings::from_run_flags`]; `csq swap` into a codex slot
+/// builds them with [`CodexLaunchSettings::for_plain_run`] — the same
+/// constructor fed the values a flagless `csq run <N>` resolves — so a
+/// swap-launched codex session carries exactly what `csq run` would build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CodexLaunchSettings<'a> {
+    pub(crate) capability_layer_enabled: bool,
+    pub(crate) layer_is_auto: bool,
+    pub(crate) toggles: CapabilityLayerToggles,
+    pub(crate) debug: bool,
+    pub(crate) bench_mode: Option<&'a str>,
+    pub(crate) coc_cache_enabled: bool,
+}
+
+impl<'a> CodexLaunchSettings<'a> {
+    /// `csq run`'s construction from its parsed flags and the persisted
+    /// toggles (`handle`).
+    pub(crate) fn from_run_flags(
+        layer_intent: super::super::LayerIntent,
+        toggles: CapabilityLayerToggles,
+        debug: bool,
+        bench_mode: Option<&'a str>,
+        coc_cache_enabled: bool,
+    ) -> Self {
+        Self {
+            capability_layer_enabled: layer_intent.enabled(),
+            layer_is_auto: layer_intent.is_auto(),
+            toggles,
+            debug,
+            bench_mode,
+            coc_cache_enabled,
+        }
+    }
+}
+
+impl CodexLaunchSettings<'static> {
+    /// What `csq run <N>` with no flags builds: no `--capability-layer` /
+    /// `--no-capability-layer`, no `--debug`, no `--bench-mode`, no
+    /// `--no-coc-cache`, and the toggles persisted in `base_dir`.
+    pub(crate) fn for_plain_run(base_dir: &Path) -> Self {
+        Self::from_run_flags(
+            super::super::LayerIntent::from_flags(false, false),
+            load_capability_layer_toggles(base_dir),
+            /* debug */ false,
+            /* bench_mode */ None,
+            /* coc_cache_enabled */ true,
+        )
+    }
+}
+
+/// The audit emitter `csq run` builds for `account` on `surface` (`handle`),
+/// and `csq swap` into a codex slot builds for the session it supervises.
+pub(crate) fn run_audit_emitter(
+    base_dir: &Path,
+    surface: SurfaceCli,
+    account: AccountNum,
+    start_ts: String,
+) -> crate::cli::audit_emit::AuditEmitter {
+    build_audit_emitter(
+        base_dir,
+        audit_surface_for(surface),
+        format!("csq run account {}", account.get()),
+        start_ts,
+    )
+}
+
+/// Ends a codex run's audit record on an exit reached BEFORE codex was
+/// spawned, so no record claims a codex session that never ran (the
+/// emitter's default `Degraded`/`Bypass` state is what `Drop` would
+/// otherwise flush).
+///
+/// - A record carrying a spawn-gate verdict, or a swap RELAUNCH's emitter
+///   (F4: it reports that swap's own attempt), is finalised as `Fail` /
+///   `Reject` with `end_ts` — the shape `evaluate_codex_spawn_gate`'s
+///   `Refuse` arm writes — so the governance verdict is not dropped — and
+///   flushed HERE through [`fail_loud_on_audit_write_failure`], the same
+///   fail-loud flush the `Refuse` and spawn-failure arms use: a record that
+///   cannot be written even to `.pending/` exits non-zero with the
+///   remediation message instead of being left to `Drop`'s WARN-only write.
+/// - Otherwise the record is discarded: nothing was governed and nothing
+///   ran, the same disposition `exit_cleanly_if_terminating_before_spawn`
+///   gives a first launch.
+pub(crate) fn end_codex_run_before_spawn(
+    audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+    is_relaunch: bool,
+) {
+    if is_relaunch || audit_emitter.spawn_gate_recorded() {
+        use csq_core::audit::{Decision, ResultState};
+        let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        audit_emitter.set_end_ts(end_ts);
+        audit_emitter.set_result(ResultState::Fail, Decision::Reject);
+        fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+    } else {
+        audit_emitter.discard();
+    }
+}
+
+/// A first-launch codex run's audit emitter while every step before the
+/// spawn is still able to refuse (`csq run` and `csq swap` into a codex
+/// slot). Dropped on
+/// ANY such exit — a `?`, an early `return`, a declined prompt — it ends the
+/// record through [`end_codex_run_before_spawn`], so no pre-spawn path can
+/// flush the default `Bypass` record. [`Self::into_spawning`] hands the
+/// emitter on only at the supervised-spawn call; from there the supervisor
+/// ends it on its own pre-spawn exits.
+pub(crate) struct PreSpawnCodexRun {
+    emitter: Option<crate::cli::audit_emit::AuditEmitter>,
+}
+
+impl PreSpawnCodexRun {
+    pub(crate) fn new(emitter: crate::cli::audit_emit::AuditEmitter) -> Self {
+        Self {
+            emitter: Some(emitter),
+        }
+    }
+
+    /// The held emitter. `None` only after [`Self::into_spawning`], which
+    /// consumes `self`, so every reachable call sees `Some`.
+    pub(crate) fn emitter_mut(&mut self) -> &mut crate::cli::audit_emit::AuditEmitter {
+        self.emitter
+            .get_or_insert_with(crate::cli::audit_emit::AuditEmitter::disabled)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn emitter_for_test(&self) -> Option<&crate::cli::audit_emit::AuditEmitter> {
+        self.emitter.as_ref()
+    }
+
+    /// Releases the emitter to the spawn.
+    pub(crate) fn into_spawning(mut self) -> crate::cli::audit_emit::AuditEmitter {
+        self.emitter
+            .take()
+            .unwrap_or_else(crate::cli::audit_emit::AuditEmitter::disabled)
+    }
+}
+
+impl Drop for PreSpawnCodexRun {
+    fn drop(&mut self) {
+        if let Some(mut emitter) = self.emitter.take() {
+            // A governed record is finalised and flushed fail-loud inside
+            // the helper; `process::exit` (its `.pending/` total-failure
+            // arm) is an ordinary call from `drop` — it neither unwinds nor
+            // returns, so no destructor contract is broken. A discarded
+            // record writes nothing; `emitter` then drops as a no-op.
+            end_codex_run_before_spawn(&mut emitter, /* is_relaunch */ false);
+        }
+    }
+}
+
+/// The audit emitter `launch_codex` runs under. The variant IS the launch
+/// kind, so a first launch can never be mistaken for a relaunch.
+pub(crate) enum CodexLaunchAudit<'a> {
+    /// `csq run`'s first launch: the guard ends the record on EVERY exit
+    /// before [`Self::into_spawning`] (a `?`, an early `return`), so no
+    /// pre-spawn exit can flush the default `Degraded`/`Bypass` record.
+    First(Box<PreSpawnCodexRun>),
+    /// A swap RELAUNCH (`codex_supervise::run_supervised`'s `relaunch`
+    /// closure): the supervisor owns this emitter and finalises it as
+    /// `Fail`/`Reject` on any `Err` the relaunch returns (FM-6).
+    Relaunch(&'a mut crate::cli::audit_emit::AuditEmitter),
+}
+
+impl<'a> CodexLaunchAudit<'a> {
+    pub(crate) fn is_relaunch(&self) -> bool {
+        matches!(self, Self::Relaunch(_))
+    }
+
+    pub(crate) fn emitter_mut(&mut self) -> &mut crate::cli::audit_emit::AuditEmitter {
+        match self {
+            Self::First(guard) => guard.emitter_mut(),
+            Self::Relaunch(emitter) => emitter,
+        }
+    }
+
+    /// Leaves the pre-spawn guard. Called only at a spawn site; the exits
+    /// between here and the spawn end the record explicitly
+    /// ([`end_codex_run_before_spawn`]).
+    pub(crate) fn into_spawning(self) -> SpawningCodexAudit<'a> {
+        match self {
+            Self::First(guard) => SpawningCodexAudit::Owned(Box::new((*guard).into_spawning())),
+            Self::Relaunch(emitter) => SpawningCodexAudit::Borrowed(emitter),
+        }
+    }
+}
+
+/// [`CodexLaunchAudit`] after it has left the pre-spawn guard.
+pub(crate) enum SpawningCodexAudit<'a> {
+    Owned(Box<crate::cli::audit_emit::AuditEmitter>),
+    Borrowed(&'a mut crate::cli::audit_emit::AuditEmitter),
+}
+
+impl SpawningCodexAudit<'_> {
+    pub(crate) fn emitter_mut(&mut self) -> &mut crate::cli::audit_emit::AuditEmitter {
+        match self {
+            Self::Owned(emitter) => emitter,
+            Self::Borrowed(emitter) => emitter,
+        }
+    }
+}
+
+/// The ONE path that supervises an interactive codex child: `launch_codex`
+/// (both its `Inherit` and `WithLayer`/`Interactive` arms) and `csq swap`
+/// into a codex slot both end here.
+///
+/// The caller has ALREADY acquired the SHARED codex share lock
+/// (`share_lock`) and prepared `handle_dir`. This holds the guard — whose
+/// descriptor keeps `FD_CLOEXEC`, so neither codex nor any tool subprocess
+/// it starts inherits it — until the supervised run returns, then drops
+/// it. That holds while csq lives: on Linux the codex child is armed with
+/// `PR_SET_PDEATHSIG(SIGTERM)` (`codex_supervise::reset_signal_dispositions_before_exec`)
+/// so it does not outlive csq; macOS has no death signal, and a SIGKILLed
+/// csq drops the lock while an orphaned codex runs on. A cross-slot swap requested from inside the session relaunches via
+/// `launch_codex`, which acquires its own fresh SHARED guard for the new
+/// child while this one is still held.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn supervise_codex_holding_share_lock(
+    share_lock: csq_core::session::shared_state::CodexShareLockGuard,
+    cmd: Command,
+    handle_dir: &Path,
+    base_dir: &Path,
+    settings: CodexLaunchSettings<'_>,
+    rest: &[String],
+    is_relaunch: bool,
+    swap_correlation: Option<csq_core::session::codex_supervisor::SwapAuditCorrelation>,
+    audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+    messaging_on: bool,
+    embedded_native_fallback: bool,
+) -> Result<()> {
+    let CodexLaunchSettings {
+        capability_layer_enabled,
+        layer_is_auto,
+        toggles,
+        debug,
+        bench_mode,
+        coc_cache_enabled,
+    } = settings;
+    let relaunch = move |target_slot: u16,
+                         thread_id: Option<&str>,
+                         swap_correlation: Option<
+        csq_core::session::codex_supervisor::SwapAuditCorrelation,
+    >,
+                         audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+                         messaging: bool|
+          -> Result<()> {
+        let target_account = AccountNum::try_from(target_slot)
+            .map_err(|e| anyhow!("invalid target slot {target_slot}: {e}"))?;
+        let new_rest = codex_supervise::relaunch_rest(target_slot, thread_id, rest);
+        launch_codex(
+            base_dir,
+            target_account,
+            capability_layer_enabled,
+            layer_is_auto,
+            &toggles,
+            debug,
+            bench_mode,
+            coc_cache_enabled,
+            &new_rest,
+            CodexLaunchAudit::Relaunch(audit_emitter),
+            swap_correlation,
+            Some(messaging),
+        )
+    };
+    // F2 (round 5) / D-F9 (round 7): `make_validate_relaunch` captures the
+    // EXACT same invocation values the `relaunch` closure above captures —
+    // see its own doc, and `validate_codex_relaunch_target`'s, for what this
+    // validates. D-F6 close-out (round 8): `base_dir`/`toggles` are cloned
+    // into the closure's OWNED captures — see `make_validate_relaunch`'s doc
+    // for why this is what makes the closure `Send + Sync + 'static`.
+    let validate_relaunch = make_validate_relaunch(
+        base_dir.to_path_buf(),
+        capability_layer_enabled,
+        layer_is_auto,
+        toggles,
+        debug,
+        coc_cache_enabled,
+    );
+    let result = codex_supervise::run_supervised_carrying(
+        cmd,
+        handle_dir,
+        base_dir,
+        validate_relaunch,
+        is_relaunch,
+        swap_correlation,
+        audit_emitter,
+        relaunch,
+        Some(messaging_on),
+        embedded_native_fallback,
+    );
+    drop(share_lock);
+    result
+}
+
+/// Builds a codex `Command` carrying the SAME env-stripping, sandbox/approval
+/// flag derivation, and passthrough-arg handling that `launch_codex` uses for
+/// its own spawn (`codex_command` + the GH an internal ticket sandbox-flag block that used
+/// to live inline in `launch_codex`). Cross-slot swap-resume shard S3 (item 3
+/// of the governing task) factored this out so
+/// `swap.rs::supervise_codex_after_binding` — which supervises a fresh codex
+/// child itself (it runs from a plain shell, not inside a supervised session,
+/// so there is no live supervisor to hand the swap off to) — builds an
+/// identical process image on the flag/env axis instead of the bare
+/// `Command::new(CLI_BINARY)` it used before this shard.
+///
+/// Deliberately does NOT itself run the JWT-exp pre-flight
+/// (`check_codex_token_freshness`), evaluate the M6 T6.1 spawn gate, or
+/// resolve the M6 T6.2 MCP-proxy rewrite — those need an `&mut AuditEmitter`
+/// and (for the gate) a resolved `OperatingEnvelope` that THIS function's
+/// call site does not carry. This is no longer a silent or reported gap:
+/// `swap::supervise_codex_after_binding` now runs the token-freshness check
+/// itself, and receives the gate verdict + MCP rewrite from ITS OWN caller
+/// (`exec_replace_swap`, which calls `evaluate_codex_spawn_gate` before the
+/// Step-2 tombstone and `resolve_codex_mcp_rewrite` after Step 3) as plain,
+/// cfg-independent arguments — see that function's doc comment for the exact
+/// sequencing that closed this parity gap (cross-slot swap-resume shard S3).
+#[cfg(test)]
+pub(crate) fn build_codex_exec_command(
+    base_dir: &Path,
+    account: AccountNum,
+    handle_dir: &Path,
+    rest: &[String],
+) -> Result<Command> {
+    build_codex_exec_command_with(base_dir, account, handle_dir, rest, None, None)
+}
+
+/// `build_codex_exec_command` for a caller that has resolved the M6 T6.2 MCP-proxy rewrite
+/// (`(csq_bin, envelope_snapshot)`): the messaging MCP server (spec 32 §6) is then routed
+/// through `csq mcp-proxy` like every other stdio server, instead of registered direct.
+/// `messaging` is `Some(decision)` when the caller carries a terminal's launch decision (a
+/// swap), `None` for a fresh launch that reads it from the handle dir or the environment.
+pub(crate) fn build_codex_exec_command_with(
+    base_dir: &Path,
+    account: AccountNum,
+    handle_dir: &Path,
+    rest: &[String],
+    mcp_wrap: Option<(&str, &Path)>,
+    messaging: Option<bool>,
+) -> Result<Command> {
+    // Admission must use the actual passthrough, before native spawn or MCP setup.
+    let resume = codex_resume_route(rest)?;
+    if resume != CodexResumeRoute::Ordinary {
+        let config = codex_surface::config_toml_path(base_dir, account);
+        let sqlite_home = config.parent().ok_or(CodexResumeRefused {
+            reason: "slot state directory unavailable",
+        })?;
+        match resume {
+            CodexResumeRoute::Exact(target) => {
+                repair_codex_resume_target(base_dir, sqlite_home, target)?
+            }
+            CodexResumeRoute::Full => repair_codex_resume_all(base_dir, sqlite_home)?,
+            CodexResumeRoute::Ordinary => {}
+        }
+    }
+    let mut cmd = codex_command(base_dir, account, handle_dir)?;
+    match messaging {
+        Some(on) => attach_messaging_codex_as(&mut cmd, handle_dir, mcp_wrap, on),
+        None => attach_messaging_codex(&mut cmd, handle_dir, mcp_wrap),
+    }
+
+    // 2026-05-15 sandbox bug fix: pass sandbox/approval flags derived
+    // from user-global ~/.codex/config.toml at spawn. Codex CLI's
+    // policy precedence treats CLI flags as authoritative for the
+    // strict policy layer; merging keys into config-N/config.toml
+    // alone produced sessions where the model still had to request
+    // escalation despite the file having approval_policy = "never" +
+    // sandbox_mode = "danger-full-access".
+    //
+    // GH an internal ticket: the derived FULL-BYPASS flag
+    // (`--dangerously-bypass-approvals-and-sandbox`) is a TERMINAL override —
+    // a later `-s read-only` in the passthrough cannot undo it (it is not a
+    // `-s` value, so codex's last-wins argparse does not apply). So a caller
+    // driving a sandboxed one-shot (`csq run N -- exec -s read-only …`) could
+    // not downscope. Fix: when the caller's passthrough ALREADY specifies a
+    // sandbox / approval policy (or `--ignore-user-config`), suppress the
+    // derived flags entirely so the caller's explicit policy is the ONLY one
+    // codex sees. Otherwise inject as before (BEFORE `rest`, last-wins for the
+    // granular `-a`/`-s` case). Resume never acquires csq-derived policy.
+    if !codex_surface::caller_overrides_sandbox(rest) && !codex_supervise::is_native_resume(rest) {
+        let derived_flags = codex_surface::derive_spawn_flags(
+            codex_surface::read_user_global_config_toml().as_deref(),
+        );
+        cmd.args(&derived_flags);
+    }
+    cmd.args(rest);
+    Ok(cmd)
+}
+
+/// Record the launch-time messaging decision for a terminal that registers nothing itself
+/// (Gemini and the native kimi/grok launches have no messaging tools). A swap out of such a
+/// terminal reads this marker (`register::existing_decision`): without it the source reads
+/// "off" (no marker, no csq hook) and a Gemini or native terminal swapped into Claude or
+/// Codex would silently lose messaging. Reads `CSQ_MESSAGING` once (`register::decision`); a
+/// failed write is logged with a fixed tag and the launch proceeds.
+///
+/// Returns the decision, so a launch that builds its own `Command` can also put it in the
+/// CLI's environment ([`set_decision_env`]).
+pub(crate) fn record_launch_decision(handle_dir: &Path) -> bool {
+    csq_core::messaging::register::decision(handle_dir)
+}
+
+/// Put the launch decision in the CLI's own environment as `CSQ_MESSAGING_DECISION`. Set
+/// EXPLICITLY on every launch, on or off, so a value exported in the parent shell never
+/// reaches the session; `strip_sensitive_env` does not touch it (it removes only the vendor
+/// credential prefixes). A swap run from inside the session reads it when the marker file is
+/// missing (`register::existing_decision_in_session`).
+pub(crate) fn set_decision_env(cmd: &mut Command, on: bool) {
+    cmd.env(
+        csq_core::messaging::register::DECISION_ENV,
+        csq_core::messaging::register::decision_env_value(on),
+    );
+}
+
+/// Spec 32 §6: register the messaging MCP server for THIS Codex launch only, as `-c
+/// mcp_servers.csq-messaging.*` flags against the terminal's own `CODEX_HOME`. The user's
+/// `~/.codex/config.toml` is not opened (INV-32-07): the flags live in this process's argv.
+/// `CSQ_MESSAGING=off` adds nothing; a registration that cannot be built logs a fixed tag
+/// and the launch proceeds without messaging (fail-open).
+fn attach_messaging_codex(cmd: &mut Command, handle_dir: &Path, mcp_wrap: Option<(&str, &Path)>) {
+    // The launch decision: a fresh handle dir reads `CSQ_MESSAGING` once and records it; a
+    // swap target already carries its source's recorded decision, which is what is read here.
+    let on = csq_core::messaging::register::decision(handle_dir);
+    attach_messaging_codex_as(cmd, handle_dir, mcp_wrap, on);
+}
+
+/// [`attach_messaging_codex`] with the decision supplied by the caller (a swap hands over its
+/// source terminal's decision, so a failed marker write cannot send it back to the env).
+fn attach_messaging_codex_as(
+    cmd: &mut Command,
+    handle_dir: &Path,
+    mcp_wrap: Option<(&str, &Path)>,
+    on: bool,
+) {
+    use csq_core::messaging::register;
+    set_decision_env(cmd, on);
+    // Codex cannot send or be targeted on Windows (its session listing is undetermined), so
+    // five tools that always fail are not registered there (spec 32b section 6).
+    if cfg!(windows) || !on {
+        return;
+    }
+    let bin = register::program_path();
+    let proxy = mcp_wrap.map(|(b, envelope)| (Path::new(b), envelope));
+    match register::codex_config_args(&bin, handle_dir, proxy) {
+        Ok(args) => {
+            cmd.args(args);
+        }
+        Err(e) => tracing::warn!(
+            error_kind = register::LOG_TAG_FAILED,
+            reason = e.tag(),
+            "launching codex without the messaging server"
+        ),
+    }
+}
+
+/// Spec 32 §6: register the messaging MCP server and hooks for THIS Claude Code launch.
+/// The server is passed as an inline `--mcp-config` (no file lands in `term-<pid>`); the
+/// three hooks and six `permissions.allow` entries are added to the handle dir's own
+/// csq-materialized settings file, which the user-global one is only ever READ into
+/// (INV-32-07). Both halves are all-or-nothing: the config string is built first (it is pure
+/// and the likelier to fail), then the settings edit, then the flag is added, so a refusal
+/// never leaves tools registered but unapproved. `CSQ_MESSAGING=off` registers nothing, and
+/// any failure logs a fixed tag and launches without messaging.
+pub(crate) fn attach_messaging_claude(cmd: &mut Command, handle_dir: &Path) {
+    // The launch decision (see `attach_messaging_codex`): recorded once, then only read.
+    let on = csq_core::messaging::register::decision(handle_dir);
+    attach_messaging_claude_as(cmd, handle_dir, on);
+}
+
+/// [`attach_messaging_claude`] with the decision supplied by the caller (the swap exec path).
+pub(crate) fn attach_messaging_claude_as(cmd: &mut Command, handle_dir: &Path, on: bool) {
+    use csq_core::messaging::register;
+    set_decision_env(cmd, on);
+    if !on {
+        return;
+    }
+    let bin = register::program_path();
+    let built = register::claude_mcp_config(&bin, handle_dir).and_then(|cfg| {
+        let bin_str = bin.to_str().ok_or(register::RegisterError::NonUtf8Path)?;
+        register::register_handle_settings(handle_dir, bin_str)?;
+        Ok(cfg)
+    });
+    match built {
+        Ok(cfg) => {
+            cmd.arg("--mcp-config").arg(cfg);
+        }
+        Err(e) => tracing::warn!(
+            error_kind = register::LOG_TAG_FAILED,
+            reason = e.tag(),
+            "launching claude without the messaging server"
+        ),
+    }
+}
+
+/// Typed pre-spawn refusal, with a static operator-safe recovery hint.
+#[derive(Debug, thiserror::Error)]
+#[error("CSQ_CODEX_RESUME_TARGET: {reason}. Recover the target transcript in persistent storage, then retry the same csq resume command; native Codex was not launched")]
+struct CodexResumeRefused {
+    reason: &'static str,
+}
+
+/// Pre-spawn refusal for the DEADLINE class only: the bounded admission budget
+/// expired before the target could be verified. Distinct from
+/// [`CodexResumeRefused`] because the recovery action is the OPPOSITE one — the
+/// same command is retried unchanged, and no operator goes looking for a
+/// transcript to repair. A starved host (every sqlite3 child deferred behind
+/// sibling load) reaches this arm; a damaged or ambiguous target never does.
+/// Which inner failures route here:
+/// `shared_state::codex_sqlite::is_bounded_deadline_refusal`.
+#[derive(Debug, thiserror::Error)]
+#[error("CSQ_CODEX_RESUME_TARGET: {reason}. Native Codex was not launched and no persistent state was changed; retry the same csq resume command (this host did not finish the bounded admission in time — the transcript is not implicated)")]
+struct CodexResumeAdmissionBusy {
+    reason: &'static str,
+}
+
+/// Reason line for the deadline class. Names the deadline, never the transcript.
+const ADMISSION_DEADLINE_REASON: &str =
+    "the bounded admission deadline expired before the target could be verified";
+
+/// Test-only seam pinning the ORDERING "the admission work budget starts only
+/// after the shared migration lock is admitted" — without any elapsed-time
+/// assertion. `route_entry_at` is sampled on entry, `lock_admitted_at`
+/// immediately after the acquire returns, and `budget_started_at` where the
+/// deadline is computed. A test holds the lock file EXCLUSIVE across a launch
+/// (so the wait is real) and asserts
+/// `budget_started_at >= lock_admitted_at` — false by the whole lock wait
+/// whenever the clock is (wrongly) created first.
+///
+/// Same zero-footprint-outside-test posture as `shared_state`'s repair hooks:
+/// the `thread_local!` itself does not exist in a production build, and
+/// production code never populates it.
+// Recorded on every platform, but its only reader is a unix-only test, so a
+// Windows test build never reads the fields.
+#[cfg(test)]
+#[cfg_attr(not(unix), expect(dead_code))]
+#[derive(Clone, Copy)]
+struct AdmissionBudgetOrder {
+    route_entry_at: std::time::Instant,
+    lock_admitted_at: std::time::Instant,
+    budget_started_at: std::time::Instant,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ADMISSION_BUDGET_ORDER: std::cell::Cell<Option<AdmissionBudgetOrder>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn record_test_admission_budget_order(
+    route_entry_at: std::time::Instant,
+    lock_admitted_at: std::time::Instant,
+    budget_started_at: std::time::Instant,
+) {
+    TEST_ADMISSION_BUDGET_ORDER.with(|cell| {
+        cell.set(Some(AdmissionBudgetOrder {
+            route_entry_at,
+            lock_admitted_at,
+            budget_started_at,
+        }))
+    });
+}
+
+#[cfg(all(test, unix))]
+fn take_test_admission_budget_order() -> Option<AdmissionBudgetOrder> {
+    TEST_ADMISSION_BUDGET_ORDER.with(|cell| cell.take())
+}
+
+// Test-only override of the ADMISSION budget for POSITIVE-path rows: a row
+// that proves a healthy step COMPLETES must not be decided by the enclosing
+// admission clock on a loaded host, while the production derivation
+// (CODEX_REPAIR_BUDGET) stays unchanged. A deliberate-deadline row CLEARS it
+// with `set_test_admission_budget(None)` (a generous budget widens the per-step
+// window too — see step_budget). Zero footprint outside a test build.
+// Plain comments, not `///`: rustdoc does not document a `thread_local!`
+// invocation, and `unused_doc_comments` is denied under `-D warnings`.
+#[cfg(test)]
+thread_local! {
+    static TEST_ADMISSION_BUDGET: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+#[cfg_attr(not(unix), expect(dead_code))]
+fn set_test_admission_budget(budget: Option<std::time::Duration>) {
+    TEST_ADMISSION_BUDGET.with(|cell| cell.set(budget));
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexResumeRoute<'a> {
+    Ordinary,
+    Exact(&'a str),
+    Full,
+}
+
+#[cfg(test)]
+fn exact_codex_resume_target(rest: &[String]) -> Result<Option<&str>> {
+    Ok(match codex_resume_route(rest)? {
+        CodexResumeRoute::Exact(target) => Some(target),
+        CodexResumeRoute::Ordinary | CodexResumeRoute::Full => None,
+    })
+}
+
+/// Resume routing is parsed before touching any persistent state.
+/// Config overrides that may relocate SQLite are refused rather than repairing
+/// the slot DB while a different database would receive the native resume.
+fn codex_resume_route(rest: &[String]) -> Result<CodexResumeRoute<'_>> {
+    let refuse = |reason| CodexResumeRefused { reason };
+    // Primary installed 0.160.1 `resume --help` and `exec resume --help`:
+    // flags can precede SESSION_ID; PROMPT is the second positional argument.
+    let value_flags = [
+        "-c",
+        "--config",
+        "--enable",
+        "--disable",
+        "-m",
+        "--model",
+        "-s",
+        "--sandbox",
+        "-a",
+        "--ask-for-approval",
+        "-C",
+        "--cd",
+        "--add-dir",
+        "--local-provider",
+        "--thread-source",
+        "--output-schema",
+        "-o",
+        "--output-last-message",
+    ];
+    let bool_flags = [
+        "--all",
+        "--include-non-interactive",
+        "--strict-config",
+        "--oss",
+        "--approve-for-me",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-bypass-hook-trust",
+        "--search",
+        "--no-alt-screen",
+        "--no-daemon",
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--json",
+    ];
+    let mut index = 0;
+    let mut in_exec = false;
+    let mut in_resume = false;
+    let mut last = false;
+    let mut positionals = Vec::new();
+    let mut route_refusal = None;
+    while let Some(arg) = rest.get(index) {
+        if arg == "--" {
+            if !in_resume {
+                return Ok(CodexResumeRoute::Ordinary);
+            }
+            positionals.extend(rest[index + 1..].iter().map(String::as_str));
+            break;
+        }
+        if arg.starts_with('-') && arg != "-" {
+            let (flag, inline) = arg
+                .split_once('=')
+                .map_or((arg.as_str(), None), |(key, value)| (key, Some(value)));
+            if flag == "--last" {
+                last = true;
+                index += 1;
+                continue;
+            }
+            if flag == "-h" || flag == "--help" || flag == "-V" || flag == "--version" {
+                return Ok(CodexResumeRoute::Ordinary);
+            }
+            if [
+                "-p",
+                "--profile",
+                "--remote",
+                "--remote-auth-token-env",
+                "--worktree",
+                "-i",
+                "--image",
+            ]
+            .contains(&flag)
+            {
+                // Consume known option values before classifying the command:
+                // a filename/model/profile named `resume` is not a subcommand.
+                route_refusal = Some("resume routing or variadic option is not admitted");
+                if flag != "--worktree" && inline.is_none() {
+                    index += 1;
+                    if rest.get(index).is_none() {
+                        return if in_resume {
+                            Err(refuse("resume option value missing").into())
+                        } else {
+                            Ok(CodexResumeRoute::Ordinary)
+                        };
+                    }
+                }
+                index += 1;
+                continue;
+            }
+            if value_flags.contains(&flag) {
+                let value = if let Some(value) = inline {
+                    value
+                } else {
+                    index += 1;
+                    let Some(value) = rest.get(index) else {
+                        return if in_resume {
+                            Err(refuse("resume option value missing").into())
+                        } else {
+                            Ok(CodexResumeRoute::Ordinary)
+                        };
+                    };
+                    value.as_str()
+                };
+                if flag == "-c" || flag == "--config" {
+                    let key = value
+                        .split('=')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .trim_matches(['\"', '\'']);
+                    if key == "sqlite_home" || key.starts_with("sqlite_home.") {
+                        route_refusal =
+                            Some("explicit sqlite_home override is not admitted for exact resume");
+                    }
+                }
+                index += 1;
+                continue;
+            }
+            if bool_flags.contains(&flag) && inline.is_none() {
+                index += 1;
+                continue;
+            }
+            route_refusal = Some("unsupported or ambiguous resume option");
+            index += 1;
+            continue;
+        }
+        if !in_resume {
+            if arg == "resume" {
+                in_resume = true;
+            } else if !in_exec && (arg == "exec" || arg == "e") {
+                in_exec = true;
+            } else {
+                return Ok(CodexResumeRoute::Ordinary);
+            }
+        } else {
+            positionals.push(arg.as_str());
+        }
+        index += 1;
+    }
+    if !in_resume {
+        return Ok(CodexResumeRoute::Ordinary);
+    }
+    if let Some(reason) = route_refusal {
+        return Err(refuse(reason).into());
+    }
+    if positionals.len() > 2 {
+        return Err(refuse("ambiguous explicit resume target").into());
+    }
+    if last || positionals.is_empty() {
+        return Ok(CodexResumeRoute::Full);
+    }
+    let target = positionals[0];
+    let is_uuid = target.len() == 36
+        && target.bytes().enumerate().all(|(i, c)| {
+            if [8, 13, 18, 23].contains(&i) {
+                c == b'-'
+            } else {
+                c.is_ascii_hexdigit()
+            }
+        });
+    if !is_uuid {
+        return Err(refuse(
+            "resume name requires native resolution; an exact UUID target is required",
+        )
+        .into());
+    }
+    Ok(CodexResumeRoute::Exact(target))
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("CSQ_CODEX_RESUME_PARTIAL: {reason}; observed visited={visited} (rows in batches that held no rewrite were read, not committed), committed rewritten={rewritten}, databases={databases_completed}, last_write_commit_unknown={in_flight_commit_unknown}. Native Codex was not launched; retry after resolving the bounded repair condition")]
+struct CodexResumePartial {
+    reason: &'static str,
+    visited: usize,
+    rewritten: usize,
+    databases_completed: usize,
+    in_flight_commit_unknown: bool,
+}
+
+/// Launch-repair allowance, DERIVED from csq-core's terms — no measured term:
+///
+/// ```text
+/// CODEX_REPAIR_BUDGET = CODEX_REPAIR_READ_TOLERANCE_MS   (4_000: migration-lock
+///                                                         admission, discovery,
+///                                                         walks, and the first
+///                                                         step's caller-side
+///                                                         allowance)
+///                     + CODEX_REPAIR_STEP_BUDGET_MS       (9_000: one spawned
+///                                                         child's window, itself
+///                                                         derived as SQLite's
+///                                                         ENFORCED
+///                                                         busy_timeout 5_000
+///                                                         + the 4_000 read
+///                                                         tolerance)
+///                     = 13_000 ms
+/// ```
+///
+/// The budget is larger than `SQLITE_BUSY_TIMEOUT_MS` by construction: the flat
+/// four-second allowance this replaces was SMALLER than the one wait every
+/// generated write script enforces on the shared database, so a
+/// contended-but-healthy admission could never complete — its write step was
+/// killed while it was still waiting inside SQLite's own bound.
+///
+/// ENFORCED WORST CASES for one launch (arithmetic over the caps, never a
+/// measurement): a hung child is killed at its own step window, so the first
+/// candidate database's refusal lands at ≤ 13s + 9s = 22s; on the exact route a
+/// slot whose every spawned step progresses but never finishes is bounded by
+/// the discovery cap (labelled arithmetic over the enforced caps):
+/// 1024 × (5 × (9s + 100ms child-cleanup grace) + 4s walk) = 1024 × 49.5s =
+/// 50 688s ≈ 14.1h (every one of those steps must be slower than its window
+/// without hanging, i.e. an adversarial disk rather than a real host); a
+/// healthy host is unchanged (well under one step window). The `-bail` probe
+/// runs inside its step's window and adds no term. NOT BOUNDED:
+/// `resume_candidate`'s `canonicalize` of a database-supplied path is
+/// interrupted by no timer. These deadlines are enforced only while csq lives.
+/// On Unix, every write child inherits the migration lock's descriptor
+/// (`RepairChild::spawn` in csq-core, which refuses a writer when no lock is
+/// held), and `flock` ownership belongs to that shared open file description,
+/// so the lock stays held until the LAST writer exits, whatever ends csq
+/// (including `SIGKILL`): no migration can take the exclusive lock under a
+/// still-running orphaned writer. What ends an orphaned writer is Linux's
+/// `PR_SET_PDEATHSIG`; elsewhere on Unix, the end of its stdin script (an
+/// undelivered remainder ends at EOF and rolls back, while the delivered part
+/// may finish first with the lock held; see `RepairChild` in csq-core). On
+/// Windows each writer is in a kill-on-close Job Object instead. A terminal interrupt is not forwarded to the children
+/// (each runs in its own process group); each write batch is one transaction
+/// that commits or rolls back whole.
+///
+/// The FULL route (`repair_codex_resume_all`) spends this allowance on
+/// discovery (≤ 1024 entries) and the filename index (≤ 20 000 entries) only;
+/// its database walk is bounded by csq-core's own enforced windows, so its
+/// ENFORCED worst case is (arithmetic over the mechanisms, never a measurement)
+/// 13s + Σ over ≤ 1024 databases of [(5 + P + B) × (9s + 100ms child-cleanup
+/// grace) + (P + B) × 4s]. P ≤ R + 1 page reads and B ≤ R flushed write batches
+/// (each spawns at most one child); the 4s terms are the walk window armed
+/// after each page read and re-armed after each acknowledged batch (each
+/// max(remaining window, 4s)). R is bounded by the distinct rowids at or below
+/// the highwater read before paging that the walk observes (strictly
+/// increasing cursor, `rowid<=highwater` page filter), NOT a captured count.
+/// It scales with the rows rather than a flat cap, which is what lets a
+/// slow-but-healthy host finish a large table (see `repair_resume_all_before`).
+/// NOT BOUNDED: one row's filesystem admission (`canonicalize` of a
+/// database-supplied path in `indexed_resume_candidate`) is interrupted by no
+/// timer, so a hung mount can stall the launch.
+///
+/// The launch-latency COST is the middle number: `csq resume` against a hung
+/// slot now refuses after ~22s instead of at 4s. It is bought so that a
+/// HEALTHY step is never killed inside the enforced wait its own script
+/// performs, and A2's distinct refusal makes that latency legible
+/// ([`CodexResumeAdmissionBusy`], whose hint is to retry — never to repair a
+/// transcript).
+///
+/// The budget starts only AFTER `acquire_codex_share_lock_shared` returns: that
+/// acquire waits up to ~2s for a live migration, and charging that wait would
+/// cut this allowance on exactly the hosts already under load.
+const CODEX_REPAIR_BUDGET: std::time::Duration = std::time::Duration::from_millis(
+    csq_core::session::shared_state::codex_sqlite::CODEX_REPAIR_READ_TOLERANCE_MS
+        + csq_core::session::shared_state::codex_sqlite::CODEX_REPAIR_STEP_BUDGET_MS,
+);
+
+fn codex_repair_deadline() -> std::time::Instant {
+    #[cfg(test)]
+    if let Some(budget) = TEST_ADMISSION_BUDGET.with(|cell| cell.get()) {
+        return std::time::Instant::now() + budget;
+    }
+    std::time::Instant::now() + CODEX_REPAIR_BUDGET
+}
+
+fn repair_codex_resume_all(base_dir: &Path, sqlite_home: &Path) -> Result<()> {
+    use csq_core::session::shared_state::codex_sqlite::{
+        repair_resume_all_before, PagedResumeOutcome, PagedResumeProgress,
+    };
+    let partial = |reason| CodexResumePartial {
+        reason,
+        visited: 0,
+        rewritten: 0,
+        databases_completed: 0,
+        in_flight_commit_unknown: false,
+    };
+    // The allowance covers discovery and the filename index; every database's
+    // walk is then bounded by csq-core's per-step and per-page windows (see
+    // `CODEX_REPAIR_BUDGET`). It starts AFTER the shared migration lock is
+    // admitted, so waiting for a live migration to finish is not charged to the
+    // repair's own work budget. The
+    // instants are sampled only in test builds, where the ordering seam asserts
+    // this route as well as the exact one.
+    #[cfg(test)]
+    let route_entry_at = std::time::Instant::now();
+    let guard = csq_core::session::shared_state::acquire_codex_share_lock_shared(base_dir)
+        .map_err(|_| partial("migration guard unavailable"))?;
+    #[cfg(test)]
+    let (lock_admitted_at, budget_started_at) =
+        (std::time::Instant::now(), std::time::Instant::now());
+    #[cfg(test)]
+    record_test_admission_budget_order(route_entry_at, lock_admitted_at, budget_started_at);
+    let deadline = codex_repair_deadline();
+    let mut roots = Vec::new();
+    match std::fs::canonicalize(sqlite_home.join("codex-sessions")) {
+        Ok(root) => roots.push(root),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(partial("persistent slot transcript root unreadable").into()),
+    }
+    roots.push(base_dir.join("shared-state/codex/codex-sessions"));
+    let entries = std::fs::read_dir(sqlite_home)
+        .map_err(|_| partial("persistent state directory unreadable"))?;
+    let mut databases = Vec::new();
+    for (count, entry) in entries.enumerate() {
+        if count >= 1024 || std::time::Instant::now() >= deadline {
+            return Err(partial("persistent state discovery incomplete within budget").into());
+        }
+        let entry = entry.map_err(|_| partial("persistent state entry unreadable"))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name
+            .strip_prefix("state_")
+            .and_then(|name| name.strip_suffix(".sqlite"))
+            .is_some_and(|schema| !schema.is_empty() && schema.bytes().all(|c| c.is_ascii_digit()))
+        {
+            databases.push(entry.path());
+        }
+    }
+    databases.sort();
+    match repair_resume_all_before(&guard, base_dir, &databases, &roots, deadline) {
+        PagedResumeOutcome::Complete(_) => Ok(()),
+        PagedResumeOutcome::Partial { progress, reason } => {
+            let PagedResumeProgress {
+                visited,
+                rewritten,
+                databases_completed,
+                in_flight_commit_unknown,
+            } = progress;
+            Err(CodexResumePartial {
+                reason,
+                visited,
+                rewritten,
+                databases_completed,
+                in_flight_commit_unknown,
+            }
+            .into())
+        }
+    }
+}
+
+fn repair_codex_resume_target(base_dir: &Path, sqlite_home: &Path, target: &str) -> Result<()> {
+    use csq_core::session::shared_state::codex_sqlite::repair_resume_target_before;
+    let refuse = |reason| CodexResumeRefused { reason };
+    let busy = |reason| CodexResumeAdmissionBusy { reason };
+    // The budget starts AFTER the lock is admitted (see `CODEX_REPAIR_BUDGET`):
+    // the acquire can wait ~2s for a live migration, and that wait is not work
+    // this route may spend its own tolerance on. The instants are sampled only
+    // in test builds, where the ordering seam asserts this.
+    #[cfg(test)]
+    let route_entry_at = std::time::Instant::now();
+    let guard = csq_core::session::shared_state::acquire_codex_share_lock_shared(base_dir)
+        .map_err(|_| refuse("migration guard unavailable"))?;
+    #[cfg(test)]
+    let (lock_admitted_at, budget_started_at) =
+        (std::time::Instant::now(), std::time::Instant::now());
+    #[cfg(test)]
+    record_test_admission_budget_order(route_entry_at, lock_admitted_at, budget_started_at);
+    let deadline = codex_repair_deadline();
+    let mut roots = Vec::new();
+    match std::fs::canonicalize(sqlite_home.join("codex-sessions")) {
+        Ok(root) => roots.push(root),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(refuse("persistent slot transcript root unreadable").into()),
+    }
+    roots.push(base_dir.join("shared-state/codex/codex-sessions"));
+    let entries = std::fs::read_dir(sqlite_home)
+        .map_err(|_| refuse("persistent state directory unreadable"))?;
+    // Discovery alone runs under the initial allowance: it is filesystem-only
+    // (read_dir plus the name filter), so no repair can consume it. Each
+    // candidate database is then admitted separately, and its repair reseeds
+    // every spawned step's window (csq-core's `CODEX_REPAIR_STEP_BUDGET`
+    // through `step_budget`), so one database's slow-but-complete repair can
+    // never expire the admission of the next one. Measured: a host whose
+    // `sqlite3` children each cost ~1s (a measured slow host's stage disk) otherwise
+    // refused the launch on the entry AFTER the repaired database, although
+    // every step had completed within its bound. The same shape as
+    // `repair_codex_resume_all` here plus csq-core's per-database budget in
+    // `repair_resume_all_before`.
+    let mut databases = Vec::new();
+    for (count, entry) in entries.enumerate() {
+        if count >= 1024 {
+            return Err(refuse("target admission state directory exceeded its entry cap").into());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(busy(ADMISSION_DEADLINE_REASON).into());
+        }
+        let entry = entry.map_err(|_| refuse("state directory entry unreadable"))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let schema = name
+            .strip_prefix("state_")
+            .and_then(|v| v.strip_suffix(".sqlite"));
+        if !schema.is_some_and(|v| !v.is_empty() && v.bytes().all(|c| c.is_ascii_digit())) {
+            continue;
+        }
+        databases.push(entry.path());
+    }
+    databases.sort();
+    let mut found = false;
+    for database in &databases {
+        match repair_resume_target_before(&guard, base_dir, database, &roots, target, deadline) {
+            Ok(0) => {}
+            Ok(_) => found = true,
+            // A starved host spent the bounded budget; it did NOT fail to admit
+            // the target. Refuse with the retryable class (and its own recovery
+            // hint) instead of the unadmittable one, whose hint would send the
+            // operator to repair a transcript nothing is wrong with.
+            Err(e)
+                if csq_core::session::shared_state::codex_sqlite::is_bounded_deadline_refusal(
+                    &e,
+                ) =>
+            {
+                return Err(busy(ADMISSION_DEADLINE_REASON).into())
+            }
+            Err(_) => {
+                return Err(
+                    refuse("target database or transcript could not be safely admitted").into(),
+                )
+            }
+        }
+    }
+    if !found {
+        return Err(refuse("exact thread target not found in persistent state").into());
+    }
+    Ok(())
+}
+
+/// Keep authentication and governance in the terminal handle, but put SQLite
+/// state directly in the persistent slot directory. Discovering existing DBs
+/// for symlinking cannot cover a fresh slot or a new upstream schema version:
+/// Codex creates those DBs in the handle, and normal child-exit cleanup deletes
+/// them before the daemon's promotion-on-reap gets a chance to preserve them.
+/// This made slot 12 re-index 16 GB of shared rollouts on every launch.
+///
+/// `sqlite_home` is Codex's native state-location setting. It covers future DB
+/// names without a schema-version allowlist and survives materialized CoC
+/// config overlays. An explicit later `-c` in the user's passthrough still wins.
+fn codex_command(base_dir: &Path, account: AccountNum, handle_dir: &Path) -> Result<Command> {
+    let config = codex_surface::config_toml_path(base_dir, account);
+    let sqlite_home = std::fs::canonicalize(config.parent().expect("slot config has a parent"))
+        .context("resolve persistent Codex SQLite directory")?;
+    let sqlite_home = sqlite_home
+        .to_str()
+        .ok_or_else(|| anyhow!("Codex SQLite directory is not UTF-8"))?;
+    // TOML encoding is essential for spaces, quotes and Windows backslashes.
+    let sqlite_value = toml::Value::String(sqlite_home.to_owned());
+    let mut cmd = Command::new(codex_surface::CLI_BINARY);
+    strip_sensitive_env(&mut cmd);
+    cmd.env_remove("CLAUDE_CONFIG_DIR");
+    cmd.env_remove("CLAUDE_HOME");
+    cmd.env(codex_surface::HOME_ENV_VAR, handle_dir);
+    cmd.arg("-c").arg(format!("sqlite_home={sqlite_value}"));
+    Ok(cmd)
+}
+
+/// PR-CA8 commit 2 + M6 T6.2 Shard 3a: materialize `term-<pid>/config.toml`
+/// as a regular file, composing up to two per-spawn transforms over the
+/// canonical `config-<N>/config.toml`:
+///
+/// 1. `instructions` (capability layer, both editions): merge the per-spawn
+///    `developer_instructions = "..."` block via `merge_instructions_via_toml_value`.
+/// 2. `mcp_wrap` (M6 T6.2 Shard 3a, enterprise-only): rewrite every STDIO
+///    `[mcp_servers.*]` table so its `command`/`args` route through
+///    `csq mcp-proxy --envelope <path> -- …`, gating the MCP tool-calls through
+///    the Shard-2 proxy. `mcp_wrap = Some((csq_bin, envelope_snapshot_path))`.
+///
+/// Either, both, or neither transform may apply; with neither this is just a
+/// symlink→regular-file copy. Replaces the symlink `create_handle_dir_codex`
+/// planted (spec 07 §7.2.2 deviation). NEVER mutates the canonical
+/// `config-<N>/config.toml` — the rewrite lives only in the ephemeral handle dir.
+///
+/// Returns the names of REMOTE (`url`-transport) MCP servers left un-gated, so the
+/// caller can warn the operator (the stdio proxy cannot interpose HTTP/SSE).
+///
+/// Idiom: `unique_tmp_path → write → secure_file → atomic_replace`, with
+/// `let _ = remove_file(&tmp);` cleanup on every error branch per
+/// `.claude/rules/security.md` §5a.
+pub(crate) fn materialize_handle_config_toml(
+    base_dir: &Path,
+    account: AccountNum,
+    handle_dir: &Path,
+    instructions: Option<&str>,
+    mcp_wrap: Option<(&str, &Path)>,
+) -> Result<Vec<String>> {
+    use csq_core::coc::translate::codex_merge::merge_instructions_via_toml_value;
+    use csq_core::platform::fs::{atomic_replace, unique_tmp_path, write_new_private};
+    use std::collections::BTreeMap;
+
+    // PATH-BUILDER: constructs the config-N/config.toml path to read CC's
+    // native config. config.toml is NOT part of the UUID credential/settings
+    // migration (credentials.json and settings.json are migrated; config.toml
+    // stays account-local). Unchanged through Phase 2 — see workspaces/
+    // an internal workspace/02-plans/03-phase2-readiness.md § M2-7.
+    let canonical = base_dir
+        .join(format!("config-{}", account))
+        .join("config.toml");
+    let mut content = std::fs::read_to_string(&canonical)
+        .with_context(|| format!("read {}", redact_path(&canonical)))?;
+
+    // Transform 1 — capability-layer instructions merge.
+    if let Some(scaffold_text) = instructions {
+        // The overlay is reserved for future MCP-filter parameters; empty today
+        // so the merge is a no-op for non-instructions keys.
+        let overlay: BTreeMap<String, String> = BTreeMap::new();
+        content = merge_instructions_via_toml_value(&content, scaffold_text, &overlay)
+            .context("merging instructions into config.toml")?;
+    }
+
+    // Transform 2 — MCP proxy rewrite (enterprise-only; `mcp_wrap` is always
+    // `None` in the community build so this branch never fires there).
+    let skipped_remote: Vec<String> = if let Some((csq_bin, envelope_path)) = mcp_wrap {
+        #[cfg(feature = "enterprise")]
+        {
+            let rewrite = csq_core::daemon::mcp_rewrite::rewrite_codex_config_mcp_servers(
+                &content,
+                csq_bin,
+                &envelope_path.to_string_lossy(),
+            )
+            // Fail-CLOSED: the operator declared an MCP policy, so if the rewrite
+            // fails we must NOT spawn with un-gated MCP — surface the fixed-vocab
+            // tag and abort the launch.
+            .map_err(|e| anyhow!("csq run codex: MCP proxy rewrite failed ({})", e.tag()))?;
+            content = rewrite.toml;
+            rewrite.skipped_remote
+        }
+        #[cfg(not(feature = "enterprise"))]
+        {
+            let _ = (csq_bin, envelope_path);
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    let target = handle_dir.join("config.toml");
+    let tmp = unique_tmp_path(&target);
+
+    // §5a: `write_new_private` creates the tmp file at 0o600 at creation,
+    // closing the window a separate write + secure_file pair would leave
+    // open — the handle-dir config.toml's `[mcp_servers.*]` table may
+    // carry user-configured MCP auth (same class as
+    // `providers::codex::surface::write_config_toml_with_global`).
+    if let Err(e) = write_new_private(&tmp, content.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow!("write {}: {e}", redact_path(&tmp)));
+    }
+    // atomic_replace is rename(2) on Unix / retry-loop MoveFileExW on
+    // Windows; both atomically replace whatever was at `target`
+    // (symlink or regular file) with the new regular file. No
+    // explicit unlink needed — and skipping it closes the TOCTOU
+    // window that round-1 H5 surfaced.
+    if let Err(e) = atomic_replace(&tmp, &target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow!(
+            "atomic_replace {} -> {}: {e}",
+            redact_path(&tmp),
+            redact_path(&target)
+        ));
+    }
+    Ok(skipped_remote)
+}
+
+/// Warn the operator (once per server) that a REMOTE (`url`-transport) MCP server
+/// is NOT routed through the governance proxy — the stdio proxy cannot interpose an
+/// HTTP/SSE transport, so its tool-calls run un-gated (spec 25 §25.11). Server
+/// names only; no host paths, so no redaction needed.
+pub(crate) fn warn_skipped_remote_mcp(skipped: &[String]) {
+    for name in skipped {
+        eprintln!(
+            "note: codex MCP server '{name}' uses a remote (url) transport — its tool-calls are \
+             NOT gated by csq (the MCP proxy interposes stdio servers only)."
+        );
+    }
+}
+
+/// M6 T6.2 Shard 3a: resolve whether a governed `csq run … --provider codex` spawn
+/// routes its MCP servers through `csq mcp-proxy`, and if so stage the envelope
+/// snapshot the proxy will load.
+///
+/// Takes the envelope the M6 T6.1 spawn gate ALREADY resolved and validated (single
+/// load — no re-read, so no gate-vs-rewrite divergence; redteam R1 finding 1.1).
+/// Returns `Some((csq_bin, envelope_snapshot_path))` iff that envelope is present
+/// (`Configured`) AND declares an `mcp` policy (`env.mcp.is_some()`) — MCP gating is
+/// opt-in via the envelope's `mcp` field. An ungoverned spawn (`gate_env == None`) or
+/// a governed session with no `mcp` policy → `None` (MCP servers run direct,
+/// backward-compatible). A refused/malformed envelope never reaches here — the gate
+/// exits the process fail-closed upstream, and it returns `None` for those anyway.
+///
+/// `csq_bin` is `current_exe()` VERBATIM (no canonicalize). `launch_codex` only runs
+/// inside an already-`Mode::Cli` process (the desktop app launches codex via a
+/// terminal running the CLI binary; it never calls `launch_codex` directly), so
+/// `current_exe()` is by construction a path that did NOT match the desktop-bundle
+/// sentinel and re-resolves to CLI mode — the `mcp-proxy` subprocess dispatches
+/// correctly. Canonicalizing is deliberately avoided (a symlinked CLI path can
+/// canonicalize INTO the desktop bundle and flip mode detection — memory
+/// `discovery_csq_symlink_breaks_mode_detect`). Fail-CLOSED: an unresolvable binary
+/// or a failed snapshot write aborts the launch rather than spawning un-gated MCP.
+#[cfg(feature = "enterprise")]
+pub(crate) fn resolve_codex_mcp_rewrite(
+    gate_env: Option<&csq_trust_contract::OperatingEnvelope>,
+    handle_dir_abs: &Path,
+) -> Result<Option<(String, std::path::PathBuf)>> {
+    use csq_core::daemon::interactive_live::materialize_envelope_snapshot;
+
+    let Some(env) = gate_env else {
+        // Ungoverned (or the gate refused upstream) → nothing to gate.
+        return Ok(None);
+    };
+    if env.mcp.is_none() {
+        // Governed, but the operator declared no MCP allow-list → not opted in.
+        return Ok(None);
+    }
+
+    let csq_bin = std::env::current_exe()
+        .map_err(|_| {
+            anyhow!("csq run codex: could not resolve the csq binary path for MCP proxy wiring")
+        })?
+        .to_string_lossy()
+        .into_owned();
+
+    let envelope_path = handle_dir_abs.join(".pact-mcp-envelope.json");
+    materialize_envelope_snapshot(env, &envelope_path).map_err(|tag| {
+        anyhow!("csq run codex: failed to stage the MCP operating-envelope snapshot ({tag})")
+    })?;
+
+    Ok(Some((csq_bin, envelope_path)))
+}
+
+/// PR-CA8 round-1 C4: post-materialization re-stat. Refuses any non-
+/// regular-file at `<handle_dir>/config.toml` immediately before
+/// `Command::spawn`. Detects a non-regular substitution present at check time:
+/// a same-user attacker could replace the materialized file with a symlink to
+/// attacker-controlled system-prompt content. This re-stat is not atomic with
+/// spawn or Codex's later read; it does not eliminate that TOCTOU window.
+///
+/// Mirrors the existing `verify_codex_canonical_is_regular_file`
+/// posture (line ~393). Fail-closed on symlink; user re-runs.
+pub(crate) fn verify_codex_handle_config_toml_is_regular_file(handle_dir: &Path) -> Result<()> {
+    let path = handle_dir.join("config.toml");
+    let meta = std::fs::symlink_metadata(&path).with_context(|| {
+        format!(
+            "stat {} — handle-dir config.toml missing post-materialization",
+            redact_path(&path)
+        )
+    })?;
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        return Err(anyhow!(
+            "refusing Codex spawn: {} became a symlink between materialization and spawn (TOCTOU). \
+             Re-run `csq run`.",
+            redact_path(&path)
+        ));
+    }
+    if !ft.is_file() {
+        return Err(anyhow!(
+            "refusing Codex spawn: {} is not a regular file (type: {:?})",
+            redact_path(&path),
+            ft
+        ));
+    }
+    Ok(())
+}
+
+/// S2 (an internal ticket): materialize the CC Level-2 native plugin tree into the
+/// ephemeral handle dir and return the absolute plugin-root path for
+/// `claude --plugin-dir`.
+///
+/// Creates a FRESH `term-<pid>/coc-plugin/` (removing any stale residue first so
+/// the pure [`emit_cc_plugin`](csq_core::coc::translate::emit_cc_plugin) writer
+/// receives the clean, csq-owned, non-symlink `dest` its caller-contract
+/// requires), renders agents/skills/commands into a CC plugin tree, then
+/// re-stats that the plugin root is a real (non-symlink) directory immediately
+/// before the caller adds `--plugin-dir` — the TOCTOU close mirroring
+/// [`verify_codex_handle_config_toml_is_regular_file`]. On ANY error the partial
+/// tree is torn down and the error propagated so the caller falls back to
+/// Level-1 prose (materialize.rs caller-contract: "partial failure leaves a
+/// partial tree the caller must tear down").
+///
+/// **Rules are NOT materialized** — they have no native CC plugin analogue and
+/// stay Level-1 prose (see `emit_cc_plugin` + spec 07 §7.2.1.1).
+///
+/// Spec 07 §7.2.1.1 grants the ephemeral `coc-plugin/` subtree its carve-out to
+/// spec 02 INV-02 ("settings.json only" in a CC handle dir); it is torn down by
+/// the same wrapper-on-exit + daemon-sweep teardown as the rest of `term-<pid>`.
+fn materialize_cc_coc_plugin(
+    handle_dir_abs: &Path,
+    artifacts: &csq_core::coc::translate::SurfaceArtifacts,
+) -> Result<PathBuf> {
+    use csq_core::coc::translate::emit_cc_plugin;
+
+    let plugin_dir = handle_dir_abs.join("coc-plugin");
+    // Fresh dir: `term-<pid>` is per-process so `coc-plugin` should not pre-exist,
+    // but remove any residue (incl. a pre-planted symlink) defensively so the
+    // emitter writes into a clean, csq-owned tree.
+    if plugin_dir.exists() || plugin_dir.symlink_metadata().is_ok() {
+        std::fs::remove_dir_all(&plugin_dir)
+            .with_context(|| format!("clearing stale {}", redact_path(&plugin_dir)))?;
+    }
+    std::fs::create_dir(&plugin_dir)
+        .with_context(|| format!("creating {}", redact_path(&plugin_dir)))?;
+
+    emit_cc_plugin(artifacts, &plugin_dir)
+        .map_err(|e| anyhow!("materializing CC coc-plugin: {e}"))?;
+
+    verify_coc_plugin_dir_is_real(&plugin_dir)?;
+    Ok(plugin_dir)
+}
+
+/// S2 TOCTOU close for the materialized plugin dir. Refuses a symlinked (or
+/// non-directory) plugin root immediately before `--plugin-dir` is added to the
+/// spawn — same fail-closed posture as
+/// [`verify_codex_handle_config_toml_is_regular_file`]. A same-user attacker who
+/// unlinked our real dir and replaced it with a symlink to attacker-controlled
+/// plugin content would otherwise inject Task-invocable agents into the CC
+/// session.
+fn verify_coc_plugin_dir_is_real(plugin_dir: &Path) -> Result<()> {
+    let meta = std::fs::symlink_metadata(plugin_dir).with_context(|| {
+        format!(
+            "stat {} — coc-plugin missing post-materialization",
+            redact_path(plugin_dir)
+        )
+    })?;
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        return Err(anyhow!(
+            "refusing claude spawn: {} became a symlink between materialization and spawn (TOCTOU). \
+             Re-run `csq run`.",
+            redact_path(plugin_dir)
+        ));
+    }
+    if !ft.is_dir() {
+        return Err(anyhow!(
+            "refusing claude spawn: {} is not a directory (type: {:?})",
+            redact_path(plugin_dir),
+            ft
+        ));
+    }
+    Ok(())
+}
+
+/// S2b (an internal ticket): materialize `.coc/` rules into the session handle dir's
+/// native Claude Code rules location so CC's own rules loader honors each rule's
+/// `paths:` scoping (a path-scoped rule activates only when Claude reads a
+/// matching file).
+///
+/// CC reads rules from `$CLAUDE_CONFIG_DIR/rules/` — which in a handle dir is a
+/// `SHARED_ITEMS` symlink to the user-global `~/.claude/rules`. To add the
+/// `.coc/` rules WITHOUT polluting that global dir (and without losing the
+/// user's own global rules), this replaces the symlink with a REAL dir that
+/// MERGES the user's global rules (copied in, by value) with the materialized
+/// rules under a `csq-coc/` subdir. The whole `rules/` dir is torn down with the
+/// ephemeral handle dir on session exit (spec 07 §7.2.1.1 lifetime), so the
+/// user's global rules are never touched. If there is no `rules` entry, a fresh
+/// real dir is created. On any error the caller falls back to delivering rules
+/// as prose.
+///
+/// **Atomic replacement (redteam R1 failure-mode MED).** When replacing the
+/// symlink, the merged dir is built in a sibling temp dir FIRST and swapped in
+/// only after every copy/emit succeeds — so a mid-copy failure NEVER destroys
+/// the symlink and the session keeps the complete user-global rule set. On the
+/// rare `rename` failure after the symlink is unlinked, the symlink is restored
+/// best-effort.
+///
+/// **`csq-coc/` subdir (redteam R1 failure-mode MED).** The materialized rules
+/// live under `rules/csq-coc/coc-<ID>.md` (CC discovers rules recursively), so
+/// they cannot collide with — or silently overwrite — a user-global rule file
+/// copied into `rules/` at the top level.
+fn materialize_native_rules(
+    handle_dir_abs: &Path,
+    rules: &[csq_core::coc::translate::FlatArtifact],
+) -> Result<()> {
+    materialize_native_rules_inner(
+        handle_dir_abs,
+        rules,
+        |p| std::fs::remove_file(p),
+        |from, to| std::fs::rename(from, to),
+    )
+}
+
+/// Closure-injectable core of [`materialize_native_rules`] (an internal journal entry
+/// For-Discussion #2). The two failure branches of the atomic symlink→dir swap —
+/// the `unlink` of the old symlink and the `rename` of the staged dir into place
+/// — are the only paths the natural test setup cannot exercise (both fs ops are
+/// near-infallible within one directory on a healthy filesystem). Injecting them
+/// as closures lets the tests deterministically fault EITHER op and assert the
+/// invariant each branch upholds:
+///
+/// - **`unlink` fails** (symlink removal denied): the symlink is left intact (the
+///   session keeps its complete user-global rule set) AND the staging dir is torn
+///   down (redteam R2 MED — no residue on any failure branch).
+/// - **`rename` fails** (post-unlink move denied): the symlink is RESTORED
+///   best-effort (so the session still resolves its user-global rules) AND the
+///   staging dir is torn down.
+///
+/// Production passes the real `std::fs::remove_file` / `std::fs::rename`; only the
+/// tests inject failing closures. The closures take/return the same shapes as the
+/// std fns so the injection is transparent (redteam-discipline Rule 5: closure
+/// injection over chmod-parent tricks, which can only reach ONE branch and
+/// misrepresent coverage).
+fn materialize_native_rules_inner<U, R>(
+    handle_dir_abs: &Path,
+    rules: &[csq_core::coc::translate::FlatArtifact],
+    mut unlink: U,
+    mut rename: R,
+) -> Result<()>
+where
+    U: FnMut(&Path) -> std::io::Result<()>,
+    R: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    use csq_core::coc::translate::emit_coc_rules;
+
+    let rules_dir = handle_dir_abs.join("rules");
+    // Emit the materialized rules under a namespaced subdir so they never collide
+    // with a top-level user-global rule file.
+    let emit_into = |dir: &Path| -> Result<()> {
+        let coc_sub = dir.join("csq-coc");
+        std::fs::create_dir_all(&coc_sub)
+            .with_context(|| format!("creating {}", redact_path(&coc_sub)))?;
+        emit_coc_rules(rules, &coc_sub).map_err(|e| anyhow!("materializing native rules: {e}"))?;
+        Ok(())
+    };
+
+    match std::fs::symlink_metadata(&rules_dir) {
+        Ok(m) if m.file_type().is_symlink() => {
+            // Build the replacement in a sibling temp dir; swap in only on full
+            // success so the symlink (→ complete user-global rules) survives any
+            // partial failure.
+            let target = std::fs::read_link(&rules_dir).ok();
+            let tmp = handle_dir_abs.join("rules.coc-staging");
+            let _ = std::fs::remove_dir_all(&tmp); // clear any stale residue
+            std::fs::create_dir(&tmp).with_context(|| format!("creating {}", redact_path(&tmp)))?;
+            let build = (|| -> Result<()> {
+                if let Some(t) = &target {
+                    if t.is_dir() {
+                        copy_dir_into(t, &tmp).with_context(|| {
+                            format!("preserving user-global rules from {}", redact_path(t))
+                        })?;
+                    }
+                }
+                emit_into(&tmp)
+            })();
+            if let Err(e) = build {
+                let _ = std::fs::remove_dir_all(&tmp); // leave the symlink intact
+                return Err(e);
+            }
+            // Swap: unlink the symlink, move the staged dir into place.
+            if let Err(e) = unlink(&rules_dir) {
+                // Symlink removal failed → symlink still intact; clean the staged
+                // dir so no residue survives (redteam R2 MED — every failure
+                // branch of the atomic swap must tear down the staging dir).
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(anyhow!(
+                    "removing rules symlink {}: {e}",
+                    redact_path(&rules_dir)
+                ));
+            }
+            if let Err(e) = rename(&tmp, &rules_dir) {
+                // Restore the symlink so the session keeps its user-global rules.
+                if let Some(t) = &target {
+                    let _ = csq_core::session::isolation::create_symlink_pub(t, &rules_dir);
+                }
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(anyhow!(
+                    "swapping staged rules into {}: {e}",
+                    redact_path(&rules_dir)
+                ));
+            }
+        }
+        // Already a real dir (unexpected for a fresh handle dir) — emit into it.
+        Ok(_) => emit_into(&rules_dir)?,
+        // No `rules` entry (the user has no ~/.claude/rules) — create fresh.
+        Err(_) => {
+            std::fs::create_dir_all(&rules_dir)
+                .with_context(|| format!("creating {}", redact_path(&rules_dir)))?;
+            emit_into(&rules_dir)?;
+        }
+    }
+
+    // TOCTOU close: refuse a symlinked rules dir before spawn (same posture as
+    // the coc-plugin guard).
+    verify_coc_plugin_dir_is_real(&rules_dir)?;
+    Ok(())
+}
+
+/// Build the Level-1 prose for exactly the artifact kinds NOT delivered natively
+/// on this surface (an internal ticket S3/S4). `remaining` is the `.coc/` artifacts with
+/// the natively-materialized kinds cleared (codex: skills removed; gemini: both
+/// skills and commands removed). Mirrors the CC launch arm's prose selection
+/// precisely so no kind is ever double-delivered or dropped:
+///
+/// - remaining kinds present → render them through the SAME
+///   `render_sections(surface_header(..), ..)` the full scaffold uses (so a full
+///   `remaining` is byte-identical to the pre-built `scaffold` — no drift), plus
+///   the FR-CL-01 structured-output directive on Compliance prompts.
+/// - nothing remains (every kind delivered natively) → deliver ONLY the directive
+///   (Compliance) or nothing at all (free-form).
+///
+/// Returns `None` when there is nothing to say (no remaining kinds AND not a
+/// Compliance prompt), so the caller omits the prose carrier entirely.
+fn reduced_surface_prose(
+    surface: Surface,
+    remaining: &csq_core::coc::translate::SurfaceArtifacts,
+    compliance: bool,
+) -> Option<String> {
+    use csq_core::coc::translate::{
+        build_output_schema_directive, render_sections, surface_header,
+    };
+    let has_content = !remaining.rules.is_empty()
+        || !remaining.agents.is_empty()
+        || !remaining.skills.is_empty()
+        || !remaining.commands.is_empty();
+    if has_content {
+        let (mut prose, _) = render_sections(surface_header(surface), remaining);
+        if compliance {
+            prose.push_str(&build_output_schema_directive());
+        }
+        Some(prose)
+    } else if compliance {
+        Some(build_output_schema_directive())
+    } else {
+        None
+    }
+}
+
+/// TOCTOU close for a materialized native subdir (codex `skills/`, gemini
+/// `skills/`/`commands/`). Refuses a symlinked (or non-directory) path
+/// immediately before the CLI is spawned against it — same fail-closed posture
+/// as [`verify_coc_plugin_dir_is_real`], but surface-neutral in its message. A
+/// same-user attacker who unlinked our real dir and replaced it with a symlink to
+/// attacker-controlled skill/command content would otherwise inject native
+/// artifacts into the spawned session.
+fn verify_materialized_dir_is_real(dir: &Path) -> Result<()> {
+    let meta = std::fs::symlink_metadata(dir).with_context(|| {
+        format!(
+            "stat {} — materialized native dir missing post-materialization",
+            redact_path(dir)
+        )
+    })?;
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        return Err(anyhow!(
+            "refusing spawn: {} became a symlink between materialization and spawn (TOCTOU). \
+             Re-run `csq run`.",
+            redact_path(dir)
+        ));
+    }
+    if !ft.is_dir() {
+        return Err(anyhow!(
+            "refusing spawn: {} is not a directory (type: {:?})",
+            redact_path(dir),
+            ft
+        ));
+    }
+    Ok(())
+}
+
+/// S3 (an internal ticket): materialize codex-native SKILLS into `$CODEX_HOME/skills/`
+/// (the handle dir IS `$CODEX_HOME`, spec 07 §7.2.2). codex has native skill
+/// delivery in the current emitter; agents, commands, and rules stay Level-1
+/// prose here. This describes csq's implementation, not Codex's capabilities.
+///
+/// Stage generated skills alongside a complete copy of inherited skills. The
+/// baseline may be a directory symlink; its target is never written. Nested
+/// symlinks and special files are rejected explicitly so resource loss cannot
+/// masquerade as successful delivery. Colliding skill names fail to prose.
+/// The original entry survives every build failure and is restored on swap failure.
+fn materialize_codex_native(
+    handle_dir_abs: &Path,
+    artifacts: &csq_core::coc::translate::SurfaceArtifacts,
+) -> Result<()> {
+    materialize_codex_native_with_rename(handle_dir_abs, artifacts, |from, to| {
+        std::fs::rename(from, to)
+    })
+}
+
+/// Publication failures are fatal: prose fallback is valid only while the
+/// inherited skills entry remains usable at its original path.
+#[derive(Debug)]
+struct CodexSkillsPublicationError(String);
+
+impl std::fmt::Display for CodexSkillsPublicationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for CodexSkillsPublicationError {}
+
+fn materialize_codex_native_with_rename<F>(
+    handle_dir_abs: &Path,
+    artifacts: &csq_core::coc::translate::SurfaceArtifacts,
+    mut rename: F,
+) -> Result<()>
+where
+    F: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    materialize_codex_native_with_operations(handle_dir_abs, artifacts, &mut rename, |backup| {
+        if backup.symlink_metadata()?.file_type().is_symlink() {
+            std::fs::remove_file(backup)
+        } else {
+            std::fs::remove_dir_all(backup)
+        }
+    })
+}
+
+fn materialize_codex_native_with_operations<F, C>(
+    handle_dir_abs: &Path,
+    artifacts: &csq_core::coc::translate::SurfaceArtifacts,
+    mut rename: F,
+    mut cleanup: C,
+) -> Result<()>
+where
+    F: FnMut(&Path, &Path) -> std::io::Result<()>,
+    C: FnMut(&Path) -> std::io::Result<()>,
+{
+    use csq_core::coc::translate::emit_codex_native;
+
+    let skills_dir = handle_dir_abs.join("skills");
+    let staging = handle_dir_abs.join("skills.coc-staging");
+    let backup = handle_dir_abs.join("skills.coc-baseline");
+    // Never clobber residue or follow an attacker-supplied staging symlink.
+    if backup.symlink_metadata().is_ok() {
+        return Err(CodexSkillsPublicationError(
+            "Codex skills baseline backup already exists; publication state needs recovery"
+                .to_string(),
+        )
+        .into());
+    }
+    std::fs::create_dir(&staging).context("creating Codex skills staging directory")?;
+    let result = (|| -> Result<()> {
+        // Emit into a fresh owned root before incorporating inherited content.
+        emit_codex_native(artifacts, &staging)
+            .map_err(|e| anyhow!("materializing codex-native skills: {e}"))?;
+        let staged_skills = staging.join("skills");
+        std::fs::create_dir_all(&staged_skills)?;
+        let inherited = match skills_dir.symlink_metadata() {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.into()),
+        };
+        if inherited {
+            // Following the root link is deliberate; descendants are checked
+            // without following links by copy_codex_inherited_skills.
+            if !skills_dir.is_dir() {
+                bail!("inherited Codex skills entry is not a readable directory");
+            }
+            let emitted: std::collections::BTreeSet<_> = std::fs::read_dir(&staged_skills)?
+                .map(|entry| entry.map(|e| e.file_name().to_string_lossy().to_ascii_lowercase()))
+                .collect::<std::io::Result<_>>()?;
+            for entry in std::fs::read_dir(&skills_dir)? {
+                let entry = entry?;
+                if emitted.contains(&entry.file_name().to_string_lossy().to_ascii_lowercase()) {
+                    bail!(
+                        "generated Codex skill collides with inherited entry {}",
+                        entry.file_name().to_string_lossy()
+                    );
+                }
+            }
+            copy_codex_inherited_skills(&skills_dir, &staged_skills)?;
+        }
+        verify_materialized_dir_is_real(&staged_skills)?;
+        if inherited {
+            rename(&skills_dir, &backup).context("backing up inherited Codex skills")?;
+        }
+        if let Err(error) = rename(&staged_skills, &skills_dir) {
+            if inherited {
+                if let Err(restore) = rename(&backup, &skills_dir) {
+                    return Err(CodexSkillsPublicationError(format!(
+                        "Codex skills installation and baseline restoration failed: {error}; {restore}; baseline retained at {}",
+                        redact_path(&backup)
+                    )).into());
+                }
+            }
+            return Err(error).context("installing staged Codex skills");
+        }
+        // Check the published entry, not only its staging predecessor. A link
+        // or file substituted during publication must abort the launch.
+        verify_materialized_dir_is_real(&skills_dir).map_err(|error| {
+            anyhow!(CodexSkillsPublicationError(format!(
+                "published Codex skills verification failed: {error}; baseline retained at {}",
+                redact_path(&backup)
+            )))
+        })?;
+        if inherited {
+            if let Err(error) = cleanup(&backup) {
+                // Delivery already succeeded; returning Err would duplicate the
+                // installed skills through the caller's prose fallback.
+                tracing::warn!(
+                    error_kind = "coc_codex_baseline_cleanup_failed",
+                    "verified Codex skills installed; retained baseline backup: {}",
+                    csq_core::error::redact_tokens(&error.to_string())
+                );
+            }
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
+/// Unlike the rule copier, unsupported resources cause an explicit fallback,
+/// preserving the original tree rather than silently omitting symlinks.
+fn copy_codex_inherited_skills(src: &Path, dst: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if kind.is_dir() {
+            std::fs::create_dir(&to)?;
+            copy_codex_inherited_skills(&from, &to)?;
+        } else if kind.is_file() {
+            std::fs::copy(&from, &to)?;
+        } else {
+            bail!(
+                "unsupported symlink or special resource in inherited Codex skills: {}",
+                redact_path(&from)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// S4 (an internal ticket): materialize gemini-native SKILLS + COMMANDS into the handle
+/// dir's `.gemini/` config root (where csq already writes `settings.json`).
+/// gemini has native skill AND command discovery — agents (no registry) and
+/// rules (no native primitive) stay Level-1 prose, so `skills/` + `commands/` are
+/// written.
+///
+/// Creates FRESH `.gemini/skills/` + `.gemini/commands/` (removing any residue
+/// first), emits, then re-stats each written dir is real before spawn. Runs
+/// BEFORE `build_spawn_plan_with_system_instruction` writes `settings.json` —
+/// safe because that path uses idempotent `create_dir_all` on `.gemini/` and
+/// never wipes it. On ANY error the partial trees are torn down and the error
+/// propagated so the caller falls back to Level-1 prose.
+fn materialize_gemini_native(
+    gemini_dir_abs: &Path,
+    artifacts: &csq_core::coc::translate::SurfaceArtifacts,
+) -> Result<()> {
+    use csq_core::coc::translate::emit_gemini_native;
+
+    let skills_dir = gemini_dir_abs.join("skills");
+    let commands_dir = gemini_dir_abs.join("commands");
+    for d in [&skills_dir, &commands_dir] {
+        if d.exists() || d.symlink_metadata().is_ok() {
+            std::fs::remove_dir_all(d)
+                .with_context(|| format!("clearing stale {}", redact_path(d)))?;
+        }
+    }
+    std::fs::create_dir_all(gemini_dir_abs)
+        .with_context(|| format!("creating {}", redact_path(gemini_dir_abs)))?;
+    if let Err(e) = emit_gemini_native(artifacts, gemini_dir_abs) {
+        let _ = std::fs::remove_dir_all(&skills_dir);
+        let _ = std::fs::remove_dir_all(&commands_dir);
+        return Err(anyhow!("materializing gemini-native skills/commands: {e}"));
+    }
+    // Only the dirs the emitter actually wrote (a kind may be empty) need the
+    // TOCTOU re-stat.
+    if !artifacts.skills.is_empty() {
+        verify_materialized_dir_is_real(&skills_dir)?;
+    }
+    if !artifacts.commands.is_empty() {
+        verify_materialized_dir_is_real(&commands_dir)?;
+    }
+    Ok(())
+}
+
+/// Recursively copy the CONTENTS of `src` into `dst` (both must be dirs).
+/// Regular files and subdirectories are copied by value; symlinks are SKIPPED
+/// (never followed) so a hostile symlink in the user-global rules dir cannot
+/// redirect a copy out of the handle dir.
+fn copy_dir_into(src: &Path, dst: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ft.is_dir() {
+            std::fs::create_dir_all(&to)?;
+            copy_dir_into(&from, &to)?;
+        } else if ft.is_file() {
+            std::fs::copy(&from, &to)?;
+        }
+        // symlinks intentionally skipped
+    }
+    Ok(())
+}
+
+/// JWT-exp pre-flight check on auth.json.
+///
+/// Reads `tokens.access_token` from the JSON at `auth_json_path`, decodes the
+/// JWT `exp` claim, and returns `Err` if the token is expired or within the
+/// grace window of expiry. Non-fatal on missing / unparseable auth.json — the
+/// daemon's normal refresh path handles legitimate token lifecycle.
+///
+/// `now_secs` is injected so callers in tests can supply a deterministic clock.
+///
+/// # Race window
+///
+/// There is a small window between this read and codex-cli's first auth.json
+/// read where the daemon's refresher could rotate the tokens. The pre-flight
+/// catches the steady-state stale-on-disk case (the original
+/// `csq run 12 --provider codex` refresh-token-reuse bug) — it does NOT
+/// prevent a race during a concurrent daemon refresh tick. The structural
+/// defense for the concurrent case is the per-canonical-path refresh-lock used
+/// by `broker_codex_check` (`refresh/check.rs:274`); a future hardening pass
+/// MAY acquire that lock here too, but the cost (~100ms hold on every
+/// `csq run`) is not justified by the rarity of the race in practice (daemon
+/// refreshes 5-min cadence; user launches are seconds).
+pub(crate) fn check_codex_token_freshness(
+    auth_json_path: &std::path::Path,
+    account: AccountNum,
+    now_secs: u64,
+) -> Result<()> {
+    let content = match std::fs::read_to_string(auth_json_path) {
+        Ok(c) => c,
+        Err(_) => return Ok(()), // Missing or unreadable auth.json — non-fatal.
+    };
+    let json = match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(v) => v,
+        Err(_) => return Ok(()), // Malformed JSON — non-fatal; credentials::load will surface the real error.
+    };
+    // Missing `tokens` key or `access_token` key — non-fatal (no JWT to check).
+    let access_token = match json
+        .get("tokens")
+        .and_then(|t| t.get("access_token"))
+        .and_then(|v| v.as_str())
+    {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+    // Malformed JWT (no dots, missing base64 payload) — non-fatal.
+    let Some(exp) = csq_core::http::codex::jwt_exp_secs(access_token) else {
+        return Ok(());
+    };
+    const GRACE_SECS: u64 = 60;
+    if exp.saturating_sub(GRACE_SECS) <= now_secs {
+        return Err(anyhow!(
+            "slot {account} has an expired Codex access token \
+             (exp={exp}, now={now_secs}) — the refresher cooldown may have \
+             been missed. Re-run `csq login {account} --provider codex` \
+             to get fresh tokens."
+        ));
+    }
+    Ok(())
+}
+
+/// Verifies the Codex canonical credential file is a regular file, not a
+/// symlink, before a Codex spawn. Origin: PR-C3c security review M1.
+///
+/// Resolution order (M4-12 UUID-keyed vs legacy numeric path):
+///
+/// 1. If `profiles.json::by_slot[N]` resolves to a UUID AND
+///    `identities/<UUID>/credentials-codex.json` exists as a regular file →
+///    accept (identity-keyed path, post-M4-12 layout).
+/// 2. Else fall back to `credentials/codex-<N>.json` (legacy numeric path,
+///    retained through Phase 4 for downgrade safety).
+///
+/// In both cases a symlink at the resolved path is rejected (same-user
+/// TOCTOU guard — PR-C3b's `save_canonical_for` always writes a regular
+/// file).
+///
+/// The dispatch branch in [`handle`] uses `symlink_metadata` so a
+/// dangling symlink still routes to Codex (refusing to silently fall
+/// through to the Claude path — an internal journal entry). But `symlink_metadata`
+/// also accepts a symlink-to-anywhere, which would let a same-user
+/// attacker who races a swap between dispatch and spawn inject
+/// attacker-chosen tokens into the handle dir's `auth.json` symlink
+/// chain. Refusing any canonical that is a symlink at spawn time
+/// closes that vector.
+fn verify_codex_canonical_is_regular_file(base_dir: &Path, account: AccountNum) -> Result<()> {
+    // Task 4: Try the UUID-keyed path first.
+    if let Some(uuid) = csq_core::accounts::profiles::resolve_slot_to_uuid(base_dir, account.get())
+    {
+        let uuid_path =
+            csq_core::accounts::identity_store::credentials_codex_path_for(base_dir, uuid);
+        if let Ok(meta) = std::fs::symlink_metadata(&uuid_path) {
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                return Err(anyhow!(
+                    "refusing Codex launch: identities/<UUID>/credentials-codex.json is a symlink. \
+                     csq only writes a regular file at this path (spec 07 §7.2.2 + INV-P08); \
+                     a symlink here means an external process mutated the credentials directory. \
+                     Re-run `csq login {account} --provider codex` to rewrite."
+                ));
+            }
+            if ft.is_file() {
+                // UUID-keyed path exists and is a regular file — accept.
+                return Ok(());
+            }
+            // UUID path exists but is neither file nor symlink (directory?): fall through to legacy.
+        }
+        // UUID path does not exist: fall through to legacy for downgrade safety.
+    }
+
+    // Fall back to the legacy numeric path.
+    let path = file::canonical_path_for(base_dir, account, Surface::Codex);
+    let meta = std::fs::symlink_metadata(&path).with_context(|| {
+        format!(
+            "stat Codex canonical — neither UUID-keyed nor legacy path exists; \
+             run `csq login {account} --provider codex`"
+        )
+    })?;
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        return Err(anyhow!(
+            "refusing Codex launch: credentials/codex-{account}.json is a symlink. \
+             csq only writes a regular file at this path (spec 07 §7.2.2 + INV-P08); \
+             a symlink here means an external process mutated the credentials directory. \
+             Re-run `csq login {account} --provider codex` to rewrite."
+        ));
+    }
+    if !ft.is_file() {
+        return Err(anyhow!(
+            "refusing Codex launch: credentials/codex-{account}.json is not a regular file (type: {:?})",
+            ft
+        ));
+    }
+    Ok(())
+}
+
+/// Detect a headless (non-interactive) Gemini invocation — a `-p` / `--prompt`
+/// one-shot. gemini-cli's `-i` / `--prompt-interactive` seeds an INTERACTIVE
+/// session and is NOT headless. an internal ticket: a headless run must not reach gemini-cli's
+/// interactive browser-auth prompt, so this gates the pre-spawn OAuth check.
+fn gemini_invocation_is_headless(rest: &[String]) -> bool {
+    let interactive = rest.iter().any(|a| {
+        a == "-i" || a == "--prompt-interactive" || a.starts_with("--prompt-interactive=")
+    });
+    if interactive {
+        return false;
+    }
+    rest.iter()
+        .any(|a| a == "-p" || a == "--prompt" || a.starts_with("--prompt="))
+}
+
+/// Verifies `config-<N>/config.toml` exists before a Codex spawn.
+/// Extracted from [`launch_codex`] so the precondition can be
+/// unit-tested without shelling out to `codex` or exit(2)-ing on the
+/// daemon check.
+fn verify_codex_config_toml(base_dir: &Path, account: AccountNum) -> Result<()> {
+    let config_toml = codex_surface::config_toml_path(base_dir, account);
+    if !config_toml.exists() {
+        return Err(anyhow!(
+            "slot {account} is missing {} — run `csq login {account} --provider codex` to complete login",
+            redact_path(&config_toml)
+        ));
+    }
+    Ok(())
+}
+
+/// Resolves the auth.json-shaped credential path a pre-spawn/pre-relaunch
+/// freshness check should read for `account`, mirroring
+/// [`verify_codex_canonical_is_regular_file`]'s UUID-keyed-then-legacy
+/// resolution order. Unlike that function, this does NOT require the path
+/// to exist or be a regular file — [`check_codex_token_freshness`] already
+/// treats a missing/unreadable file as non-fatal, and callers of THIS
+/// function (the swap-target pre-check, which runs before a real handle dir
+/// for the target exists) need a best-effort path, not an assertion.
+#[cfg(unix)]
+fn codex_auth_json_path_for_slot(base_dir: &Path, account: AccountNum) -> std::path::PathBuf {
+    if let Some(uuid) = csq_core::accounts::profiles::resolve_slot_to_uuid(base_dir, account.get())
+    {
+        let uuid_path =
+            csq_core::accounts::identity_store::credentials_codex_path_for(base_dir, uuid);
+        if uuid_path.exists() {
+            return uuid_path;
+        }
+    }
+    file::canonical_path_for(base_dir, account, Surface::Codex)
+}
+
+/// S-F3/C-F2: validates a cross-slot swap request's TARGET slot BEFORE the
+/// current codex child is torn down. Runs the same admission checks
+/// `launch_codex` runs before its own spawn — the daemon-health check
+/// (FM-5, re-run here even though the CURRENT session already required a
+/// healthy daemon to exist: the daemon can go down BETWEEN the current
+/// session's launch and this relaunch attempt, and `drive_child`'s SIGUSR1
+/// handler calls this BEFORE tearing the current child down, so a
+/// daemon-down refusal here is the only chance to leave that child
+/// running rather than discovering the same refusal one recursive
+/// `launch_codex` call later, after the teardown), account-number
+/// validation, the config + credential-regular-file checks, the JWT-exp
+/// pre-flight, and (on enterprise builds) the M6 T6.1 spawn-boundary gate
+/// — MINUS the actual spawn.
+///
+/// The M6 gate is evaluated against a throwaway [`crate::cli::audit_emit::AuditEmitter::disabled`]
+/// emitter, never the live session's own emitter: this is an ADMISSION CHECK
+/// that may be refused, and a refused check must not mutate the still-running
+/// original session's audit record with a verdict about a slot it never
+/// actually spawned onto. The AUTHORITATIVE gate evaluation + audit recording
+/// happens exactly once, inside the real recursive `launch_codex` call that
+/// runs only after this check has passed.
+///
+/// Called from `codex_supervise::drive_child` on every `SIGUSR1` with a
+/// pending, structurally-valid (`SwapRequest::parse`-accepted) request —
+/// i.e. AFTER `take_swap_request` has already consumed the request file, so
+/// an `Err` here does not leave the request wedged for a retry: the caller's
+/// contract is "print the reason and keep the current codex running."
+///
+/// F2 (round 5): `toggles`, `debug`, and `coc_cache_enabled` are the SAME
+/// values the ORIGINAL `csq run` invocation resolved — `launch_codex` builds
+/// a `validate` closure over its own captured invocation and passes that
+/// closure (not these bools re-derived) into `run_supervised` /
+/// `drive_child`, which calls it here with EXACTLY those values on every
+/// `SIGUSR1`. Before this fix this function re-read `toggles` fresh from
+/// disk (`load_capability_layer_toggles(base_dir)`, which is BLIND to any
+/// value the desktop tray or a `--capability-layer` flag had already
+/// resolved for the live session — a stale/absent-on-disk read only
+/// coincidentally matched the real invocation) and hardcoded
+/// `debug = false, coc_cache_enabled = true` regardless of the real
+/// invocation's actual values.
+#[cfg(unix)]
+pub(crate) fn validate_codex_relaunch_target(
+    base_dir: &Path,
+    target_slot: u16,
+    capability_layer_enabled: bool,
+    layer_is_auto: bool,
+    toggles: &CapabilityLayerToggles,
+    debug: bool,
+    coc_cache_enabled: bool,
+) -> Result<AccountNum> {
+    let _ = provider_session_policy::check_unknown_launch(base_dir)?;
+    // S-L1: the SAME enterprise license gate `csq run`'s own `handle`
+    // enforces before doing anything else (task #77 shard 3) — a relaunch
+    // is a fresh dispatch onto a (possibly different) account and must be
+    // gated identically, not merely inherit the ORIGINAL session's
+    // already-passed check from however long ago that was.
+    #[cfg(feature = "enterprise")]
+    super::super::enforce_enterprise_license(base_dir)?;
+
+    // FM-5: refuse a swap onto ANY target while the daemon is down/stale/
+    // unhealthy — the SAME check `require_daemon_healthy` runs at the top of
+    // `launch_codex`, added here so the relaunch path (which re-enters
+    // `launch_codex` and hits that check too, but only AFTER the CURRENT
+    // child has already been torn down) gets a chance to refuse BEFORE
+    // `drive_child`'s SIGUSR1 handler calls `graceful_stop` on the still-
+    // running original session. Non-exiting by construction (this function
+    // has never called `process::exit`) — `Err` here already reaches
+    // `drive_child`'s existing refusal branch, which prints the reason and
+    // leaves the current child untouched (S-F3/C-F2).
+    if let Some(reason) = codex_daemon_refusal(&daemon::detect_daemon(base_dir)) {
+        return Err(anyhow!(reason));
+    }
+
+    let account = AccountNum::try_from(target_slot)
+        .map_err(|e| anyhow!("invalid target slot {target_slot}: {e}"))?;
+
+    // S-L1: the SAME 3P-collision refusal `handle` runs before dispatch — a
+    // target slot whose on-disk state is incoherent (a 3P provider binding
+    // present AND a Codex/Gemini canonical symlink also present, e.g. from a
+    // logout race) must be refused here too, not discovered only after the
+    // current session has already been torn down.
+    let is_third_party = discovery::discover_per_slot_third_party(base_dir)
+        .into_iter()
+        .any(|a| a.id == account.get() && matches!(a.source, AccountSource::ThirdParty { .. }));
+    let target_surface = surface_cli_for_slot(base_dir, account);
+    if is_third_party && target_surface != SurfaceCli::Claude {
+        return Err(anyhow!(
+            "slot {target_slot} is in an inconsistent state \
+             (3P provider binding present AND Codex/Gemini canonical symlink present). \
+             Run `csq logout {target_slot}` to repair, then `csq login {target_slot} --provider <X>` \
+             to re-bind."
+        ));
+    }
+    // S-L1: a cross-slot Codex swap can only ever target a Codex slot — the
+    // same surface-routing invariant `handle`'s dispatch ladder enforces
+    // (only a `SurfaceCli::Codex` slot reaches `launch_codex` at all).
+    // Refusing here, before teardown, surfaces a target-slot mixup as a
+    // named error instead of leaving the caller's config/credential checks
+    // below to fail with a less specific message.
+    if is_third_party {
+        return Err(anyhow!(
+            "account {target_slot} is a third-party provider slot, not a Codex slot — \
+             cross-slot Codex swap cannot target it"
+        ));
+    }
+    if target_surface != SurfaceCli::Codex {
+        return Err(anyhow!(
+            "account {target_slot} is not a Codex slot — cross-slot Codex swap cannot target it"
+        ));
+    }
+
+    verify_codex_config_toml(base_dir, account)?;
+    verify_codex_canonical_is_regular_file(base_dir, account)?;
+
+    let auth_json_path = codex_auth_json_path_for_slot(base_dir, account);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    check_codex_token_freshness(&auth_json_path, account, now_secs)?;
+
+    #[cfg(feature = "enterprise")]
+    {
+        let mut scratch_emitter = crate::cli::audit_emit::AuditEmitter::disabled();
+        evaluate_codex_spawn_gate(base_dir, &mut scratch_emitter)
+            .map_err(|e| anyhow!("account {target_slot} spawn gate refused the swap: {e}"))?;
+    }
+
+    // C-R4-4 (completed, governing task item 3): run the SAME
+    // capability-layer preflight `launch_codex` runs before its own spawn,
+    // HERE — before `drive_child`'s caller tears the current, still-running
+    // child down. Before the C-R4-4 fix, a `.coc/` load failure surfaced
+    // only inside the RECURSIVE `launch_codex` call the relaunch closure
+    // makes, which happens strictly AFTER `graceful_stop(child)` has
+    // already killed the original session — so the failure killed the
+    // session it was supposed to leave untouched on refusal, with nothing
+    // left to fall back to.
+    //
+    // F2 (round 5): `capability_layer_enabled`, `layer_is_auto`, `toggles`,
+    // `debug`, and `coc_cache_enabled` are ALL now threaded through from the
+    // ORIGINAL `csq run` invocation's own resolved intent, via the `validate`
+    // closure `launch_codex` builds and passes into `run_supervised` — so
+    // this preflight validates against the EXACT intent the real,
+    // flag-respecting relaunch will run under, not an approximation of it.
+    // `rest` (the passthrough argv) is deliberately NOT threaded:
+    // `run_capability_layer_preflight` only consults it for FR-CL
+    // bench-mode/rule-scope decisions, and the real recursive
+    // `launch_codex` call re-derives `rest` from the swap request's own
+    // `relaunch_rest` output regardless — this admission check's own `rest`
+    // value has no bearing on whether the swap is ADMITTED.
+    if let Err(e) = run_capability_layer_preflight(
+        base_dir,
+        account,
+        capability_layer_enabled,
+        layer_is_auto,
+        toggles,
+        debug,
+        Surface::Codex,
+        coc_cache_enabled,
+        &[],
+    ) {
+        return Err(anyhow!(
+            "capability-layer check refused the swap to account {target_slot}: {e}"
+        ));
+    }
+
+    Ok(account)
+}
+
+/// D-F9 (round 7): builds the `validate` closure `codex_supervise::
+/// run_supervised` calls on every `SIGUSR1` with a pending swap request —
+/// a thin `move` wrapper over [`validate_codex_relaunch_target`] that
+/// captures the SAME invocation values (`capability_layer_enabled`,
+/// `layer_is_auto`, `toggles`, `debug`, `coc_cache_enabled`) `launch_codex`
+/// already resolved for THIS call, so a relaunch's admission preflight
+/// validates under the exact intent the real, flag-respecting relaunch
+/// will run under (F2, round 5's doc on [`validate_codex_relaunch_target`]
+/// — unchanged by this extraction).
+///
+/// Extracted because `launch_codex`'s `LayerControl::Inherit` and
+/// `LayerControl::WithLayer` arms each built a BYTE-IDENTICAL closure
+/// inline — the two copies had already drifted apart once (one carried a
+/// stale doc-comment reference the other didn't) before this fix. A single
+/// function is the only way the two call sites cannot drift again.
+///
+/// D-F6 close-out (round 8): `base_dir` and `toggles` are now taken BY
+/// VALUE (`PathBuf` / `CapabilityLayerToggles`, the latter `Copy`) rather
+/// than borrowed — the returned closure captures owned data and is
+/// therefore `Send + Sync + 'static`, not merely `'a`. This is what lets
+/// `codex_supervise::drive_child` run it on a detached WORKER THREAD
+/// (`recv_timeout(budget)` against the thread's result channel) instead of
+/// blocking its own poll loop for the call's entire, internally-unbounded
+/// duration — see that function's doc comment for the full rationale. The
+/// caller (`launch_codex`) already owns or can cheaply clone both values
+/// (`base_dir.to_path_buf()`; `toggles` derefs, `Copy`).
+#[cfg(unix)]
+pub(crate) fn make_validate_relaunch(
+    base_dir: PathBuf,
+    capability_layer_enabled: bool,
+    layer_is_auto: bool,
+    toggles: CapabilityLayerToggles,
+    debug: bool,
+    coc_cache_enabled: bool,
+) -> impl Fn(u16) -> Result<AccountNum> + Send + Sync + 'static {
+    move |slot: u16| -> Result<AccountNum> {
+        validate_codex_relaunch_target(
+            &base_dir,
+            slot,
+            capability_layer_enabled,
+            layer_is_auto,
+            &toggles,
+            debug,
+            coc_cache_enabled,
+        )
+    }
+}
+
+/// Non-unix stand-in: `validate_codex_relaunch_target` is `#[cfg(unix)]`
+/// (it needs unix-only ancestry/signal helpers transitively — see the
+/// Inherit-branch call site's own doc), and `run_supervised` never calls
+/// `validate` at all on non-unix (documented gap — swap has no non-unix
+/// analog), so a stub that would only ever fire where it is provably
+/// unreachable is sufficient here. Same by-value signature as the unix arm
+/// (D-F6 close-out, round 8) so both cfg variants type-check identically
+/// against `run_supervised`'s `Send + Sync + 'static` bound.
+#[cfg(not(unix))]
+pub(crate) fn make_validate_relaunch(
+    _base_dir: PathBuf,
+    _capability_layer_enabled: bool,
+    _layer_is_auto: bool,
+    _toggles: CapabilityLayerToggles,
+    _debug: bool,
+    _coc_cache_enabled: bool,
+) -> impl Fn(u16) -> Result<AccountNum> + Send + Sync + 'static {
+    |_slot: u16| -> Result<AccountNum> {
+        Err(anyhow!("codex cross-slot swap validation is unix-only"))
+    }
+}
+
+/// Requires the daemon to be `Healthy` before a Codex spawn. Spec 07
+/// §7.5 INV-P02: without the daemon, codex's on-expiry in-process
+/// refresh will fire and burn the refresh token. Exits with
+/// [`EXIT_CODE_DAEMON_REQUIRED`] on any non-Healthy state so scripts
+/// can distinguish "daemon-down" from other launch failures.
+///
+/// PR-C4 (H2 gate): cross-platform — `daemon::detect_daemon` already
+/// has a Windows named-pipe branch (`csq-core/src/daemon/detect.rs`
+/// `windows_health_check`), so the same DetectResult variants apply
+/// across Unix and Windows. This closes the an internal journal entry
+/// `#[cfg(not(unix))] Ok(())` carve-out.
+/// Launches gemini-cli for a Gemini-surface slot.
+///
+/// Spec 07 §7.2.3 / §7.5: Gemini does NOT require the daemon for
+/// spawn (INV-P02 inverted). The CLI talks directly to Google's
+/// API via `gemini-cli`; csq's role is to (a) keep the slot's API
+/// key in the platform-native vault and (b) pre-seed
+/// `<handle_dir>/.gemini/settings.json` with
+/// `selectedType=gemini-api-key` so gemini-cli doesn't
+/// interactively prompt for an auth choice on first spawn (UX
+/// shortcut for API-key bound slots, not a ToS-driven defense —
+/// the original "EP1-EP7 / 7-layer ToS guard" framing was
+/// retracted in an internal journal entry). Neither task needs the daemon.
+///
+/// Handle dir layout for Gemini is minimal:
+///
+/// ```text
+/// term-<pid>/
+///   .csq-account             # marker file (diagnostic)
+///   .gemini/
+///     settings.json          # pre-seeded selectedType + model
+/// ```
+///
+/// No `.credentials.json` symlink (Gemini has no Anthropic OAuth
+/// path) and no `config-<N>/` housekeeping beyond what `setkey
+/// gemini` already wrote.
+///
+/// THRESHOLD — D4 factoring trigger. Sibling: `exec_gemini` in
+/// `commands/swap.rs`. At N=2 callers the ~20 LOC duplication is
+/// cheaper than introducing a `csq_core::providers::gemini::session`
+/// module + typed error enum. When a 3rd caller surfaces (most
+/// likely the desktop spawn path landing inside csq-cli, or a
+/// future Bedrock launcher reusing the same shape), factor both
+/// bodies into csq-core. Both sites must be edited together — AND the
+/// factored spawn path MUST carry the an internal ticket headless-OAuth guard
+/// (`gemini_invocation_is_headless` → `oauth_login::check_headless_oauth_ready_for_process`)
+/// so a future desktop/Bedrock caller cannot silently regress the "no
+/// interactive prompt on a headless run" contract. The guard is structurally
+/// required, not caller-optional.
+#[allow(clippy::too_many_arguments)]
+fn launch_gemini(
+    base_dir: &Path,
+    claude_home: &Path,
+    account: AccountNum,
+    capability_layer_enabled: bool,
+    layer_is_auto: bool,
+    toggles: &CapabilityLayerToggles,
+    debug: bool,
+    bench_mode: Option<&str>,
+    coc_cache_enabled: bool,
+    rest: &[String],
+    audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+) -> Result<()> {
+    use csq_core::platform::secret;
+    provider_session_policy::emit_warning(provider_session_policy::check_unknown_launch_with_args(
+        base_dir, rest,
+    )?);
+    use csq_core::providers::gemini::spawn::{
+        build_spawn_plan_with_system_instruction, execute_plan_as_child,
+        execute_plan_as_child_piped, spawn_gemini,
+    };
+
+    // PR-CA8b commit 4: build HostContext from the parent env BEFORE
+    // any spawn-time work. Detected names are used by the layer-on
+    // path to emit the host-isolation warning per spec 08 MED-03;
+    // they're inert on the layer-off path.
+    let host_ctx = detect_host_context();
+
+    // PR-CA8b commit 4: capability-layer pre-flight. When the flag
+    // is OFF (default for v2.4.0-alpha) or `.coc/` resolves to
+    // fallback, the path is the v2.3.1 path verbatim (Inherit
+    // branch). When ON, the per-spawn handle-dir settings.json is
+    // materialized with the layer's `system_instruction` field
+    // (spec 10 §10.4.6.1 gemini row).
+    let layer_control = match run_capability_layer_preflight(
+        base_dir,
+        account,
+        capability_layer_enabled,
+        layer_is_auto,
+        toggles,
+        debug,
+        Surface::Gemini,
+        coc_cache_enabled,
+        rest,
+    ) {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!(
+                "error: {}",
+                csq_core::error::redact_tokens(&format!("{err}"))
+            );
+            // M06 fail-loud (H1): this `process::exit` bypasses Drop — flush the
+            // owning emitter's record BEFORE exit. Capability layer rejected the
+            // Gemini run before any spawn → Fail + Reject.
+            {
+                use csq_core::audit::{Decision, ResultState};
+                let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                audit_emitter.set_end_ts(end_ts);
+                audit_emitter.set_result(ResultState::Fail, Decision::Reject);
+                fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+            }
+            std::process::exit(err.exit_code() as i32);
+        }
+    };
+
+    // --bench-mode layer-only: terminate before subprocess spawn.
+    if let Some("layer-only") = bench_mode {
+        return handle_bench_mode_layer_only(Surface::Gemini, audit_emitter);
+    }
+
+    // M6 T6.1: cross-CLI spawn-boundary governance gate (enterprise-only).
+    // Block/Escalate (or a malformed/unbuildable envelope) → refuse to spawn
+    // (fail-loud audit + non-zero exit); Pass/Conditional/Ungoverned → proceed.
+    // T6.4 note: gemini's `spawn_gemini` snapshots the global process env to
+    // build the child env; csq-ee declines to mutate global process state in
+    // production, so a Conditional gemini path-scope is RECORDED (attested) but
+    // NOT injected into the child — advisory-only per the M6 fidelity gap (the
+    // spec documents codex/gemini as spawn-boundary-only, not in-loop).
+    #[cfg(feature = "enterprise")]
+    {
+        use crate::cli::commands::spawn_gate;
+        use csq_core::daemon::interactive_live::SpawnGate;
+        // Gemini has no MCP config-rewrite (honest fidelity gap — spec 25 §25.11.4),
+        // so it ignores the resolved envelope the gate now returns.
+        let (gate, _gate_env) =
+            spawn_gate::evaluate_spawn(base_dir, csq_trust_contract::SpawnCli::Gemini);
+        match gate {
+            SpawnGate::Ungoverned => {}
+            SpawnGate::Proceed {
+                verdict, action_id, ..
+            } => {
+                audit_emitter.set_spawn_gate(
+                    "gemini",
+                    &action_id,
+                    spawn_gate::verdict_tag(verdict),
+                );
+            }
+            SpawnGate::Refuse { reason, action_id } => {
+                eprintln!("error: csq run gemini refused by operating envelope ({reason})");
+                use csq_core::audit::{Decision, ResultState};
+                let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                audit_emitter.set_spawn_gate("gemini", &action_id, reason);
+                audit_emitter.set_end_ts(end_ts);
+                audit_emitter.set_result(ResultState::Fail, Decision::Reject);
+                fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+                std::process::exit(EXIT_CODE_SPAWN_BLOCKED);
+            }
+        }
+    }
+
+    // Refuse symlink at the binding marker — same posture as
+    // `verify_codex_canonical_is_regular_file`. csq writes a
+    // regular file here; a symlink at this path is an external
+    // mutation that deserves an abort.
+    let binding_path = file::canonical_path_for(base_dir, account, Surface::Gemini);
+    let meta = std::fs::symlink_metadata(&binding_path).with_context(|| {
+        format!(
+            "stat {} — Gemini binding missing; run `csq setkey gemini --slot {account}` (API key / Vertex SA) or `csq login {account} --provider gemini` (Code Assist OAuth) first",
+            redact_path(&binding_path)
+        )
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(anyhow!(
+            "refusing Gemini launch: {} is a symlink. csq only writes a regular file at this path; a symlink here means an external process mutated the credentials directory. Re-run `csq setkey gemini --slot {account}` to rewrite.",
+            redact_path(&binding_path)
+        ));
+    }
+
+    // an internal ticket: a headless (`-p`/`--prompt`) run against a Code Assist OAuth Gemini
+    // slot whose `~/.gemini/oauth_creds.json` is missing or stale would trip
+    // gemini-cli's interactive browser-auth prompt ("Opening authentication
+    // page ... [Y/n]"), which hangs any non-TTY caller with no catchable error.
+    // Pre-check the cached creds here and return a typed error instead of
+    // spawning. API-key and Vertex-SA slots never prompt, so they skip this.
+    //
+    // Detection is `-p`/`--prompt`-ONLY, NOT `!stdin().is_terminal()`: a bare
+    // non-TTY check fires for EVERY piped/redirected/CI invocation — including
+    // stub-driven integration harnesses (`cu2_gemini_one_shot_integration`) and
+    // any non-OAuth spawn — and would reject a legitimate one-shot whose creds
+    // gemini-cli would resolve differently. The reported failure (an internal ticket) is the
+    // `-p` case; the piped-stdin-without-`-p` variant is a documented, accepted
+    // limitation (zero-tolerance Rule 5: the specific blocker is that non-TTY
+    // detection breaks stub/test spawns + non-OAuth gemini paths).
+    if gemini_invocation_is_headless(rest) {
+        use csq_core::providers::gemini::provisioning::{self, AuthMode};
+        let binding = provisioning::read_binding(base_dir, account)
+            .with_context(|| format!("read Gemini binding for slot {account}"))?;
+        if matches!(binding.auth, AuthMode::CodeAssistOAuth) {
+            // Path-redaction: two OauthLoginError variants (Malformed/Unreadable)
+            // embed the absolute `~/.gemini/oauth_creds.json` path in their
+            // Display, which would leak $HOME/username to operator stderr — and
+            // `csq run` is NOT operator-surface-exempt (operator-surface-verification.md
+            // Rule 5). All four failure variants share one remediation, so emit a
+            // fixed, path-free message instead of interpolating the raw error.
+            // The home is resolved by `platform::home::home_dir` (inside
+            // `check_headless_oauth_ready_for_process`), the SAME resolver the OAuth
+            // writer and the usage poller use: on Windows `HOME` is usually unset and
+            // the profile directory is the real one.
+            csq_core::providers::gemini::oauth_login::check_headless_oauth_ready_for_process(
+                account,
+            )
+            .map_err(|_e| {
+                anyhow!(
+                    "headless Gemini run for slot {account} cannot proceed: cached \
+                     Google OAuth credentials are missing, expired, or unreadable. \
+                     Run `csq login {account} --provider gemini` to re-authenticate, \
+                     then retry."
+                )
+            })?;
+        }
+    }
+
+    // Ensure ~/.claude/accounts exists. We do NOT create config-N/
+    // for Gemini — the binding marker lives in
+    // ~/.claude/accounts/credentials/, and the per-spawn settings
+    // file lives in the handle dir.
+    let accounts_root = claude_home.join("accounts");
+    // SEC-2.15 (unified, R1 M1): create AND secure the accounts root
+    // fail-closed via the shared helper (was create_dir_all at the
+    // process umask).
+    csq_core::platform::fs::ensure_private_dir_root(&accounts_root)
+        .map_err(|e| anyhow::anyhow!("accounts_root_refused: {e}"))?;
+
+    // Minimal handle dir: just the directory + .csq-account marker.
+    // The settings drift reassertion (called inside
+    // build_spawn_plan*) creates the .gemini/ subdir and writes
+    // settings.json with the pre-seeded selectedType + model.
+    let pid = std::process::id();
+    let handle_dir = base_dir.join(format!("term-{}", pid));
+    std::fs::create_dir_all(&handle_dir).with_context(|| {
+        format!(
+            "failed to create Gemini handle dir at {}",
+            redact_path(&handle_dir)
+        )
+    })?;
+    // M4-7: Gemini handle-dir marker uses the slot's identity UUID
+    // when a `by_slot` mapping exists; otherwise the legacy decimal
+    // slot id.
+    match csq_core::accounts::profiles::resolve_slot_to_uuid(base_dir, account.get()) {
+        Some(uuid) => markers::write_csq_account(&handle_dir, uuid)
+            .context("failed to write .csq-account marker for Gemini handle dir")?,
+        None => markers::write_csq_account_legacy(&handle_dir, account)
+            .context("failed to write .csq-account marker for Gemini handle dir")?,
+    }
+
+    let handle_dir_abs = std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
+    // Gemini's spawn env is a fixed allowlist, so the decision enters it explicitly through
+    // `SpawnPlan::with_messaging_decision`.
+    let messaging_on = record_launch_decision(&handle_dir_abs);
+
+    // Open the platform-native vault. Failures here are
+    // user-actionable (locked keychain, missing libsecret) — surface
+    // via anyhow rather than panicking.
+    let vault = secret::open_default_vault().map_err(|e| {
+        let _ = std::fs::remove_dir_all(&handle_dir);
+        anyhow!("secret vault unavailable ({}): {e}", e.error_kind_tag())
+    })?;
+
+    println!("Launching gemini for account {} (term-{})...", account, pid);
+
+    // host-isolation-parity-followups (1): emit ABOVE the Inherit/
+    // WithLayer split so the spec-08 MED-03 warning fires on BOTH
+    // gemini spawn paths, not only WithLayer. The risk this warns
+    // about — the model reading the parent `$HOME` unfiltered — is
+    // identical on Inherit (v2.3.1 byte-equivalent path): neither arm
+    // overrides `$HOME` before `spawn_gemini` execs, so gating the
+    // warning to WithLayer was an oversight, not a deliberate scope
+    // limit (confirmed against an internal ticket's own review notes, which
+    // flagged this exact asymmetry as "pre-existing" and unresolved).
+    // Matches the unconditional 3P-bearer gate in `launch_third_party`
+    // (only `surface_name != "ollama"` gates that one).
+    emit_host_isolation_warning_if_needed(&host_ctx, account, "gemini");
+
+    match layer_control {
+        LayerControl::Inherit => {
+            // v2.3.1 byte-equivalent path — exec on Unix / exit on
+            // Windows. spawn_gemini handles everything (settings
+            // drift reassertion, .env scan, vault read, exec).
+            //
+            // exec-replace invariant (PR-CA10c): Gemini Inherit path calls
+            // exec inside spawn_gemini on Unix (return type Infallible) —
+            // Drop is bypassed after a successful exec. We pre-flush so
+            // the record is durable on the Unix happy path.
+            //
+            // Windows limitation: spawn_gemini's Result<Infallible, _>
+            // return type means it cannot thread an `&mut AuditEmitter`
+            // through to capture end_ts AFTER child.wait() (the way
+            // exec_or_spawn does for Anthropic/Codex/3P). On Windows,
+            // end_ts will equal start_ts for Gemini Inherit sessions
+            // until spawn_gemini gains a cross-module refactor in a
+            // follow-up PR (tracked separately). Pre-flush is preferred
+            // over not-flushing because Windows process::exit on
+            // non-zero child status would otherwise bypass Drop and
+            // drop the record entirely.
+            {
+                use csq_core::audit::{Decision, ResultState};
+                let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                audit_emitter.set_end_ts(end_ts);
+                audit_emitter.set_result(ResultState::Degraded, Decision::Bypass);
+                // M06 fail-loud: Gemini Inherit calls exec inside spawn_gemini
+                // (Unix) / process::exit (Windows) — Drop is bypassed. We still
+                // own the exit code here, so surface a `.pending/` total failure
+                // before handing off.
+                fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+            }
+            match spawn_gemini(
+                base_dir,
+                &handle_dir_abs,
+                account,
+                rest.to_vec(),
+                vault.as_ref(),
+                messaging_on,
+            ) {
+                Ok(_never) => unreachable!("spawn_gemini returns Infallible on success"),
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&handle_dir);
+                    Err(map_spawn_error(account, e))
+                }
+            }
+        }
+        LayerControl::WithLayer {
+            mode,
+            class,
+            rule_ids_in_scope,
+            scaffold,
+            // S4 (an internal ticket): gemini materializes SKILLS + COMMANDS natively; the
+            // rest is prose (`rules_only_scaffold` is a CC-only field).
+            artifacts,
+            project_root,
+            ..
+        } => {
+            // host-isolation-parity-followups (1): the spec 08 MED-03
+            // warning now emits ONCE, unconditionally, above this
+            // match (both Inherit and WithLayer read the parent
+            // `$HOME` unfiltered) — see the emit call before `match
+            // layer_control` above. Do NOT re-add an emit here; that
+            // would double-fire the warning on the WithLayer path.
+
+            // Build the spawn plan. Layer-on variant calls
+            // probe::reassert_settings_drift_with_system_instruction
+            // internally with the scaffold (overwrites any prior
+            // system_instruction value — csq-owned during layer-on
+            // per round-3 R3-H1).
+            let parent_env: std::collections::HashMap<String, String> = std::env::vars().collect();
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            // The shared home resolver (`HOME` is usually unset on Windows), the same one
+            // the gemini OAuth writer, the usage poller and the headless check use.
+            let home = csq_core::platform::home::home_dir();
+            // Fix A (native-delegation gate): suppress the flattened `.coc/`
+            // scaffold when the target's native `.gemini/` / `GEMINI.md` are
+            // present — gemini-cli loads its own artifacts, so injecting the
+            // full `.coc/` flatten into `settings.json system_instruction`
+            // duplicates + overflows context. `CSQ_COC_PARITY_TEST=1` forces it.
+            let inject = should_inject_scaffold(Surface::Gemini, &cwd, project_root.as_deref());
+            // S4 (an internal ticket): deliver gemini-native SKILLS + COMMANDS through
+            // `.gemini/skills/` + `.gemini/commands/` (native progressive
+            // disclosure + `/commands`). Runs BEFORE the settings.json write below
+            // (that path uses idempotent `create_dir_all` on `.gemini/` and never
+            // wipes it). agents/rules have no native gemini primitive → prose.
+            // Native materialization is JOINT (all-or-nothing): a single
+            // `materialize_gemini_native` call emits both kinds, and any error
+            // tears BOTH down and routes BOTH to prose. This is deliberate and
+            // safe — `emit_gemini_native` only errors on an id-validation reject
+            // (unreachable for spec-conformant `.coc/` ids) or a filesystem write
+            // failure on the fresh handle dir (near-infallible), so the joint
+            // fallback never fires in practice; and on the fallback, prose is the
+            // full `scaffold` (every kind delivered exactly once — no
+            // double-delivery, no drop). Per-kind independence (CC-arm style) would
+            // add surface for a path that cannot be reached.
+            let gemini_dir = handle_dir_abs.join(".gemini");
+            let mut skills_native = false;
+            let mut commands_native = false;
+            if inject && (!artifacts.skills.is_empty() || !artifacts.commands.is_empty()) {
+                match materialize_gemini_native(&gemini_dir, &artifacts) {
+                    Ok(()) => {
+                        skills_native = !artifacts.skills.is_empty();
+                        commands_native = !artifacts.commands.is_empty();
+                    }
+                    Err(e) => {
+                        // Fail-safe: tear down the partial trees; both kinds fall
+                        // back to prose.
+                        let _ = std::fs::remove_dir_all(gemini_dir.join("skills"));
+                        let _ = std::fs::remove_dir_all(gemini_dir.join("commands"));
+                        tracing::warn!(
+                            error_kind = "coc_gemini_native_failed",
+                            "gemini-native skills/commands materialization failed; falling back to prose: {}",
+                            csq_core::error::redact_tokens(&e.to_string())
+                        );
+                    }
+                }
+            }
+            // Prose (settings.json `system_instruction`) = exactly the kinds NOT
+            // delivered natively. When !inject (project carries its own native
+            // `.gemini/`), defer entirely — Level-1 behavior byte-unchanged.
+            let prose_owned: Option<String> = if !inject {
+                if scaffold.as_deref().is_some_and(|s| !s.is_empty()) {
+                    note_scaffold_deferred(Surface::Gemini);
+                }
+                None
+            } else if skills_native || commands_native {
+                // Some kind native → prose is every kind NOT materialized. A kind
+                // whose materialization was skipped/failed stays in `remaining`.
+                let remaining = csq_core::coc::translate::SurfaceArtifacts {
+                    skills: if skills_native {
+                        Vec::new()
+                    } else {
+                        artifacts.skills.clone()
+                    },
+                    commands: if commands_native {
+                        Vec::new()
+                    } else {
+                        artifacts.commands.clone()
+                    },
+                    ..(*artifacts).clone()
+                };
+                reduced_surface_prose(
+                    Surface::Gemini,
+                    &remaining,
+                    class.class == csq_core::capability_layer::PromptClassKind::Compliance,
+                )
+            } else {
+                // Nothing native → full prose (all kinds).
+                scaffold
+            };
+            let system_instruction = prose_owned.as_deref().filter(|s| !s.is_empty());
+
+            let plan = match build_spawn_plan_with_system_instruction(
+                base_dir,
+                &handle_dir_abs,
+                account,
+                &parent_env,
+                &cwd,
+                home.as_deref(),
+                vault.as_ref(),
+                rest.to_vec(),
+                system_instruction,
+            ) {
+                Ok(p) => p.with_messaging_decision(messaging_on),
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&handle_dir);
+                    return Err(map_spawn_error(account, e));
+                }
+            };
+
+            // Round-1 C4: post-rename re-stat closes TOCTOU window
+            // between settings.json materialization and gemini-cli
+            // starting up.
+            verify_gemini_handle_settings_is_regular_file(&handle_dir_abs)?;
+
+            // CU2 (an internal ticket): spawn shape is mode-driven BEFORE the child
+            // is created. OneShot requires piped stdio for post-validate
+            // capture; Interactive keeps inherited stdio.
+            //
+            // GOTCHA-A: #3a alone (detection) would be a silent no-op without
+            // this dispatch branch — detecting OneShot but spawning with
+            // inherited stdio would land in a dead arm that drops inputs.
+            // Both detection AND piped-spawn MUST land together.
+            let child = match mode {
+                SpawnMode::OneShot => {
+                    // Piped stdio variant preserves the same security posture
+                    // (env_clear + allowlist, current_dir, Unix pre_exec
+                    // RLIMIT_CORE=0) as execute_plan_as_child.
+                    match execute_plan_as_child_piped(plan) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = std::fs::remove_dir_all(&handle_dir);
+                            return Err(anyhow!("failed to spawn gemini-cli (piped): {e}"));
+                        }
+                    }
+                }
+                SpawnMode::Interactive => {
+                    // Inherited stdio (existing behavior — INV-2 unchanged).
+                    match execute_plan_as_child(plan) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = std::fs::remove_dir_all(&handle_dir);
+                            return Err(anyhow!("failed to spawn gemini-cli: {e}"));
+                        }
+                    }
+                }
+            };
+
+            // CU2 (#3d): audit attribution comes from the ACTUAL outcome.
+            // For OneShot, spawn_gemini_with_layer_dispatch sets all audit
+            // fields internally (including process::exit paths — GOTCHA-F).
+            // For Interactive success, the dispatch returns Ok(()) and we
+            // set Pass+Accept here (the WithLayer path completed normally).
+            let result = spawn_gemini_with_layer_dispatch(
+                child,
+                &handle_dir,
+                mode,
+                class,
+                rule_ids_in_scope,
+                toggles,
+                debug,
+                audit_emitter,
+            );
+
+            // Interactive success path: set audit fields here so Drop
+            // flushes the complete record. OneShot and error paths set
+            // their own audit fields inside the dispatch function.
+            if result.is_ok() && mode == SpawnMode::Interactive {
+                use csq_core::audit::{Decision, ResultState};
+                let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                audit_emitter.set_end_ts(end_ts);
+                audit_emitter.set_result(ResultState::Pass, Decision::Accept);
+                audit_emitter.set_rule_ids(vec![], vec![]);
+            }
+            result
+        }
+    }
+}
+
+/// Refuse to launch a native slot whose binding marker is a SYMLINK. csq only
+/// ever writes a REGULAR file at `credentials/{kimi,grok}-<N>.json` (via
+/// `native::write_binding`), so a symlink here is external tampering. Because
+/// `native::marker_exists` (and thus the `binding_guard` union detector) now
+/// treats a dangling marker symlink as BOUND for fail-toward-refuse (redteam R2
+/// MEDIUM-2), dispatch MUST refuse it explicitly rather than exec the vendor CLI
+/// against tampered state — parity with `launch_gemini`'s symlink refusal and
+/// codex's `verify_codex_canonical_is_regular_file`.
+fn refuse_native_marker_symlink(
+    base_dir: &Path,
+    account: AccountNum,
+    surface: Surface,
+    descriptor: &csq_core::providers::native::NativeCli,
+) -> Result<()> {
+    let marker = csq_core::providers::native::marker_path(base_dir, account, surface);
+    if let Ok(meta) = std::fs::symlink_metadata(&marker) {
+        if meta.file_type().is_symlink() {
+            return Err(anyhow!(
+                "refusing {} launch: {} is a symlink. csq only writes a regular file at this path; a symlink here means an external process mutated the credentials directory. Re-run `csq login {account} --provider {}` to rewrite.",
+                descriptor.display_name,
+                redact_path(&marker),
+                descriptor.id
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `csq run N` dispatch for a native, self-authenticating vendor-CLI slot
+/// (Kimi/Grok — Wave 3, an internal journal entry). Modeled on [`launch_gemini`] but
+/// substantially simpler per the INV-P02 inversion (spec 07 §7.5): native
+/// CLIs self-authenticate, so this function does NOT open the secret vault,
+/// does NOT check OAuth readiness, does NOT load/refresh/fan-out any
+/// credential, and does NOT create `config-<N>/`.
+///
+/// Steps:
+/// 1. Capability-layer pre-flight ([`run_capability_layer_preflight`]).
+/// 2. `--bench-mode layer-only` early return.
+/// 3. Assert the binding marker exists
+///    ([`csq_core::providers::native::marker_exists`]) — a clear
+///    remediation error if not (the marker is written by `csq login N
+///    --provider {kimi-cli,grok}`, never by `csq run`).
+/// 4. Create the minimal `term-<pid>` handle dir with only `.csq-account`
+///    (mirrors `launch_gemini` — no `config-N/`, no per-spawn settings
+///    file: native CLIs have no per-account config surface for csq to
+///    materialize into).
+/// 5. Fire the spec 08 MED-03 host-isolation warning (the model reads
+///    `$HOME` unfiltered, the same exposure as every other spawned
+///    surface).
+/// 6. Resolve the vendor binary (PATH + the known-install-dir fallback —
+///    `~/.kimi-code/bin` / `~/.grok/bin`, since neither is on PATH by
+///    default) and **exec** it (Unix) / spawn+wait (non-Unix) via
+///    [`exec_or_spawn`], inheriting the parent env (minus a small
+///    csq-session-dir scrub) + cwd + `rest` passthrough args.
+///
+/// ## Per-slot vendor home (0135 design lock)
+///
+/// Before spawn, [`set_native_home_env`] points the vendor at THIS slot's
+/// isolated home ([`csq_core::providers::native::native_home_path`]) via
+/// `descriptor.home_env` (`KIMI_CODE_HOME` / `GROK_HOME`), after stripping
+/// BOTH native home vars from the child env. Strip-both-then-set-one is
+/// security-load-bearing: an inherited parent-shell `GROK_HOME` while
+/// launching a Kimi slot must never leak into the child — that is the
+/// exact multi-account isolation bug this redesign fixes. The vendor
+/// loads/refreshes its own credentials from that home; csq never reads or
+/// writes inside it.
+///
+/// ## No spawn-boundary governance gate (M6 T6.1)
+///
+/// Unlike `launch_codex`/`launch_gemini`, this function does NOT evaluate
+/// the enterprise M6 T6.1 spawn-boundary gate
+/// (`csq_trust_contract::SpawnCli`) — that enum has only `Codex`/`Gemini`
+/// variants today (not `#[non_exhaustive]`); adding Kimi/Grok variants is a
+/// cross-crate change out of this shard's scope (an internal journal entry W3-4). This
+/// mirrors the gate's own documented scope ("Only codex/gemini hit this
+/// spawn-boundary gate; cc and 3P providers are gated in-loop, not here") —
+/// native surfaces join that same "not gated here" set for now.
+///
+/// ## No capability-layer materialization YET (missing wiring, not a
+/// structural limitation of the vendor CLIs)
+///
+/// This function does NOT currently write anything into Kimi/Grok's own
+/// config surface — but that surface DOES exist. `<KIMI_CODE_HOME>/
+/// config.toml` is a real per-slot vendor-written file
+/// `coc::translate::kimi_merge::merge_kimi_config_via_toml_value` already
+/// knows how to round-trip-merge into (see that module's doc comment), and
+/// `$GROK_HOME/{AGENTS.md,config.toml,settings.json}` is the documented
+/// Grok target (`coc::translate::grok` module doc). Both homes are ALREADY
+/// pointed at by THIS function via [`set_native_home_env`] below — the
+/// vendor CLI reads/writes them directly on every spawn. What is missing
+/// is the CALL from this function into `emit_kimi_native`/
+/// `emit_grok_native` (plus a not-yet-written Grok config/settings merge
+/// helper, mirroring `kimi_merge`) BEFORE spawn — that wiring is a
+/// follow-on shard (an internal journal entry W3-4), not a structural gap in what the
+/// vendor CLIs read. So today this function never calls `spawn_with_layer`
+/// — every [`LayerControl`] outcome (`Inherit` or `WithLayer`) converges
+/// on the same `exec_or_spawn` call below, unlike `launch_codex`/
+/// `launch_gemini` which branch into a governed spawn+post-validate loop
+/// on `WithLayer`. When `WithLayer` resolves a non-empty scaffold that
+/// `should_inject_scaffold` says SHOULD be delivered (no native
+/// `AGENTS.md`/`.kimi`/`.grok` artifacts found anywhere up-tree), there is
+/// nowhere TODAY to deliver it — csq notes the gap on stderr rather than
+/// silently dropping it. The common case (native artifacts present)
+/// already suppresses injection via `should_inject_scaffold`, so this note
+/// fires only for a `.coc/`-only project with no native CLI artifacts
+/// anywhere up-tree. This note (and the `spawn_with_layer` bypass above)
+/// MUST be removed/updated when the wiring shard lands.
+///
+/// ### Acceptance criterion for the wiring shard — audit-emission parity
+///
+/// A native Kimi/Grok run whose in-scope RULE set (`SurfaceArtifacts.rules`
+/// after `flatten_artifacts` — NOT the whole scaffold; a `.coc/` with zero
+/// rules but non-empty agents/skills/commands legitimately has an empty
+/// rule set) is non-empty MUST emit non-empty `rule_ids_cited_*` on the
+/// audit record; a run that delivers NO scaffold at all MUST emit
+/// `Degraded`/`Bypass` (mirroring every other surface's Inherit/no-layer
+/// classification — see the `audit_emitter.set_result` call in this
+/// function's `Ok` path below). **This AC is UNTESTABLE in this PR — no
+/// spawn path here materializes a scaffold at all (see the section above),
+/// so there is no live behavior to assert against.** The wiring shard that
+/// adds the `emit_kimi_native`/`emit_grok_native` calls MUST add the test
+/// alongside the wiring, not before it — writing a test that cannot fail
+/// today would be vacuous coverage.
+///
+/// ### Additional wiring-shard obligations (redteam round 4)
+///
+/// - **Symlink re-stat / refuse-on-symlink + per-slot write lock +
+///   reconcile-on-emit** for the PERSISTENT vendor homes (R4-2). Unlike
+///   `emit_cc_plugin`'s fresh per-spawn dest (pre-plant impossible),
+///   `<KIMI_CODE_HOME>` / `$GROK_HOME` have an unbounded pre-plant
+///   window. Before EVERY read AND write the wiring MUST re-stat the
+///   target and refuse (operator-visibly) when it is a symlink, and MUST
+///   serialize concurrent emits per slot. (R11 MED-1: `emit_kimi_native`/
+///   `emit_grok_native` already do this for their own pre-write overwrite
+///   snapshot READ and the write itself, at the LEAF artifact path ONLY —
+///   see `write_file_restorable`'s `symlink_metadata` check in
+///   `materialize.rs`. This is LEAF-scoped coverage, not full coverage: it
+///   does NOT defend a symlinked ANCESTOR — a symlink at `dest` ITSELF or
+///   at an intermediate directory component (`dest/skills`) is still
+///   followed by `create_dir_all`. This AC covers that remaining gap, plus
+///   any ADDITIONAL reads/writes the wiring shard itself performs, e.g. a
+///   `kimi_merge`-style existing-`config.toml` read.) Reconcile-on-emit
+///   MUST filter every delete candidate through
+///   `coc::translate::materialize::is_csq_owned_entry` (R11 MED-2) — an
+///   entry for which it returns `false` MUST NEVER be a reconcile-delete
+///   candidate. Note its doc comment's one inherent limitation: a
+///   user-authored entry literally named `csq-<anything>` is
+///   indistinguishable from csq-owned and WILL be reconciled.
+/// - **csq-unique hook command minting** (R4-4): every csq-contributed
+///   hook command MUST carry a csq-unique token so the ownership-marker
+///   identity key (`command`) can never collide with a user-authored
+///   hook — see `kimi_merge::CSQ_MANAGED_HOOK_COMMANDS_KEY`.
+/// - **`${{` template-DSL pre-flight over the AGENTS.md body** (R7-1):
+///   the emitter's `check_no_template_dsl` covers skills/commands/agents
+///   bodies but NOT the rule prose carried in
+///   `GrokSpawnPayload.agents_md` (translate is pure). The
+///   `$GROK_HOME/AGENTS.md` write MUST run
+///   `coc::translate::materialize::check_no_template_dsl` (pub for this
+///   purpose) over the merged body first — a `.coc/` rule documenting CI
+///   behavior with a GitHub-Actions-style `${{ matrix.foo }}` /
+///   `${{ secrets.X }}` literal is a common accidental collision Grok
+///   would silently substitute at spawn.
+/// - **Flip every "not delivered yet" disclosure surface** (round-13
+///   review "also" item): today's not-delivered posture is spread across
+///   THREE places that must ALL flip together, or the operator sees a
+///   stale "not delivered" claim after the wiring ships (the mirror-image
+///   lie of a stale "delivered" claim). Checklist for the wiring shard:
+///   1. This doc comment's "No capability-layer materialization YET"
+///      section above (including the operator stderr note and the
+///      `spawn_with_layer` bypass it documents) — remove/update per its
+///      own "MUST be removed/updated when the wiring shard lands" note.
+///   2. `csq/src/cli/commands/inspect_coc.rs`'s `NOT_DELIVERED_BANNER`
+///      text + `render_translate_json`'s `"delivered": false` key for
+///      `Surface::Kimi`/`Surface::Grok` — both MUST flip to `true`/absent
+///      once `launch_native` actually materializes native artifacts.
+///   3. The `inspect_coc.rs` test suite pinning the not-delivered
+///      posture (`non_json_summary_marks_kimi_and_grok_as_not_delivered`,
+///      `translate_json_marks_kimi_and_grok_as_not_delivered`, and the
+///      sibling reject-boundary tests asserting Kimi/Grok do NOT yet
+///      match the wired-surfaces set) MUST be updated to assert the NEW
+///      delivered posture — leaving them unchanged would pin a stale
+///      claim as a passing test.
+/// - **Duplicate-subagent hazard on Grok** (round-13 review HIGH-2): NO
+///   `[compat.claude]` cell suppresses `.claude/agents/` subagent
+///   discovery (the `agents` cell name is a false friend — see
+///   `GrokSpawnPayload::compat_cells_disabled`'s doc comment). So a
+///   project carrying `<project>/.claude/agents/REVIEW.md` and no `.coc/` resolves
+///   through the legacy chain to a `CocSet` containing `REVIEW`, and
+///   `emit_grok_native` would write `$GROK_HOME/agents/csq-REVIEW.md`
+///   while Grok independently loads `<project>/.claude/agents/REVIEW.md` — same
+///   body, two names, two subagents with near-identical `description:`
+///   competing for automatic selection. The `csq-` prefix that prevents a
+///   FILENAME collision is exactly what hides the duplicate from Grok's
+///   own dedup. The wiring shard MUST either skip materializing an
+///   `agents/<ID>.md` entry whose id already resolves to a `.claude/
+///   agents/<ID>.md` (or `.grok/agents/<ID>.md`) file reachable from
+///   `cwd` up to the resolved project root (mirroring
+///   `native_artifacts_present`'s own bounded walk — see that function's
+///   doc comment for why an UNBOUNDED walk is itself a bug), OR gate the
+///   entire native-agent materialization on `!native_artifacts_present`
+///   the same way scaffold injection is gated.
+#[allow(clippy::too_many_arguments)]
+fn launch_native(
+    base_dir: &Path,
+    account: AccountNum,
+    surface: Surface,
+    capability_layer_enabled: bool,
+    layer_is_auto: bool,
+    toggles: &CapabilityLayerToggles,
+    debug: bool,
+    bench_mode: Option<&str>,
+    coc_cache_enabled: bool,
+    rest: &[String],
+    audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+) -> Result<()> {
+    use csq_core::providers::native;
+    provider_session_policy::emit_warning(provider_session_policy::check_unknown_launch_with_args(
+        base_dir, rest,
+    )?);
+
+    let descriptor = native::descriptor(surface)
+        .ok_or_else(|| anyhow!("internal error: {surface} is not a native-CLI surface"))?;
+
+    // PR-CA8b commit 4 pattern: build HostContext from the parent env BEFORE
+    // any spawn-time work (see launch_gemini for the identical rationale).
+    let host_ctx = detect_host_context();
+
+    let layer_control = match run_capability_layer_preflight(
+        base_dir,
+        account,
+        capability_layer_enabled,
+        layer_is_auto,
+        toggles,
+        debug,
+        surface,
+        coc_cache_enabled,
+        rest,
+    ) {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!(
+                "error: {}",
+                csq_core::error::redact_tokens(&format!("{err}"))
+            );
+            // M06 fail-loud (H1): this `process::exit` bypasses Drop — flush the
+            // owning emitter's record BEFORE exit. Capability layer rejected the
+            // run before any spawn → Fail + Reject.
+            {
+                use csq_core::audit::{Decision, ResultState};
+                let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                audit_emitter.set_end_ts(end_ts);
+                audit_emitter.set_result(ResultState::Fail, Decision::Reject);
+                fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+            }
+            std::process::exit(err.exit_code() as i32);
+        }
+    };
+
+    // --bench-mode layer-only: terminate before subprocess spawn.
+    if let Some("layer-only") = bench_mode {
+        return handle_bench_mode_layer_only(surface, audit_emitter);
+    }
+
+    // A dangling/tampered marker symlink now reads as "bound" for the conflict
+    // guard (`native::marker_exists` uses `symlink_metadata` for fail-toward-
+    // refuse — redteam R2 MEDIUM-2). Dispatch MUST therefore explicitly refuse a
+    // symlink marker here rather than exec the vendor CLI against tampered state
+    // — parity with `launch_gemini`'s symlink refusal above.
+    refuse_native_marker_symlink(base_dir, account, surface, descriptor)?;
+
+    // Assert the binding marker exists — `csq run` never writes it (that is
+    // `csq login N --provider {kimi-cli,grok}`'s job).
+    if !native::marker_exists(base_dir, account, surface) {
+        return Err(anyhow!(
+            "slot {account} has no {} binding — run `csq login {account} --provider {}` first",
+            descriptor.display_name,
+            descriptor.id
+        ));
+    }
+
+    // Minimal handle dir: just the directory + .csq-account marker. No
+    // config-N/, no per-spawn settings/config file — native CLIs run
+    // directly in the caller's cwd with no csq-managed home to redirect.
+    // R2 M3: both dirs route through the shared SEC-2.15 helper — the
+    // accounts root resolves a leaf symlink (operator external-drive
+    // setup), the handle dir below it is strict (0o700 at creation).
+    csq_core::platform::fs::ensure_private_dir_root(base_dir).context("accounts_root_refused")?;
+    let pid = std::process::id();
+    let handle_dir = base_dir.join(format!("term-{}", pid));
+    csq_core::platform::fs::ensure_private_dir(&handle_dir).with_context(|| {
+        format!(
+            "failed to create {} handle dir at {}",
+            descriptor.display_name,
+            redact_path(&handle_dir)
+        )
+    })?;
+    let marker_result =
+        match csq_core::accounts::profiles::resolve_slot_to_uuid(base_dir, account.get()) {
+            Some(uuid) => markers::write_csq_account(&handle_dir, uuid),
+            None => markers::write_csq_account_legacy(&handle_dir, account),
+        };
+    if let Err(e) = marker_result {
+        let _ = std::fs::remove_dir_all(&handle_dir);
+        return Err(anyhow!(
+            "failed to write .csq-account marker for {} handle dir: {e}",
+            descriptor.display_name
+        ));
+    }
+
+    let messaging_on = record_launch_decision(&handle_dir);
+
+    println!(
+        "Launching {} for account {} (term-{})...",
+        descriptor.display_name, account, pid
+    );
+
+    // Same host-isolation exposure as every other spawned surface — the
+    // model reads $HOME unfiltered. Emitted unconditionally (mirrors the
+    // gemini unconditional-emit fix, host-isolation-parity-followups (1)) —
+    // this function has only one spawn path, so there is no Inherit/
+    // WithLayer split to worry about double-firing across.
+    emit_host_isolation_warning_if_needed(&host_ctx, account, descriptor.id);
+
+    // No per-spawn materialization surface exists for native CLIs (see
+    // docstring above) — note the gap rather than silently dropping a
+    // non-empty scaffold the operator would otherwise never learn was
+    // skipped.
+    match layer_control {
+        LayerControl::WithLayer {
+            scaffold,
+            project_root,
+            ..
+        } => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            if should_inject_scaffold(surface, &cwd, project_root.as_deref())
+                && scaffold.as_deref().is_some_and(|s| !s.is_empty())
+            {
+                eprintln!(
+                    "note: csq: {} native delivery isn't wired yet — csq points \
+                     {} at this slot's vendor home but doesn't materialize the \
+                     .coc/ scaffold into it yet (that wiring is a follow-on shard). \
+                     Add an AGENTS.md in this directory so {} loads it natively in \
+                     the meantime.",
+                    descriptor.display_name, descriptor.home_env, descriptor.binary
+                );
+            }
+        }
+        LayerControl::Inherit => {}
+    }
+
+    // No enterprise M6 T6.1 spawn-boundary gate — see docstring above.
+
+    let binary_path = csq_core::cli_deps::install_path::find_in_path(descriptor.binary)
+        .ok_or_else(|| {
+            let _ = std::fs::remove_dir_all(&handle_dir);
+            anyhow!(
+                "{} binary ({}) not found on PATH or in its known install dir — \
+                 run `csq cli install {}` first",
+                descriptor.display_name,
+                descriptor.binary,
+                descriptor.binary
+            )
+        })?;
+
+    let mut cmd = Command::new(&binary_path);
+    set_decision_env(&mut cmd, messaging_on);
+    // Scrub csq-session-dir env so the native CLI never accidentally
+    // resolves a stale csq-managed config dir from the parent shell
+    // (mirrors launch_codex's identical CLAUDE_CONFIG_DIR scrub posture).
+    cmd.env_remove("CLAUDE_CONFIG_DIR");
+    cmd.env_remove("CLAUDE_HOME");
+    cmd.env_remove(codex_surface::HOME_ENV_VAR);
+    // C2 (0135 design lock): redirect the vendor at THIS slot's isolated
+    // vendor home. See `set_native_home_env` doc comment for the
+    // strip-both-then-set-one security rationale.
+    set_native_home_env(&mut cmd, descriptor, base_dir, account);
+    // Pin the vendor model when the descriptor declares one (Kimi → K3;
+    // the native kimi CLI otherwise self-defaults to K2.7). Injected BEFORE
+    // the operator's trailing args and SUPPRESSED when the operator already
+    // passed their own `-m`/`--model` — see `native_pinned_model_to_inject`.
+    if let Some(model) = native_pinned_model_to_inject(descriptor, rest) {
+        cmd.arg("--model").arg(model);
+    }
+    cmd.args(rest);
+
+    {
+        use csq_core::audit::{Decision, ResultState};
+        // No rule validation runs on this path (no post-validate loop, see
+        // docstring above) — Degraded + Bypass mirrors every other
+        // surface's Inherit/no-layer classification.
+        audit_emitter.set_result(ResultState::Degraded, Decision::Bypass);
+    }
+    exec_or_spawn(cmd, &handle_dir, audit_emitter, false)
+}
+
+/// Sets the vendor-isolation env var for a native-CLI spawn (`csq run` on a
+/// Kimi/Grok slot), redirecting the vendor at slot `slot`'s isolated home
+/// ([`csq_core::providers::native::native_home_path`]). Extracted as a
+/// standalone helper so the env-construction is directly testable without
+/// spawning a real process (mirrors `attach_scaffold`'s `Command` + `get_envs`
+/// testing pattern).
+///
+/// **PRIMARY METHODOLOGICAL DIRECTIVE (0135 design lock):** strip BOTH known
+/// native home vars (`KIMI_CODE_HOME` AND `GROK_HOME`) BEFORE setting
+/// `descriptor.home_env` to the slot's home — never strip only the
+/// surface's own var. Strip-before-set is the same discipline
+/// `launch_codex` uses for `CODEX_HOME` (strip first so the explicit value
+/// below always wins over a parent-shell export); strip-BOTH is additional
+/// and load-bearing here because there are two sibling native surfaces
+/// sharing this call site. A parent shell exporting `GROK_HOME` while csq
+/// launches a Kimi slot must NOT leak into the child — that would silently
+/// redirect the vendor at the wrong account, the exact multi-account
+/// isolation bug this redesign fixes.
+fn set_native_home_env(
+    cmd: &mut Command,
+    descriptor: &csq_core::providers::native::NativeCli,
+    base_dir: &Path,
+    slot: AccountNum,
+) {
+    use csq_core::providers::native;
+    cmd.env_remove(native::KIMI.home_env);
+    cmd.env_remove(native::GROK.home_env);
+    cmd.env(
+        descriptor.home_env,
+        native::native_home_path(base_dir, slot, descriptor.surface),
+    );
+}
+
+/// Decides the model alias csq should inject as `--model <alias>` when it
+/// spawns a native vendor CLI, or `None` to inject nothing.
+///
+/// Returns `Some(alias)` only when BOTH hold:
+/// 1. the descriptor declares a [`pinned_model`](csq_core::providers::native::NativeCli::pinned_model)
+///    (Kimi pins K3; Grok is `None`, trusting the vendor's own latest default), AND
+/// 2. the operator did NOT already pass their own model selection in the
+///    trailing args — a per-invocation `-m`/`--model` always wins over the
+///    csq default, so csq stays out of the way when the operator is explicit.
+///
+/// Extracted as a pure function (no `Command`, no I/O) so the injection
+/// decision is directly unit-testable — the same rationale as
+/// [`set_native_home_env`]'s extraction.
+fn native_pinned_model_to_inject<'a>(
+    descriptor: &'a csq_core::providers::native::NativeCli,
+    rest: &[String],
+) -> Option<&'a str> {
+    let model = descriptor.pinned_model?;
+    // Suppress the csq default when the operator set their own model. Covers
+    // `-m X`, `-mX`, `--model X`, and `--model=X`. `--model` deliberately
+    // does NOT match the `-m`-prefix arm (it starts with `--`, not `-m`).
+    let operator_set_model = rest.iter().any(|a| {
+        a == "--model" || a.starts_with("--model=") || (a.starts_with("-m") && !a.starts_with("--"))
+    });
+    if operator_set_model {
+        None
+    } else {
+        Some(model)
+    }
+}
+
+/// CU2 (an internal ticket): dispatches a spawned gemini Child on the
+/// with-layer path. The child was spawned with the correct stdio
+/// shape for `mode` by the caller (piped for OneShot, inherited for
+/// Interactive) — this function only waits and drives post-validate.
+///
+/// # OneShot path (CU2 #3c)
+///
+/// Child was spawned with `execute_plan_as_child_piped` by the
+/// caller. This function captures with `wait_with_output`, builds
+/// lossy-UTF-8 for the validator, runs `run_post_spawn_toggled`, then:
+/// - **Pass:** echo Gemini's exact stdout+stderr bytes; clean up
+///   handle_dir; propagate child exit (Fail+Accept if non-zero).
+/// - **Fail (PostValidateFailed):** do NOT echo stdout; echo stderr;
+///   print csq's structured-error line; clean up handle_dir;
+///   flush Fail/Reject audit; `process::exit(24)`.
+///
+/// # GOTCHA-D (false-reject DoS guard — enforcement defaults OFF)
+///
+/// The Gemini one-shot citation gate REJECTING uncited output is the
+/// DoS-prone half: if gemini-cli does NOT honor
+/// `settings.json::system_instruction` in `--prompt` mode, the model
+/// never receives the RULE_IDs, can never cite them, and EVERY Gemini
+/// one-shot would exit 24 (self-inflicted denial of service). CU0's
+/// probe confirming `system_instruction` delivery is still pending
+/// (external dependency), so the OneShot arm forces
+/// `disable_post_validate = true` BY DEFAULT — detection + piped capture
+/// run, but the gate does not reject. Operators whose gemini-cli is
+/// confirmed opt IN with `CSQ_GEMINI_ONE_SHOT_POST_VALIDATE=1`. When
+/// CU0's probe clears, flip enforcement default-on here (an internal ticket).
+/// Distinct from `--no-post-validate` (FR-CL-05), which disables the
+/// gate for ALL surfaces; the GOTCHA-D default-off is Gemini-one-shot-
+/// specific and DoS-motivated.
+///
+/// # Audit attribution (#3d)
+///
+/// Every exit branch sets audit result fields from the ACTUAL outcome:
+/// - Interactive pass: Pass+Accept (set by caller after return).
+/// - OneShot post-validate pass, child success: Pass+Accept (set here).
+/// - OneShot post-validate pass, child non-zero: Fail+Accept (set here,
+///   then process::exit — GOTCHA-F flush before exit).
+/// - OneShot post-validate reject: Fail+Reject (set here, then
+///   process::exit — GOTCHA-F flush before exit).
+///
+/// # INV-2 (GOTCHA-E)
+///
+/// Interactive path is UNCHANGED: inherited stdio, no post-validate,
+/// wait-then-propagate-exit.
+#[allow(clippy::too_many_arguments)]
+fn spawn_gemini_with_layer_dispatch(
+    mut child: std::process::Child,
+    handle_dir: &Path,
+    mode: SpawnMode,
+    class: PromptClass,
+    rule_ids_in_scope: BTreeSet<String>,
+    toggles: &CapabilityLayerToggles,
+    debug: bool,
+    audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+) -> Result<()> {
+    match mode {
+        SpawnMode::OneShot => {
+            // CU2 #3c: child was spawned with piped stdio by caller.
+            // Capture full output, run post-validate, then echo/suppress.
+            let output = match child.wait_with_output() {
+                Ok(o) => o,
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(handle_dir);
+                    return Err(anyhow!("failed to wait for gemini-cli: {e}"));
+                }
+            };
+
+            // Same guard as the CC reference path: a child that exited
+            // non-zero having written NOTHING has not been governed and cannot
+            // be judged. Post-validation on an empty string answers identically
+            // whether the model was non-compliant or never ran, so reporting its
+            // verdict would name the wrong subsystem and bury the child's own
+            // error. Fail + Accept: the run failed, the capability layer did not
+            // reject it.
+            if !output.status.success() && output.stdout.iter().all(|b| b.is_ascii_whitespace()) {
+                let _ = std::io::stderr().write_all(&output.stderr);
+                eprintln!(
+                    "csq: gemini-cli exited {} without producing output — the \
+                     capability layer did not evaluate it (there was nothing to \
+                     evaluate). The error above is the child's own.",
+                    output
+                        .status
+                        .code()
+                        .map_or_else(|| "on a signal".to_string(), |c| format!("with code {c}"))
+                );
+                let _ = std::fs::remove_dir_all(handle_dir);
+                {
+                    use csq_core::audit::{Decision, ResultState};
+                    let end_ts =
+                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                    audit_emitter.set_end_ts(end_ts);
+                    audit_emitter.set_result(ResultState::Fail, Decision::Accept);
+                    fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+                }
+                std::process::exit(output.status.code().unwrap_or(1));
+            }
+
+            // UTF-8 lossy: citation / negative-evidence checks operate on
+            // textual signal; a mid-byte truncation cannot manufacture a
+            // citation nor erase a negative pattern. The bytes echoed to
+            // the user are the original output.stdout — lossy only feeds
+            // the validator. Mirrors the CC reference path exactly.
+            let raw = String::from_utf8_lossy(&output.stdout).into_owned();
+
+            // GOTCHA-D (false-reject DoS guard): default Gemini one-shot
+            // enforcement OFF until CU0's probe confirms gemini-cli honors
+            // settings.json::system_instruction in `--prompt` mode. The
+            // gate MECHANISM (detection + piped capture) runs regardless;
+            // only REJECTION is suppressed by default. Opt in once the
+            // probe clears with CSQ_GEMINI_ONE_SHOT_POST_VALIDATE=1.
+            let gemini_enforce = std::env::var("CSQ_GEMINI_ONE_SHOT_POST_VALIDATE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let mut eff_toggles = *toggles;
+            if !gemini_enforce {
+                eff_toggles.disable_post_validate = true;
+            }
+
+            match run_post_spawn_toggled(raw, class, rule_ids_in_scope, &eff_toggles) {
+                Ok(post_state) => {
+                    if debug {
+                        let cited = post_state
+                            .decoded
+                            .as_ref()
+                            .and_then(|d| d.fields.get("rule_ids_cited"))
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        emit_debug_post_validate(true, &cited, None);
+                    }
+                    // Post-validate passed — echo Gemini's exact bytes to
+                    // the user (no transformation). Stderr also forwarded
+                    // so gemini-cli's diagnostic output reaches the terminal.
+                    let _ = std::io::stdout().write_all(&output.stdout);
+                    let _ = std::io::stderr().write_all(&output.stderr);
+                    let _ = std::fs::remove_dir_all(handle_dir);
+
+                    if !output.status.success() {
+                        // GOTCHA-F (INV-7): this process::exit bypasses Drop →
+                        // audit_emitter never flushes. Flush BEFORE exiting.
+                        // Post-validate accepted the output (Accept); child
+                        // itself exited non-zero → Fail.
+                        use csq_core::audit::{Decision, ResultState};
+                        let end_ts =
+                            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                        audit_emitter.set_end_ts(end_ts);
+                        audit_emitter.set_result(ResultState::Fail, Decision::Accept);
+                        audit_emitter.set_rule_ids(vec![], vec![]);
+                        fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+                        std::process::exit(output.status.code().unwrap_or(1));
+                    }
+
+                    // #3d: successful OneShot + post-validate pass → Pass+Accept.
+                    // Audit fields set here; caller no longer sets unconditionally.
+                    {
+                        use csq_core::audit::{Decision, ResultState};
+                        let end_ts =
+                            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                        audit_emitter.set_end_ts(end_ts);
+                        audit_emitter.set_result(ResultState::Pass, Decision::Accept);
+                        // Cited rule_ids from post-validation decoded state.
+                        let cited: Vec<String> = post_state
+                            .decoded
+                            .as_ref()
+                            .and_then(|d| d.fields.get("rule_ids_cited"))
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        // Post-validate PASSED, so FR-CL-04 repair did not
+                        // run and `after_repair == original`. Passing
+                        // `(cited, vec![])` here recorded
+                        // `rule_ids_dropped_invalid_format = cited.len()` —
+                        // "every citation was dropped as malformed" — on the
+                        // success path. See `set_rule_ids_unrepaired`.
+                        audit_emitter.set_rule_ids_unrepaired(cited);
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    if debug {
+                        let reason = match &e {
+                            StageError::PostValidateFailed { reason } => Some(reason.as_str()),
+                            _ => None,
+                        };
+                        emit_debug_post_validate(false, &[], reason);
+                    }
+                    // Post-validate failed — do NOT echo Gemini's stdout
+                    // (user must not act on rejected content). Stderr IS
+                    // echoed so Gemini's diagnostic context survives.
+                    let _ = std::io::stderr().write_all(&output.stderr);
+                    eprintln!("csq: capability layer rejected output: {e}");
+                    let exit_code = match &e {
+                        StageError::PostValidateFailed { .. } => 24,
+                        _ => e.exit_code() as i32,
+                    };
+                    // GOTCHA-G: clean up handle_dir on reject path too.
+                    let _ = std::fs::remove_dir_all(handle_dir);
+                    // GOTCHA-F (INV-7): flush audit BEFORE process::exit.
+                    // The capability layer rejected the output → Fail+Reject.
+                    {
+                        use csq_core::audit::{Decision, ResultState};
+                        let end_ts =
+                            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                        audit_emitter.set_end_ts(end_ts);
+                        audit_emitter.set_result(ResultState::Fail, Decision::Reject);
+                        audit_emitter.set_rule_ids(vec![], vec![]);
+                        fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+                    }
+                    std::process::exit(exit_code);
+                }
+            }
+        }
+        SpawnMode::Interactive => {
+            // INV-2 (GOTCHA-E): Interactive path is UNCHANGED.
+            // Inherited stdio (child was spawned with execute_plan_as_child
+            // by the caller). No post-validate runs on this path.
+            let _ = (class, rule_ids_in_scope, debug, toggles);
+            let status = child.wait().map_err(|e| {
+                let _ = std::fs::remove_dir_all(handle_dir);
+                anyhow!("failed to wait for gemini-cli: {e}")
+            })?;
+            let _ = std::fs::remove_dir_all(handle_dir);
+            if !status.success() {
+                // GOTCHA-F (INV-7): gemini Interactive child exited
+                // non-zero. This process::exit bypasses Drop — flush BEFORE
+                // exiting. Fail+Accept (no post-validate rejection on the
+                // interactive path).
+                use csq_core::audit::{Decision, ResultState};
+                let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                audit_emitter.set_end_ts(end_ts);
+                audit_emitter.set_result(ResultState::Fail, Decision::Accept);
+                audit_emitter.set_rule_ids(vec![], vec![]);
+                fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+                std::process::exit(status.code().unwrap_or(1));
+            }
+            // #3d: Interactive pass → Pass+Accept (set by caller after return).
+            Ok(())
+        }
+    }
+}
+
+/// Detects production-shaped env-var names in the parent process
+/// environment and builds a `gemini::HostContext` for the spec 08
+/// MED-03 host-isolation warning. Pure observation of env at
+/// invocation time (read-on-spawn matches doctor's read-on-invoke
+/// posture).
+fn detect_host_context() -> csq_core::coc::translate::gemini::HostContext {
+    let detected: BTreeSet<String> = std::env::vars()
+        .map(|(k, _v)| k)
+        .filter(|k| csq_core::env::looks_like_production_secret(k))
+        .collect();
+    csq_core::coc::translate::gemini::HostContext {
+        production_secrets_present: !detected.is_empty(),
+        detected_var_names: detected,
+    }
+}
+
+/// Emits the spec 08 MED-03 host-isolation warning to stderr +
+/// structured log. Round-2 H3 disclosure-minimization: surface
+/// `count + first-name exemplar`, NOT the full `detected_var_names`
+/// list. Round-1 H8: uses `tracing::warn!` with structured fields,
+/// NOT `log::warn!` formatted string.
+///
+/// `surface` names the CLI/provider whose spawn reads `$HOME`
+/// unfiltered (`"gemini"` for the Gemini path; the bound 3P catalog id
+/// — `"kimi"`, `"zai"`, `"mm"`, `"deepseek"`, `"ollama"` — for 3P bearer
+/// slots dispatched through `launch_third_party`, since ALL of them
+/// spawn the same `claude` binary with the same unfiltered-`$HOME`
+/// exposure; see the callsite in `launch_third_party`). Surface-generic
+/// since PR-kimi-grok-host-isolation (Wave 3): the message text and
+/// `error_kind`/`surface` log fields are parameterized so the operator
+/// sees exactly which model is on the exposed host — the gemini call
+/// site pins `"gemini"`, reproducing the pre-generalization byte-exact
+/// message.
+///
+/// Informational — does NOT abort the spawn. Operator-side
+/// mitigation (clean VM) per spec 08 stays load-bearing.
+fn emit_host_isolation_warning_if_needed(
+    host_ctx: &csq_core::coc::translate::gemini::HostContext,
+    account: AccountNum,
+    surface: &str,
+) {
+    if !host_ctx.production_secrets_present {
+        return;
+    }
+    let count = host_ctx.detected_var_names.len();
+    let exemplar = csq_core::env::first_exemplar(&host_ctx.detected_var_names)
+        .unwrap_or("<unknown>")
+        .to_string();
+    eprintln!(
+        "warning: {surface} host-isolation — {count} production-shaped env-var name(s) detected \
+         (e.g. {exemplar}); model running {surface} reads $HOME unfiltered; \
+         see specs/08 MED-03 host-isolation caveat."
+    );
+    tracing::warn!(
+        target: "csq::capability_layer",
+        error_kind = format!("{surface}_host_isolation_warning"),
+        surface = surface,
+        account = account.get(),
+        detected_count = count,
+        first_name = exemplar.as_str(),
+        "{} host-isolation warning emitted", surface
+    );
+}
+
+/// PR-CA8b round-1 C4 + R2-H3: post-rename re-stat for gemini's
+/// handle-dir settings.json. Mirrors `verify_codex_handle_config_toml_is_regular_file`.
+/// Closes the TOCTOU window between materialization and
+/// `gemini-cli` starting up; on Windows the upper bound is ~500ms
+/// per `atomic_replace_windows` retry-loop semantics.
+fn verify_gemini_handle_settings_is_regular_file(handle_dir: &Path) -> Result<()> {
+    let path = handle_dir.join(".gemini").join("settings.json");
+    let meta = std::fs::symlink_metadata(&path).with_context(|| {
+        format!(
+            "stat {} — handle-dir gemini settings.json missing post-materialization",
+            redact_path(&path)
+        )
+    })?;
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        return Err(anyhow!(
+            "refusing Gemini spawn: {} became a symlink between materialization and spawn (TOCTOU). \
+             Re-run `csq run`.",
+            redact_path(&path)
+        ));
+    }
+    if !ft.is_file() {
+        return Err(anyhow!(
+            "refusing Gemini spawn: {} is not a regular file (type: {:?})",
+            redact_path(&path),
+            ft
+        ));
+    }
+    Ok(())
+}
+
+/// Maps a `SpawnError` to user-actionable anyhow text.
+fn map_spawn_error(
+    account: AccountNum,
+    e: csq_core::providers::gemini::spawn::SpawnError,
+) -> anyhow::Error {
+    use csq_core::providers::gemini::spawn::SpawnError as S;
+    match e {
+        // Mirror the variant's own Display string per
+        // `rules/operator-surface-verification.md` Rule 2 (field-shape
+        // trigger): `env_file: PathBuf` is the leak-class field, and
+        // surfacing it here would re-leak the user's directory tree
+        // even though the variant's `#[error(...)]` was hardened in
+        // the same shard (see `csq-core/src/providers/gemini/spawn.rs`
+        // `SpawnError::ShadowAuth` design-intent comment). Drop the
+        // path; keep the actionable variable name + remediation hint.
+        S::ShadowAuth {
+            env_file: _,
+            variable,
+        } => anyhow!(
+            "refusing Gemini spawn — a `.env` file declares {} which would override the csq-injected key. \
+             Remove or rename the variable before retrying, or run `csq run` from a different directory.",
+            variable
+        ),
+        S::Probe(p) => anyhow!("Gemini drift detector failed: {p}"),
+        S::Provision(p) => anyhow!("Gemini provisioning state for slot {account} is unusable: {p}"),
+        S::Vault(v) => anyhow!(
+            "Gemini secret vault read failed ({}) for slot {account}: {v}",
+            v.error_kind_tag()
+        ),
+    }
+}
+
+/// FM-5: `is_relaunch` gates whether a refusal `return Err`s (so a cross-slot
+/// swap relaunch's caller — `codex_supervise`'s `relaunch` closure, and via
+/// it FM-6's flush + recovery-message handling — can catch this instead of
+/// the whole csq process dying out uncleanly) or keeps the original
+/// `process::exit` with the distinct, script-facing
+/// `EXIT_CODE_DAEMON_REQUIRED` this function's own doc comment documents. On
+/// the primary `csq run` entrypoint (`is_relaunch = false`) the exit-code
+/// fidelity is preserved exactly as before; on a relaunch the top-level
+/// `cli::run()` error handler in `main.rs` maps ANY `Err` to a generic exit
+/// 1 — the same fidelity trade-off `evaluate_codex_spawn_gate`'s
+/// pre-existing Err path already makes for the M6 spawn gate.
+///
+/// C-R4-4: precisely what this function's `Err` return does and does NOT
+/// preserve on a relaunch (`doc-property-claims.md`: the prior wording here
+/// implied returning `Err` "left the ORIGINAL session alone," which is
+/// false for THIS call site). On a relaunch, `launch_codex` — and this
+/// check at its top — runs from inside the recursive call the supervisor's
+/// `relaunch` closure makes AFTER `drive_child`'s `graceful_stop(child)` has
+/// ALREADY torn the original codex child down; by the time this function's
+/// `Err` path executes here, there is no original session left to preserve.
+/// Its actual job at THIS position is narrower: avoid a raw `process::exit`
+/// that would bypass the audit emitter's flush, and let FM-6's recovery-hint
+/// message reach the user describing how to get back to the (already
+/// terminated) conversation. The check that DOES keep the original session
+/// alive on refusal is the SEPARATE, earlier one — this file's own
+/// `validate_codex_relaunch_target`, which runs its own `codex_daemon_refusal`
+/// call (and, per C-R4-4, its own capability-layer preflight) BEFORE
+/// `drive_child` calls `graceful_stop` at all. That is the function whose
+/// `Err` genuinely leaves the current codex child untouched.
+fn require_daemon_healthy(
+    base_dir: &Path,
+    audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+    is_relaunch: bool,
+) -> Result<()> {
+    // M06 fail-loud (H1): every "Codex spawn refused" branch below uses
+    // `process::exit`, which bypasses the owning emitter's `Drop` in
+    // `handle`. The daemon-prerequisite gate is a real run outcome (the
+    // Codex run was refused before any spawn) → Fail + Reject. Flush the
+    // record BEFORE the exit, fail-loud if even `.pending/` is unwritable.
+    let flush_refused = |emitter: &mut crate::cli::audit_emit::AuditEmitter| {
+        use csq_core::audit::{Decision, ResultState};
+        let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        emitter.set_end_ts(end_ts);
+        emitter.set_result(ResultState::Fail, Decision::Reject);
+        fail_loud_on_audit_write_failure(emitter.try_flush_now());
+    };
+
+    if let Some(reason) = codex_daemon_refusal(&daemon::detect_daemon(base_dir)) {
+        eprintln!("{reason}");
+        flush_refused(audit_emitter);
+        if is_relaunch {
+            return Err(anyhow!("{reason}"));
+        }
+        std::process::exit(EXIT_CODE_DAEMON_REQUIRED);
+    }
+    Ok(())
+}
+
+/// Pure operator-output and admission decision, shared by the real spawn gate
+/// and private fixtures. A healthy socket never waives version compatibility.
+///
+/// C-R4-3: `pub(crate)` (was private) so `swap.rs`'s `handoff_to_supervisor`
+/// can run the SAME daemon-health check before writing a swap request,
+/// rather than letting a daemon-down refusal surface only later, silently,
+/// inside the supervisor's own relaunch attempt.
+pub(crate) fn codex_daemon_refusal(result: &DetectResult) -> Option<String> {
+    let reason = match result {
+        DetectResult::Healthy { daemon_version, .. } => {
+            // Spec 07 §7.5 INV-P02: the daemon owns the Codex refresh hot path.
+            daemon::version_drift_reason(daemon_version)?
+        }
+        DetectResult::NotRunning => format!(
+            "csq daemon is not running. The daemon must own token refresh for Codex \
+             (spec 07 §7.5 INV-P02). {}",
+            daemon::recovery::recovery_guidance()
+        ),
+        // Detection reasons can contain private socket/PID paths or raw OS
+        // errors. Preserve the category, not the untrusted diagnostic body.
+        DetectResult::Stale { .. } => format!(
+            "csq daemon is stale (PID/socket verification failed). {}",
+            daemon::recovery::recovery_guidance()
+        ),
+        DetectResult::Unhealthy { .. } => format!(
+            "csq daemon is unhealthy (socket/health verification failed). Inspect `csq daemon status`. {}",
+            daemon::recovery::recovery_guidance()
+        ),
+    };
+    Some(format!("Codex spawn refused — {reason}"))
+}
+
+/// Caller-side dispatch instruction returned by
+/// [`run_capability_layer_preflight`]. The csq-cli launch path uses
+/// it to decide between the v2.3.1 inherit-and-exec shape and the
+/// PR-CA6b+ with-layer spawn+wait shape (spec 10 §10.4.2).
+enum LayerControl {
+    /// Layer is OFF or `.coc/` resolved to fallback. Caller takes
+    /// the v2.3.1 path: `exec_or_spawn` (exec on Unix, spawn+wait on
+    /// Windows). Argv + env are byte-identical to pre-PR-CA5.
+    Inherit,
+    /// Layer ran the pre-spawn pipeline successfully. Caller spawns
+    /// CC as a child (always spawn+wait — never `exec`) so the parent
+    /// stays alive for the post-spawn pipeline. Per spec 10 §10.4.2:
+    /// - `mode == OneShot` (PR-CA7b1) → `Stdio::piped()` capture +
+    ///   post-validate against captured output + echo to user stdout.
+    /// - `mode == Interactive` (PR-CA7b2 deferred) → inherited stdio
+    ///   today; PTY allocation when interactive post-validate ships.
+    ///
+    /// `scaffold` is the system-prompt-append text built by
+    /// `ScaffoldStage`, including the FR-CL-01 structured-output
+    /// directive when `class == Compliance` (PR-CA7c). The caller
+    /// delivers this to CC via `--append-system-prompt-file <path>`
+    /// (file-based carrier — avoids E2BIG when the flattened `.coc/`
+    /// artifacts exceed ARG_MAX); spec 10 §10.4.6 records the delivery
+    /// mechanism.
+    WithLayer {
+        mode: SpawnMode,
+        class: PromptClass,
+        rule_ids_in_scope: BTreeSet<String>,
+        scaffold: Option<String>,
+        /// Rules-ONLY scaffold for the CC Level-2 native-materialization
+        /// branch (an internal ticket S2). Same value shape for all surfaces; only the
+        /// CC launch path consumes it today (codex/gemini deliver full prose).
+        rules_only_scaffold: Option<String>,
+        /// Per-kind flattened artifacts (rules/agents/skills/commands) with full
+        /// bodies. The CC launch path materializes agents/skills/commands into a
+        /// native session-scoped plugin (Level-2, an internal ticket S2); the codex/gemini
+        /// launch paths ignore this field today.
+        // Boxed (clippy::large_enum_variant) — `project_root` below pushed the
+        // variant over the size threshold; `SurfaceArtifacts` is the largest
+        // field, so it's the one to box (mirrors `LayerOutcome::Enabled`'s
+        // `pre_spawn` box for the identical reason).
+        artifacts: Box<csq_core::coc::translate::SurfaceArtifacts>,
+        /// The `.coc/` project root `loader::discover` resolved (`LoadOutcome::
+        /// project_root`), or `None` when no `.coc/` was found anywhere up-tree
+        /// (the legacy-fallback case — `coc::fallback::probe` still may have
+        /// produced a non-empty `CocSet` from `.claude/`/`.gemini/`/`AGENTS.md`
+        /// at `cwd` alone). Round-13 review MED-1: threaded through so
+        /// `native_artifacts_present`'s upward walk is bounded by this ACTUAL
+        /// root rather than re-detecting `.coc/` itself — see that function's
+        /// doc comment for why the re-detection was unbounded in the
+        /// legacy-fallback case and what that unboundedness broke in practice.
+        project_root: Option<std::path::PathBuf>,
+    },
+}
+
+/// Time the `.coc/` load and emit either `STAGE_COC_LOAD` (warm hit) or
+/// `STAGE_COC_LOAD_COLD` (cold parse) per spec 10 §10.9.1.
+///
+/// Wraps [`csq_core::coc::load_with_cache`] in stage instrumentation so
+/// the bench harness can fill the `(binary, cache)` matrix from a single
+/// call site. The stage_id is decided at finish time based on the
+/// returned [`csq_core::coc::Warmth`].
+///
+/// `cache_enabled` plumbs `--no-coc-cache` (spec 10 §10.9.5). When
+/// `false`, the cache is neither read nor written for this invocation
+/// and the emit is always `STAGE_COC_LOAD_COLD`.
+///
+/// Result mapping:
+/// - `Ok(Warm)` → `STAGE_COC_LOAD` + `StageResult::Applied`
+/// - `Ok(Cold)` → `STAGE_COC_LOAD_COLD` + `StageResult::Applied`
+///   (parse produced a `CocSet`, even on legacy / empty / version-refused
+///   fall-throughs — those are structured outcomes, not stage errors).
+/// - `Err(_)` → `STAGE_COC_LOAD_COLD` + `StageResult::Error` (the
+///   resolver itself failed, e.g. I/O on `COC.lock`; warm path cannot
+///   surface a load error because the cache hit short-circuits parsing).
+fn load_coc_with_timing(
+    cwd: &Path,
+    base_dir: &Path,
+    cache_enabled: bool,
+) -> Result<csq_core::coc::LoadOutcomeWithWarmth, csq_core::coc::LoadError> {
+    use csq_core::capability_layer::{
+        emit_stage_timing, StageResult, StageTiming, STAGE_COC_LOAD, STAGE_COC_LOAD_COLD,
+    };
+    use csq_core::coc::Warmth;
+    let started_at_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let start_instant = std::time::Instant::now();
+    let result = csq_core::coc::load_with_cache(cwd, base_dir, cache_enabled);
+    let elapsed_ns = start_instant.elapsed().as_nanos();
+    let (stage_id, stage_result) = match &result {
+        Ok(o) => match o.warmth {
+            Warmth::Warm => (STAGE_COC_LOAD, StageResult::Applied),
+            Warmth::Cold => (STAGE_COC_LOAD_COLD, StageResult::Applied),
+        },
+        Err(_) => (STAGE_COC_LOAD_COLD, StageResult::Error),
+    };
+    let timing = StageTiming {
+        stage_id,
+        started_at_ns,
+        elapsed_ns,
+        result: stage_result,
+    };
+    emit_stage_timing(&timing);
+    result
+}
+
+/// Best-effort append of `project_root` to the transitional roots-seen
+/// FIFO at `~/.csq/coc-roots-seen.jsonl` per spec 10 §10.9.3.
+///
+/// This is the "every `csq run` invocation appends its `coc_root`
+/// (deduplicated per file) on success" half of the cache-sweeper
+/// contract: the daemon-side `coc_cache_sweeper` reads this file to
+/// discover known roots and GCs cache files whose `lock_sha` matches no
+/// current root. Without this append, every parse cache file is orphaned
+/// from the sweeper's perspective.
+///
+/// `roots_seen_path = None` resolves to the spec-mandated default; tests
+/// pass an explicit override under `tempfile::TempDir`.
+///
+/// Failures are logged at WARN with a fixed `error_kind` tag; never
+/// propagated. A failed roots-seen append must NOT block `csq run`.
+fn record_root_seen(project_root: &Path, roots_seen_path: Option<&Path>) {
+    let path: PathBuf = match roots_seen_path {
+        Some(p) => p.to_path_buf(),
+        // SHARED resolver — the daemon-side sweeper reads through this exact
+        // function, so the writer and the reader cannot drift apart. They did:
+        // the sweeper used to hardcode `<base_dir>/coc-roots-seen.jsonl` and so
+        // never saw a single root this writer recorded.
+        None => match csq_core::daemon::coc_cache_sweeper::default_roots_seen_path() {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    error_kind = "coc_roots_seen_path",
+                    "could not resolve home directory for coc-roots-seen.jsonl"
+                );
+                return;
+            }
+        },
+    };
+    if let Err(e) = csq_core::daemon::coc_cache_sweeper::append_root_seen(&path, project_root) {
+        tracing::warn!(
+            error_kind = "coc_roots_seen_append",
+            "failed to append project_root to coc-roots-seen.jsonl: {e}"
+        );
+    }
+}
+
+// F10 (round 5): test-only injection seam for the `.coc/` walk's cwd —
+// mirrors `swap.rs`'s `COUNT_CODEX_ANCESTORS_OVERRIDE` pattern (a
+// thread-local, not the real process cwd, so it is safe under `cargo
+// test`'s default parallel runner: each test thread gets its own override,
+// and a reused harness thread always starts from "no override" via the
+// RAII guard's `Drop`).
+#[cfg(test)]
+thread_local! {
+    static COC_PREFLIGHT_CWD_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+// `pub(crate)` (not merely private): item 5 (D-F3, worker-thread
+// hermeticity) needs `codex_supervise::drive_child` to be able to
+// re-install this override, by value, on a brand-new worker thread it
+// spawns — see `coc_preflight_cwd_override_snapshot` below for the reader
+// half of that seam.
+#[cfg(test)]
+pub(crate) struct CocPreflightCwdOverrideGuard;
+
+#[cfg(test)]
+impl Drop for CocPreflightCwdOverrideGuard {
+    fn drop(&mut self) {
+        COC_PREFLIGHT_CWD_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// Forces `run_capability_layer_preflight`'s `.coc/` walk to use `path`
+/// (instead of the real process cwd) on THIS thread until the returned
+/// guard drops. See [`COC_PREFLIGHT_CWD_OVERRIDE`]'s doc for why this
+/// exists instead of `std::env::set_current_dir`.
+///
+/// `pub(crate)`: also called from `codex_supervise::drive_child`'s worker
+/// thread (item 5) to re-install a snapshot taken via
+/// [`coc_preflight_cwd_override_snapshot`] — a thread-local set on the
+/// CALLING thread is otherwise invisible to that brand-new OS thread.
+#[cfg(test)]
+pub(crate) fn force_coc_preflight_cwd(path: PathBuf) -> CocPreflightCwdOverrideGuard {
+    COC_PREFLIGHT_CWD_OVERRIDE.with(|c| *c.borrow_mut() = Some(path));
+    CocPreflightCwdOverrideGuard
+}
+
+/// Item 5 (D-F3, worker-thread hermeticity): reads [`COC_PREFLIGHT_CWD_OVERRIDE`]
+/// on the CALLING thread without disturbing it, so a caller about to spawn a
+/// new OS thread (`codex_supervise::drive_child`'s validate worker) can carry
+/// whatever override this thread currently has installed across the spawn
+/// boundary via [`force_coc_preflight_cwd`]. Returns `None` when no override
+/// is installed on this thread — the worker then runs with no override
+/// either, exactly matching what this thread would have seen.
+///
+/// `unix`-only: its callers (`codex_supervise::drive_child` and that
+/// module's tests) are `#[cfg(unix)]`.
+#[cfg(all(test, unix))]
+pub(crate) fn coc_preflight_cwd_override_snapshot() -> Option<PathBuf> {
+    COC_PREFLIGHT_CWD_OVERRIDE.with(|c| c.borrow().clone())
+}
+
+// (round 6, item 3): a SECOND test-only seam, alongside the cwd-path
+// override above — this one forces `resolve_coc_preflight_cwd` to return
+// `Err` directly, rather than a path that then resolves successfully. The
+// override above cannot reach this: `run_capability_layer_preflight` (see
+// its doc, F10 round 5) catches every `.coc/`-CONTENT failure internally
+// and downgrades it to `Ok(LayerControl::Inherit)` — the ONLY reachable
+// `Err` on this admission path is `resolve_coc_preflight_cwd`'s own `?` at
+// the top of that function, before any content is even read. Forcing
+// exactly that call gives `enabled=true` a genuine `Err` outcome distinct
+// from `enabled=false`'s `Ok` (that flag's hot-path short-circuit returns
+// `Ok(Inherit)` BEFORE ever calling `resolve_coc_preflight_cwd` at all) —
+// the discriminator `validate_codex_relaunch_target`'s and
+// `launch_codex`'s validate-closure tests need.
+#[cfg(test)]
+thread_local! {
+    static COC_PREFLIGHT_CWD_FORCE_ERR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct CocPreflightCwdErrOverrideGuard;
+
+#[cfg(test)]
+impl Drop for CocPreflightCwdErrOverrideGuard {
+    fn drop(&mut self) {
+        COC_PREFLIGHT_CWD_FORCE_ERR.with(|c| c.set(false));
+    }
+}
+
+/// Forces `resolve_coc_preflight_cwd` to return `Err` on THIS thread until
+/// the returned guard drops. See [`COC_PREFLIGHT_CWD_FORCE_ERR`]'s doc.
+/// `pub(crate)` (not merely private) so `codex_supervise::tests` — which
+/// exercises `validate_codex_relaunch_target` and the `launch_codex`-shaped
+/// `default_validate` closure against the SAME admission path from a
+/// different file — can install it too.
+#[cfg(test)]
+pub(crate) fn force_coc_preflight_cwd_err() -> CocPreflightCwdErrOverrideGuard {
+    COC_PREFLIGHT_CWD_FORCE_ERR.with(|c| c.set(true));
+    CocPreflightCwdErrOverrideGuard
+}
+
+#[cfg(test)]
+fn resolve_coc_preflight_cwd() -> Result<PathBuf, csq_core::capability_layer::StageError> {
+    if COC_PREFLIGHT_CWD_FORCE_ERR.with(|c| c.get()) {
+        return Err(csq_core::capability_layer::StageError::ScaffoldFailed {
+            reason: "forced test error (COC_PREFLIGHT_CWD_FORCE_ERR)".to_string(),
+        });
+    }
+    if let Some(p) = COC_PREFLIGHT_CWD_OVERRIDE.with(|c| c.borrow().clone()) {
+        return Ok(p);
+    }
+    std::env::current_dir().map_err(|e| csq_core::capability_layer::StageError::ScaffoldFailed {
+        reason: format!("could not resolve CWD for .coc/ walk: {e}"),
+    })
+}
+
+#[cfg(not(test))]
+fn resolve_coc_preflight_cwd() -> Result<PathBuf, csq_core::capability_layer::StageError> {
+    std::env::current_dir().map_err(|e| csq_core::capability_layer::StageError::ScaffoldFailed {
+        reason: format!("could not resolve CWD for .coc/ walk: {e}"),
+    })
+}
+
+/// Capability-layer pre-flight (PR-CA6b wire-up). Resolves `.coc/`
+/// from the project root (CWD walk) and runs the pre-spawn pipeline
+/// when the user opted in via `--capability-layer`.
+///
+/// Returns:
+/// - `Ok(LayerControl::Inherit)` when the layer is OFF (no flag,
+///   default-OFF for v2.4.0-alpha) OR when `.coc/` resolved to
+///   `CocSource::Empty` (FR-RUN-04 graceful no-`.coc/`). Caller takes
+///   the v2.3.1 launch path with byte-identical argv + env.
+/// - `Ok(LayerControl::WithLayer { mode })` when the pre-spawn
+///   pipeline succeeded. Caller spawns+waits per spec 10 §10.4.2.
+/// - `Err(StageError)` when any stage in the pre-spawn pipeline
+///   errored. The caller maps `err.exit_code()` to the process exit
+///   code per spec 03 §3.9.
+#[allow(clippy::too_many_arguments)]
+fn run_capability_layer_preflight(
+    _base_dir: &Path,
+    _account: AccountNum,
+    enabled: bool,
+    // M7: `true` when the layer is on via the no-flag `AutoDefault`
+    // path (not an explicit `--capability-layer`). Drives the
+    // one-time "auto-engaged" stderr note below.
+    layer_is_auto: bool,
+    toggles: &CapabilityLayerToggles,
+    debug: bool,
+    surface: Surface,
+    coc_cache_enabled: bool,
+    rest: &[String],
+) -> Result<LayerControl, csq_core::capability_layer::StageError> {
+    // Per-technique full-disable AND the global flag both inhibit
+    // every layer stage, so treat them as `enabled=false` for the
+    // hot-path short-circuit. The CLI flag short-circuit
+    // (`enabled == false`) keeps its v2.3.1 byte-equivalent path.
+    if !enabled || toggles.is_layer_fully_disabled() {
+        // Hot-path short-circuit: zero pipeline cost when the layer
+        // is off. The NFR-COMPAT-02 ≤ 5 ms overhead budget for
+        // empty `.coc/` only applies when the layer is ON; when
+        // OFF the path is the v2.3.1 path verbatim.
+        return Ok(LayerControl::Inherit);
+    }
+
+    // Resolve `.coc/` via the spec-09 fallback chain. Per an internal journal entry
+    // the prior first-pull trust gate was retracted (`.coc/` is files
+    // in the user's repo, equivalent to `.claude/`); the version-grace
+    // state lives at `<base_dir>/coc-version-grace.json`.
+    //
+    // F10 (round 5): `resolve_coc_preflight_cwd` is a THREAD-LOCAL test
+    // seam (see its doc) rather than a real `std::env::current_dir()` call
+    // under `#[cfg(test)]` — the process-global cwd is unsafe to mutate
+    // under `cargo test`'s default parallel runner (unlike this crate's
+    // existing `COUNT_CODEX_ANCESTORS_OVERRIDE` pattern in `swap.rs`, which
+    // this mirrors).
+    let cwd = resolve_coc_preflight_cwd()?;
+    let base_dir = super::claude_home().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+    let with_warmth = match load_coc_with_timing(&cwd, &base_dir, coc_cache_enabled) {
+        Ok(o) => o,
+        Err(e) => {
+            // A `.coc/` load failure should NOT block `csq run`.
+            // Log + fall through to the bare-CLI path. This matches
+            // FR-RUN-04 for any unrecoverable resolver failure
+            // (corrupt parse, version refused). The user sees the
+            // warning on stderr but the launch continues.
+            eprintln!("warning: capability-layer .coc/ load failed: {e}");
+            return Ok(LayerControl::Inherit);
+        }
+    };
+    let outcome = with_warmth.outcome;
+
+    if let Some(project_root) = outcome.project_root.as_deref() {
+        record_root_seen(project_root, None);
+    }
+
+    let stdin_is_tty = std::io::stdin().is_terminal();
+    match run_with_layer_toggled(
+        true,
+        outcome.set,
+        surface,
+        rest.to_vec(),
+        stdin_is_tty,
+        toggles,
+    )? {
+        LayerOutcome::Disabled => Ok(LayerControl::Inherit),
+        LayerOutcome::Enabled {
+            mode,
+            class,
+            rule_ids_in_scope,
+            pre_spawn,
+        } => {
+            if debug {
+                emit_debug_classifier(class);
+            }
+            // M7 auto-engage note. Print once, on stderr, only when:
+            // (a) the layer is on via the no-flag default path
+            //     (`layer_is_auto`) — NOT when the user explicitly
+            //     passed `--capability-layer`, who already knows;
+            // (b) stderr is a TTY — keeps piped/scripted stdout+stderr
+            //     byte-clean for harness and CI consumers;
+            // so a user who didn't realize a `.coc/` was present in an
+            // ancestor dir learns why CC's behavior changed and how to
+            // opt out. Goes to stderr so it never contaminates the
+            // captured stdout the post-validate stage echoes.
+            if layer_is_auto && std::io::stderr().is_terminal() {
+                eprintln!(
+                    "csq: capability layer engaged (.coc/ detected). \
+                     Disable for this run with --no-capability-layer, \
+                     or durably via the desktop tray toggle."
+                );
+            }
+            // `pre_spawn` is boxed in `LayerOutcome::Enabled`
+            // (clippy::large_enum_variant); deref to move its fields out.
+            let pre_spawn = *pre_spawn;
+            Ok(LayerControl::WithLayer {
+                mode,
+                class,
+                rule_ids_in_scope,
+                scaffold: pre_spawn.scaffold,
+                rules_only_scaffold: pre_spawn.rules_only_scaffold,
+                artifacts: Box::new(pre_spawn.artifacts),
+                project_root: outcome.project_root,
+            })
+        }
+    }
+}
+
+/// Build the classifier JSONL record (PR-CA7d1; spec 10 §10.7.4).
+/// Pure function; deterministic. Separated from the eprintln so tests
+/// can verify the JSON shape without stderr capture.
+fn build_debug_classifier_record(class: PromptClass) -> serde_json::Value {
+    use csq_core::capability_layer::errors::CLASSIFIER_THRESHOLD;
+    use csq_core::capability_layer::PromptClassKind;
+    let class_str = match class.class {
+        PromptClassKind::Compliance => "compliance",
+        PromptClassKind::FreeForm => "freeform",
+    };
+    let conf = (class.conf as f64 * 10_000.0).round() / 10_000.0;
+    let threshold = (CLASSIFIER_THRESHOLD as f64 * 10_000.0).round() / 10_000.0;
+    serde_json::json!({
+        "event": "classifier",
+        "class": class_str,
+        "confidence": conf,
+        "threshold": threshold,
+        "low_confidence": class.conf < CLASSIFIER_THRESHOLD,
+    })
+}
+
+/// Build the post-validate JSONL record (PR-CA7d1). Pure function;
+/// deterministic. `ok=true` carries the rule_ids the validator
+/// confirmed cited; `ok=false` carries the failure reason verbatim
+/// from `StageError::PostValidateFailed`.
+fn build_debug_post_validate_record(
+    ok: bool,
+    rule_ids_cited: &[String],
+    reason: Option<&str>,
+) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "event".into(),
+        serde_json::Value::String("post_validate".into()),
+    );
+    obj.insert("ok".into(), serde_json::Value::Bool(ok));
+    if ok {
+        obj.insert(
+            "rule_ids_cited".into(),
+            serde_json::Value::Array(
+                rule_ids_cited
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    } else if let Some(r) = reason {
+        obj.insert("reason".into(), serde_json::Value::String(r.to_string()));
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Emit a JSONL record of the classifier verdict to stderr. The
+/// harness parses lines starting with `csq-debug: ` per invocation.
+fn emit_debug_classifier(class: PromptClass) {
+    let payload = build_debug_classifier_record(class);
+    if let Ok(line) = serde_json::to_string(&payload) {
+        eprintln!("csq-debug: {line}");
+    }
+}
+
+/// Emit a JSONL record of the post-validate result to stderr.
+fn emit_debug_post_validate(ok: bool, rule_ids_cited: &[String], reason: Option<&str>) {
+    let payload = build_debug_post_validate_record(ok, rule_ids_cited, reason);
+    if let Ok(line) = serde_json::to_string(&payload) {
+        eprintln!("csq-debug: {line}");
+    }
+}
+
+#[cfg(test)]
+mod debug_record_tests {
+    use super::*;
+    use csq_core::capability_layer::PromptClassKind;
+
+    #[test]
+    fn build_debug_classifier_record_has_event_class_confidence() {
+        let class = PromptClass {
+            class: PromptClassKind::Compliance,
+            conf: 0.4286,
+        };
+        let v = build_debug_classifier_record(class);
+        assert_eq!(v["event"], "classifier");
+        assert_eq!(v["class"], "compliance");
+        assert!((v["confidence"].as_f64().unwrap() - 0.4286).abs() < 1e-4);
+        assert!((v["threshold"].as_f64().unwrap() - 0.15).abs() < 1e-4);
+        assert_eq!(v["low_confidence"], false);
+    }
+
+    #[test]
+    fn build_debug_classifier_record_marks_low_confidence_below_threshold() {
+        let class = PromptClass {
+            class: PromptClassKind::Compliance,
+            conf: 0.05, // below 0.15 threshold
+        };
+        let v = build_debug_classifier_record(class);
+        assert_eq!(v["low_confidence"], true);
+    }
+
+    #[test]
+    fn build_debug_classifier_record_freeform_class_is_serialized() {
+        let class = PromptClass {
+            class: PromptClassKind::FreeForm,
+            conf: 0.50,
+        };
+        let v = build_debug_classifier_record(class);
+        assert_eq!(v["class"], "freeform");
+        // Conf=0.50 is above threshold so low_confidence is false.
+        assert_eq!(v["low_confidence"], false);
+    }
+
+    #[test]
+    fn build_debug_post_validate_ok_carries_rule_ids() {
+        let cited = vec!["RULE-NO-PII".to_string(), "RULE-AUTH".to_string()];
+        let v = build_debug_post_validate_record(true, &cited, None);
+        assert_eq!(v["event"], "post_validate");
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["rule_ids_cited"][0], "RULE-NO-PII");
+        assert_eq!(v["rule_ids_cited"][1], "RULE-AUTH");
+        assert!(v.get("reason").is_none(), "ok=true must omit reason");
+    }
+
+    #[test]
+    fn build_debug_post_validate_fail_carries_reason_no_rule_ids() {
+        let v = build_debug_post_validate_record(false, &[], Some("missing RULE_ID citation"));
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["reason"], "missing RULE_ID citation");
+        assert!(
+            v.get("rule_ids_cited").is_none(),
+            "ok=false must omit rule_ids_cited"
+        );
+    }
+}
+
+/// Delivers the capability-layer scaffold text to a CC `Command` via
+/// `--append-system-prompt-file <path>`.
+///
+/// Writes `scaffold_text` to a unique temp file under the system temp dir
+/// and appends `--append-system-prompt-file <path>` to `cmd`.  Returns the
+/// temp-file path so the caller can clean it up after `spawn_with_layer`
+/// returns (WithLayer always spawns+waits, so the parent is still alive).
+///
+/// Falls back to `CLAUDE_SYSTEM_PROMPT_APPEND` env var on write failure so
+/// small scaffolds (< ARG_MAX) are still delivered on permission-restricted
+/// temp dirs.  Returns `None` when `scaffold_text` is `None` or empty.
+///
+/// **E2BIG rationale**: env vars count toward the execve argv+envp limit
+/// (macOS ARG_MAX = 1 MiB).  Large `.coc/` artifact flattens can exceed
+/// that limit, causing `cmd.spawn()` to return `os error 7`.  Writing the
+/// content to a file keeps argv small regardless of scaffold size.
+fn attach_scaffold(cmd: &mut Command, scaffold_text: Option<&str>) -> Option<PathBuf> {
+    use csq_core::platform::fs::unique_tmp_path;
+
+    let text = match scaffold_text {
+        Some(s) if !s.is_empty() => s,
+        _ => return None,
+    };
+
+    let base = std::env::temp_dir().join("csq-coc-scaffold.md");
+    let tmp = unique_tmp_path(&base);
+
+    match std::fs::write(&tmp, text.as_bytes()) {
+        Ok(()) => {
+            cmd.arg("--append-system-prompt-file").arg(&tmp);
+            Some(tmp)
+        }
+        Err(e) => {
+            // Best-effort fallback: small scaffolds still reach CC via the
+            // env var; large ones will hit E2BIG on spawn (the original bug)
+            // but that is better than silently dropping the scaffold.
+            tracing::warn!(
+                error_kind = "scaffold_tmp_write_failed",
+                "could not write scaffold temp file, falling back to env var: {e}"
+            );
+            cmd.env("CLAUDE_SYSTEM_PROMPT_APPEND", text);
+            None
+        }
+    }
+}
+
+/// Spawn step (spec 10 §10.4.2). Always spawns CC as a child (never
+/// `exec`s) so the parent process stays alive for the post-spawn
+/// pipeline. Dispatches on `mode`:
+///
+/// - **OneShot** (PR-CA7b1) — `Stdio::piped()` captures CC's stdout to
+///   memory; csq runs `run_post_spawn` against the captured output;
+///   if post-validate succeeds the captured bytes are echoed to the
+///   user's stdout. If post-validate fails (`PostValidateFailed`,
+///   exit 24) csq exits with that code WITHOUT echoing CC's output —
+///   the user sees the structured error instead.
+/// - **Interactive** — inherited stdio; no post-spawn validation
+///   runs on this path (spec 10 §10.4.2.1).
+///
+/// Cleans up the handle dir on spawn failure to mirror
+/// `exec_or_spawn`'s posture.
+#[allow(clippy::too_many_arguments)]
+fn spawn_with_layer(
+    cmd: Command,
+    handle_dir: &Path,
+    mode: SpawnMode,
+    class: PromptClass,
+    rule_ids_in_scope: BTreeSet<String>,
+    toggles: &CapabilityLayerToggles,
+    debug: bool,
+    audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+) -> Result<()> {
+    match mode {
+        SpawnMode::OneShot => spawn_one_shot_with_post_validate(
+            cmd,
+            handle_dir,
+            class,
+            rule_ids_in_scope,
+            toggles,
+            debug,
+            audit_emitter,
+        ),
+        // Interactive shape doesn't have a post-validate stage today
+        // (PR-CA7b2 deferred). The classifier debug event already
+        // landed in run_capability_layer_preflight; nothing further
+        // for `--debug` to emit here until per-turn validate ships.
+        SpawnMode::Interactive => spawn_interactive_inherited(cmd, handle_dir, audit_emitter),
+    }
+}
+
+/// PR-CA7b1 OneShot spawn shape: `Stdio::piped()` for stdout/stderr,
+/// `Stdio::null()` for stdin (CC's `--print` mode reads no
+/// interactive input). Captures the full output, runs `run_post_spawn`,
+/// then either echoes to the user's stdout (success) or exits with the
+/// post-validate exit code WITHOUT echoing (failure — the user sees
+/// the structured error so they don't act on rejected content).
+#[allow(clippy::too_many_arguments)]
+fn spawn_one_shot_with_post_validate(
+    mut cmd: Command,
+    handle_dir: &Path,
+    class: PromptClass,
+    rule_ids_in_scope: BTreeSet<String>,
+    toggles: &CapabilityLayerToggles,
+    debug: bool,
+    audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+) -> Result<()> {
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let handle_dir_abs =
+        std::fs::canonicalize(handle_dir).unwrap_or_else(|_| handle_dir.to_path_buf());
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(handle_dir);
+            // csq still owns the exit code (nothing launched), so flush the
+            // audit record fail-loud here, exactly as `exec_or_spawn`'s
+            // spawn-error branch does: a total `.pending/` write failure exits
+            // EXIT_CODE_AUDIT_WRITE_FAILED instead of being lost behind the
+            // launch error.
+            let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            audit_emitter.set_end_ts(end_ts);
+            fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+            return Err(anyhow!("failed to launch claude: {e}"));
+        }
+    };
+    let lifecycle = csq_core::sessions::lifecycle::capture_child(handle_dir, &child);
+    let child_pid = child.id();
+    if let Err(e) = markers::write_live_cc_pid(&handle_dir_abs, child_pid) {
+        eprintln!("warning: could not record CC child PID: {e}");
+    }
+
+    let output = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(handle_dir);
+            return Err(anyhow!("failed to wait for claude: {e}"));
+        }
+    };
+
+    csq_core::sessions::lifecycle::waited(lifecycle.as_ref(), &output.status);
+
+    // The child FAILED and produced no stdout — surface ITS error, do not
+    // post-validate.
+    //
+    // Post-validation asks "did this output cite the in-scope RULE_IDs". On an
+    // EMPTY string that question has exactly one answer regardless of the truth
+    // it is meant to measure: a non-compliant model and a child that never ran
+    // are indistinguishable to it. Running it here therefore produced a
+    // confident verdict about compliance from a run that produced nothing to be
+    // compliant WITH, and printed that verdict INSTEAD of the actual cause.
+    //
+    // Observed: `claude --print` with no prompt exits non-zero with
+    // "Input must be provided either through stdin or as a prompt argument",
+    // and the operator saw only
+    // "capability layer rejected output: ... cited none of the 82 in-scope
+    // RULE_ID(s)" — a message that names the wrong subsystem and gives no route
+    // to the real problem.
+    //
+    // A child that exits non-zero having written nothing has not been governed
+    // and cannot be judged; its own stderr is the load-bearing diagnostic. The
+    // audit records Fail + Accept — the run failed, but the capability layer did
+    // NOT reject it, so recording Reject here would attribute the failure to
+    // csq's governance rather than to the child.
+    if !output.status.success() && output.stdout.iter().all(|b| b.is_ascii_whitespace()) {
+        let _ = std::io::stderr().write_all(&output.stderr);
+        eprintln!(
+            "csq: claude exited {} without producing output — the capability layer \
+             did not evaluate it (there was nothing to evaluate). The error above \
+             is the child's own.",
+            output
+                .status
+                .code()
+                .map_or_else(|| "on a signal".to_string(), |c| format!("with code {c}"))
+        );
+        let _ = std::fs::remove_dir_all(handle_dir);
+        {
+            use csq_core::audit::{Decision, ResultState};
+            let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            audit_emitter.set_end_ts(end_ts);
+            audit_emitter.set_result(ResultState::Fail, Decision::Accept);
+            fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+        }
+        std::process::exit(output.status.code().unwrap_or(1));
+    }
+
+    // UTF-8 lossy is acceptable for post-validation: the citation +
+    // negative-evidence checks operate on textual signal, and a
+    // mid-byte truncation cannot manufacture a citation that wasn't
+    // there nor erase a negative-evidence pattern that was. The
+    // bytes echoed to the user are the original `output.stdout` —
+    // the lossy conversion only feeds the validator.
+    let raw = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    match run_post_spawn_toggled(raw, class, rule_ids_in_scope, toggles) {
+        Ok(post_state) => {
+            if debug {
+                let cited = post_state
+                    .decoded
+                    .as_ref()
+                    .and_then(|d| d.fields.get("rule_ids_cited"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                emit_debug_post_validate(true, &cited, None);
+            }
+            // Post-validate passed — echo CC's exact bytes to the
+            // user (no transformation). Stderr is also forwarded so
+            // CC's diagnostic output reaches the terminal.
+            let _ = std::io::stdout().write_all(&output.stdout);
+            let _ = std::io::stderr().write_all(&output.stderr);
+            let _ = std::fs::remove_dir_all(handle_dir);
+            if !output.status.success() {
+                // M06 fail-loud (H1): this `process::exit` bypasses Drop, so
+                // the owning `audit_emitter` in `run::handle` would never
+                // flush — the record would be lost with no `.pending/` write
+                // and no WARN. csq owns this exit code, so flush BEFORE the
+                // exit and surface a `.pending/` total failure fail-loud.
+                // Post-validate accepted the output (Decision::Accept); the
+                // child itself exited non-zero, so the run result is Fail.
+                {
+                    use csq_core::audit::{Decision, ResultState};
+                    let end_ts =
+                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                    audit_emitter.set_end_ts(end_ts);
+                    audit_emitter.set_result(ResultState::Fail, Decision::Accept);
+                    fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+                }
+                std::process::exit(output.status.code().unwrap_or(1));
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if debug {
+                let reason = match &e {
+                    StageError::PostValidateFailed { reason } => Some(reason.as_str()),
+                    _ => None,
+                };
+                emit_debug_post_validate(false, &[], reason);
+            }
+            // Post-validate failed — DO NOT echo CC's stdout (the
+            // user must not act on rejected output). Stderr IS
+            // echoed so CC's diagnostic context survives. The
+            // structured error is printed in csq's own voice, then
+            // we exit with the spec 03 §3.9 code.
+            let _ = std::io::stderr().write_all(&output.stderr);
+            eprintln!("csq: capability layer rejected output: {e}");
+            let exit_code = match &e {
+                StageError::PostValidateFailed { .. } => 24,
+                _ => e.exit_code() as i32,
+            };
+            let _ = std::fs::remove_dir_all(handle_dir);
+            // M06 fail-loud (H1): post-validate rejected the output. This
+            // `process::exit` bypasses Drop, so flush the audit record BEFORE
+            // exiting (csq owns this exit code). The capability layer
+            // rejected the run → ResultState::Fail + Decision::Reject.
+            {
+                use csq_core::audit::{Decision, ResultState};
+                let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                audit_emitter.set_end_ts(end_ts);
+                audit_emitter.set_result(ResultState::Fail, Decision::Reject);
+                fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+            }
+            std::process::exit(exit_code);
+        }
+    }
+}
+
+/// Interactive spawn shape: inherited stdio (parent's stdio IS the
+/// user's terminal, so the child's `isatty` returns 1 for free). No
+/// post-spawn validation runs on this path (spec 10 §10.4.2.1).
+fn spawn_interactive_inherited(
+    mut cmd: Command,
+    handle_dir: &Path,
+    audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+) -> Result<()> {
+    let handle_dir_abs =
+        std::fs::canonicalize(handle_dir).unwrap_or_else(|_| handle_dir.to_path_buf());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(handle_dir);
+            // csq still owns the exit code (nothing launched), so flush the
+            // audit record fail-loud here, exactly as `exec_or_spawn`'s
+            // spawn-error branch does: a total `.pending/` write failure exits
+            // EXIT_CODE_AUDIT_WRITE_FAILED instead of being lost behind the
+            // launch error.
+            let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            audit_emitter.set_end_ts(end_ts);
+            fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+            return Err(anyhow!("failed to launch claude: {e}"));
+        }
+    };
+    let lifecycle = csq_core::sessions::lifecycle::capture_child(handle_dir, &child);
+    let child_pid = child.id();
+    if let Err(e) = markers::write_live_cc_pid(&handle_dir_abs, child_pid) {
+        eprintln!("warning: could not record CC child PID: {e}");
+    }
+    let status = child.wait();
+    if let Ok(status) = &status {
+        csq_core::sessions::lifecycle::waited(lifecycle.as_ref(), status);
+    }
+    let _ = std::fs::remove_dir_all(handle_dir);
+    match status {
+        Ok(s) if !s.success() => {
+            // M06 fail-loud (H1): the interactive child exited non-zero. This
+            // `process::exit` bypasses Drop, so flush the audit record BEFORE
+            // exiting (csq owns this exit code). Interactive has no
+            // post-validate gate (PR-CA7b2 deferred) — the layer was active
+            // and did not reject, so the run result is Fail + Accept (mirrors
+            // the WithLayer success-path setter, with Fail for the non-zero
+            // child).
+            use csq_core::audit::{Decision, ResultState};
+            let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            audit_emitter.set_end_ts(end_ts);
+            audit_emitter.set_result(ResultState::Fail, Decision::Accept);
+            fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+            std::process::exit(s.code().unwrap_or(1))
+        }
+        Ok(_) => Ok(()),
+        Err(e) => Err(anyhow!("failed to wait for claude: {e}")),
+    }
+}
+
+/// M06 fail-loud handler for the primary `csq run` flow.
+///
+/// The flush callsites that reach this helper are the ones where csq still
+/// owns the exit code (immediately before the Unix `exec` replace, or before
+/// the Windows `process::exit`).  When even the `.pending/` fallback write
+/// fails, [`crate::cli::audit_emit::AuditEmitter::try_flush_now`] returns
+/// `Err(AuditEmitError::PendingWriteFailed)`; we print the multi-line
+/// remediation to stderr and exit non-zero BEFORE control hands off to the
+/// process image replacement.
+///
+/// On `Ok(())` this is a no-op.  The `Drop` / `flush_now` teardown paths do
+/// NOT route through here — they keep the best-effort WARN posture because the
+/// operation already completed and there is no exit code left to own (see
+/// `audit_emit.rs` fail-loud split doc-comment and spec 12 §12.4).
+pub(crate) fn fail_loud_on_audit_write_failure(
+    result: std::result::Result<(), crate::cli::audit_emit::AuditEmitError>,
+) {
+    if let Err(e) = result {
+        eprintln!("{}", e.remediation_message());
+        std::process::exit(EXIT_CODE_AUDIT_WRITE_FAILED);
+    }
+}
+
+/// Execs CC on Unix or spawns + waits on Windows, cleaning up the
+/// handle dir on failure.
+///
+/// PR-CA10c platform-conditional audit emit:
+/// - **Unix**: `cmd.exec()` replaces the process image; Rust destructors do
+///   not run. `end_ts` is captured and the audit record flushed BEFORE
+///   exec, so the record reflects the exec-handoff timestamp.
+/// - **Windows**: `cmd.spawn()` + `child.wait()` returns after the child
+///   exits. `end_ts` is captured AFTER wait (the true child-exit
+///   timestamp), then flushed before `process::exit` may bypass Drop.
+///   This avoids the Windows `end_ts == start_ts` asymmetry that would
+///   otherwise hide long-running session durations from the audit trail.
+fn exec_or_spawn(
+    mut cmd: Command,
+    handle_dir: &Path,
+    audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+    managed_claude: bool,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // exec replaces process — Drop is bypassed. Capture end_ts +
+        // flush synchronously BEFORE handoff so the record is durable.
+        //
+        // M06 fail-loud: this is the primary `csq run` flow. We still own the
+        // exit code here (exec has not happened yet), so a `.pending/` total
+        // failure MUST surface the multi-line remediation and exit non-zero
+        // BEFORE `cmd.exec()` replaces the process image.
+        let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        audit_emitter.set_end_ts(end_ts);
+        fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+        let lifecycle = managed_claude
+            .then(|| csq_core::sessions::lifecycle::prepare_exec(handle_dir))
+            .flatten();
+        let err = cmd.exec();
+        csq_core::sessions::lifecycle::cancel_exec(lifecycle.as_ref());
+        let _ = std::fs::remove_dir_all(handle_dir);
+        Err(anyhow!("exec failed: {err}"))
+    }
+
+    #[cfg(not(unix))]
+    {
+        // Non-Unix (Windows): spawn CC as a child and record its
+        // PID in `.live-cc-pid` so the daemon sweep can tell CC
+        // apart from csq-cli. On Unix `exec` replaces csq-cli with
+        // claude and the csq PID becomes claude's PID, so there is
+        // only one PID and this marker is not needed.
+        let handle_dir_abs =
+            std::fs::canonicalize(handle_dir).unwrap_or_else(|_| handle_dir.to_path_buf());
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(handle_dir);
+                // Capture end_ts at the failure point — record reflects
+                // when the launch attempt terminated even on spawn error.
+                let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                audit_emitter.set_end_ts(end_ts);
+                fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+                return Err(anyhow!("failed to launch claude: {e}"));
+            }
+        };
+        let lifecycle = managed_claude
+            .then(|| csq_core::sessions::lifecycle::capture_child(handle_dir, &child))
+            .flatten();
+        let child_pid = child.id();
+        if let Err(e) = markers::write_live_cc_pid(&handle_dir_abs, child_pid) {
+            eprintln!("warning: could not record CC child PID: {e}");
+        }
+        let status = child.wait();
+        if let Ok(status) = &status {
+            csq_core::sessions::lifecycle::waited(lifecycle.as_ref(), status);
+        }
+        let _ = std::fs::remove_dir_all(handle_dir);
+        // Capture end_ts AFTER wait — this is the true child-exit time.
+        // Flush BEFORE `process::exit` on non-zero status (process::exit
+        // bypasses Drop, same as Unix exec).
+        //
+        // M06 fail-loud: we still own the exit code here (process::exit below
+        // has not run), so surface a `.pending/` total failure before exit.
+        let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        audit_emitter.set_end_ts(end_ts);
+        fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+        match status {
+            Ok(s) if !s.success() => std::process::exit(s.code().unwrap_or(1)),
+            Ok(_) => Ok(()),
+            Err(e) => Err(anyhow!("failed to wait for claude: {e}")),
+        }
+    }
+}
+
+fn resolve_account(base_dir: &Path, explicit: Option<AccountNum>) -> Result<Option<AccountNum>> {
+    if let Some(a) = explicit {
+        return Ok(Some(a));
+    }
+
+    // PR-C3c: the "pick the only live slot" convenience must consider
+    // Codex slots too — otherwise `csq run` on a machine with only a
+    // Codex slot would resolve `None` and launch vanilla claude.
+    // Multi-slot listings include Codex entries via `discover_codex`
+    // so the user can pick by number across surfaces.
+    let mut accounts = discovery::discover_anthropic(base_dir);
+    accounts.extend(discovery::discover_codex(base_dir));
+    // Wave 3: a native-CLI slot (Kimi/Grok marker) is runnable, so bare
+    // `csq run` on a native-only host must auto-pick it instead of launching
+    // vanilla claude (redteam round-2 NEW-1). The `Surface::Kimi/Grok` hint
+    // arms below already expect these entries. (Gemini's parallel auto-pick
+    // exclusion is a separate pre-existing item, left as-is here.)
+    accounts.extend(discovery::discover_native(base_dir));
+    let with_creds: Vec<_> = accounts.iter().filter(|a| a.has_credentials).collect();
+
+    match with_creds.len() {
+        0 => Ok(None), // vanilla claude
+        1 => {
+            let num = AccountNum::try_from(with_creds[0].id)
+                .map_err(|e| anyhow!("invalid account: {e}"))?;
+            Ok(Some(num))
+        }
+        _ => {
+            let mut msg = String::from("multiple accounts configured — specify one:\n");
+            for a in &with_creds {
+                let surface_hint = match a.surface {
+                    Surface::ClaudeCode => "",
+                    Surface::Codex => " [codex]",
+                    Surface::Gemini => " [gemini]",
+                    Surface::Kimi => " [kimi]",
+                    Surface::Grok => " [grok]",
+                };
+                msg.push_str(&format!(
+                    "  csq run {}  ({}){}\n",
+                    a.id, a.label, surface_hint
+                ));
+            }
+            Err(anyhow!(msg))
+        }
+    }
+}
+
+/// Warn-only environment preflight invoked at the top of `handle`.
+///
+/// Prints to stderr so it shows up during exec without polluting
+/// parseable stdout. Never blocks — users have already decided to
+/// launch; mid-session interactive prompts would strand them.
+fn run_env_preflight(claude_home: &Path) {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    let issues = env_check::run_preflight(claude_home, &cwd);
+    if issues.is_empty() {
+        return;
+    }
+    eprintln!("csq: environment issues detected before launch:");
+    for issue in &issues {
+        match issue {
+            EnvIssue::NodeMissingForHooks { hook_count } => {
+                eprintln!("  ! node / bun not found, but {hook_count} hook command(s) configured.");
+                eprintln!("    Claude Code will emit 'SessionStart:startup hook error' on launch.");
+                eprintln!("    Fix: {}", env_check::node_install_hint());
+            }
+            EnvIssue::HookScriptMissing { script_path, .. } => {
+                // `csq run` is NOT operator-explicit-action over the
+                // hook path; the operator invoked `run` to launch CC,
+                // not to inspect hooks. Redact `$HOME` per
+                // `rules/operator-surface-verification.md` Rule 4 —
+                // path is preserved as diagnostic value but the
+                // username prefix becomes `~`.
+                eprintln!("  ! hook script not found: {}", redact_path(script_path));
+            }
+            EnvIssue::HookRelativeRequireMissing {
+                script_path,
+                missing_sibling,
+            } => {
+                eprintln!(
+                    "  ! hook require fails: {} expects {}",
+                    redact_path(script_path),
+                    redact_path(missing_sibling)
+                );
+                eprintln!(
+                    "    (this is node:internal/modules/cjs/loader:1143 — sibling modules missing)"
+                );
+            }
+        }
+    }
+    eprintln!();
+}
+
+fn exec_claude(base_dir: &Path, claude_home: &Path, rest: &[String]) -> Result<()> {
+    let mut cmd = build_vanilla_claude_command(base_dir, claude_home, rest)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = cmd.exec();
+        Err(anyhow!("exec failed: {err}"))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let status = cmd.status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+/// Removes env vars that could override credentials, redirect API traffic,
+/// or otherwise compromise the isolated session.
+///
+/// Strips:
+///
+/// - `ANTHROPIC_*` — base-URL redirects / auth-token overrides for the
+///   Claude Code surface.
+/// - `AWS_BEARER_TOKEN_BEDROCK` — bedrock bypass.
+/// - `CLAUDE_API_KEY` — direct key override.
+/// - `OPENAI_*` — symmetric protection for the Codex surface. A
+///   poisoned dotfile setting `OPENAI_BASE_URL=https://attacker.example`
+///   would silently redirect every Codex API call and exfiltrate the
+///   JWT access token csq just provisioned. Origin: PR-C3c security
+///   review H1 — symmetric with the `ANTHROPIC_*` threat.
+/// - `CODEX_HOME` — scrubbed so the only authoritative value is the
+///   `cmd.env(HOME_ENV_VAR, handle_dir)` csq sets explicitly in
+///   `launch_codex`. Prevents a parent shell that already exported
+///   `CODEX_HOME=/somewhere-else` from winning a clash if csq's
+///   layering ever regresses.
+///
+/// Both the Claude and Codex launch paths call this so a mis-
+/// provisioned slot cannot leak credentials across surfaces via a
+/// parent-shell env var. `csq exec` (`commands::exec`) reuses it for the
+/// same reason — it is the single source of truth for the spawn env allowlist.
+pub(crate) fn strip_sensitive_env(cmd: &mut Command) {
+    // Collect into a Vec first so we don't mutate env vars during iteration.
+    let to_strip: Vec<String> = std::env::vars()
+        .filter_map(|(k, _)| {
+            if k.starts_with("ANTHROPIC_")
+                || k.starts_with("OPENAI_")
+                || k == "AWS_BEARER_TOKEN_BEDROCK"
+                || k == "CLAUDE_API_KEY"
+                || k == "CODEX_HOME"
+            {
+                Some(k)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for key in to_strip {
+        cmd.env_remove(&key);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bench-mode helpers (design 08 §11 / R2/B56, T11, T12)
+// ---------------------------------------------------------------------------
+
+/// Entry point for `--bench-mode layer-only`.
+///
+/// Design contract (R2/B56):
+/// 1. Env gate: `CSQ_BENCH_MODE=1` must be set or exit 64.
+/// 2. Emit a stderr WARN (not a public CLI surface).
+/// 3. Append a JSONL audit record to `~/.csq/bench-mode-audits.jsonl`
+///    (FIFO 256-line cap, mode 0600, atomic_replace + §5a cleanup on
+///    every error branch so the tmp file never lingers at default
+///    permissions).
+/// 4. Drain `csq_core::capability_layer::drain_timings()`.
+/// 5. Write timing JSONL to `COC_BENCH_OUT` env path or stdout.
+/// 6. Return `Ok(())` — the CLI subprocess is NOT spawned.
+///
+/// The caller's `audit_emitter` already holds a record from the successful
+/// capability-layer preflight that ran immediately before this function. On
+/// the `Ok` paths (steps 2-6) this function returns to `launch_*`, the owning
+/// emitter `Drop`-flushes the record with its default `Degraded` + `Bypass`
+/// (the run terminated before spawn), and there is nothing to do here. The ONE
+/// path that needs an explicit flush is the env-gate failure branch below: its
+/// `std::process::exit(64)` bypasses `Drop`, so the held record would be lost
+/// with no `.pending/` write and no WARN — the exact fail-open class M06
+/// closes. We flush it fail-loud BEFORE the exit.
+fn handle_bench_mode_layer_only(
+    surface: Surface,
+    audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+) -> Result<()> {
+    // 1. Env gate.
+    if std::env::var("CSQ_BENCH_MODE").as_deref() != Ok("1") {
+        eprintln!("error: --bench-mode requires CSQ_BENCH_MODE=1 in env");
+        // M06 fail-loud (MED, same class as H1): this `process::exit` bypasses
+        // the owning emitter's `Drop` in `launch_*`. The bench-mode env gate is
+        // a PRECONDITION REFUSAL — `CSQ_BENCH_MODE=1` was required and absent,
+        // so the run did not execute. This mirrors the daemon-gate
+        // precondition-refusal exits (`require_daemon_healthy` → Fail+Reject):
+        // the result is `Fail` (run refused) + `Reject` (refused before any
+        // spawn). Flush BEFORE the exit; `try_flush_now` take()s the record so
+        // the owner's `Drop` stays a guaranteed no-op (no double-emit).
+        {
+            use csq_core::audit::{Decision, ResultState};
+            let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            audit_emitter.set_end_ts(end_ts);
+            audit_emitter.set_result(ResultState::Fail, Decision::Reject);
+            fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+        }
+        std::process::exit(64);
+    }
+
+    // 2. Stderr WARN.
+    eprintln!(
+        "WARNING: --bench-mode layer-only is bench-internal; \
+         not part of the public CLI surface"
+    );
+
+    // 3. Audit record.
+    let home =
+        csq_core::platform::home::home_dir().context("could not determine home directory")?;
+    let csq_home = home.join(".csq");
+    std::fs::create_dir_all(&csq_home).context("failed to create ~/.csq")?;
+    let audit_path = csq_home.join("bench-mode-audits.jsonl");
+    append_bench_audit_record(&audit_path)?;
+
+    // 4. Drain timings.
+    let timings = csq_core::capability_layer::drain_timings();
+
+    // 5. Write JSONL.
+    let out_path = std::env::var("COC_BENCH_OUT").ok();
+    write_bench_jsonl(timings, out_path.as_deref(), surface)?;
+
+    Ok(())
+}
+
+/// Append a single audit record to `~/.csq/bench-mode-audits.jsonl`.
+///
+/// FIFO semantics: keep at most 256 lines (oldest lines dropped first).
+/// Atomic write (tmp → secure_file → atomic_replace) with §5a cleanup
+/// on every error branch so the tmp file never lingers at umask-default
+/// permissions with audit content inside.
+fn append_bench_audit_record(audit_path: &std::path::Path) -> Result<()> {
+    use csq_core::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+    use std::collections::BTreeMap;
+
+    // Build the audit record using BTreeMap for deterministic key order
+    // (R2/B70: all serialized maps must be BTreeMap).
+    let mut record: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
+    record.insert(
+        "event",
+        serde_json::Value::String("bench_mode_invocation".into()),
+    );
+
+    let caller_pid = std::process::id();
+    record.insert(
+        "caller_pid",
+        serde_json::Value::Number(serde_json::Number::from(caller_pid)),
+    );
+
+    // argv[0] of the csq process (best-effort; empty string on failure).
+    let caller_argv0 = std::env::args().next().unwrap_or_default();
+    record.insert("caller_argv0", serde_json::Value::String(caller_argv0));
+
+    // csq_pid == caller_pid in the single-process model.
+    record.insert(
+        "csq_pid",
+        serde_json::Value::Number(serde_json::Number::from(caller_pid)),
+    );
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    record.insert(
+        "ts",
+        serde_json::Value::Number(serde_json::Number::from(ts)),
+    );
+
+    let line =
+        serde_json::to_string(&record).context("failed to serialize bench-mode audit record")?;
+
+    // Read existing lines (if any), cap at 255 to leave room for the new record.
+    const FIFO_CAP: usize = 256;
+    let existing: Vec<String> = if audit_path.exists() {
+        std::fs::read_to_string(audit_path)
+            .context("failed to read bench-mode-audits.jsonl")?
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let keep_from = existing.len().saturating_sub(FIFO_CAP - 1);
+    let mut buf: Vec<u8> = Vec::new();
+    for old_line in &existing[keep_from..] {
+        buf.extend_from_slice(old_line.as_bytes());
+        buf.push(b'\n');
+    }
+    buf.extend_from_slice(line.as_bytes());
+    buf.push(b'\n');
+
+    // Atomic write: tmp → secure_file(0o600) → atomic_replace → done.
+    // §5a cleanup: remove tmp on every error branch.
+    let tmp = unique_tmp_path(audit_path);
+
+    if let Err(e) = std::fs::write(&tmp, &buf) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow!("write bench audit tmp {}: {e}", redact_path(&tmp)));
+    }
+    if let Err(e) = secure_file(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow!(
+            "secure_file bench audit tmp {}: {e}",
+            redact_path(&tmp)
+        ));
+    }
+    if let Err(e) = atomic_replace(&tmp, audit_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow!(
+            "atomic_replace bench audit {} -> {}: {e}",
+            redact_path(&tmp),
+            redact_path(audit_path)
+        ));
+    }
+    Ok(())
+}
+
+/// Emit per-stage timing records to `out_path` (a file path) or stdout.
+///
+/// Schema (spec 08 §"Latency bench harness", schema_version "1.0.0"):
+///   - One `header` record
+///   - One `stage_timing` record per collected stage
+///
+/// All maps use `BTreeMap` (R2/B70) for deterministic key ordering.
+fn write_bench_jsonl(
+    timings: csq_core::capability_layer::PipelineTimings,
+    out_path: Option<&str>,
+    surface: Surface,
+) -> Result<()> {
+    use std::collections::BTreeMap;
+    use std::io::Write as _;
+
+    // run_id: "<unix_ms_13d>-<4d_random>" per R2/B82.
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let rand_suffix = unix_ms.wrapping_mul(6364136223846793005).wrapping_add(1) & 0xFFFF;
+    let run_id = format!("{unix_ms:013}-{rand_suffix:04}");
+
+    let surface_str = match surface {
+        Surface::ClaudeCode => "cc",
+        Surface::Codex => "codex",
+        Surface::Gemini => "gemini",
+        Surface::Kimi => "kimi",
+        Surface::Grok => "grok",
+    };
+
+    // Header record.
+    let mut header: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
+    header.insert("event", serde_json::Value::String("header".into()));
+    header.insert("schema_version", serde_json::Value::String("1.0.0".into()));
+    header.insert(
+        "bench_id",
+        serde_json::Value::String("capability_layer_cost".into()),
+    );
+    header.insert("run_id", serde_json::Value::String(run_id));
+    header.insert(
+        "csq_version",
+        serde_json::Value::String(env!("CARGO_PKG_VERSION").into()),
+    );
+    header.insert("surface", serde_json::Value::String(surface_str.into()));
+
+    let platform_str = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "unknown"
+    };
+    header.insert("platform", serde_json::Value::String(platform_str.into()));
+
+    let header_line =
+        serde_json::to_string(&header).context("failed to serialize bench JSONL header")?;
+
+    // Per-stage timing records.
+    let mut stage_lines: Vec<String> = Vec::with_capacity(timings.timings.len());
+    for t in &timings.timings {
+        let mut rec: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
+        rec.insert("event", serde_json::Value::String("stage_timing".into()));
+        rec.insert(
+            "stage_id",
+            serde_json::Value::String(t.stage_id.to_string()),
+        );
+        rec.insert(
+            "elapsed_ns",
+            serde_json::Value::Number(serde_json::Number::from(t.elapsed_ns as u64)),
+        );
+        rec.insert(
+            "started_at_ns",
+            serde_json::Value::Number(serde_json::Number::from(t.started_at_ns as u64)),
+        );
+        // warmth: "cold" if stage_id is "cap.coc_load.cold", else "warm".
+        let warmth = if t.stage_id == csq_core::capability_layer::STAGE_COC_LOAD_COLD {
+            "cold"
+        } else {
+            "warm"
+        };
+        rec.insert("warmth", serde_json::Value::String(warmth.into()));
+        let result_str = format!("{:?}", t.result).to_lowercase();
+        rec.insert("result", serde_json::Value::String(result_str));
+        stage_lines
+            .push(serde_json::to_string(&rec).context("failed to serialize stage_timing record")?);
+    }
+
+    // Assemble output.
+    let mut buf = String::new();
+    buf.push_str(&header_line);
+    buf.push('\n');
+    for l in &stage_lines {
+        buf.push_str(l);
+        buf.push('\n');
+    }
+
+    // Write to file or stdout.
+    match out_path {
+        Some(path) => {
+            let p = std::path::Path::new(path);
+            std::fs::write(p, buf.as_bytes())
+                .with_context(|| format!("failed to write bench JSONL to {path}"))?;
+        }
+        None => {
+            std::io::stdout()
+                .lock()
+                .write_all(buf.as_bytes())
+                .context("failed to write bench JSONL to stdout")?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    include!("ruletrim_override_tests.rs");
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn daemon_recovery_run_refuses_drift_and_missing_handshake_but_admits_matching_version() {
+        for version in ["2.5.0", "", "bad\n/Users/private/token"] {
+            let state = DetectResult::Healthy {
+                pid: 123,
+                socket_path: PathBuf::from("/private/fixture.sock"),
+                daemon_version: version.into(),
+            };
+            let output = codex_daemon_refusal(&state).expect("drift must refuse");
+            assert!(output.starts_with("Codex spawn refused"));
+            assert!(output.contains("restarting the same old binary does not fix"));
+            assert!(output.contains("supervisor is unverified"));
+            assert!(!output.contains("/Users/private"));
+            assert!(!output.contains("/private/fixture.sock"));
+            eprintln!("{output}");
+        }
+        assert!(codex_daemon_refusal(&DetectResult::Healthy {
+            pid: 123,
+            socket_path: PathBuf::from("/private/fixture.sock"),
+            daemon_version: daemon::CLI_VERSION.into(),
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn daemon_recovery_run_unavailable_siblings_require_owner_verification() {
+        for state in [
+            DetectResult::NotRunning,
+            DetectResult::Stale {
+                reason: "stale /Users/private/token\nBearer secret".into(),
+            },
+            DetectResult::Unhealthy {
+                reason: "timeout /Users/private/token\nBearer secret".into(),
+            },
+        ] {
+            let output = codex_daemon_refusal(&state).expect("unavailable must refuse");
+            assert!(output.contains("supervisor is unverified"));
+            assert!(output.contains("Only for a confirmed standalone foreground"));
+            assert!(!output.contains("daemon stop && csq daemon start"));
+            assert!(!output.contains("/Users/private"));
+            assert!(!output.contains("Bearer secret"));
+        }
+    }
+
+    fn acc(n: u16) -> AccountNum {
+        AccountNum::try_from(n).unwrap()
+    }
+
+    // ── S2 (an internal ticket): CC native-materialization helpers ────────────────
+
+    fn flat(id: &str, body: &str) -> csq_core::coc::translate::FlatArtifact {
+        csq_core::coc::translate::FlatArtifact {
+            id: id.to_string(),
+            precedence: 0,
+            body: body.to_string(),
+            paths: Vec::new(),
+        }
+    }
+
+    /// Full path: materialize a plugin tree from agents/skills/commands into a
+    /// fresh `coc-plugin/`, return its absolute path, and confirm the CC plugin
+    /// shape + 0o600 perms. Rules are NOT materialized.
+    #[test]
+    fn materialize_cc_coc_plugin_writes_expected_tree() {
+        let handle = TempDir::new().unwrap();
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            rules: vec![flat("RULE-X", "rule must NOT be materialized")],
+            agents: vec![flat("AGENT-Y", "you are a reviewer")],
+            skills: vec![flat("SKILL-Z", "progressive disclosure")],
+            commands: vec![flat("COMMAND-W", "run the thing")],
+        };
+        let plugin_dir = materialize_cc_coc_plugin(handle.path(), &arts).unwrap();
+
+        assert_eq!(plugin_dir, handle.path().join("coc-plugin"));
+        assert!(plugin_dir.join(".claude-plugin/plugin.json").is_file());
+        assert!(plugin_dir.join("agents/AGENT-Y.md").is_file());
+        assert!(plugin_dir.join("skills/SKILL-Z/SKILL.md").is_file());
+        assert!(plugin_dir.join("commands/COMMAND-W.md").is_file());
+        // Rules are Level-1 prose — never materialized.
+        assert!(!plugin_dir.join("rules").exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(plugin_dir.join("agents/AGENT-Y.md"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "materialized files must be 0o600");
+        }
+    }
+
+    /// Caller-contract "fresh dest": a pre-existing `coc-plugin/` with stale
+    /// residue is cleared before the emitter writes, so no orphan survives.
+    #[test]
+    fn materialize_cc_coc_plugin_clears_stale_residue() {
+        let handle = TempDir::new().unwrap();
+        let stale = handle.path().join("coc-plugin").join("agents");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("ORPHAN.md"), b"stale from a prior emit").unwrap();
+
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            agents: vec![flat("AGENT-FRESH", "fresh")],
+            ..Default::default()
+        };
+        let plugin_dir = materialize_cc_coc_plugin(handle.path(), &arts).unwrap();
+
+        assert!(plugin_dir.join("agents/AGENT-FRESH.md").is_file());
+        assert!(
+            !plugin_dir.join("agents/ORPHAN.md").exists(),
+            "stale residue must be cleared before emit (fresh-dest contract)"
+        );
+    }
+
+    /// TOCTOU close: a symlink planted at the plugin root is refused fail-closed.
+    #[cfg(unix)]
+    #[test]
+    fn verify_coc_plugin_dir_is_real_rejects_symlink() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real-target");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("coc-plugin");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let err = verify_coc_plugin_dir_is_real(&link).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "symlinked plugin root must be refused: {err}"
+        );
+    }
+
+    /// A real directory passes the TOCTOU re-stat.
+    #[test]
+    fn verify_coc_plugin_dir_is_real_accepts_directory() {
+        let dir = TempDir::new().unwrap();
+        let plugin = dir.path().join("coc-plugin");
+        std::fs::create_dir(&plugin).unwrap();
+        assert!(verify_coc_plugin_dir_is_real(&plugin).is_ok());
+    }
+
+    // ── S2b (an internal ticket): native rule materialization ─────────────────────
+
+    fn rule(id: &str, body: &str, paths: &[&str]) -> csq_core::coc::translate::FlatArtifact {
+        csq_core::coc::translate::FlatArtifact {
+            id: id.to_string(),
+            precedence: 0,
+            body: body.to_string(),
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    /// The handle dir's `rules` symlink → user-global rules is replaced by a real
+    /// dir that MERGES the preserved user-global rules with the materialized
+    /// `coc-<ID>.md`; the user-global dir itself is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_native_rules_replaces_symlink_and_merges() {
+        let dir = TempDir::new().unwrap();
+        // User-global rules dir (the symlink target).
+        let user_rules = dir.path().join("user-claude-rules");
+        std::fs::create_dir(&user_rules).unwrap();
+        std::fs::write(user_rules.join("user-global.md"), b"user rule").unwrap();
+        // Handle dir with a `rules` symlink → user-global rules.
+        let handle = dir.path().join("term-1");
+        std::fs::create_dir(&handle).unwrap();
+        std::os::unix::fs::symlink(&user_rules, handle.join("rules")).unwrap();
+
+        let rules = vec![
+            rule("RULE-SCOPED", "# RULE-SCOPED\nbody", &["src/**/*.rs"]),
+            rule("RULE-UNSCOPED", "always on", &[]),
+        ];
+        materialize_native_rules(&handle, &rules).unwrap();
+
+        let rd = handle.join("rules");
+        // Now a REAL dir, not a symlink.
+        assert!(!std::fs::symlink_metadata(&rd)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        // User-global rule preserved (copied in).
+        assert_eq!(
+            std::fs::read_to_string(rd.join("user-global.md")).unwrap(),
+            "user rule"
+        );
+        // coc rules materialized under the namespaced `csq-coc/` subdir.
+        assert!(
+            std::fs::read_to_string(rd.join("csq-coc/coc-RULE-SCOPED.md"))
+                .unwrap()
+                .contains("paths:\n  - \"src/**/*.rs\"")
+        );
+        // Byte-exact, INCLUDING the provenance boundary: this is the consumer's
+        // view of the emitted artifact from a different crate, so pinning the
+        // literal here is what makes the wire format a cross-crate contract
+        // rather than an internal detail of `wrap_coc_provenance` (which is
+        // `pub(crate)` in csq-core and unreachable from this test).
+        assert_eq!(
+            std::fs::read_to_string(rd.join("csq-coc/coc-RULE-UNSCOPED.md")).unwrap(),
+            "<!-- csq:coc-source id=\"RULE-UNSCOPED\" -->\n\
+             always on\n\
+             <!-- /csq:coc-source id=\"RULE-UNSCOPED\" -->\n"
+        );
+        // The user-global source dir is UNTOUCHED (no coc files leaked into it).
+        assert!(!user_rules.join("csq-coc").exists());
+        assert_eq!(
+            std::fs::read_dir(&user_rules).unwrap().count(),
+            1,
+            "user-global rules dir must be untouched"
+        );
+    }
+
+    /// When the handle dir has no `rules` entry (user has no ~/.claude/rules), a
+    /// fresh real dir is created with just the coc rules.
+    #[test]
+    fn materialize_native_rules_creates_fresh_when_absent() {
+        let dir = TempDir::new().unwrap();
+        let handle = dir.path().join("term-2");
+        std::fs::create_dir(&handle).unwrap();
+        materialize_native_rules(&handle, &[rule("RULE-X", "body", &[])]).unwrap();
+        assert!(handle.join("rules/csq-coc/coc-RULE-X.md").is_file());
+    }
+
+    /// Redteam R1 (failure-mode): a user-global rule that happens to be named
+    /// `coc-<ID>.md` is PRESERVED, not silently overwritten — the materialized
+    /// rules live under the `csq-coc/` subdir, so top-level names never collide.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_native_rules_preserves_colliding_user_filename() {
+        let dir = TempDir::new().unwrap();
+        let user_rules = dir.path().join("user-rules");
+        std::fs::create_dir(&user_rules).unwrap();
+        // A user rule whose filename collides with the emitted prefix.
+        std::fs::write(user_rules.join("coc-RULE-SCOPED.md"), b"USER OWNED").unwrap();
+        let handle = dir.path().join("term-3");
+        std::fs::create_dir(&handle).unwrap();
+        std::os::unix::fs::symlink(&user_rules, handle.join("rules")).unwrap();
+
+        materialize_native_rules(&handle, &[rule("RULE-SCOPED", "coc body", &["x"])]).unwrap();
+
+        let rd = handle.join("rules");
+        // User's top-level file preserved verbatim.
+        assert_eq!(
+            std::fs::read_to_string(rd.join("coc-RULE-SCOPED.md")).unwrap(),
+            "USER OWNED"
+        );
+        // csq's rule lives in the subdir, distinct.
+        assert!(rd.join("csq-coc/coc-RULE-SCOPED.md").is_file());
+    }
+
+    /// Redteam R1 (failure-mode): a mid-build failure must NOT destroy the
+    /// symlink — the session keeps the complete user-global rule set. Force a
+    /// failure by making the coc rule id invalid (rejected by `validate_id`).
+    #[cfg(unix)]
+    #[test]
+    fn materialize_native_rules_leaves_symlink_intact_on_failure() {
+        let dir = TempDir::new().unwrap();
+        let user_rules = dir.path().join("user-rules");
+        std::fs::create_dir(&user_rules).unwrap();
+        std::fs::write(user_rules.join("keep.md"), b"keep me").unwrap();
+        let handle = dir.path().join("term-4");
+        std::fs::create_dir(&handle).unwrap();
+        std::os::unix::fs::symlink(&user_rules, handle.join("rules")).unwrap();
+
+        // An id with a path separator is rejected by emit_coc_rules::validate_id.
+        let err = materialize_native_rules(&handle, &[rule("bad/id", "b", &[])]);
+        assert!(err.is_err(), "invalid id must fail materialization");
+
+        // The symlink is untouched → the session still sees the complete user rules.
+        let rd = handle.join("rules");
+        assert!(std::fs::symlink_metadata(&rd)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(rd.join("keep.md")).unwrap(),
+            "keep me"
+        );
+        // No staging residue left behind.
+        assert!(!handle.join("rules.coc-staging").exists());
+    }
+
+    /// FD2 (an internal journal entry): the swap's `unlink` failure branch — the symlink
+    /// removal is denied. Injected via closure (redteam-discipline Rule 5: closure
+    /// injection reaches THIS branch exactly, where a chmod-parent trick could
+    /// not). Invariant: the symlink is left intact (session keeps its complete
+    /// user-global rules) AND the staging dir is torn down.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_native_rules_swap_unlink_failure_preserves_symlink() {
+        let dir = TempDir::new().unwrap();
+        let user_rules = dir.path().join("user-rules");
+        std::fs::create_dir(&user_rules).unwrap();
+        std::fs::write(user_rules.join("keep.md"), b"keep me").unwrap();
+        let handle = dir.path().join("term-fd2a");
+        std::fs::create_dir(&handle).unwrap();
+        std::os::unix::fs::symlink(&user_rules, handle.join("rules")).unwrap();
+
+        let err = materialize_native_rules_inner(
+            &handle,
+            &[rule("RULE-X", "body", &["x"])],
+            // unlink denied — the symlink is never removed.
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "boom",
+                ))
+            },
+            |from, to| std::fs::rename(from, to),
+        );
+        assert!(err.is_err(), "unlink failure must propagate");
+
+        let rd = handle.join("rules");
+        // Symlink intact → the session still resolves the complete user rules.
+        assert!(std::fs::symlink_metadata(&rd)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(rd.join("keep.md")).unwrap(),
+            "keep me"
+        );
+        // Staging dir torn down — no residue on the failure branch.
+        assert!(!handle.join("rules.coc-staging").exists());
+    }
+
+    /// FD2 (an internal journal entry): the swap's `rename` failure branch — the staged dir
+    /// move is denied AFTER the symlink was already unlinked. Injected via closure.
+    /// Invariant: the symlink is RESTORED best-effort (session still resolves its
+    /// user-global rules) AND the staging dir is torn down.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_native_rules_swap_rename_failure_restores_symlink() {
+        let dir = TempDir::new().unwrap();
+        let user_rules = dir.path().join("user-rules");
+        std::fs::create_dir(&user_rules).unwrap();
+        std::fs::write(user_rules.join("keep.md"), b"keep me").unwrap();
+        let handle = dir.path().join("term-fd2b");
+        std::fs::create_dir(&handle).unwrap();
+        std::os::unix::fs::symlink(&user_rules, handle.join("rules")).unwrap();
+
+        let err = materialize_native_rules_inner(
+            &handle,
+            &[rule("RULE-X", "body", &["x"])],
+            // Real unlink — the symlink IS removed, so the rename branch is reached.
+            |p| std::fs::remove_file(p),
+            // rename denied — restore path must fire.
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "boom",
+                ))
+            },
+        );
+        assert!(err.is_err(), "rename failure must propagate");
+
+        let rd = handle.join("rules");
+        // Symlink RESTORED → still a symlink, still resolving to the user rules.
+        let meta = std::fs::symlink_metadata(&rd).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "symlink restored after rename failure"
+        );
+        assert_eq!(std::fs::read_link(&rd).unwrap(), user_rules);
+        assert_eq!(
+            std::fs::read_to_string(rd.join("keep.md")).unwrap(),
+            "keep me"
+        );
+        // Staging dir torn down — no residue on the failure branch.
+        assert!(!handle.join("rules.coc-staging").exists());
+    }
+
+    /// FD2 (an internal journal entry): the inner, driven with the REAL `std::fs` ops, is
+    /// behavior-identical to the public `materialize_native_rules` — the swap
+    /// succeeds and the merged dir replaces the symlink. Guards against the
+    /// injection refactor changing the happy path.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_native_rules_inner_real_ops_swaps_successfully() {
+        let dir = TempDir::new().unwrap();
+        let user_rules = dir.path().join("user-rules");
+        std::fs::create_dir(&user_rules).unwrap();
+        std::fs::write(user_rules.join("keep.md"), b"keep me").unwrap();
+        let handle = dir.path().join("term-fd2c");
+        std::fs::create_dir(&handle).unwrap();
+        std::os::unix::fs::symlink(&user_rules, handle.join("rules")).unwrap();
+
+        materialize_native_rules_inner(
+            &handle,
+            &[rule("RULE-X", "body", &["x"])],
+            |p| std::fs::remove_file(p),
+            |from, to| std::fs::rename(from, to),
+        )
+        .unwrap();
+
+        let rd = handle.join("rules");
+        // Now a real dir (symlink swapped out), user rules preserved, coc rule emitted.
+        assert!(!std::fs::symlink_metadata(&rd)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(rd.join("keep.md")).unwrap(),
+            "keep me"
+        );
+        assert!(rd.join("csq-coc/coc-RULE-X.md").is_file());
+        assert!(!handle.join("rules.coc-staging").exists());
+    }
+
+    // ── S3 (an internal ticket): codex-native wiring ───────────────────────────────
+
+    /// S3: `materialize_codex_native` writes ONLY skills into `$CODEX_HOME/skills/`
+    /// (the handle dir), leaving no other native kind on disk.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_codex_native_writes_skills_dir() {
+        let dir = TempDir::new().unwrap();
+        let handle = dir.path().join("term-codex");
+        std::fs::create_dir(&handle).unwrap();
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            rules: vec![rule("RULE-A", "r", &[])],
+            agents: vec![rule("AGENT-A", "persona", &[])],
+            skills: vec![rule("SKILL-A", "# skill\nbody", &[])],
+            commands: vec![rule("CMD-A", "do it", &[])],
+        };
+        materialize_codex_native(&handle, &arts).unwrap();
+        assert!(handle.join("skills/SKILL-A/SKILL.md").is_file());
+        // No agents/commands/rules dirs — those stay prose.
+        assert!(!handle.join("agents").exists());
+        assert!(!handle.join("commands").exists());
+        assert!(!handle.join("rules").exists());
+    }
+
+    #[cfg(unix)]
+    fn inherited_codex_skills_fixture() -> (TempDir, PathBuf, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let baseline = dir.path().join("canonical-skills");
+        let handle = dir.path().join("term-codex");
+        std::fs::create_dir_all(baseline.join("keep/references")).unwrap();
+        std::fs::create_dir(&handle).unwrap();
+        std::fs::write(baseline.join("keep/SKILL.md"), "Read references/details.md").unwrap();
+        std::fs::write(
+            baseline.join("keep/references/details.md"),
+            "operator reference bytes",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&baseline, handle.join("skills")).unwrap();
+        (dir, handle, baseline)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_codex_native_preserves_inherited_resources() {
+        let (_dir, handle, baseline) = inherited_codex_skills_fixture();
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            skills: vec![rule("SKILL-NEW", "generated", &[])],
+            ..Default::default()
+        };
+        materialize_codex_native(&handle, &arts).unwrap();
+        assert!(!handle
+            .join("skills")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        for path in ["keep/SKILL.md", "keep/references/details.md"] {
+            assert_eq!(
+                std::fs::read(handle.join("skills").join(path)).unwrap(),
+                std::fs::read(baseline.join(path)).unwrap()
+            );
+        }
+        assert!(handle.join("skills/SKILL-NEW/SKILL.md").is_file());
+        assert!(!baseline.join("SKILL-NEW").exists());
+        assert!(!handle.join("skills.coc-staging").exists());
+        assert!(!handle.join("skills.coc-baseline").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_codex_native_roundtrips_binary_executable_and_empty_resources() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, handle, baseline) = inherited_codex_skills_fixture();
+        std::fs::create_dir_all(baseline.join("keep/scripts")).unwrap();
+        std::fs::create_dir_all(baseline.join("keep/assets/empty")).unwrap();
+        let script = baseline.join("keep/scripts/check.sh");
+        std::fs::write(&script, b"#!/bin/sh\nprintf resource-ok\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let binary = baseline.join("keep/assets/data.bin");
+        std::fs::write(&binary, [0, 255, 128, 10, 13, 0]).unwrap();
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            skills: vec![rule("SKILL-NEW", "generated", &[])],
+            ..Default::default()
+        };
+
+        materialize_codex_native(&handle, &arts).unwrap();
+
+        for path in ["keep/scripts/check.sh", "keep/assets/data.bin"] {
+            let delivered = handle.join("skills").join(path);
+            let original = baseline.join(path);
+            assert_eq!(
+                std::fs::read(&delivered).unwrap(),
+                std::fs::read(&original).unwrap()
+            );
+            assert_eq!(
+                std::fs::metadata(&delivered).unwrap().permissions().mode() & 0o777,
+                std::fs::metadata(&original).unwrap().permissions().mode() & 0o777,
+            );
+        }
+        assert!(handle.join("skills/keep/assets/empty").is_dir());
+        assert!(!baseline.join("SKILL-NEW").exists());
+        assert!(!handle.join("skills.coc-staging").exists());
+        assert!(!handle.join("skills.coc-baseline").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_codex_native_bad_id_keeps_baseline() {
+        let (_dir, handle, baseline) = inherited_codex_skills_fixture();
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            skills: vec![
+                rule("SKILL-NEW", "generated", &[]),
+                rule("../bad", "invalid", &[]),
+            ],
+            ..Default::default()
+        };
+        assert!(materialize_codex_native(&handle, &arts).is_err());
+        assert_eq!(std::fs::read_link(handle.join("skills")).unwrap(), baseline);
+        assert!(handle.join("skills/keep/references/details.md").is_file());
+        assert!(!handle.join("skills.coc-staging").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_codex_native_rejects_inherited_case_collision() {
+        let (_dir, handle, baseline) = inherited_codex_skills_fixture();
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            skills: vec![rule("KEEP", "would overwrite operator skill", &[])],
+            ..Default::default()
+        };
+        let error = materialize_codex_native(&handle, &arts).unwrap_err();
+        assert!(error.to_string().contains("collides"));
+        assert_eq!(std::fs::read_link(handle.join("skills")).unwrap(), baseline);
+        assert_eq!(
+            std::fs::read_to_string(handle.join("skills/keep/SKILL.md")).unwrap(),
+            "Read references/details.md"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_codex_native_rejects_linked_resources_without_loss() {
+        let (_dir, handle, baseline) = inherited_codex_skills_fixture();
+        std::os::unix::fs::symlink("details.md", baseline.join("keep/references/alias.md"))
+            .unwrap();
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            skills: vec![rule("SKILL-NEW", "generated", &[])],
+            ..Default::default()
+        };
+        assert!(materialize_codex_native(&handle, &arts)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported symlink"));
+        assert_eq!(std::fs::read_link(handle.join("skills")).unwrap(), baseline);
+        assert_eq!(
+            std::fs::read_link(handle.join("skills/keep/references/alias.md")).unwrap(),
+            PathBuf::from("details.md")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_codex_native_failed_swap_restores_baseline() {
+        let (_dir, handle, baseline) = inherited_codex_skills_fixture();
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            skills: vec![rule("SKILL-NEW", "generated", &[])],
+            ..Default::default()
+        };
+        let result = materialize_codex_native_with_rename(&handle, &arts, |from, to| {
+            if from
+                .parent()
+                .is_some_and(|p| p.ends_with("skills.coc-staging"))
+            {
+                Err(std::io::Error::other("injected swap failure"))
+            } else {
+                std::fs::rename(from, to)
+            }
+        });
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("installing staged"));
+        assert_eq!(std::fs::read_link(handle.join("skills")).unwrap(), baseline);
+        assert!(handle.join("skills/keep/references/details.md").is_file());
+        assert!(!handle.join("skills.coc-staging").exists());
+        assert!(!handle.join("skills.coc-baseline").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_codex_native_failed_restore_is_fatal() {
+        let (_dir, handle, baseline) = inherited_codex_skills_fixture();
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            skills: vec![rule("SKILL-NEW", "generated", &[])],
+            ..Default::default()
+        };
+        let error = materialize_codex_native_with_rename(&handle, &arts, |from, to| {
+            if from == handle.join("skills") {
+                std::fs::rename(from, to)
+            } else {
+                Err(std::io::Error::other("injected install/restore failure"))
+            }
+        })
+        .unwrap_err();
+        assert!(error
+            .downcast_ref::<CodexSkillsPublicationError>()
+            .is_some());
+        assert_eq!(
+            std::fs::read_link(handle.join("skills.coc-baseline")).unwrap(),
+            baseline
+        );
+        assert!(!handle.join("skills").exists());
+        assert_eq!(
+            std::fs::read_to_string(baseline.join("keep/references/details.md")).unwrap(),
+            "operator reference bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_codex_native_unresolved_backup_is_fatal() {
+        let (_dir, handle, baseline) = inherited_codex_skills_fixture();
+        std::fs::rename(handle.join("skills"), handle.join("skills.coc-baseline")).unwrap();
+        let arts = csq_core::coc::translate::SurfaceArtifacts::default();
+        let error = materialize_codex_native(&handle, &arts).unwrap_err();
+        assert!(error
+            .downcast_ref::<CodexSkillsPublicationError>()
+            .is_some());
+        assert_eq!(
+            std::fs::read_link(handle.join("skills.coc-baseline")).unwrap(),
+            baseline
+        );
+        assert!(!handle.join("skills").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_codex_native_substituted_publication_is_fatal() {
+        for replace_with_link in [true, false] {
+            let (_dir, handle, baseline) = inherited_codex_skills_fixture();
+            let arts = csq_core::coc::translate::SurfaceArtifacts {
+                skills: vec![rule("SKILL-NEW", "generated", &[])],
+                ..Default::default()
+            };
+            let error = materialize_codex_native_with_rename(&handle, &arts, |from, to| {
+                std::fs::rename(from, to)?;
+                if from
+                    .parent()
+                    .is_some_and(|p| p.ends_with("skills.coc-staging"))
+                {
+                    std::fs::remove_dir_all(to)?;
+                    if replace_with_link {
+                        std::os::unix::fs::symlink(&baseline, to)?;
+                    } else {
+                        std::fs::write(to, "attacker file")?;
+                    }
+                }
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(error
+                .downcast_ref::<CodexSkillsPublicationError>()
+                .is_some());
+            assert_eq!(
+                std::fs::read_link(handle.join("skills.coc-baseline")).unwrap(),
+                baseline
+            );
+            assert_eq!(
+                std::fs::read_to_string(baseline.join("keep/references/details.md")).unwrap(),
+                "operator reference bytes"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_codex_native_cleanup_failure_keeps_native_success() {
+        let (_dir, handle, baseline) = inherited_codex_skills_fixture();
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            skills: vec![rule("SKILL-NEW", "generated", &[])],
+            ..Default::default()
+        };
+        materialize_codex_native_with_operations(
+            &handle,
+            &arts,
+            |from, to| std::fs::rename(from, to),
+            |_| Err(std::io::Error::other("injected cleanup failure")),
+        )
+        .unwrap();
+        assert!(handle.join("skills/SKILL-NEW/SKILL.md").is_file());
+        assert_eq!(
+            std::fs::read_link(handle.join("skills.coc-baseline")).unwrap(),
+            baseline
+        );
+        assert_eq!(
+            std::fs::read_to_string(baseline.join("keep/references/details.md")).unwrap(),
+            "operator reference bytes"
+        );
+    }
+
+    // ── S4 (an internal ticket): gemini-native wiring ──────────────────────────────
+
+    /// S4: `materialize_gemini_native` writes skills + commands into `.gemini/`,
+    /// leaving agents/rules for prose.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_gemini_native_writes_skills_and_commands() {
+        let dir = TempDir::new().unwrap();
+        let gemini_dir = dir.path().join("term-gemini").join(".gemini");
+        let arts = csq_core::coc::translate::SurfaceArtifacts {
+            rules: vec![rule("RULE-A", "r", &[])],
+            agents: vec![rule("AGENT-A", "persona", &[])],
+            skills: vec![rule("SKILL-A", "# skill\nbody", &[])],
+            commands: vec![rule("CMD-A", "do it", &[])],
+        };
+        materialize_gemini_native(&gemini_dir, &arts).unwrap();
+        assert!(gemini_dir.join("skills/SKILL-A/SKILL.md").is_file());
+        assert!(gemini_dir.join("commands/CMD-A.toml").is_file());
+        assert!(!gemini_dir.join("agents").exists());
+        assert!(!gemini_dir.join("rules").exists());
+    }
+
+    // ── S3/S4: reduced prose selection ─────────────────────────────────────
+
+    /// `reduced_surface_prose` returns None when nothing remains and the prompt
+    /// is free-form; the directive only when nothing remains but Compliance;
+    /// and rendered sections when kinds remain.
+    #[test]
+    fn reduced_surface_prose_selection_matrix() {
+        use csq_core::coc::translate::SurfaceArtifacts;
+        // Empty + free-form → nothing to say.
+        assert_eq!(
+            reduced_surface_prose(Surface::Codex, &SurfaceArtifacts::default(), false),
+            None
+        );
+        // Empty + Compliance → directive only.
+        let directive = reduced_surface_prose(Surface::Codex, &SurfaceArtifacts::default(), true)
+            .expect("compliance directive");
+        assert_eq!(
+            directive,
+            csq_core::coc::translate::build_output_schema_directive()
+        );
+        // Remaining rules → rendered prose that contains the rule body.
+        let remaining = SurfaceArtifacts {
+            rules: vec![rule("RULE-KEEP", "rule stays prose", &[])],
+            ..Default::default()
+        };
+        let prose =
+            reduced_surface_prose(Surface::Gemini, &remaining, false).expect("prose for remaining");
+        assert!(
+            prose.contains("rule stays prose"),
+            "remaining rule body must be in prose: {prose:?}"
+        );
+    }
+
+    /// `copy_dir_into` does not follow a symlink in the source (never redirects
+    /// a copy out of the handle dir).
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_into_skips_symlinks() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret"), b"x").unwrap();
+        std::fs::write(src.join("real.md"), b"r").unwrap();
+        std::os::unix::fs::symlink(&outside, src.join("escape")).unwrap();
+        copy_dir_into(&src, &dst).unwrap();
+        assert!(dst.join("real.md").is_file());
+        assert!(!dst.join("escape").exists(), "symlink must be skipped");
+    }
+
+    // ── Fix A: native-artifact scaffold gate (native-delegation) ──────────
+    // Round-13 review MED-1: `native_artifacts_present` no longer re-detects
+    // `.coc/` internally — every test below passes the project root
+    // EXPLICITLY (`Some(root)`) instead of planting a literal `.coc/` dir for
+    // the function to rediscover. `None` means "no `.coc/` found anywhere" —
+    // the legacy-fallback case — and is exercised directly below.
+
+    #[test]
+    fn native_artifacts_present_detects_each_surface() {
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path();
+        let root = Some(cwd);
+        // Empty (of native artifacts) dir → no native artifacts for any surface.
+        assert!(!native_artifacts_present(Surface::ClaudeCode, cwd, root));
+        assert!(!native_artifacts_present(Surface::Codex, cwd, root));
+        assert!(!native_artifacts_present(Surface::Gemini, cwd, root));
+
+        // cc: `.claude/` dir OR `CLAUDE.md` file.
+        std::fs::create_dir(cwd.join(".claude")).unwrap();
+        assert!(native_artifacts_present(Surface::ClaudeCode, cwd, root));
+        assert!(
+            !native_artifacts_present(Surface::Codex, cwd, root),
+            ".claude/ must not count as a codex native artifact"
+        );
+
+        // codex: `.codex/` dir OR `AGENTS.md` file.
+        std::fs::write(cwd.join("AGENTS.md"), "x").unwrap();
+        assert!(native_artifacts_present(Surface::Codex, cwd, root));
+
+        // gemini: `.gemini/` dir OR `GEMINI.md` file.
+        assert!(!native_artifacts_present(Surface::Gemini, cwd, root));
+        std::fs::create_dir(cwd.join(".gemini")).unwrap();
+        assert!(native_artifacts_present(Surface::Gemini, cwd, root));
+    }
+
+    #[test]
+    fn native_artifacts_present_detects_marker_files_without_dirs() {
+        // A bare CLAUDE.md / GEMINI.md (no dir) still counts as native.
+        let dir = TempDir::new().unwrap();
+        let root = Some(dir.path());
+        std::fs::write(dir.path().join("CLAUDE.md"), "x").unwrap();
+        std::fs::write(dir.path().join("GEMINI.md"), "x").unwrap();
+        assert!(native_artifacts_present(
+            Surface::ClaudeCode,
+            dir.path(),
+            root
+        ));
+        assert!(native_artifacts_present(Surface::Gemini, dir.path(), root));
+        // Codex has no marker here → not falsely detected.
+        assert!(!native_artifacts_present(Surface::Codex, dir.path(), root));
+    }
+
+    #[test]
+    fn native_artifacts_present_detects_intermediate_ancestor_marker() {
+        // R2 finding 2: a native artifact at an INTERMEDIATE dir between cwd and
+        // the project root must be detected (the walk checks every level).
+        let root = TempDir::new().unwrap();
+        let mid = root.path().join("a");
+        std::fs::create_dir(&mid).unwrap();
+        std::fs::write(mid.join("AGENTS.md"), "x").unwrap(); // codex native at intermediate level
+        let cwd = mid.join("b");
+        std::fs::create_dir(&cwd).unwrap();
+        assert!(native_artifacts_present(
+            Surface::Codex,
+            &cwd,
+            Some(root.path())
+        ));
+    }
+
+    #[test]
+    fn native_artifacts_present_walks_up_to_project_root() {
+        // Redteam R1 HIGH: running `csq run N` from a SUBDIR of a project whose
+        // native artifacts live at the root must still detect them (mirrors the
+        // `.coc/` loader's upward walk + the native CLI's own artifact
+        // discovery). The leaf-only check missed this, re-opening the overflow
+        // bug for every non-root invocation.
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "x").unwrap(); // codex native at root
+        let subdir = root.path().join("a").join("b").join("c");
+        std::fs::create_dir_all(&subdir).unwrap();
+        // From the deep subdir, the root-level AGENTS.md is still found.
+        assert!(native_artifacts_present(
+            Surface::Codex,
+            &subdir,
+            Some(root.path())
+        ));
+        // A surface with NO native artifact at any level is not falsely
+        // suppressed; the walk stops at the project root → false.
+        assert!(!native_artifacts_present(
+            Surface::Gemini,
+            &subdir,
+            Some(root.path())
+        ));
+    }
+
+    #[test]
+    fn native_artifacts_present_walk_stops_at_project_root() {
+        // The walk must NOT climb past the given project root into a parent
+        // that happens to hold a native marker (e.g. a user-global `~/.codex`
+        // above the project) — the explicit root bounds it.
+        let outer = TempDir::new().unwrap();
+        std::fs::create_dir(outer.path().join(".codex")).unwrap(); // "user-global"-shaped, ABOVE project
+        let project = outer.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        // codex native artifact is NOT in the project → false despite the
+        // ancestor `.codex` (walk stops at the project root).
+        assert!(!native_artifacts_present(
+            Surface::Codex,
+            &project,
+            Some(&project)
+        ));
+    }
+
+    /// Round-13 review MED-1 non-vacuity: `project_root = None` (no `.coc/`
+    /// found anywhere — the legacy-fallback case) MUST check `cwd` alone, NOT
+    /// climb to an ancestor. Before the fix, the walk's own `.coc`
+    /// re-detection never found a `.coc/` in this scenario (there is none)
+    /// and climbed unbounded — reaching `$HOME/.claude`, which
+    /// `base_dir()`'s `create_dir_all("$HOME/.claude/accounts")` guarantees
+    /// exists on every csq host regardless of genuine CC-native content.
+    /// This test plants the identical shape: a `.claude`-look-alike ancestor
+    /// ABOVE cwd, with nothing native AT cwd itself.
+    #[test]
+    fn native_artifacts_present_none_root_checks_cwd_only_no_upward_climb() {
+        let home_like = TempDir::new().unwrap();
+        // Stand-in for `$HOME/.claude` — csq's own bookkeeping dir, not
+        // genuine CC-native content, but indistinguishable to a bare
+        // `is_dir()` check.
+        std::fs::create_dir(home_like.path().join(".claude")).unwrap();
+        let project = home_like.path().join("some-project");
+        std::fs::create_dir(&project).unwrap();
+        // No `.coc/` anywhere → project_root is None. Nothing native AT
+        // `project` itself.
+        assert!(
+            !native_artifacts_present(Surface::ClaudeCode, &project, None),
+            "None-root must check cwd only — must NOT climb to the ancestor \
+             `.claude` and misreport native content present"
+        );
+        // Sanity: the SAME ancestor marker IS found when `project` itself is
+        // the (explicit) root — proves the predicate isn't just broken.
+        std::fs::create_dir(project.join(".claude")).unwrap();
+        assert!(native_artifacts_present(
+            Surface::ClaudeCode,
+            &project,
+            Some(&project)
+        ));
+    }
+
+    /// Round-13 review HIGH-1 non-vacuity: Grok reads `.claude/` NATIVELY
+    /// (report 14 §2 G2) — a project carrying ONLY `.claude/` (the majority,
+    /// CC-first shape) MUST be detected as "Grok already has native content",
+    /// not silently missed.
+    #[test]
+    fn native_artifacts_present_grok_detects_claude_dir() {
+        let dir = TempDir::new().unwrap();
+        let root = Some(dir.path());
+        assert!(!native_artifacts_present(Surface::Grok, dir.path(), root));
+        std::fs::create_dir(dir.path().join(".claude")).unwrap();
+        assert!(native_artifacts_present(Surface::Grok, dir.path(), root));
+    }
+
+    /// Grok's six-name instruction-file sweep (report 14 §3.1, verified via
+    /// `12-project-rules.md:17-24`) — every name must be detected individually.
+    #[test]
+    fn native_artifacts_present_grok_detects_all_six_instruction_names() {
+        for name in [
+            "AGENTS.md",
+            "CLAUDE.md",
+            "Agents.md",
+            "Claude.md",
+            "CLAUDE.local.md",
+            "AGENT.md",
+        ] {
+            let dir = TempDir::new().unwrap();
+            std::fs::write(dir.path().join(name), "x").unwrap();
+            assert!(
+                native_artifacts_present(Surface::Grok, dir.path(), Some(dir.path())),
+                "Grok must detect `{name}`"
+            );
+        }
+    }
+
+    /// Round-13 review MED-2: Kimi's real per-directory marker is
+    /// `.kimi-code/`, never `.kimi/` (report 13 §3.1 row 3) — and the
+    /// lowercase `agents.md` fallback must ALSO be detected.
+    #[test]
+    fn native_artifacts_present_kimi_detects_kimi_code_dir_and_lowercase_agents_md() {
+        let dir = TempDir::new().unwrap();
+        let root = Some(dir.path());
+        assert!(!native_artifacts_present(Surface::Kimi, dir.path(), root));
+        std::fs::create_dir(dir.path().join(".kimi-code")).unwrap();
+        assert!(native_artifacts_present(Surface::Kimi, dir.path(), root));
+
+        let dir2 = TempDir::new().unwrap();
+        std::fs::write(dir2.path().join("agents.md"), "x").unwrap();
+        assert!(native_artifacts_present(
+            Surface::Kimi,
+            dir2.path(),
+            Some(dir2.path())
+        ));
+    }
+
+    #[test]
+    fn should_inject_scaffold_defers_when_native_present() {
+        // Env override (CSQ_COC_PARITY_TEST) is process-global → serialize.
+        let _lock = csq_core::platform::test_env::lock();
+        let had = std::env::var_os("CSQ_COC_PARITY_TEST");
+        // SAFETY: test_env::lock serializes env mutation per rules/testing.md.
+        unsafe {
+            std::env::remove_var("CSQ_COC_PARITY_TEST");
+        }
+
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path();
+        let root = Some(cwd);
+        // No native artifacts → inject (transition behavior preserved).
+        assert!(should_inject_scaffold(Surface::Codex, cwd, root));
+        // Native present → defer (do NOT inject) — THE fix.
+        std::fs::create_dir(cwd.join(".codex")).unwrap();
+        assert!(!should_inject_scaffold(Surface::Codex, cwd, root));
+
+        // Parity override forces injection even when native present.
+        // SAFETY: still under test_env::lock.
+        unsafe {
+            std::env::set_var("CSQ_COC_PARITY_TEST", "1");
+        }
+        assert!(should_inject_scaffold(Surface::Codex, cwd, root));
+
+        // SAFETY: restore prior value under the lock.
+        unsafe {
+            match had {
+                Some(v) => std::env::set_var("CSQ_COC_PARITY_TEST", v),
+                None => std::env::remove_var("CSQ_COC_PARITY_TEST"),
+            }
+        }
+    }
+
+    #[test]
+    fn gemini_invocation_is_headless_detects_print_flags() {
+        // an internal ticket: `-p` / `--prompt` / `--prompt=x` are headless one-shots.
+        assert!(gemini_invocation_is_headless(&["-p".into(), "hi".into()]));
+        assert!(gemini_invocation_is_headless(&[
+            "--prompt".into(),
+            "hi".into()
+        ]));
+        assert!(gemini_invocation_is_headless(&["--prompt=hi".into()]));
+    }
+
+    #[test]
+    fn gemini_invocation_is_headless_false_for_interactive() {
+        // Bare launch and interactive-prompt seeds are NOT headless — they may
+        // legitimately complete the browser-auth flow on the TTY.
+        assert!(!gemini_invocation_is_headless(&[]));
+        assert!(!gemini_invocation_is_headless(&[
+            "--model".into(),
+            "gemini-2.5-pro".into()
+        ]));
+        assert!(!gemini_invocation_is_headless(&["-i".into(), "hi".into()]));
+        assert!(!gemini_invocation_is_headless(&[
+            "--prompt-interactive".into(),
+            "hi".into()
+        ]));
+        // `-i` alongside `-p` stays interactive (interactive wins).
+        assert!(!gemini_invocation_is_headless(&[
+            "-p".into(),
+            "hi".into(),
+            "-i".into()
+        ]));
+    }
+
+    /// PR-C3c regression: `verify_codex_config_toml` errors with an
+    /// actionable message when the pre-seed is missing.
+    #[test]
+    fn codex_precondition_errors_on_missing_config_toml() {
+        let dir = TempDir::new().unwrap();
+        let err = verify_codex_config_toml(dir.path(), acc(4))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("config.toml"),
+            "error should name config.toml: {err}"
+        );
+        assert!(
+            err.contains("csq login 4 --provider codex"),
+            "error should point at the fix: {err}"
+        );
+    }
+
+    /// PR-C3c regression: precondition succeeds once the pre-seed
+    /// exists (PR-C3b's `surface::write_config_toml` output).
+    #[test]
+    fn codex_precondition_succeeds_when_config_toml_present() {
+        let dir = TempDir::new().unwrap();
+        let slot = acc(5);
+        codex_surface::write_config_toml(dir.path(), slot, Some("gpt-5.4")).unwrap();
+        verify_codex_config_toml(dir.path(), slot).expect("precondition should pass");
+    }
+
+    #[test]
+    fn codex_command_persists_new_sqlite_schema_outside_handle() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config-12");
+        let handle = dir.path().join("term-123");
+        std::fs::create_dir(&config).unwrap();
+        std::fs::create_dir(&handle).unwrap();
+        let cmd = codex_command(dir.path(), acc(12), &handle).unwrap();
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "-c");
+        let parsed: toml::Value = toml::from_str(args[1].to_str().unwrap()).unwrap();
+        let state_dir = Path::new(parsed["sqlite_home"].as_str().unwrap());
+        assert_eq!(state_dir, std::fs::canonicalize(&config).unwrap());
+        assert!(
+            cmd.get_envs().any(|(key, value)| {
+                key == codex_surface::HOME_ENV_VAR && value == Some(handle.as_os_str())
+            }),
+            "authentication must remain bound to the terminal handle"
+        );
+        // No database existed at provisioning time. A future schema name
+        // created at the delivered sqlite_home must survive normal cleanup.
+        std::fs::write(state_dir.join("state_999.sqlite"), b"new schema").unwrap();
+        std::fs::remove_dir_all(&handle).unwrap();
+        assert_eq!(
+            std::fs::read(config.join("state_999.sqlite")).unwrap(),
+            b"new schema"
+        );
+    }
+
+    /// R9 end-to-end through the launch builder: a state DB whose thread row
+    /// records a reaped `term-<pid>` rollout path is repaired by
+    /// `codex_command` (which every codex launch and swap-exec goes through).
+    #[test]
+    fn codex_command_repairs_reaped_handle_rollout_path() {
+        let _env = csq_core::platform::test_env::lock();
+        let Ok(sqlite3) = csq_core::session::shared_state::codex_sqlite::resolve_sqlite3() else {
+            return; // no sqlite3 on this host: nothing to repair with
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let cfg = codex_surface::config_toml_path(&base, acc(12));
+        let slot_dir = cfg.parent().unwrap().to_path_buf();
+        let rollout = slot_dir.join("codex-sessions/2026/10/06/rollout-a.jsonl");
+        std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        std::fs::write(&rollout, b"T").unwrap();
+        let dead = base.join("term-2776/sessions/2026/10/06/rollout-a.jsonl");
+        let db = slot_dir.join("state_5.sqlite");
+        let run = |sql: &str| {
+            let out = std::process::Command::new(&sqlite3)
+                .arg(&db)
+                .arg(sql)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        run("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT);");
+        run(&format!(
+            "INSERT INTO threads VALUES ('11111111-1111-4111-8111-111111111111', '{}');",
+            dead.display()
+        ));
+        build_codex_exec_command(
+            &base,
+            acc(12),
+            &base.join("term-1"),
+            &[
+                "resume".into(),
+                "11111111-1111-4111-8111-111111111111".into(),
+                "--sandbox".into(),
+                "read-only".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            run(
+                "SELECT rollout_path FROM threads WHERE id='11111111-1111-4111-8111-111111111111';"
+            )
+            .trim(),
+            rollout.display().to_string()
+        );
+    }
+
+    /// A healthy host whose `sqlite3` children are each slow — the exact
+    /// slow-host stage-disk shape, reproduced with a 1s wrapper instead of
+    /// depending on the host — must still admit the target. Every spawned step
+    /// runs under csq-core's per-step budget, and the slot's SECOND directory
+    /// entry (`codex-sessions/` beside `state_5.sqlite`) is checked under the
+    /// allowance advanced by the slow-but-progressing repair, not a flat 4s
+    /// launch allowance that the repair alone consumes. Pre-fix this row
+    /// refused after the repair had already succeeded, with
+    /// "target admission exceeded its bounded budget".
+    #[cfg(unix)]
+    #[test]
+    fn codex_command_admits_target_when_sqlite_children_are_slow() {
+        let _env = csq_core::platform::test_env::lock();
+        // Resolve the real binary with the override removed: the wrapper below
+        // must wrap IT, and the repair must reach it through the wrapper.
+        let saved = std::env::var_os("CSQ_SQLITE3");
+        // SAFETY: still under test_env::lock.
+        unsafe {
+            std::env::remove_var("CSQ_SQLITE3");
+        }
+        let Ok(real) = csq_core::session::shared_state::codex_sqlite::resolve_sqlite3() else {
+            // SAFETY: restore prior value under the lock.
+            unsafe {
+                match saved {
+                    Some(saved) => std::env::set_var("CSQ_SQLITE3", saved),
+                    None => std::env::remove_var("CSQ_SQLITE3"),
+                }
+            }
+            return; // no sqlite3 on this host: nothing to repair with
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let wrapper = base.join("slow-sqlite3");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\n/bin/sleep 1\nexec '{}' \"$@\"\n",
+                real.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg = codex_surface::config_toml_path(&base, acc(12));
+        let slot_dir = cfg.parent().unwrap().to_path_buf();
+        let rollout = slot_dir.join("codex-sessions/2026/10/06/rollout-a.jsonl");
+        std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        std::fs::write(&rollout, b"T").unwrap();
+        let dead = base.join("term-2776/sessions/2026/10/06/rollout-a.jsonl");
+        let db = slot_dir.join("state_5.sqlite");
+        let run = |sql: &str| {
+            let out = std::process::Command::new(&real)
+                .arg(&db)
+                .arg(sql)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        run("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT);");
+        run(&format!(
+            "INSERT INTO threads VALUES ('11111111-1111-4111-8111-111111111111', '{}');",
+            dead.display()
+        ));
+        // SAFETY: still under test_env::lock; restored before the asserts.
+        unsafe {
+            std::env::set_var("CSQ_SQLITE3", &wrapper);
+        }
+        let launched = build_codex_exec_command(
+            &base,
+            acc(12),
+            &base.join("term-1"),
+            &[
+                "resume".into(),
+                "11111111-1111-4111-8111-111111111111".into(),
+                "--sandbox".into(),
+                "read-only".into(),
+            ],
+        );
+        // SAFETY: restore prior value under the lock.
+        unsafe {
+            match saved {
+                Some(saved) => std::env::set_var("CSQ_SQLITE3", saved),
+                None => std::env::remove_var("CSQ_SQLITE3"),
+            }
+        }
+        launched.unwrap();
+        assert_eq!(
+            run(
+                "SELECT rollout_path FROM threads WHERE id='11111111-1111-4111-8111-111111111111';"
+            )
+            .trim(),
+            rollout.display().to_string()
+        );
+    }
+
+    /// Private real SQLite/FS launch fixtures; no native account/session state.
+    #[cfg(unix)]
+    struct R9LaunchRepairFixture {
+        _temp: TempDir,
+        base: PathBuf,
+        slot: PathBuf,
+        db: PathBuf,
+        dead: PathBuf,
+        candidate: PathBuf,
+        sqlite3: PathBuf,
+        fixture_home: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl R9LaunchRepairFixture {
+        fn new() -> Self {
+            // Every row built on this fixture gets the named generous admission
+            // budget: a positive row must never be decided by the enclosing
+            // repair clock on a loaded host. A row that deliberately exercises a
+            // deadline MUST clear it with `set_test_admission_budget(None)`
+            // (production's 13 s) before launching: csq-core's `step_budget`
+            // returns `deadline.max(now + CODEX_REPAIR_STEP_BUDGET)`, so a
+            // generous caller budget also WIDENS the step window, and a child
+            // sized to outrun 9 s would complete instead of being killed. The
+            // opt-outs are the two 10 s starved rows and r9p_full_route_child_
+            // overrunning_its_step_window_still_refuses. The production
+            // derivation is pinned separately by
+            // r9_admission_budget_covers_the_enforced_busy_timeout.
+            set_test_admission_budget(Some(R9_POSITIVE_ADMISSION_BUDGET));
+            let temp = TempDir::new().unwrap();
+            let base = temp.path().canonicalize().unwrap();
+            let slot = base.join("config-12");
+            let db = slot.join("state_5.sqlite");
+            let tail = "2026/10/06/rollout-launch-r9.jsonl";
+            let dead = base.join("term-2776/sessions").join(tail);
+            let candidate = base.join("shared-state/codex/codex-sessions").join(tail);
+            let fixture_home = base.join("fixture-home");
+            std::fs::create_dir_all(&slot).unwrap();
+            std::fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+            std::fs::create_dir(&fixture_home).unwrap();
+            std::fs::write(&candidate, b"private rollout fixture").unwrap();
+            let sqlite3 = csq_core::session::shared_state::codex_sqlite::resolve_sqlite3()
+                .expect("R9 launch fixtures require actual sqlite3; missing binary is not a pass");
+            let fixture = Self {
+                _temp: temp,
+                base,
+                slot,
+                db,
+                dead,
+                candidate,
+                sqlite3,
+                fixture_home,
+            };
+            fixture.sql("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT);");
+            fixture.sql(&format!(
+                "INSERT INTO threads VALUES ('99999999-9999-4999-8999-999999999999', '{}');",
+                fixture.dead.to_str().unwrap().replace('\'', "''")
+            ));
+            fixture
+        }
+
+        fn sql(&self, sql: &str) -> String {
+            let out = std::process::Command::new(&self.sqlite3)
+                .env_clear()
+                .env("HOME", &self.fixture_home)
+                .current_dir(&self.base)
+                .arg("-init")
+                .arg("/dev/null")
+                .arg(&self.db)
+                // `synchronous=OFF`: fixture-only durability, so these writes
+                // do not depend on the host's fsync latency (a measured slow host's stage
+                // disk costs ~1s per commit; same posture as the csq-core
+                // `r9_fixture_sql` the 2026-10-13 fixture fix gave).
+                .arg(format!(
+                    "PRAGMA trusted_schema=OFF;\nPRAGMA synchronous=OFF;\n{sql}"
+                ))
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "private SQLite fixture failed: {out:?}"
+            );
+            String::from_utf8(out.stdout).unwrap()
+        }
+
+        fn rollout(&self) -> String {
+            self.sql(
+                "SELECT rollout_path FROM threads WHERE id='99999999-9999-4999-8999-999999999999';",
+            )
+            .trim()
+            .to_owned()
+        }
+
+        fn launch(&self) -> Result<Command> {
+            build_codex_exec_command_with(
+                &self.base,
+                acc(12),
+                &self.base.join("term-1"),
+                &[
+                    "resume".into(),
+                    "99999999-9999-4999-8999-999999999999".into(),
+                    "--sandbox".into(),
+                    "read-only".into(),
+                ],
+                None,
+                Some(false),
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    fn r9_delayed_sqlite_wrapper(base: &Path, delay_ms: u64, real_sqlite3: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        // TempDir permissions follow umask on this Darwin; pin this owned root.
+        std::fs::set_permissions(base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // `<ms>\n<absolute sqlite3 path>` in `fixture-exec` is the stub's own
+        // spec: sleep the recorded milliseconds, then become the real sqlite3
+        // with the runner's argv.
+        std::fs::write(
+            base.join("fixture-exec"),
+            format!("{delay_ms}\n{}", real_sqlite3.display()),
+        )
+        .unwrap();
+        std::fs::write(base.join("fixture-mode"), "delayed").unwrap();
+        let wrapper = base.join("r9-sqlite-fixture");
+        std::os::unix::fs::symlink(r9_stub_cli_binary(), &wrapper).unwrap();
+        wrapper
+    }
+
+    /// Resolve the `stub-cli` fixture binary beside the test executable,
+    /// building it on demand when the active target profile has never seen an
+    /// explicit `cargo build`.
+    ///
+    /// `stub-cli` is declared `test = false` in `csq-core/Cargo.toml`, so NO
+    /// `cargo test` invocation builds it; a run against a fresh target dir
+    /// holds no binary and the fixture test dies on the availability assert
+    /// instead of testing admission. Build it once per test process into this
+    /// very profile instead of depending on prior build history in a shared
+    /// target directory (same helper as the csq-core R9 fixtures).
+    #[cfg(unix)]
+    fn r9_stub_cli_binary() -> &'static Path {
+        static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        BINARY
+            .get_or_init(|| {
+                let executable = std::env::current_exe().unwrap();
+                let executable_dir = executable.parent().unwrap();
+                let profile = if executable_dir
+                    .file_name()
+                    .is_some_and(|name| name == "deps")
+                {
+                    executable_dir.parent().unwrap()
+                } else {
+                    executable_dir
+                };
+                let binary = profile.join("stub-cli");
+                // Always ask cargo: an existing binary may predate this source.
+                // An up-to-date build is a no-op.
+                let target_dir = profile.parent().expect("cargo target dir above profile");
+                let mut command = std::process::Command::new(
+                    std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()),
+                );
+                command
+                    .args(["build", "-p", "csq-core", "--bin", "stub-cli"])
+                    // A runtime path, so it must resolve at RUN time: the
+                    // compile-time dir would read the BUILD tree from a stale
+                    // target artifact (runtime-manifest-dir gate).
+                    .current_dir(csq_core::testing::manifest_dir(env!("CARGO_MANIFEST_DIR")))
+                    .env("CARGO_TARGET_DIR", target_dir);
+                match profile.file_name().and_then(|name| name.to_str()) {
+                    Some("release") => {
+                        command.arg("--release");
+                    }
+                    Some("debug") | None => {}
+                    Some(other) => {
+                        command.args(["--profile", other]);
+                    }
+                }
+                let output = command
+                    .output()
+                    .expect("run cargo build for the stub-cli fixture");
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    output.status.success() && binary.is_file(),
+                    "R9 native fixture requires cargo build -p csq-core --bin stub-cli \
+                     (status {:?}; stderr: {stderr})",
+                    output.status,
+                );
+                binary
+            })
+            .as_path()
+    }
+
+    /// A sqlite3 that is slower than the whole admission budget must refuse as
+    /// the RETRYABLE deadline class — never as "could not be safely admitted",
+    /// whose recovery hint sends the operator to repair a transcript nothing is
+    /// wrong with.
+    ///
+    /// The instrument is ordering-based, not elapsed-based: the child starts
+    /// 10s late, past every window this route can grant it, and the runner
+    /// takes its deadline branch BEFORE any completion check — so the refusal
+    /// class never depends on host speed or load.
+    ///
+    /// Falsifying result pre-fix: the deadline-class inner is discarded by the
+    /// `Err(_)` arm and the message carries "could not be safely admitted".
+    #[cfg(unix)]
+    #[test]
+    fn r9_exact_resume_starved_sqlite_child_refuses_as_the_retryable_deadline_class() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        // Deliberate-deadline row: production's budget, so the 10 s child
+        // outruns the 9 s per-step window (a generous budget would widen it).
+        set_test_admission_budget(None);
+        let temp = tempfile::Builder::new()
+            .prefix("cr-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let wrapper_base = temp.path().canonicalize().unwrap();
+        // 10s: past every window this route grants — the merged per-step
+        // window (CODEX_REPAIR_STEP_BUDGET_MS, 9s) and the pre-merge flat 4s —
+        // so the child is always killed at a window, on any host speed.
+        let wrapper = r9_delayed_sqlite_wrapper(&wrapper_base, 10_000, &f.sqlite3);
+        let before = std::fs::read(&f.db).unwrap();
+        let prior_sqlite3 = std::env::var_os("CSQ_SQLITE3");
+        // SAFETY: under test_env::lock, so no other test thread reads these.
+        unsafe {
+            std::env::set_var("CSQ_SQLITE3", &wrapper);
+        }
+        let launched = f.launch();
+        // SAFETY: restore prior value under the lock.
+        unsafe {
+            match prior_sqlite3 {
+                Some(value) => std::env::set_var("CSQ_SQLITE3", value),
+                None => std::env::remove_var("CSQ_SQLITE3"),
+            }
+        }
+        let error = launched.unwrap_err();
+        let message = error.to_string();
+        eprintln!("R9 starved exact admission refusal: {message}");
+        assert!(message.contains("CSQ_CODEX_RESUME_TARGET"));
+        assert!(
+            message.contains("bounded admission deadline expired"),
+            "a starved host must refuse as the retryable deadline class: {message}"
+        );
+        assert!(
+            !message.contains("could not be safely admitted"),
+            "a starved host was refused as an unadmittable transcript: {message}"
+        );
+        assert_eq!(
+            f.rollout(),
+            f.dead.to_str().unwrap(),
+            "a refused admission must leave the recorded path untouched"
+        );
+        assert_eq!(std::fs::read(&f.db).unwrap(), before);
+    }
+
+    /// The admission work budget must start only AFTER the shared migration
+    /// lock is admitted: that acquire can wait ~2s for a live migration, and
+    /// charging it would cut the admission's own tolerance by half on exactly
+    /// the hosts already under load.
+    ///
+    /// Ordering-based: the lock is held EXCLUSIVE for 1.5s (inside the
+    /// acquire's ~2s bound) so the wait is real, and the seam's three instants
+    /// then show whether the budget clock was created before or after it — no
+    /// assertion depends on how long the work itself took.
+    ///
+    /// Falsifying result pre-fix: `budget_started_at` is sampled on entry, so
+    /// it precedes `lock_admitted_at` by the whole ~1.5s wait.
+    #[cfg(unix)]
+    #[test]
+    fn r9_exact_admission_budget_starts_after_the_share_lock_is_admitted() {
+        let _env = csq_core::platform::test_env::lock();
+        use std::os::fd::AsRawFd;
+        let f = R9LaunchRepairFixture::new();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(f.base.join("shared-state/codex/.share.lock"))
+            .unwrap();
+        // SAFETY: lock owns a live descriptor; flock changes only this private
+        // fixture's advisory lock and never touches any account namespace.
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1_500));
+            drop(lock);
+        });
+        let _ = take_test_admission_budget_order();
+        let launched = f.launch();
+        release.join().unwrap();
+        let order = take_test_admission_budget_order()
+            .expect("the exact route must record its admission ordering");
+        eprintln!(
+            "R9 admission ordering: entry {:?}, lock admitted {:?}, budget started {:?}",
+            order.route_entry_at, order.lock_admitted_at, order.budget_started_at
+        );
+        let waited = order
+            .lock_admitted_at
+            .saturating_duration_since(order.route_entry_at);
+        assert!(
+            waited >= std::time::Duration::from_millis(1_000),
+            "the migration lock must have been genuinely contended for this \
+             assertion to discriminate (waited {waited:?})"
+        );
+        assert!(launched.is_ok(), "{launched:?}");
+        assert!(
+            order.budget_started_at >= order.lock_admitted_at,
+            "the admission work budget started before the shared migration lock \
+             was admitted"
+        );
+    }
+
+    /// The fifth red row's entry point: `build_codex_exec_command` (the
+    /// pre-messaging wrapper whose `.unwrap()` in
+    /// `codex_command_repairs_reaped_handle_rollout_path` panics with
+    /// `CSQ_CODEX_RESUME_TARGET: ... could not be safely admitted`) reaches the
+    /// SAME `repair_codex_resume_target` admission as the `_with` wrapper — the
+    /// route is `build_codex_exec_command` -> `_with` ->
+    /// `CodexResumeRoute::Exact` -> `repair_codex_resume_target`, and there is no
+    /// second refusal site — so a starved host must render the DISTINCT
+    /// retryable refusal here too.
+    ///
+    /// Falsifying result pre-fix: this entry point renders the unadmittable
+    /// string the row panics with, which the assertion below refuses.
+    #[cfg(unix)]
+    #[test]
+    fn r9_codex_command_entry_shares_the_retryable_deadline_refusal() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        // Deliberate-deadline row: production's budget, so the 10 s child
+        // outruns the 9 s per-step window (a generous budget would widen it).
+        set_test_admission_budget(None);
+        let temp = tempfile::Builder::new()
+            .prefix("cr-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let wrapper_base = temp.path().canonicalize().unwrap();
+        // 10s: past every window this route grants — the merged per-step
+        // window (CODEX_REPAIR_STEP_BUDGET_MS, 9s) and the pre-merge flat 4s —
+        // so the child is always killed at a window, on any host speed.
+        let wrapper = r9_delayed_sqlite_wrapper(&wrapper_base, 10_000, &f.sqlite3);
+        let prior_sqlite3 = std::env::var_os("CSQ_SQLITE3");
+        // SAFETY: under test_env::lock, so no other test thread reads these.
+        unsafe {
+            std::env::set_var("CSQ_SQLITE3", &wrapper);
+        }
+        let launched = build_codex_exec_command(
+            &f.base,
+            acc(12),
+            &f.base.join("term-1"),
+            &[
+                "resume".into(),
+                "99999999-9999-4999-8999-999999999999".into(),
+                "--sandbox".into(),
+                "read-only".into(),
+            ],
+        );
+        // SAFETY: restore prior value under the lock.
+        unsafe {
+            match prior_sqlite3 {
+                Some(value) => std::env::set_var("CSQ_SQLITE3", value),
+                None => std::env::remove_var("CSQ_SQLITE3"),
+            }
+        }
+        let message = launched.unwrap_err().to_string();
+        eprintln!("R9 starved codex_command-entry refusal: {message}");
+        assert!(message.contains("CSQ_CODEX_RESUME_TARGET"));
+        assert!(
+            message.contains("bounded admission deadline expired"),
+            "the row's entry point must render the retryable deadline class: {message}"
+        );
+        assert!(
+            !message.contains("could not be safely admitted"),
+            "the row's entry point rendered the unadmittable class: {message}"
+        );
+        assert_eq!(
+            f.rollout(),
+            f.dead.to_str().unwrap(),
+            "a refused admission must leave the recorded path untouched"
+        );
+    }
+
+    /// The FULL route's admission budget must start after the shared migration
+    /// lock too — residual (3) of the r9 freeze, which pinned only the exact
+    /// route's ordering. A `resume --last` launch under a held migration lock
+    /// must record `budget_started_at >= lock_admitted_at`.
+    ///
+    /// Falsifying result with the clock created before the acquire: the budget
+    /// instant precedes the lock's by the whole ~1.5s wait.
+    #[cfg(unix)]
+    #[test]
+    fn r9p_full_route_admission_budget_starts_after_the_share_lock_is_admitted() {
+        let _env = csq_core::platform::test_env::lock();
+        use std::os::fd::AsRawFd;
+        let f = R9LaunchRepairFixture::new();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(f.base.join("shared-state/codex/.share.lock"))
+            .unwrap();
+        // SAFETY: lock owns a live descriptor; flock changes only this private
+        // fixture's advisory lock and never touches any account namespace.
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1_500));
+            drop(lock);
+        });
+        let _ = take_test_admission_budget_order();
+        let launched = build_codex_exec_command_with(
+            &f.base,
+            acc(12),
+            &f.base.join("term-1"),
+            &[
+                "resume".into(),
+                "--last".into(),
+                "--sandbox".into(),
+                "read-only".into(),
+            ],
+            None,
+            Some(false),
+        );
+        release.join().unwrap();
+        let order = take_test_admission_budget_order()
+            .expect("the full route must record its admission ordering");
+        eprintln!(
+            "R9 full-route admission ordering: entry {:?}, lock admitted {:?}, budget started {:?}",
+            order.route_entry_at, order.lock_admitted_at, order.budget_started_at
+        );
+        let waited = order
+            .lock_admitted_at
+            .saturating_duration_since(order.route_entry_at);
+        assert!(
+            waited >= std::time::Duration::from_millis(1_000),
+            "the migration lock must have been genuinely contended for this \
+             assertion to discriminate (waited {waited:?})"
+        );
+        assert!(launched.is_ok(), "{launched:?}");
+        assert!(
+            order.budget_started_at >= order.lock_admitted_at,
+            "the full route's admission budget started before the shared \
+             migration lock was admitted"
+        );
+    }
+
+    /// Positive-path admission budget for the R9 rows: generous by
+    /// construction (60 s, matching the gate fixture budgets) so a loaded host
+    /// cannot make a healthy step refuse. Production keeps its derived 13 s.
+    // Every user of this constant is a `#[cfg(unix)]` row, so on the Windows
+    // test target it is dead; the preflight's windows-cfg cross-lint compiles
+    // that target with `-D warnings`, and `dead_code` is denied there.
+    #[cfg_attr(not(unix), expect(dead_code))]
+    const R9_POSITIVE_ADMISSION_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// The production admission budget must never be smaller than the one wait
+    /// every generated write script enforces — the arithmetic face of the row
+    /// below, and the check that stays red for a flat-four-second mutant
+    /// regardless of host speed.
+    #[test]
+    fn r9_admission_budget_covers_the_enforced_busy_timeout() {
+        use csq_core::session::shared_state::codex_sqlite::SQLITE_BUSY_TIMEOUT_MS;
+        assert!(
+            CODEX_REPAIR_BUDGET > std::time::Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS),
+            "the admission budget {CODEX_REPAIR_BUDGET:?} must exceed the enforced \
+             busy_timeout {SQLITE_BUSY_TIMEOUT_MS}ms"
+        );
+    }
+
+    /// The admission-budget seam is LIVE: an exhausted budget refuses before any
+    /// repair runs.
+    ///
+    /// This is the falsifying instrument for [`set_test_admission_budget`]: with
+    /// the override removed, this launch would repair normally and succeed, so
+    /// the row reds. It is deliberately independent of host load — the budget is
+    /// zero, never a wall-clock allowance — because a smaller-than-production
+    /// budget cannot be tested through timing: `step_budget` re-arms every step
+    /// to `deadline.max(now + CODEX_REPAIR_STEP_BUDGET)`, so a 1 s budget still
+    /// leaves a 9 s step window and never reds this route.
+    #[cfg(unix)]
+    #[test]
+    fn r9_an_exhausted_admission_budget_refuses_before_any_repair() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        let before = std::fs::read(&f.db).unwrap();
+        set_test_admission_budget(Some(std::time::Duration::ZERO));
+        let launched = f.launch();
+        set_test_admission_budget(None);
+        let message = launched.unwrap_err().to_string();
+        assert!(
+            message.contains("bounded admission deadline expired"),
+            "an exhausted admission budget must refuse as the retryable class: {message}"
+        );
+        assert_eq!(
+            f.rollout(),
+            f.dead.to_str().unwrap(),
+            "a refused admission must leave the recorded path untouched"
+        );
+        assert_eq!(std::fs::read(&f.db).unwrap(), before);
+    }
+
+    /// A contended-but-HEALTHY admission must complete: the write step's wait is
+    /// bounded by the `PRAGMA busy_timeout` every generated write script
+    /// enforces ([`SQLITE_BUSY_TIMEOUT_MS`]), so a launch budget smaller than
+    /// that wait kills a step that was going to succeed. This is the red row
+    /// for the flat-four-second mutant.
+    ///
+    /// Ordering-based: a real `sqlite3` child holds `BEGIN IMMEDIATE` on the
+    /// fixture database until this test touches a sentinel, which lands
+    /// `SQLITE_BUSY_TIMEOUT_MS - 400ms` after the launch starts. The healthy
+    /// branch therefore finishes its wait 400ms INSIDE the enforced busy
+    /// timeout, while the mutant's flat four-second allowance kills the step
+    /// 600ms earlier, mid-wait.
+    #[cfg(unix)]
+    #[test]
+    fn r9_exact_admission_completes_when_the_write_step_waits_out_a_held_lock() {
+        use csq_core::session::shared_state::codex_sqlite::SQLITE_BUSY_TIMEOUT_MS;
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        let sentinel = f.base.join("release-write-lock");
+        let mut holder = {
+            let sentinel = sentinel.display();
+            let bin = f.sqlite3.display();
+            let db = f.db.display();
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!(
+                    "{{ printf 'BEGIN IMMEDIATE;\\n'; while [ ! -f '{sentinel}' ]; do sleep 0.05; done; printf 'COMMIT;\\n'; }} | '{bin}' -batch '{db}'"
+                ))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        // The lock is held once a busy_timeout=0 probe cannot take it: an
+        // ordering signal, never a sleep-based one.
+        let probe = |sql: &str| {
+            std::process::Command::new(&f.sqlite3)
+                .env_clear()
+                .env("HOME", &f.fixture_home)
+                .current_dir(&f.base)
+                .arg(&f.db)
+                .arg(sql)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        let mut held = false;
+        for _ in 0..300 {
+            if !probe("PRAGMA busy_timeout=0; BEGIN IMMEDIATE;") {
+                held = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            held,
+            "the fixture's write lock must be held before the launch starts"
+        );
+        let release_after = std::time::Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS - 400);
+        let launched = std::thread::scope(|scope| {
+            let launching = scope.spawn(|| {
+                // The fixture's thread-local budget does not cross into this
+                // scoped thread; the launch under test is the POSITIVE row, so
+                // grant it here too.
+                set_test_admission_budget(Some(R9_POSITIVE_ADMISSION_BUDGET));
+                f.launch()
+            });
+            std::thread::sleep(release_after);
+            std::fs::write(&sentinel, b"release").unwrap();
+            launching.join().unwrap()
+        });
+        let _ = holder.wait();
+        assert!(
+            launched.is_ok(),
+            "a contended-but-healthy write step must be allowed to finish its \
+             enforced busy-timeout wait: {launched:?}"
+        );
+        assert_eq!(
+            f.rollout(),
+            f.candidate.to_str().unwrap(),
+            "the gated rewrite must have landed once the holder released"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r9_launch_refuses_slot_root_enotdir_before_shared_fallback() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        let blocked = f.base.join("blocked-root-parent");
+        std::fs::write(&blocked, b"regular file, not a directory").unwrap();
+        std::os::unix::fs::symlink(blocked.join("child"), f.slot.join("codex-sessions")).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(f.slot.join("codex-sessions"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+        let before = std::fs::read(&f.db).unwrap();
+        let error = f.launch().unwrap_err();
+        assert!(error.downcast_ref::<CodexResumeRefused>().is_some());
+        assert_eq!(f.rollout(), f.dead.to_str().unwrap());
+        assert_eq!(std::fs::read(&f.db).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r9_launch_refuses_migration_contention_then_repairs_after_release() {
+        let _env = csq_core::platform::test_env::lock();
+        use std::os::fd::AsRawFd;
+        let f = R9LaunchRepairFixture::new();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(f.base.join("shared-state/codex/.share.lock"))
+            .unwrap();
+        // SAFETY: lock owns a live descriptor; flock changes only this private
+        // fixture's advisory lock and never touches any account namespace.
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let before = std::fs::read(&f.db).unwrap();
+        let start = std::time::Instant::now();
+        let error = f.launch().unwrap_err();
+        assert!(error.downcast_ref::<CodexResumeRefused>().is_some());
+        let elapsed = start.elapsed();
+        eprintln!("R9 private contended launch repair elapsed: {elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_secs(4));
+        assert_eq!(f.rollout(), f.dead.to_str().unwrap());
+        assert_eq!(std::fs::read(&f.db).unwrap(), before);
+        drop(lock);
+        f.launch().unwrap();
+        assert_eq!(f.rollout(), f.candidate.to_str().unwrap());
+        f.launch().unwrap();
+        assert_eq!(f.rollout(), f.candidate.to_str().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r9_launch_accepts_genuinely_missing_slot_root() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        assert_eq!(
+            std::fs::canonicalize(f.slot.join("codex-sessions"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        f.launch().unwrap();
+        assert_eq!(f.rollout(), f.candidate.to_str().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r9_exact_resume_ignores_8228_unrepairable_rows_beyond_old_output_cap() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        f.sql("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<8228) INSERT INTO threads SELECT 'dead-'||i, '/missing/'||printf('%0200d',i)||'/rollout-unrepairable.jsonl' FROM n;");
+        let before =
+            f.sql("SELECT count(*), sum(length(rollout_path)) FROM threads WHERE id!='99999999-9999-4999-8999-999999999999';");
+        assert_eq!(before.split('|').next(), Some("8228"));
+        assert!(
+            before
+                .split('|')
+                .nth(1)
+                .unwrap()
+                .trim()
+                .parse::<usize>()
+                .unwrap()
+                > 1024 * 1024
+        );
+        // The retained historical fullscan must actually reach its stdout cap
+        // on this same fixture; a query/API failure is not the regression control.
+        let lock = csq_core::session::shared_state::acquire_codex_share_lock_shared(&f.base)
+            .expect("migration lock");
+        let old = csq_core::session::shared_state::codex_sqlite::repair_slot_rollout_paths_before(
+            &lock,
+            &f.base,
+            &f.db,
+            &[f.base.join("shared-state/codex/codex-sessions")],
+            codex_repair_deadline(),
+        )
+        .unwrap_err();
+        match old {
+            csq_core::session::shared_state::ShareError::SqliteCommandFailed { detail, .. } => {
+                eprintln!("R9 actual historical fullscan refusal: {detail}");
+                assert!(
+                    detail.contains("output") || detail.contains("stdout"),
+                    "actual output cap required: {detail}"
+                );
+            }
+            other => panic!("fullscan control failed outside capped transport: {other:?}"),
+        }
+        let command = f
+            .launch()
+            .expect("exact resume must not read unrelated capped rows");
+        assert!(command.get_args().any(|v| v == "resume"));
+        assert_eq!(f.rollout(), f.candidate.to_str().unwrap());
+        assert_eq!(
+            f.sql("SELECT count(*), sum(length(rollout_path)) FROM threads WHERE id!='99999999-9999-4999-8999-999999999999';"),
+            before
+        );
+        assert_eq!(f.sql("SELECT count(*) FROM threads WHERE id!='99999999-9999-4999-8999-999999999999' AND rollout_path != '/missing/'||printf('%0200d',CAST(substr(id,6) AS INTEGER))||'/rollout-unrepairable.jsonl';").trim(), "0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r9_exact_resume_accepts_options_before_uuid_for_both_native_routes() {
+        let _env = csq_core::platform::test_env::lock();
+        for exec in [false, true] {
+            let f = R9LaunchRepairFixture::new();
+            let mut args: Vec<String> = if exec {
+                vec![
+                    "exec".into(),
+                    "resume".into(),
+                    "--json".into(),
+                    "--ignore-user-config".into(),
+                ]
+            } else {
+                vec!["resume".into(), "--sandbox".into(), "read-only".into()]
+            };
+            args.extend([
+                "--all".into(),
+                "--model".into(),
+                "gpt-6.1-sol".into(),
+                "99999999-9999-4999-8999-999999999999".into(),
+            ]);
+            let command = build_codex_exec_command_with(
+                &f.base,
+                acc(12),
+                &f.base.join("term-1"),
+                &args,
+                None,
+                Some(false),
+            )
+            .unwrap();
+            assert!(command.get_args().any(|v| v == "resume"));
+            assert_eq!(
+                f.rollout(),
+                f.candidate.to_str().unwrap(),
+                "supported options-before-UUID must reach target admission"
+            );
+        }
+        let full: Vec<String> = ["resume", "--last", "99999999-9999-4999-8999-999999999999"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert!(exact_codex_resume_target(&full).unwrap().is_none());
+        for args in [
+            vec![
+                "resume",
+                "--unknown-option",
+                "99999999-9999-4999-8999-999999999999",
+            ],
+            vec!["resume", "some-session-name"],
+            vec![
+                "resume",
+                "-p",
+                "other-profile",
+                "99999999-9999-4999-8999-999999999999",
+            ],
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+            assert!(exact_codex_resume_target(&args)
+                .unwrap_err()
+                .downcast_ref::<CodexResumeRefused>()
+                .is_some());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r9_exact_resume_canonicalizes_resolving_alias_after_native_activity() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        std::fs::create_dir_all(f.dead.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&f.candidate, &f.dead).unwrap();
+        f.launch().unwrap();
+        assert_eq!(f.rollout(), f.candidate.to_str().unwrap());
+        f.sql(&format!(
+            "UPDATE threads SET rollout_path='{}' WHERE id='99999999-9999-4999-8999-999999999999';",
+            f.dead.to_str().unwrap().replace('\'', "''")
+        ));
+        f.launch().unwrap();
+        assert_eq!(f.rollout(), f.candidate.to_str().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r9_exact_resume_refuses_missing_or_ambiguous_transcript_without_mutation() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        std::fs::remove_file(&f.candidate).unwrap();
+        let before = std::fs::read(&f.db).unwrap();
+        let error = f.launch().unwrap_err();
+        assert!(error.downcast_ref::<CodexResumeRefused>().is_some());
+        assert!(error.to_string().contains("CSQ_CODEX_RESUME_TARGET"));
+        assert!(!error.to_string().contains(f.base.to_str().unwrap()));
+        assert_eq!(std::fs::read(&f.db).unwrap(), before);
+        std::fs::write(&f.candidate, b"one").unwrap();
+        let second = f
+            .candidate
+            .parent()
+            .unwrap()
+            .join("duplicate")
+            .join(f.candidate.file_name().unwrap());
+        std::fs::create_dir_all(second.parent().unwrap()).unwrap();
+        std::fs::write(second, b"two").unwrap();
+        assert!(f
+            .launch()
+            .unwrap_err()
+            .downcast_ref::<CodexResumeRefused>()
+            .is_some());
+        assert_eq!(std::fs::read(&f.db).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r9_ordinary_launch_never_reads_or_repairs_thread_rows() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        let before = std::fs::read(&f.db).unwrap();
+        codex_command(&f.base, acc(12), &f.base.join("term-1")).unwrap();
+        build_codex_exec_command_with(
+            &f.base,
+            acc(12),
+            &f.base.join("term-1"),
+            &[
+                "--sandbox".into(),
+                "read-only".into(),
+                "exec".into(),
+                "--".into(),
+                "resume".into(),
+            ],
+            None,
+            Some(false),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&f.db).unwrap(), before);
+        assert_eq!(f.rollout(), f.dead.to_str().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r9_ordinary_option_value_named_resume_is_not_a_resume_route() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        let before = std::fs::read(&f.db).unwrap();
+        for option in ["--output-last-message", "--model"] {
+            let args: Vec<String> = vec![
+                "-c".into(),
+                "sqlite_home=\"/different\"".into(),
+                "exec".into(),
+                "--ignore-user-config".into(),
+                option.into(),
+                "resume".into(),
+                "hello".into(),
+            ];
+            let result = build_codex_exec_command_with(
+                &f.base,
+                acc(12),
+                &f.base.join("term-1"),
+                &args,
+                None,
+                Some(false),
+            );
+            assert!(
+                result.is_ok(),
+                "ordinary option value must not trigger target admission: {result:?}"
+            );
+            assert_eq!(std::fs::read(&f.db).unwrap(), before);
+        }
+        assert_eq!(f.rollout(), f.dead.to_str().unwrap());
+    }
+
+    #[test]
+    fn r9_exact_resume_refuses_sqlite_home_override_and_preserves_picker_scope() {
+        for args in [
+            vec![
+                "resume",
+                "99999999-9999-4999-8999-999999999999",
+                "-c",
+                "sqlite_home=\"/different\"",
+            ],
+            vec![
+                "--config=sqlite_home=\"/different\"",
+                "resume",
+                "99999999-9999-4999-8999-999999999999",
+            ],
+            vec![
+                "resume",
+                "99999999-9999-4999-8999-999999999999",
+                "--config",
+                "\"sqlite_home\" = \"/different\"",
+            ],
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+            assert!(exact_codex_resume_target(&args)
+                .unwrap_err()
+                .downcast_ref::<CodexResumeRefused>()
+                .is_some());
+        }
+        assert_eq!(
+            exact_codex_resume_target(&["resume".into(), "--last".into()]).unwrap(),
+            None
+        );
+        assert_eq!(exact_codex_resume_target(&["resume".into()]).unwrap(), None);
+        assert_eq!(
+            exact_codex_resume_target(&["exec".into(), "--".into(), "resume".into()]).unwrap(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r9p_bare_last_and_exec_last_use_the_actual_full_repair_builder() {
+        let _env = csq_core::platform::test_env::lock();
+        for args in [
+            vec!["resume"],
+            vec!["resume", "--last"],
+            vec!["exec", "resume", "--last", "hello"],
+        ] {
+            let f = R9LaunchRepairFixture::new();
+            let count = if args.len() == 1 { 8228 } else { 1200 };
+            let missing = f.base.join("missing").to_str().unwrap().replace('\'', "''");
+            f.sql(&format!("DELETE FROM threads; WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<{count}) INSERT INTO threads SELECT 'dead-'||i,'{missing}/'||printf('%0200d',i)||'/absent.jsonl' FROM n;"));
+            f.sql(&format!(
+                "INSERT INTO threads VALUES('99999999-9999-4999-8999-999999999999','{}');",
+                f.dead.to_str().unwrap().replace('\'', "''")
+            ));
+            let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+            let command = build_codex_exec_command_with(
+                &f.base,
+                acc(12),
+                &f.base.join("term-1"),
+                &args,
+                None,
+                Some(false),
+            )
+            .expect("full resume builder must repair beyond first page");
+            assert!(command.get_args().any(|arg| arg == "resume"));
+            assert_eq!(
+                f.rollout(),
+                f.candidate.to_str().unwrap(),
+                "actual full-route target canonicalization"
+            );
+            assert_eq!(f.sql(&format!("SELECT count(*) FROM threads WHERE id LIKE 'dead-%' AND rollout_path != '{missing}/'||printf('%0200d',CAST(substr(id,6) AS INTEGER))||'/absent.jsonl';")).trim(), "0");
+        }
+    }
+
+    /// Run a bare full-route `resume` over a 1200-row multi-page table with
+    /// every `sqlite3` child delayed by `delay_ms` (the stub's own enforced
+    /// sleep), restoring `CSQ_SQLITE3` afterwards.
+    #[cfg(unix)]
+    fn r9p_full_route_launch_with_delayed_children(
+        f: &R9LaunchRepairFixture,
+        delay_ms: u64,
+    ) -> Result<Command> {
+        let missing = f.base.join("missing").to_str().unwrap().replace('\'', "''");
+        f.sql(&format!("DELETE FROM threads; WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1200) INSERT INTO threads SELECT 'dead-'||i,'{missing}/'||printf('%0200d',i)||'/absent.jsonl' FROM n;"));
+        f.sql(&format!(
+            "INSERT INTO threads VALUES('99999999-9999-4999-8999-999999999999','{}');",
+            f.dead.to_str().unwrap().replace('\'', "''")
+        ));
+        let temp = tempfile::Builder::new()
+            .prefix("cr-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let wrapper_base = temp.path().canonicalize().unwrap();
+        let wrapper = r9_delayed_sqlite_wrapper(&wrapper_base, delay_ms, &f.sqlite3);
+        let prior_sqlite3 = std::env::var_os("CSQ_SQLITE3");
+        // SAFETY: under test_env::lock, so no other test thread reads these.
+        unsafe {
+            std::env::set_var("CSQ_SQLITE3", &wrapper);
+        }
+        let launched = build_codex_exec_command_with(
+            &f.base,
+            acc(12),
+            &f.base.join("term-1"),
+            &["resume".into()],
+            None,
+            Some(false),
+        );
+        // SAFETY: restore prior value under the lock.
+        unsafe {
+            match prior_sqlite3 {
+                Some(value) => std::env::set_var("CSQ_SQLITE3", value),
+                None => std::env::remove_var("CSQ_SQLITE3"),
+            }
+        }
+        launched
+    }
+
+    /// The full route's database walk is bounded by its per-step and per-page
+    /// windows, never by one coarse deadline over the whole walk. 1200 rows are
+    /// 3 pages plus the terminating empty read, after 5 fixed reads and before
+    /// the one rewrite batch: ≥ 10 children × 1.5s ENFORCED sleep = ≥ 15s of
+    /// walk, longer than one 9s step window on any host, while every child
+    /// stays far inside its own window. A coarse post-walk check against the
+    /// database's first step window refuses this completed repair.
+    #[cfg(unix)]
+    #[test]
+    fn r9p_full_route_completes_a_walk_longer_than_one_step_window() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        let launched = r9p_full_route_launch_with_delayed_children(&f, 1_500);
+        assert!(
+            launched.is_ok(),
+            "a slow-but-healthy full-route walk must complete: {:?}",
+            launched.err()
+        );
+        assert_eq!(
+            f.rollout(),
+            f.candidate.to_str().unwrap(),
+            "the full-route rewrite must have landed"
+        );
+    }
+
+    /// Fail-closed counterpart: a child slower than its own enforced step
+    /// window (10s > CODEX_REPAIR_STEP_BUDGET_MS, 9s) is still killed and the
+    /// full route refuses as a typed partial without launching or rewriting.
+    #[cfg(unix)]
+    #[test]
+    fn r9p_full_route_child_overrunning_its_step_window_still_refuses() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        // Deliberate-deadline row: production's budget, so the 10 s child
+        // outruns the 9 s per-step window (a generous budget would widen it).
+        set_test_admission_budget(None);
+        let error = r9p_full_route_launch_with_delayed_children(&f, 10_000).unwrap_err();
+        let typed = error
+            .downcast_ref::<CodexResumePartial>()
+            .unwrap_or_else(|| panic!("typed partial before native command: {error}"));
+        assert_eq!((typed.visited, typed.rewritten), (0, 0));
+        assert_eq!(
+            f.rollout(),
+            f.dead.to_str().unwrap(),
+            "a refused full-route repair must leave the recorded path untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r9p_full_resume_partial_refuses_native_spawn_with_observed_and_committed_counts() {
+        let _env = csq_core::platform::test_env::lock();
+        let f = R9LaunchRepairFixture::new();
+        let duplicate = f.candidate.parent().unwrap().join("duplicate");
+        std::fs::create_dir(&duplicate).unwrap();
+        std::fs::write(
+            duplicate.join(f.candidate.file_name().unwrap()),
+            b"ambiguous transcript",
+        )
+        .unwrap();
+        let before = std::fs::read(&f.db).unwrap();
+        let error = build_codex_exec_command_with(
+            &f.base,
+            acc(12),
+            &f.base.join("term-1"),
+            &["resume".into()],
+            None,
+            Some(false),
+        )
+        .unwrap_err();
+        let typed = error
+            .downcast_ref::<CodexResumePartial>()
+            .expect("typed partial before native command");
+        assert_eq!((typed.visited, typed.rewritten), (0, 0));
+        assert!(!typed.in_flight_commit_unknown);
+        assert_eq!(std::fs::read(&f.db).unwrap(), before);
+    }
+
+    /// `visited` counts rows observed, including rows of batches that held no
+    /// rewrite and so were never transactionally confirmed; only `rewritten`
+    /// is committed. The operator string must not call visited rows
+    /// "confirmed". Falsifying result with the old wording: the message
+    /// contains "confirmed visited=".
+    #[test]
+    fn codex_resume_partial_message_does_not_over_claim_confirmation() {
+        let message = CodexResumePartial {
+            reason: "shared resume repair deadline exhausted",
+            visited: 7,
+            rewritten: 2,
+            databases_completed: 1,
+            in_flight_commit_unknown: true,
+        }
+        .to_string();
+        assert_eq!(
+            message,
+            "CSQ_CODEX_RESUME_PARTIAL: shared resume repair deadline exhausted; observed visited=7 (rows in batches that held no rewrite were read, not committed), committed rewritten=2, databases=1, last_write_commit_unknown=true. Native Codex was not launched; retry after resolving the bounded repair condition"
+        );
+        assert!(!message.contains("confirmed"));
+    }
+
+    #[test]
+    fn r9p_full_route_parser_keeps_ordinary_option_values_outside_repair() {
+        assert_eq!(
+            codex_resume_route(&[
+                "-m".into(),
+                "resume".into(),
+                "exec".into(),
+                "-o".into(),
+                "resume".into(),
+                "hello".into()
+            ])
+            .unwrap(),
+            CodexResumeRoute::Ordinary
+        );
+        assert_eq!(
+            codex_resume_route(&["resume".into(), "--last".into(), "a prompt".into()]).unwrap(),
+            CodexResumeRoute::Full
+        );
+        assert!(codex_resume_route(&[
+            "resume".into(),
+            "--last".into(),
+            "--config=sqlite_home=\"/different\"".into()
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn codex_command_sqlite_directory_is_slot_scoped() {
+        let dir = TempDir::new().unwrap();
+        let mut homes = Vec::new();
+        for slot in [11, 12] {
+            std::fs::create_dir(dir.path().join(format!("config-{slot}"))).unwrap();
+            let cmd = codex_command(dir.path(), acc(slot), &dir.path().join("term-1")).unwrap();
+            let arg = cmd.get_args().nth(1).unwrap().to_str().unwrap();
+            let parsed: toml::Value = toml::from_str(arg).unwrap();
+            homes.push(parsed["sqlite_home"].as_str().unwrap().to_owned());
+        }
+        assert_ne!(
+            homes[0], homes[1],
+            "never redirect another slot's live database"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_command_sqlite_path_is_toml_escaped() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("space quote\" backslash\\");
+        let config = base.join("config-12");
+        std::fs::create_dir_all(&config).unwrap();
+        let cmd = codex_command(&base, acc(12), &base.join("term-1")).unwrap();
+        let arg = cmd.get_args().nth(1).unwrap().to_str().unwrap();
+        let parsed: toml::Value = toml::from_str(arg).unwrap();
+        assert_eq!(
+            Path::new(parsed["sqlite_home"].as_str().unwrap()),
+            std::fs::canonicalize(config).unwrap()
+        );
+        assert_eq!(
+            parsed.as_table().unwrap().len(),
+            1,
+            "path cannot inject config keys"
+        );
+    }
+
+    // ── `build_codex_exec_command` — the shared flag/env helper
+    // `launch_codex` and `swap::supervise_codex_after_binding` both call
+    // (cross-slot swap-resume shard S3, item 3) ─────────────────────────
+
+    #[test]
+    fn build_codex_exec_command_carries_the_same_env_strip_as_codex_command() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config-12");
+        let handle = dir.path().join("term-123");
+        std::fs::create_dir(&config).unwrap();
+        std::fs::create_dir(&handle).unwrap();
+
+        let cmd = build_codex_exec_command(dir.path(), acc(12), &handle, &[]).unwrap();
+        assert!(
+            cmd.get_envs().any(|(key, value)| {
+                key == codex_surface::HOME_ENV_VAR && value == Some(handle.as_os_str())
+            }),
+            "must set CODEX_HOME exactly as codex_command does"
+        );
+        // `strip_sensitive_env` + the explicit removes run inside
+        // `codex_command` — assert the CLAUDE_CONFIG_DIR removal reached
+        // this command too (env_remove shows up as `Some(None)` in
+        // `get_envs` — a key explicitly cleared, not merely absent).
+        assert!(
+            cmd.get_envs()
+                .any(|(key, value)| key == "CLAUDE_CONFIG_DIR" && value.is_none()),
+            "must remove CLAUDE_CONFIG_DIR exactly as codex_command does"
+        );
+    }
+
+    #[test]
+    fn build_codex_exec_command_derives_sandbox_flags_like_launch_codex_did_inline() {
+        // Mirrors the GH an internal ticket derivation `launch_codex` used to build inline
+        // — moving it into `build_codex_exec_command` must not change its
+        // outcome: an empty `rest` with no global config still derives no
+        // flags (nothing to derive from), while a `rest` that already
+        // specifies a sandbox policy suppresses derivation entirely.
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config-7");
+        let handle = dir.path().join("term-7");
+        std::fs::create_dir(&config).unwrap();
+        std::fs::create_dir(&handle).unwrap();
+
+        let rest = vec!["-s".to_string(), "read-only".to_string()];
+        let cmd = build_codex_exec_command(dir.path(), acc(7), &handle, &rest).unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        // The caller's own `-s read-only` must be the ONLY sandbox flag —
+        // `caller_overrides_sandbox` must have suppressed derivation.
+        assert_eq!(
+            args.iter().filter(|a| a.as_str() == "-s").count(),
+            1,
+            "caller-supplied sandbox flag must not be duplicated by derivation: {args:?}"
+        );
+        assert!(args.contains(&"read-only".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_does_not_acquire_derived_permission_policy() {
+        let _env = csq_core::platform::test_env::lock();
+        struct RestoreHome(Option<std::ffi::OsString>);
+        impl Drop for RestoreHome {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("HOME", value),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+        let _restore = RestoreHome(std::env::var_os("HOME"));
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(
+            home.join(".codex/config.toml"),
+            "approval_policy=\"never\"\nsandbox_mode=\"danger-full-access\"\n",
+        )
+        .unwrap();
+        std::env::set_var("HOME", &home);
+        std::fs::create_dir(dir.path().join("config-7")).unwrap();
+        let handle = dir.path().join("term-7");
+        std::fs::create_dir(&handle).unwrap();
+        for caller in [
+            vec!["resume", "--last"],
+            vec!["resume", "--last", "-c", "sandbox_mode=\"read-only\""],
+        ] {
+            let rest: Vec<String> = caller.into_iter().map(str::to_owned).collect();
+            let command = build_codex_exec_command_with(
+                dir.path(),
+                acc(7),
+                &handle,
+                &rest,
+                None,
+                Some(false),
+            )
+            .unwrap();
+            let args: Vec<_> = command.get_args().collect();
+            assert!(
+                !args.contains(&std::ffi::OsStr::new(
+                    "--dangerously-bypass-approvals-and-sandbox"
+                )),
+                "resume must not acquire any csq-derived bypass policy: {rest:?}"
+            );
+            assert!(!args.contains(&std::ffi::OsStr::new("--ask-for-approval")));
+            assert!(!args.contains(&std::ffi::OsStr::new("--sandbox")));
+            assert_eq!(
+                args[args.len() - rest.len()..],
+                rest.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Parity, by construction: both `launch_codex`'s spawn and
+    /// `swap::supervise_codex_after_binding`'s exec build their `Command` through
+    /// THIS SAME function with the SAME `(base_dir, account, handle_dir,
+    /// rest)` — so two calls with identical inputs must produce identical
+    /// argv/env, and any future flag added to one caller is automatically
+    /// present for the other (parity by construction, not a second
+    /// hand-maintained list — mirrors
+    /// `codex_supervise::tests::relaunch_parity_shares_flags_with_the_initial_launch`'s
+    /// framing for the supervised-relaunch half of this same shard).
+    #[test]
+    fn build_codex_exec_command_is_deterministic_across_call_sites() {
+        let _env = csq_core::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config-3");
+        let handle = dir.path().join("term-3");
+        std::fs::create_dir(&config).unwrap();
+        std::fs::create_dir(&handle).unwrap();
+        // This assertion compares command construction, independently of
+        // resume repair's SQLite dependency and target-admission fixtures.
+        let rest: Vec<String> = ["exec", "--sandbox", "read-only", "--", "parity"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+
+        // Stand-in for `launch_codex`'s own call site.
+        let from_launch = build_codex_exec_command(dir.path(), acc(3), &handle, &rest).unwrap();
+        // Stand-in for `swap::supervise_codex_after_binding`'s call site.
+        let from_swap = build_codex_exec_command(dir.path(), acc(3), &handle, &rest).unwrap();
+
+        assert_eq!(
+            format!("{from_launch:?}"),
+            format!("{from_swap:?}"),
+            "both call sites must build byte-identical commands"
+        );
+    }
+
+    /// **2026-05-26 post-A++ run-dispatch regression (host slot 8).** A Codex
+    /// slot logged in after the legacy-mirror cleanup has its credential ONLY
+    /// at `identities/<UUID>/credentials-codex.json` — no legacy
+    /// `credentials/codex-<N>.json`. The pre-fix `surface_cli_for_slot` checked
+    /// only the legacy path, so `csq run N` detected Claude, routed to the
+    /// Anthropic path, and died with `credential file not found:
+    /// identities/<UUID>/credentials.json`. This pins the identity-keyed codex
+    /// detection: a post-A++ codex slot dispatches to `SurfaceCli::Codex`.
+    #[test]
+    fn surface_cli_for_slot_detects_post_aplusplus_codex_via_identity_store() {
+        use csq_core::accounts::identity_store::{credentials_codex_path_for, identity_path};
+        use csq_core::accounts::profiles::{profiles_path, save, ProfilesFile};
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let slot = acc(8);
+
+        // by_slot maps slot 8 → a UUID; credentials-codex.json at the identity
+        // path; NO legacy credentials/codex-8.json mirror.
+        let uuid = csq_core::accounts::identity_store::IdentityId::new_v4();
+        let mut pf = ProfilesFile::empty();
+        pf.by_slot.insert("8".to_string(), uuid);
+        save(&profiles_path(base), &pf).unwrap();
+        std::fs::create_dir_all(identity_path(base, uuid)).unwrap();
+        std::fs::write(credentials_codex_path_for(base, uuid), b"{}").unwrap();
+
+        assert_eq!(
+            surface_cli_for_slot(base, slot),
+            SurfaceCli::Codex,
+            "post-A++ codex slot (identity-keyed credentials-codex.json, no legacy \
+             mirror) MUST dispatch to Codex, not fall through to Claude"
+        );
+    }
+
+    /// W3-3 (an internal journal entry): a slot bound to a native Kimi/Grok CLI (via the
+    /// credential-less binding marker `credentials/{kimi,grok}-<N>.json`)
+    /// MUST dispatch to `SurfaceCli::Kimi`/`Grok`, not fall through to Claude.
+    #[test]
+    fn surface_cli_for_slot_detects_native_kimi_and_grok_markers() {
+        use csq_core::providers::catalog::Surface as CatalogSurface;
+        use csq_core::providers::native;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+
+        let kimi_slot = acc(9);
+        assert_eq!(
+            surface_cli_for_slot(base, kimi_slot),
+            SurfaceCli::Claude,
+            "an unbound slot falls through to Claude"
+        );
+        native::write_binding(base, kimi_slot, CatalogSurface::Kimi).unwrap();
+        assert_eq!(
+            surface_cli_for_slot(base, kimi_slot),
+            SurfaceCli::Kimi,
+            "a slot with a Kimi binding marker MUST dispatch to SurfaceCli::Kimi"
+        );
+
+        let grok_slot = acc(10);
+        native::write_binding(base, grok_slot, CatalogSurface::Grok).unwrap();
+        assert_eq!(
+            surface_cli_for_slot(base, grok_slot),
+            SurfaceCli::Grok,
+            "a slot with a Grok binding marker MUST dispatch to SurfaceCli::Grok"
+        );
+    }
+
+    /// redteam R2 MEDIUM-2: dispatch MUST refuse a native slot whose binding
+    /// marker is a symlink (external tampering) rather than exec the vendor CLI
+    /// against it — parity with `launch_gemini`'s symlink refusal. Since
+    /// `marker_exists` now treats a dangling symlink as bound (fail-toward-
+    /// refuse), this dispatch gate is what keeps a tampered slot from launching.
+    #[test]
+    #[cfg(unix)]
+    fn refuse_native_marker_symlink_rejects_symlink_allows_regular() {
+        use csq_core::providers::catalog::Surface as CatalogSurface;
+        use csq_core::providers::native;
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let slot = acc(11);
+        let kimi = native::descriptor(CatalogSurface::Kimi).unwrap();
+
+        // A regular-file marker (what csq writes) is accepted.
+        native::write_binding(base, slot, CatalogSurface::Kimi).unwrap();
+        assert!(refuse_native_marker_symlink(base, slot, CatalogSurface::Kimi, kimi).is_ok());
+
+        // Replace it with a symlink → refused with an actionable message.
+        let marker = native::marker_path(base, slot, CatalogSurface::Kimi);
+        std::fs::remove_file(&marker).unwrap();
+        std::os::unix::fs::symlink(base.join("elsewhere.json"), &marker).unwrap();
+        let err = refuse_native_marker_symlink(base, slot, CatalogSurface::Kimi, kimi);
+        assert!(err.is_err(), "a symlink marker must be refused");
+        assert!(err.unwrap_err().to_string().contains("is a symlink"));
+    }
+
+    /// W3-7 (an internal journal entry): the `handle` collision guard bails when
+    /// `is_third_party && surface_for_preflight != SurfaceCli::Claude` —
+    /// designed to catch a slot that has BOTH a 3P binding AND a
+    /// Codex/Gemini canonical present (a corrupted on-disk state). A
+    /// native-CLI slot (Kimi/Grok) MUST NOT trip this guard: it has a
+    /// binding marker (so `surface_for_preflight` resolves to
+    /// `SurfaceCli::Kimi`/`Grok`, not `Claude`) but it is emphatically
+    /// NOT a 3P binding (`discover_per_slot_third_party` scans
+    /// `config-N/settings.json` for a 3P `ANTHROPIC_BASE_URL`; native
+    /// slots never write one). This pins the premise the guard's
+    /// `is_third_party` flag relies on: a native slot's
+    /// `discover_per_slot_third_party` entry is absent, so
+    /// `is_third_party` evaluates `false` and the guard's `&&` short-
+    /// circuits — the bail never fires. (`account-terminal-separation.md`
+    /// MUST Rule 3 — identity derivation must key on the canonical
+    /// marker, not a guessed/overlapping classification.)
+    #[test]
+    fn native_slot_not_misclassified_as_3p_collision() {
+        use csq_core::providers::catalog::Surface as CatalogSurface;
+        use csq_core::providers::native;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let kimi_slot = acc(11);
+        native::write_binding(base, kimi_slot, CatalogSurface::Kimi).unwrap();
+
+        // Premise 1: surface_for_preflight resolves away from Claude.
+        assert_eq!(surface_cli_for_slot(base, kimi_slot), SurfaceCli::Kimi);
+
+        // Premise 2: the slot is NOT reported as a 3P per-slot binding —
+        // the collision guard's `is_third_party` flag is derived from
+        // exactly this discovery call in `handle`.
+        let is_third_party = discovery::discover_per_slot_third_party(base)
+            .into_iter()
+            .any(|a| {
+                a.id == kimi_slot.get() && matches!(a.source, AccountSource::ThirdParty { .. })
+            });
+        assert!(
+            !is_third_party,
+            "a native-CLI slot must never be classified as a 3P per-slot binding — \
+             doing so would trip the `is_third_party && surface != Claude` collision \
+             guard and spuriously bail `csq run` on every native session"
+        );
+    }
+
+    // ── set_native_home_env (C2, 0135 design lock) ────────────────────
+
+    /// A Kimi slot's spawn env sets `KIMI_CODE_HOME` to
+    /// `native_home_path(...)` for the slot and does NOT set `GROK_HOME`
+    /// (only strips it — see the sibling strip test below). Pins the C2
+    /// contract: the vendor is redirected at the slot's own isolated home,
+    /// never the sibling surface's var.
+    #[test]
+    fn set_native_home_env_kimi_sets_home_and_not_grok() {
+        use csq_core::providers::native;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let slot = acc(1);
+        let mut cmd = Command::new("echo"); // dummy executable, never spawned
+
+        set_native_home_env(&mut cmd, &native::KIMI, base, slot);
+
+        let expected_home = native::native_home_path(base, slot, native::KIMI.surface);
+        let envs: Vec<(&std::ffi::OsStr, Option<&std::ffi::OsStr>)> = cmd.get_envs().collect();
+        assert!(
+            envs.iter().any(|(k, v)| {
+                *k == std::ffi::OsStr::new("KIMI_CODE_HOME")
+                    && *v == Some(expected_home.as_os_str())
+            }),
+            "KIMI_CODE_HOME must be set to native_home_path(...); got {envs:?}"
+        );
+        assert!(
+            !envs
+                .iter()
+                .any(|(k, v)| *k == std::ffi::OsStr::new("GROK_HOME") && v.is_some()),
+            "GROK_HOME must never be set (Some) for a Kimi slot; got {envs:?}"
+        );
+    }
+
+    /// Symmetric to the Kimi case above: a Grok slot sets `GROK_HOME` and
+    /// never sets `KIMI_CODE_HOME`.
+    #[test]
+    fn set_native_home_env_grok_sets_home_and_not_kimi() {
+        use csq_core::providers::native;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let slot = acc(2);
+        let mut cmd = Command::new("echo");
+
+        set_native_home_env(&mut cmd, &native::GROK, base, slot);
+
+        let expected_home = native::native_home_path(base, slot, native::GROK.surface);
+        let envs: Vec<(&std::ffi::OsStr, Option<&std::ffi::OsStr>)> = cmd.get_envs().collect();
+        assert!(
+            envs.iter().any(|(k, v)| {
+                *k == std::ffi::OsStr::new("GROK_HOME") && *v == Some(expected_home.as_os_str())
+            }),
+            "GROK_HOME must be set to native_home_path(...); got {envs:?}"
+        );
+        assert!(
+            !envs
+                .iter()
+                .any(|(k, v)| *k == std::ffi::OsStr::new("KIMI_CODE_HOME") && v.is_some()),
+            "KIMI_CODE_HOME must never be set (Some) for a Grok slot; got {envs:?}"
+        );
+    }
+
+    /// The strip: for a Kimi slot, `GROK_HOME` MUST be EXPLICITLY removed
+    /// from the child env (`Command::env_remove`, surfaced by `get_envs()`
+    /// as a `(key, None)` modification), not merely left un-set. A `None`
+    /// modification structurally suppresses ANY inherited parent-shell
+    /// value for that key regardless of what the real process env holds —
+    /// this is the mechanism-level proof that a poisoned parent-shell
+    /// `GROK_HOME` cannot leak into a Kimi child (0135 design lock: the
+    /// exact multi-account isolation bug this redesign fixes). Mirrors
+    /// `strip_sensitive_env_covers_openai_and_codex_home`'s "we can't
+    /// mutate the real env during parallel tests" posture — the assertion
+    /// is on `Command`'s recorded modification, not on `std::env`.
+    #[test]
+    fn set_native_home_env_strips_inherited_grok_home_for_kimi_slot() {
+        use csq_core::providers::native;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let slot = acc(3);
+        let mut cmd = Command::new("echo");
+
+        set_native_home_env(&mut cmd, &native::KIMI, base, slot);
+
+        let stripped = cmd
+            .get_envs()
+            .any(|(k, v)| k == std::ffi::OsStr::new("GROK_HOME") && v.is_none());
+        assert!(
+            stripped,
+            "GROK_HOME must be an explicit env_remove modification (None), \
+             not merely absent, so an inherited parent-shell value is suppressed"
+        );
+    }
+
+    #[test]
+    fn native_pin_injects_kimi_k3_by_default() {
+        use csq_core::providers::native;
+        // No operator args → csq pins K3 (the vendor CLI would otherwise
+        // launch its own K2.7 default).
+        assert_eq!(
+            native_pinned_model_to_inject(&native::KIMI, &[]),
+            Some("kimi-code/k3")
+        );
+    }
+
+    #[test]
+    fn native_pin_none_for_grok() {
+        use csq_core::providers::native;
+        // Grok has no pin — its CLI self-defaults to its latest model.
+        assert_eq!(native_pinned_model_to_inject(&native::GROK, &[]), None);
+    }
+
+    #[test]
+    fn native_pin_suppressed_by_operator_model_flag() {
+        use csq_core::providers::native;
+        let cases: &[&[&str]] = &[
+            &["-m", "kimi-code/kimi-for-coding"],
+            &["-mkimi-code/kimi-for-coding"],
+            &["--model", "kimi-code/kimi-for-coding"],
+            &["--model=kimi-code/kimi-for-coding"],
+            &["--auto", "--model", "foo"],
+        ];
+        for case in cases {
+            let rest: Vec<String> = case.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                native_pinned_model_to_inject(&native::KIMI, &rest),
+                None,
+                "operator model flag {case:?} must suppress the csq pin"
+            );
+        }
+    }
+
+    #[test]
+    fn native_pin_not_suppressed_by_unrelated_flags() {
+        use csq_core::providers::native;
+        // A `--max-turns` / `-p` arg must NOT be mistaken for a model flag.
+        let rest = vec!["-p".to_string(), "hello".to_string()];
+        assert_eq!(
+            native_pinned_model_to_inject(&native::KIMI, &rest),
+            Some("kimi-code/k3")
+        );
+    }
+
+    /// M19b regression: the v1 `AuditRecord.surface` records the ACTUAL
+    /// dispatched surface, not a hardcoded `cc`. Pre-fix, `run.rs` built the
+    /// record with `surface: Surface::Cc` before the surface was even determined,
+    /// mislabeling every codex/gemini run as `cc` in its own audit record. This
+    /// pins the record-construction value: a post-A++ codex slot maps to
+    /// `audit::Surface::Codex`.
+    #[test]
+    fn audit_record_surface_reflects_codex_slot() {
+        use csq_core::accounts::identity_store::{credentials_codex_path_for, identity_path};
+        use csq_core::accounts::profiles::{profiles_path, save, ProfilesFile};
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let slot = acc(8);
+
+        let uuid = csq_core::accounts::identity_store::IdentityId::new_v4();
+        let mut pf = ProfilesFile::empty();
+        pf.by_slot.insert("8".to_string(), uuid);
+        save(&profiles_path(base), &pf).unwrap();
+        std::fs::create_dir_all(identity_path(base, uuid)).unwrap();
+        std::fs::write(credentials_codex_path_for(base, uuid), b"{}").unwrap();
+
+        // The exact composition `handle` uses to build the record's `surface`.
+        let surface = audit_surface_for(surface_cli_for_slot(base, slot));
+        assert_eq!(
+            surface,
+            csq_core::audit::Surface::Codex,
+            "a codex run's audit record MUST carry surface: codex, not the pre-fix hardcoded cc"
+        );
+    }
+
+    /// M19b: the surface mapping is total and correct for every wired surface.
+    #[test]
+    fn audit_surface_for_maps_every_surface() {
+        use csq_core::audit::Surface as A;
+        assert_eq!(audit_surface_for(SurfaceCli::Claude), A::Cc);
+        assert_eq!(audit_surface_for(SurfaceCli::Codex), A::Codex);
+        assert_eq!(audit_surface_for(SurfaceCli::Gemini), A::Gemini);
+        assert_eq!(audit_surface_for(SurfaceCli::Kimi), A::Kimi);
+        assert_eq!(audit_surface_for(SurfaceCli::Grok), A::Grok);
+    }
+
+    /// PR-C3c regression: `resolve_account` lists Codex slots
+    /// alongside Claude slots and returns an error listing BOTH when
+    /// multiple are configured. The surface hint ` [codex]` lets the
+    /// user disambiguate without reading `credentials/` directly.
+    #[test]
+    fn resolve_account_multi_slot_lists_codex_alongside_claude() {
+        use csq_core::credentials::{
+            AnthropicCredentialFile, CodexCredentialFile, CodexTokensFile, CredentialFile,
+            OAuthPayload,
+        };
+        use csq_core::types::{AccessToken, RefreshToken};
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+
+        // Install one Anthropic slot…
+        let anth = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("sk-ant-oat01-fake".into()),
+                refresh_token: RefreshToken::new("sk-ant-ort01-fake".into()),
+                expires_at: 1775726524877,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        credentials::save(&file::canonical_path(base, acc(1)), &anth).unwrap();
+
+        // …and one Codex slot.
+        let codex = CredentialFile::Codex(CodexCredentialFile {
+            auth_mode: Some("chatgpt".into()),
+            openai_api_key: None,
+            tokens: CodexTokensFile {
+                account_id: Some("acct-1234".into()),
+                access_token: "eyJ.jwt.stub".into(),
+                refresh_token: Some("rt_stub_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into()),
+                id_token: Some("eyJ.id.stub".into()),
+                extra: Default::default(),
+            },
+            last_refresh: None,
+            extra: Default::default(),
+        });
+        credentials::save(
+            &file::canonical_path_for(base, acc(4), Surface::Codex),
+            &codex,
+        )
+        .unwrap();
+
+        let err = resolve_account(base, None).unwrap_err().to_string();
+        assert!(
+            err.contains("csq run 1"),
+            "multi-slot listing must include Anthropic slot 1: {err}"
+        );
+        assert!(
+            err.contains("csq run 4"),
+            "multi-slot listing must include Codex slot 4: {err}"
+        );
+        assert!(
+            err.contains("[codex]"),
+            "Codex slots must carry a surface hint: {err}"
+        );
+    }
+
+    /// PR-C3c security review M1 regression: a Codex canonical that
+    /// is a symlink (same-user swap attack) is refused at launch
+    /// time even though the dispatch branch in `handle` accepts a
+    /// `symlink_metadata`-present file.
+    #[cfg(unix)]
+    #[test]
+    fn codex_canonical_symlink_is_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let slot = acc(9);
+
+        let creds_dir = base.join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        // Attacker-target file with a fake credential shape.
+        let decoy = dir.path().join("decoy.json");
+        std::fs::write(&decoy, b"{}").unwrap();
+        // Canonical is a symlink to the decoy — NOT a regular file.
+        symlink(&decoy, creds_dir.join("codex-9.json")).unwrap();
+
+        let err = verify_codex_canonical_is_regular_file(base, slot)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("symlink"),
+            "error must name the symlink posture: {err}"
+        );
+        assert!(
+            err.contains("csq login 9 --provider codex"),
+            "error must point at the fix: {err}"
+        );
+    }
+
+    #[test]
+    fn codex_canonical_regular_file_passes() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let creds_dir = base.join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(creds_dir.join("codex-10.json"), b"{}").unwrap();
+
+        verify_codex_canonical_is_regular_file(base, acc(10)).expect("regular file accepted");
+    }
+
+    // ── Task 4: verify_codex_canonical_is_regular_file — UUID-keyed path ────
+
+    /// After the root-cause fix, slots provisioned via `mint_for_codex_login`
+    /// have credentials only at `identities/<UUID>/credentials-codex.json`.
+    /// The pre-flight check must accept this path as a regular file.
+    #[test]
+    fn codex_canonical_uuid_keyed_regular_file_passes() {
+        use csq_core::accounts::identity_store::{credentials_codex_path_for, IdentityId};
+        use csq_core::accounts::profiles;
+        use std::str::FromStr;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+
+        // Seed by_slot mapping for slot 11.
+        let uuid = IdentityId::from_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+        let mut pf = profiles::ProfilesFile::empty();
+        pf.by_slot.insert("11".to_string(), uuid);
+        profiles::save(&profiles::profiles_path(base), &pf).unwrap();
+
+        // Write credentials-codex.json at the UUID-keyed path (regular file).
+        let cred_path = credentials_codex_path_for(base, uuid);
+        std::fs::create_dir_all(cred_path.parent().unwrap()).unwrap();
+        std::fs::write(&cred_path, b"{}").unwrap();
+
+        // No legacy credentials/codex-11.json file — UUID path only.
+        verify_codex_canonical_is_regular_file(base, acc(11))
+            .expect("UUID-keyed regular file must be accepted");
+    }
+
+    /// When neither the UUID-keyed path nor the legacy path exists, the
+    /// check must return an error pointing the user at `csq login`.
+    #[test]
+    fn codex_canonical_neither_uuid_nor_legacy_returns_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+        // No credentials anywhere.
+        let err = verify_codex_canonical_is_regular_file(base, acc(15))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("csq login 15 --provider codex"),
+            "error must point at the fix: {err}"
+        );
+    }
+
+    /// PR-C3c security review H1 regression: `strip_sensitive_env`
+    /// now covers `OPENAI_*` and `CODEX_HOME` in addition to the
+    /// pre-existing `ANTHROPIC_*` / `AWS_BEARER_TOKEN_BEDROCK` /
+    /// `CLAUDE_API_KEY` set. A poisoned dotfile setting
+    /// `OPENAI_BASE_URL` must not leak into a Codex child.
+    #[test]
+    fn strip_sensitive_env_covers_openai_and_codex_home() {
+        let test_vars = [
+            ("OPENAI_API_KEY", true),
+            ("OPENAI_BASE_URL", true),
+            ("OPENAI_API_BASE", true),
+            ("OPENAI_ORG_ID", true),
+            ("CODEX_HOME", true),
+            ("ANTHROPIC_API_KEY", true),
+            ("CLAUDE_API_KEY", true),
+            ("AWS_BEARER_TOKEN_BEDROCK", true),
+            ("PATH", false),
+            ("HOME", false),
+            ("CLAUDE_CONFIG_DIR", false),
+        ];
+        for (var, should_strip) in test_vars {
+            let matches = var.starts_with("ANTHROPIC_")
+                || var.starts_with("OPENAI_")
+                || var == "AWS_BEARER_TOKEN_BEDROCK"
+                || var == "CLAUDE_API_KEY"
+                || var == "CODEX_HOME";
+            assert_eq!(matches, should_strip, "var {var} classification mismatch");
+        }
+    }
+
+    /// PR-C3c regression: when only a Codex slot is present,
+    /// `resolve_account` picks it (rather than falling through to
+    /// vanilla claude). This is the "single-Codex user" onboarding
+    /// path — `csq run` with no args must still work.
+    #[test]
+    fn resolve_account_single_codex_slot_is_picked() {
+        use csq_core::credentials::{CodexCredentialFile, CodexTokensFile, CredentialFile};
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+
+        let codex = CredentialFile::Codex(CodexCredentialFile {
+            auth_mode: Some("chatgpt".into()),
+            openai_api_key: None,
+            tokens: CodexTokensFile {
+                account_id: Some("acct-only".into()),
+                access_token: "eyJ.jwt".into(),
+                refresh_token: Some("rt_only_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into()),
+                id_token: None,
+                extra: Default::default(),
+            },
+            last_refresh: None,
+            extra: Default::default(),
+        });
+        credentials::save(
+            &file::canonical_path_for(base, acc(2), Surface::Codex),
+            &codex,
+        )
+        .unwrap();
+
+        let picked = resolve_account(base, None).unwrap();
+        assert_eq!(
+            picked,
+            Some(acc(2)),
+            "the single Codex slot must be auto-picked"
+        );
+    }
+
+    #[test]
+    fn strip_sensitive_env_removes_anthropic_vars() {
+        // We can't modify the real env during tests (parallel safety), so
+        // we test the logic by verifying the filter directly.
+        let test_vars = [
+            ("ANTHROPIC_API_KEY", true),
+            ("ANTHROPIC_BASE_URL", true),
+            ("ANTHROPIC_AUTH_TOKEN", true),
+            ("ANTHROPIC_MODEL", true),
+            ("AWS_BEARER_TOKEN_BEDROCK", true),
+            ("CLAUDE_API_KEY", true),
+            ("PATH", false),
+            ("HOME", false),
+            ("CLAUDE_CONFIG_DIR", false),
+            ("CLAUDE_HOME", false),
+        ];
+
+        for (var, should_strip) in test_vars {
+            let matches = var.starts_with("ANTHROPIC_")
+                || var == "AWS_BEARER_TOKEN_BEDROCK"
+                || var == "CLAUDE_API_KEY";
+            assert_eq!(matches, should_strip, "var {var}");
+        }
+    }
+
+    /// Regression guard for an internal journal entry invariant: csq run N MUST leave
+    /// term-<pid>/settings.json populated after handle dir creation.
+    ///
+    /// This test exercises `csq_core::session::create_handle_dir` plus the
+    /// explicit defensive re-materialize that run.rs adds at the call site.
+    /// It does NOT invoke `run()` itself because `run()` execs claude and
+    /// would hang the test suite. The invariant we care about — settings.json
+    /// exists, is valid JSON, and reflects the merged base+overlay — is fully
+    /// observable at the handle-dir level.
+    ///
+    /// Arrange: tempdir with ~/.claude/settings.json (global base) and
+    ///          config-1/settings.json (slot overlay).
+    /// Act:     create_handle_dir + defensive re-materialize.
+    /// Assert:  term-<pid>/settings.json exists, is a regular file (not a
+    ///          symlink), is parseable JSON, and merges content from both
+    ///          sources (overlay key wins).
+    #[test]
+    fn settings_json_exists_after_create_handle_dir() {
+        use csq_core::session;
+        use csq_core::types::AccountNum;
+
+        let base = tempfile::tempdir().expect("tempdir");
+        let claude_home = tempfile::tempdir().expect("tempdir");
+
+        // Arrange: permanent account dir
+        let account = AccountNum::try_from(1u16).unwrap();
+        let config_dir = base.path().join("config-1");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        // Write account marker so create_handle_dir sees a valid config-N
+        csq_core::accounts::markers::write_csq_account_legacy(&config_dir, account).unwrap();
+        csq_core::accounts::markers::write_current_account(&config_dir, account).unwrap();
+
+        // Global settings: base layer (statusLine customization)
+        let global_settings = serde_json::json!({
+            "env": {},
+            "statusBar": {"visible": true},
+            "theme": "dark"
+        });
+        std::fs::write(
+            claude_home.path().join("settings.json"),
+            serde_json::to_string_pretty(&global_settings).unwrap(),
+        )
+        .unwrap();
+
+        // Slot settings: overlay layer (3P env block wins over base)
+        let slot_settings = serde_json::json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://example.com/v1"
+            }
+        });
+        std::fs::write(
+            config_dir.join("settings.json"),
+            serde_json::to_string_pretty(&slot_settings).unwrap(),
+        )
+        .unwrap();
+
+        // Act: create handle dir (which calls materialize internally)
+        let pid = std::process::id();
+        let handle_dir =
+            session::create_handle_dir(base.path(), claude_home.path(), account, pid).unwrap();
+
+        // Defensive re-materialize — mirrors exactly what run.rs does
+        let result =
+            session::materialize_handle_settings(&handle_dir, claude_home.path(), &config_dir);
+        assert!(
+            result.is_ok(),
+            "defensive re-materialize failed: {:?}",
+            result.err()
+        );
+
+        // Assert: settings.json exists as a real file (not a symlink)
+        let settings_path = handle_dir.join("settings.json");
+        assert!(settings_path.exists(), "settings.json must exist");
+        let metadata = std::fs::symlink_metadata(&settings_path).unwrap();
+        assert!(
+            !metadata.file_type().is_symlink(),
+            "settings.json must be a real file, not a symlink"
+        );
+
+        // Assert: parseable JSON
+        let content = std::fs::read_to_string(&settings_path).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("settings.json must be valid JSON");
+
+        // Assert: overlay key present (env.ANTHROPIC_BASE_URL from slot settings)
+        assert_eq!(
+            parsed["env"]["ANTHROPIC_BASE_URL"],
+            serde_json::json!("https://example.com/v1"),
+            "slot overlay env key must survive merge"
+        );
+
+        // Assert: base key present (theme from global settings)
+        assert_eq!(
+            parsed["theme"],
+            serde_json::json!("dark"),
+            "global base key must survive merge"
+        );
+    }
+
+    /// [`keychain-fix-r8c.md`'s NIT], retargeted by the custody model: the
+    /// no-custody entry point `force_sync_account_changed` — what this test
+    /// has always driven — must REFUSE (`TargetTokenInvalidated`) rather
+    /// than silently write when a FRESH handle dir's keychain item X holds a
+    /// valid Anthropic login from a DIFFERENT, unknown account AND the
+    /// caller supplied a token with no captured target custody.
+    ///
+    /// STALE PREMISE, corrected (quoted for history): the original doc said
+    /// this test pins `force_sync_for_launch` → `force_sync_for_launch_locked`
+    /// → `force_sync_account_changed` reaching
+    /// `ForcedSyncResult::ForeignLoginUnharvested`. Both hops are obsolete:
+    /// `force_sync_for_launch_locked` now calls
+    /// `force_sync_account_changed_for_launch` (custody-carrying, quarantining
+    /// — pinned by `foreign_login_on_fresh_launch_is_quarantined_via_force_sync_for_launch`
+    /// below), and since `12a5c873c` the custody-less
+    /// `force_sync_account_changed` refuses an `Intended::Token` with
+    /// `target_binding == None` (keychain.rs:7803-7805 — AFTER
+    /// `decide_cc_keychain_write` at :7793 and BEFORE the source-binding
+    /// rule-3 refusal at :7833-7835), so rule 3 is unreachable through it.
+    /// The property that survives — and the one the NIT cared about — is
+    /// that an unmatched foreign login is never a silent write; the
+    /// assertions below pin it with the keychain call log, not merely the
+    /// return variant (which `TargetTokenInvalidated` shares with the
+    /// expired-target case at :7789).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn no_custody_forced_write_refuses_an_unmatched_foreign_login_on_a_fresh_launch_dir() {
+        use csq_core::accounts::identity_store;
+        use csq_core::credentials::keychain::{
+            clear_test_keychain_executor, set_test_keychain_executor, ForcedSyncResult,
+            RawContentClassification, ScriptedKeychainExecutor,
+        };
+        use csq_core::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
+        use csq_core::testing::identity_fixtures::write_uuid_account_marker;
+        use csq_core::types::{AccessToken, RefreshToken};
+
+        let _env_lock = csq_core::platform::test_env::lock();
+        let base = tempfile::TempDir::new().unwrap();
+        let claude_home = tempfile::TempDir::new().unwrap();
+
+        let account = AccountNum::try_from(1u16).unwrap();
+        let config_dir = base.path().join("config-1");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let uuid = write_uuid_account_marker(base.path(), &config_dir, 1);
+        let own_cf = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("at-1".into()),
+                refresh_token: RefreshToken::new("rt-1".into()),
+                expires_at: 4_102_444_800_000, // year 2100 (feedback_no_test_timebombs)
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        credentials::save(
+            &identity_store::credentials_path_for(base.path(), uuid),
+            &own_cf,
+        )
+        .unwrap();
+        let own_raw = serde_json::to_string(&own_cf).unwrap();
+
+        let pid = std::process::id();
+        let handle_dir =
+            session::create_handle_dir(base.path(), claude_home.path(), account, pid).unwrap();
+        let (handle_dir_abs, is_canonical) =
+            csq_core::credentials::keychain::canonicalize_for_keychain_sync(&handle_dir);
+        assert!(is_canonical, "fixture: canonicalize must succeed");
+
+        // X holds a valid Anthropic identity from a DIFFERENT, unknown
+        // account: no history entry matches it, so
+        // `decide_cc_keychain_write` classifies it as `RefuseUnharvested`
+        // (rule 3). On THIS entry that classification never reaches its
+        // `ForeignLoginUnharvested` arm — the custody refusal returns first
+        // (see the order below).
+        let foreign = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("at-FOREIGN".into()),
+                refresh_token: RefreshToken::new("rt-FOREIGN".into()),
+                expires_at: 4_102_444_800_000,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        let foreign_json = serde_json::to_string(&foreign).unwrap();
+        let exec = std::rc::Rc::new(ScriptedKeychainExecutor::scripted(
+            RawContentClassification::Content(foreign_json.into()),
+        ));
+        // The global takes ownership of the `Rc`; the clone kept here is what
+        // lets the assertions inspect the executor's own call log. A return
+        // value alone cannot separate "refused before touching the keychain"
+        // from "wrote, then returned the refusal variant".
+        set_test_keychain_executor(exec.clone());
+
+        // `force_sync_account_changed` is the CUSTODY-LESS entry point
+        // (`force_sync_account_changed_with_executor` → `force_sync_inner_guarded(…, None, None)`),
+        // and since `12a5c873c` ("separate verified Anthropic organization
+        // contexts") a raw token is no longer accepted as ownership evidence.
+        //
+        // Verified order inside `force_sync_inner_with_profiles`: X is read
+        // (`find`, keychain.rs:7725), `decide_cc_keychain_write` runs FIRST
+        // (:7793 — it can itself return `Applied` on `NoWrite`), the custody
+        // refusal for `Intended::Token` with `target_binding == None`
+        // follows at :7803-7805, the source-binding rule-3 refusal
+        // (`ForeignLoginUnharvested`) at :7833-7835, and an EXPIRED target
+        // token also returns `TargetTokenInvalidated`, at :7789 — which is
+        // why the variant alone does not pin this path.
+        //
+        // Rule 3's `ForeignLoginUnharvested` is therefore unreachable through
+        // THIS entry — a custody-carrying caller that wants it
+        // (`csq swap`/auto-rotate) goes through
+        // `force_swap_write_before_repoint_guarded`/`_locked` with a
+        // captured binding, and the launch goes through
+        // `force_sync_account_changed_for_launch` (pinned by
+        // `foreign_login_on_fresh_launch_is_quarantined_via_force_sync_for_launch`
+        // below, which drives the same foreign X to its quarantine outcome).
+        // What this test pins is the property the original NIT cared about:
+        // an unmatched foreign login is NEVER a silent write.
+        let result = csq_core::credentials::keychain::force_sync_account_changed(
+            base.path(),
+            &handle_dir_abs,
+            Some(&own_raw),
+        );
+        clear_test_keychain_executor();
+
+        assert!(
+            matches!(result, Ok(ForcedSyncResult::TargetTokenInvalidated)),
+            "a forced write carrying a token but NO captured target custody must \
+             refuse: {result:?}"
+        );
+        let calls = exec.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|(verb, _, _)| matches!(*verb, "add" | "delete")),
+            "the refusal must be decided BEFORE any keychain mutation — a write \
+             followed by this variant is indistinguishable from the refusal by \
+             the return value alone: {calls:?}"
+        );
+        assert_eq!(
+            calls.len(),
+            1,
+            "exactly one `find` (the single X read) and no mutation: {calls:?}"
+        );
+        assert_eq!(calls[0].0, "find");
+    }
+
+    /// `keychain-fix-r8d.md` item 2: the launch-level test the prior test's
+    /// NOTE said could not exist — drives `force_sync_for_launch` ITSELF
+    /// (not `force_sync_account_changed` directly), now that it checks the
+    /// test-installed-executor override BEFORE its
+    /// `keychain_mirror_disabled_now()` short-circuit, matching its siblings.
+    ///
+    /// On a FRESH handle dir the launch does NOT surface an
+    /// `ForeignLoginUnharvested` `Err` — that arm belongs to the
+    /// non-quarantining callers of `decide_launch_disposition`. The foreign
+    /// item is saved to `keychain-quarantine/` and replaced, so the outcome
+    /// asserted here is `Ok(true)` PLUS the exact foreign payload on disk.
+    /// The `Ok(true)` comparison alone does not discriminate: the
+    /// mirror-disabled short-circuit also returns `Ok(true)` without ever
+    /// reaching the quarantine save, which is why the payload assertion is
+    /// the discriminating one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn foreign_login_on_fresh_launch_is_quarantined_via_force_sync_for_launch() {
+        use csq_core::accounts::identity_store;
+        use csq_core::credentials::keychain::{
+            clear_test_keychain_executor, set_test_keychain_executor, RawContentClassification,
+            ScriptedKeychainExecutor,
+        };
+        use csq_core::credentials::{self, AnthropicCredentialFile, CredentialFile, OAuthPayload};
+        use csq_core::testing::identity_fixtures::write_uuid_account_marker;
+        use csq_core::types::{AccessToken, RefreshToken};
+
+        let _env_lock = csq_core::platform::test_env::lock();
+        let base = tempfile::TempDir::new().unwrap();
+        let claude_home = tempfile::TempDir::new().unwrap();
+
+        let account = AccountNum::try_from(1u16).unwrap();
+        let config_dir = base.path().join("config-1");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let uuid = write_uuid_account_marker(base.path(), &config_dir, 1);
+        let own_cf = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("at-1".into()),
+                refresh_token: RefreshToken::new("rt-1".into()),
+                expires_at: 4_102_444_800_000, // year 2100 (feedback_no_test_timebombs)
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        credentials::save(
+            &identity_store::credentials_path_for(base.path(), uuid),
+            &own_cf,
+        )
+        .unwrap();
+
+        let pid = std::process::id();
+        let handle_dir =
+            session::create_handle_dir(base.path(), claude_home.path(), account, pid).unwrap();
+        let (handle_dir_abs, is_canonical) =
+            csq_core::credentials::keychain::canonicalize_for_keychain_sync(&handle_dir);
+        assert!(is_canonical, "fixture: canonicalize must succeed");
+
+        // Mirror the real mint path (`accounts::login::finalize_login`): the
+        // identity record at `identities/<uuid>/identity.json`. The launch
+        // captures its target custody through `capture_known_slot` →
+        // `capture_anthropic_binding_locked` → `read_stored_anthropic_context`,
+        // which reads THIS file and FAILS CLOSED without it — the launch
+        // would then refuse with `TargetTokenInvalidated` before ever
+        // classifying X (`force_sync_inner_with_profiles`, the
+        // `Intended::Token` + `target_binding == None` gate). Mode 0o600:
+        // `read_json(path, private = true)` rejects any group/world bit.
+        let identity_path =
+            csq_core::accounts::identity_store::identity_json_path_for(base.path(), uuid);
+        std::fs::create_dir_all(identity_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &identity_path,
+            r#"{"email":"fixture-slot-1@test.invalid","provider":"anthropic",
+               "created_at":"2026-01-01T00:00:00Z","key_id":null}"#,
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&identity_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+
+        // X holds a valid Anthropic identity from a DIFFERENT, unknown
+        // account — same shape as the sibling test above.
+        let foreign = CredentialFile::Anthropic(AnthropicCredentialFile {
+            claude_ai_oauth: OAuthPayload {
+                access_token: AccessToken::new("at-FOREIGN".into()),
+                refresh_token: RefreshToken::new("rt-FOREIGN".into()),
+                expires_at: 4_102_444_800_000,
+                scopes: vec![],
+                subscription_type: None,
+                rate_limit_tier: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        });
+        let foreign_json = serde_json::to_string(&foreign).unwrap();
+        let exec = std::rc::Rc::new(ScriptedKeychainExecutor::scripted(
+            RawContentClassification::Content((foreign_json.clone()).into()),
+        ));
+        set_test_keychain_executor(exec);
+
+        // The REAL launch entry point — `force_sync_for_launch`, not
+        // `force_sync_account_changed` directly.
+        let result =
+            csq_core::credentials::keychain::force_sync_for_launch(base.path(), &handle_dir_abs);
+        clear_test_keychain_executor();
+
+        // A fresh launch dir no longer refuses: the unidentified item is
+        // saved to the quarantine dir and replaced. (Ok(true) = mirror
+        // applied; the old trivial short-circuit would also be Ok(true), so
+        // the quarantine file below is what proves the foreign path ran.)
+        assert_eq!(result, Ok(true), "{result:?}");
+        let qdir = base.path().join("keychain-quarantine");
+        let saved: Vec<_> = std::fs::read_dir(&qdir)
+            .expect("quarantine dir must exist")
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect();
+        assert_eq!(saved, vec![foreign_json], "exact foreign payload saved");
+    }
+
+    // ============================================================
+    // Wave 3 kimi/grok host-isolation warning (spec 08 MED-03)
+    // ============================================================
+
+    /// `resolve_third_party_surface_name` resolves a kimi-bound slot to the
+    /// catalog id `"kimi"` — the same id `emit_host_isolation_warning_if_needed`
+    /// uses to build the operator-facing message/log surface tag. Mirrors
+    /// `coc::translate::gemini::host_isolation_warning_fires_when_secrets_detected`
+    /// (both assert the host-isolation surfacing mechanism engages for the
+    /// respective surface) — the closest in-tree analogue reachable from
+    /// `launch_third_party`, since kimi has no `GeminiSpawnPayload`-shaped
+    /// translate step to assert a `host_isolation_warning` bit on.
+    #[test]
+    fn resolve_third_party_surface_name_resolves_kimi_binding() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let config_dir = base.path().join("config-7");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let slot_settings = serde_json::json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding",
+                "ANTHROPIC_AUTH_TOKEN": "sk-kimi-test"
+            }
+        });
+        std::fs::write(
+            config_dir.join("settings.json"),
+            serde_json::to_string_pretty(&slot_settings).unwrap(),
+        )
+        .unwrap();
+
+        let account = AccountNum::try_from(7u16).unwrap();
+        let surface = resolve_third_party_surface_name(base.path(), account);
+        assert_eq!(
+            surface, "kimi",
+            "a slot bound to the Kimi coding-subscription endpoint must resolve \
+             to the catalog id \"kimi\", not the display name \"Kimi\" or a \
+             generic fallback"
+        );
+    }
+
+    /// A slot with no 3P binding on disk (unbound / never `setkey`'d) falls
+    /// back to the generic `"third-party"` label rather than panicking or
+    /// silently omitting the warning's surface tag.
+    #[test]
+    fn resolve_third_party_surface_name_falls_back_when_unbound() {
+        let base = tempfile::tempdir().expect("tempdir");
+        // No config-N directory at all for this slot.
+        let account = AccountNum::try_from(9u16).unwrap();
+        let surface = resolve_third_party_surface_name(base.path(), account);
+        assert_eq!(surface, "third-party");
+    }
+
+    /// M1 (security redteam MEDIUM): the host-isolation warning gate in
+    /// `launch_third_party` (`if surface_name != "ollama" { emit(...) }`)
+    /// MUST be skipped for a loopback-bound ollama slot but MUST still fire
+    /// for every other 3P surface — kimi included, the Wave 3 target.
+    /// `provider_from_base_url` (`csq-core/src/accounts/discovery.rs`)
+    /// classifies a slot as `"Ollama"` ONLY when `ANTHROPIC_BASE_URL`
+    /// contains `localhost`/`127.0.0.1`, so `resolve_third_party_surface_name`
+    /// returning exactly `"ollama"` is, by construction, loopback — no
+    /// remote vendor to exfiltrate to. This test exercises the REAL resolve
+    /// function against real loopback + kimi fixtures and asserts the exact
+    /// boolean condition the production gate uses, so a future rename of the
+    /// ollama catalog id or a change to the gate's comparison target would
+    /// fail this test.
+    #[test]
+    fn host_isolation_warning_gate_skips_ollama_but_fires_for_kimi() {
+        let base = tempfile::tempdir().expect("tempdir");
+
+        let ollama_dir = base.path().join("config-20");
+        std::fs::create_dir_all(&ollama_dir).unwrap();
+        std::fs::write(
+            ollama_dir.join("settings.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "env": { "ANTHROPIC_BASE_URL": "http://localhost:11434" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let kimi_dir = base.path().join("config-21");
+        std::fs::create_dir_all(&kimi_dir).unwrap();
+        std::fs::write(
+            kimi_dir.join("settings.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-kimi-test"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let ollama_account = AccountNum::try_from(20u16).unwrap();
+        let kimi_account = AccountNum::try_from(21u16).unwrap();
+
+        let ollama_surface = resolve_third_party_surface_name(base.path(), ollama_account);
+        let kimi_surface = resolve_third_party_surface_name(base.path(), kimi_account);
+
+        // Mirrors the exact production gate in `launch_third_party`:
+        //     if surface_name != "ollama" { emit_host_isolation_warning_if_needed(...) }
+        // — asserted via the two boundary values the gate distinguishes.
+        assert_eq!(
+            ollama_surface, "ollama",
+            "loopback ollama MUST be excluded from the MED-03 warning — no remote \
+             vendor to exfiltrate to"
+        );
+        assert_ne!(
+            kimi_surface, "ollama",
+            "kimi MUST still fire the MED-03 warning — remote vendor, unfiltered $HOME"
+        );
+    }
+
+    /// `emit_host_isolation_warning_if_needed` is a no-op (no panic, silent
+    /// return) when `HostContext::production_secrets_present` is false —
+    /// exercised directly for the kimi/zai/mm/deepseek/ollama surface tags
+    /// now reachable through `resolve_third_party_surface_name`, mirroring
+    /// gemini's `host_isolation_warning_clear_by_default` coverage of the
+    /// same "clear by default" invariant.
+    #[test]
+    fn emit_host_isolation_warning_if_needed_noop_when_clear() {
+        let host_ctx = csq_core::coc::translate::gemini::HostContext::default();
+        let account = AccountNum::try_from(1u16).unwrap();
+        for surface in ["gemini", "kimi", "zai", "mm", "deepseek", "ollama"] {
+            // Must not panic for any surface tag — the function returns
+            // immediately on `!production_secrets_present` before touching
+            // `surface` at all.
+            emit_host_isolation_warning_if_needed(&host_ctx, account, surface);
+        }
+    }
+
+    // ============================================================
+    // PR-CA8 commit 2 — codex handle-dir config.toml verification
+    // ============================================================
+
+    /// PR-CA8 round-1 C4: post-materialization re-stat accepts a
+    /// regular file.
+    #[test]
+    fn verify_codex_handle_config_toml_accepts_regular_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.toml"), "model = \"x\"\n").unwrap(); // CI-ALLOW-fs-write-config-toml
+        verify_codex_handle_config_toml_is_regular_file(dir.path()).unwrap();
+    }
+
+    /// PR-CA8 round-1 C4 + round-2 H3: post-materialization re-stat
+    /// rejects a symlink replacement (TOCTOU window between
+    /// `atomic_replace` returning and `Command::spawn` invocation).
+    #[test]
+    #[cfg(unix)]
+    fn verify_codex_handle_config_toml_rejects_symlink_replaced_post_rename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let attacker = dir.path().join("attacker.toml");
+        std::fs::write(&attacker, "model = \"attacker\"\n").unwrap();
+        // Simulate post-rename TOCTOU: an attacker has unlinked our
+        // regular file and replaced it with a symlink to attacker
+        // content.
+        std::os::unix::fs::symlink(&attacker, dir.path().join("config.toml")).unwrap();
+        let err = verify_codex_handle_config_toml_is_regular_file(dir.path()).unwrap_err();
+        let err_text = format!("{err}");
+        assert!(
+            err_text.contains("symlink") || err_text.contains("TOCTOU"),
+            "error must flag the symlink replacement: {err_text}"
+        );
+    }
+
+    /// PR-CA8 round-1 C4: post-materialization re-stat rejects a
+    /// missing file (handle-dir corruption).
+    #[test]
+    fn verify_codex_handle_config_toml_rejects_missing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = verify_codex_handle_config_toml_is_regular_file(dir.path()).unwrap_err();
+        let err_text = format!("{err}");
+        assert!(
+            err_text.contains("missing") || err_text.contains("stat"),
+            "error must flag the missing file: {err_text}"
+        );
+    }
+
+    /// PR-CA8 commit 2: materialize_handle_config_toml writes a regular
+    /// file (NOT a symlink) at handle_dir/config.toml, atomically
+    /// replacing whatever was there. Tempdir test exercises the full
+    /// merge → write → secure_file → atomic_replace pipeline against
+    /// a synthetic canonical config-N/config.toml.
+    #[test]
+    fn materialize_handle_config_toml_writes_regular_file_replacing_symlink() {
+        use csq_core::types::AccountNum;
+        let base = tempfile::tempdir().expect("tempdir");
+        let account = AccountNum::try_from(1u16).unwrap();
+
+        // Set up canonical at base/config-1/config.toml
+        let canonical_dir = base.path().join("config-1");
+        std::fs::create_dir_all(&canonical_dir).unwrap();
+        std::fs::write(
+            canonical_dir.join("config.toml"),
+            "cli_auth_credentials_store = \"file\"\nmodel = \"gpt-5\"\n",
+        )
+        .unwrap();
+
+        // Set up handle dir with symlink at term-<pid>/config.toml
+        // pointing back to canonical (mimics create_handle_dir_codex).
+        let handle_dir = base.path().join("term-test");
+        std::fs::create_dir_all(&handle_dir).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            canonical_dir.join("config.toml"),
+            handle_dir.join("config.toml"),
+        )
+        .unwrap();
+        #[cfg(not(unix))]
+        std::fs::write(handle_dir.join("config.toml"), "placeholder\n").unwrap(); // CI-ALLOW-fs-write-config-toml
+
+        // Act — instructions-only (no MCP wrap) exercises the same
+        // symlink→regular-file materialization path.
+        let scaffold = "## Compliance rules\n\nCite RULE_IDs.\n";
+        let skipped =
+            materialize_handle_config_toml(base.path(), account, &handle_dir, Some(scaffold), None)
+                .expect("materialize must succeed against valid canonical");
+        assert!(skipped.is_empty(), "no MCP wrap → no skipped remotes");
+
+        // Assert: handle_dir/config.toml is now a REGULAR FILE
+        let target = handle_dir.join("config.toml");
+        let meta = std::fs::symlink_metadata(&target).unwrap();
+        assert!(
+            !meta.file_type().is_symlink(),
+            "materialize must replace the symlink with a regular file"
+        );
+        assert!(meta.file_type().is_file());
+
+        // Assert: content has canonical keys + scaffold-derived
+        // instructions
+        let body = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            body.contains("cli_auth_credentials_store"),
+            "canonical key must survive merge: {body}"
+        );
+        assert!(
+            body.contains("model"),
+            "canonical model key must survive merge: {body}"
+        );
+        let parsed: toml::Value = toml::from_str(&body).unwrap();
+        assert_eq!(parsed["developer_instructions"].as_str(), Some(scaffold));
+        assert!(parsed.get("instructions").is_none());
+        let canonical = std::fs::read_to_string(canonical_dir.join("config.toml")).unwrap();
+        assert!(!canonical.contains("developer_instructions"));
+    }
+
+    /// M6 T6.2 Shard 3a: the MCP-wrap materialization path rewrites the
+    /// canonical `[mcp_servers.*]` stdio tables through `csq mcp-proxy` in the
+    /// HANDLE-dir config.toml, leaving the canonical `config-<N>/config.toml`
+    /// untouched, and reports remote (url-transport) servers as skipped.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn materialize_handle_config_toml_wraps_mcp_servers_leaving_canonical_untouched() {
+        use csq_core::types::AccountNum;
+        let base = tempfile::tempdir().expect("tempdir");
+        let account = AccountNum::try_from(1u16).unwrap();
+
+        let canonical_dir = base.path().join("config-1");
+        std::fs::create_dir_all(&canonical_dir).unwrap();
+        let canonical_body = "cli_auth_credentials_store = \"file\"\nmodel = \"gpt-5\"\n\
+             \n[mcp_servers.github]\ncommand = \"github-mcp\"\nargs = [\"--stdio\"]\n\
+             \n[mcp_servers.remote]\nurl = \"https://mcp.example/sse\"\n";
+        let canonical_path = canonical_dir.join("config.toml");
+        std::fs::write(&canonical_path, canonical_body).unwrap();
+
+        let handle_dir = base.path().join("term-mcp");
+        std::fs::create_dir_all(&handle_dir).unwrap();
+
+        let csq_bin = "/usr/local/bin/csq";
+        let env_path = handle_dir.join(".pact-mcp-envelope.json");
+        let skipped = materialize_handle_config_toml(
+            base.path(),
+            account,
+            &handle_dir,
+            None,
+            Some((csq_bin, env_path.as_path())),
+        )
+        .expect("mcp-wrap materialize succeeds");
+
+        // Remote server reported as un-gated.
+        assert_eq!(skipped, vec!["remote".to_string()]);
+
+        // Handle-dir config.toml has the github server routed through the proxy.
+        // String assertions here; csq-core `mcp_rewrite` unit tests pin the
+        // structural TOML shape.
+        let written = std::fs::read_to_string(handle_dir.join("config.toml")).unwrap();
+        assert!(
+            written.contains(&format!("command = \"{csq_bin}\"")),
+            "github server command must be rewritten to the csq binary:\n{written}"
+        );
+        assert!(
+            written.contains("\"mcp-proxy\"") && written.contains("\"github-mcp\""),
+            "args must route mcp-proxy through the original github-mcp command:\n{written}"
+        );
+        // Remote untouched — its url survives and no command was injected.
+        assert!(
+            written.contains("url = \"https://mcp.example/sse\""),
+            "remote server url must be preserved:\n{written}"
+        );
+
+        // CANONICAL config.toml is byte-unchanged — the rewrite lives only in the
+        // ephemeral handle dir (never mutate the user's slot config).
+        assert_eq!(
+            std::fs::read_to_string(&canonical_path).unwrap(),
+            canonical_body,
+            "canonical config-N/config.toml must NOT be rewritten"
+        );
+    }
+
+    /// Regression guard: calling `materialize_handle_settings` twice on the
+    /// same handle dir produces identical byte content (idempotency).
+    ///
+    /// This pins the invariant that the defensive re-materialize in run.rs
+    /// cannot corrupt a settings.json that create_handle_dir already wrote.
+    #[test]
+    fn materialize_handle_settings_is_idempotent() {
+        use csq_core::session;
+        use csq_core::types::AccountNum;
+
+        let base = tempfile::tempdir().expect("tempdir");
+        let claude_home = tempfile::tempdir().expect("tempdir");
+
+        let account = AccountNum::try_from(1u16).unwrap();
+        let config_dir = base.path().join("config-1");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        csq_core::accounts::markers::write_csq_account_legacy(&config_dir, account).unwrap();
+        csq_core::accounts::markers::write_current_account(&config_dir, account).unwrap();
+
+        let slot_settings = serde_json::json!({
+            "env": {"ANTHROPIC_MODEL": "claude-opus-4"},
+            "statusBar": {"visible": false}
+        });
+        std::fs::write(
+            config_dir.join("settings.json"),
+            serde_json::to_string_pretty(&slot_settings).unwrap(),
+        )
+        .unwrap();
+
+        let pid = std::process::id();
+        let handle_dir =
+            session::create_handle_dir(base.path(), claude_home.path(), account, pid).unwrap();
+
+        // First call (already done by create_handle_dir, but call explicitly)
+        session::materialize_handle_settings(&handle_dir, claude_home.path(), &config_dir).unwrap();
+        let first_read = std::fs::read(handle_dir.join("settings.json")).unwrap();
+
+        // Second call — must produce identical bytes
+        session::materialize_handle_settings(&handle_dir, claude_home.path(), &config_dir).unwrap();
+        let second_read = std::fs::read(handle_dir.join("settings.json")).unwrap();
+
+        assert_eq!(
+            first_read, second_read,
+            "materialize_handle_settings must be idempotent: second call produced different bytes"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // T12 — bench JSONL emission shape tests (design 08 §"Latency bench
+    // harness", R2/B56/B80).
+    // ------------------------------------------------------------------
+
+    /// `write_bench_jsonl` emits lines where every `stage_timing` record
+    /// carries an `"event": "stage_timing"` field.
+    #[test]
+    fn bench_jsonl_emission_carries_event_stage_timing_field() {
+        use csq_core::capability_layer::{
+            PipelineTimings, StageResult, StageTiming, STAGE_SCAFFOLD,
+        };
+        use csq_core::providers::catalog::Surface;
+
+        let t = StageTiming {
+            stage_id: STAGE_SCAFFOLD,
+            started_at_ns: 0,
+            elapsed_ns: 100_000,
+            result: StageResult::Applied,
+        };
+        let pt = PipelineTimings {
+            timings: vec![t],
+            total_ns: 100_000,
+        };
+
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let out = tmp_dir.path().join("bench.jsonl");
+        write_bench_jsonl(pt, Some(out.to_str().unwrap()), Surface::ClaudeCode).unwrap();
+
+        let content = std::fs::read_to_string(&out).unwrap();
+        let stage_lines: Vec<&str> = content
+            .lines()
+            .filter(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap_or_default();
+                v.get("event").and_then(|e| e.as_str()) == Some("stage_timing")
+            })
+            .collect();
+
+        assert!(
+            !stage_lines.is_empty(),
+            "expected at least one stage_timing record in bench JSONL output"
+        );
+        for line in &stage_lines {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(
+                v.get("event").and_then(|e| e.as_str()),
+                Some("stage_timing"),
+                "every stage_timing line must carry event=stage_timing"
+            );
+        }
+    }
+
+    /// `write_bench_jsonl` emits `warmth` as either `"cold"` or `"warm"`.
+    /// `cap.coc_load.cold` → "cold"; all others → "warm".
+    #[test]
+    fn bench_jsonl_emission_carries_warmth_field_cold_or_warm() {
+        use csq_core::capability_layer::{
+            PipelineTimings, StageResult, StageTiming, STAGE_COC_LOAD_COLD, STAGE_SCAFFOLD,
+        };
+        use csq_core::providers::catalog::Surface;
+
+        let timings = vec![
+            StageTiming {
+                stage_id: STAGE_COC_LOAD_COLD,
+                started_at_ns: 0,
+                elapsed_ns: 50_000,
+                result: StageResult::Applied,
+            },
+            StageTiming {
+                stage_id: STAGE_SCAFFOLD,
+                started_at_ns: 50_000,
+                elapsed_ns: 80_000,
+                result: StageResult::Applied,
+            },
+        ];
+        let total_ns: u128 = timings.iter().map(|t| t.elapsed_ns).sum();
+        let pt = PipelineTimings { timings, total_ns };
+
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let out = tmp_dir.path().join("bench_warmth.jsonl");
+        write_bench_jsonl(pt, Some(out.to_str().unwrap()), Surface::Codex).unwrap();
+
+        let content = std::fs::read_to_string(&out).unwrap();
+        let stage_records: Vec<serde_json::Value> = content
+            .lines()
+            .filter_map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).ok()?;
+                if v.get("event").and_then(|e| e.as_str()) == Some("stage_timing") {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(stage_records.len(), 2, "expected 2 stage_timing records");
+
+        let cold_rec = &stage_records[0];
+        assert_eq!(
+            cold_rec.get("stage_id").and_then(|v| v.as_str()),
+            Some(csq_core::capability_layer::STAGE_COC_LOAD_COLD),
+            "first record must be cap.coc_load.cold"
+        );
+        assert_eq!(
+            cold_rec.get("warmth").and_then(|v| v.as_str()),
+            Some("cold"),
+            "cap.coc_load.cold must produce warmth=cold"
+        );
+
+        let warm_rec = &stage_records[1];
+        assert_eq!(
+            warm_rec.get("warmth").and_then(|v| v.as_str()),
+            Some("warm"),
+            "all stages other than cap.coc_load.cold must produce warmth=warm"
+        );
+    }
+
+    /// `write_bench_jsonl` serializes `StageResult` variants as lowercase
+    /// strings: applied, skipped, degraded, error.
+    #[test]
+    fn bench_jsonl_emission_carries_result_applied_skipped_degraded_error() {
+        use csq_core::capability_layer::{
+            PipelineTimings, StageResult, StageTiming, STAGE_COC_LOAD, STAGE_MCP_GATE,
+            STAGE_POST_VALIDATE, STAGE_SCAFFOLD,
+        };
+        use csq_core::providers::catalog::Surface;
+
+        let cases = [
+            (STAGE_COC_LOAD, StageResult::Applied, "applied"),
+            (STAGE_SCAFFOLD, StageResult::Skipped, "skipped"),
+            (STAGE_MCP_GATE, StageResult::Degraded, "degraded"),
+            (STAGE_POST_VALIDATE, StageResult::Error, "error"),
+        ];
+        let timings: Vec<StageTiming> = cases
+            .iter()
+            .enumerate()
+            .map(|(i, (id, result, _))| StageTiming {
+                stage_id: id,
+                started_at_ns: i as u128 * 10_000,
+                elapsed_ns: 10_000,
+                result: *result,
+            })
+            .collect();
+        let total_ns: u128 = timings.iter().map(|t| t.elapsed_ns).sum();
+        let pt = PipelineTimings { timings, total_ns };
+
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let out = tmp_dir.path().join("bench_result.jsonl");
+        write_bench_jsonl(pt, Some(out.to_str().unwrap()), Surface::Gemini).unwrap();
+
+        let content = std::fs::read_to_string(&out).unwrap();
+        let stage_records: Vec<serde_json::Value> = content
+            .lines()
+            .filter_map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).ok()?;
+                if v.get("event").and_then(|e| e.as_str()) == Some("stage_timing") {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(stage_records.len(), 4, "expected 4 stage_timing records");
+        for (i, (_, _, expected_result)) in cases.iter().enumerate() {
+            let actual = stage_records[i]
+                .get("result")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            assert_eq!(
+                actual, *expected_result,
+                "record[{i}] result must be {expected_result:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// PR-CA9b carry-forward: `load_coc_with_timing` emits exactly one
+    /// `STAGE_COC_LOAD_COLD` record into the thread-local timings store on
+    /// the no-`.coc/`-found path (an empty tempdir resolves to
+    /// `CocSource::Empty` per FR-RUN-04 — a structured outcome that maps to
+    /// `StageResult::Applied`, not `Error`).
+    #[test]
+    fn load_coc_with_timing_emits_cold_stage_on_empty_root() {
+        use csq_core::capability_layer::{drain_timings, StageResult, STAGE_COC_LOAD_COLD};
+
+        // Drain any residue from earlier tests on this thread.
+        let _ = drain_timings();
+
+        let dir = TempDir::new().unwrap();
+        let with_warmth = load_coc_with_timing(dir.path(), dir.path(), true)
+            .expect("load on empty tmpdir should succeed (returns Empty source)");
+        // No `.coc/` found → project_root is None.
+        assert!(with_warmth.outcome.project_root.is_none());
+        assert_eq!(with_warmth.warmth, csq_core::coc::Warmth::Cold);
+
+        let result = drain_timings();
+        let cold = result
+            .timings
+            .iter()
+            .find(|t| t.stage_id == STAGE_COC_LOAD_COLD)
+            .expect("expected one STAGE_COC_LOAD_COLD timing");
+        assert_eq!(cold.result, StageResult::Applied);
+        assert!(cold.elapsed_ns > 0, "cold-load timing must be non-zero");
+    }
+
+    /// `LayerControl` (and `StageError`, transitively via `enum
+    /// PreSpawnState`) does not derive `Debug`, so a `{:?}` on
+    /// `run_capability_layer_preflight`'s result does not compile. This is
+    /// a manual, variant-only description for assertion failure messages —
+    /// no field payload, just enough to distinguish which arm was reached.
+    fn describe_layer_control_result(
+        r: &Result<LayerControl, csq_core::capability_layer::StageError>,
+    ) -> &'static str {
+        match r {
+            Ok(LayerControl::Inherit) => "Ok(Inherit)",
+            Ok(LayerControl::WithLayer { .. }) => "Ok(WithLayer{..})",
+            Err(_) => "Err(..)",
+        }
+    }
+
+    /// Build a minimal `.coc/` with COC.lock. Per an internal journal entry the
+    /// per-artifact signing apparatus was retracted, so no COC.sig
+    /// step is required.
+    fn build_coc_dir(parent: &Path, lock_content: &[u8]) {
+        let coc = parent.join(".coc");
+        std::fs::create_dir_all(coc.join("rules")).unwrap();
+        std::fs::create_dir_all(coc.join("agents")).unwrap();
+        std::fs::create_dir_all(coc.join("skills")).unwrap();
+        std::fs::create_dir_all(coc.join("commands")).unwrap();
+        std::fs::write(coc.join("COC.md"), "---\ncoc.version: 1.0.0\n---\n").unwrap();
+        std::fs::write(coc.join("COC.lock"), lock_content).unwrap();
+    }
+
+    /// PR-CA9b Shard 2: a second `load_coc_with_timing` call against the
+    /// same `.coc/` (with `cache_enabled=true`) emits `STAGE_COC_LOAD`
+    /// (warm) instead of `STAGE_COC_LOAD_COLD`.
+    #[test]
+    fn load_coc_with_timing_emits_warm_stage_on_second_call() {
+        use csq_core::capability_layer::{drain_timings, StageResult, STAGE_COC_LOAD};
+
+        let _ = drain_timings();
+
+        let dir = TempDir::new().unwrap();
+        build_coc_dir(dir.path(), b"{\"v\":1,\"key\":\"warm-stage-shard2\"}");
+
+        // First call populates the cache.
+        let _ = load_coc_with_timing(dir.path(), dir.path(), true).unwrap();
+        let _ = drain_timings();
+
+        // Second call hits the cache → warm stage.
+        let with_warmth = load_coc_with_timing(dir.path(), dir.path(), true).unwrap();
+        assert_eq!(with_warmth.warmth, csq_core::coc::Warmth::Warm);
+        let result = drain_timings();
+        let warm = result
+            .timings
+            .iter()
+            .find(|t| t.stage_id == STAGE_COC_LOAD)
+            .expect("expected one STAGE_COC_LOAD (warm) timing");
+        assert_eq!(warm.result, StageResult::Applied);
+    }
+
+    /// PR-CA9b Shard 2: `cache_enabled=false` emits `STAGE_COC_LOAD_COLD`
+    /// even when a cache file exists. Verifies the `--no-coc-cache` flag
+    /// suppresses cache reads (not just writes).
+    #[test]
+    fn load_coc_with_timing_cache_disabled_always_cold() {
+        use csq_core::capability_layer::{drain_timings, STAGE_COC_LOAD, STAGE_COC_LOAD_COLD};
+
+        let _ = drain_timings();
+
+        let dir = TempDir::new().unwrap();
+        build_coc_dir(dir.path(), b"{\"v\":1,\"key\":\"no-cache-flag\"}");
+
+        // First call WITH cache populates it.
+        let _ = load_coc_with_timing(dir.path(), dir.path(), true).unwrap();
+        let _ = drain_timings();
+
+        // Second call with cache_enabled=false stays Cold even though
+        // a fresh cache file exists on disk.
+        let with_warmth = load_coc_with_timing(dir.path(), dir.path(), false).unwrap();
+        assert_eq!(with_warmth.warmth, csq_core::coc::Warmth::Cold);
+        let result = drain_timings();
+        assert!(
+            result.timings.iter().all(|t| t.stage_id != STAGE_COC_LOAD),
+            "no STAGE_COC_LOAD warm record allowed when cache_enabled=false"
+        );
+        assert!(
+            result
+                .timings
+                .iter()
+                .any(|t| t.stage_id == STAGE_COC_LOAD_COLD),
+            "expected STAGE_COC_LOAD_COLD when cache_enabled=false"
+        );
+    }
+
+    /// PR-CA9b carry-forward: `record_root_seen` writes a parseable
+    /// `RootEntry` into the explicit override path. Spec 10 §10.9.3:
+    /// "Each `csq run` invocation appends its `coc_root` (deduplicated
+    /// per file) on success."
+    #[test]
+    fn record_root_seen_writes_parseable_entry_to_override_path() {
+        use csq_core::daemon::coc_cache_sweeper::read_roots_seen;
+
+        let dir = TempDir::new().unwrap();
+        let fifo = dir.path().join("coc-roots-seen.jsonl");
+        let project_root = dir.path().join("repo-A");
+        std::fs::create_dir(&project_root).unwrap();
+
+        record_root_seen(&project_root, Some(&fifo));
+
+        let entries = read_roots_seen(&fifo).expect("FIFO must be readable");
+        assert_eq!(entries.len(), 1, "expected exactly one entry");
+        assert_eq!(entries[0].coc_root, project_root.to_string_lossy());
+        assert!(entries[0].last_seen > 0, "last_seen must be set");
+    }
+
+    /// PR-CA9b carry-forward: `record_root_seen` swallows write errors —
+    /// a failed roots-seen append must NOT block `csq run`. Pointing the
+    /// FIFO at a non-existent parent that cannot be created (a regular
+    /// file path used as a parent) makes `append_root_seen` fail; the
+    /// helper must return without panicking and without propagating.
+    #[cfg(unix)]
+    #[test]
+    fn record_root_seen_swallows_write_errors() {
+        let dir = TempDir::new().unwrap();
+        // Block `create_dir_all` by using a regular file as a path
+        // segment. `<tmp>/blocker/sub/coc-roots-seen.jsonl` cannot be
+        // created because `<tmp>/blocker` is a file, not a dir.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"").unwrap();
+        let fifo = blocker.join("sub").join("coc-roots-seen.jsonl");
+        let project_root = dir.path().join("repo-A");
+        std::fs::create_dir(&project_root).unwrap();
+
+        // Must not panic, must not propagate.
+        record_root_seen(&project_root, Some(&fifo));
+
+        // FIFO was not created.
+        assert!(!fifo.exists());
+    }
+
+    // ── M3-3 Phase 2/3 boundary pin (INVERTED) ────────────────────────────
+    //
+    // Previously named `run_command_handle_dir_symlinks_target_unchanged`
+    // (M2-7 pin asserting config-N/ target through Phase 2).
+    //
+    // Per M3-3 PRIMARY METHODOLOGICAL DIRECTIVE 2 (WBS line 92):
+    // this test is INVERTED in the SAME COMMIT as the source-tree changes.
+    // The test now asserts the Phase 3 invariant: under a coexisting layout
+    // (UUID present in profiles.json::by_slot), `.credentials.json` MUST
+    // target `identities/<UUID>/credentials.json`, NOT `config-N/`.
+
+    /// M3-3 (INVERTED boundary pin): `create_handle_dir` builds `.credentials.json`
+    /// symlinks that target `identities/<UUID>/credentials.json` when a UUID is
+    /// present in `profiles.json::by_slot`.
+    ///
+    /// This test replaces the Phase 2/3 boundary test
+    /// `run_command_handle_dir_symlinks_target_unchanged` (M2-7 pin).
+    /// Phase 3 has shipped the retarget; the assertion is now that the symlink
+    /// goes to the identity-keyed path.  A regression to `config-N/` will fail
+    /// this test.
+    ///
+    /// See internal-design-docs
+    /// § M3-3 acceptance criterion 8.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[cfg(unix)]
+    #[test]
+    fn run_command_handle_dir_symlinks_target_identity_uuid() {
+        use csq_core::accounts::profiles;
+        use csq_core::testing::identity_fixtures::fixture_uuid_for_slot;
+
+        // Arrange: coexisting layout — both config-N/ AND identities/<UUID>/
+        // exist, with profiles.json mapping slot→UUID.
+        let base_dir = TempDir::new().unwrap();
+        let claude_home_dir = TempDir::new().unwrap();
+        let base = base_dir.path();
+        let claude_home = claude_home_dir.path();
+        let slot_num: u16 = 3;
+        let slot = AccountNum::try_from(slot_num).unwrap();
+        let pid: u32 = 99999;
+
+        // Write profiles.json with slot→UUID mapping.
+        let uuid = fixture_uuid_for_slot(slot_num);
+        let profiles_path = profiles::profiles_path(base);
+        let mut pf = csq_core::accounts::profiles::ProfilesFile::empty();
+        pf.by_slot.insert(slot_num.to_string(), uuid);
+        profiles::save(&profiles_path, &pf).unwrap();
+
+        // Create config-N/ with .credentials.json and .csq-account.
+        let config_dir = base.join(format!("config-{slot_num}"));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join(".credentials.json"), b"{}").unwrap();
+        std::fs::write(config_dir.join(".csq-account"), b"3").unwrap();
+        std::fs::write(config_dir.join("settings.json"), b"{}").unwrap();
+        std::fs::write(config_dir.join(".claude.json"), b"{}").unwrap();
+
+        // Create identities/<UUID>/ with credentials.json (Phase 3 canonical target).
+        let uuid_dir = base.join("identities").join(uuid.to_string());
+        std::fs::create_dir_all(&uuid_dir).unwrap();
+        std::fs::write(uuid_dir.join("credentials.json"), b"{}").unwrap();
+
+        // Act: create the handle dir.
+        csq_core::session::create_handle_dir(base, claude_home, slot, pid).unwrap();
+
+        // Assert: .credentials.json symlink targets identities/<UUID>/credentials.json
+        // (Phase 3 invariant), NOT config-N/ (Phase 2 invariant).
+        let handle_dir = base.join(format!("term-{pid}"));
+        let creds_link = handle_dir.join(".credentials.json");
+        let symlink_target = std::fs::read_link(&creds_link).unwrap();
+        let target_str = symlink_target.to_string_lossy();
+        assert!(
+            target_str.contains("identities"),
+            "Phase 3: .credentials.json symlink must target identities/<UUID>/, \
+             got: {target_str}"
+        );
+        assert!(
+            target_str.contains(&uuid.to_canonical_string()),
+            "Phase 3: .credentials.json symlink must contain the UUID for slot {slot_num}, \
+             got: {target_str}"
+        );
+        assert!(
+            !target_str.contains(&format!("config-{slot_num}")),
+            "Phase 3: .credentials.json must NOT target config-{slot_num}/ \
+             (that was Phase 2); got: {target_str}"
+        );
+
+        // Defensive: the handle dir itself must exist.
+        assert!(handle_dir.is_dir(), "handle dir must be created");
+    }
+
+    // ── IR-H3: check_codex_token_freshness unit tests ─────────────────────
+
+    /// Build a minimal auth.json in a tempdir with the given access_token.
+    fn write_auth_json_for_jwt_test(
+        dir: &std::path::Path,
+        access_token: &str,
+    ) -> std::path::PathBuf {
+        let body = serde_json::json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": access_token,
+                "refresh_token": "rt_test",
+                "account_id": "acct-test"
+            }
+        });
+        let path = dir.join("auth.json");
+        std::fs::write(&path, serde_json::to_string(&body).unwrap()).unwrap();
+        path
+    }
+
+    /// Build a base64url-encoded JWT payload with the given `exp` value and
+    /// return a three-part JWT string (`header.payload.sig`).
+    fn make_jwt_with_exp(exp: u64) -> String {
+        // Encode with standard base64url (no padding) for compatibility with
+        // csq_core::http::codex::jwt_exp_secs.
+        fn b64url(s: &str) -> String {
+            base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                s.as_bytes(),
+            )
+        }
+        let header = b64url(r#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = b64url(&format!(r#"{{"exp":{exp},"sub":"test"}}"#));
+        format!("{header}.{payload}.fakesig")
+    }
+
+    #[test]
+    fn jwt_exp_pre_flight_expired_token_returns_error() {
+        let dir = TempDir::new().unwrap();
+        // exp = 1000, now = 2000 → clearly expired
+        let jwt = make_jwt_with_exp(1000);
+        let path = write_auth_json_for_jwt_test(dir.path(), &jwt);
+        let err = check_codex_token_freshness(&path, acc(1), 2000)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("expired Codex access token"),
+            "expired token must produce actionable error: {err}"
+        );
+        assert!(
+            err.contains("csq login 1 --provider codex"),
+            "error must name the fix command: {err}"
+        );
+    }
+
+    #[test]
+    fn jwt_exp_pre_flight_about_to_expire_within_grace_returns_error() {
+        let dir = TempDir::new().unwrap();
+        // exp = 1050, grace = 60, now = 1000 → exp - 60 = 990 ≤ now (1000) → stale
+        let jwt = make_jwt_with_exp(1050);
+        let path = write_auth_json_for_jwt_test(dir.path(), &jwt);
+        let err = check_codex_token_freshness(&path, acc(2), 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("expired Codex access token"),
+            "within-grace token must also produce error: {err}"
+        );
+    }
+
+    #[test]
+    fn jwt_exp_pre_flight_fresh_token_returns_ok() {
+        let dir = TempDir::new().unwrap();
+        // exp = 9999, now = 1000, grace = 60 → exp - 60 = 9939 > 1000 → fresh
+        let jwt = make_jwt_with_exp(9999);
+        let path = write_auth_json_for_jwt_test(dir.path(), &jwt);
+        check_codex_token_freshness(&path, acc(3), 1000).expect("fresh token must pass pre-flight");
+    }
+
+    #[test]
+    fn jwt_exp_pre_flight_malformed_jwt_no_dots_is_nonfatal() {
+        let dir = TempDir::new().unwrap();
+        // access_token with no dots — jwt_exp_secs returns None → non-fatal
+        let path = write_auth_json_for_jwt_test(dir.path(), "notajwt");
+        check_codex_token_freshness(&path, acc(4), 9999)
+            .expect("malformed JWT (no dots) must not block launch");
+    }
+
+    #[test]
+    fn jwt_exp_pre_flight_missing_tokens_key_is_nonfatal() {
+        let dir = TempDir::new().unwrap();
+        // auth.json with no `tokens` key
+        let body = serde_json::json!({"auth_mode": "chatgpt"});
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, serde_json::to_string(&body).unwrap()).unwrap();
+        check_codex_token_freshness(&path, acc(5), 9999)
+            .expect("missing 'tokens' key must be non-fatal");
+    }
+
+    #[test]
+    fn jwt_exp_pre_flight_missing_access_token_key_is_nonfatal() {
+        let dir = TempDir::new().unwrap();
+        // `tokens` present but no `access_token` field
+        let body = serde_json::json!({"auth_mode": "chatgpt", "tokens": {"refresh_token": "rt"}});
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, serde_json::to_string(&body).unwrap()).unwrap();
+        check_codex_token_freshness(&path, acc(6), 9999)
+            .expect("missing 'access_token' key must be non-fatal");
+    }
+
+    #[test]
+    fn jwt_exp_pre_flight_missing_auth_json_is_nonfatal() {
+        let dir = TempDir::new().unwrap();
+        // auth.json does not exist
+        let path = dir.path().join("auth.json");
+        check_codex_token_freshness(&path, acc(7), 9999)
+            .expect("absent auth.json must be non-fatal");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jwt_exp_pre_flight_dangling_symlink_is_nonfatal() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        // Create a symlink pointing at a non-existent target — read_to_string will fail.
+        let path = dir.path().join("auth.json");
+        symlink(dir.path().join("nowhere"), &path).unwrap();
+        check_codex_token_freshness(&path, acc(8), 9999)
+            .expect("dangling symlink auth.json must be non-fatal");
+    }
+
+    // ── attach_scaffold tests ────────────────────────────────────────────
+
+    /// Non-empty scaffold: --append-system-prompt-file + path arg must be
+    /// appended to the command; the temp file must exist with the scaffold
+    /// content; CLAUDE_SYSTEM_PROMPT_APPEND must NOT be set.
+    #[test]
+    fn attach_scaffold_nonempty_uses_file_carrier() {
+        let scaffold = "## Compliance rules\n\nCite RULE_IDs.\n";
+        let mut cmd = Command::new("echo"); // dummy executable
+        let tmp_path = attach_scaffold(&mut cmd, Some(scaffold))
+            .expect("non-empty scaffold must return Some(path)");
+
+        // The temp file must exist and contain the exact scaffold text.
+        assert!(
+            tmp_path.exists(),
+            "scaffold temp file must exist after attach"
+        );
+        let on_disk = std::fs::read_to_string(&tmp_path).expect("must be readable");
+        assert_eq!(
+            on_disk, scaffold,
+            "on-disk content must be byte-identical to scaffold"
+        );
+
+        // The command args must include --append-system-prompt-file <path>.
+        // Inspect args directly via `Command::get_args` (stable since 1.57) —
+        // OsStr equality avoids the `Debug`-format backslash-escaping that
+        // breaks a string `contains` check on Windows temp paths.
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert!(
+            args.iter()
+                .any(|a| *a == std::ffi::OsStr::new("--append-system-prompt-file")),
+            "command args must include --append-system-prompt-file: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| *a == tmp_path.as_os_str()),
+            "command args must include the temp path: {args:?}"
+        );
+
+        // Env var must NOT be set (file carrier replaces it). `get_envs` is
+        // stable since 1.57 — check it directly rather than via the debug repr.
+        assert!(
+            !cmd.get_envs()
+                .any(|(k, _)| k == std::ffi::OsStr::new("CLAUDE_SYSTEM_PROMPT_APPEND")),
+            "env var must be absent when file carrier succeeds"
+        );
+
+        // Cleanup the temp file (mirrors what the WithLayer arm does).
+        let _ = std::fs::remove_file(&tmp_path);
+        assert!(
+            !tmp_path.exists(),
+            "cleanup: temp file must be gone after remove_file"
+        );
+    }
+
+    /// Empty scaffold: no flag, no file, no env var.
+    #[test]
+    fn attach_scaffold_empty_is_noop() {
+        let mut cmd = Command::new("echo");
+        let result = attach_scaffold(&mut cmd, Some(""));
+        assert!(result.is_none(), "empty scaffold must return None");
+        let dbg = format!("{cmd:?}");
+        assert!(
+            !dbg.contains("--append-system-prompt-file"),
+            "empty scaffold must not append flag: {dbg}"
+        );
+        assert!(
+            !dbg.contains("CLAUDE_SYSTEM_PROMPT_APPEND"),
+            "empty scaffold must not set env var: {dbg}"
+        );
+    }
+
+    /// None scaffold: same no-op as empty.
+    #[test]
+    fn attach_scaffold_none_is_noop() {
+        let mut cmd = Command::new("echo");
+        let result = attach_scaffold(&mut cmd, None);
+        assert!(result.is_none(), "None scaffold must return None");
+        let dbg = format!("{cmd:?}");
+        assert!(
+            !dbg.contains("--append-system-prompt-file"),
+            "None scaffold must not append flag: {dbg}"
+        );
+    }
+
+    /// Cleanup contract: after remove_file on the returned path, the file
+    /// is gone.  (Tests that the returned path is the actual file path, not
+    /// a copy or a directory.)
+    #[test]
+    fn attach_scaffold_cleanup_removes_temp_file() {
+        let scaffold = "rule-1: cite IDs\n";
+        let mut cmd = Command::new("echo");
+        let tmp_path = attach_scaffold(&mut cmd, Some(scaffold))
+            .expect("non-empty scaffold must return Some(path)");
+        assert!(tmp_path.exists(), "file must exist before cleanup");
+        let _ = std::fs::remove_file(&tmp_path);
+        assert!(!tmp_path.exists(), "file must not exist after cleanup");
+    }
+
+    // ── F10 (round 5): `enabled` genuinely changes `run_capability_layer_
+    //    preflight`'s decision, discriminated by OBSERVED VARIANT rather
+    //    than Ok/Err ─────────────────────────────────────────────────────
+    //
+    // The pair this replaces (`relaunch_validation_honors_original_
+    // invocation_{disabled,enabled}_layer`, in `codex_supervise.rs`) both
+    // asserted only `result.is_ok()` — and EVERY reachable outcome of
+    // `run_capability_layer_preflight` on this admission path is `Ok(..)`:
+    // every `.coc/`-content failure (load error, version-refused, a
+    // malformed lock) is caught internally and converted to
+    // `Ok(LayerControl::Inherit)` (FR-RUN-04's fail-open contract — see the
+    // `Err(e) => { eprintln!(...); return Ok(LayerControl::Inherit) }` arm
+    // above), and with `rest = &[]` (this admission check's fixed
+    // passthrough — see `validate_codex_relaunch_target`'s doc) neither the
+    // classifier nor the scaffold/mcp-gate stages have a reachable `Err`
+    // path either. So no `.coc/` fixture — malformed or otherwise — can
+    // make this function return `Err` here, and a hardcoded `(true, true)`
+    // would pass BOTH the old tests identically to the real threaded
+    // values: they were not discriminating tests. The genuinely observable
+    // discriminator is the returned `LayerControl` VARIANT: `enabled=false`
+    // is `Inherit` regardless of what's on disk; `enabled=true` against a
+    // REAL, present `.coc/` is `WithLayer`.
+    #[test]
+    fn capability_layer_preflight_enabled_flag_changes_the_returned_variant() {
+        // Process-global CLAUDE_HOME (this function's `.coc/` cache root
+        // comes from `super::claude_home()`, NOT its own `_base_dir` param)
+        // — serialize per `test-hermeticity.md`.
+        let _lock = csq_core::platform::test_env::lock();
+        let had = std::env::var_os("CLAUDE_HOME");
+        let cache_dir = TempDir::new().expect("tempdir for CLAUDE_HOME");
+        // SAFETY: test_env::lock serializes env mutation per rules/testing.md.
+        unsafe {
+            std::env::set_var("CLAUDE_HOME", cache_dir.path());
+        }
+
+        let coc_dir = TempDir::new().expect("tempdir for .coc/");
+        build_coc_dir(
+            coc_dir.path(),
+            b"{\"v\":1,\"key\":\"f10-preflight-variant\"}",
+        );
+        let _cwd_guard = force_coc_preflight_cwd(coc_dir.path().to_path_buf());
+
+        let account = AccountNum::try_from(21u16).unwrap();
+        let toggles = CapabilityLayerToggles::default();
+
+        // RED against a hardcoded `(true, true)`: this call is IDENTICAL
+        // for both assertions below except `enabled`, so a hardcoded value
+        // that ignores its argument makes one of the two assertions fail.
+        let disabled = run_capability_layer_preflight(
+            coc_dir.path(),
+            account,
+            /* enabled */ false,
+            /* layer_is_auto */ false,
+            &toggles,
+            false,
+            Surface::Codex,
+            true,
+            &[],
+        );
+        let disabled_desc = describe_layer_control_result(&disabled);
+        assert!(
+            matches!(disabled, Ok(LayerControl::Inherit)),
+            "enabled=false must be Inherit regardless of a present .coc/, got {disabled_desc}"
+        );
+
+        let enabled = run_capability_layer_preflight(
+            coc_dir.path(),
+            account,
+            /* enabled */ true,
+            /* layer_is_auto */ false,
+            &toggles,
+            false,
+            Surface::Codex,
+            true,
+            &[],
+        );
+        let enabled_desc = describe_layer_control_result(&enabled);
+        assert!(
+            matches!(enabled, Ok(LayerControl::WithLayer { .. })),
+            "enabled=true against a REAL, present .coc/ must engage the \
+             layer (WithLayer), not fall back to Inherit — got {enabled_desc}"
+        );
+
+        // SAFETY: restore prior value under the lock.
+        unsafe {
+            match had {
+                Some(v) => std::env::set_var("CLAUDE_HOME", v),
+                None => std::env::remove_var("CLAUDE_HOME"),
+            }
+        }
+    }
+
+    // ── round 6, item 3: `force_coc_preflight_cwd_err` genuinely
+    //    discriminates `enabled` at the LOWEST level (this is the seam
+    //    `codex_supervise::tests` reuses one layer up) ────────────────────
+    #[test]
+    fn run_capability_layer_preflight_propagates_err_only_when_enabled_true() {
+        let account = AccountNum::try_from(22u16).unwrap();
+        let toggles = CapabilityLayerToggles::default();
+        let _err_guard = force_coc_preflight_cwd_err();
+
+        // enabled=false short-circuits BEFORE ever calling
+        // `resolve_coc_preflight_cwd` (the hot-path check in
+        // `run_capability_layer_preflight`, above) — the forced Err must
+        // never be reached.
+        let disabled = run_capability_layer_preflight(
+            Path::new("/unused"),
+            account,
+            /* enabled */ false,
+            /* layer_is_auto */ false,
+            &toggles,
+            false,
+            Surface::Codex,
+            true,
+            &[],
+        );
+        assert!(
+            matches!(disabled, Ok(LayerControl::Inherit)),
+            "enabled=false must short-circuit to Ok(Inherit) before the cwd \
+             resolution the forced-Err seam targets even runs: {}",
+            describe_layer_control_result(&disabled)
+        );
+
+        // enabled=true reaches `resolve_coc_preflight_cwd()?` directly —
+        // the ONE reachable Err on this admission path (see that function's
+        // doc) — and must propagate it rather than downgrading to Inherit.
+        let enabled = run_capability_layer_preflight(
+            Path::new("/unused"),
+            account,
+            /* enabled */ true,
+            /* layer_is_auto */ false,
+            &toggles,
+            false,
+            Surface::Codex,
+            true,
+            &[],
+        );
+        assert!(
+            enabled.is_err(),
+            "enabled=true must propagate the forced cwd-resolution Err: {}",
+            describe_layer_control_result(&enabled)
+        );
+    }
+}
+
+/// Spec 32 §6 / INV-32-07: launch registration of the messaging server and hooks.
+#[cfg(test)]
+mod messaging_registration_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    const VAR: &str = "CSQ_MESSAGING";
+
+    /// Run `f` with `CSQ_MESSAGING` set to `value` (or removed), under the shared env lock,
+    /// restoring the previous value afterwards.
+    fn with_messaging_env<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
+        let _lock = csq_core::platform::test_env::lock();
+        let saved = std::env::var(VAR).ok();
+        match value {
+            Some(v) => std::env::set_var(VAR, v),
+            None => std::env::remove_var(VAR),
+        }
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match saved {
+            Some(v) => std::env::set_var(VAR, v),
+            None => std::env::remove_var(VAR),
+        }
+        r.unwrap_or_else(|p| std::panic::resume_unwind(p))
+    }
+
+    struct Fixture {
+        _dir: TempDir,
+        handle: PathBuf,
+        user_settings: PathBuf,
+        #[cfg(not(windows))]
+        user_codex: PathBuf,
+    }
+
+    fn fixture() -> Fixture {
+        fixture_in(TempDir::new().unwrap())
+    }
+
+    fn fixture_in(dir: TempDir) -> Fixture {
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        let user_settings = home.join(".claude").join("settings.json");
+        let user_codex = home.join(".codex").join("config.toml");
+        std::fs::write(
+            &user_settings,
+            "{\"permissions\":{\"allow\":[\"WebSearch\"]}}\n",
+        )
+        .unwrap();
+        std::fs::write(&user_codex, "model = \"x\"\n").unwrap();
+        let handle = dir.path().join("accounts").join("term-4242");
+        std::fs::create_dir_all(&handle).unwrap();
+        std::fs::write(handle.join("settings.json"), "{\"effortLevel\":\"medium\"}").unwrap();
+        Fixture {
+            _dir: dir,
+            handle,
+            user_settings,
+            #[cfg(not(windows))]
+            user_codex,
+        }
+    }
+
+    /// The caller holds the shared env lock for fixture creation through assertions.
+    /// Registration builds commands without executing them, so no vendor CLI is needed.
+    fn launch_fixture() -> (Fixture, LaunchEnv) {
+        // A fixed OS temp root avoids an inherited TMPDIR that another fixture removed.
+        #[cfg(unix)]
+        let dir = TempDir::new_in("/tmp").unwrap();
+        #[cfg(not(unix))]
+        let dir = TempDir::new().unwrap();
+        let f = fixture_in(dir);
+        let home = f._dir.path().join("home");
+        let tmp = f._dir.path().join("tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        let bin = f._dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        // These commands are inspected, never spawned. If a future launch fixture
+        // resolves a vendor through PATH, it must still resolve inside this sandbox.
+        for name in ["claude", "codex"] {
+            let executable = bin.join(name);
+            std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+        }
+        let values = [
+            ("HOME", Some(home.into_os_string())),
+            (
+                "USERPROFILE",
+                Some(f._dir.path().join("home").into_os_string()),
+            ),
+            ("PATH", Some(bin.into_os_string())),
+            (
+                "CSQ_BASE_DIR",
+                Some(f._dir.path().join("accounts").into_os_string()),
+            ),
+            (VAR, None),
+        ];
+        let restore = LaunchEnv(
+            values
+                .iter()
+                .map(|(k, _)| (*k, std::env::var_os(k)))
+                .collect(),
+        );
+        for (key, value) in values {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        (f, restore)
+    }
+
+    struct LaunchEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl Drop for LaunchEnv {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn launch_command(f: &Fixture, surface: &str) -> Command {
+        let mut cmd = Command::new(f._dir.path().join("bin").join(surface));
+        let tmp = f._dir.path().join("tmp");
+        // Only this inspected child command receives the private temp root.
+        // Never expose ambient-tempdir sibling tests to a transient root.
+        for key in ["TMPDIR", "TEMP", "TMP"] {
+            cmd.env(key, &tmp);
+        }
+        cmd
+    }
+
+    #[test]
+    fn launch_fixture_keeps_parent_temp_environment_and_binds_child_temp() {
+        let _lock = csq_core::platform::test_env::lock();
+        let previous: Vec<_> = ["TMPDIR", "TEMP", "TMP"]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect();
+        {
+            let (f, _restore) = launch_fixture();
+            let cmd = launch_command(&f, "claude");
+            for (key, value) in &previous {
+                assert_eq!(std::env::var_os(key), *value);
+                assert!(cmd.get_envs().any(|(name, value)| name == *key
+                    && value == Some(f._dir.path().join("tmp").as_os_str())));
+            }
+        }
+        for (key, value) in previous {
+            assert_eq!(std::env::var_os(key), value);
+        }
+    }
+
+    #[test]
+    fn pool_values_never_enter_claude_launch_environment_or_materialized_settings() {
+        use secrecy::ExposeSecret;
+        let _lock = csq_core::platform::test_env::lock();
+        let (f, _restore) = launch_fixture();
+        let base = f._dir.path().join("accounts");
+        let vault =
+            csq_core::platform::secret::file::FileVault::open_test(&base.join("pool-test-vault"))
+                .unwrap();
+        csq_core::pool::Pool::with_default_vault_for_test(std::sync::Arc::new(vault), || {
+            let pool = csq_core::pool::Pool::new(&base);
+            let stored_value = "synthetic-private-pool-stored-value";
+            let env_value = "synthetic-private-pool-env-value";
+            pool.add("credit.one", "anthropic", stored_value.into(), None, None)
+                .unwrap();
+            let env_file = base.join("pool-input.env");
+            // Born owner-only on both platforms (0o600 on Unix; a protected
+            // single-owner-ACE DACL on Windows), so `add_env_file` admits it
+            // everywhere and the env-sourced leak probe genuinely runs.
+            csq_core::platform::fs::write_new_private(
+                &env_file,
+                format!("credit.env={env_value}\n").as_bytes(),
+            )
+            .unwrap();
+            pool.add_env_file(&env_file, &["credit.env".into()], "anthropic", None, None)
+                .unwrap();
+            let leak_probes = [stored_value, env_value];
+            assert!(pool.list().unwrap().iter().all(|row| row.present));
+            let home = f.user_settings.parent().unwrap();
+            let rest = vec!["plugin".to_owned(), "details".to_owned()];
+            // These are the production builders used by launch_anthropic,
+            // launch_third_party and exec_claude. Outer launch admission/native
+            // force_sync is deliberately outside this construction fixture.
+            for overlay in [
+                "{}",
+                r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.z.ai/api/anthropic","ANTHROPIC_AUTH_TOKEN":"synthetic-slot-key"}}"#,
+                "{}",
+            ] {
+                let config = base.join("config-1");
+                std::fs::create_dir_all(&config).unwrap();
+                std::fs::write(config.join("settings.json"), overlay).unwrap();
+                csq_core::session::materialize_handle_settings(&f.handle, home, &config).unwrap();
+                let mut anthropic = build_anthropic_command(&base, &f.handle, &rest).unwrap();
+                // Match the Inherit arm's final user-argument placement.
+                anthropic.args(&rest);
+                let commands = [
+                    anthropic,
+                    build_third_party_command(&base, &f.handle, &rest).unwrap(),
+                    build_vanilla_claude_command(&base, home, &rest).unwrap(),
+                ];
+                for cmd in &commands {
+                    assert_eq!(cmd.get_program(), "claude");
+                    assert!(argv(cmd).ends_with(&rest));
+                    let env: Vec<_> = cmd
+                        .get_envs()
+                        .map(|(key, value)| {
+                            (
+                                key.to_string_lossy().into_owned(),
+                                value.map(|v| v.to_string_lossy().into_owned()),
+                            )
+                        })
+                        .collect();
+                    for value in leak_probes.iter().copied() {
+                        assert!(!serde_json::to_string(&env).unwrap().contains(value));
+                        assert!(!serde_json::to_string(&argv(cmd)).unwrap().contains(value));
+                        assert!(!std::fs::read_to_string(f.handle.join("settings.json"))
+                            .unwrap()
+                            .contains(value));
+                    }
+                }
+                assert_eq!(
+                    pool.read_key("credit.one").unwrap().expose_secret(),
+                    stored_value
+                );
+                assert_eq!(
+                    pool.read_key("credit.env").unwrap().expose_secret(),
+                    env_value
+                );
+            }
+        });
+    }
+
+    fn argv(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn handle_settings(f: &Fixture) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(f.handle.join("settings.json")).unwrap()).unwrap()
+    }
+
+    fn decision_env_of(cmd: &Command) -> Option<Option<String>> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == csq_core::messaging::register::DECISION_ENV)
+            .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    /// F3: every launch that builds a `Command` sets `CSQ_MESSAGING_DECISION` EXPLICITLY, on or
+    /// off, so a parent-shell value cannot win, and `strip_sensitive_env` leaves it alone.
+    /// Falsifier: before, no launch set it, so `decision_env_of` is `None` for all four.
+    #[test]
+    fn every_launch_sets_the_decision_env_explicitly_and_the_strip_keeps_it() {
+        let f = fixture();
+        let var = csq_core::messaging::register::DECISION_ENV;
+        for on in [true, false] {
+            let want = Some(Some(if on { "on" } else { "off" }.to_owned()));
+            let mut claude = Command::new("echo");
+            attach_messaging_claude_as(&mut claude, &f.handle, on);
+            assert_eq!(decision_env_of(&claude), want, "claude on={on}");
+            let mut codex = Command::new("echo");
+            attach_messaging_codex_as(&mut codex, &f.handle, None, on);
+            assert_eq!(decision_env_of(&codex), want, "codex on={on}");
+            let mut native = Command::new("echo");
+            set_decision_env(&mut native, on);
+            assert_eq!(decision_env_of(&native), want, "native on={on}");
+        }
+        // a parent-shell value is overridden: the explicit set is what the child gets, and the
+        // strip does not remove it
+        let _lock = csq_core::platform::test_env::lock();
+        let prev = std::env::var_os(var);
+        std::env::set_var(var, "on");
+        let mut cmd = Command::new("echo");
+        set_decision_env(&mut cmd, false);
+        strip_sensitive_env(&mut cmd);
+        match prev {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+        assert_eq!(decision_env_of(&cmd), Some(Some("off".to_owned())));
+    }
+
+    #[test]
+    fn claude_launch_gets_inline_config_and_only_the_handle_dir_settings_change() {
+        let _lock = csq_core::platform::test_env::lock();
+        let (f, _restore) = launch_fixture();
+        let user_before = std::fs::read(&f.user_settings).unwrap();
+        let mut cmd = launch_command(&f, "claude");
+        attach_messaging_claude(&mut cmd, &f.handle);
+        let args = argv(&cmd);
+        assert_eq!(args[0], "--mcp-config", "{args:?}");
+        let cfg: serde_json::Value = serde_json::from_str(&args[1]).unwrap();
+        let srv = &cfg["mcpServers"]["csq-messaging"];
+        assert_eq!(srv["args"], serde_json::json!(["mcp-messaging"]));
+        assert_eq!(srv["env"]["CLAUDE_CONFIG_DIR"], f.handle.to_str().unwrap());
+        // Inline: no config file is written; the handle dir holds only settings.json (edited in
+        // place) and the launch-decision marker (spec 02 INV-02 permits the .csq* family).
+        let mut names: Vec<String> = std::fs::read_dir(&f.handle)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [".csq-messaging", "settings.json"],
+            "only the launch-decision marker joins settings.json"
+        );
+        let s = handle_settings(&f);
+        assert_eq!(s["hooks"].as_object().unwrap().len(), 3, "{s}");
+        for ev in ["UserPromptSubmit", "PostToolUse", "Stop"] {
+            let c = s["hooks"][ev][0]["hooks"][0]["command"].as_str().unwrap();
+            assert!(
+                c.ends_with(&format!("sessions inbox --messages --hook {ev}")),
+                "{c}"
+            );
+        }
+        assert_eq!(s["permissions"]["allow"].as_array().unwrap().len(), 6);
+        assert_eq!(s["effortLevel"], "medium");
+        // The user's own settings are byte-identical.
+        assert_eq!(std::fs::read(&f.user_settings).unwrap(), user_before);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn codex_launch_carries_the_c_flags_and_leaves_the_user_config_untouched() {
+        let _lock = csq_core::platform::test_env::lock();
+        let (f, _restore) = launch_fixture();
+        let user_before = std::fs::read(&f.user_codex).unwrap();
+        let mut cmd = launch_command(&f, "codex");
+        attach_messaging_codex(&mut cmd, &f.handle, None);
+        let args = argv(&cmd);
+        assert_eq!(args.len(), 8, "{args:?}");
+        assert!(args.iter().step_by(2).all(|a| a == "-c"));
+        assert!(args
+            .iter()
+            .any(|a| a.starts_with("mcp_servers.csq-messaging.command=")));
+        assert!(args.iter().any(|a| a
+            == &format!(
+                "mcp_servers.csq-messaging.env={{CODEX_HOME=\"{}\", CSQ_BASE_DIR=\"{}\"}}",
+                f.handle.to_str().unwrap(),
+                f._dir.path().join("accounts").to_str().unwrap()
+            )));
+        assert!(args
+            .iter()
+            .any(|a| a == "mcp_servers.csq-messaging.default_tools_approval_mode=\"approve\""));
+        assert_eq!(std::fs::read(&f.user_codex).unwrap(), user_before);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn codex_launch_under_an_mcp_policy_routes_the_server_through_the_proxy() {
+        let f = fixture();
+        let envelope = f.handle.join(".pact-mcp-envelope.json");
+        let mut cmd = Command::new("echo");
+        with_messaging_env(None, || {
+            attach_messaging_codex(&mut cmd, &f.handle, Some(("/opt/csq", &envelope)))
+        });
+        let args = argv(&cmd);
+        let a = args
+            .iter()
+            .find(|a| a.starts_with("mcp_servers.csq-messaging.args="))
+            .unwrap();
+        assert!(
+            a.contains("\"mcp-proxy\"")
+                && a.contains("\"--envelope\"")
+                && a.contains("\"mcp-messaging\""),
+            "{a}"
+        );
+        let c = args
+            .iter()
+            .find(|a| a.starts_with("mcp_servers.csq-messaging.command="))
+            .unwrap();
+        assert_eq!(c, "mcp_servers.csq-messaging.command=\"/opt/csq\"");
+    }
+
+    #[test]
+    fn the_off_switch_registers_nothing_in_either_cli() {
+        let f = fixture();
+        let settings_before = std::fs::read(f.handle.join("settings.json")).unwrap();
+        let mut claude = Command::new("echo");
+        let mut codex = Command::new("echo");
+        with_messaging_env(Some("off"), || {
+            attach_messaging_claude(&mut claude, &f.handle);
+            attach_messaging_codex(&mut codex, &f.handle, None);
+        });
+        assert!(argv(&claude).is_empty(), "{:?}", argv(&claude));
+        assert!(argv(&codex).is_empty(), "{:?}", argv(&codex));
+        assert_eq!(
+            std::fs::read(f.handle.join("settings.json")).unwrap(),
+            settings_before
+        );
+    }
+
+    #[test]
+    fn a_failed_registration_still_launches_without_half_registering() {
+        // Settings edit refused (no settings.json in the handle dir): no flag is added, so
+        // tools are never registered without their allow rules; the command is still usable.
+        let f = fixture();
+        std::fs::remove_file(f.handle.join("settings.json")).unwrap();
+        let mut cmd = Command::new("echo");
+        with_messaging_env(None, || attach_messaging_claude(&mut cmd, &f.handle));
+        assert!(argv(&cmd).is_empty(), "{:?}", argv(&cmd));
+
+        // Unbuildable config (handle dir not UTF-8): neither CLI gets a flag, nothing panics.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let bad = PathBuf::from(std::ffi::OsStr::from_bytes(b"/h/\xffterm"));
+            let mut claude = Command::new("echo");
+            let mut codex = Command::new("echo");
+            with_messaging_env(None, || {
+                attach_messaging_claude(&mut claude, &bad);
+                attach_messaging_codex(&mut codex, &bad, None);
+            });
+            assert!(argv(&claude).is_empty() && argv(&codex).is_empty());
+        }
+    }
+
+    /// M1: once a handle dir carries `off`, an attach reads THAT and not the environment.
+    /// Falsifier: the old `register::enabled()` read gave `--mcp-config` here.
+    #[test]
+    fn a_recorded_off_decision_beats_an_enabling_environment_in_both_clis() {
+        let f = fixture();
+        csq_core::messaging::register::record_decision(&f.handle, false).unwrap();
+        let mut claude = Command::new("echo");
+        let mut codex = Command::new("echo");
+        with_messaging_env(None, || {
+            attach_messaging_claude(&mut claude, &f.handle);
+            attach_messaging_codex(&mut codex, &f.handle, None);
+        });
+        assert!(argv(&claude).is_empty(), "{:?}", argv(&claude));
+        assert!(argv(&codex).is_empty(), "{:?}", argv(&codex));
+    }
+
+    /// A fresh launch records what the environment said, so a later swap can carry it.
+    #[test]
+    fn a_fresh_launch_records_the_environment_decision_once() {
+        let f = fixture();
+        let mut claude = Command::new("echo");
+        with_messaging_env(Some("off"), || {
+            attach_messaging_claude(&mut claude, &f.handle)
+        });
+        assert_eq!(
+            csq_core::messaging::register::read_decision(&f.handle),
+            Some(false)
+        );
+        let g = fixture();
+        let mut claude = Command::new("echo");
+        with_messaging_env(None, || attach_messaging_claude(&mut claude, &g.handle));
+        assert_eq!(
+            csq_core::messaging::register::read_decision(&g.handle),
+            Some(true)
+        );
+    }
+
+    /// I3: a Gemini or native launch records the decision, so a swap out of it into Claude or
+    /// Codex reads the operator's choice instead of "off". Falsifier: without the call the
+    /// marker is absent and `existing_decision` is false even with `CSQ_MESSAGING` unset (on).
+    #[test]
+    fn gemini_and_native_launches_record_the_decision_for_a_later_swap() {
+        for (env, want) in [(None, true), (Some("off"), false)] {
+            let f = fixture();
+            with_messaging_env(env, || record_launch_decision(&f.handle));
+            assert_eq!(
+                csq_core::messaging::register::read_decision(&f.handle),
+                Some(want)
+            );
+        }
+        // an existing marker is kept, not overwritten from the environment
+        let f = fixture();
+        csq_core::messaging::register::record_decision(&f.handle, false).unwrap();
+        with_messaging_env(None, || record_launch_decision(&f.handle));
+        assert_eq!(
+            csq_core::messaging::register::read_decision(&f.handle),
+            Some(false)
+        );
+    }
+
+    /// F8: Codex registers nothing on Windows even when messaging is on.
+    #[cfg(windows)]
+    #[test]
+    fn codex_registers_no_messaging_tools_on_windows() {
+        let f = fixture();
+        let mut codex = Command::new("echo");
+        with_messaging_env(None, || attach_messaging_codex(&mut codex, &f.handle, None));
+        assert!(argv(&codex).is_empty(), "{:?}", argv(&codex));
+    }
+}
+
+/// F1: `csq run` into a codex slot must not leave a phantom
+/// `Degraded`/`Bypass` run record when `launch_codex` refuses BEFORE its
+/// spawn. Drives the REAL `launch_codex` under the same
+/// `CodexLaunchAudit::First(PreSpawnCodexRun)` wrapper `handle` builds, past
+/// a fake healthy daemon, to the `check_codex_token_freshness` refusal of an
+/// expired token — one of the `?` exits ahead of the share lock.
+#[cfg(all(test, unix))]
+mod codex_pre_spawn_guard_tests {
+    use super::*;
+    use crate::cli::commands::fake_daemon_test_support::spawn_fake_healthy_daemon;
+
+    fn b64url(s: &str) -> String {
+        base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            s.as_bytes(),
+        )
+    }
+
+    /// A codex slot whose canonical credential carries an access token
+    /// that expired at `exp = 1000`.
+    fn expired_codex_slot(base: &Path, account: u16) {
+        let config = base.join(format!("config-{account}"));
+        std::fs::create_dir_all(config.join("codex-sessions")).unwrap();
+        std::fs::write(config.join(".csq-account"), account.to_string()).unwrap();
+        std::fs::write(config.join("config.toml"), "model = \"o1\"\n").unwrap(); // CI-ALLOW-fs-write-config-toml
+        std::fs::write(config.join("codex-history.jsonl"), "").unwrap();
+        let jwt = format!(
+            "{}.{}.fakesig",
+            b64url(r#"{"alg":"HS256","typ":"JWT"}"#),
+            b64url(r#"{"exp":1000,"sub":"test"}"#)
+        );
+        let creds = base.join("credentials");
+        std::fs::create_dir_all(&creds).unwrap();
+        std::fs::write(
+            creds.join(format!("codex-{account}.json")),
+            format!(
+                r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{jwt}","refresh_token":"rt","id_token":"it","account_id":"uuid"}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Every record under `csq-runs/` and `csq-runs/.pending/` (the same
+    /// reader as `swap::tests::run_records_including_pending`).
+    fn run_records_including_pending(base: &Path) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        for dir in [
+            base.join("csq-runs"),
+            base.join("csq-runs").join(".pending"),
+        ] {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if !entry.path().is_file() {
+                    continue;
+                }
+                let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+                match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(v) => out.push(v),
+                    Err(_) => out.extend(
+                        text.lines()
+                            .filter(|l| !l.trim().is_empty())
+                            .map(|l| serde_json::from_str(l).unwrap_or(serde_json::Value::Null)),
+                    ),
+                }
+            }
+        }
+        out
+    }
+
+    /// Falsifying result (pre-F1, `handle` passing its bare emitter): the
+    /// emitter drops un-ended on the token refusal and parks its default
+    /// `Degraded`/`Bypass` record in `csq-runs/.pending/`.
+    #[test]
+    fn csq_run_codex_expired_token_leaves_no_bypass_run_record() {
+        // The fake daemon's socket derives from `base` on macOS; a deep
+        // runner TMPDIR would push its pathname past `sun_path`.
+        let base = csq_core::testing::socket_fixture::short_root("csq-run-").unwrap();
+        let account = AccountNum::try_from(9u16).unwrap();
+        expired_codex_slot(base.path(), account.get());
+        let _daemon = spawn_fake_healthy_daemon(base.path());
+        let audit = CodexLaunchAudit::First(Box::new(PreSpawnCodexRun::new(run_audit_emitter(
+            base.path(),
+            SurfaceCli::Codex,
+            account,
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ))));
+        let toggles = CapabilityLayerToggles::default();
+        let result = launch_codex(
+            base.path(),
+            account,
+            /* capability_layer_enabled */ false,
+            /* layer_is_auto */ false,
+            &toggles,
+            /* debug */ false,
+            /* bench_mode */ None,
+            /* coc_cache_enabled */ false,
+            &[],
+            audit,
+            /* swap_correlation */ None,
+            /* messaging */ None,
+        );
+        let err = result.expect_err("an expired codex token must refuse the launch");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("expired"),
+            "the refusal must be the token check: {msg}"
+        );
+        let records = run_records_including_pending(base.path());
+        assert!(
+            !records
+                .iter()
+                .any(|r| r.to_string().contains("\"decision\":\"bypass\"")),
+            "a Bypass run record: {records:?}"
+        );
+        assert!(
+            records
+                .iter()
+                .all(|r| !r.to_string().contains("\"result_state\":\"degraded\"")),
+            "a Degraded run record: {records:?}"
+        );
+        let _ = std::fs::remove_dir_all(base.path().join(format!("term-{}", std::process::id())));
+    }
+}

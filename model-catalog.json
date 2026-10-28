@@ -1,0 +1,27 @@
+{
+  "zai": {
+    "models": ["glm-4.7", "glm-5.2", "glm-5.2[1m]"],
+    "latest": "glm-5.2[1m]",
+    "default": "glm-5.2[1m]"
+  },
+  "mm": {
+    "models": ["MiniMax-M2.7-highspeed", "MiniMax-M3"],
+    "latest": "MiniMax-M3",
+    "default": "MiniMax-M3"
+  },
+  "ollama": {
+    "models": [],
+    "latest": null,
+    "default": "qwen3:latest"
+  },
+  "azure": {
+    "models": ["gpt-5.5", "gpt-5.5-mini"],
+    "latest": "gpt-5.5",
+    "default": "gpt-5.5"
+  },
+  "vertex": {
+    "models": ["gemini-2.5-pro", "gemini-2.5-flash"],
+    "latest": "gemini-2.5-pro",
+    "default": "gemini-2.5-pro"
+  }
+}

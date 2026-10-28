@@ -1,0 +1,205 @@
+.env
+__pycache__/
+*.pyc
+/credentials/
+.account.*
+.DS_Store
+**/.DS_Store
+
+# Credential and session state files (security: never commit)
+config-*/
+.credentials.json
+.csq-account
+.current-account
+.live-pid
+.quota-cursor
+# Daemon runtime state — sockets and PIDs leaked into the repo would
+# either be dead pointers (sock) or pid-collision fodder (pid).
+*.sock
+*.pid
+# OAuth login locks — held only while a login flow is in flight; if
+# they ever land in the working tree it's because a test fixture wrote
+# into the wrong cwd.
+.login-*.lock
+# Belt-and-braces: any per-account directory tree that drifted into the
+# working tree (e.g. via test fixtures pointing at `./accounts/`). Anchored
+# to repo root so it does NOT catch source code paths like
+# `csq-core/src/accounts/`.
+/accounts/
+
+# Gemini CLI-durable event log (spec 05 §5.8.1, security: never commit)
+gemini-events-*.ndjson
+gemini-events-*.corrupt.*
+
+# Codex wham/usage raw + drift captures (PII-redacted on write but the
+# diffs would still surface user_id / account_id / email shape drift
+# across sessions; captures live only on the operator's machine).
+/accounts/codex-wham-raw.json
+/accounts/codex-wham-drift.json
+
+# Maintainer-local release artifacts. Produced by
+# `docs/release-signing.md` §3-§7c on the maintainer host (sign +
+# notarize + staple + minisign) and uploaded to the GitHub release
+# pre-tag-push via §8. The local copies persist in the working tree
+# afterward and never need to be committed — they regenerate every
+# release cut. Anchored to repo root so a directory of a similar name
+# anywhere else in the tree is not affected.
+#
+# Extending this block: add an anchored pattern here when
+# `docs/release-signing.md` introduces a new artifact shape (e.g. a
+# new hash algorithm like `.sha512` or a new bundle format).
+/csq-desktop-*.dmg
+/csq-desktop-*.dmg.sha256
+/csq-desktop-*.app.tar.gz
+/csq-desktop-*.app.tar.gz.sha256
+/csq-desktop-*.app.tar.gz.sig
+# §3-§7c also emit these alongside the bundle artifacts. Same
+# disposition: regenerated every release cut, uploaded to the GH
+# release pre-tag-push, never need to be committed.
+/latest.json
+/SHA256SUMS
+/SHA256SUMS.sig
+# Signing keys. Today the Tauri updater key lives outside the repo at
+# `~/.tauri/csq-updater.key` (per `discovery_tauri_signing_key_local_path`
+# user memory). The narrow anchored pattern below is defense-in-depth
+# against accidental relocation during key rotation. Not broad enough
+# to catch unrelated `*.key` files elsewhere in the tree.
+/csq-updater.key
+
+# Developer-local Cargo config overrides (machine-specific [patch] blocks).
+# The canonical example lives at .cargo/config.toml.example.
+.cargo/config.toml
+
+# Rust build artifacts
+target/
+
+# Frontend + Tauri CLI host build artifacts (csq crate)
+csq/node_modules/
+csq/ui/node_modules/
+node_modules/
+csq/ui/dist/
+
+# Local-only research and notes folders
+notes/
+research/
+internal/
+upstream-internals/
+*.research.md
+
+# Phase test outputs and other ephemeral analysis data
+journal/*-data/
+
+# Runtime learning state — auto-appended on every session start.
+# Tracking it produces churn on every commit and never carries useful diffs.
+# Matches at any depth (csq-desktop/.claude/learning/ too) via the **/ prefix.
+**/.claude/learning/
+
+# Scheduled-task lock file — runtime state for the harness cron
+# scheduler. Recreated on every session; has no diff value.
+**/.claude/scheduled_tasks.lock
+
+# Operator identity — .claude/operator-id holds a GPG verified_id fingerprint,
+# written by .claude/hooks/lib/operator-id.js on session start. It is
+# operator-local disclosure, not source, and this repo is the upstream of a
+# PUBLIC community fork — an accidental commit publishes a maintainer's key
+# fingerprint irreversibly (`security.md` "No secrets in logs or errors").
+# Upstream kailash-coc-rs ignores it for the same reason.
+.claude/operator-id
+**/.claude/operator-id
+
+# Per-operator session-notes layout, produced by the SessionStart hook when it
+# splits a legacy monolithic .session-notes
+# (.claude/hooks/lib/session-notes-layout.js). Ephemeral + per-machine, same
+# class as the workspaces/**/.session-notes entry below.
+.session-notes.d/
+**/.session-notes.d/
+.session-notes.shared.md
+**/.session-notes.shared.md
+.session-notes.migrated
+**/.session-notes.migrated
+
+# IDE settings
+.vscode/
+**/.vscode/
+
+# Session notes (ephemeral, per-machine)
+workspaces/**/.session-notes
+
+# Per-workspace journal-skip audit log, appended by the SessionEnd hook
+# (written by a session-end hook). Machine-
+# generated, append-only, session-local — and per-machine, since which commits a
+# given operator's session skipped is not a property of the repo. That writer's
+# own doc comment asserted this file was already ignored "(workspaces/* is
+# gitignored at the repo root)", which was never true: only the .session-notes
+# entry above is. So the log sat untracked and surfaced as `git status` noise in
+# every /sweep from 2026-08-04 on. Same class as .session-notes; ignored here,
+# and the false comment corrected at the writer.
+workspaces/**/.journal-skipped.log
+
+# COC eval environment — durable code (lib/, schemas/, tests/, fixtures/,
+# suites/, conftest.py, run.py) is tracked. Only ephemeral run state is
+# ignored. The legacy `coc-eval/coc-env/` workspace and per-run results
+# are local-only.
+coc-eval/__pycache__/
+coc-eval/.pytest_cache/
+coc-eval/.benchmarks/
+coc-eval/coc-env/
+coc-eval/results/
+coc-eval/bench/results/
+coc-eval/scaffolds/output/
+coc-eval/run-environment-pin.json
+coc-eval/**/__pycache__/
+# Vector 3 — append-only longitudinal events file. Regenerable from
+# `coc-eval/results/_history/<YYYY-MM>/*.jsonl.gz` archives. Gitignored
+# by default; operators may opt-in to commit the file when reproducible
+# cross-version dashboards matter for the repo.
+coc-eval/baselines-longitudinal.json
+.playwright-mcp/
+.claude/worktrees/
+
+# PR-CA9b — stub binaries (built per CI run, never committed)
+coc-eval/bench/stubs/stub-claude
+coc-eval/bench/stubs/stub-codex
+coc-eval/bench/stubs/stub-gemini
+# Unprefixed symlinks emitted by build-stubs.sh
+coc-eval/bench/stubs/claude
+coc-eval/bench/stubs/codex
+coc-eval/bench/stubs/gemini
+
+# Transient side file from scripts/generate-third-party-licenses.sh
+# (mktemp "THIRD-PARTY-LICENSES.md.XXXXXX"; trap-cleaned on every exit, this is
+# defense-in-depth against a SIGKILL leaving one staged).
+THIRD-PARTY-LICENSES.md.*
+
+# Research scratch — intermediate retrieval artefacts (base64-encoded PDFs for
+# tool transport, page dumps, grep-context extracts). Every finding drawn from
+# these is distilled into the tracked tree WITH its primary-source citation, so
+# the scratch is regenerable and must not be committed. Large base64 artefacts
+# in particular: files over 10 MB must never be committed, and git never
+# forgets. (Incident history is in the journal, not here — `.gitignore` is not
+# stripped by the community extraction, so it must carry no internal narrative.)
+/*_b64.txt
+/*_ctx.txt
+/helm-safety.yml
+
+
+
+# .env backups — same secrets as .env; an untracked one is a `git add -A` away
+# from being committed (near-miss 2026-08-31).
+.env.bak*
+.env.*.bak
+
+# Quarantined stale release artifacts. Kept on disk as a recovery fallback but
+# NEVER committed: >10 MB each, which `git.md` MUST NOT #4 blocks outright, and
+# git never forgets a large blob. Ignored rather than merely uncommitted so the
+# worktree-drift guard can reach CLEAN — a guard that reports a permanent,
+# deliberate exception on every run is one operators learn to skip
+# (durable-instruments.md MUST-1), and this trunk's whole point is that the
+# guards must be able to terminate.
+.stale-artifacts-*/
+
+# dev-preflight receipt — written at repo root (NOT the .git admin subtree,
+# which is a protected path here). Untracked by design: it is bound to one SHA
+# and is evidence for a single push, never repo content.
+.csq-dev-preflight.json
+.claude/test-harness/results/

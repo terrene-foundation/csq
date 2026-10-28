@@ -1,0 +1,400 @@
+//! `csq.verify.v1` builder — maps the internal chain-verify result onto the public
+//! `csq-sdk` [`VerifyPayload`] DTO, supplying `EDITION`.
+//!
+//! This op wraps the existing chain-integrity verdict ([`crate::audit::VerifyJsonOutput`],
+//! spec 12 §12.13.5) in the shared SDK envelope so a consumer discovers it via
+//! `csq sdk capabilities` and branches on the same `schema` / `ok` surface every op
+//! shares. The value it delivers (SDK-plan §S2 value-anchor): **a never-inherit-unproven
+//! gate** — a caller runs `csq audit verify --json`, reads `ok`, and refuses to build on
+//! an unproven chain.
+//!
+//! ## Why the builder is app-side
+//!
+//! The wire SHAPE ([`VerifyPayload`] + its [`VerifyKeyGap`](super::VerifyKeyGap) /
+//! [`VerifyFailureDetail`](super::VerifyFailureDetail) sub-DTOs) lives in `csq-sdk`. The
+//! MAPPING from csq-core's internal `VerifyJsonOutput` (whose sub-fields are the internal
+//! `crate::audit::VerifyJsonKeyGap` / `crate::audit::VerifyFailureDetail` types) onto
+//! those wire DTOs is app glue and stays here — the internal audit type is free to evolve
+//! without disturbing the public wire contract (an internal journal entry, the mirror decision).
+//!
+//! ## Verdict semantics
+//!
+//! Verify ALWAYS produces a verdict, so this op uses [`Envelope::verdict`](super::Envelope::verdict):
+//! the payload rides EVERY outcome, and `ok = result.is_ok()` reflects chain health (a
+//! clean or historically-degraded chain is `ok:true` / exit 0; a `KeyNotFound`/integrity
+//! failure is `ok:false`). The caller (`csq audit verify`) still derives the 3-valued
+//! process exit code (0/1/2) from the same `result` via [`crate::audit::exit_code_for_error`];
+//! this envelope does not encode it (the binary `ok` cannot carry the partial/integrity
+//! distinction — the exit code and the `status` field do).
+
+use super::{Envelope, VerifyPayload, EDITION, SCHEMA_VERIFY_V1};
+use crate::audit::{to_json_output, LedgerError, VerifyJsonOutput, VerifySummary};
+
+/// Build the `csq.verify.v1` envelope from a `verify_chain` result.
+///
+/// `enterprise_licensed` gates the two enterprise-only fields (`trust_plane_grade`,
+/// `verification_level_summary`): an enterprise binary with no valid license passes `false`,
+/// suppressing them so the wire shape matches community (task #77 gate-coverage — the trust
+/// grade is enterprise-differentiated output the use-only binary must not leak). Community
+/// builds already have these `None` from `to_json_output`, so the flag is a no-op there; the
+/// CLI passes `true` in community and the `enforce`-derived result in enterprise.
+///
+/// `record_verification_level` is the per-record `VerificationLevel` string (community field)
+/// populated when `--record <id>` was supplied; `None` when the flag was absent; `"NOT_FOUND"`
+/// when the id was supplied but not found in the chain.
+#[must_use]
+pub fn build_verify_envelope(
+    result: &Result<VerifySummary, LedgerError>,
+    enterprise_licensed: bool,
+    record_verification_level: Option<String>,
+) -> Envelope<VerifyPayload> {
+    let ok = result.is_ok();
+    let json_out = to_json_output(result);
+    let mut payload = payload_from_json_output(json_out, EDITION, record_verification_level);
+    if !enterprise_licensed {
+        // Unlicensed enterprise binary → present the community wire shape.
+        payload.trust_plane_grade = None;
+        payload.verification_level_summary = None;
+    }
+    Envelope::verdict(SCHEMA_VERIFY_V1, None, ok, payload)
+}
+
+/// Map csq-core's internal [`VerifyJsonOutput`] onto the public `csq-sdk`
+/// [`VerifyPayload`] DTO, converting the two mirrored sub-DTOs and tagging `edition`.
+/// Consumes the `VerifyJsonOutput` (moves the gap vec + failure detail — no clone).
+/// `record_verification_level` is the community-field per-record level string from the
+/// `--record <id>` lookup, or `None` when the flag was absent.
+fn payload_from_json_output(
+    o: VerifyJsonOutput,
+    edition: &'static str,
+    record_verification_level: Option<String>,
+) -> VerifyPayload {
+    let mut payload = VerifyPayload::new(o.status, o.verified_count, o.skipped_v1_count, edition)
+        .with_unknown_kind_count(o.unknown_kind_count)
+        .with_skipped_truncated_count(o.skipped_truncated_count)
+        .with_historical_key_gaps(
+            o.historical_key_gaps
+                .into_iter()
+                .map(|g| csq_sdk::VerifyKeyGap::new(g.key_id, g.first_seq, g.last_seq, g.count))
+                .collect(),
+        );
+    if let Some(d) = o.failure_detail {
+        payload = payload.with_failure_detail(csq_sdk::VerifyFailureDetail::new(d.kind, d.message));
+    }
+    if let Some(grade) = o.trust_plane_grade {
+        payload = payload.with_trust_plane_grade(grade);
+    }
+    if let Some(summary) = o.verification_level_summary {
+        payload = payload.with_verification_level_summary(summary);
+    }
+    if let Some(level) = record_verification_level {
+        payload = payload.with_record_verification_level(level);
+    }
+    payload
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::types::{KeyId, Sha256Hex};
+    use crate::audit::verify::KeyGap;
+
+    // The builder maps `&Result<VerifySummary, LedgerError>` → envelope. Tests
+    // construct those values directly (VerifySummary derives Default; LedgerError
+    // variants are public) so the unit tests exercise the mapping in isolation,
+    // with no chain-staging or keychain dependency.
+
+    fn expected_edition() -> &'static str {
+        if cfg!(feature = "enterprise") {
+            "enterprise"
+        } else {
+            "community"
+        }
+    }
+
+    #[test]
+    fn clean_chain_is_ok_true_verdict_with_status_ok_and_edition() {
+        let result: Result<VerifySummary, LedgerError> = Ok(VerifySummary {
+            verified_count: 7,
+            ..VerifySummary::default()
+        });
+        let env = build_verify_envelope(&result, true, None);
+        let line = env.to_line().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["schema"], "csq.verify.v1");
+        assert_eq!(v["ok"], true, "a clean chain is ok:true");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["verified_count"], 7);
+        assert!(
+            v.get("error").is_none(),
+            "verdict envelope carries no error"
+        );
+        assert!(v.get("failure_detail").is_none(), "ok verdict omits detail");
+        // `edition` is always present (the HIGH-1 discriminant).
+        assert_eq!(v["edition"], expected_edition());
+        // LOW-2 (AC#2 wire-omission proof): absent `--record` (None) MUST omit the field
+        // from the wire entirely — byte-identical back-compat guarantee.
+        // Mirrors the `community_omits_enterprise_only_fields` guard style.
+        assert!(
+            !line.contains("record_verification_level"),
+            "absent --record must omit the field from wire: {line}"
+        );
+    }
+
+    #[test]
+    fn historical_gap_is_ok_true_status_partial_historical_with_gaps() {
+        // Chain-linked but signature-skipped for a rotated-out key → Ok(summary)
+        // with gaps → ok:true (exit 0), inheritable-but-degraded.
+        let result: Result<VerifySummary, LedgerError> = Ok(VerifySummary {
+            verified_count: 4,
+            historical_key_gaps: vec![KeyGap {
+                key_id: "ed25519:aa".to_string(),
+                first_seq: 1,
+                last_seq: 3,
+                count: 3,
+            }],
+            ..VerifySummary::default()
+        });
+        let env = build_verify_envelope(&result, true, None);
+        let v: serde_json::Value = serde_json::from_str(&env.to_line().unwrap()).unwrap();
+        assert_eq!(v["ok"], true, "degraded-but-linked is ok:true");
+        assert_eq!(v["status"], "partial_historical");
+        assert_eq!(v["historical_key_gaps"][0]["count"], 3);
+        assert!(v.get("failure_detail").is_none());
+    }
+
+    /// THE SECURITY GAP THIS CLOSES (2026-09-13, second instance).
+    ///
+    /// `to_json_output` never consulted `limit_exceeded_count`, so a scan that
+    /// examined only the chain's tail reported a bare `"ok"` — and, unlike
+    /// `GET /api/audit/health` (which at least carried `records_unverified`
+    /// alongside), this payload had NO field disclosing it at all.
+    /// `skipped_v1_count` counts v1-schema records, not truncated ones.
+    ///
+    /// Under truncation `verify_chain` skips exactly the two ANTI-truncation
+    /// checks — the genesis seq-0 requirement, and the first record's `prev_hash`
+    /// link (seeded FROM the record itself, then counted as verified) — so the
+    /// oldest surviving record is anchored to nothing and deletion of the oldest
+    /// records is undetectable. A CI job gating on `status == "ok"` passed.
+    #[test]
+    fn truncated_scan_is_not_reported_as_a_whole_chain_ok() {
+        let result: Result<VerifySummary, LedgerError> = Ok(VerifySummary {
+            verified_count: 10_000,
+            limit_exceeded_count: 1_660,
+            ..VerifySummary::default()
+        });
+        let env = build_verify_envelope(&result, true, None);
+        let v: serde_json::Value = serde_json::from_str(&env.to_line().unwrap()).unwrap();
+        assert_eq!(
+            v["status"], "partial_truncated",
+            "a tail-only scan MUST NOT report the whole-chain status"
+        );
+        assert_eq!(
+            v["skipped_truncated_count"], 1_660,
+            "the payload must disclose how many oldest records went unexamined"
+        );
+        // Deliberately ok:true / exit 0, matching the `partial_historical`
+        // precedent: outgrowing the record limit is a coverage fact, not a tamper
+        // signal, and failing it would fire on every chain past the limit. A
+        // consumer needing whole-chain coverage tests `status`, never `ok`.
+        assert_eq!(v["ok"], true, "truncation is not a tamper signal");
+        assert!(v.get("failure_detail").is_none());
+    }
+
+    /// An untruncated clean scan stays plainly `"ok"` with the new field omitted —
+    /// the over-correction guard. Without this, a fix that always reported
+    /// truncation would also pass the test above.
+    #[test]
+    fn untruncated_clean_scan_is_still_plain_ok_with_the_field_omitted() {
+        let result: Result<VerifySummary, LedgerError> = Ok(VerifySummary {
+            verified_count: 7,
+            limit_exceeded_count: 0,
+            ..VerifySummary::default()
+        });
+        let line = build_verify_envelope(&result, true, None)
+            .to_line()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert!(
+            !line.contains("skipped_truncated_count"),
+            "a whole-chain scan must keep the pre-field wire shape: {line}"
+        );
+    }
+
+    /// PRECEDENCE PARITY. `to_json_output` (this surface) and
+    /// `AuditHealth::from_verify_result` (`csq doctor --json` +
+    /// `GET /api/audit/health`) are INDEPENDENT producers reading the same
+    /// `VerifySummary`. Nothing in the type system ties them together — which is
+    /// precisely how they came to disagree in the first place. This pins their
+    /// classification of the same summary to each other across all four cases.
+    #[test]
+    fn verify_status_and_audit_health_classify_the_same_summary_alike() {
+        use crate::audit::AuditHealth;
+
+        let gap = || KeyGap {
+            key_id: "ed25519:aa".to_string(),
+            first_seq: 1,
+            last_seq: 3,
+            count: 3,
+        };
+
+        // (summary, expected verify status, expected AuditHealth discriminant)
+        let cases: Vec<(VerifySummary, &str, &str)> = vec![
+            (
+                VerifySummary {
+                    verified_count: 7,
+                    ..VerifySummary::default()
+                },
+                "ok",
+                "verified",
+            ),
+            (
+                VerifySummary {
+                    verified_count: 7,
+                    limit_exceeded_count: 5,
+                    ..VerifySummary::default()
+                },
+                "partial_truncated",
+                "tail_verified",
+            ),
+            (
+                VerifySummary {
+                    verified_count: 7,
+                    historical_key_gaps: vec![gap()],
+                    ..VerifySummary::default()
+                },
+                "partial_historical",
+                "degraded",
+            ),
+            // BOTH conditions: each producer must resolve the tie the SAME way —
+            // gaps outrank truncation, because a gap carries per-gap detail an
+            // operator acts on.
+            (
+                VerifySummary {
+                    verified_count: 7,
+                    limit_exceeded_count: 5,
+                    historical_key_gaps: vec![gap()],
+                    ..VerifySummary::default()
+                },
+                "partial_historical",
+                "degraded",
+            ),
+        ];
+
+        for (summary, want_status, want_health) in cases {
+            let result: Result<VerifySummary, LedgerError> = Ok(summary);
+            let out = crate::audit::to_json_output(&result);
+            let health = AuditHealth::from_verify_result(&result);
+            let health_tag = serde_json::to_value(&health).unwrap()["status"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(
+                out.status, want_status,
+                "verify --json status for {result:?}"
+            );
+            assert_eq!(health_tag, want_health, "AuditHealth for {result:?}");
+        }
+    }
+
+    #[test]
+    fn integrity_failure_is_ok_false_verdict_that_keeps_the_payload() {
+        // The load-bearing invariant test: a negative verdict still carries the
+        // payload (status + failure_detail) and NO error object.
+        let err: Result<VerifySummary, LedgerError> = Err(LedgerError::ChainBroken {
+            seq: 3,
+            expected_prev: Sha256Hex::genesis(),
+            actual_prev: Sha256Hex::genesis(),
+        });
+        let env = build_verify_envelope(&err, true, None);
+        let v: serde_json::Value = serde_json::from_str(&env.to_line().unwrap()).unwrap();
+        assert_eq!(v["schema"], "csq.verify.v1");
+        assert_eq!(v["ok"], false, "an integrity failure is ok:false");
+        assert_eq!(v["status"], "integrity_failure");
+        assert!(
+            v.get("error").is_none(),
+            "verdict envelope has NO error object even on failure"
+        );
+        assert_eq!(
+            v["failure_detail"]["kind"], "chain_broken",
+            "the failure detail rides the payload, not an error object"
+        );
+        assert_eq!(v["verified_count"], 0);
+        assert_eq!(v["edition"], expected_edition());
+    }
+
+    #[test]
+    fn key_not_found_is_ok_false_status_partial() {
+        // KeyNotFound → exit-2 "partial"; ok:false (Err), status "partial".
+        let err: Result<VerifySummary, LedgerError> = Err(LedgerError::KeyNotFound {
+            key_id: KeyId::try_new(format!("ed25519:{}", "d".repeat(64))).unwrap(),
+        });
+        let env = build_verify_envelope(&err, true, None);
+        let v: serde_json::Value = serde_json::from_str(&env.to_line().unwrap()).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["status"], "partial");
+        assert_eq!(v["failure_detail"]["kind"], "key_not_found");
+    }
+
+    #[test]
+    fn envelope_serializes_to_a_single_line() {
+        // R3: even a message with embedded newlines stays one physical line.
+        let err: Result<VerifySummary, LedgerError> = Err(LedgerError::KeyNotFound {
+            key_id: KeyId::try_new(format!("ed25519:{}", "0".repeat(64))).unwrap(),
+        });
+        let env = build_verify_envelope(&err, true, None);
+        let line = env.to_line().unwrap();
+        assert_eq!(
+            line.matches('\n').count(),
+            0,
+            "verify envelope must be one physical line: {line}"
+        );
+    }
+
+    /// Community: the two enterprise-only fields are omitted from the wire
+    /// (byte-identical schema), disambiguated by the always-present `edition`.
+    #[cfg(not(feature = "enterprise"))]
+    #[test]
+    fn community_omits_enterprise_only_fields() {
+        let result: Result<VerifySummary, LedgerError> = Ok(VerifySummary::default());
+        let env = build_verify_envelope(&result, true, None);
+        let line = env.to_line().unwrap();
+        assert!(
+            !line.contains("trust_plane_grade"),
+            "community wire must omit trust_plane_grade: {line}"
+        );
+        assert!(
+            !line.contains("verification_level_summary"),
+            "community wire must omit verification_level_summary: {line}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["edition"], "community");
+    }
+
+    /// Enterprise gate-coverage (task #77): an unlicensed enterprise binary
+    /// (`enterprise_licensed=false`) suppresses the two enterprise-only fields, presenting
+    /// the community wire shape so the use-only binary does not leak the trust-plane grade.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn unlicensed_enterprise_suppresses_trust_plane_fields() {
+        let result: Result<VerifySummary, LedgerError> = Ok(VerifySummary {
+            verified_count: 3,
+            ..VerifySummary::default()
+        });
+        let denied = build_verify_envelope(&result, false, None)
+            .to_line()
+            .unwrap();
+        assert!(
+            !denied.contains("trust_plane_grade"),
+            "unlicensed enterprise wire must omit trust_plane_grade: {denied}"
+        );
+        assert!(
+            !denied.contains("verification_level_summary"),
+            "unlicensed enterprise wire must omit verification_level_summary: {denied}"
+        );
+        // The `edition` discriminant is NOT gated — only the enterprise fields are.
+        let v: serde_json::Value = serde_json::from_str(&denied).unwrap();
+        assert_eq!(v["edition"], "enterprise");
+    }
+}

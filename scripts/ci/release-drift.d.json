@@ -1,0 +1,39 @@
+{
+  "$comment": [
+    "Declaration for scripts/verify/release-drift.sh — edit THIS, never the",
+    "script's internals, so there is exactly one place a number lives.",
+    "",
+    "WHY THIS EXISTS. On 2026-09-02 `main` was 1,242 commits past the v2.18.0",
+    "tag (441 fix, 112 feat) with the workspace version STILL reading 2.18.0.",
+    "Nothing anywhere said so. `version-lockstep` was green the whole time —",
+    "correctly, because it only checks that tauri.conf.json, Cargo.toml and",
+    "community main agree WITH EACH OTHER, and three files agreeing on a stale",
+    "version is exactly as true after 1,242 commits as before. The release",
+    "machinery was never broken; a release was simply never started, because the",
+    "version on main equalled the last released version and no gate cared.",
+    "",
+    "This measures the thing that actually drifted."
+  ],
+  "threshold_commits": 250,
+  "$why_threshold": [
+    "250 separates two named outcomes. Below it: a normal release cadence — the",
+    "gaps between v2.16.x and v2.18.0 were tens of commits, not hundreds. Above",
+    "it: a release that has been forgotten rather than deferred, which is the",
+    "state this exists to surface. It is a DECLARED assumption, written here so a",
+    "reader can disagree with a specific number rather than an invisible one."
+  ],
+  "grandfathered_until": "2026-10-01",
+  "$why_grandfather": [
+    "Current drift is far past the threshold, and a gate that fails every PR on",
+    "day one is a gate the first person it blocks disables — the override habit",
+    "forms because an instrument is unactionable, not because it is loud",
+    "(instrument-discipline.md MUST-1). So until this date the gate WARNS loudly",
+    "and exits 0; after it, drift past the threshold FAILS.",
+    "",
+    "This is the calendar backstop from completion-criterion.md MUST-6: an",
+    "event trigger that never fires parks forever, so the deferral has a date on",
+    "it. Cutting the release is what clears this — not moving the date. Moving it",
+    "requires its own dated rationale here, because that is how this gate gets",
+    "quietly defeated."
+  ]
+}

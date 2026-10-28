@@ -1,0 +1,45 @@
+{
+  "directives": [
+    {
+      "directive": {
+        "expires_at": 5100,
+        "id": "7d1e0a52-3c1b-4f6e-9a2d-1b2c3d4e5f60",
+        "issued_at": 1400,
+        "issuer": "trestle-steward",
+        "kind": "delete_scratch",
+        "schema": "csq.directive.v1",
+        "scope": "only paths this session created",
+        "suggested": [
+          "rm -rf <old clone in your scratch dir>"
+        ],
+        "summary": "Your scratch directory holds 5.5 GiB; please delete what no live task will reopen.",
+        "target": {
+          "host": "host-1",
+          "pid": 4242,
+          "started_at": 1000
+        },
+        "why": {
+          "measured_at": 1390,
+          "metric": "session_scratch_bytes",
+          "source": "du -sk <scratch dir>",
+          "threshold": 2147483648.0,
+          "value": 5905580032.0
+        }
+      },
+      "receipt": {
+        "ack": {
+          "note": "moved to trestle run",
+          "outcome": "done"
+        },
+        "acknowledged_at": 1700,
+        "expires_at": 5100,
+        "id": "7d1e0a52-3c1b-4f6e-9a2d-1b2c3d4e5f60",
+        "queued_at": 1500,
+        "status": "acknowledged",
+        "surfaced_at": 1600
+      }
+    }
+  ],
+  "ok": true,
+  "schema": "csq.directive_inbox.v1"
+}

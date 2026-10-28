@@ -1,0 +1,26 @@
+{
+  "subject": "Sizing declarations for shipped public workflows only.",
+  "measurement": "Workflow declarations; no execution observations retained.",
+  "authority": "The shipped workflow timeout-minutes declaration is authoritative.",
+  "new_job_limits": {
+    "binding-guard-parity.yml": {
+      "binding-guard-parity": [
+        5,
+        "Declared in the shipped workflow; null means no explicit timeout."
+      ]
+    },
+    "daemon-twin-parity.yml": {
+      "daemon-twin-parity": [
+        5,
+        "Declared in the shipped workflow; null means no explicit timeout."
+      ]
+    },
+    "test.yml": {
+      "test": [
+        null,
+        "Declared in the shipped workflow; null means no explicit timeout."
+      ]
+    }
+  },
+  "observed_jobs": {}
+}

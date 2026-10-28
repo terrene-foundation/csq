@@ -1,0 +1,246 @@
+[workspace]
+resolver = "2"
+members = [
+  "csq-core",
+  "csq",                      # Single-binary csq CLI and desktop.
+  "csq-merkle",              # RFC 6962 Merkle verifier leaf (dep of csq-ledger; csq-core does not use it).
+  "csq-redact",              # W1 community leaf: token redaction + RedactedString (dep of csq-sdk).
+  "csq-sdk",                 # W2 public wire contract: SDK envelope/error/adapter + payload DTOs.
+  "csq-ledger",              # M10 Foundation-owned transparency-log server.
+]
+
+[workspace.package]
+version = "2.21.3"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/terrene-foundation/csq"
+
+[workspace.dependencies]
+# csq-redact — community (Apache-2.0) leaf crate: token redaction + the
+# RedactedString newtype, extracted from csq-core (W1). csq-core re-exports it so
+# existing callsites are unchanged; the public csq-sdk (W2) depends on it directly.
+# `version` is REQUIRED alongside `path` (W3): csq-sdk is now publishable and
+# depends on csq-redact via `.workspace = true`, so `cargo publish -p csq-sdk`
+# needs a crates.io version on this dep (a bare path dep fails publish). Local
+# builds use the path; the published crate carries the version. This literal MUST
+# equal workspace.package.version. `/release` bumps workspace.package.version but
+# NOT these dep literals (nor the enterprise SDK crate's `=X.Y.Z` pin), so the
+# `version_pins_match_workspace` test in the enterprise SDK crate fails closed on drift
+# until W5 automates the bump — do NOT trust the /release flow to keep these in sync.
+csq-redact = { path = "csq-redact", version = "2.21.3" }
+# csq-sdk — public (Apache-2.0) SDK wire contract (W2): envelope/error/adapter +
+# payload DTOs. csq-core depends on it and re-exports it (crate::sdk::*); the
+# builders (EDITION + audit->DTO mapping) live app-side in csq-core. `version`
+# alongside `path` for the same publishability reason as csq-redact above; the same
+# `version_pins_match_workspace` guard covers this literal.
+csq-sdk = { path = "csq-sdk", version = "2.21.3" }
+# csq-merkle — RFC 6962 Merkle verifier leaf crate (publish=false). csq-ledger
+# depends on it; csq-core does NOT (nothing there calls it, so the dependency was
+# dropped — rustc nightly's `unused_dependencies` lint). No `version` alongside `path`
+# is needed because it is not published and no publishable (OPEN) crate depends on it —
+# it is PROPRIETARY (publish=false) reached only by PROPRIETARY crates, the allowed
+# edition-boundary direction. Zero enterprise deps; ships to community
+# (COMMUNITY_SHIPPED_PROPRIETARY). A future csq-core caller re-adds the edge.
+csq-merkle = { path = "csq-merkle" }
+serde = { version = "1", features = ["derive"] }
+# `raw_value` enables `serde_json::value::RawValue` — verbatim JSON capture used
+# by the audit-chain forward-compat path (`csq-core/src/audit/opaque.rs`) to
+# preserve byte-identity of unknown-kind records for canonical-hash recompute.
+# Declared explicitly rather than relying on a transitive activation (fail-safe).
+serde_json = { version = "1", features = ["raw_value"] }
+# `toml` parses + serializes TOML 1.0 documents. Added in PR-CA8 commit 2
+# for codex `config.toml` per-spawn merge per spec 10 §10.4.6.1. Exact-
+# minor-version pin per round-2 R2-H1: `toml::to_string` output is not
+# byte-stable across major or minor versions; the property-test suite
+# in `coc/translate/codex_merge.rs` MUST re-run against codex's TOML
+# parser before bumping the minor. The intra-minor patch float (1.1.x)
+# is OK — patches preserve serializer output by semver contract.
+toml = "1"
+thiserror = "2"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+# tracing-log is a default feature that silently installs a
+# LogTracer via log::set_logger when `.try_init()` runs. The csq
+# desktop surface registers tauri-plugin-log which ALSO installs a
+# log facade — the second installation fails with SetLoggerError
+# and panics the desktop app at startup. Disable tracing-log (and
+# re-enable the other defaults we actually use) to keep the two
+# systems separate.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "registry", "std", "ansi", "smallvec"] }
+# tracing-appender — the daemon's persistent rolling-file log (#1a-2,
+# daemon-auth-resilience Wave A2). Default features ONLY: unlike
+# tracing-subscriber (see the comment above), tracing-appender's own
+# dependency graph is crossbeam-channel + time + a small file-rolling
+# helper — it does NOT pull in tracing-log itself. Verified per-PR via
+# `cargo tree -p csq -i tracing-log` (must show no NEW path through this
+# crate); the pre-existing disabled path stays disabled.
+tracing-appender = "0.2"
+hex = "0.4"
+sha2 = "0.10"
+# HKDF (RFC 5869) over SHA-256 — RustCrypto family, consistent with the existing
+# aes-gcm / sha2 / ed25519-dalek set (no FFI, audited pure Rust). Used by M-DEK's
+# enterprise-only org-root ceremony to derive the org KEK from the XOR of the
+# participants' entropy shares. Already present transitively (Cargo.lock); promoting
+# to a direct workspace dep gives a stable public API surface and one version pin.
+hkdf = "0.12"
+unicode-normalization = "0.1"
+unicode-general-category = "1.1"
+secrecy = { version = "0.10", features = ["serde"] }
+libc = "0.2"
+tempfile = "3"
+urlencoding = "2"
+# Date/time math for the pay-per-token billing ledger. Used in
+# usage::ledger::summarize for rolling time-window aggregation. `default-
+# features = false` drops the platform-clock backend we don't need; we
+# pass our own `now` into summarize so deterministic tests work without
+# touching the real clock.
+chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
+# UUID v4 for identity-keyed account storage.
+# `v4` is the only variant used (random UUIDs); `serde` enables round-trip
+# through identity store JSON files. First new runtime dep added since
+# v2.0.0; dependency approval followed the project
+# independence review for the identity-storage migration.
+uuid = { version = "1", features = ["v4", "serde"] }
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+dirs = "6"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "blocking"] }
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json", "query"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tower = { version = "0.5", features = ["util"] }
+base64 = "0.22"
+getrandom = "0.2"
+security-framework = "3"
+# `zeroize` pins the SigningKey seed-scrub-on-drop guarantee that M-DEK's seat
+# DEK custody (`audit::key_hierarchy`) and every other Ed25519 seed holder rely
+# on — declared here rather than left to cross-crate feature unification, so the
+# property cannot silently vanish if another crate drops the feature.
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+# Gemini PR-G2a — encryption-at-rest primitives for the platform::secret
+# fallback path (Linux without Secret Service / explicit opt-in). RustCrypto
+# audited pure Rust; no FFI.
+#
+# `zeroize wipes secret material before drop` was WRITTEN here before it was
+# TRUE (doc-property-claims.md — a claim asserted, not verified): by default
+# neither `aes-gcm` nor its `aes` dependency enables their own optional
+# `zeroize` features (verified via `cargo tree -e features -i aes-gcm` / `-i
+# aes` — neither appeared in the resolved feature set for this workspace
+# before this line was added), so `AesGcm`'s ephemeral GHASH subkey
+# (`ghash_key.zeroize()`, aes-gcm's `src/lib.rs`) and `aes::Aes256`'s
+# round-key schedule (`impl ZeroizeOnDrop for Aes256`, aes's
+# `src/autodetect.rs` / `armv8.rs` — gated identically to
+# `ed25519-dalek`'s `SigningKey` below) were BOTH silently unwiped in every
+# csq build to date. `features = ["zeroize"]` below closes the `aes-gcm`
+# half explicitly (its own scrub, not forwarded to its `aes` dependency);
+# the direct `aes` line further down closes the round-key half — `aes` is
+# not otherwise imported by name anywhere in csq, it exists solely to pin
+# that transitive feature (`durable-instruments.md` MUST-1: the property
+# rests on a dependency feature and had no instrument that would notice
+# its absence — see `audit::key_hierarchy::keys`'s compile-time assertions
+# for both types).
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+# Pinned SOLELY to enable its `zeroize` feature for the `Aes256`/`Aes128`
+# round-key-schedule scrub-on-drop (see the aes-gcm comment above) — `aes-gcm`
+# depends on this transitively and does not forward the feature itself, so a
+# direct pin is the only way to turn it on. Version MUST track whatever
+# `aes-gcm` 0.10's Cargo.lock resolves (currently 0.8.x) or this becomes a
+# SEPARATE crate instance in the graph and the feature no longer unifies with
+# aes-gcm's copy — verify with `cargo tree -i aes` after any aes-gcm bump.
+aes = { version = "0.8", features = ["zeroize"] }
+# Linux Secret Service 5 uses separate AES/CBC versions. These direct anchors
+# scrub the owning AES schedule and CBC IV; they do not scrub Session/DH
+# buffers, VAES temporaries, registers, or every copy of secret material.
+secret-service-aes = { package = "aes", version = "0.9", default-features = false, features = ["zeroize"] }
+secret-service-cbc = { package = "cbc", version = "0.2", default-features = false, features = ["zeroize"] }
+argon2 = "0.5"
+zeroize = { version = "1", features = ["derive"] }
+# `subtle` provides constant-time equality (`ConstantTimeEq`) for
+# comparing OAuth state tokens. Already a transitive dep of
+# `ed25519-dalek` / `aes-gcm`, so adding it as a direct workspace dep
+# does not pull anything new into the build graph — only gives us the
+# public API surface. Kept at workspace level so both `csq-core` (state
+# store + race) and `csq` (race state-token compare in the desktop
+# surface) share the same version.
+#
+# `core_hint_black_box`: without it, `Choice`'s optimization barrier (the
+# thing standing between "constant-time compare" and "the compiler proved
+# it can skip work and turned it back into an early-exit branch") is a
+# hand-rolled `core::ptr::read_volatile` shim the crate's own source calls
+# "best-effort... a continually moving target" — written for pre-stabilization
+# Rust. This feature switches to the stdlib's own `core::hint::black_box`
+# (stable since 1.66; this workspace's toolchain is 1.94), which is the
+# barrier the crate's authors actually intend for stable Rust today. Zero
+# downside found: the feature adds no dependency, needs no `std`/`alloc`, and
+# was simply never opted into when `default-features = false` (above) turned
+# off subtle's OWN unrelated defaults (`std`, `i128`) at the same time.
+subtle = { version = "2", default-features = false, features = ["core_hint_black_box"] }
+# Gemini PR-G2a.2 — Linux Secret Service / kwallet via D-Bus. The crate's
+# `rt-tokio-crypto-rust` feature picks tokio for the async runtime and
+# RustCrypto for session-key crypto so we keep the no-OpenSSL-FFI posture.
+# Linux-only — the crate itself does not compile on macOS / Windows.
+secret-service = { version = "5", default-features = false, features = ["rt-tokio-crypto-rust"] }
+# PR-CA9b T18 originally used bincode 1.3.3 for the parse-cache wire format,
+# but bincode 1.x AND 2.x are both flagged unmaintained (RUSTSEC-2024-0419,
+# RUSTSEC-2025-0141). The use case is trivial — length-prefix + bytes for a
+# single Vec<u8> — so the dependency is dropped entirely. The on-disk format
+# (`u64 LE length || bytes`) is bit-identical to bincode 1.x's
+# `with_fixint_encoding`, so existing 0x0001 caches keep working.
+# `regex` is used by `audit::persist` to validate RULE_ID strings against
+# `^[A-Z][A-Z0-9-]{1,32}$` (B6 mitigation, spec 12 §12.5). Already a
+# transitive dep via `tracing-subscriber` / `tower`; promoting to a direct
+# workspace dep gives a stable API surface and version pin in one place.
+regex = "1"
+# `async-trait` enables async methods on traits with object-safe vtables.
+# The audit sink interface introduces `audit::LedgerSink`
+# whose `append` / `verify_at` methods are async and reachable through
+# `dyn LedgerSink` from the daemon. Until rustc stabilises async fn in
+# trait objects (rust-lang/rust#91611), the macro is the standard path.
+async-trait = "0.1"
+# `keyring` provides a single cross-platform API for OS keychain storage:
+# macOS Keychain, Linux Secret Service (D-Bus), Windows Credential Manager.
+# Audit signing uses it for signing-key custody under the
+# `csq-audit-signing` service name. The per-platform-fidelity argument for
+# native crates doesn't apply to signing-key storage (simpler than OAuth
+# tokens); `keyring` ships one API across 3 platforms in one milestone.
+# PRIMARY METHODOLOGICAL DIRECTIVE M04: `security-framework` (macOS),
+# `secret-service` (Linux), and `windows-rs` (Windows) are BLOCKED for
+# signing-key custody — all keychain access goes through `keyring`.
+# Platform features enable real OS keychain backends:
+#   apple-native   — macOS Keychain via security-framework (keyring-internal dep)
+#   windows-native — Windows Credential Manager
+# Without these features, keyring falls back to an in-memory mock that does
+# not persist between calls; tests and production storage would both fail silently.
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
+# `jsonschema` validates JSON values against a JSON Schema document.
+# Used by the Phase-2b governance enforcement loop (T1a.3) to validate
+# provider responses against the response_format JSON Schema constraint.
+# Optional — compiled only in enterprise builds (csq-core `enterprise` feature).
+# Pure-Rust; no C FFI added to the build graph.
+jsonschema = { version = "0.46", default-features = false }
+
+# ── Build-cache hygiene: bounded sccache instead of unbounded incremental ──────
+# Cargo's per-crate incremental cache grows WITHOUT BOUND across this workspace's
+# many build configurations (check / clippy / nextest / doc / feature matrices /
+# --no-default-features), because Cargo's built-in cleanup barely prunes it — a
+# single machine accumulated 16k+ incremental dirs (100s of GB) in days.
+#
+# Crucially, incremental compilation DISABLES sccache: sccache bails on incremental
+# builds, so with incremental ON the (already-wired) `rustc-wrapper = sccache` in
+# `~/.cargo/config.toml` never caches anything — the same bounded, content-addressed
+# cache CI uses is left idle while the unbounded incremental path balloons.
+#
+# Turning incremental OFF for dev/test lets sccache actually cache, capping the
+# on-disk cache to tens of GB (CI builds this workspace in ~7 GB via sccache).
+# Trade-off: a warm single-crate rebuild is slightly slower, offset by sccache +
+# the targeted `cargo <cmd> -p <crate>` builds this repo already mandates.
+[profile.dev]
+incremental = false
+
+[profile.test]
+incremental = false
+
+[workspace.lints.rust]
+unexpected_cfgs = "allow"

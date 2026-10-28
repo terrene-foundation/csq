@@ -1,0 +1,10 @@
+{
+  "schema_version": "1",
+  "provider": "openai",
+  "captured_at": null,
+  "captured_against_csq_sha": null,
+  "status_code": null,
+  "redacted_body": null,
+  "extraction_patterns": [],
+  "_placeholder_note": "Operator-run capture pending. Run coc-eval/scripts/characterize-error-bodies.sh --provider openai with a deliberately-malformed bad key. Capture only the redacted provider error shape needed for token-extraction fixtures."
+}

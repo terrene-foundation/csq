@@ -6,11 +6,55 @@
 //! `--version` output (e.g. OSC-52 clipboard write, cursor movement
 //! sequences, character-set switching).
 
+/// The ONE predicate every display sanitizer in the crate uses: a character a
+/// rendered line must never carry.
+///
+/// Deliberately broader than "control": C0 and C1 come from `is_control`, and
+/// the rest are the characters that make a line LIE about itself — bidi
+/// controls reorder what a reader sees, zero-width characters hide text
+/// inside a word, the TAG block can encode a payload that no terminal shows,
+/// U+2028/2029 end lines silently, and U+FEFF is both a BOM and zero-width.
+/// U+200D (ZWJ) is NOT stripped: it is load-bearing inside emoji sequences and
+/// carries no reordering power.
+///
+/// The U+2060..=U+206F block is stripped WHOLE (not only its bidi
+/// isolates): those are Cf formatting characters — word joiner, invisible
+/// operators, deprecated directional marks — that render as nothing and can
+/// hide text inside a word. `archive_health::is_format_char` already strips
+/// this block from the PAUSED reason; leaving the shared sink behind it was a
+/// two-list drift, not a decision (R3 security review, Q5).
+pub fn is_unsafe_display_char(c: char) -> bool {
+    let u = c as u32;
+    c.is_control()
+        || u == 0x061C
+        || u == 0x200B
+        || u == 0x200C
+        || u == 0x200E
+        || u == 0x200F
+        || u == 0x2028
+        || u == 0x2029
+        || (0x202A..=0x202E).contains(&u)
+        || (0x2060..=0x206F).contains(&u)
+        || u == 0xFEFF
+        || (0xE0000..=0xE007F).contains(&u)
+}
+
+/// Strip every [`is_unsafe_display_char`] EXCEPT `\t` (`\x09`), uncapped.
+///
+/// For a value whose length is already bounded by its producer (a fix hint
+/// naming two agent paths): truncating it could cut a path in half, so the
+/// caller gets the whole string with only the unsafe characters removed.
+pub fn strip_unsafe_display(raw: &str) -> String {
+    raw.chars()
+        .filter(|&c| c == '\t' || !is_unsafe_display_char(c))
+        .collect()
+}
+
 /// Strip control characters from subprocess output before printing.
 ///
-/// Strips:
-/// - Every char in `\x00..=\x1f` EXCEPT `\t` (`\x09`).
-/// - `\x7f` (DEL).
+/// Strips every [`is_unsafe_display_char`] EXCEPT `\t` (`\x09`): C0, DEL, C1,
+/// the bidi controls, zero-width characters (except ZWJ), U+2028/2029, U+FEFF
+/// and the TAG block.
 ///
 /// Caps the result to 200 **chars (Unicode codepoints)** — NOT bytes.
 /// Using `char`-based capping avoids splitting multi-byte UTF-8 sequences
@@ -18,10 +62,7 @@
 /// output may be up to 800 bytes (4 bytes per emoji), which is still
 /// well within any terminal line budget.
 pub fn sanitize_for_display(raw: &str) -> String {
-    raw.chars()
-        .filter(|&c| c == '\t' || (c >= ' ' && c != '\x7f'))
-        .take(200)
-        .collect()
+    strip_unsafe_display(raw).chars().take(200).collect()
 }
 
 /// Replaces the operator's `$HOME` prefix with `~` so paths emitted to
@@ -749,6 +790,25 @@ mod tests {
         let raw = "hello\x7fworld";
         let sanitized = sanitize_for_display(raw);
         assert_eq!(sanitized, "helloworld", "DEL must be stripped");
+    }
+
+    /// The ONE display predicate, measured at the sink `csq doctor` and the
+    /// desktop both render through, over the whole unsafe set. RED before the
+    /// widening: the old body kept everything `>= ' '` except DEL, so every
+    /// case here above U+007F passed through unchanged (`left` was the whole
+    /// input, not `ab`).
+    #[test]
+    fn sanitize_strips_every_unsafe_class_at_the_shared_sink() {
+        let raw = "a\u{7f}\u{9b}\u{61c}\u{200b}\u{200c}\u{200e}\u{200f}\u{2028}\
+                   \u{2029}\u{202a}\u{202e}\u{2060}\u{2064}\u{2066}\u{2069}\u{206f}\u{feff}\
+                   \u{e0041}\u{e007f}b";
+        assert_eq!(sanitize_for_display(raw), "ab", "raw: {raw:?}");
+        // ZWJ (U+200D) is NOT in the set: it is load-bearing inside emoji
+        // sequences and carries no reordering power.
+        assert_eq!(
+            sanitize_for_display("\u{1f469}\u{200d}\u{1f4bb}"),
+            "\u{1f469}\u{200d}\u{1f4bb}"
+        );
     }
 
     #[test]

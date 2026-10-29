@@ -161,8 +161,9 @@ fn check_pair(f: &Fixture, health: &str, code: i32) {
     );
     // Parsing the full stdout discriminates a single doctor object from double output.
     let doctor_report: Value = serde_json::from_slice(&doctor.stdout).unwrap();
-    // Pin the current Doctor contract (spec 13 §9: v33 Codex hook-trust carry diagnostics + v34 keychain_orphans).
-    assert_eq!(doctor_report["schema_version"], 34);
+    // Pin the current Doctor contract (spec 13 §9 v35: archive_health bumps BOTH
+    // editions 34 -> 35, an internal ticket/an internal ticket, landed in a6aa898f7).
+    assert_eq!(doctor_report["schema_version"], 35);
     assert_eq!(doctor_report["gate_status"], report);
     for is_doctor in [false, true] {
         let text = f.run(is_doctor, false);

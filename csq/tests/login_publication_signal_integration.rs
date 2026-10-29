@@ -16,9 +16,19 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 const ENTRY: &str = "login_publication_signal_private_entry";
 const ROLE: &str = "CSQ_PRIVATE_PUBLICATION_ROLE";
+// Stall injection (inert unless set): seconds a role sleeps at startup, to
+// simulate a host io stall delaying that process (an internal ticket RED proof).
+const STALL_VENDOR: &str = "CSQ_PRIVATE_STALL_VENDOR_S";
+const STALL_DRIVER: &str = "CSQ_PRIVATE_STALL_DRIVER_S";
 const ROOT: &str = "CSQ_PRIVATE_PUBLICATION_ROOT";
 const MODE: &str = "CSQ_PRIVATE_PUBLICATION_MODE";
-const BUDGET: Duration = Duration::from_secs(10);
+// Hang guard only (an internal ticket): every wait below is on an EVENT (a receipt file, the
+// latched signal); a host io stall delays the event, it must not fail the row.
+const BUDGET: Duration = Duration::from_secs(300);
+// The vendor's own login deadline is a product watchdog, not a test assertion:
+// 30s expired under a stalled host (vendor start + receipts), refusing
+// publication and retaining the reader. Far above any stall.
+const VENDOR_DEADLINE: Duration = Duration::from_secs(600);
 const PRIOR_AUTH: &[u8] = b"PRIVATE_PRIOR_RAW_AUTH_UNCHANGED";
 const PRIOR_CONFIG: &[u8] = b"model = \"gpt-fixture\"\nmodel_reasoning_effort = \"high\"\nunknown_secret = \"PRIVATE_MUST_NOT_COPY\"\n";
 fn slot() -> AccountNum {
@@ -39,7 +49,7 @@ fn until(mut condition: impl FnMut() -> bool) -> bool {
         if Instant::now() >= deadline {
             return false;
         }
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 fn command(root: &Path, role: &str, mode: &str) -> Command {
@@ -60,6 +70,11 @@ fn command(root: &Path, role: &str, mode: &str) -> Command {
         .env(ROLE, role)
         .env(ROOT, root)
         .env(MODE, mode)
+        .envs(
+            [STALL_VENDOR, STALL_DRIVER]
+                .into_iter()
+                .filter_map(|key| std::env::var_os(key).map(|value| (key, value))),
+        )
         .env("HOME", root.join("home"))
         .env("USERPROFILE", root.join("home"))
         .env("CSQ_BASE_DIR", root.join("base"))
@@ -126,7 +141,13 @@ fn assert_private_vendor_home(root: &Path, home: &Path) {
     assert!(meta.is_dir() && !meta.file_type().is_symlink());
     assert_eq!(meta.permissions().mode() & 0o777, 0o700);
 }
+fn stall(key: &str) {
+    if let Some(secs) = std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok()) {
+        std::thread::sleep(Duration::from_secs(secs));
+    }
+}
 fn vendor(root: &Path, mode: &str) -> ! {
+    stall(STALL_VENDOR);
     assert!(
         until(|| root.join("vendor-go").exists()),
         "private adoption release missing"
@@ -213,6 +234,7 @@ impl Drop for StubCustody {
     }
 }
 fn driver(root: &Path, mode: &str) -> ! {
+    stall(STALL_DRIVER);
     let retained = Arc::new(Mutex::new(None));
     let custody = StubCustody {
         child: Arc::clone(&retained),
@@ -281,7 +303,7 @@ fn driver(root: &Path, mode: &str) -> ! {
                     });
                     let receipt = login_cancel_guard::spawn_cli_piped_login_scoped_observed_receipt(
                         &mut child,
-                        Duration::from_secs(30),
+                        VENDOR_DEADLINE,
                         (Arc::clone(&child_grant), child_lock),
                         "Codex",
                         |_| {

@@ -131,6 +131,11 @@ def safe_to_skip_path(path):
                              part.split(".", 1)[0].rstrip(" ").casefold()) or
                 re.search(r"~[0-9]", part)):
             return False
+    # A Rust source is never safe to skip, whatever directory holds it (the
+    # allowlisted docs/, specs/, ... trees can carry a module pulled in by
+    # `include!` or `#[path]`).
+    if path.casefold().endswith(".rs"):
+        return False
     # Markdown under a source directory can be an include_str! build input.
     if any(part.casefold() == "src" for part in parts):
         return False
@@ -140,6 +145,46 @@ def safe_to_skip_path(path):
     return (path.endswith(".md") or
             (len(parts) > 1 and parts[0] in
              {"docs", "workspaces", ".claude", ".agents", ".codex", "specs"}))
+
+
+def paths_relevant(changed, checkout_inputs=None):
+    """True when ANY changed path (renames: both names) must run Windows.
+
+    The single path classifier: the CI detect job (`decide`) and any local
+    caller that must reach the same verdict use it, so the two cannot drift.
+    `checkout_inputs` returns (tracked, protected, prefixes).
+    """
+    folded = {}
+    directories = set()
+    relevant = False
+    for path in changed:
+        relevant = not safe_to_skip_path(path) or relevant
+        key = path.casefold()
+        parents = ["/".join(key.split("/")[:length])
+                   for length in range(1, len(key.split("/")))]
+        if ((key in folded and folded[key] != path) or key in directories or
+                any(parent in folded for parent in parents)):
+            relevant = True
+        folded[key] = path
+        directories.update(parents)
+    if not relevant:
+        tracked, protected, prefixes = (checkout_inputs or read_checkout_inputs)()
+        # Compare against unchanged tracked files too. Case-only renames
+        # conservatively run Windows, even when the old name was removed.
+        for path in tracked:
+            key = path.casefold()
+            parents = ["/".join(key.split("/")[:length])
+                       for length in range(1, len(key.split("/")))]
+            if ((key in folded and folded[key] != path) or key in directories or
+                    any(parent in folded for parent in parents)):
+                relevant = True
+        relevant = bool(set(folded).intersection(path.casefold() for path in protected)) or relevant
+        # Protect newly added files under configured walker roots, including
+        # dotfiles; exact component boundaries avoid matching sibling names.
+        for prefix in prefixes:
+            key = prefix.casefold()
+            relevant = any(path == key or path.startswith(key + "/") for path in folded) or relevant
+    return relevant
 
 
 def decide(event_name, event, repository, fetch, checkout_inputs=None):
@@ -175,22 +220,7 @@ def decide(event_name, event, repository, fetch, checkout_inputs=None):
 
         count = metadata()
         seen = set()
-        folded = {}
-        directories = set()
-        relevant = False
-
-        def note_path(path):
-            nonlocal relevant
-            relevant = not safe_to_skip_path(path) or relevant
-            key = path.casefold()
-            parents = ["/".join(key.split("/")[:length])
-                       for length in range(1, len(key.split("/")))]
-            if ((key in folded and folded[key] != path) or key in directories or
-                    any(parent in folded for parent in parents)):
-                relevant = True
-            folded[key] = path
-            directories.update(parents)
-
+        changed = []
         for page in range(1, (count + 99) // 100 + 1):
             files = fetch(endpoint + "/files?per_page=100&page=" + str(page))
             expected = min(100, count - len(seen))
@@ -204,32 +234,16 @@ def decide(event_name, event, repository, fetch, checkout_inputs=None):
                                   "copied", "changed", "unchanged"}:
                     raise ValueError("invalid changed-file status")
                 path = item["filename"]
-                note_path(path)
+                changed.append(path)
                 if path in seen:
                     raise ValueError("duplicate changed-file pagination")
                 seen.add(path)
                 # A safe destination cannot hide a change to a risky input.
                 if status == "renamed":
-                    note_path(item["previous_filename"])
+                    changed.append(item["previous_filename"])
         if len(seen) != count or metadata() != count:
             raise ValueError("changed-file count changed during detection")
-        if not relevant:
-            tracked, protected, prefixes = (checkout_inputs or read_checkout_inputs)()
-            # Compare against unchanged tracked files too. Case-only renames
-            # conservatively run Windows, even when the old name was removed.
-            for path in tracked:
-                key = path.casefold()
-                parents = ["/".join(key.split("/")[:length])
-                           for length in range(1, len(key.split("/")))]
-                if ((key in folded and folded[key] != path) or key in directories or
-                        any(parent in folded for parent in parents)):
-                    relevant = True
-            relevant = bool(set(folded).intersection(path.casefold() for path in protected)) or relevant
-            # Protect newly added files under configured walker roots, including
-            # dotfiles; exact component boundaries avoid matching sibling names.
-            for prefix in prefixes:
-                key = prefix.casefold()
-                relevant = any(path == key or path.startswith(key + "/") for path in folded) or relevant
+        relevant = paths_relevant(changed, checkout_inputs)
         return relevant, "RUN" if relevant else "SKIP", "complete PR files and guarded checkout inputs"
     except Exception as error:
         # Do not print API error bodies, URLs or supplied values (possibly

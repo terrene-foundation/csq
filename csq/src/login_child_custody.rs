@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 
 #[path = "login_child_custody/group.rs"]
 pub(crate) mod group;
+#[cfg(all(test, unix))]
+#[path = "login_child_custody/tty_tests.rs"]
+mod tty_tests;
 use group::{ErrorAction, ErrorBudget, GroupControl, GroupSignal};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -349,6 +352,14 @@ pub(crate) struct OwnedLoginChild<K> {
     auxiliary_errors: ErrorBudget,
     observer: Option<Box<WaitObserver>>,
     keepalive: Option<K>,
+    /// Terminal custody of an attended login, owned HERE and released on every
+    /// custody end (reap, refusal, suspension, the leaked-unresolved branch).
+    #[cfg(unix)]
+    terminal_custody: Option<group::TerminalCustody>,
+    attended: bool,
+    suspended: bool,
+    #[cfg(unix)]
+    last_stop_scan: Option<Instant>,
 }
 impl<K> OwnedLoginChild<K> {
     pub(crate) fn adopt_group(
@@ -357,7 +368,19 @@ impl<K> OwnedLoginChild<K> {
         watchdog: LoginWatchdog,
         keepalive: K,
     ) -> Self {
+        #[cfg(unix)]
+        let terminal_custody = group.take_terminal();
+        #[cfg(unix)]
+        let attended = terminal_custody.is_some();
+        #[cfg(not(unix))]
+        let attended = false;
         Self {
+            #[cfg(unix)]
+            terminal_custody,
+            attended,
+            suspended: false,
+            #[cfg(unix)]
+            last_stop_scan: None,
             child: Arc::new(Mutex::new(child)),
             group,
             watchdog,
@@ -371,6 +394,72 @@ impl<K> OwnedLoginChild<K> {
             auxiliary_errors: ErrorBudget::default(),
             observer: None,
             keepalive: Some(keepalive),
+        }
+    }
+    /// Give the terminal back (foreground, modes, SIGTTOU) if this custody holds it.
+    fn release_terminal(&mut self) {
+        #[cfg(unix)]
+        {
+            self.terminal_custody = None;
+        }
+    }
+    /// An attended vendor that ended because the OPERATOR stopped it at the
+    /// terminal. With the vendor group in the foreground, Ctrl-C and Ctrl-Z go
+    /// to the vendor, not to csq, so csq sees them only as the vendor's fate.
+    /// Death by SIGINT/SIGQUIT (or exit 130) is a cancellation. A vendor that
+    /// exits 0 after a SIGINT completed its OAuth in the browser by the user's
+    /// own action: that is a success and is NOT reported here (owner ruling).
+    pub(crate) fn operator_stop(&self, status: Option<&ExitStatus>) -> Option<&'static str> {
+        if self.suspended {
+            return Some("login cancelled (suspended)");
+        }
+        if !self.attended {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            let status = status?;
+            let interrupted = matches!(status.signal(), Some(libc::SIGINT | libc::SIGQUIT))
+                || status.code() == Some(130);
+            interrupted.then_some("login cancelled")
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = status;
+            None
+        }
+    }
+    /// A vendor stopped (Ctrl-Z) while owning the terminal cannot be resumed by
+    /// the shell, which does not know its group: give the terminal back, then
+    /// end the login through the ordinary kill/census path. No job-control proxy.
+    #[cfg(unix)]
+    fn observe_suspension(&mut self) {
+        if self.terminal_custody.is_none() || self.suspended || self.reaped.is_some() {
+            return;
+        }
+        // The leader is read every pass; the process-table scan for a stopped
+        // NON-leader member (a wrapper that ignores SIGTSTP while its child
+        // stops) is rate-limited.
+        let scan = self
+            .last_stop_scan
+            .is_none_or(|at| at.elapsed() >= Duration::from_millis(250));
+        if scan {
+            self.last_stop_scan = Some(Instant::now());
+        }
+        if !self.group.stopped_member(scan) {
+            return;
+        }
+        self.suspended = true;
+        self.release_terminal();
+        eprintln!("login_vendor_suspended pgid={}", self.group.id());
+        self.watchdog.refuse_cancelled_unconditional();
+        if self.group.signal(GroupSignal::Kill).is_err() {
+            eprintln!(
+                "login_vendor_suspended_kill_refused pgid={}",
+                self.group.id()
+            );
+            self.terminal_refusal();
         }
     }
     pub(crate) fn shared_child(&self) -> Arc<Mutex<Child>> {
@@ -405,6 +494,7 @@ impl<K> OwnedLoginChild<K> {
     fn terminal_refusal_for(&mut self, reason: RefusalReason) {
         self.watchdog.refuse(reason);
         self.terminal = true;
+        self.release_terminal();
         if self.reaped.is_none() || !self.group.readers_joined() {
             self.watchdog.mark_custody_unresolved(self.group.id());
             eprintln!(
@@ -495,6 +585,9 @@ impl<K> OwnedLoginChild<K> {
             Err(_) => Err(io::Error::other("owned login child mutex poisoned")),
         };
         self.observe_result(result);
+        if self.reaped.is_some() {
+            self.release_terminal();
+        }
     }
     #[cfg(any(feature = "desktop", test))]
     pub(crate) fn wait_vendor(
@@ -568,6 +661,8 @@ impl<K> OwnedLoginChild<K> {
                 self.group.mark_readers_joined();
             }
             self.observe_kill_intent();
+            #[cfg(unix)]
+            self.observe_suspension();
             self.poll_child(joined);
             if self.terminal {
                 return Err(self
@@ -652,6 +747,8 @@ impl<K> Drop for OwnedLoginChild<K> {
                     }
                 }
             }
+            #[cfg(unix)]
+            self.observe_suspension();
             self.observe_kill_intent();
             if self.watchdog.custody_unresolved() {
                 self.terminal = true;
@@ -661,6 +758,9 @@ impl<K> Drop for OwnedLoginChild<K> {
                 std::thread::sleep(POLL_INTERVAL);
             }
         }
+        // BEFORE the deliberate leak below: the leaked group handle must never
+        // keep the operator's terminal.
+        self.release_terminal();
         if self.watchdog.custody_unresolved() {
             // Retain the actual Child, group handle and lock/permit. Never silently
             // drop a potentially live child or run cleanup before actual writer finalization.

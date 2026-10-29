@@ -528,6 +528,7 @@ mod tests {
                 .unwrap_or_else(|error| error.into_inner());
             let records = Arc::new(std::sync::Mutex::new(Vec::new()));
             let _subscriber = tracing::subscriber::set_default(AdmissionWarnings(records.clone()));
+            tracing::callsite::rebuild_interest_cache();
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_time()
                 .start_paused(true)

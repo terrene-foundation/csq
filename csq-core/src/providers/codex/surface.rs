@@ -4132,7 +4132,11 @@ status_line = ["model-with-reasoning", "context-remaining", "git-branch", "curre
         write_config_toml_with_global(base.path(), account, None, Some(old)).unwrap();
         let logs = Arc::new(Mutex::new(Vec::new()));
         FAIL_STATUS_LINE_NARROW.with(|flag| flag.set(true));
+        let _capture = crate::testing::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let outcome = tracing::subscriber::with_default(Capture(logs.clone()), || {
+            tracing::callsite::rebuild_interest_cache();
             write_config_toml_with_global(base.path(), account, None, Some(next))
         });
         assert!(outcome.is_ok());

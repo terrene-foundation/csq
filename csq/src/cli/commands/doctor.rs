@@ -115,6 +115,21 @@ struct DoctorReport {
     /// `pass0_skipped_slots`'s convention.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     stale_quota_slots: Vec<StaleQuotaSlotJson>,
+    /// v35 (an internal ticket): R2 archive upload/delete health. Omitted entirely when
+    /// `~/.config/csq-archive` does not exist (opt-in by presence) or the base
+    /// dir is not `<home>/.claude/accounts`. Each check is
+    /// `{"state":"ok"|"warn"|"unknown","reason":..}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archive_health: Option<csq_core::archive_health::ArchiveChecks>,
+    /// v35: set (instead of `archive_health`) when the base dir is not
+    /// `<home>/.claude/accounts`, so the archive's home cannot be located and
+    /// the check could not run: `"cannot locate home"`. Never silent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archive_health_error: Option<&'static str>,
+    /// v35 (an internal ticket): bounded sizes of `~/.claude/projects`, `~/.claude/accounts`
+    /// and thread-history databases over 1 GiB (paths shown as `~/...`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_footprint: Option<csq_core::archive_health::footprint::Footprint>,
     /// Slots whose identity holds a pending post-commit rescue record.
     ///
     /// A pending record makes the refresher SKIP the provider request (the
@@ -2139,9 +2154,9 @@ struct UnsharedHandleStateJson {
 }
 
 #[cfg(feature = "enterprise")]
-const DOCTOR_SCHEMA_VERSION: u32 = 34;
+const DOCTOR_SCHEMA_VERSION: u32 = 35;
 #[cfg(not(feature = "enterprise"))]
-const DOCTOR_SCHEMA_VERSION: u32 = 34;
+const DOCTOR_SCHEMA_VERSION: u32 = 35;
 
 /// One text line for the daemon's keychain orphan sweep, or `None` when it has
 /// never published and nothing is wrong. The wording and the severity both come
@@ -2377,6 +2392,16 @@ fn build_report(base_dir: &Path) -> DoctorReport {
         mcp_images,
         accounts: check_accounts(base_dir),
         stale_quota_slots: check_stale_quota_polls(base_dir),
+        archive_health: archive_checks_for(
+            base_dir,
+            std::time::SystemTime::now(),
+            &csq_core::archive_health::SystemLaunchd,
+        ),
+        archive_health_error: home_of_base(base_dir)
+            .is_none()
+            .then_some("cannot locate home"),
+        disk_footprint: home_of_base(base_dir)
+            .map(|h| csq_core::archive_health::footprint::measure(&h)),
         rescue_pending_slots: csq_core::credentials::rescue::pending_rescues(base_dir),
         codex_shared_shape_mismatches: check_codex_shared_shapes(base_dir),
         codex_project_trust: check_codex_project_trust(base_dir),
@@ -6216,6 +6241,16 @@ fn print_report(r: &DoctorReport) {
         );
     }
 
+    for line in render_archive_lines(r.archive_health.as_ref()) {
+        println!("{line}");
+    }
+    if let Some(why) = r.archive_health_error {
+        println!("{}", archive_error_line(why));
+    }
+    for line in render_footprint_lines(r.disk_footprint.as_ref()) {
+        println!("{line}");
+    }
+
     for s in &r.stale_quota_slots {
         println!(
             "  Quota poll:  {} slot {} [{}] \"{}\" stale {} — {}",
@@ -7023,6 +7058,96 @@ fn format_utc_date(secs: u64) -> String {
     let year = if month <= 2 { y + 1 } else { y };
 
     format!("{year:04}-{month:02}-{d:02} {h:02}:{m:02}:{s:02} UTC")
+}
+
+fn home_of_base(base_dir: &Path) -> Option<std::path::PathBuf> {
+    csq_core::archive_health::home_of_base(base_dir)
+}
+
+/// Archive checks for the home derived from `base_dir`; `None` when the archive
+/// is not configured (nothing is shown) or no home can be derived.
+fn archive_checks_for(
+    base_dir: &Path,
+    now: std::time::SystemTime,
+    launchd: &dyn csq_core::archive_health::LaunchdProbe,
+) -> Option<csq_core::archive_health::ArchiveChecks> {
+    let home = home_of_base(base_dir)?;
+    match csq_core::archive_health::check(&home, now, launchd) {
+        csq_core::archive_health::ArchiveHealth::NotConfigured => None,
+        csq_core::archive_health::ArchiveHealth::Configured(c) => Some(*c),
+    }
+}
+
+/// The UNKNOWN row shown when the archive's home cannot be located.
+fn archive_error_line(why: &str) -> String {
+    format!("  Archive:     {} UNKNOWN archive health: {why}", info())
+}
+
+/// One `⚠` (WARN) or `ℹ` (UNKNOWN) row plus a fix hint per non-OK archive check.
+fn render_archive_lines(c: Option<&csq_core::archive_health::ArchiveChecks>) -> Vec<String> {
+    use csq_core::archive_health::CheckState;
+    let Some(c) = c else { return Vec::new() };
+    c.findings()
+        .into_iter()
+        .map(|f| {
+            let (glyph, word, reason) = match &f.state {
+                CheckState::Warn(r) => (warn(), "WARN", r.as_str()),
+                CheckState::Unknown(r) => (info(), "UNKNOWN", r.as_str()),
+                CheckState::Ok => (ok(), "OK", ""),
+            };
+            // The reason can carry operator-typed text (the PAUSED line): strip
+            // home prefixes and terminal/format characters at the render too.
+            let reason =
+                sanitize_for_display(&csq_core::cli_deps::sanitize::redact_home_anywhere(reason));
+            // A hint names the per-role plist paths, so it is kept WHOLE — the
+            // 200-char display cap could cut a path in half and leave an
+            // unusable command. Strip unsafe characters only.
+            let hint = csq_core::cli_deps::sanitize::strip_unsafe_display(
+                &csq_core::cli_deps::sanitize::redact_home_anywhere(&f.hint),
+            );
+            format!(
+                "  Archive:     {glyph} {word} {} — {reason}. Fix: {hint}",
+                f.check
+            )
+        })
+        .collect()
+}
+
+fn human_bytes(b: u64) -> String {
+    const G: f64 = (1u64 << 30) as f64;
+    const M: f64 = (1u64 << 20) as f64;
+    if b as f64 >= G {
+        format!("{:.1} GiB", b as f64 / G)
+    } else {
+        format!("{:.1} MiB", b as f64 / M)
+    }
+}
+
+/// Info rows for the bounded disk-footprint measurement.
+fn render_footprint_lines(
+    f: Option<&csq_core::archive_health::footprint::Footprint>,
+) -> Vec<String> {
+    use csq_core::archive_health::footprint::Size;
+    let Some(f) = f else { return Vec::new() };
+    let size = |s: &Size| match s {
+        Size::Bytes(b) => human_bytes(*b),
+        Size::Unknown(r) => format!("UNKNOWN ({r})"),
+    };
+    let mut out = vec![format!(
+        "  Disk:        {} ~/.claude/projects {}, ~/.claude/accounts {}",
+        info(),
+        size(&f.projects),
+        size(&f.accounts)
+    )];
+    for t in &f.big_threads {
+        out.push(format!(
+            "  Disk:        {} {} is {}",
+            info(),
+            sanitize_for_display(&t.path),
+            human_bytes(t.bytes)
+        ));
+    }
+    out
 }
 
 fn ok() -> &'static str {
@@ -9030,6 +9155,160 @@ mod tests {
         assert!(errored.get("keychain_orphans").is_none(), "{errored}");
     }
 
+    #[test]
+    fn archive_rows_and_json_fields_for_a_paused_stale_archive() {
+        use csq_core::archive_health::{LaunchdProbe, LaunchdState};
+        struct NoneLoaded;
+        impl LaunchdProbe for NoneLoaded {
+            fn state(&self, _l: &str) -> LaunchdState {
+                LaunchdState::NotLoaded
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let base = home.path().join(".claude/accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        // Not configured: nothing anywhere.
+        let now = std::time::SystemTime::now();
+        assert!(archive_checks_for(&base, now, &NoneLoaded).is_none());
+        let mut report = make_report(TerminalInfo {
+            modern_count: 0,
+            legacy_count: 0,
+            check_available: false,
+        });
+        assert!(serde_json::to_value(&report)
+            .unwrap()
+            .get("archive_health")
+            .is_none());
+        assert!(render_archive_lines(None).is_empty());
+
+        let arch = home.path().join(".config/csq-archive");
+        std::fs::create_dir_all(arch.join("log")).unwrap();
+        // The two upload agents EXIST and the probe says NotLoaded, so the
+        // upload_jobs hint is the review-then-bootstrap command naming the
+        // discovered file — the shape an operator acts on. (With no agents the
+        // row would carry the "not installed" creation hint instead.)
+        let agents = home.path().join("Library/LaunchAgents");
+        std::fs::create_dir_all(&agents).unwrap();
+        for label in [
+            "com.example.csq-archive.hot",
+            "com.example.csq-archive.nightly",
+        ] {
+            std::fs::write(agents.join(format!("{label}.plist")), "<plist/>").unwrap();
+        }
+        std::fs::write(arch.join("PAUSED"), "2026-10-28 paused: fix pending\n").unwrap();
+        std::fs::write(
+            arch.join("log/last-success.json"),
+            r#"{"last_success":"2020-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let checks = archive_checks_for(&base, now, &NoneLoaded).expect("configured");
+        let lines = render_archive_lines(Some(&checks));
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert!(lines[0].contains("upload_jobs") && lines[0].contains("launchctl bootstrap"));
+        // The hint names the discovered plist via `$HOME`, never by absolute
+        // path: this is the operator-facing surface, and the home directory is
+        // not part of what it should disclose. `$HOME` inside double quotes is
+        // what makes the copied command actually run (ROOT ruling, G4 R3).
+        assert!(
+            lines[0].contains("$HOME/Library/LaunchAgents/com.example.csq-archive.hot.plist"),
+            "{:?}",
+            lines[0]
+        );
+        assert!(
+            lines.iter().all(|l| !l.contains("'~") && !l.contains("'$")),
+            "single-quoted expansion token in a rendered line: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|l| !l.contains(home.path().to_str().unwrap())),
+            "{lines:?}"
+        );
+        assert!(lines[1].contains("upload_recent"));
+        assert!(lines[2].contains("upload_recent_hot"));
+        assert!(lines[3].contains("local delete has never run"));
+        assert!(lines[4].contains("paused: fix pending"));
+        assert!(lines
+            .iter()
+            .all(|l| l.contains("WARN") && l.contains("Fix:")));
+
+        report.archive_health = Some(checks);
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["archive_health"]["upload_jobs"]["state"], "warn");
+        assert_eq!(v["archive_health"]["delete_active"]["state"], "warn");
+        assert!(v["archive_health"]["paused"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("fix pending"));
+    }
+
+    #[test]
+    fn paused_key_straddling_the_cut_never_reaches_doctor_text_or_json() {
+        let _env = csq_core::platform::test_env::lock();
+        let home = tempfile::tempdir().unwrap();
+        let base = home.path().join(".claude/accounts");
+        let arch = home.path().join(".config/csq-archive");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(arch.join("log")).unwrap();
+        let key = format!("sk-proj-{}", "Zq7".repeat(16));
+        std::fs::write(arch.join("PAUSED"), format!("{} {key}\n", "x".repeat(179))).unwrap();
+        struct NoProbe;
+        impl csq_core::archive_health::LaunchdProbe for NoProbe {
+            fn state(&self, _l: &str) -> csq_core::archive_health::LaunchdState {
+                csq_core::archive_health::LaunchdState::NotLoaded
+            }
+        }
+        let checks = archive_checks_for(&base, std::time::SystemTime::now(), &NoProbe).unwrap();
+        let text = render_archive_lines(Some(&checks)).join("\n");
+        let json = serde_json::to_string(&checks).unwrap();
+        assert!(
+            !text.contains(&key[..12]) && !json.contains(&key[..12]),
+            "{text}\n{json}"
+        );
+    }
+
+    #[test]
+    fn relocated_base_reports_archive_health_error_in_json_and_text() {
+        let _env_guard = csq_core::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        let dir = csq_core::testing::identity_fixtures::coexisting_fixture(1);
+        // the fixture root is not <home>/.claude/accounts
+        let report = build_report(dir.path());
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["archive_health_error"], "cannot locate home");
+        assert!(v.get("archive_health").is_none() && v.get("disk_footprint").is_none());
+        let line = archive_error_line(report.archive_health_error.unwrap());
+        assert!(
+            line.contains("UNKNOWN archive health: cannot locate home"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn footprint_rows_show_home_relative_paths_only() {
+        let home = tempfile::tempdir().unwrap();
+        let f = csq_core::archive_health::footprint::Footprint {
+            projects: csq_core::archive_health::footprint::Size::Bytes(3 << 20),
+            accounts: csq_core::archive_health::footprint::Size::Unknown(
+                "walk time cap reached".into(),
+            ),
+            big_threads: vec![csq_core::archive_health::footprint::BigThread {
+                path: "~/.claude/accounts/term-1/thread_history_a.sqlite".into(),
+                bytes: 2 << 30,
+            }],
+        };
+        let lines = render_footprint_lines(Some(&f));
+        assert!(
+            lines[0].contains("3.0 MiB") && lines[0].contains("UNKNOWN"),
+            "{lines:?}"
+        );
+        assert!(lines[1].contains("2.0 GiB") && lines[1].contains("~/.claude/accounts"));
+        let all = lines.join("\n");
+        assert!(!all.contains(home.path().to_str().unwrap()));
+        assert_eq!(home_of_base(Path::new("/x/y")), None);
+    }
+
     /// Helper: build a minimal DoctorReport with specific terminal info.
     fn make_report(terminals: TerminalInfo) -> DoctorReport {
         DoctorReport {
@@ -9104,6 +9383,9 @@ mod tests {
                 expired: 0,
             },
             stale_quota_slots: Vec::new(),
+            archive_health: None,
+            archive_health_error: None,
+            disk_footprint: None,
             rescue_pending_slots: Vec::new(),
             session_logins: Vec::new(),
             sessions_undetermined: true,

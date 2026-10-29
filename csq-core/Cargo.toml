@@ -32,7 +32,7 @@ tokio.workspace = true
 tracing.workspace = true
 hex.workspace = true
 sha2.workspace = true
-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 unicode-normalization.workspace = true
 unicode-general-category.workspace = true
 secrecy.workspace = true

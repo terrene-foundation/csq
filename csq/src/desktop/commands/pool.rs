@@ -793,6 +793,10 @@ mod tests {
         }
         assert_eq!(registered, granted);
     }
+    // The shared capture lock must span the whole capture, awaits included;
+    // tokio::test runs a current-thread runtime, so no other task here can
+    // need it (clippy::await_holding_lock is about multi-task runtimes).
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn pool_ipc_worker_panic_has_fixed_error_tag() {
         #[derive(Clone)]
@@ -812,7 +816,11 @@ mod tests {
             .with_ansi(false)
             .with_writer(move || writer.clone())
             .finish();
+        let _capture = csq_core::testing::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
         assert_eq!(
             blocking::<()>(|| panic!("synthetic panic payload"))
                 .await

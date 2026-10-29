@@ -7457,7 +7457,10 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let out = tracing::subscriber::with_default(TextCapture(events.clone()), run);
+            let out = tracing::subscriber::with_default(TextCapture(events.clone()), || {
+                tracing::callsite::rebuild_interest_cache();
+                run()
+            });
             let got = events.lock().unwrap().clone();
             (out, got)
         }

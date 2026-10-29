@@ -35,6 +35,7 @@
     "app-command:gemini_switch_model",
     "app-command:get_account_usage",
     "app-command:get_accounts",
+    "app-command:get_archive_health",
     "app-command:get_autostart_enabled",
     "app-command:get_build_edition",
     "app-command:get_capability_layer_toggles",

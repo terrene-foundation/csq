@@ -105,6 +105,21 @@ def generated_out_dir_suffix(tokens):
     return None
 
 
+def windows_named_pipe(value):
+    """Recognize only the local Win32 pipe root or a single pipe name.
+
+    Host pathlib treats this Windows device namespace as relative on Linux.
+    It cannot identify a repository input; leave other Windows path shapes
+    to the existing static-input validation rather than relaxing that guard.
+    """
+    prefix = "\\\\.\\pipe\\"
+    candidate = value[:len(prefix)]
+    if not candidate.isascii() or candidate.lower() != prefix:
+        return False
+    name = value[len(prefix):]
+    return name not in {".", ".."} and not any(char in name for char in "\\/\x00")
+
+
 def cfg_false(tokens):
     """Prove exclusion on Windows; unknown feature predicates stay included."""
     words = [t[0] for t in tokens]
@@ -186,6 +201,20 @@ def file_census(source, root):
                for i, t in enumerate(tokens[:-2]) if t[0] == "mod" and
                tokens[i + 2][0] == ";"]
     namespaces, readers, bindings, scopes = {"fs"}, set(), {}, []
+    # `include!` / `#[path]` pull another file into the BUILD. A Rust source
+    # target is never allowlisted by the path classifier (`safe_to_skip_path`
+    # refuses any `.rs`); any other target (e.g. a docs-allowlisted .md) is a
+    # compile input the census cannot protect, so it is UNRESOLVED and the
+    # caller runs Windows.
+    for i, t in enumerate(tokens[:-3]):
+        if t[2] == "code" and t[0] == "include" and [x[0] for x in tokens[i + 1:i + 3]] == ["!", "("]:
+            end = pairs[i + 2]
+            strings = [x[0] for x in tokens[i + 3:end] if x[2] == "string"]
+            if not strings or not strings[-1].endswith(".rs"):
+                raise ValueError("include! target is not a Rust source")
+        if (t[2] == "code" and t[0] == "#" and [x[0] for x in tokens[i + 1:i + 4]] == ["[", "path", "="]
+                and not (tokens[i + 4][2] == "string" and tokens[i + 4][0].endswith(".rs"))):
+            raise ValueError("#[path] target is not a Rust source")
     macros = {"include_str", "include_bytes"}
     for i, token in enumerate(tokens):
         if token[0] != "use": continue
@@ -305,6 +334,9 @@ def file_census(source, root):
         suffix = generated_out_dir_suffix(args[0]) if macro else None
         if suffix is not None:
             row.update(state="generated_out_dir", suffix=suffix)
+        elif (not macro and len(args[0]) == 1 and args[0][0][2] == "string" and
+              isinstance(args[0][0][0], str) and windows_named_pipe(args[0][0][0])):
+            row["state"] = "runtime"
         elif value is None:
             row["state"] = "configured" if any(t[0] in configured_names for t in args[0]) else "unresolved" if macro or static_hint(args[0]) or (args[0][0][2] == "string" and args[0][0][0] is None) else "runtime"
         else:
@@ -347,7 +379,7 @@ def scan(root):
             for module, unix in modules:
                 for candidate in [directory / (module + ".rs"), directory / module / "mod.rs"]:
                     if candidate.is_file(): module_refs.setdefault(candidate.relative_to(root).as_posix(), []).append(unix)
-        except (ValueError, OSError, IndexError, TypeError) as error:
+        except (ValueError, OSError, IndexError, TypeError, AttributeError) as error:
             errors.append({"source": source.relative_to(root).as_posix(), "reason": type(error).__name__})
     # External cfg-gated modules are retained in the census, with their scope.
     for row in census:

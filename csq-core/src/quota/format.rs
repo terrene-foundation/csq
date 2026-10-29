@@ -6,20 +6,28 @@ use crate::types::AccountNum;
 use serde::Deserialize;
 use std::path::Path;
 
-/// Strips control characters (bytes < 0x20) from a label string to prevent
-/// ANSI escape injection when the label is written to a terminal.
+/// Strips every character [`crate::cli_deps::sanitize::is_unsafe_display_char`]
+/// rejects from a label string, to prevent ANSI escape injection and bidi /
+/// zero-width spoofing when the label is written to a terminal.
 ///
 /// Pre-RN1-D3 csq versions wrote `accounts[N].email` without validation.
 /// A malicious or corrupted value could contain ANSI escape sequences that
 /// rewrite the terminal display or move the cursor. This sanitizer is applied
-/// at every label render site (statusline, doctor warning).
+/// at every label render site (statusline, doctor warning). The predicate
+/// itself is shared with [`crate::cli_deps::sanitize::sanitize_for_display`],
+/// so the statusline and the doctor cannot drift apart on what is unsafe.
 ///
-/// Returns the original string unchanged if no control characters are found
-/// (the common case). Returns a new `String` with control chars stripped if
-/// any are found.
+/// Returns the original string unchanged if no unsafe character is found
+/// (the common case). Returns a new `String` with them stripped otherwise.
 pub fn sanitize_for_display(label: &str) -> std::borrow::Cow<'_, str> {
-    if label.bytes().any(|b| b < 0x20) {
-        std::borrow::Cow::Owned(label.chars().filter(|c| *c as u32 >= 0x20).collect())
+    use crate::cli_deps::sanitize::is_unsafe_display_char;
+    if label.chars().any(is_unsafe_display_char) {
+        std::borrow::Cow::Owned(
+            label
+                .chars()
+                .filter(|c| !is_unsafe_display_char(*c))
+                .collect(),
+        )
     } else {
         std::borrow::Cow::Borrowed(label)
     }
@@ -527,6 +535,31 @@ pub fn parse_workspace_dir(raw: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::quota::UsageWindow;
+
+    #[test]
+    fn sanitize_strips_c1_and_bidi_controls() {
+        // C1 controls and the bidi controls that reorder a rendered line.
+        for raw in [
+            "a\u{85}b",
+            "a\u{9f}b",
+            "a\u{200e}b",
+            "a\u{200f}b",
+            "a\u{202a}b",
+            "a\u{202e}b",
+            "a\u{2066}b",
+            "a\u{2069}b",
+        ] {
+            assert_eq!(sanitize_for_display(raw), "ab", "{raw:?}");
+        }
+        assert_eq!(
+            sanitize_for_display("com.example.csq-archive.hot"),
+            "com.example.csq-archive.hot"
+        );
+        assert!(matches!(
+            sanitize_for_display("plain"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
 
     #[test]
     fn fmt_time_edge_cases() {

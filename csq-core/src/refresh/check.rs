@@ -1682,7 +1682,10 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let out = tracing::subscriber::with_default(Capture(Arc::clone(&events)), run);
+        let out = tracing::subscriber::with_default(Capture(Arc::clone(&events)), || {
+            tracing::callsite::rebuild_interest_cache();
+            run()
+        });
         let captured = std::mem::take(&mut *events.lock().unwrap());
         (out, captured)
     }
@@ -3532,7 +3535,10 @@ mod tests {
         };
         // broker_codex_check and its injected transport execute synchronously on
         // this thread; the scoped default is removed before assertions run.
-        let result = tracing::subscriber::with_default(subscriber, run);
+        let result = tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            run()
+        });
         let captured = events.lock().unwrap().clone();
         (result, captured)
     }

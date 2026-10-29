@@ -1430,7 +1430,11 @@ mod initialization_tests {
             .with_ansi(false)
             .with_writer(move || writer.clone())
             .finish();
+        let _capture = csq_core::testing::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let result = tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
             reload_or_warn(|| Err::<(), _>(std::io::Error::other("secret-path-do-not-log")))
         });
         assert!(result.is_none());

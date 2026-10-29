@@ -2463,32 +2463,21 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         // On Linux `pid_file_path` prefers $XDG_RUNTIME_DIR, a path shared by
-        // every process of the user: pin it to a private dir so a concurrent
-        // test binary or a real daemon cannot already hold the pid file.
-        let _env = csq_core::platform::test_env::lock();
+        // every process of the user: register the base with a private dir so a
+        // concurrent test binary or a real daemon cannot already hold the pid
+        // file, without mutating process env.
         let dir = tempfile::TempDir::new().unwrap();
         let runtime = dir.path().join("runtime");
         std::fs::create_dir(&runtime).unwrap();
-        struct XdgRestore(Option<std::ffi::OsString>);
-        impl Drop for XdgRestore {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
-                    None => std::env::remove_var("XDG_RUNTIME_DIR"),
-                }
-            }
-        }
-        let _xdg = XdgRestore(std::env::var_os("XDG_RUNTIME_DIR"));
-        std::env::set_var("XDG_RUNTIME_DIR", &runtime);
         let target = dir.path().join("external");
         std::fs::create_dir(&target).unwrap();
         let link = dir.path().join("accounts");
         std::os::unix::fs::symlink(&target, &link).unwrap();
+        let (_registration, _) = csq_core::daemon::paths::test_socket::register_in(&link, &runtime);
 
         let pid_path = daemon::pid_file_path(&link);
-        // Discriminates the XDG pin: without it the pid file resolves under the
-        // user-shared runtime dir and a real daemon can already hold it.
-        #[cfg(target_os = "linux")]
+        // Discriminates the pin: without it the pid file resolves under the
+        // user-shared runtime dir (Linux) and a real daemon can already hold it.
         assert!(
             pid_path.starts_with(&runtime),
             "pid file must resolve under the test's private runtime dir, got {}",

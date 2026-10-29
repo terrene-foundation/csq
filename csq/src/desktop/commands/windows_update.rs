@@ -209,7 +209,11 @@ mod updater_failure_tests {
             .with_max_level(tracing::Level::WARN)
             .with_writer(move || writer.clone())
             .finish();
+        let _capture = csq_core::testing::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
             for stage in ["builder", "check", "download"] {
                 updater_failure(
                     stage,

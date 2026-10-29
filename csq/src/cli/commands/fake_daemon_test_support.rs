@@ -250,10 +250,9 @@ pub(crate) struct FakeHealthyDaemon {
     // pid file is removed — see this struct's `Drop` impl doc.
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     _listener_thread: std::thread::JoinHandle<()>,
-    #[cfg(target_os = "linux")]
-    _env_guard: csq_core::platform::test_env::EnvTestGuard,
-    #[cfg(target_os = "linux")]
-    saved_xdg: Option<String>,
+    // Redirects `socket_path`/`pid_file_path` for THIS base only (an internal ticket):
+    // no fixture mutates the process-global `$XDG_RUNTIME_DIR`.
+    _registration: csq_core::daemon::paths::test_socket::Registration,
     #[cfg(target_os = "linux")]
     _runtime_dir: tempfile::TempDir,
 }
@@ -268,18 +267,6 @@ impl Drop for FakeHealthyDaemon {
         // poll means it notices within one tick and exits on its own.
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = std::fs::remove_file(&self.pid_path);
-        #[cfg(target_os = "linux")]
-        {
-            // SAFETY: `_env_guard` (dropped after this fn returns, per
-            // field-drop order) still holds the shared env-test mutex for
-            // the duration of this restore.
-            unsafe {
-                match &self.saved_xdg {
-                    Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
-                    None => std::env::remove_var("XDG_RUNTIME_DIR"),
-                }
-            }
-        }
     }
 }
 
@@ -309,16 +296,10 @@ pub(crate) fn spawn_fake_healthy_daemon(base_dir: &Path) -> FakeHealthyDaemon {
         .expect("private short fake daemon runtime dir");
 
     #[cfg(target_os = "linux")]
-    let env_state = {
-        let guard = csq_core::platform::test_env::lock();
-        let saved = std::env::var("XDG_RUNTIME_DIR").ok();
-        // SAFETY: guarded by the shared cross-module env-test mutex above,
-        // per `csq_core::platform::test_env`'s documented contract.
-        unsafe {
-            std::env::set_var("XDG_RUNTIME_DIR", runtime_dir.path());
-        }
-        (guard, saved)
-    };
+    let (registration, _) =
+        csq_core::daemon::paths::test_socket::register_in(base_dir, runtime_dir.path());
+    #[cfg(not(target_os = "linux"))]
+    let (registration, _) = csq_core::daemon::paths::test_socket::register(base_dir);
 
     let pid_path = csq_core::daemon::pid_file_path(base_dir);
     let sock_path = csq_core::daemon::socket_path(base_dir);
@@ -388,10 +369,7 @@ pub(crate) fn spawn_fake_healthy_daemon(base_dir: &Path) -> FakeHealthyDaemon {
         pid_path,
         stop,
         _listener_thread: thread,
-        #[cfg(target_os = "linux")]
-        _env_guard: env_state.0,
-        #[cfg(target_os = "linux")]
-        saved_xdg: env_state.1,
+        _registration: registration,
         #[cfg(target_os = "linux")]
         _runtime_dir: runtime_dir,
     }
@@ -399,65 +377,25 @@ pub(crate) fn spawn_fake_healthy_daemon(base_dir: &Path) -> FakeHealthyDaemon {
 
 /// The "no daemon at all" counterpart to [`spawn_fake_healthy_daemon`]: a
 /// test that needs `daemon::detect_daemon` to report `NotRunning` against a
-/// FRESH tempdir (rather than a genuinely healthy fixture) still needs the
-/// SAME `$XDG_RUNTIME_DIR` override, for the SAME reason — on Linux,
-/// `pid_file_path`/`socket_path` prefer the process-global env var over
-/// `base_dir` whenever it is set, so an un-guarded test is not actually
-/// checking `base_dir` at all: it is checking whatever real (or
-/// concurrently fixture-mutated) `$XDG_RUNTIME_DIR` happens to hold at that
-/// moment. Guarded by the same cross-module mutex, so it never races a
-/// sibling test's `spawn_fake_healthy_daemon`/`spawn_no_daemon_env_guard`
-/// call on the same process-global var.
+/// FRESH tempdir registers that base with `daemon::paths::test_socket`, so
+/// `pid_file_path`/`socket_path` resolve under the base instead of whatever
+/// the ambient (or a sibling fixture's) runtime dir holds. It mutates no
+/// process-global state and takes no env lock: a caller whose code reads
+/// other process env holds `test_env::lock()` itself.
 #[cfg(unix)]
 pub(crate) struct NoDaemonEnvGuard {
-    #[cfg(target_os = "linux")]
-    _env_guard: csq_core::platform::test_env::EnvTestGuard,
-    #[cfg(target_os = "linux")]
-    saved_xdg: Option<String>,
-}
-
-#[cfg(unix)]
-impl Drop for NoDaemonEnvGuard {
-    fn drop(&mut self) {
-        #[cfg(target_os = "linux")]
-        {
-            // SAFETY: `_env_guard` (dropped after this fn returns, per
-            // field-drop order) still holds the shared env-test mutex for
-            // the duration of this restore.
-            unsafe {
-                match &self.saved_xdg {
-                    Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
-                    None => std::env::remove_var("XDG_RUNTIME_DIR"),
-                }
-            }
-        }
-    }
+    _registration: csq_core::daemon::paths::test_socket::Registration,
 }
 
 #[cfg(unix)]
 pub(crate) fn spawn_no_daemon_env_guard(base_dir: &Path) -> NoDaemonEnvGuard {
-    #[cfg(target_os = "linux")]
-    {
-        let guard = csq_core::platform::test_env::lock();
-        let saved = std::env::var("XDG_RUNTIME_DIR").ok();
-        // SAFETY: guarded by the shared cross-module env-test mutex above,
-        // per `csq_core::platform::test_env`'s documented contract.
-        // `base_dir` is a fresh tempdir with no pid/socket file, so
-        // pointing XDG_RUNTIME_DIR at it makes `detect_daemon` genuinely
-        // observe `NotRunning`, not whatever the real/ambient runtime dir
-        // (or a concurrently-running fixture's) holds.
-        unsafe {
-            std::env::set_var("XDG_RUNTIME_DIR", base_dir);
-        }
-        NoDaemonEnvGuard {
-            _env_guard: guard,
-            saved_xdg: saved,
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = base_dir;
-        NoDaemonEnvGuard {}
+    // `base_dir` is a fresh tempdir with no pid/socket file; registering it
+    // makes `detect_daemon(base_dir)` genuinely observe `NotRunning` rather
+    // than whatever the real runtime dir holds, with no process-global
+    // mutation (an internal ticket).
+    let (registration, _) = csq_core::daemon::paths::test_socket::register(base_dir);
+    NoDaemonEnvGuard {
+        _registration: registration,
     }
 }
 

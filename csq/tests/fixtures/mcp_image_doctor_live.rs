@@ -347,8 +347,8 @@ fn native_doctor_live_mcp_json_and_text() {
     let json_bytes = bounded_file(&root.join("doctor-json.stdout"));
     assert_eq!(json_bytes.iter().filter(|b| **b == b'\n').count(), 1);
     let value: Value = serde_json::from_slice(&json_bytes).unwrap();
-    assert_eq!(value["schema"], "csq.doctor.v34");
-    assert_eq!(value["schema_version"], 34);
+    assert_eq!(value["schema"], "csq.doctor.v35");
+    assert_eq!(value["schema_version"], 35);
     assert_eq!(value["cli_shim"]["check_status"], "current");
     assert_eq!(value["cli_shim"]["managed_plist_allowed"], true);
     let rows = value["mcp_images"]["rows"].as_array().unwrap();

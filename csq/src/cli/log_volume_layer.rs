@@ -138,7 +138,13 @@ mod tests {
         .with_filter(filter);
         let subscriber = Registry::default().with(counter);
         log_volume::reset_event_counter();
-        with_default(subscriber, body);
+        let _capture = csq_core::testing::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            body()
+        });
         let n = *count.lock().unwrap();
         // Recover the buffer as Vec<u8>. The Mutex held a `dyn Write`
         // pointing at a Vec; lock it and clone-out the bytes via a
@@ -164,7 +170,13 @@ mod tests {
         .with_filter(filter);
         let subscriber = Registry::default().with(counter);
         log_volume::reset_event_counter();
-        with_default(subscriber, body);
+        let _capture = csq_core::testing::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            body()
+        });
         let n = *count.lock().unwrap();
         let bytes = buf.lock().unwrap().clone();
         (n, bytes)
@@ -263,7 +275,11 @@ mod tests {
         };
         let subscriber = Registry::default().with(stderr_layer).with(trace_layer);
         log_volume::reset_event_counter();
+        let _capture = csq_core::testing::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
             for i in 0..30 {
                 tracing::info!(idx = i, "trial");
             }

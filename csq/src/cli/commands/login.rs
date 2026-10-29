@@ -1716,10 +1716,9 @@ fn handle_direct(base_dir: &Path, account: AccountNum, json: bool) -> Result<()>
                     login_timeout.as_secs()
                 );
             }
-            let succeeded =
-                crate::login_cancel_guard::complete_vendor_grant(&grant, vendor_result)?;
-            if !succeeded {
-                return Err(anyhow!("claude auth login exited with non-zero status"));
+            let exit = crate::login_cancel_guard::complete_vendor_grant(&grant, vendor_result)?;
+            if !exit.success() {
+                return Err(anyhow!("claude auth login {exit}"));
             }
             // The vendor, native expectation and fresh credential capture all
             // use the SAME unique grant home, never the prior canonical slot.
@@ -2857,10 +2856,10 @@ mod tests {
                 native_identity_fixture(&config, "22222222-2222-4222-8222-222222222222");
             credentials::save(&config.join(".credentials.json"), &credential).unwrap();
             let profile = native_profile_fixture("22222222-2222-4222-8222-222222222222");
-            // Pin XDG_RUNTIME_DIR to a private dir (Linux) so finalize's daemon POSTs hit this
-            // recorder, never a real daemon: the socket path ignores `base` on Linux. The
-            // surrounding `with_in_memory_secret_backend` already holds the env lock.
-            let daemon = RecordingDaemon::spawn_with_env_lock_held(dir.path());
+            // The recorder registers `dir` with `daemon::paths::test_socket` so finalize's
+            // daemon POSTs hit it, never a real daemon. The surrounding
+            // `with_in_memory_secret_backend` already holds the env lock; the recorder takes none.
+            let daemon = RecordingDaemon::spawn(dir.path());
             handle_direct_flow(
                 dir.path(),
                 account,
@@ -3428,64 +3427,23 @@ mod tests {
 
     /// A Unix-socket listener standing in for the daemon's IPC socket: it
     /// records every request it receives and answers 200. Mirrors the
-    /// `$XDG_RUNTIME_DIR` isolation documented on
-    /// `fake_daemon_test_support` — on Linux `daemon::socket_path` prefers
-    /// that process-global variable over `base_dir`, so without the
-    /// override this fixture would bind (and the wake would POST into)
-    /// whatever the ambient runtime dir holds, a real daemon included.
+    /// per-base socket injection (`daemon::paths::test_socket`): only calls
+    /// passing this fixture's `base` resolve to its socket, so it never binds
+    /// (and the wake never POSTs into) the ambient runtime dir, a real daemon
+    /// included, and no process-global env is touched.
     struct RecordingDaemon {
         socket: std::path::PathBuf,
         requests: Arc<std::sync::Mutex<Vec<String>>>,
         stop: Arc<std::sync::atomic::AtomicBool>,
         _thread: std::thread::JoinHandle<()>,
-        _guard: RecordingDaemonEnvGuard,
+        // Per-base socket injection (an internal ticket): no process-env mutation.
+        _registration: csq_core::daemon::paths::test_socket::Registration,
         #[cfg(target_os = "linux")]
         _runtime_dir: tempfile::TempDir,
     }
 
-    #[cfg(target_os = "linux")]
-    struct RecordingDaemonEnvGuard {
-        // `None` when the caller already holds the env lock (`spawn_with_env_lock_held`).
-        _env_guard: Option<csq_core::platform::test_env::EnvTestGuard>,
-        saved: Option<String>,
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    struct RecordingDaemonEnvGuard;
-
-    #[cfg(target_os = "linux")]
-    impl Drop for RecordingDaemonEnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: `_env_guard` (dropped after this fn returns, per
-            // field-drop order) still holds the shared env-test mutex for
-            // the duration of this restore.
-            unsafe {
-                match &self.saved {
-                    Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
-                    None => std::env::remove_var("XDG_RUNTIME_DIR"),
-                }
-            }
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    impl Drop for RecordingDaemonEnvGuard {
-        fn drop(&mut self) {}
-    }
-
     impl RecordingDaemon {
         fn spawn(base: &std::path::Path) -> Self {
-            Self::start(base, true)
-        }
-
-        /// For a caller that ALREADY holds `test_env::lock()` (e.g. inside
-        /// `with_in_memory_secret_backend`): the lock is not re-entrant, so `spawn` would
-        /// deadlock on Linux. The caller's lock must outlive the returned recorder.
-        fn spawn_with_env_lock_held(base: &std::path::Path) -> Self {
-            Self::start(base, false)
-        }
-
-        fn start(base: &std::path::Path, take_env_lock: bool) -> Self {
             use std::io::{Read, Write};
             use std::sync::atomic::Ordering;
 
@@ -3496,22 +3454,10 @@ mod tests {
                 .expect("private runtime dir for the recording daemon");
 
             #[cfg(target_os = "linux")]
-            let guard = {
-                let env_guard = take_env_lock.then(csq_core::platform::test_env::lock);
-                let saved = std::env::var("XDG_RUNTIME_DIR").ok();
-                // SAFETY: guarded by the shared cross-module env-test mutex
-                // above, per `csq_core::platform::test_env`'s contract.
-                unsafe { std::env::set_var("XDG_RUNTIME_DIR", runtime_dir.path()) };
-                RecordingDaemonEnvGuard {
-                    _env_guard: env_guard,
-                    saved,
-                }
-            };
+            let (registration, _) =
+                csq_core::daemon::paths::test_socket::register_in(base, runtime_dir.path());
             #[cfg(not(target_os = "linux"))]
-            let guard = {
-                let _ = take_env_lock;
-                RecordingDaemonEnvGuard
-            };
+            let (registration, _) = csq_core::daemon::paths::test_socket::register(base);
 
             let socket = csq_core::daemon::socket_path(base);
             if let Some(parent) = socket.parent() {
@@ -3562,7 +3508,7 @@ mod tests {
                 requests,
                 stop,
                 _thread: thread,
-                _guard: guard,
+                _registration: registration,
                 #[cfg(target_os = "linux")]
                 _runtime_dir: runtime_dir,
             }
@@ -3603,6 +3549,8 @@ mod tests {
     fn wake_usage_poller_posts_the_rebind_route_with_the_bound_slot() {
         // The recording daemon's socket derives from `dir` on macOS.
         let dir = csq_core::testing::socket_fixture::short_root("csq-login-").unwrap();
+        // The recorder takes no env lock; this test holds its own.
+        let _env = csq_core::platform::test_env::lock();
         let daemon = RecordingDaemon::spawn(dir.path());
 
         let account = AccountNum::try_from(7u16).unwrap();

@@ -725,7 +725,11 @@ fn und_actual_held_original_lock_times_out_then_same_key_recovers_once() {
         crate::sessions::directives::acquire_message_store_lock_as("fixture", &lock).unwrap();
     let started = std::time::Instant::now();
     let captured = Captured::default();
+    let _capture = crate::testing::TRACING_CAPTURE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let (failed, first) = tracing::subscriber::with_default(captured.clone(), || {
+        tracing::callsite::rebuild_interest_cache();
         invoke(owned.path(), 100, arguments("held lock fixture", None))
     });
     assert!(failed);
@@ -805,7 +809,11 @@ fn und_unknown_callback_canary_is_absent_from_envelope_and_recovery_trace() {
     let captured = Captured::default();
     // This is an error-decoration contract test, not a synthetic send/repro.
     let canary = "RAW_CALLBACK_PATH_BODY_CANARY_1042";
+    let _capture = crate::testing::TRACING_CAPTURE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let error = tracing::subscriber::with_default(captured.clone(), || {
+        tracing::callsite::rebuild_interest_cache();
         request::with_key::<()>(Ok(NOW), None, |_, _| Err(DirectiveError::undet(canary)))
             .unwrap_err()
     });
@@ -845,7 +853,11 @@ fn und_typed_origin_survives_fallback_and_initial_clock_without_invented_key() {
     );
     let captured = Captured::default();
     let called = std::cell::Cell::new(false);
+    let _capture = crate::testing::TRACING_CAPTURE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let error = tracing::subscriber::with_default(captured.clone(), || {
+        tracing::callsite::rebuild_interest_cache();
         request::with_key::<()>(Err(carried), None, |_, _| {
             called.set(true);
             Ok(())
@@ -892,7 +904,11 @@ fn und_actual_success_traces_lock_and_ledger_without_peer_or_key_leaks() {
     let captured = Captured::default();
     let body = "SUCCESS_BODY_CANARY_1042";
     let key = request::mint(NOW);
+    let _capture = crate::testing::TRACING_CAPTURE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let (failed, receipt) = tracing::subscriber::with_default(captured.clone(), || {
+        tracing::callsite::rebuild_interest_cache();
         invoke(owned.path(), 100, arguments(body, Some(&key)))
     });
     assert!(!failed);

@@ -4898,6 +4898,7 @@ mod tests {
         let now = std::time::Instant::now();
         assert!(!state.sibling_backoff_active(now));
         tracing::subscriber::with_default(MetadataWarningCapture(events.clone()), || {
+            tracing::callsite::rebuild_interest_cache();
             for tick in 0..10u64 {
                 state.record_sibling(two, now + std::time::Duration::from_secs(tick));
             }
@@ -4969,6 +4970,7 @@ mod tests {
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let first_calls = std::sync::atomic::AtomicUsize::new(0);
         tracing::subscriber::with_default(MetadataWarningCapture(events.clone()), || {
+            tracing::callsite::rebuild_interest_cache();
             for tick in 0..5 {
                 let ctx = legacy_cache_ctx(&base, binding.clone(), &http, &negative);
                 assert_eq!(
@@ -5047,6 +5049,7 @@ mod tests {
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let first_calls = std::sync::atomic::AtomicUsize::new(0);
         tracing::subscriber::with_default(MetadataWarningCapture(events.clone()), || {
+            tracing::callsite::rebuild_interest_cache();
             for tick in 0..5 {
                 let ctx = legacy_cache_ctx(&base, binding.clone(), &http, &negative);
                 let outcome = reconcile_candidates(&ctx, std::slice::from_ref(&candidate), None);
@@ -5130,6 +5133,7 @@ mod tests {
             let events = Arc::new(std::sync::Mutex::new(Vec::new()));
             let first_calls = std::sync::atomic::AtomicUsize::new(0);
             tracing::subscriber::with_default(MetadataWarningCapture(events.clone()), || {
+                tracing::callsite::rebuild_interest_cache();
                 for tick in 0..5 {
                     let ctx = legacy_cache_ctx(&base, binding.clone(), &http, &negative);
                     let outcome =
@@ -5181,6 +5185,7 @@ mod tests {
         let now = std::time::Instant::now();
         let sibling = ai::SlotKey::from_key("3");
         tracing::subscriber::with_default(MetadataWarningCapture(events.clone()), || {
+            tracing::callsite::rebuild_interest_cache();
             assert!(!state.known_sibling_backoff_active(id, now));
             state.record_known_same_email(id, sibling, now);
             state.record_known_same_email(id, sibling, now + std::time::Duration::from_secs(5));
@@ -5212,6 +5217,7 @@ mod tests {
         let slot = AccountNum::try_from(2u16).unwrap();
         let now = std::time::Instant::now();
         tracing::subscriber::with_default(MetadataWarningCapture(events.clone()), || {
+            tracing::callsite::rebuild_interest_cache();
             for error in [
                 ai::IdentityError::LegacyEmailUnparseable,
                 ai::IdentityError::UnsafePermissions,

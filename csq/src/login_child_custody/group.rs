@@ -40,6 +40,9 @@ struct Inner {
     pump: Mutex<Option<Pump>>,
     readers: AtomicBool,
     killed: Mutex<Option<Instant>>,
+    // Terminal foreground held for an attended login; restored on reap or drop.
+    #[cfg(unix)]
+    foreground: Mutex<Option<TerminalCustody>>,
     #[cfg(windows)]
     job: win::Job,
 }
@@ -85,6 +88,69 @@ impl GroupControl {
             return Err(error);
         }
         Ok(())
+    }
+    /// Give the terminal back to csq's own group (no-op when never handed off).
+    #[cfg(unix)]
+    pub(crate) fn release_foreground(&self) {
+        let taken = self
+            .0
+            .foreground
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drop(taken); // TerminalCustody::drop restores and logs a failure.
+    }
+    /// Move the terminal custody out to the sole custody owner, so leaking this
+    /// handle (the deliberate unresolved-custody branch) can never leak the tty.
+    #[cfg(unix)]
+    pub(crate) fn take_terminal(&self) -> Option<TerminalCustody> {
+        self.0
+            .foreground
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+    /// Whether ANY member of the group is observed STOPPED (job control). The
+    /// leader is read with WSTOPPED|WNOWAIT; other members from the process
+    /// table (`scan_members`, heavier, so the caller rate-limits it). Read-only:
+    /// never reaps. Requires csq still to hold the wait lease, so a numeric
+    /// PGID is only ever read while our unreaped leader reserves it.
+    #[cfg(unix)]
+    pub(crate) fn stopped_member(&self, scan_members: bool) -> bool {
+        let Ok(lease) = self.0.lease.lock() else {
+            return false;
+        };
+        if *lease != WaitLease::Retained {
+            return false;
+        }
+        // A leader that has already exited (unreaped) means the login is over:
+        // its members are the freeze/census's to reap, never a suspension, so an
+        // exit-0 login is not turned into a cancellation by a stopped helper.
+        if leader_has_exited(self.id()) {
+            return false;
+        }
+        // SAFETY: initialized C output; WSTOPPED|WNOWAIT only observe our child.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: query only our direct child.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.id() as libc::id_t,
+                &mut info,
+                libc::WSTOPPED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            #[cfg(target_os = "linux")]
+            // SAFETY: waitid initialized the SIGCHLD arm.
+            let observed = unsafe { info.si_pid() };
+            #[cfg(target_os = "macos")]
+            let observed = info.si_pid;
+            if observed == self.id() as libc::pid_t && info.si_code == libc::CLD_STOPPED {
+                return true;
+            }
+        }
+        scan_members && group_has_stopped_member(self.id())
     }
     pub(crate) fn mark_readers_joined(&self) {
         // Serialize both completion orders with reaping and stop decisions.
@@ -306,6 +372,8 @@ impl GroupControl {
         }
         let result = child.try_wait();
         if matches!(result, Ok(Some(_))) {
+            #[cfg(unix)]
+            self.release_foreground();
             // Only an actual reap of the original Child creates positive state.
             *lease = if self.readers_joined() {
                 WaitLease::Finalized
@@ -318,23 +386,246 @@ impl GroupControl {
 }
 
 pub(crate) fn spawn(command: &mut Command) -> io::Result<(Child, GroupControl)> {
+    spawn_with(command, false)
+}
+
+/// [`spawn`] for an ATTENDED login (csq's own stdin is its controlling
+/// terminal, as in `csq login N`): the vendor's new process group is also made
+/// the terminal's foreground group, so the vendor may use the tty without
+/// being stopped by SIGTTOU/SIGTTIN. Foreground returns to csq when the leader
+/// is reaped or the group handle drops. With no such terminal (desktop, pipes,
+/// a backgrounded csq) this is exactly [`spawn`].
+pub(crate) fn spawn_attended(command: &mut Command) -> io::Result<(Child, GroupControl)> {
+    spawn_with(command, true)
+}
+
+fn spawn_with(command: &mut Command, attended: bool) -> io::Result<(Child, GroupControl)> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
-        let child = command.spawn()?;
+        let mut foreground = if attended {
+            TerminalCustody::arm(command)?
+        } else {
+            None
+        };
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                // Only the pre_exec handoff returns HANDOFF_ERRNO (every one of
+                // its failures is mapped to it; execve never yields ENOTTY), so a
+                // missing or unrunnable program is never labelled a handoff failure.
+                if foreground.is_some() && error.raw_os_error() == Some(HANDOFF_ERRNO) {
+                    eprintln!("login_tty_foreground_handoff_failed stage=pre_exec");
+                }
+                return Err(error);
+            }
+        };
+        if let Some(custody) = foreground.as_mut() {
+            custody.vendor = child.id() as libc::pid_t;
+        }
         let group = GroupControl(Arc::new(Inner {
             pid: child.id(),
             lease: Mutex::new(WaitLease::Retained),
             pump: Mutex::new(None),
             readers: AtomicBool::new(false),
             killed: Mutex::new(None),
+            foreground: Mutex::new(foreground),
         }));
         Ok((child, group))
     }
     #[cfg(windows)]
     {
+        let _ = attended;
         win::spawn(command)
+    }
+}
+
+/// The one errno the pre_exec handoff reports for every failure.
+#[cfg(unix)]
+const HANDOFF_ERRNO: libc::c_int = libc::ENOTTY;
+
+/// At most one attended custody at a time: SIGTTOU save/restore pairs would
+/// otherwise interleave out of order. A second concurrent arm is REFUSED
+/// (fail closed) instead of corrupting the first one's restore.
+#[cfg(unix)]
+static CUSTODY_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+struct ActiveSlot;
+#[cfg(unix)]
+impl ActiveSlot {
+    fn claim() -> Option<Self> {
+        CUSTODY_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self)
+    }
+}
+#[cfg(unix)]
+impl Drop for ActiveSlot {
+    fn drop(&mut self) {
+        CUSTODY_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+/// The terminal custody of an ATTENDED login, a separate owned object whose
+/// Drop restores everything it took: the foreground group, the tty modes and
+/// csq's SIGTTOU disposition. The custody owner holds it (not the group handle,
+/// which the unresolved-custody branch deliberately leaks), so no custody end
+/// can keep the operator's terminal.
+///
+/// csq ignores SIGTTOU for the whole window: with the vendor in the foreground
+/// csq is a background group, and under `stty tostop` its own writes (notices,
+/// the Codex stdout tee) would otherwise stop csq itself. The ignore is reset
+/// to the default in the child before exec, so the vendor never inherits it.
+#[cfg(unix)]
+pub(crate) struct TerminalCustody {
+    fd: std::os::fd::OwnedFd,
+    own: libc::pid_t,
+    pub(crate) vendor: libc::pid_t,
+    termios: libc::termios,
+    prior_ttou: libc::sigaction,
+    // Declared last: released only after Drop::drop has restored everything.
+    _slot: ActiveSlot,
+}
+
+#[cfg(unix)]
+impl TerminalCustody {
+    /// Arm the handoff when the process has a controlling terminal (opened as
+    /// /dev/tty, so a redirected stdin does not defeat it) whose foreground
+    /// group is csq's own; `Ok(None)` otherwise (not attended, or csq itself is
+    /// a background job).
+    ///
+    /// The terminal is taken in the child's `pre_exec`, after std made the child
+    /// its own group leader and before exec: the vendor never runs one
+    /// instruction as a background group, so there is no window in which it can
+    /// touch the tty and stop, and no SIGCONT is needed. A parent-side
+    /// tcsetpgrp after spawn would race the vendor's first tty access.
+    ///
+    /// The registered closure is bound to this one handoff (a raw fd number and
+    /// the parent's group): arm once per Command and never respawn that Command.
+    fn arm(command: &mut Command) -> io::Result<Option<Self>> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::process::CommandExt;
+        // Fail closed: degrading to an unattended spawn would put the vendor in a
+        // background group, the very an internal ticket stop.
+        let Some(slot) = ActiveSlot::claim() else {
+            eprintln!("login_tty_custody_overlap_refused");
+            return Err(io::Error::other("login terminal custody already active"));
+        };
+        // SAFETY: NUL-terminated literal path; the flags forbid acquiring a
+        // controlling terminal and leaking the descriptor into the vendor.
+        let tty = unsafe {
+            libc::open(
+                c"/dev/tty".as_ptr(),
+                libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOCTTY,
+            )
+        };
+        if tty < 0 {
+            return Ok(None); // no controlling terminal: not attended
+        }
+        // SAFETY: tty is a fresh descriptor this function owns.
+        let tty = unsafe { std::os::fd::OwnedFd::from_raw_fd(tty) };
+        // SAFETY: read-only queries.
+        let (foreground, own) = unsafe { (libc::tcgetpgrp(tty.as_raw_fd()), libc::getpgrp()) };
+        if foreground < 0 || foreground != own {
+            return Ok(None);
+        }
+        // SAFETY: F_DUPFD_CLOEXEC; >= 10 keeps clear of the child's stdio dup2
+        // targets, CLOEXEC keeps it out of the vendor.
+        let raw = unsafe { libc::fcntl(tty.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
+        if raw < 0 {
+            eprintln!("login_tty_foreground_handoff_failed stage=dup");
+            return Err(io::Error::other("login terminal handoff unavailable"));
+        }
+        // SAFETY: raw is a fresh descriptor this function exclusively owns.
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        drop(tty);
+        // SAFETY: zeroed termios filled by tcgetattr on the live tty.
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: valid fd and out-pointer.
+        if unsafe { libc::tcgetattr(raw, &mut termios) } != 0 {
+            eprintln!("login_tty_foreground_handoff_failed stage=termios");
+            return Err(io::Error::other("login terminal handoff unavailable"));
+        }
+        // SAFETY: zeroed sigaction; SIG_IGN installed, the prior one saved.
+        let mut prior_ttou: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: as above; only valid pointers are passed.
+        unsafe {
+            let mut ignore: libc::sigaction = std::mem::zeroed();
+            ignore.sa_sigaction = libc::SIG_IGN;
+            libc::sigemptyset(&mut ignore.sa_mask);
+            if libc::sigaction(libc::SIGTTOU, &ignore, &mut prior_ttou) != 0 {
+                eprintln!("login_tty_foreground_handoff_failed stage=sigttou");
+                return Err(io::Error::other("login terminal handoff unavailable"));
+            }
+        }
+        // SAFETY: the closure only calls async-signal-safe functions.
+        unsafe {
+            command.pre_exec(move || {
+                // Refuse if csq lost the foreground between arm and fork (a
+                // ^Z-and-bg race): never take the terminal from the shell.
+                if libc::tcgetpgrp(raw) != own {
+                    return Err(io::Error::from_raw_os_error(HANDOFF_ERRNO));
+                }
+                // SIGTTOU is ignored (inherited from csq), so this is permitted
+                // from the not-yet-foreground group.
+                if libc::tcsetpgrp(raw, libc::getpid()) != 0 {
+                    return Err(io::Error::from_raw_os_error(HANDOFF_ERRNO));
+                }
+                libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+        Ok(Some(Self {
+            fd,
+            own,
+            vendor: 0,
+            termios,
+            prior_ttou,
+            _slot: slot,
+        }))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalCustody {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        let fd = self.fd.as_raw_fd();
+        // SAFETY: plain queries/calls on our own duplicate of the tty and
+        // groups; SIGTTOU is ignored for the whole window so none can stop us.
+        unsafe {
+            let foreground = libc::tcgetpgrp(fd);
+            // Take the terminal back only from the vendor's group or from a
+            // group that no longer exists; never from a live unrelated group.
+            let vendor_gone = foreground > 0
+                && foreground != self.own
+                && libc::kill(-foreground, 0) != 0
+                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            if foreground == self.vendor || vendor_gone {
+                if libc::tcsetpgrp(fd, self.own) != 0 {
+                    eprintln!(
+                        "login_tty_foreground_restore_failed errno={}",
+                        io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+                    );
+                }
+            } else if foreground != self.own {
+                eprintln!("login_tty_foreground_restore_skipped");
+            }
+            if libc::tcgetpgrp(fd) == self.own
+                && libc::tcsetattr(fd, libc::TCSANOW, &self.termios) != 0
+            {
+                eprintln!(
+                    "login_tty_modes_restore_failed errno={}",
+                    io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+                );
+            }
+            if libc::sigaction(libc::SIGTTOU, &self.prior_ttou, std::ptr::null_mut()) != 0 {
+                eprintln!("login_tty_sigttou_restore_failed");
+            }
+        }
     }
 }
 
@@ -343,6 +634,38 @@ pub(crate) fn spawn(command: &mut Command) -> io::Result<(Child, GroupControl)> 
 #[cfg(all(test, unix))]
 pub(crate) fn observe_owned_unreaped_for_test(child: &Child) -> io::Result<bool> {
     observe_unreaped(child.id())
+}
+
+/// True only when the unreaped leader is observed EXITED (si_code names an
+/// exit, kill or dump). Darwin fills the siginfo for a merely STOPPED child
+/// even under WEXITED|WNOHANG, so `observe_unreaped`'s pid match alone is not
+/// proof of exit; the si_code is.
+#[cfg(unix)]
+fn leader_has_exited(pid: u32) -> bool {
+    // SAFETY: initialized C output; WNOWAIT never consumes the child's identity.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: query only our direct child.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc != 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    // SAFETY: waitid initialized the SIGCHLD arm.
+    let observed = unsafe { info.si_pid() };
+    #[cfg(target_os = "macos")]
+    let observed = info.si_pid;
+    observed == pid as libc::pid_t
+        && matches!(
+            info.si_code,
+            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+        )
 }
 
 #[cfg(unix)]
@@ -593,6 +916,23 @@ fn member_state(pid: u32) -> io::Result<Option<(u32, bool)>> {
     }
 }
 
+/// Any live member of `pgid` in job-control stop (`T`/`t`). An unreadable
+/// member reads as not stopped: this only ever ADDS a cancellation trigger.
+#[cfg(target_os = "linux")]
+fn group_has_stopped_member(pgid: u32) -> bool {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    dir.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+            .and_then(|pid| read_stat(pid).ok().flatten())
+            .is_some_and(|(state, group)| group == pgid && matches!(state, b'T' | b't'))
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn members(pgid: u32) -> io::Result<Vec<u32>> {
     let mut pids = Vec::new();
@@ -726,6 +1066,32 @@ fn member_state(pid: u32) -> io::Result<Option<(u32, bool)>> {
         return Err(io::Error::other("login group member info incomplete"));
     }
     Ok(Some((info.pbi_pgid, info.pbi_status != SZOMB)))
+}
+
+/// Any live member of `pgid` in job-control stop (SSTOP). Unreadable reads as
+/// not stopped: this only ever ADDS a cancellation trigger.
+#[cfg(target_os = "macos")]
+fn group_has_stopped_member(pgid: u32) -> bool {
+    const SSTOP: u32 = 4;
+    let Ok(pids) = members(pgid) else {
+        return false;
+    };
+    pids.into_iter().any(|pid| {
+        // SAFETY: plain C output struct sized exactly for PROC_PIDTBSDINFO.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: valid output buffer of `size` bytes.
+        let bytes = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        bytes == size && info.pbi_pgid == pgid && info.pbi_status == SSTOP
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -924,5 +1290,25 @@ impl ErrorBudget {
         } else {
             ErrorAction::Continue
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod overlap_tests {
+    use super::*;
+
+    #[test]
+    fn second_attended_arm_while_one_is_active_fails_closed() {
+        // Hold the single custody slot as a live attended login would.
+        let _held = ActiveSlot::claim().expect("slot free at test start");
+        let mut command = Command::new("true");
+        let error = match TerminalCustody::arm(&mut command) {
+            Ok(_) => panic!("OVERLAP_NOT_REFUSED: a second arm must not degrade to unattended"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("already active"),
+            "OVERLAP_WORDING: {error}"
+        );
     }
 }

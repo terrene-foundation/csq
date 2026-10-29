@@ -7014,7 +7014,10 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let out = tracing::subscriber::with_default(WarnCapture(events.clone()), run);
+        let out = tracing::subscriber::with_default(WarnCapture(events.clone()), || {
+            tracing::callsite::rebuild_interest_cache();
+            run()
+        });
         let captured = std::mem::take(&mut *events.lock().unwrap());
         (out, captured)
     }

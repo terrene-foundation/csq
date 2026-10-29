@@ -49,7 +49,10 @@ fn logs(run: impl FnOnce()) -> Vec<Event> {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let events = Arc::new(Mutex::new(Vec::new()));
-    tracing::subscriber::with_default(Capture(events.clone()), run);
+    tracing::subscriber::with_default(Capture(events.clone()), || {
+        tracing::callsite::rebuild_interest_cache();
+        run()
+    });
     // Read through the lock (take, as the events are not Clone): a dispatcher clone may outlive with_default, so
     // sole ownership of the Arc is not guaranteed (an internal ticket).
     // The named binding is deliberate: the `MutexGuard` temporary must drop at the end of this statement,

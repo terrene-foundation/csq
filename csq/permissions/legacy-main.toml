@@ -72,5 +72,6 @@ commands.allow = [
   "cloud_claude_provision_bedrock",
   "get_codex_slot_write_status",
   "get_claude_autocompact_status",
+  "get_archive_health",
   "ack_codex_slot_raced"
 ]

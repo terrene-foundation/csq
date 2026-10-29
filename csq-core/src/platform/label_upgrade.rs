@@ -809,7 +809,10 @@ mod tests {
     fn capture<T>(run: impl FnOnce() -> T) -> (T, Vec<(tracing::Level, String)>) {
         let _lock = capture_lock();
         let events = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let out = tracing::subscriber::with_default(Events(events.clone()), run);
+        let out = tracing::subscriber::with_default(Events(events.clone()), || {
+            tracing::callsite::rebuild_interest_cache();
+            run()
+        });
         let got = events.lock().unwrap().clone();
         (out, got)
     }

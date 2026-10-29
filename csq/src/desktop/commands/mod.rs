@@ -1387,6 +1387,113 @@ pub async fn get_claude_autocompact_status(
     .map_err(|_| "Claude auto-compact diagnostic unavailable".to_string())
 }
 
+/// One failing archive check for the desktop banner (an internal ticket): the public view of
+/// `csq_core::archive_health::ArchiveFinding`. Fixed check ids, a one-line reason
+/// (home paths redacted) and a fix hint; no file content beyond the pause reason line.
+#[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveFindingView {
+    /// `upload_jobs` | `upload_recent` | `upload_recent_hot` | `delete_active` |
+    /// `paused` | `archive_health` (the home could not be located).
+    pub check: String,
+    /// `warn` | `unknown`.
+    pub state: String,
+    pub reason: String,
+    pub hint: String,
+}
+
+/// Pure core of [`get_archive_health`]: the findings for the home derived from `base`.
+/// Empty when the archive is not configured or all checks pass.
+pub(crate) fn archive_findings_view(
+    base: &std::path::Path,
+    now: std::time::SystemTime,
+    launchd: &dyn csq_core::archive_health::LaunchdProbe,
+) -> Vec<ArchiveFindingView> {
+    use csq_core::archive_health::{check, home_of_base, CheckState};
+    let Some(home) = home_of_base(base) else {
+        // Same as `csq doctor`: never silent when the archive's home is unlocatable.
+        return vec![ArchiveFindingView {
+            check: "archive_health".to_owned(),
+            state: "unknown".to_owned(),
+            reason: "cannot locate home".to_owned(),
+            hint: "csq expects its accounts directory at ~/.claude/accounts".to_owned(),
+        }];
+    };
+    let Some(checks) = check(&home, now, launchd).checks().cloned() else {
+        return Vec::new();
+    };
+    checks
+        .findings()
+        .into_iter()
+        .map(|f| {
+            let (state, reason) = match f.state {
+                CheckState::Warn(r) => ("warn", r),
+                CheckState::Unknown(r) => ("unknown", r),
+                CheckState::Ok => ("ok", String::new()),
+            };
+            ArchiveFindingView {
+                check: f.check.to_owned(),
+                state: state.to_owned(),
+                // Redact the home prefix first, then strip every character the
+                // display predicate rejects (C0/C1 controls, bidi controls,
+                // zero-width characters, line separators, the TAG block): a
+                // reason is built from a file's own bytes.
+                reason: csq_core::cli_deps::sanitize_for_display(
+                    &csq_core::cli_deps::sanitize::redact_home_anywhere(&reason),
+                ),
+                // A hint names the per-role plist paths, so it is kept WHOLE:
+                // the 200-char display cap could cut a path in half and leave
+                // an unusable command. Strip only.
+                hint: csq_core::cli_deps::sanitize::strip_unsafe_display(
+                    &csq_core::cli_deps::sanitize::redact_home_anywhere(&f.hint),
+                ),
+            }
+        })
+        .collect()
+}
+
+static ARCHIVE_HEALTH_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Holds the single-flight slot of [`get_archive_health`]; released on drop.
+struct ArchiveHealthFlight;
+impl ArchiveHealthFlight {
+    fn acquire() -> Result<Self, String> {
+        use std::sync::atomic::Ordering;
+        ARCHIVE_HEALTH_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self)
+            .map_err(|_| "archive health check already running".to_string())
+    }
+}
+impl Drop for ArchiveHealthFlight {
+    fn drop(&mut self) {
+        ARCHIVE_HEALTH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Archive upload/delete health for the desktop banner. Read-only and idempotent;
+/// never starts or stops a job. The only subprocess is a 2 s-capped `launchctl print`.
+///
+/// # Errors
+/// `base_dir` does not match the resolved csq accounts directory, or the worker fails.
+#[tauri::command]
+pub async fn get_archive_health(base_dir: String) -> Result<Vec<ArchiveFindingView>, String> {
+    let base = resolve_csq_base_dir(&base_dir)?;
+    // Single flight: one `launchctl` probe at a time. A concurrent call is refused
+    // (the renderer keeps its last findings) rather than parking another worker.
+    let permit = ArchiveHealthFlight::acquire()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        archive_findings_view(
+            &base,
+            std::time::SystemTime::now(),
+            &csq_core::archive_health::SystemLaunchd,
+        )
+    })
+    .await
+    .map_err(|_| "archive health unavailable".to_string())
+}
+
 /// Lists the Codex slots with a recorded config-write condition. Read-only and idempotent.
 ///
 /// # Errors
@@ -5102,6 +5209,123 @@ pub(crate) mod test_base_dir_env {
 }
 
 #[cfg(test)]
+mod archive_health_command_tests {
+    use super::*;
+
+    struct NoneLoaded;
+    impl csq_core::archive_health::LaunchdProbe for NoneLoaded {
+        fn state(&self, _l: &str) -> csq_core::archive_health::LaunchdState {
+            csq_core::archive_health::LaunchdState::NotLoaded
+        }
+    }
+
+    #[test]
+    fn findings_view_is_empty_when_not_configured_and_public_when_failing() {
+        // `redact_home_anywhere` reads $HOME: pin it to the fixture home under the
+        // shared env lock so the assertion does not depend on where TMPDIR lives.
+        let _env = csq_core::platform::test_env::lock();
+        let home = tempfile::TempDir::new().unwrap();
+        let saved_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let _restore = HomeRestore(saved_home);
+        let base = home.path().join(".claude/accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        let now = std::time::SystemTime::now();
+        assert!(archive_findings_view(&base, now, &NoneLoaded).is_empty());
+        let arch = home.path().join(".config/csq-archive");
+        std::fs::create_dir_all(arch.join("log")).unwrap();
+        std::fs::write(
+            arch.join("PAUSED"),
+            format!("paused: see {}/x", home.path().display()),
+        )
+        .unwrap();
+        let v = archive_findings_view(&base, now, &NoneLoaded);
+        let ids: Vec<_> = v.iter().map(|f| f.check.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "upload_jobs",
+                "upload_recent",
+                "upload_recent_hot",
+                "delete_active",
+                "paused"
+            ]
+        );
+        assert!(v.iter().all(|f| f.state == "warn" && !f.hint.is_empty()));
+        let wire = serde_json::to_string(&v).unwrap();
+        assert!(!wire.contains(home.path().to_str().unwrap()), "{wire}");
+    }
+
+    #[test]
+    fn paused_key_straddling_the_cut_never_reaches_the_ipc_payload() {
+        let _env = csq_core::platform::test_env::lock();
+        let home = tempfile::TempDir::new().unwrap();
+        let base = home.path().join(".claude/accounts");
+        let arch = home.path().join(".config/csq-archive");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(arch.join("log")).unwrap();
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        std::fs::write(arch.join("PAUSED"), format!("{} {key}\n", "x".repeat(179))).unwrap();
+        let wire = serde_json::to_string(&archive_findings_view(
+            &base,
+            std::time::SystemTime::now(),
+            &NoneLoaded,
+        ))
+        .unwrap();
+        assert!(!wire.contains(&key[..12]), "{wire}");
+    }
+
+    #[test]
+    fn relocated_base_yields_one_unknown_row_not_silence() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let v = archive_findings_view(dir.path(), std::time::SystemTime::now(), &NoneLoaded);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(v[0].check, "archive_health");
+        assert_eq!(v[0].state, "unknown");
+        assert_eq!(v[0].reason, "cannot locate home");
+    }
+
+    struct HomeRestore(Option<std::ffi::OsString>);
+    impl Drop for HomeRestore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn single_flight_refuses_a_concurrent_probe_and_releases_on_drop() {
+        let first = ArchiveHealthFlight::acquire().expect("free slot");
+        assert_eq!(
+            ArchiveHealthFlight::acquire().err().as_deref(),
+            Some("archive health check already running")
+        );
+        drop(first);
+        assert!(ArchiveHealthFlight::acquire().is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn command_rejects_a_base_dir_that_is_not_the_resolved_accounts_dir() {
+        let _env = csq_core::platform::test_env::lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().join(".claude/accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set_locked(&_env, &base);
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let error = get_archive_health(outside.to_string_lossy().into_owned())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "base_dir does not match the resolved csq accounts directory"
+        );
+    }
+}
+
+#[cfg(test)]
 mod claude_autocompact_status_tests {
     use super::*;
 
@@ -7455,6 +7679,10 @@ mod tests {
     /// dropped silently, never re-raised into the (already committed)
     /// command. Reverting the helper to `let _ = spawn_blocking(..).await`
     /// removes the log line and reds the content assertions.
+    // The shared capture lock must span the whole capture, awaits included;
+    // this runtime is current-thread, so no other task here can need it
+    // (clippy::await_holding_lock is about multi-task runtimes).
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn notify_daemon_blocking_logs_a_panicked_task_and_does_not_propagate() {
         let sink = LogSink::default();
@@ -7462,7 +7690,11 @@ mod tests {
             .with_writer(sink.clone())
             .with_ansi(false)
             .finish();
+        let _capture = csq_core::testing::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
 
         notify_daemon_blocking(|| panic!("notify body panic carrying SECRET-MARKER")).await;
 

@@ -14,7 +14,7 @@ use csq_core::providers::{catalog::Surface, native, native_login};
 use csq_core::types::AccountNum;
 use std::ffi::OsStr;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
@@ -33,7 +33,9 @@ const CONTROL_ASSERTION: &str = "LOGIN_NATIVE_CTRLC_CONTROL_BINDING";
 const PRIOR_ASSERTION: &str = "LOGIN_NATIVE_CTRLC_PRIOR_RESTORED";
 // These are failure/cleanup budgets, never scheduler-speed success assertions.
 // Every successful transition requires its causal marker or fresh nonce.
-const BUDGET: Duration = Duration::from_secs(8);
+// HANG GUARD, not a pacing assumption: success always needs its causal marker;
+// this only bounds a genuinely wedged run. Sized for a sustained host io stall (an internal ticket).
+const BUDGET: Duration = Duration::from_secs(180);
 const PGID_ASSERTION: &str = "LOGIN_NATIVE_CTRLC_OWNED_VENDOR_PGID";
 const REAP_ASSERTION: &str = "LOGIN_NATIVE_CTRLC_ACTUAL_CHILD_REAP";
 
@@ -59,7 +61,7 @@ fn poll(mut condition: impl FnMut() -> bool) -> bool {
         if Instant::now() >= deadline {
             return false;
         }
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -183,6 +185,11 @@ fn run_vendor(root: &Path, ignore: bool, surface: Surface) -> ! {
     )
     .unwrap();
     csq_core::platform::fs::secure_file(&credential).unwrap();
+    // Exit lifeline: the kernel closes this write end when the vendor exits.
+    let _life = std::fs::OpenOptions::new()
+        .write(true)
+        .open(root.join("vendor-life"))
+        .unwrap();
     atomic_write(
         root,
         "vendor-ready",
@@ -331,7 +338,7 @@ fn run_driver(root: &Path, role: &str, surface: Surface) -> ! {
         serde_json::to_string(&receipt).unwrap().as_bytes(),
     )
     .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + BUDGET;
     loop {
         if PRIOR_SIGNALS.load(Ordering::SeqCst) > prior_at_return
             && !root.join("prior-restored").exists()
@@ -390,6 +397,15 @@ fn login_native_ctrlc_private_entry() {
     }
 }
 
+/// SIGCONT on drop, so a panic while the driver is stopped never strands it.
+struct StoppedDriver(libc::pid_t);
+impl Drop for StoppedDriver {
+    fn drop(&mut self) {
+        // SAFETY: the pid is this test's own still-owned, unreaped driver.
+        unsafe { libc::kill(self.0, libc::SIGCONT) };
+    }
+}
+
 struct Driver {
     child: Option<Child>,
     input: Option<ChildStdin>,
@@ -400,11 +416,21 @@ struct Driver {
     surface: Surface,
     logs_forwarded: bool,
     vendor_pid: Option<u32>,
+    life: Option<std::fs::File>,
 }
 
 impl Driver {
     fn spawn(role: &'static str, surface: Surface) -> Self {
         let sandbox = tempfile::tempdir().unwrap();
+        let life_path = sandbox.path().join("vendor-life");
+        let life_c = std::ffi::CString::new(life_path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid NUL-terminated path inside this test's private sandbox.
+        assert_eq!(unsafe { libc::mkfifo(life_c.as_ptr(), 0o600) }, 0);
+        let life = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&life_path)
+            .unwrap();
         let mut command = selected_command(sandbox.path(), role, surface).unwrap();
         command.process_group(0).stdin(Stdio::piped());
         let mut child = command.spawn().unwrap();
@@ -420,6 +446,7 @@ impl Driver {
             surface,
             logs_forwarded: false,
             vendor_pid: None,
+            life: Some(life),
         };
         // A fresh actual Child remains UNREAPED until cleanup completes.
         // getpgid binds the only terminal-signal target to its owned group.
@@ -428,6 +455,43 @@ impl Driver {
         fixture
     }
 
+    /// Freeze the driver (waitid(WSTOPPED|WNOWAIT) proves it stopped) so signals sent
+    /// next are only pending: the 200ms production pump cannot act on them
+    /// before the test has ordered the vendor's exit.
+    fn stop(&self) -> StoppedDriver {
+        assert!(self.pgid_custody);
+        let guard = StoppedDriver(self.pid);
+        // SAFETY: only this unreaped private driver PID is targeted.
+        assert_eq!(unsafe { libc::kill(self.pid, libc::SIGSTOP) }, 0);
+        // SAFETY: waitid with WNOWAIT only observes the state change and never
+        // reaps: Child keeps sole ownership of the exit status, so a driver that
+        // already died stays a zombie instead of being reaped before the guard's
+        // SIGCONT (no PID-reuse window).
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.pid as libc::id_t,
+                &mut info,
+                libc::WSTOPPED | libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(
+            info.si_code,
+            libc::CLD_STOPPED,
+            "driver exited instead of stopping"
+        );
+        guard
+    }
+    /// True once the kernel closed the vendor's FIFO write end: the vendor
+    /// process exited. An event, not a duration; valid only after ready().
+    fn vendor_exited(&self) -> bool {
+        use std::io::Read;
+        let mut byte = [0_u8; 1];
+        let mut life = self.life.as_ref().unwrap();
+        matches!(life.read(&mut byte), Ok(0))
+    }
     fn root(&self) -> &Path {
         self.sandbox.as_ref().unwrap().path()
     }
@@ -648,23 +712,21 @@ fn assert_ignored(surface: Surface) {
         && driver.ping(b"native-after-cancel-1")
         && !driver.root().join("reaped-receipt").exists()
         && unbound(driver.root(), surface);
-    let second = if retained {
+    // The second interrupt is the product's explicit second-Ctrl-C kill
+    // escalation, acted on by the 200ms pump. Deliver it while the driver is
+    // stopped (a further SIGINT would coalesce into the same single pending
+    // signal), release the vendor and wait for its ACTUAL exit before SIGCONT:
+    // the late-zero outcome no longer depends on pump latency (an internal ticket). Lock
+    // retention is asserted before the stop and again after the reap; nothing
+    // is sampled while the driver is frozen, where no check could fail.
+    let repeated = retained && {
+        let stopped = driver.stop();
         driver.signal_group();
-        let ack = driver.ping(b"native-after-repeat-2");
-        driver.signal_group();
-        ack
-    } else {
-        false
+        driver.release();
+        let exited = poll(|| driver.vendor_exited());
+        drop(stopped);
+        exited
     };
-    let repeated = retained
-        && second
-        && driver.ping(b"native-after-repeat-3")
-        && held(driver.root())
-        && !driver.root().join("reaped-receipt").exists()
-        && unbound(driver.root(), surface);
-    if ready {
-        driver.assert_live_vendor_group();
-    }
     driver.release();
     let receipt = driver.receipt();
     let reaped = receipt
@@ -688,6 +750,63 @@ fn assert_ignored(surface: Surface) {
             && receipt
                 .as_ref()
                 .is_some_and(|r| actual_cancel_receipt(r, None))
+            && status.is_some_and(|s| s.code() == Some(130)),
+        "{LATE_ASSERTION}"
+    );
+}
+
+fn assert_second_interrupt_kills(surface: Surface) {
+    let mut driver = Driver::spawn("driver-ignore", surface);
+    let ready = driver.ready();
+    if ready {
+        driver.signal_group();
+    }
+    let cancelled = ready && poll(|| driver.notices("driver-ignore") > 0);
+    let survived = cancelled
+        && held(driver.root())
+        && driver.ping(b"native-kill-after-cancel-1")
+        && !driver.root().join("reaped-receipt").exists()
+        && unbound(driver.root(), surface);
+    // Second Ctrl-C: the pump escalates to SIGKILL; the vendor is never released.
+    let killed = survived && {
+        driver.signal_group();
+        poll(|| driver.vendor_exited())
+    };
+    // A sample that sees the lock free and then no receipt proves the lock was
+    // released before the reap.
+    let mut released_early = false;
+    if killed {
+        poll(|| {
+            let free = !held(driver.root());
+            let receipt = driver.root().join("reaped-receipt").exists();
+            released_early |= free && !receipt;
+            receipt || released_early
+        });
+    }
+    let receipt = driver.receipt();
+    let reaped = receipt
+        .as_ref()
+        .is_some_and(|r| driver.actual_reap_matches_spawn(r));
+    let preserved = credential_present(driver.root(), surface) && unbound(driver.root(), surface);
+    let completed = driver.root().join("vendor-completed").exists();
+    let unlocked = matches!(
+        AccountLoginLock::acquire(&driver.root().join("base"), account()),
+        Ok(AcquireOutcome::Acquired(_))
+    );
+    let status = driver.finish_and_reap();
+    assert!(survived && killed, "{RETAIN_ASSERTION}");
+    assert!(
+        !released_early,
+        "{LATE_ASSERTION}: lock released before reap"
+    );
+    assert!(
+        reaped
+            && !completed
+            && preserved
+            && unlocked
+            && receipt
+                .as_ref()
+                .is_some_and(|r| actual_cancel_receipt(r, Some(libc::SIGKILL)))
             && status.is_some_and(|s| s.code() == Some(130)),
         "{LATE_ASSERTION}"
     );
@@ -768,4 +887,16 @@ fn login_native_grok_ctrlc_ignored_sigint_retains_lock_until_late_zero_no_bindin
 fn login_native_grok_no_cancel_actual_zero_writes_binding() {
     let _env_guard = csq_core::platform::test_env::lock();
     assert_control(Surface::Grok);
+}
+
+#[test]
+fn login_native_kimi_ctrlc_second_interrupt_kills_vendor_130_no_binding() {
+    let _env_guard = csq_core::platform::test_env::lock();
+    assert_second_interrupt_kills(Surface::Kimi);
+}
+
+#[test]
+fn login_native_grok_ctrlc_second_interrupt_kills_vendor_130_no_binding() {
+    let _env_guard = csq_core::platform::test_env::lock();
+    assert_second_interrupt_kills(Surface::Grok);
 }

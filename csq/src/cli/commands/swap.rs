@@ -5108,17 +5108,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_refuses_when_daemon_is_not_healthy() {
-        #[cfg(not(target_os = "linux"))]
         let _env_guard = csq_core::platform::test_env::lock();
         let handle_dir = tempfile::TempDir::new_in("/tmp").expect("owned handoff fixture root");
         let base = csq_core::testing::socket_fixture::short_root("csq-swap-")
             .expect("owned handoff fixture root");
-        // Deliberately NO spawn_fake_healthy_daemon(base.path()) call — but
-        // STILL needs the env guard: on Linux, detect_daemon prefers
-        // $XDG_RUNTIME_DIR over base_dir whenever that var is set, so
-        // without this a concurrently-running sibling test's
-        // spawn_fake_healthy_daemon fixture (or the ambient real runtime
-        // dir) is what actually gets checked, not this fresh tempdir.
+        // Deliberately NO spawn_fake_healthy_daemon(base.path()) call: the
+        // guard registers this fresh base with `daemon::paths::test_socket`,
+        // so detect_daemon observes `NotRunning` for it rather than the
+        // ambient runtime dir. The env lock above is the test's own.
         let _no_daemon = spawn_no_daemon_env_guard(base.path());
         let target = AccountNum::try_from(9u16).unwrap();
         write_codex_creds_fixture(base.path(), 9, "acct-9", false);
@@ -5145,7 +5142,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_refuses_when_swap_request_already_pending() {
-        #[cfg(not(target_os = "linux"))]
         let _env_guard = csq_core::platform::test_env::lock();
         let handle_dir = tempfile::TempDir::new_in("/tmp").expect("owned handoff fixture root");
         let base = csq_core::testing::socket_fixture::short_root("csq-swap-")
@@ -5201,7 +5197,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_refuses_and_writes_nothing_when_target_has_no_codex_credentials() {
-        #[cfg(not(target_os = "linux"))]
         let _env_guard = csq_core::platform::test_env::lock();
         let handle_dir = tempfile::TempDir::new_in("/tmp").expect("owned handoff fixture root");
         let base = csq_core::testing::socket_fixture::short_root("csq-swap-")
@@ -5258,7 +5253,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_refuses_and_clears_inflight_when_supervisor_record_is_absent() {
-        #[cfg(not(target_os = "linux"))]
         let _env_guard = csq_core::platform::test_env::lock();
         let handle_dir = tempfile::TempDir::new_in("/tmp").expect("owned handoff fixture root");
         let base = csq_core::testing::socket_fixture::short_root("csq-swap-")
@@ -5293,7 +5287,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_refuses_and_withdraws_request_when_recorded_supervisor_is_dead() {
-        #[cfg(not(target_os = "linux"))]
         let _env_guard = csq_core::platform::test_env::lock();
         let handle_dir = tempfile::TempDir::new_in("/tmp").expect("owned handoff fixture root");
         let base = csq_core::testing::socket_fixture::short_root("csq-swap-")
@@ -5355,7 +5348,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_writes_failed_outcome_when_refused_before_any_signal_is_sent() {
-        #[cfg(not(target_os = "linux"))]
         let _env_guard = csq_core::platform::test_env::lock();
         let handle_dir = tempfile::TempDir::new_in("/tmp").expect("owned handoff fixture root");
         let base = csq_core::testing::socket_fixture::short_root("csq-swap-")
@@ -5458,7 +5450,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_writes_request_with_thread_id_and_signals_supervisor() {
-        #[cfg(not(target_os = "linux"))]
         let _env_guard = csq_core::platform::test_env::lock();
         use std::process::Stdio;
         use std::time::{Duration, Instant};
@@ -5596,7 +5587,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_accepts_a_supervisor_two_hops_above_the_ancestor_npm_launcher_shape() {
-        #[cfg(not(target_os = "linux"))]
         let _env_guard = csq_core::platform::test_env::lock();
         use std::process::Stdio;
         use std::time::{Duration, Instant};
@@ -5753,7 +5743,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_refuses_and_does_not_signal_when_record_pid_is_not_the_ancestors_parent() {
-        #[cfg(not(target_os = "linux"))]
         let _env_guard = csq_core::platform::test_env::lock();
         use std::process::Stdio;
         use std::time::{Duration, Instant};
@@ -5858,7 +5847,6 @@ mod tests {
     #[test]
     fn handoff_refuses_and_does_not_signal_when_more_than_one_codex_is_between_shell_and_supervisor(
     ) {
-        #[cfg(not(target_os = "linux"))]
         let _env_guard = csq_core::platform::test_env::lock();
         use std::process::Stdio;
         use std::time::{Duration, Instant};
@@ -5952,7 +5940,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_refuses_and_does_not_signal_when_the_ancestor_chain_is_unreadable() {
-        #[cfg(not(target_os = "linux"))]
         let _env_guard = csq_core::platform::test_env::lock();
         use std::process::Stdio;
         use std::time::{Duration, Instant};
@@ -6044,7 +6031,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_reports_undetermined_and_writes_no_outcome_when_no_verdict_ever_arrives() {
-        #[cfg(not(target_os = "linux"))]
         let _env_guard = csq_core::platform::test_env::lock();
         use std::process::Stdio;
         use std::time::{Duration, Instant};
@@ -6159,7 +6145,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handoff_reports_the_refusal_reason_and_writes_no_outcome_itself() {
-        #[cfg(not(target_os = "linux"))]
         let _env_guard = csq_core::platform::test_env::lock();
         use std::process::Stdio;
         use std::time::{Duration, Instant};

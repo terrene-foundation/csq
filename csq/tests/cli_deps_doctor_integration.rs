@@ -5,8 +5,8 @@
 //! - Slot-suppression: surface row appears only when authenticated slots exist.
 //! - Stale-slot variant: `Missing | WrongBinary` with slots configured.
 //! - Empty-state row: no slots on any surface.
-//! - `schema_version` in JSON output — both editions report 34 as of v34
-//!   (v33 Codex hook-trust carry diagnostics + v34 keychain_orphans, spec 13 §9); expectations
+//! - `schema_version` in JSON output — both editions report 35 as of v35
+//!   (v33 Codex hook-trust carry diagnostics + v34 keychain_orphans + v35 archive_health, spec 13 §9; an internal ticket/an internal ticket, landed in a6aa898f7); expectations
 //!   follow `doctor.rs::DOCTOR_SCHEMA_VERSION`.
 //! - Absent-key test: `codex_cli` omitted when no codex slots (R1-L2).
 //! - Probe-disabled disclosure via env var.
@@ -226,16 +226,16 @@ fn test_1_all_surfaces_with_stubs_render_three_rows() {
 
     let json = run_doctor_json(base.path(), stubs.path().to_str().unwrap());
 
-    // Spec 13 §9 pins both editions to v34 (v33 Codex hook-trust carry diagnostics + v34 keychain_orphans). The spawned binary
+    // Spec 13 §9 v35 bumps BOTH editions 34 -> 35 for archive_health (an internal ticket, landed in a6aa898f7). The spawned binary
     // carries this crate's feature set; keep this public JSON contract in
     // lockstep with `doctor.rs::DOCTOR_SCHEMA_VERSION`.
     #[cfg(feature = "enterprise")]
-    let expected_schema = 34;
+    let expected_schema = 35;
     #[cfg(not(feature = "enterprise"))]
-    let expected_schema = 34;
+    let expected_schema = 35;
     assert_eq!(
         json["schema_version"], expected_schema,
-        "schema_version must equal the edition-active value (both editions: 34)"
+        "schema_version must equal the edition-active value (both editions: 35)"
     );
     assert_eq!(json["claude_code"]["status"], "ok");
     assert_eq!(json["codex_cli"]["status"], "ok");
@@ -523,17 +523,17 @@ fn test_10_json_schema_version_2() {
 
     let json = run_doctor_json(base.path(), stubs.path().to_str().unwrap());
 
-    // Spec 13 §9 pins both editions to v34 (v33 Codex hook-trust carry diagnostics + v34 keychain_orphans). The spawned binary
+    // Spec 13 §9 v35 bumps BOTH editions 34 -> 35 for archive_health (an internal ticket, landed in a6aa898f7). The spawned binary
     // carries this crate's feature set; keep this public JSON contract in
     // lockstep with `doctor.rs::DOCTOR_SCHEMA_VERSION`.
     #[cfg(feature = "enterprise")]
-    let expected_schema: u64 = 34;
+    let expected_schema: u64 = 35;
     #[cfg(not(feature = "enterprise"))]
-    let expected_schema: u64 = 34;
+    let expected_schema: u64 = 35;
     assert_eq!(
         json["schema_version"],
         Value::Number(serde_json::Number::from(expected_schema)),
-        "schema_version must equal the edition-active value (both editions: 34)"
+        "schema_version must equal the edition-active value (both editions: 35)"
     );
 }
 
@@ -1478,8 +1478,8 @@ fn r0_m3_doctor_binary_warns_for_definitely_unloaded_managed_service() {
     );
     assert!(out.status.success());
     let json: Value = serde_json::from_slice(&out.stdout).unwrap();
-    // Spec 13 §9 and both edition-active doctor constants pin v34 (v33 Codex hook-trust carry diagnostics + v34 keychain_orphans).
-    assert_eq!(json["schema_version"], 34);
+    // Spec 13 §9 and both edition-active doctor constants pin v35 (v33 Codex hook-trust carry diagnostics + v34 keychain_orphans + v35 archive_health; an internal ticket/an internal ticket, landed in a6aa898f7).
+    assert_eq!(json["schema_version"], 35);
     assert_eq!(json["cli_shim"]["managed_plist_installed"], true);
     assert_eq!(json["cli_shim"]["managed_service_state"], "not_loaded");
     assert!(json["cli_shim"].get("managed_job_loaded").is_none());

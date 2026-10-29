@@ -42,7 +42,10 @@ fn capture(run: impl FnOnce()) -> Vec<Fields> {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let rows = Arc::new(Mutex::new(Vec::new()));
-    tracing::subscriber::with_default(Capture(rows.clone()), run);
+    tracing::subscriber::with_default(Capture(rows.clone()), || {
+        tracing::callsite::rebuild_interest_cache();
+        run()
+    });
     let result = rows.lock().unwrap().clone();
     result
 }

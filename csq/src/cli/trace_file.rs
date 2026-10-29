@@ -263,7 +263,11 @@ mod tests {
         let path = tmp.path().join("trace.log");
         let layer = TraceFileLayer::open_at(&path).unwrap();
         let subscriber = Registry::default().with(layer);
+        let _capture = csq_core::testing::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
             tracing::info!(idx = 1, "hello");
             tracing::warn!(idx = 2, "warned");
         });
@@ -285,7 +289,11 @@ mod tests {
         let path = tmp.path().join("trace.log");
         let layer = TraceFileLayer::open_at(&path).unwrap();
         let subscriber = Registry::default().with(layer);
+        let _capture = csq_core::testing::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
             tracing::error!(
                 key = "sk-ant-api03-FAKETESTAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
                 "auth body"
@@ -311,12 +319,17 @@ mod tests {
         let layer_a = TraceFileLayer::open_at(&path_a).unwrap();
         let layer_b = TraceFileLayer::open_at(&path_b).unwrap();
 
+        let _capture = csq_core::testing::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let sub_a = Registry::default().with(layer_a);
         let sub_b = Registry::default().with(layer_b);
         with_default(sub_a, || {
+            tracing::callsite::rebuild_interest_cache();
             tracing::info!(side = "a", "a-event");
         });
         with_default(sub_b, || {
+            tracing::callsite::rebuild_interest_cache();
             tracing::info!(side = "b", "b-event");
         });
         assert!(std::fs::read_to_string(&path_a).unwrap().contains("\"a\""));
@@ -335,7 +348,11 @@ mod tests {
         let path = tmp.path().join("trace.log");
         let layer = TraceFileLayer::open_at(&path).unwrap();
         let subscriber = Registry::default().with(layer);
+        let _capture = csq_core::testing::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
             tracing::info!(count = 42_u64, ratio = 0.5_f64, ok = true, "metrics");
         });
         let content = std::fs::read_to_string(&path).unwrap();

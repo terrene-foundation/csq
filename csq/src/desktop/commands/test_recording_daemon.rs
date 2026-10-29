@@ -22,74 +22,30 @@ const HANG_GUARD: Duration = Duration::from_secs(60);
 /// lock. A scheduler starts its `HANG_GUARD` only after it sees this.
 const ENV_ACQUIRED: &str = "env acquired";
 
-/// The fixture's hold on the shared env-test mutex, plus (Linux) the
-/// `$XDG_RUNTIME_DIR` value to restore. Linux resolves the daemon socket
-/// path through that var (`paths::socket_path`), so a fixture must point it
-/// at its own tempdir or the notify would target the real runtime dir.
+/// The fixture's hold on the shared env-test mutex, for its whole life.
 ///
-/// The restore runs in THIS type's `Drop` body, and `_guard` is a field of
-/// it: Rust drops a struct's fields only after its `Drop` body returns, so
-/// the restore always runs while the mutex is still held. The earlier shape
-/// (the guard and a separate restore type as sibling fields of
-/// `RecordingDaemon`, guard declared first) dropped the guard FIRST — fields
-/// drop in declaration order — so the restore wrote the var after the mutex
-/// was released. A sibling fixture that had just taken the lock and pointed
-/// the var at its own socket then had it overwritten, its notify resolved a
-/// socket that does not exist, the notify no-oped silently, and its `recv`
-/// timed out.
+/// The fixture mutates NO process-global env. It used to point
+/// `$XDG_RUNTIME_DIR` at its tempdir on Linux, so every concurrently running
+/// test that resolved "the daemon" landed on it and the "nothing arrives"
+/// row failed under load (an internal ticket). The socket is now injected per base through
+/// `daemon::paths::test_socket`: only a caller passing the fixture's own
+/// `base_dir()` resolves to it.
 struct FixtureEnv {
-    #[cfg(target_os = "linux")]
-    xdg_prior: Option<std::ffi::OsString>,
     _guard: csq_core::platform::test_env::EnvTestGuard,
+    _socket: csq_core::daemon::paths::test_socket::Registration,
 }
 
 impl FixtureEnv {
-    fn acquire(base: &std::path::Path) -> Self {
+    fn acquire(base: &std::path::Path) -> (Self, std::path::PathBuf) {
         let _guard = csq_core::platform::test_env::lock();
-        #[cfg(target_os = "linux")]
-        let xdg_prior = {
-            let prior = std::env::var_os("XDG_RUNTIME_DIR");
-            // SAFETY: guarded by the shared env-test mutex taken above.
-            unsafe { std::env::set_var("XDG_RUNTIME_DIR", base) };
-            prior
-        };
-        #[cfg(not(target_os = "linux"))]
-        let _ = base;
-        Self {
-            #[cfg(target_os = "linux")]
-            xdg_prior,
-            _guard,
-        }
-    }
-}
-
-impl Drop for FixtureEnv {
-    fn drop(&mut self) {
-        // The restore below is sound only under the mutex. Checked on every
-        // platform so the ordering invariant is not Linux-only evidence;
-        // skipped while unwinding so a failing test is not turned into an abort.
-        if !std::thread::panicking() {
-            assert_eq!(
-                csq_core::platform::test_env::current_holder(),
-                Some(std::thread::current().id()),
-                "the recording daemon's env restore must run under the env-test mutex"
-            );
-        }
-        #[cfg(target_os = "linux")]
-        // SAFETY: `_guard` is a field of this struct, so it is dropped only
-        // after this body returns; the shared env-test mutex is held here.
-        unsafe {
-            match self.xdg_prior.take() {
-                Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
-                None => std::env::remove_var("XDG_RUNTIME_DIR"),
-            }
-        }
+        let (_socket, sock) = csq_core::daemon::paths::test_socket::register(base);
+        (Self { _guard, _socket }, sock)
     }
 }
 
 pub(crate) struct RecordingDaemon {
-    // Declaration order is drop order: the env hold (and its XDG restore)
-    // is released only after the serving thread has been stopped and
+    // Declaration order is drop order: the env hold (and the socket
+    // registration) is released only after the serving thread has been stopped and
     // joined in `Drop` and every other field is gone.
     base: tempfile::TempDir,
     /// `Ok(request)` per recorded request; `Err(text)` when the fixture itself
@@ -115,17 +71,17 @@ impl RecordingDaemon {
         // (`UnixSocketPath`'s own doc). The shared short-root fixture also
         // pins the root's 0700 mode at creation.
         let base = csq_core::testing::socket_fixture::short_root("csq-lg-").unwrap();
-        let _env = FixtureEnv::acquire(base.path());
+        let (_env, sock) = FixtureEnv::acquire(base.path());
         // Outside the STARTUP_ORDERING block on purpose: the regression probe
         // that removes the rendezvous keeps this event, so the scheduler's
         // guarded wait still sees the baseline's "constructor returned" first.
         if let Some((events, _)) = &schedule {
             events.send(ENV_ACQUIRED).unwrap();
         }
-        let sock = csq_core::daemon::socket_path(base.path());
-        assert!(
-            sock.starts_with(base.path()),
-            "fixture socket must resolve into the tempdir: {sock:?}"
+        assert_eq!(
+            csq_core::daemon::socket_path(base.path()),
+            sock,
+            "the fixture's base must resolve to the fixture socket"
         );
         let listener = UnixListener::bind(&sock).unwrap();
         let (tx, requests) = std::sync::mpsc::channel::<Result<String, String>>();
@@ -370,25 +326,42 @@ mod tests {
             .starts_with("POST /api/probe HTTP/1.1"));
     }
 
-    /// The env restore runs while the env-test mutex is still held, and puts
-    /// the var back. Dropping the fixture runs `FixtureEnv`'s holder assert;
-    /// a shape that releases the mutex before the restore panics there.
+    /// an internal ticket: the fixture must not leak into callers that did not pass its
+    /// base. A daemon-reaching call for ANOTHER base (what a concurrently
+    /// running test does) is resolved through the unchanged process env, so
+    /// it never lands on the fixture; the fixture's own base still does.
+    /// On Linux the old fixture pointed `$XDG_RUNTIME_DIR` at itself, so
+    /// `socket_path(other)` equalled the fixture socket and the `assert_ne!`
+    /// below reds.
     #[test]
-    fn dropping_the_fixture_restores_the_env_under_the_env_lock() {
+    fn a_notify_for_another_base_never_reaches_the_fixture() {
+        // Read under the shared env lock: sibling fixtures repoint this var
+        // under it, so an unlocked read could observe their value. The lock
+        // is released before `new`, which takes it for the fixture's life.
         let prior = {
-            let _g = csq_core::platform::test_env::lock();
+            let _env = csq_core::platform::test_env::lock();
             std::env::var_os("XDG_RUNTIME_DIR")
         };
         let daemon = RecordingDaemon::new(Duration::ZERO);
-        #[cfg(target_os = "linux")]
         assert_eq!(
-            std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
-            Some(daemon.base_dir().as_os_str()),
-            "the fixture points the runtime dir at its own tempdir"
+            std::env::var_os("XDG_RUNTIME_DIR"),
+            prior,
+            "the fixture must not mutate process-global env"
         );
-        drop(daemon);
-        let _g = csq_core::platform::test_env::lock();
-        assert_eq!(std::env::var_os("XDG_RUNTIME_DIR"), prior);
+        let other = tempfile::TempDir::new().unwrap();
+        // No I/O: a notify for `other` would hit the REAL daemon socket on
+        // Linux. Resolution is the whole property: `other` must not resolve
+        // to the fixture's socket.
+        assert_ne!(
+            csq_core::daemon::socket_path(other.path()),
+            csq_core::daemon::socket_path(daemon.base_dir()),
+            "a different base resolved to the fixture socket"
+        );
+        // The fixture's own base still resolves to it.
+        csq_core::daemon::notify::cache_invalidation(daemon.base_dir());
+        assert!(daemon
+            .recv("the own-base invalidation")
+            .starts_with("POST /api/invalidate-cache HTTP/1.1"));
     }
 
     /// Negative pole: with nothing driven, nothing is recorded.

@@ -21,7 +21,7 @@ not listed here.
 
 ## Overview
 
-- **MIT License** — 481 crate(s)
+- **MIT License** — 480 crate(s)
 - **Unicode License v3** — 19 crate(s)
 - **Apache License 2.0** — 10 crate(s)
 - **BSD 3-Clause "New" or "Revised" License** — 7 crate(s)
@@ -1360,7 +1360,6 @@ Used by:
 
 Used by:
 
-- [sha1 0.10.6](https://github.com/RustCrypto/hashes)
 - [sha2 0.10.9](https://github.com/RustCrypto/hashes)
 
 ```
@@ -3234,6 +3233,7 @@ THE SOFTWARE.
 
 Used by:
 
+- [sha1 0.11.0](https://github.com/RustCrypto/hashes)
 - [sha2 0.11.0](https://github.com/RustCrypto/hashes)
 
 ```
@@ -3274,7 +3274,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- [tungstenite 0.28.0](https://github.com/snapview/tungstenite-rs)
+- [tungstenite 0.30.0](https://github.com/snapview/tungstenite-rs)
 
 ```
 Copyright (c) 2017 Alexey Galakhov
@@ -4322,6 +4322,43 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
+- [rand_core 0.10.1](https://github.com/rust-random/rand_core)
+
+```
+Copyright (c) 2018-2026 The Rand Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
+---
+
+## MIT License
+
+Used by:
+
 - [zeroize 1.9.0](https://github.com/RustCrypto/utils)
 
 ```
@@ -4500,43 +4537,6 @@ Used by:
 
 ```
 Copyright (c) 2019 RustCrypto Developers
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-```
-
----
-
-## MIT License
-
-Used by:
-
-- [ppv-lite86 0.2.21](https://github.com/cryptocorrosion/cryptocorrosion)
-
-```
-Copyright (c) 2019 The CryptoCorrosion Contributors
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -4947,6 +4947,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
+- [chacha20 0.10.2](https://github.com/RustCrypto/stream-ciphers)
 - [zeroize_derive 1.5.0](https://github.com/RustCrypto/utils)
 
 ```
@@ -6117,10 +6118,8 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 Used by:
 
-- [rand 0.9.3](https://github.com/rust-random/rand)
-- [rand_chacha 0.9.0](https://github.com/rust-random/rand)
+- [rand 0.10.3](https://github.com/rust-random/rand)
 - [rand_core 0.6.4](https://github.com/rust-random/rand)
-- [rand_core 0.9.5](https://github.com/rust-random/rand)
 
 ```
 Copyright 2018 Developers of the Rand project

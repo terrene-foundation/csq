@@ -1,4 +1,5 @@
 pub mod accounts;
+pub mod archive_health;
 #[cfg(all(test, unix))]
 mod ascii_probe;
 // Crate-internal `declare_all_enum!` macro (never cross-crate-exported — see

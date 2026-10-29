@@ -53,7 +53,7 @@
 #
 # # Why stdout is empty when indeterminate
 #
-# The same reason `cargo-target-dir.sh` prints nothing when cargo fails: a
+# The same reason the build-directory resolver prints nothing when it fails: a
 # caller that forgets to check the status must not be able to consume something
 # that looks like an answer. `$(csq_detect_edition …)` with an unchecked status
 # yields "", and every consumer's own "is this a known edition" validation then
@@ -859,7 +859,7 @@ csq_resolve_edition() {
 # Factored out of dev-install.sh so the highest-consequence part of the
 # script -- the check that runs AFTER the operator's previous binary has
 # already been overwritten -- is exercisable from the self-test without
-# needing a cargo build.
+# needing a compile step.
 #
 # Same tri-state posture as csq_detect_edition, on purpose: a binary that
 # will not run has not demonstrated it is the edition that was asked for, and

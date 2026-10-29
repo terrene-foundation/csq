@@ -81,7 +81,7 @@ fn session_login_binary_missing_snapshot_is_unknown_on_both_surfaces() {
             if verb == "status" {
                 "csq.status.v2"
             } else {
-                "csq.doctor.v34"
+                "csq.doctor.v35"
             }
         );
         assert!(report.get("keychain_mirror").is_none());

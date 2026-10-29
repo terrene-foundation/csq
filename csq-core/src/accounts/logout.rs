@@ -3029,8 +3029,10 @@ mod tests {
 
         let log = WarnLog::default();
         let started = std::time::Instant::now();
-        let result =
-            tracing::subscriber::with_default(log.clone(), || logout_account(&base, account(1)));
+        let result = tracing::subscriber::with_default(log.clone(), || {
+            tracing::callsite::rebuild_interest_cache();
+            logout_account(&base, account(1))
+        });
         let elapsed = started.elapsed();
         // Read the holder's state BEFORE releasing it: a refusal must return
         // while the lock is genuinely held, within the derived bounded wait.

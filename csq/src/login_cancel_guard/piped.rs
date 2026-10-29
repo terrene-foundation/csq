@@ -600,7 +600,7 @@ fn spawn_cli_piped_login_inner<K>(
     }
     #[cfg(test)]
     custody.spawn_outcome(PipedLoginSpawnOutcome::SpawnAttemptStarted);
-    let (child, group) = match crate::login_child_custody::group::spawn(command) {
+    let (child, group) = match crate::login_child_custody::group::spawn_attended(command) {
         Ok(child) => child,
         Err(error) => {
             #[cfg(test)]
@@ -709,9 +709,15 @@ fn spawn_cli_piped_login_inner<K>(
             reader_joined_thread_id: reader.joined_thread_id(),
         });
     }
+    let operator_stop = owned.operator_stop(result.as_ref().ok());
+    was_cancelled |= operator_stop.is_some();
     if was_cancelled {
-        if !announced_cancel {
-            eprintln!("Cancelling — waiting for {vendor} login to exit");
+        match operator_stop {
+            Some(message) => eprintln!("{message}"),
+            None if !announced_cancel => {
+                eprintln!("Cancelling — waiting for {vendor} login to exit");
+            }
+            None => {}
         }
         return Err(anyhow::Error::new(CliLoginCancelled {
             prior_refusal: result.err(),

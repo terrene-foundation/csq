@@ -14,6 +14,7 @@ mod login_child_custody;
 use csq_core::accounts::login_lock::{AccountLoginLock, AcquireOutcome};
 use csq_core::types::AccountNum;
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
@@ -32,7 +33,9 @@ const PRIOR_ASSERTION: &str = "LOGIN_CTRLC_PRIOR_RESTORED";
 const RESTORE_ASSERTION: &str = "LOGIN_CTRLC_DEFAULT_RESTORED";
 // These are failure/cleanup budgets, never scheduler-speed success assertions.
 // Every successful transition requires its causal marker or fresh nonce.
-const BUDGET: Duration = Duration::from_secs(8);
+// HANG GUARD, not a pacing assumption: success always needs its causal marker;
+// this only bounds a genuinely wedged run. Sized for a sustained host io stall (an internal ticket).
+const BUDGET: Duration = Duration::from_secs(180);
 const PGID_ASSERTION: &str = "LOGIN_CTRLC_OWNED_VENDOR_PGID";
 const REAP_ASSERTION: &str = "LOGIN_CTRLC_ACTUAL_CHILD_REAP";
 
@@ -58,7 +61,7 @@ fn poll(mut condition: impl FnMut() -> bool) -> bool {
         if Instant::now() >= deadline {
             return false;
         }
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -143,6 +146,11 @@ fn run_vendor(root: &Path, ignore: bool) -> ! {
         unsafe { libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) },
         0
     );
+    // Exit lifeline: the kernel closes this write end when the vendor exits.
+    let _life = std::fs::OpenOptions::new()
+        .write(true)
+        .open(root.join("vendor-life"))
+        .unwrap();
     atomic_write(
         root,
         "vendor-ready",
@@ -283,7 +291,7 @@ fn run_driver(root: &Path, role: &str) -> ! {
     .unwrap();
     // Guard has already restored the prior OS disposition. Remain the owned
     // PGID leader until the controller finishes all descendant cleanup/signals.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + BUDGET;
     loop {
         if PRIOR_SIGNALS.load(Ordering::SeqCst) > prior_at_return
             && !root.join("prior-restored").exists()
@@ -339,6 +347,15 @@ fn login_ctrlc_private_entry() {
     }
 }
 
+/// SIGCONT on drop, so a panic while the driver is stopped never strands it.
+struct StoppedDriver(libc::pid_t);
+impl Drop for StoppedDriver {
+    fn drop(&mut self) {
+        // SAFETY: the pid is this test's own still-owned, unreaped driver.
+        unsafe { libc::kill(self.0, libc::SIGCONT) };
+    }
+}
+
 struct Driver {
     child: Option<Child>,
     input: Option<ChildStdin>,
@@ -348,11 +365,21 @@ struct Driver {
     role: &'static str,
     logs_forwarded: bool,
     vendor_pid: Option<u32>,
+    life: Option<std::fs::File>,
 }
 
 impl Driver {
     fn spawn(role: &'static str) -> Self {
         let sandbox = tempfile::tempdir().unwrap();
+        let life_path = sandbox.path().join("vendor-life");
+        let life_c = std::ffi::CString::new(life_path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid NUL-terminated path inside this test's private sandbox.
+        assert_eq!(unsafe { libc::mkfifo(life_c.as_ptr(), 0o600) }, 0);
+        let life = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&life_path)
+            .unwrap();
         let mut command = selected_command(sandbox.path(), role).unwrap();
         command.process_group(0).stdin(Stdio::piped());
         let mut child = command.spawn().unwrap();
@@ -367,6 +394,7 @@ impl Driver {
             role,
             logs_forwarded: false,
             vendor_pid: None,
+            life: Some(life),
         };
         // A fresh actual Child remains UNREAPED until cleanup completes.
         // getpgid binds the only terminal-signal target to its owned group.
@@ -375,6 +403,43 @@ impl Driver {
         fixture
     }
 
+    /// Freeze the driver (waitid(WSTOPPED|WNOWAIT) proves it stopped) so signals sent
+    /// next are only pending: the 200ms production pump cannot act on them
+    /// before the test has ordered the vendor's exit.
+    fn stop(&self) -> StoppedDriver {
+        assert!(self.pgid_custody);
+        let guard = StoppedDriver(self.pid);
+        // SAFETY: only this unreaped private driver PID is targeted.
+        assert_eq!(unsafe { libc::kill(self.pid, libc::SIGSTOP) }, 0);
+        // SAFETY: waitid with WNOWAIT only observes the state change and never
+        // reaps: Child keeps sole ownership of the exit status, so a driver that
+        // already died stays a zombie instead of being reaped before the guard's
+        // SIGCONT (no PID-reuse window).
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.pid as libc::id_t,
+                &mut info,
+                libc::WSTOPPED | libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(
+            info.si_code,
+            libc::CLD_STOPPED,
+            "driver exited instead of stopping"
+        );
+        guard
+    }
+    /// True once the kernel closed the vendor's FIFO write end: the vendor
+    /// process exited. An event, not a duration; valid only after ready().
+    fn vendor_exited(&self) -> bool {
+        use std::io::Read;
+        let mut byte = [0_u8; 1];
+        let mut life = self.life.as_ref().unwrap();
+        matches!(life.read(&mut byte), Ok(0))
+    }
     fn root(&self) -> &Path {
         self.sandbox.as_ref().unwrap().path()
     }
@@ -574,23 +639,21 @@ fn login_ctrlc_ignored_sigint_retains_parent_lock_until_late_zero_reap() {
         && held(driver.root())
         && driver.ping(b"after-cancel-1")
         && !driver.root().join("reaped-receipt").exists();
-    let second_ping = if retained {
+    // The second interrupt is the product's explicit second-Ctrl-C kill
+    // escalation, acted on by the 200ms pump. Deliver it while the driver is
+    // stopped (a further SIGINT would coalesce into the same single pending
+    // signal), release the vendor and wait for its ACTUAL exit before SIGCONT:
+    // the late-zero outcome no longer depends on pump latency (an internal ticket). Lock
+    // retention is asserted before the stop and again after the reap; nothing
+    // is sampled while the driver is frozen, where no check could fail.
+    let repeated = retained && {
+        let stopped = driver.stop();
         driver.signal_group();
-        let ping = driver.ping(b"after-repeat-2");
-        driver.signal_group();
-        ping
-    } else {
-        false
+        driver.release();
+        let exited = poll(|| driver.vendor_exited());
+        drop(stopped);
+        exited
     };
-    let repeated = retained
-        && second_ping
-        && driver.ping(b"after-repeat-3")
-        && held(driver.root())
-        && !driver.root().join("reaped-receipt").exists();
-    // Cleanup precedes assertions even for a compiled missing-handler mutant.
-    if ready {
-        driver.assert_live_vendor_group();
-    }
     driver.release();
     let receipt = driver.receipt();
     let reaped = receipt
@@ -681,4 +744,131 @@ fn login_ctrlc_restores_default_handler_after_actual_reap() {
             && status.is_some_and(|status| status.signal() == Some(libc::SIGINT)),
         "{RESTORE_ASSERTION}"
     );
+}
+
+#[test]
+fn login_ctrlc_second_interrupt_kills_vendor_130_no_post_lock_until_reap() {
+    let _env_guard = csq_core::platform::test_env::lock();
+    let mut driver = Driver::spawn("driver-ignore");
+    let ready = driver.ready();
+    if ready {
+        driver.signal_group();
+    }
+    let cancelled = ready && poll(|| driver.notices("driver-ignore") > 0);
+    // First interrupt handled; the SIGINT-ignoring vendor is still alive and
+    // the vendor has NOT been released.
+    let survived = cancelled
+        && held(driver.root())
+        && driver.ping(b"kill-after-cancel-1")
+        && !driver.root().join("reaped-receipt").exists();
+    // Second Ctrl-C: the pump escalates to SIGKILL. The vendor dies only by
+    // that kill (never by release), proven by the kernel FIFO EOF.
+    let killed = survived && {
+        driver.signal_group();
+        poll(|| driver.vendor_exited())
+    };
+    // Until the receipt exists the lock must stay held. A sample that sees the
+    // lock free and then no receipt proves it was released before the reap.
+    let mut released_early = false;
+    if killed {
+        poll(|| {
+            let free = !held(driver.root());
+            let receipt = driver.root().join("reaped-receipt").exists();
+            released_early |= free && !receipt;
+            receipt || released_early
+        });
+    }
+    let receipt = driver.receipt();
+    let reaped = receipt
+        .as_ref()
+        .is_some_and(|r| driver.actual_reap_matches_spawn(r));
+    let completed = driver.root().join("vendor-completed").exists();
+    let post = std::fs::read(driver.root().join("post-called")).ok();
+    let unlocked = matches!(
+        AccountLoginLock::acquire(&driver.root().join("base"), account()),
+        Ok(AcquireOutcome::Acquired(_))
+    );
+    let status = driver.finish_and_reap();
+    assert!(survived && killed, "{RETAIN_ASSERTION}");
+    assert!(
+        !released_early,
+        "{LATE_ASSERTION}: lock released before reap"
+    );
+    assert!(
+        reaped
+            && !completed
+            && unlocked
+            && post.is_none()
+            && receipt
+                .as_ref()
+                .is_some_and(|r| actual_cancel_receipt(r, Some(libc::SIGKILL)))
+            && status.is_some_and(|status| status.code() == Some(130)),
+        "{LATE_ASSERTION}"
+    );
+}
+
+fn pid_gone(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only probes existence of a pid this test once owned.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Stall-injection RED for the pgid case (an internal ticket acceptance 3): when an io stall
+/// lets the vendor exit and be reaped BEFORE the test signals its group, the
+/// owned-pgid read must refuse (`getpgid` == -1) instead of signalling a stale
+/// group. The injected stall is the late `signal_group` after the full reap.
+#[test]
+#[should_panic(expected = "LOGIN_CTRLC_OWNED_VENDOR_PGID")]
+fn login_ctrlc_pgid_assertion_refuses_a_vendor_gone_before_the_signal() {
+    let _env_guard = csq_core::platform::test_env::lock();
+    let mut driver = Driver::spawn("driver-ignore");
+    assert!(driver.ready());
+    driver.release();
+    let receipt = driver.receipt();
+    assert!(
+        receipt.is_some(),
+        "vendor must be reaped before the injected late signal"
+    );
+    driver.signal_group();
+}
+
+/// Last-resort cleanup for the exact driver and vendor pids a test spawned. It
+/// SIGKILLs a pid only while that pid is still alive and only those two pids,
+/// so a regression fails the row without leaking a frozen process onto a
+/// fleet host.
+struct LeakKiller(Vec<libc::pid_t>);
+impl Drop for LeakKiller {
+    fn drop(&mut self) {
+        for pid in self.0.drain(..) {
+            if !pid_gone(pid) {
+                // SAFETY: a pid this test spawned and observed still alive.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+}
+
+/// Stall-injection RED for the cross-test-leak case (an internal ticket acceptance 3): a
+/// failure while the driver is frozen (the worst stall) must still leave no
+/// live driver or vendor behind, otherwise the next test's setup hits
+/// `still running`.
+#[test]
+fn login_ctrlc_failure_while_driver_frozen_leaves_no_live_process() {
+    let _env_guard = csq_core::platform::test_env::lock();
+    // Declared before the driver, so on any unwind it drops AFTER the driver's
+    // own cleanup has had its chance and only kills what is still alive.
+    let mut leak_killer = LeakKiller(Vec::new());
+    let mut driver = Driver::spawn("driver-ignore");
+    assert!(driver.ready());
+    let driver_pid = driver.pid;
+    let vendor_pid = libc::pid_t::try_from(driver.vendor_pid.unwrap()).unwrap();
+    leak_killer.0.extend([driver_pid, vendor_pid]);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _stopped = driver.stop();
+        panic!("injected failure while the driver is frozen");
+    }));
+    assert!(unwound.is_err());
+    drop(driver);
+    assert!(pid_gone(vendor_pid), "vendor leaked past the failed test");
+    assert!(pid_gone(driver_pid), "driver leaked past the failed test");
 }

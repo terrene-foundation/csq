@@ -3330,10 +3330,18 @@ pub(crate) mod tests {
         let h = std::thread::spawn(move || wake_retry_loop(&p, &p, &f2));
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(!h.is_finished(), "still polling");
-        let t0 = std::time::Instant::now();
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        // The loop finishing is the event; a stopwatch over `join` would fail a
+        // correct loop on a starved host (an internal ticket). 60 s is only a hang net.
+        let hang_net = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !h.is_finished() {
+            assert!(
+                std::time::Instant::now() < hang_net,
+                "wake_retry_loop did not stop after its flag was set"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         h.join().unwrap();
-        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
     }
 
     use super::*;
@@ -3444,8 +3452,8 @@ pub(crate) mod tests {
     /// the M6 gate (enterprise builds) resolves `SpawnGate::Ungoverned`.
     /// Returns the fixture `TempDir` PLUS the [`FakeHealthyDaemon`] guard —
     /// callers MUST bind both (`let (base_dir, _daemon) = ...`); dropping the
-    /// guard early tears down the fake daemon's PID file / env override
-    /// while `validate_codex_relaunch_target`'s FM-5 daemon-health check
+    /// guard early tears down the fake daemon's PID file / socket
+    /// registration while `validate_codex_relaunch_target`'s FM-5 daemon-health check
     /// still needs it.
     fn valid_swap_target_base_dir(slot: u16) -> (tempfile::TempDir, FakeHealthyDaemon) {
         let dir = tmp_handle_dir();
@@ -3847,6 +3855,7 @@ pub(crate) mod tests {
         // signal the supervisor before it would exit naturally.
         let cmd = stub_cmd(&capture, &["--hang-ms", "5000", "--exit-code", "0"]);
         let mut audit = test_audit_emitter(dir.path());
+        let _env = csq_core::platform::test_env::lock();
         let (base_dir, _daemon) = valid_swap_target_base_dir(7);
 
         let handle_dir = dir.path().to_path_buf();
@@ -4152,8 +4161,7 @@ pub(crate) mod tests {
     fn relaunch_parity_shares_flags_with_the_initial_launch() {
         let _guard = lock_signal_state();
         // Match sibling supervisor tests' signal-then-env lock order.
-        // Linux's FakeHealthyDaemon holds the env lock for its lifetime.
-        #[cfg(not(target_os = "linux"))]
+        // The fake-daemon fixtures take no env lock; this test holds its own.
         let _env = csq_core::platform::test_env::lock();
         // Drives the PRODUCTION relaunch path: both the initial spawn and
         // the relaunch build their argv through the REAL
@@ -4332,6 +4340,72 @@ pub(crate) mod tests {
         );
     }
 
+    /// Waits for a shell fixture's receipt file (written atomically by `mv`
+    /// only AFTER the event it vouches for) and returns its trimmed content.
+    /// The wait is an EVENT wait: the 60 s bound is only a hang net, so a
+    /// starved test thread can never fail a row by being late. Fixture
+    /// children MUST outlive this bound (120 s), or a late observer finds
+    /// nothing to observe (an internal ticket).
+    pub(crate) fn wait_for_fixture_receipt(path: &std::path::Path) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if !text.trim().is_empty() {
+                    return text.trim().to_string();
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture receipt {path:?} never published"
+            );
+            std::thread::sleep(Duration::from_millis(POLL_MS));
+        }
+    }
+
+    /// Owns a fixture `std::process::Child` and, if the test unwinds before
+    /// `graceful_stop` reaped it, SIGKILLs the child's live descendants and the
+    /// child so a failed row cannot park `sh` + a 120 s `sleep` (both ignore
+    /// SIGTERM). It signals ONLY while `try_wait()` reports the child still
+    /// unreaped, so its pid cannot have been recycled; descendants are re-checked
+    /// against their snapshot start time like `graceful_stop` does; pids <= 1
+    /// are never signalled; every `kill` result is ignored (ESRCH is fine).
+    struct KillOnDrop(std::process::Child);
+
+    impl std::ops::Deref for KillOnDrop {
+        type Target = std::process::Child;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl std::ops::DerefMut for KillOnDrop {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            if !matches!(self.0.try_wait(), Ok(None)) {
+                return; // already reaped: the pid is no longer ours to signal
+            }
+            let root = self.0.id();
+            if root <= 1 {
+                return;
+            }
+            let snapshot: Vec<(u32, Option<String>)> = collect_descendant_pids(root)
+                .into_iter()
+                .filter(|pid| *pid > 1)
+                .map(|pid| (pid, sup::process_start_time(pid)))
+                .collect();
+            for pid in descendants_still_matching_snapshot(&snapshot) {
+                let _ = sup::signal_supervisor(pid, libc::SIGKILL);
+            }
+            let _ = sup::signal_supervisor(root, libc::SIGKILL);
+            let _ = self.0.wait();
+        }
+    }
+
     #[test]
     fn graceful_stop_bound_documents_two_named_outcomes() {
         // A bare program name resolves through the process PATH, which sibling tests swap
@@ -4342,53 +4416,78 @@ pub(crate) mod tests {
         // calling the REAL `graceful_stop` function — not merely reasoning
         // about a raw `kill` — for the wedged outcome below.
 
-        // Outcome 1 (healthy): a default-SIGTERM-disposition process dies
-        // almost immediately.
-        let mut healthy_child = std::process::Command::new(stub_cli_path())
-            .arg("--exit-code")
-            .arg("0")
-            .spawn()
-            .expect("spawn healthy stub");
-        let healthy_started = std::time::Instant::now();
+        // Outcome 1 (healthy): a default-SIGTERM-disposition process dies FROM
+        // the SIGTERM. The child cannot exit on its own during the test (120 s),
+        // so the signal in its exit status is the event: a process that ignored
+        // or handled TERM would not report SIGTERM. No wall-clock ceiling: a
+        // starved test thread must not fail a row whose child died correctly
+        // (an internal ticket).
+        let mut healthy_child = KillOnDrop(
+            std::process::Command::new("/bin/sleep")
+                .arg("120")
+                .spawn()
+                .expect("spawn healthy sleeper"),
+        );
         unsafe {
             libc::kill(healthy_child.id() as libc::pid_t, libc::SIGTERM);
         }
-        let _ = healthy_child.wait();
-        let healthy_elapsed = healthy_started.elapsed();
-        assert!(
-            healthy_elapsed < Duration::from_millis(GRACEFUL_STOP_MS / 2),
-            "a process with default SIGTERM disposition must die in well under \
-             half the graceful-stop bound, got {healthy_elapsed:?}"
-        );
+        let healthy_status = healthy_child.wait().expect("reap healthy sleeper");
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                healthy_status.signal(),
+                Some(libc::SIGTERM),
+                "a process with default SIGTERM disposition must die from the SIGTERM: {healthy_status:?}"
+            );
+        }
 
         // Outcome 2 (wedged): a SIGTERM-IGNORING process, driven through the
         // REAL `graceful_stop`, must survive the initial SIGTERM, sit out
         // the full `GRACEFUL_STOP_MS` window, and then die from the
         // follow-up SIGKILL (which a `trap` cannot ignore) — never from its
-        // own unrelated `sleep 30`.
-        let mut wedged_child = std::process::Command::new("sh")
-            .args(["-c", "trap '' TERM; sleep 30"])
-            .spawn()
-            .expect("spawn SIGTERM-ignoring stub");
-        // Give the shell a moment to install the trap before signalling —
-        // without this, `graceful_stop`'s SIGTERM can race the shell's own
-        // startup and arrive before `trap` has run, in which case the
-        // DEFAULT (terminate) disposition applies and the child dies almost
-        // instantly, exactly like `signal_supervisor_delivers_to_a_real_child`
-        // in `codex_supervisor.rs` already documents for the identical race.
-        std::thread::sleep(Duration::from_millis(150));
+        // own unrelated `sleep 120`.
+        let receipt_dir = tempfile::tempdir().unwrap();
+        let receipt = receipt_dir.path().join("trap.ready");
+        let mut wedged_child = KillOnDrop(
+            std::process::Command::new("/bin/sh")
+                .env("PATH", "/usr/bin:/bin")
+                .args([
+                    "-c",
+                    "trap '' TERM; echo ready > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; sleep 120",
+                    "sh",
+                ])
+                .arg(&receipt)
+                .spawn()
+                .expect("spawn SIGTERM-ignoring stub"),
+        );
+        // The shell publishes the receipt only AFTER `trap` ran, so the SIGTERM
+        // below can never arrive before the trap is installed (a fixed wait
+        // here raced a starved host: an internal ticket). The child sleeps 120 s, longer
+        // than the 60 s hang net, so a late observer still finds it alive.
+        let _ = wait_for_fixture_receipt(&receipt);
         let wedged_started = std::time::Instant::now();
-        graceful_stop(&mut wedged_child);
+        let outcome = graceful_stop(&mut wedged_child);
         let wedged_elapsed = wedged_started.elapsed();
         assert!(
             wedged_elapsed >= Duration::from_millis(GRACEFUL_STOP_MS),
             "graceful_stop must wait out the FULL window before SIGKILL-ing a \
              SIGTERM-ignoring child, got {wedged_elapsed:?}"
         );
+        // The EVENT, not a stopwatch: a wall-clock ceiling would go RED on a
+        // starved test thread even though the child died correctly (an internal ticket).
         assert!(
-            wedged_elapsed < Duration::from_secs(29),
-            "graceful_stop must have SIGKILLed the wedged child well before its \
-             unrelated `sleep 30` could complete on its own, got {wedged_elapsed:?}"
+            matches!(outcome, StopOutcome::Killed),
+            "a SIGTERM-ignoring child must be SIGKILLed after the window"
+        );
+        use std::os::unix::process::ExitStatusExt;
+        let status = wedged_child
+            .try_wait()
+            .expect("try_wait")
+            .expect("graceful_stop already reaped the child");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "the wedged child must die from the follow-up SIGKILL, not exit on its own: {status:?}"
         );
 
         let _ = Write::flush(&mut std::io::stdout());
@@ -4402,29 +4501,53 @@ pub(crate) mod tests {
         // A bare program name resolves through the process PATH, which sibling tests swap
         // under the shared env lock; hold it so the spawn cannot see a mid-swap PATH.
         let _env_lock = csq_core::platform::test_env::lock();
-        // A SIGTERM-ignoring shell that backgrounds a `sleep 30` grandchild
+        // A SIGTERM-ignoring shell that backgrounds a `sleep 120` grandchild
         // and then waits — mirrors the real npm-installed-codex shape
         // (`node` launcher -> real codex process) that C-R4-6 exists for:
         // SIGKILL aimed only at the direct child would leave the
         // grandchild running, orphaned from this supervisor's view.
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "trap '' TERM; sleep 30 & wait"])
-            .spawn()
-            .expect("spawn SIGTERM-ignoring parent with a backgrounded child");
-        // Give the shell time to install the trap and background the
-        // grandchild before collecting descendants (same race guarded
-        // against in `graceful_stop_bound_documents_two_named_outcomes`).
-        std::thread::sleep(Duration::from_millis(200));
+        let receipt_dir = tempfile::tempdir().unwrap();
+        let receipt = receipt_dir.path().join("grandchild.pid");
+        let mut child = KillOnDrop(
+            std::process::Command::new("/bin/sh")
+                .env("PATH", "/usr/bin:/bin")
+                .args([
+                    "-c",
+                    "trap '' TERM; sleep 120 & echo $! > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; wait",
+                    "sh",
+                ])
+                .arg(&receipt)
+                .spawn()
+                .expect("spawn SIGTERM-ignoring parent with a backgrounded child"),
+        );
+        // The shell publishes `$!` only AFTER the fork and the trap, so the scan
+        // below sees a grandchild that exists (a fixed 200 ms wait raced a
+        // starved host: an internal ticket); the 120 s child outlives the 60 s hang net.
+        let receipted_pid: u32 = wait_for_fixture_receipt(&receipt).parse().unwrap();
 
-        let descendants = collect_descendant_pids(child.id());
+        // `mv` (which publishes the receipt) is itself a short-lived child of the
+        // shell and `ps` lists it until the shell reaps it, so poll until the
+        // descendant set settles to exactly the receipted pid, under the hang net.
+        let settle_deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let descendants = loop {
+            let now_seen = collect_descendant_pids(child.id());
+            if now_seen == vec![receipted_pid] || std::time::Instant::now() >= settle_deadline {
+                break now_seen;
+            }
+            std::thread::sleep(Duration::from_millis(POLL_MS));
+        };
         assert_eq!(
             descendants.len(),
             1,
-            "precondition: the backgrounded `sleep 30` must be discoverable \
+            "precondition: the backgrounded `sleep 120` must be discoverable \
              as exactly one descendant of the shell before the kill, or this \
              test cannot tell a real fix from a vacuous one — got {descendants:?}"
         );
         let grandchild_pid = descendants[0];
+        assert_eq!(
+            grandchild_pid, receipted_pid,
+            "the one descendant must be the receipted pid"
+        );
         // Precondition: the grandchild is genuinely alive right now (ESRCH
         // would mean ps mis-parsed or the process already exited on its
         // own, either of which would make the post-kill check meaningless).
@@ -4437,17 +4560,20 @@ pub(crate) mod tests {
 
         graceful_stop(&mut child);
 
-        // Give the SIGKILL a moment to actually reap the grandchild (kill(2)
-        // is async; the grandchild's exit is observed via ESRCH on kill(pid, 0)
-        // once its zombie/slot is reclaimed by its new reaper — a brief
-        // poll avoids a flaky one-shot check).
+        // kill(2) is async; the grandchild's exit is observed via ESRCH on
+        // kill(pid, 0) once its zombie is reclaimed by its new reaper. The wait
+        // is an event wait with a 60 s hang net, never a fixed window (an internal ticket).
+        let reap_deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mut still_alive = true;
-        for _ in 0..20 {
+        loop {
             if unsafe { libc::kill(grandchild_pid as libc::pid_t, 0) } != 0 {
                 still_alive = false;
                 break;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            if std::time::Instant::now() >= reap_deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(POLL_MS));
         }
         assert!(
             !still_alive,
@@ -4466,7 +4592,8 @@ pub(crate) mod tests {
         // A bare program name resolves through the process PATH, which sibling tests swap
         // under the shared env lock; hold it so the spawn cannot see a mid-swap PATH.
         let _env_lock = csq_core::platform::test_env::lock();
-        let mut child = std::process::Command::new("sh")
+        let mut child = std::process::Command::new("/bin/sh")
+            .env("PATH", "/usr/bin:/bin")
             .args(["-c", "sleep 30"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -4559,7 +4686,8 @@ pub(crate) mod tests {
         // `sh` sends itself SIGINT, then (if that had no effect — the BUG
         // this test regresses) sleeps long enough to make the bug obvious
         // without hanging the suite for the full duration.
-        let mut cmd = std::process::Command::new("sh");
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.env("PATH", "/usr/bin:/bin");
         cmd.arg("-c").arg("kill -INT $$; sleep 5");
         let mut audit = test_audit_emitter(dir.path());
         let _ = run_supervised(
@@ -4644,7 +4772,8 @@ pub(crate) mod tests {
         let dir = tmp_handle_dir();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500))
             .expect("chmod handle dir read-only");
-        let mut cmd = std::process::Command::new("sh");
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.env("PATH", "/usr/bin:/bin");
         cmd.arg("-c").arg("kill -INT $$; sleep 5");
         let mut audit = test_audit_emitter(dir.path());
         let _ = run_supervised(
@@ -5116,7 +5245,8 @@ pub(crate) mod tests {
             &mut audit,
             |_slot, _thread_id, _swap_correlation, relaunch_emitter, _messaging| {
                 let inner_dir = tmp_handle_dir();
-                let mut relaunch_cmd = std::process::Command::new("sh");
+                let mut relaunch_cmd = std::process::Command::new("/bin/sh");
+                relaunch_cmd.env("PATH", "/usr/bin:/bin");
                 relaunch_cmd.arg("-c").arg("kill -INT $$; sleep 5");
                 run_supervised(
                     relaunch_cmd,
@@ -5212,7 +5342,8 @@ pub(crate) mod tests {
         // `$0` inside `sh -c` is the first argument after the script, so the
         // ready path is passed positionally (no env-var coupling).
         let ready_path = dir.path().join(".child-term-trap-ready");
-        let mut cmd = std::process::Command::new("sh");
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.env("PATH", "/usr/bin:/bin");
         cmd.args([
             "-c",
             // The loop is BOUNDED at ~30 s, mirroring the old `sleep 30`: on the
@@ -5674,6 +5805,7 @@ pub(crate) mod tests {
         // `base_dir` doubles as BOTH the swap-target validation fixture AND
         // the `build_audit_emitter` root for the FRESH relaunch emitter —
         // `csq-runs/.pending/` under it is where that second record lands.
+        let _env = csq_core::platform::test_env::lock();
         let (base_dir, _daemon) = valid_swap_target_base_dir(3);
 
         let handle_dir_for_writer = dir.path().to_path_buf();
@@ -5825,9 +5957,10 @@ pub(crate) mod tests {
         // NOT `valid_swap_target_base_dir`, which stands up a fake healthy
         // daemon; this test needs the opposite.
         let base_dir = tmp_handle_dir();
-        // Linux resolves daemon paths through XDG_RUNTIME_DIR before base_dir.
-        // Hold the shared env guard so a healthy ambient or sibling fixture
-        // cannot satisfy this test's deliberately absent daemon.
+        // Register this base so a healthy ambient or sibling fixture cannot
+        // satisfy this test's deliberately absent daemon; the env lock is
+        // this test's own.
+        let _env = csq_core::platform::test_env::lock();
         let _no_daemon = spawn_no_daemon_env_guard(base_dir.path());
         std::fs::create_dir_all(base_dir.path().join("config-8")).unwrap();
         std::fs::write(base_dir.path().join("config-8").join("config.toml"), b"").unwrap(); // CI-ALLOW-fs-write-config-toml (test fixture)
@@ -6020,6 +6153,7 @@ pub(crate) mod tests {
     #[test]
     fn validate_codex_relaunch_target_admits_disabled_and_refuses_enabled_on_forced_preflight_err()
     {
+        let _env = csq_core::platform::test_env::lock();
         let (base_dir, _daemon) = valid_swap_target_base_dir(4);
         let _err_guard = crate::cli::commands::run::force_coc_preflight_cwd_err();
 
@@ -6067,6 +6201,7 @@ pub(crate) mod tests {
     /// `capability_layer_enabled` rather than forwarding the parameter.
     #[test]
     fn make_validate_relaunch_admits_disabled_and_refuses_enabled_on_forced_preflight_err() {
+        let _env = csq_core::platform::test_env::lock();
         let (base_dir, _daemon) = valid_swap_target_base_dir(4);
         let _err_guard = crate::cli::commands::run::force_coc_preflight_cwd_err();
         let toggles = csq_core::capability_layer::CapabilityLayerToggles::default();
@@ -6108,6 +6243,7 @@ pub(crate) mod tests {
 
     #[test]
     fn default_validate_closure_admits_disabled_and_refuses_enabled_on_forced_preflight_err() {
+        let _env = csq_core::platform::test_env::lock();
         let (base_dir, _daemon) = valid_swap_target_base_dir(4);
         let _err_guard = crate::cli::commands::run::force_coc_preflight_cwd_err();
 
@@ -7023,7 +7159,8 @@ pub(crate) mod tests {
         // budget expires), and `kill(pid, 0)` succeeds on a zombie — so a
         // pid-liveness watcher measures reap time, not forwarding time.
         let got_term = dir.path().join("got-term");
-        let mut cmd = Command::new("sh");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.env("PATH", "/usr/bin:/bin");
         cmd.args([
             "-c",
             "trap 'touch \"$1\"; exit 0' TERM; while true; do sleep 0.05; done",
@@ -7756,7 +7893,7 @@ mod managed_backend_tests {
     #[test]
     fn backend_guard_stops_spawned_process_without_a_tui_or_ready_socket() {
         let mut command = Command::new("/bin/sh");
-        command.args(["-c", "exec sleep 30"]);
+        command.args(["-c", "exec sleep 120"]);
         let mut backend = OwnedNativeBackend::spawn(command).unwrap();
         let identity = backend.launcher.clone();
         assert!(identity.verify().is_ok());
@@ -7769,7 +7906,7 @@ mod managed_backend_tests {
     #[test]
     fn startup_error_drop_cleans_the_owned_backend_group() {
         let mut command = Command::new("/bin/sh");
-        command.args(["-c", "exec sleep 30"]);
+        command.args(["-c", "exec sleep 120"]);
         let backend = OwnedNativeBackend::spawn(command).unwrap();
         let identity = backend.launcher.clone();
         drop(backend);
@@ -7777,25 +7914,43 @@ mod managed_backend_tests {
     }
     #[test]
     fn backend_session_and_group_cleanup_include_its_descendants() {
+        // The "a real descendant exists" precondition is a RECEIPT: the shell
+        // publishes `$!` (atomically, via rename) only AFTER the fork returned,
+        // so the test never infers the descendant from a wall-clock window or
+        // from a `ps` scan racing the fork. Falsifying result: if the shell
+        // never forks (or the receipt is never written) the bounded wait below
+        // panics "descendant receipt never published"; a delayed fork (stall
+        // injected before `sleep`) only delays the receipt, never fails the row.
+        let dir = tempfile::tempdir().unwrap();
+        let receipt = dir.path().join("descendant.pid");
         let mut command = Command::new("/bin/sh");
-        command.args(["-c", "trap 'wait; exit 0' TERM; sleep 30 & wait"]);
+        command.args([
+            "-c",
+            "trap 'wait; exit 0' TERM; sleep 120 & echo $! > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; wait",
+            "sh",
+        ]);
+        command.arg(&receipt);
         let mut backend = OwnedNativeBackend::spawn(command).unwrap();
         let pid = backend.launcher.pid;
         // SAFETY: read-only session/group queries on our exact live child.
         assert_eq!(unsafe { libc::getsid(pid as i32) }, pid as i32);
         assert_eq!(unsafe { libc::getpgid(pid as i32) }, pid as i32);
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let descendant = loop {
-            if let Some(pid) = collect_descendant_pids(pid).into_iter().next() {
-                break csq_core::providers::codex::managed_backend::LauncherIdentity::capture(pid)
-                    .unwrap();
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "fixture must spawn a real descendant"
-            );
-            std::thread::sleep(Duration::from_millis(POLL_MS));
-        };
+        // The descendant's lifetime (120 s) MUST exceed this test's own hang net
+        // (60 s): a 30 s child can exit before a starved test thread (a full
+        // 2000-test run under load: an internal ticket, 60 s without one observation) ever
+        // looks, leaving nothing to observe. `stop()` kills it, so it never runs
+        // to term. Falsifying result: a starved observer sees a dead pid.
+        // Waiting on the receipt is an EVENT wait; this bound is only a hang net.
+        let descendant_pid: u32 = super::tests::wait_for_fixture_receipt(&receipt)
+            .parse()
+            .unwrap();
+        let descendant =
+            csq_core::providers::codex::managed_backend::LauncherIdentity::capture(descendant_pid)
+                .unwrap();
+        assert!(
+            collect_descendant_pids(pid).contains(&descendant_pid),
+            "the receipted pid must be a live descendant of the backend"
+        );
         backend.stop().unwrap();
         assert!(
             descendant.verify().is_err(),

@@ -30,7 +30,14 @@ use std::path::{Path, PathBuf};
 /// On Windows, uses `%LOCALAPPDATA%\csq\` (typically
 /// `C:\Users\{user}\AppData\Local\csq\`). Falls back to `base_dir` if
 /// `LOCALAPPDATA` is unset.
+///
+/// With feature `test-utils` (Unix), a base registered through
+/// [`test_socket`] resolves to its registered runtime directory instead.
 pub fn pid_file_path(base_dir: &Path) -> PathBuf {
+    #[cfg(all(feature = "test-utils", unix))]
+    if let Some(pid) = test_socket::lookup_pid(base_dir) {
+        return pid;
+    }
     #[cfg(target_os = "linux")]
     {
         if let Some(dir) = xdg_runtime_dir() {
@@ -62,7 +69,16 @@ pub fn pid_file_path(base_dir: &Path) -> PathBuf {
 ///
 /// Windows returns a named-pipe path `\\.\pipe\csq-{username}`.
 /// The username suffix ensures per-user isolation on multi-user boxes.
+///
+/// Test fixtures never repoint the process-global `$XDG_RUNTIME_DIR`; with
+/// feature `test-utils` (Unix) they register their own base through
+/// `test_socket` (see that module), which redirects only callers passing
+/// that exact base.
 pub fn socket_path(base_dir: &Path) -> PathBuf {
+    #[cfg(all(feature = "test-utils", unix))]
+    if let Some(sock) = test_socket::lookup_socket(base_dir) {
+        return sock;
+    }
     // base_dir is used on macOS and unknown-Unix only; suppress
     // unused-variable warnings on Linux and Windows.
     let _ = &base_dir;
@@ -89,6 +105,99 @@ pub fn socket_path(base_dir: &Path) -> PathBuf {
     {
         // Unknown Unix: fall back to base_dir.
         base_dir.join("csq.sock")
+    }
+}
+
+/// Per-base socket injection for test fixtures (feature `test-utils`, Unix
+/// only; compiled out of production builds).
+///
+/// A fixture daemon that must be reachable through `socket_path(base)` on
+/// Linux used to point the process-global `$XDG_RUNTIME_DIR` at itself, so
+/// EVERY concurrent test resolving "the daemon" landed on it (an internal ticket).
+/// Registering the fixture's own `base` here instead redirects ONLY callers
+/// that pass that exact base; a caller with any other base resolves as usual
+/// and no process-global state changes.
+#[cfg(all(feature = "test-utils", unix))]
+pub mod test_socket {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    #[derive(Clone)]
+    struct Entry {
+        sock: PathBuf,
+        pid: PathBuf,
+    }
+
+    fn registry() -> &'static Mutex<HashMap<PathBuf, Entry>> {
+        static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Entry>>> = OnceLock::new();
+        REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Keys a base is looked up under: as given, and (when it resolves)
+    /// canonicalized, so a caller that canonicalizes still matches.
+    fn keys(base: &Path) -> Vec<PathBuf> {
+        let mut keys = vec![base.to_path_buf()];
+        if let Ok(canon) = base.canonicalize() {
+            if canon != base {
+                keys.push(canon);
+            }
+        }
+        keys
+    }
+
+    fn lookup(base: &Path) -> Option<Entry> {
+        let map = registry().lock().unwrap_or_else(|p| p.into_inner());
+        if map.is_empty() {
+            return None;
+        }
+        keys(base).iter().find_map(|k| map.get(k).cloned())
+    }
+
+    pub(super) fn lookup_socket(base: &Path) -> Option<PathBuf> {
+        lookup(base).map(|e| e.sock)
+    }
+
+    pub(super) fn lookup_pid(base: &Path) -> Option<PathBuf> {
+        lookup(base).map(|e| e.pid)
+    }
+
+    /// Unregisters its base on drop.
+    #[must_use = "the redirect ends when the registration is dropped"]
+    pub struct Registration {
+        keys: Vec<PathBuf>,
+    }
+
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            let mut map = registry().lock().unwrap_or_else(|p| p.into_inner());
+            for k in &self.keys {
+                map.remove(k);
+            }
+        }
+    }
+
+    /// Redirects `socket_path(base)` to `base/csq.sock` and
+    /// `pid_file_path(base)` to `base/csq-daemon.pid` until the returned
+    /// registration is dropped; returns the socket path.
+    pub fn register(base: &Path) -> (Registration, PathBuf) {
+        register_in(base, base)
+    }
+
+    /// Like [`register`], but both paths live in `dir` (for a fixture whose
+    /// socket must sit in a short directory, independent of a deep `base`).
+    pub fn register_in(base: &Path, dir: &Path) -> (Registration, PathBuf) {
+        let entry = Entry {
+            sock: dir.join("csq.sock"),
+            pid: dir.join("csq-daemon.pid"),
+        };
+        let sock = entry.sock.clone();
+        let keys = keys(base);
+        let mut map = registry().lock().unwrap_or_else(|p| p.into_inner());
+        for k in &keys {
+            map.insert(k.clone(), entry.clone());
+        }
+        (Registration { keys }, sock)
     }
 }
 
@@ -165,6 +274,27 @@ pub fn pipe_name(base_dir: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "test-utils", unix))]
+    #[test]
+    fn registered_base_redirects_socket_and_pid_only_for_that_base() {
+        // Unregistered resolution reads `$XDG_RUNTIME_DIR` on Linux, which
+        // sibling tests set and remove under this lock.
+        let _env = crate::platform::test_env::lock();
+        let a = tempfile::TempDir::new().unwrap();
+        let b = tempfile::TempDir::new().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let before_b_sock = socket_path(b.path());
+        let before_b_pid = pid_file_path(b.path());
+        let (reg, sock) = test_socket::register_in(a.path(), dir.path());
+        assert_eq!(socket_path(a.path()), sock);
+        assert_eq!(sock, dir.path().join("csq.sock"));
+        assert_eq!(pid_file_path(a.path()), dir.path().join("csq-daemon.pid"));
+        assert_eq!(socket_path(b.path()), before_b_sock);
+        assert_eq!(pid_file_path(b.path()), before_b_pid);
+        drop(reg);
+        assert_ne!(socket_path(a.path()), sock);
+    }
+
     use super::*;
 
     #[test]

@@ -12611,6 +12611,7 @@ mod codex_pre_spawn_guard_tests {
         let base = csq_core::testing::socket_fixture::short_root("csq-run-").unwrap();
         let account = AccountNum::try_from(9u16).unwrap();
         expired_codex_slot(base.path(), account.get());
+        let _env = csq_core::platform::test_env::lock();
         let _daemon = spawn_fake_healthy_daemon(base.path());
         let audit = CodexLaunchAudit::First(Box::new(PreSpawnCodexRun::new(run_audit_emitter(
             base.path(),

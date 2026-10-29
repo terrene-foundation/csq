@@ -1330,7 +1330,10 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let out = tracing::subscriber::with_default(Kinds(Arc::clone(&seen)), run);
+        let out = tracing::subscriber::with_default(Kinds(Arc::clone(&seen)), || {
+            tracing::callsite::rebuild_interest_cache();
+            run()
+        });
         let kinds = seen.lock().unwrap().clone();
         (out, kinds)
     }

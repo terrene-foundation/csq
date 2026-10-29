@@ -38,7 +38,10 @@ pub fn handle(base_dir: &Path) -> Result<()> {
     let config_dir = match super::current_config_dir() {
         Some(d) => d,
         None => {
-            println!("csq: no config dir");
+            println!(
+                "{}",
+                early_exit_line(base_dir, std::time::SystemTime::now(), "csq: no config dir")
+            );
             return Ok(());
         }
     };
@@ -61,7 +64,14 @@ pub fn handle(base_dir: &Path) -> Result<()> {
     let account: AccountNum = match snapshot::snapshot_account(&config_dir, base_dir) {
         Some(a) => a,
         None => {
-            println!("csq: no active account");
+            println!(
+                "{}",
+                early_exit_line(
+                    base_dir,
+                    std::time::SystemTime::now(),
+                    "csq: no active account"
+                )
+            );
             return Ok(());
         }
     };
@@ -127,13 +137,47 @@ pub fn handle(base_dir: &Path) -> Result<()> {
     // orgident r7 item 9: the TERMINAL's bound slot (`account`, from its marker) shares
     // its sign-in with another slot. Local state files only: no keychain, no network.
     let shared_sign_in = csq_core::accounts::launch_block::status_segment(base_dir, account.get());
-    let line = [Some(line), shared_sign_in, notice, messages]
+    // Archive badge: cheap file checks only (no launchctl spawn on the render path).
+    let archive = archive_segment(base_dir, std::time::SystemTime::now());
+    let line = [Some(line), shared_sign_in, notice, messages, archive]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
         .join(" ");
     println!("{line}");
     Ok(())
+}
+
+/// The line `handle` prints on both early-exit branches (no config dir, no active
+/// account): the message plus the archive badge, so a dead backup is never hidden
+/// by an unrelated early return.
+fn early_exit_line(base_dir: &Path, now: std::time::SystemTime, msg: &str) -> String {
+    match archive_segment(base_dir, now) {
+        Some(badge) => format!("{msg} {badge}"),
+        None => msg.to_string(),
+    }
+}
+
+/// The statusline's archive segment (an internal ticket): fixed `⚠ backup off` / `⚠ backup stale` /
+/// `⚠ delete off` / `⚠ backup ?` badges when the opt-in archive
+/// (`~/.config/csq-archive`) has a WARN, or an UNKNOWN on a file-based check.
+///
+/// Chosen design: the FILE CHECKS only (the heartbeat files, the capped
+/// `deleted.jsonl` tail, the `PAUSED` marker: a few opens and capped reads, each
+/// `O_NOFOLLOW|O_NONBLOCK` and regular-file-only so a FIFO or symlink cannot block
+/// the render), with the launchd check skipped (`SkipLaunchd`). No process is
+/// spawned on the render path and there is no cache file to go stale. A dead launchd
+/// job does NOT show its own badge here, but the heartbeats stop: the hourly one
+/// ages past 2 h and `backup stale` appears, so the stall surfaces within about two
+/// hours, not at once; `csq doctor` and the desktop banner name the exact job.
+/// Nothing shows when the archive is not configured or the base dir is not
+/// `<home>/.claude/accounts`.
+fn archive_segment(base_dir: &Path, now: std::time::SystemTime) -> Option<String> {
+    let home = csq_core::archive_health::home_of_base(base_dir)?;
+    let health =
+        csq_core::archive_health::check(&home, now, &csq_core::archive_health::SkipLaunchd);
+    let badges = csq_core::archive_health::statusline_badges(health.checks()?);
+    (!badges.is_empty()).then(|| badges.join(" "))
 }
 
 /// The statusline's message segment: `[<n> message(s)]` when messages are waiting, nothing
@@ -1329,6 +1373,51 @@ mod git_cache_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn early_exit_lines_carry_the_archive_badge_only_when_configured_and_failing() {
+        // `handle` prints `early_exit_line` on both early-exit branches.
+        let home = tempfile::tempdir().unwrap();
+        let base = home.path().join(".claude/accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_793_000_000);
+        // not configured: the bare message
+        assert_eq!(
+            super::early_exit_line(&base, now, "csq: no active account"),
+            "csq: no active account"
+        );
+        // configured and failing: the badge rides along on both messages
+        std::fs::create_dir_all(home.path().join(".config/csq-archive/log")).unwrap();
+        for msg in ["csq: no config dir", "csq: no active account"] {
+            let line = super::early_exit_line(&base, now, msg);
+            assert!(line.starts_with(msg), "{line}");
+            assert!(line.contains("\u{26a0} backup stale"), "{line}");
+        }
+    }
+
+    #[test]
+    fn archive_segment_shows_badges_only_for_a_configured_warning_archive() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        let home = tempfile::tempdir().unwrap();
+        let base = home.path().join(".claude/accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(1_793_000_000);
+        // not configured: nothing
+        assert_eq!(super::archive_segment(&base, now), None);
+        // configured, nothing ever ran: stale + delete badges, fixed text
+        let arch = home.path().join(".config/csq-archive");
+        std::fs::create_dir_all(arch.join("log")).unwrap();
+        assert_eq!(
+            super::archive_segment(&base, now).as_deref(),
+            Some("\u{26a0} backup stale \u{26a0} delete off")
+        );
+        // paused adds `backup off`; the reason text never appears
+        std::fs::write(arch.join("PAUSED"), "paused: private-reason").unwrap();
+        let seg = super::archive_segment(&base, now).unwrap();
+        assert!(seg.starts_with("\u{26a0} backup off"), "{seg}");
+        assert!(!seg.contains("private-reason"));
+        // a base dir that is not <home>/.claude/accounts: nothing
+        assert_eq!(super::archive_segment(home.path(), SystemTime::now()), None);
+    }
 
     #[test]
     fn message_segment_counts_and_distinguishes_absence_from_failure() {

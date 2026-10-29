@@ -2399,7 +2399,10 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let events = Arc::new(Mutex::new(Vec::new()));
-        tracing::subscriber::with_default(MirrorRetryCapture(events.clone()), run);
+        tracing::subscriber::with_default(MirrorRetryCapture(events.clone()), || {
+            tracing::callsite::rebuild_interest_cache();
+            run()
+        });
         // Read through the lock: the subscriber clone may outlive `with_default`.
         let captured = events.lock().unwrap_or_else(|p| p.into_inner());
         captured.clone()

@@ -43,7 +43,10 @@ fn captured_report(base: &Path) -> (LifecycleReport, Vec<(tracing::Level, Fields
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let events = Arc::new(Mutex::new(Vec::new()));
-    let report = tracing::subscriber::with_default(Capture(events.clone()), || report(base));
+    let report = tracing::subscriber::with_default(Capture(events.clone()), || {
+        tracing::callsite::rebuild_interest_cache();
+        report(base)
+    });
     // Read through the lock (take, as the events are not Clone): a dispatcher clone may outlive with_default, so
     // sole ownership of the Arc is not guaranteed (an internal ticket).
     let events = std::mem::take(&mut *events.lock().unwrap());

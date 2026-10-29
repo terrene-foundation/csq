@@ -1488,6 +1488,7 @@ pub fn run() {
             commands::move_account,
             commands::get_codex_slot_write_status,
             commands::get_claude_autocompact_status,
+            commands::get_archive_health,
             commands::ack_codex_slot_raced,
             commands::get_account_usage,
             commands::get_rotation_config,

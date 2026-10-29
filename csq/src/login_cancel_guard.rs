@@ -124,7 +124,7 @@ fn attach_signal_pump(group: &crate::login_child_custody::group::GroupControl) {
 /// CLI-only notice: the shared desktop notice has a different explicit action.
 pub(crate) fn print_cli_notice(notice: TimeoutNotice, account: csq_core::types::AccountNum) {
     match notice.disposition {
-        TimeoutDisposition::Retained => eprintln!("{}: sign-in program is still running; press Ctrl-C to request cancellation, then Ctrl-C again to end its process group (account {account})", notice.tag()),
+        TimeoutDisposition::Retained => eprintln!("{}: sign-in program is still running; press Ctrl-C to interrupt it (the interrupt goes to the sign-in program directly); where the login deadline applies, a program that ignores Ctrl-C is ended when it passes (account {account})", notice.tag()),
         TimeoutDisposition::Terminated => eprintln!("{}: sign-in program was terminated at the deadline; canonical login publication refused (account {account})", notice.tag()),
     }
 }
@@ -463,6 +463,55 @@ impl CliLoginReceipt {
     }
 }
 
+/// How a vendor login ended, worded for the operator. Fixed vocabulary only:
+/// a numeric exit code or a signal name, never paths, arguments or output.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VendorExit(std::process::ExitStatus);
+
+impl VendorExit {
+    pub(crate) fn success(&self) -> bool {
+        self.0.success()
+    }
+}
+
+impl std::fmt::Display for VendorExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(signal) = self.0.signal() {
+                return write!(f, "was terminated by signal {}", signal_name(signal));
+            }
+            if let Some(signal) = self.0.stopped_signal() {
+                return write!(f, "was stopped by signal {}", signal_name(signal));
+            }
+        }
+        match self.0.code() {
+            Some(code) => write!(f, "exited with status {code}"),
+            None => f.write_str("ended without an exit status"),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_name(signal: i32) -> String {
+    let name = match signal {
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGINT => "SIGINT",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGTSTP => "SIGTSTP",
+        libc::SIGTTIN => "SIGTTIN",
+        libc::SIGTTOU => "SIGTTOU",
+        other => return other.to_string(),
+    };
+    name.to_owned()
+}
+
 /// Shared production seam: Command is fully built before entry. K can retain an
 /// actual account lock; the caller's enclosing account lock also spans this call.
 #[cfg(test)]
@@ -558,7 +607,7 @@ pub(crate) fn spawn_cli_login_scoped<K>(
     notice: impl FnMut(TimeoutNotice),
     cancellation: &ScopedLoginCancellation,
     deadline_stopped: &mut bool,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<VendorExit> {
     spawn_cli_inherited_login_inner(
         command,
         timeout,
@@ -569,7 +618,7 @@ pub(crate) fn spawn_cli_login_scoped<K>(
         DeadlineStop::TerminateGroup,
         deadline_stopped,
     )
-    .map(|receipt| receipt.status.success())
+    .map(|receipt| VendorExit(receipt.status))
 }
 
 pub(crate) fn spawn_cli_inherited_login_scoped<K>(
@@ -639,7 +688,7 @@ fn spawn_cli_inherited_login_inner<K>(
         eprintln!("Cancelling — waiting for {vendor} login to exit");
         return Err(cancelled_before_spawn().context(CliLoginCustodyFinalized));
     }
-    let (child, group) = match crate::login_child_custody::group::spawn(command) {
+    let (child, group) = match crate::login_child_custody::group::spawn_attended(command) {
         Ok(child) => child,
         Err(error) => {
             if cancellation.cancelled() {
@@ -697,9 +746,15 @@ fn spawn_cli_inherited_login_inner<K>(
             .context("failed to restore terminal cancellation handler")
             .context(CliLoginCustodyFinalized)?;
     }
+    let operator_stop = owned.operator_stop(result.as_ref().ok());
+    was_cancelled |= operator_stop.is_some();
     if was_cancelled {
-        if !announced_cancel {
-            eprintln!("Cancelling — waiting for {vendor} login to exit");
+        match operator_stop {
+            Some(message) => eprintln!("{message}"),
+            None if !announced_cancel => {
+                eprintln!("Cancelling — waiting for {vendor} login to exit");
+            }
+            None => {}
         }
         return Err(anyhow::Error::new(CliLoginCancelled {
             prior_refusal: result.err(),
@@ -1495,5 +1550,27 @@ mod receipt_tests {
             Ok(())
         })
         .expect("scoped deadline stop must finish with the actual reap");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod vendor_exit_tests {
+    use super::VendorExit;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    #[test]
+    fn exit_wording_names_code_or_signal() {
+        let say = |raw| VendorExit(ExitStatus::from_raw(raw)).to_string();
+        assert_eq!(say(1 << 8), "exited with status 1");
+        assert_eq!(say(libc::SIGTTOU), "was terminated by signal SIGTTOU");
+        assert_eq!(say(libc::SIGKILL), "was terminated by signal SIGKILL");
+        assert_eq!(say(64), "was terminated by signal 64");
+        // WIFSTOPPED shape: (signal << 8) | 0x7f.
+        assert_eq!(
+            say((libc::SIGTTOU << 8) | 0x7f),
+            "was stopped by signal SIGTTOU"
+        );
+        assert!(VendorExit(ExitStatus::from_raw(0)).success());
     }
 }

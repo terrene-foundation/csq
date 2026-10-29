@@ -360,3 +360,12 @@ fn group_guard_kills_before_reaping_and_never_after() {
 }
 #[path = "../src/login_child_custody.rs"]
 mod login_child_custody;
+// The custody module's tty tests are compiled into every crate that includes
+// it (`#[cfg(all(test, unix))]` inside login_child_custody.rs) and name
+// `crate::login_cancel_guard` at the crate root. The two sibling integration
+// crates include that module too; this one included only the custody half, so
+// the tty tests failed to resolve it (E0433). Nothing here calls the guard
+// directly, hence the allow.
+#[allow(dead_code)]
+#[path = "../src/login_cancel_guard.rs"]
+mod login_cancel_guard;

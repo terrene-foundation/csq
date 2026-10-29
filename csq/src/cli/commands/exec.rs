@@ -2065,14 +2065,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn capture_bounded_bounds_real_child_pipe_and_child_exits() {
-        // A bare program name resolves through the process PATH, which sibling tests swap
-        // under the shared env lock; hold it so the spawn cannot see a mid-swap PATH.
+        // Sibling tests swap the process PATH under the shared env lock, which is
+        // why this holds it. The interpreter below is absolute and its PATH is
+        // pinned as well, so the spawn stays correct even against a sibling that
+        // mutates PATH without taking the lock (an internal ticket).
         let _env_lock = csq_core::platform::test_env::lock();
         use std::process::{Command, Stdio};
         // Emit 9 MiB (> the 8 MiB cap) then close. `yes` SIGPIPEs when `head`
         // has taken its bytes; the pipeline (sh) exit status is head's (0).
         let over_cap: usize = MAX_CAPTURE_BYTES + 1024 * 1024; // 9 MiB
-        let mut child = Command::new("sh")
+        let mut child = Command::new("/bin/sh")
+            .env("PATH", "/usr/bin:/bin")
             .arg("-c")
             .arg(format!("yes | head -c {over_cap}"))
             .stdout(Stdio::piped())

@@ -16085,9 +16085,15 @@ mod tests {
         sweep: impl FnOnce() -> MirrorSyncStatus,
     ) -> MirrorSyncStatus {
         let failures = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _capture = crate::testing::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let status = tracing::subscriber::with_default(
             StatusWriteCapture(std::sync::Arc::clone(&failures)),
-            sweep,
+            || {
+                tracing::callsite::rebuild_interest_cache();
+                sweep()
+            },
         );
         let published = read_mirror_sync_status(base).is_some_and(|row| {
             row.pending == status.pending
@@ -18990,6 +18996,7 @@ mod tests {";
         }
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         tracing::subscriber::with_default(Events(events.clone()), || {
+            tracing::callsite::rebuild_interest_cache();
             assert!(matches!(
                 decide_auto_rotate_disposition(Ok(ForcedSyncResult::AbsentWriteFailed)),
                 Ok(ForcedSyncResult::AbsentWriteFailed)

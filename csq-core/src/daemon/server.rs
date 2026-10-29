@@ -6141,14 +6141,12 @@ mod tests {
     }
 
     /// Serialises this capture against every OTHER scoped-dispatcher capture
-    /// in the binary — see `refresh::check`'s `BROKER_CAPTURE_LOCK` doc for
-    /// why a dedicated lock is required: `with_default` also mutates
-    /// tracing's PROCESS-GLOBAL max-level filter, so two captures racing
-    /// across threads can transiently filter each other's events out.
-    static HARVEST_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// in the binary through the shared capture lock: `with_default` also
+    /// mutates tracing's PROCESS-GLOBAL max-level filter, so two captures
+    /// racing across threads can transiently filter each other's events out
+    /// (see `crate::testing::TRACING_CAPTURE_LOCK`).
     fn capture_harvest_events<T>(run: impl FnOnce() -> T) -> (T, Vec<HarvestEvent>) {
-        let _capture_guard = HARVEST_CAPTURE_LOCK
+        let _capture_guard = crate::testing::TRACING_CAPTURE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -6156,7 +6154,10 @@ mod tests {
             events: Arc::clone(&events),
             next_span: std::sync::atomic::AtomicU64::new(1),
         };
-        let result = tracing::subscriber::with_default(subscriber, run);
+        let result = tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            run()
+        });
         let captured = events.lock().unwrap().clone();
         (result, captured)
     }

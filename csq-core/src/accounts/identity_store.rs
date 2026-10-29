@@ -1218,6 +1218,7 @@ mod tests {
         let events: Events = Arc::new(Mutex::new(Vec::new()));
         let removes = std::cell::Cell::new(0);
         tracing::subscriber::with_default(Capture(events.clone()), || {
+            tracing::callsite::rebuild_interest_cache();
             marker.rollback_if_created_with(|path| {
                 removes.set(removes.get() + 1);
                 // SAFETY: geteuid has no arguments or pointer preconditions.

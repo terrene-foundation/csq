@@ -89,7 +89,10 @@ fn capture<T>(run: impl FnOnce() -> T) -> (T, Vec<String>) {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let ev = Events::default();
-    let out = tracing::subscriber::with_default(ev.clone(), run);
+    let out = tracing::subscriber::with_default(ev.clone(), || {
+        tracing::callsite::rebuild_interest_cache();
+        run()
+    });
     let lines = std::mem::take(&mut *ev.0.lock().unwrap());
     (out, lines)
 }

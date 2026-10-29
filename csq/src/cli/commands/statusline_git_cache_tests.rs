@@ -1605,7 +1605,13 @@ fn final_cache_capture(run: impl FnOnce()) -> String {
         .with_max_level(tracing::Level::DEBUG)
         .with_writer(move || Capture(sink.clone()))
         .finish();
-    tracing::subscriber::with_default(subscriber, run);
+    let _capture = csq_core::testing::TRACING_CAPTURE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        run()
+    });
     let result = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
     result
 }

@@ -8,6 +8,7 @@
   import UpdateBanner from "./lib/components/UpdateBanner.svelte";
   import CorruptPrefsBanner from "./lib/components/CorruptPrefsBanner.svelte";
   import CodexSlotStatusPanel from "./lib/components/CodexSlotStatusPanel.svelte";
+  import ArchiveHealthBanner from "./lib/components/ArchiveHealthBanner.svelte";
   import ClaudeAutoCompactStatusPanel from "./lib/components/ClaudeAutoCompactStatusPanel.svelte";
   import InteractiveConsole from "./lib/components/InteractiveConsole.svelte";
   import PolicyConsole from "./lib/components/PolicyConsole.svelte";
@@ -69,6 +70,7 @@
   <Header />
   <CorruptPrefsBanner />
   <UpdateBanner />
+  <ArchiveHealthBanner />
   <div class="tabs" role="tablist" aria-label="Dashboard views">
     <button
       id="tab-accounts"

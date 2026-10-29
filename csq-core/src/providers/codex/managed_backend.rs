@@ -2005,6 +2005,14 @@ mod tests {
     /// spawns, so connects queue in the backlog: no separate readiness signal is needed.
     const HANG_GUARD: Duration = Duration::from_secs(60);
 
+    /// Client-side budget for every RPC / handshake / binding publication whose PURPOSE
+    /// is not the deadline itself. NOT UNDER TEST: it only has to outlast a host stalled
+    /// by fleet load (an internal ticket: a fixed 3s/6s client deadline expired before the loaded
+    /// client wrote, surfacing as "native RPC write failed"). Tests that assert a
+    /// deadline (`stalled_*`, `trickled_*`, `watcher_returns_at_its_total_deadline_*`,
+    /// `fixwave_r2_timeout_poisons_*`, stop-bound joins) keep their own short bounds.
+    const CLIENT_BUDGET: Duration = Duration::from_secs(30);
+
     fn plan() -> (tempfile::TempDir, ManagedBackendPlan) {
         // Unix-domain sockets have a small platform path limit. Use the shared
         // short-root fixture so the plan is valid under long workspace/TMPDIR
@@ -2197,7 +2205,7 @@ mod tests {
             socket.send(tungstenite::Message::Text(json!({"id":request["id"],"result":{"turn":{"id":"native-turn","status":"inProgress"}}}).to_string().into())).unwrap();
         });
         let launcher = LauncherIdentity::capture(std::process::id()).unwrap();
-        plan.publish_binding(&launcher, Duration::from_secs(3))
+        plan.publish_binding(&launcher, CLIENT_BUDGET)
             .unwrap()
             .publish_recipient(&LauncherIdentity::capture(std::process::id()).unwrap())
             .unwrap();
@@ -2209,7 +2217,7 @@ mod tests {
                 &main,
                 &item,
                 StartAdmission::AdmitAnyStatus,
-                Duration::from_secs(3)
+                CLIENT_BUDGET
             )
             .unwrap(),
             "native-turn"
@@ -2227,7 +2235,7 @@ mod tests {
         });
         let published = plan.publish_binding(
             &LauncherIdentity::capture(std::process::id()).unwrap(),
-            Duration::from_secs(3),
+            CLIENT_BUDGET,
         );
         // Report BOTH sides, and never hang reporting them. If the client failed BEFORE it
         // connected (deadline, launcher verification, connect_checked), the fixture server
@@ -2334,9 +2342,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
         });
         let launcher = LauncherIdentity::capture(std::process::id()).unwrap();
-        let mut binding = plan
-            .publish_binding(&launcher, Duration::from_secs(3))
-            .unwrap();
+        let mut binding = plan.publish_binding(&launcher, CLIENT_BUDGET).unwrap();
         binding.publish_recipient(&launcher).unwrap();
 
         let started = Instant::now();
@@ -2442,7 +2448,7 @@ mod tests {
                 .unwrap();
         });
         let recipient = LauncherIdentity::capture(std::process::id()).unwrap();
-        plan.publish_binding(&recipient, Duration::from_secs(3))
+        plan.publish_binding(&recipient, CLIENT_BUDGET)
             .unwrap()
             .publish_recipient(&recipient)
             .unwrap();
@@ -2462,7 +2468,7 @@ mod tests {
                 &recipient,
                 MAIN,
                 &summary,
-                Duration::from_secs(3),
+                CLIENT_BUDGET,
             )
             .unwrap(),
             ITEM
@@ -2501,7 +2507,7 @@ mod tests {
                 .unwrap();
         });
         let recipient = LauncherIdentity::capture(std::process::id()).unwrap();
-        plan.publish_binding(&recipient, Duration::from_secs(3))
+        plan.publish_binding(&recipient, CLIENT_BUDGET)
             .unwrap()
             .publish_recipient(&recipient)
             .unwrap();
@@ -2512,7 +2518,7 @@ mod tests {
                 &recipient,
                 MAIN,
                 2,
-                Duration::from_secs(3)
+                CLIENT_BUDGET
             )
             .unwrap(),
             ITEM
@@ -2524,7 +2530,7 @@ mod tests {
             MAIN,
             ITEM,
             2,
-            Duration::from_secs(3)
+            CLIENT_BUDGET
         )
         .unwrap());
         server.join().unwrap();
@@ -2584,7 +2590,7 @@ mod tests {
             ))
             .unwrap();
         drop(stray);
-        plan.publish_binding(&recipient, Duration::from_secs(3))
+        plan.publish_binding(&recipient, CLIENT_BUDGET)
             .unwrap()
             .publish_recipient(&recipient)
             .unwrap();
@@ -2595,7 +2601,7 @@ mod tests {
                 &recipient,
                 MAIN,
                 2,
-                Duration::from_secs(3)
+                CLIENT_BUDGET
             )
             .unwrap(),
             ITEM
@@ -2607,7 +2613,7 @@ mod tests {
             MAIN,
             ITEM,
             2,
-            Duration::from_secs(3)
+            CLIENT_BUDGET
         )
         .unwrap());
         server.join().unwrap();
@@ -2627,7 +2633,7 @@ mod tests {
             }
         });
         let recipient = LauncherIdentity::capture(std::process::id()).unwrap();
-        plan.publish_binding(&recipient, Duration::from_secs(3))
+        plan.publish_binding(&recipient, CLIENT_BUDGET)
             .unwrap()
             .publish_recipient(&recipient)
             .unwrap();
@@ -2638,7 +2644,7 @@ mod tests {
             MAIN,
             ITEM,
             1,
-            Duration::from_secs(3)
+            CLIENT_BUDGET
         )
         .is_err());
         server.join().unwrap();
@@ -2671,15 +2677,13 @@ mod tests {
             drop(initialized(&listener, &home, HANG_GUARD));
         });
         let native = LauncherIdentity::capture(std::process::id()).unwrap();
-        let mut binding = plan
-            .publish_binding(&native, Duration::from_secs(3))
-            .unwrap();
+        let mut binding = plan.publish_binding(&native, CLIENT_BUDGET).unwrap();
         binding.publish_recipient(&recipient).unwrap();
         let record = json!({"kind":"private-recorded-process-binding-fixture","backend":native,"recipient":recipient,"handleDevice":binding.handle_device,"handleInode":binding.handle_inode});
         assert_eq!(record["recipient"]["pid"], child.0.id());
         let mapped = resolve_managed_caller_with(
             &plan.handle_dir,
-            Duration::from_secs(3),
+            CLIENT_BUDGET,
             &|_| Ok(plan.sqlite_home.clone()),
             &|identity| {
                 assert_eq!(identity, &native);
@@ -3001,9 +3005,7 @@ mod tests {
             wait,
         );
         let launcher = LauncherIdentity::capture(std::process::id()).unwrap();
-        let mut binding = plan
-            .publish_binding(&launcher, Duration::from_secs(3))
-            .unwrap();
+        let mut binding = plan.publish_binding(&launcher, CLIENT_BUDGET).unwrap();
         binding.publish_recipient(&launcher).unwrap();
         let (tx, rx) = std::sync::mpsc::channel::<(String, String)>();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3163,12 +3165,19 @@ mod tests {
         }
     }
 
+    /// Returns the server thread and a `scenario_done` signal, sent once the
+    /// scenario was actually SERVED (all seed reads answered, the staged
+    /// notifications sent) and the watcher then made no request for `settle`.
+    /// A host stall before the first reply delays the signal; it can never
+    /// fire it early.
     fn serve_scripted(
         listener: UnixListener,
         home: PathBuf,
         script: WatchScript,
-    ) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || {
+        settle: Duration,
+    ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<()>) {
+        let (done, scenario_done) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
             let publish = initialized_bounded(&listener, &home, HANG_GUARD);
             let mut socket = match initialized_bounded(&listener, &home, HANG_GUARD) {
                 Some(socket) => socket,
@@ -3182,8 +3191,13 @@ mod tests {
                 .get_ref()
                 .set_read_timeout(Some(Duration::from_millis(25)))
                 .unwrap();
+            let started = Instant::now();
+            let mut last_activity = Instant::now();
+            let mut sent = false;
+            let mut settled = false;
             loop {
                 let pending: Vec<String> = script.outbox.lock().unwrap().drain(..).collect();
+                sent |= !pending.is_empty();
                 for child in pending {
                     if socket
                         .send(tungstenite::Message::Text(
@@ -3205,10 +3219,22 @@ mod tests {
                             io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                         ) =>
                     {
-                        continue
+                        // EVENT, not a guessed clock: done once the seed was
+                        // served, the notifications went out, and the watcher
+                        // has been quiet for `settle`.
+                        let seeded = *script.reads.lock().unwrap() >= seed_reads;
+                        if sent && seeded && !settled && last_activity.elapsed() >= settle {
+                            settled = true;
+                            let _ = done.send(());
+                        }
+                        if started.elapsed() >= HANG_GUARD {
+                            break;
+                        }
+                        continue;
                     }
                     Err(_) => break,
                 };
+                last_activity = Instant::now();
                 let request: serde_json::Value = match serde_json::from_str(&message) {
                     Ok(value) => value,
                     Err(_) => continue,
@@ -3298,8 +3324,13 @@ mod tests {
                     }
                     _ => send_result(&mut socket, id, json!({})),
                 }
+                last_activity = Instant::now();
             }
-        })
+            if sent && !settled {
+                let _ = done.send(());
+            }
+        });
+        (handle, scenario_done)
     }
 
     struct ScriptedRun {
@@ -3307,20 +3338,23 @@ mod tests {
         script: WatchScript,
     }
 
-    /// Drive the watcher against a scripted server.
+    /// Drive the watcher against a scripted server. `settle` is the quiet
+    /// window after the scenario was served. `expect_start` callers first wait
+    /// (bounded by `HANG_GUARD`) for the start itself, so a slow host cannot
+    /// stop the watcher before it got there; callers expecting NOTHING wait
+    /// only for the served-and-quiet signal.
     fn run_scripted(
         plan: &ManagedBackendPlan,
         listener: UnixListener,
         script: WatchScript,
         expected: Option<&'static str>,
-        wait: Duration,
+        expect_start: bool,
+        settle: Duration,
     ) -> ScriptedRun {
         let home = plan.handle_dir.clone();
-        let server = serve_scripted(listener, home, script.clone());
+        let (server, scenario_done) = serve_scripted(listener, home, script.clone(), settle);
         let launcher = LauncherIdentity::capture(std::process::id()).unwrap();
-        let mut binding = plan
-            .publish_binding(&launcher, Duration::from_secs(3))
-            .unwrap();
+        let mut binding = plan.publish_binding(&launcher, CLIENT_BUDGET).unwrap();
         binding.publish_recipient(&launcher).unwrap();
         let (tx, rx) = std::sync::mpsc::channel::<(String, String)>();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3348,12 +3382,21 @@ mod tests {
                 Duration::from_millis(25),
             )
         });
-        std::thread::sleep(wait);
+        let mut starts = Vec::new();
+        let first = if expect_start {
+            rx.recv_timeout(HANG_GUARD).ok()
+        } else {
+            None
+        };
+        let ran = scenario_done.recv_timeout(HANG_GUARD);
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let outcome = watcher.join().unwrap();
         assert!(outcome.is_ok(), "watcher must stop cleanly: {outcome:?}");
         server.join().expect("fixture server thread");
-        let mut starts = Vec::new();
+        ran.expect("fixture server never served the scenario and went quiet");
+        if expect_start {
+            starts.push(first.expect("the expected start never happened"));
+        }
         while let Ok(row) = rx.try_recv() {
             starts.push(row);
         }
@@ -3399,7 +3442,8 @@ mod tests {
             listener,
             script,
             Some(ITEM),
-            Duration::from_millis(2000),
+            true,
+            Duration::from_millis(1000),
         );
         assert_eq!(
             run.starts,
@@ -3437,6 +3481,7 @@ mod tests {
             listener,
             script,
             Some(ITEM),
+            false,
             Duration::from_millis(3000),
         );
         assert!(
@@ -3463,6 +3508,7 @@ mod tests {
             listener,
             script,
             Some(ITEM),
+            false,
             Duration::from_millis(1500),
         );
         assert!(
@@ -3485,11 +3531,10 @@ mod tests {
         script.queue.lock().unwrap().push(ITEM.to_owned());
         script.outbox.lock().unwrap().push(CHILD_A.to_owned());
         let home = plan.handle_dir.clone();
-        let server = serve_scripted(listener, home, script.clone());
+        let (server, _scenario_done) =
+            serve_scripted(listener, home, script.clone(), Duration::from_millis(100));
         let launcher = LauncherIdentity::capture(std::process::id()).unwrap();
-        let mut binding = plan
-            .publish_binding(&launcher, Duration::from_secs(3))
-            .unwrap();
+        let mut binding = plan.publish_binding(&launcher, CLIENT_BUDGET).unwrap();
         binding.publish_recipient(&launcher).unwrap();
         let current = std::sync::Arc::new(std::sync::Mutex::new(ITEM.to_owned()));
         let (tx, rx) = std::sync::mpsc::channel::<(String, String)>();
@@ -3519,9 +3564,7 @@ mod tests {
                 Duration::from_millis(25),
             )
         });
-        let first = rx
-            .recv_timeout(Duration::from_secs(3))
-            .expect("first start");
+        let first = rx.recv_timeout(CLIENT_BUDGET).expect("first start");
         assert_eq!(first, (MAIN.to_owned(), ITEM.to_owned()));
         {
             let mut queue = script.queue.lock().unwrap();
@@ -3536,7 +3579,7 @@ mod tests {
         );
         script.outbox.lock().unwrap().push(CHILD_A.to_owned());
         script.outbox.lock().unwrap().push(CHILD_A.to_owned());
-        let second = rx.recv_timeout(Duration::from_secs(3)).ok();
+        let second = rx.recv_timeout(CLIENT_BUDGET).ok();
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = watcher.join();
         server.join().expect("fixture server thread");
@@ -3574,7 +3617,8 @@ mod tests {
             listener,
             script,
             Some(ITEM),
-            Duration::from_millis(2500),
+            true,
+            Duration::from_millis(1000),
         );
         let after = *run.script.loaded_lists.lock().unwrap();
         assert!(
@@ -3608,10 +3652,10 @@ mod tests {
                 request["id"].clone(),
                 json!({"queuedSubmission":{"id":ITEM,"clientUserMessageId":message_id}}),
             );
-            wait_for_client_close(&mut socket, Duration::from_secs(6));
+            wait_for_client_close(&mut socket, HANG_GUARD);
         });
         let launcher = LauncherIdentity::capture(std::process::id()).unwrap();
-        plan.publish_binding(&launcher, Duration::from_secs(3))
+        plan.publish_binding(&launcher, CLIENT_BUDGET)
             .unwrap()
             .publish_recipient(&launcher)
             .unwrap();
@@ -3622,7 +3666,7 @@ mod tests {
             &launcher,
             MAIN,
             &summary,
-            Duration::from_secs(6),
+            CLIENT_BUDGET,
         );
         server.join().expect("fixture server thread");
         assert_eq!(queued.unwrap(), ITEM, "a slow queue/add must still queue");
@@ -3712,9 +3756,7 @@ mod tests {
             }
         });
         let launcher = LauncherIdentity::capture(std::process::id()).unwrap();
-        let mut binding = plan
-            .publish_binding(&launcher, Duration::from_secs(3))
-            .unwrap();
+        let mut binding = plan.publish_binding(&launcher, CLIENT_BUDGET).unwrap();
         binding.publish_recipient(&launcher).unwrap();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = stop.clone();
@@ -3811,7 +3853,7 @@ mod tests {
             }
         });
         let launcher = LauncherIdentity::capture(std::process::id()).unwrap();
-        plan.publish_binding(&launcher, Duration::from_secs(3))
+        plan.publish_binding(&launcher, CLIENT_BUDGET)
             .unwrap()
             .publish_recipient(&launcher)
             .unwrap();
@@ -3822,7 +3864,7 @@ mod tests {
             MAIN,
             ITEM,
             admission,
-            Duration::from_secs(3),
+            CLIENT_BUDGET,
         );
         server.join().expect("fixture server thread");
         (result, seen_start.load(std::sync::atomic::Ordering::SeqCst))
@@ -3873,7 +3915,7 @@ mod tests {
             wait_for_client_close(&mut socket, HANG_GUARD);
         });
         let launcher = LauncherIdentity::capture(std::process::id()).unwrap();
-        plan.publish_binding(&launcher, Duration::from_secs(3))
+        plan.publish_binding(&launcher, CLIENT_BUDGET)
             .unwrap()
             .publish_recipient(&launcher)
             .unwrap();
@@ -3881,15 +3923,12 @@ mod tests {
         let (stream, _, _, _) = connect_checked(
             &binding.socket_path,
             Some(&binding),
-            Instant::now() + Duration::from_secs(3),
+            Instant::now() + CLIENT_BUDGET,
         )
         .unwrap();
-        let mut client = RpcClient::initialize(
-            stream,
-            &binding.handle_dir,
-            Instant::now() + Duration::from_secs(3),
-        )
-        .unwrap();
+        let mut client =
+            RpcClient::initialize(stream, &binding.handle_dir, Instant::now() + CLIENT_BUDGET)
+                .unwrap();
         let thread = read_thread(&mut client, MAIN).unwrap();
         // The server waits for the client to CLOSE (event), so release the socket before
         // joining; otherwise the join would ride the 60s hang guard.
@@ -3928,7 +3967,7 @@ mod tests {
             }
         });
         let launcher = LauncherIdentity::capture(std::process::id()).unwrap();
-        plan.publish_binding(&launcher, Duration::from_secs(3))
+        plan.publish_binding(&launcher, CLIENT_BUDGET)
             .unwrap()
             .publish_recipient(&launcher)
             .unwrap();
@@ -3936,14 +3975,14 @@ mod tests {
         let (stream, _, _, _) = connect_checked(
             &binding.socket_path,
             Some(&binding),
-            Instant::now() + Duration::from_secs(30),
+            Instant::now() + CLIENT_BUDGET,
         )
         .unwrap();
         let never = || false;
         let mut client = RpcClient::initialize_watch(
             stream,
             &binding.handle_dir,
-            Instant::now() + Duration::from_secs(30),
+            Instant::now() + CLIENT_BUDGET,
             &never,
         )
         .unwrap();
@@ -3981,9 +4020,7 @@ mod tests {
             Duration::from_millis(1200),
         );
         let launcher = LauncherIdentity::capture(std::process::id()).unwrap();
-        let mut binding = plan
-            .publish_binding(&launcher, Duration::from_secs(3))
-            .unwrap();
+        let mut binding = plan.publish_binding(&launcher, CLIENT_BUDGET).unwrap();
         binding.publish_recipient(&launcher).unwrap();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = stop.clone();

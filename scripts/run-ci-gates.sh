@@ -44,6 +44,10 @@
 #   # ci-gate: none        -> deliberately not a tree gate. MUST be followed by
 #                             `# ci-gate-reason: <why>` so the exemption is
 #                             justified in place rather than by assertion.
+#   # ci-gate: parked      -> a tree-scan gate held off the blocking path. Same
+#                             `# ci-gate-reason:` requirement as `none`; listed
+#                             by name on every run. A registry (floor) entry
+#                             is NEVER satisfied by `parked`: it must run.
 #
 # `tree-scan` is a CONTRACT, not just a label. A gate declaring it MUST:
 #   (a) accept the repo root as its first positional argument — so this runner
@@ -171,6 +175,14 @@ reason_of() {
         | sed -E 's/^# ci-gate-reason:[[:space:]]*//'
 }
 
+# A `# ci-gate: parked` script is a tree-scan gate taken off the blocking path
+# for now. Like `none`, it MUST carry a `# ci-gate-reason:` line, and it is
+# listed BY NAME on every run so the parked set is never invisible. Parking is
+# never a floor bypass: a registry entry that did not run is still a finding,
+# so parking a floor gate also means deleting its registry line, in the same
+# reviewed change.
+parked_names=()
+
 unmarked=()
 findings=()
 undetermined=()
@@ -208,6 +220,13 @@ for gate in "${gates[@]}"; do
                 skipped=$((skipped + 1))
             fi
             ;;
+        parked)
+            if [ -z "$(reason_of "$gate")" ]; then
+                unmarked+=("$name (declared 'parked' with no '# ci-gate-reason:' line)")
+            else
+                parked_names+=("$name")
+            fi
+            ;;
         "")
             unmarked+=("$name (no '# ci-gate:' marker)")
             ;;
@@ -218,7 +237,10 @@ for gate in "${gates[@]}"; do
 done
 
 say ""
-say "run-ci-gates: ran $ran tree-scan gate(s), $skipped exempt, ${#gates[@]} script(s) total."
+say "run-ci-gates: ran $ran tree-scan gate(s), $skipped exempt, ${#parked_names[@]} parked, ${#gates[@]} script(s) total."
+if [ "${#parked_names[@]}" -gt 0 ]; then
+    say "run-ci-gates: parked (not run): ${parked_names[*]}"
+fi
 say "run-ci-gates: floor expects ${#expected[@]} gate(s) from ${REGISTRY#"$ROOT"/}."
 
 # Floor evaluation. A registry entry that did not run is a shrink; report every
@@ -279,7 +301,8 @@ if [ "${#unmarked[@]}" -gt 0 ]; then
     printf 'Every script under scripts/verify/ must declare its CI role in its\n' >&2
     printf 'header, because a gate that nothing runs is the defect this checks for:\n\n' >&2
     printf '    # ci-gate: tree-scan   (runs here; takes REPO_ROOT; 0/1/2 exits)\n' >&2
-    printf '    # ci-gate: none        (plus a "# ci-gate-reason:" line saying why)\n\n' >&2
+    printf '    # ci-gate: none        (plus a "# ci-gate-reason:" line saying why)\n' >&2
+    printf '    # ci-gate: parked      (plus a "# ci-gate-reason:" line saying why)\n\n' >&2
     printf '    %s\n' "${unmarked[@]}" >&2
     rc=1
 fi

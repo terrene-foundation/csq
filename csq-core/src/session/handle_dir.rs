@@ -812,12 +812,9 @@ fn restore_aside(handle_dir: &Path, aside: &Path, link: &Path) {
 fn write_copy_marker(handle_dir: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let marker = handle_dir.join(CODEX_HOOKS_COPY_MARKER);
     let tmp = crate::platform::fs::unique_tmp_path(&marker);
-    let result = crate::platform::fs::write_new_private(&tmp, sha256_hex(bytes).as_bytes())
-        .and_then(|()| crate::platform::fs::atomic_replace(&tmp, &marker));
-    result.map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        std::io::Error::other(e.to_string())
-    })
+    crate::platform::fs::write_new_private_retained(&tmp, sha256_hex(bytes).as_bytes())
+        .and_then(|written| written.replace(&marker))
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 /// Whether `bytes` (the handle's regular `hooks.json`) is an unmodified csq copy: the marker's
@@ -928,13 +925,16 @@ fn link_codex_global_hooks(handle_dir: &Path, global: Option<&Path>) -> Result<(
         .symlink_metadata()
         .is_ok_and(|m| m.file_type().is_symlink())
         && link_points_to(&tmp, global);
-    let mut copy_bytes: Option<Vec<u8>> = None;
+    let mut copy_bytes: Option<(Vec<u8>, crate::platform::fs::WrittenPrivateFile)> = None;
     if !is_exact_link {
         remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
-        let staged = read_regular_bounded(global, false)
-            .filter(|b| crate::platform::fs::write_new_private_synced(&tmp, b).is_ok());
-        let Some(bytes) = staged else {
-            remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
+        let staged = read_regular_bounded(global, false).and_then(|bytes| {
+            crate::platform::fs::write_new_private_synced_retained(&tmp, &bytes)
+                .ok()
+                .map(|writer| (bytes, writer))
+        });
+        let Some(staged) = staged else {
+            // The writer cleans a failed creation; a collision is not ours.
             warn!(
                 error_kind = "codex_hooks_copy_failed",
                 "no symlink could be made and the global hooks could not be copied; not linked"
@@ -946,7 +946,7 @@ fn link_codex_global_hooks(handle_dir: &Path, global: Option<&Path>) -> Result<(
             "the platform cannot create a symlink; hooks.json is a copy of the global hooks, \
              re-synced on every launch and repoint (enable Windows Developer Mode for a link)"
         );
-        copy_bytes = Some(bytes);
+        copy_bytes = Some(staged);
     }
     let mut aside: Option<PathBuf> = None;
     if existing.is_some() {
@@ -958,7 +958,9 @@ fn link_codex_global_hooks(handle_dir: &Path, global: Option<&Path>) -> Result<(
         });
         if move_foreign {
             let Some(dest) = foreign_aside_path(handle_dir) else {
-                remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
+                if copy_bytes.is_none() {
+                    remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
+                }
                 warn!(
                     error_kind = "codex_hooks_foreign_aside_names_exhausted",
                     "no free hooks.json.csq-foreign-* name; the foreign entry is left in place"
@@ -972,7 +974,9 @@ fn link_codex_global_hooks(handle_dir: &Path, global: Option<&Path>) -> Result<(
                 ),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
+                    if copy_bytes.is_none() {
+                        remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
+                    }
                     warn!(
                         error_kind = "codex_hooks_foreign_move_failed",
                         io_kind = ?e.kind(),
@@ -991,7 +995,9 @@ fn link_codex_global_hooks(handle_dir: &Path, global: Option<&Path>) -> Result<(
                     if read_regular_bounded(&detached, true).as_deref() != expected_local.as_deref()
                     {
                         restore_aside(handle_dir, &detached, &link);
-                        remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
+                        if copy_bytes.is_none() {
+                            remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
+                        }
                         warn!(
                             error_kind = "codex_hooks_changed_during_link",
                             "handle-dir hooks.json changed while it was being linked; kept"
@@ -1002,7 +1008,9 @@ fn link_codex_global_hooks(handle_dir: &Path, global: Option<&Path>) -> Result<(
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
+                    if copy_bytes.is_none() {
+                        remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
+                    }
                     warn!(
                         error_kind = "codex_hooks_aside_failed",
                         io_kind = ?e.kind(),
@@ -1019,10 +1027,15 @@ fn link_codex_global_hooks(handle_dir: &Path, global: Option<&Path>) -> Result<(
             f();
         }
     });
-    let placed = match copy_bytes.as_deref() {
-        Some(bytes) => {
-            std::fs::rename(&tmp, &link).and_then(|()| write_copy_marker(handle_dir, bytes))
-        }
+    let copied = copy_bytes.is_some();
+    let placed = match copy_bytes {
+        Some((bytes, writer)) => writer
+            .replace(&link)
+            .map_err(|e| match e {
+                crate::error::PlatformError::Io(e) => e,
+                other => std::io::Error::other(other.to_string()),
+            })
+            .and_then(|()| write_copy_marker(handle_dir, &bytes)),
         None => {
             let made = create_symlink(global, &link);
             remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
@@ -1042,7 +1055,9 @@ fn link_codex_global_hooks(handle_dir: &Path, global: Option<&Path>) -> Result<(
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
+            if !copied {
+                remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
+            }
             if let Some(a) = aside.as_deref() {
                 remove_file_logged(a, "codex_hooks_aside_remove_failed");
             }
@@ -1053,7 +1068,9 @@ fn link_codex_global_hooks(handle_dir: &Path, global: Option<&Path>) -> Result<(
             Ok(())
         }
         Err(e) => {
-            remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
+            if !copied {
+                remove_file_logged(&tmp, "codex_hooks_tmp_remove_failed");
+            }
             if let Some(a) = aside.as_deref() {
                 restore_aside(handle_dir, a, &link);
             }
@@ -2065,11 +2082,9 @@ fn write_layer_record(handle_dir: &Path, rec: &LayerRecord) {
     let path = handle_dir.join(LAYER_RECORD_FILE);
     let tmp = crate::platform::fs::unique_tmp_path(&path);
     let body = serde_json::to_string(rec).unwrap_or_else(|_| "{}".to_string());
-    let result = crate::platform::fs::write_new_private(&tmp, body.as_bytes())
-        .and_then(|()| crate::platform::fs::secure_file(&tmp))
-        .and_then(|()| crate::platform::fs::atomic_replace(&tmp, &path));
+    let result = crate::platform::fs::write_new_private_retained(&tmp, body.as_bytes())
+        .and_then(|written| written.replace(&path));
     if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(&path);
         warn!(
             error_kind = "layer_record_write_failed",
@@ -2105,11 +2120,18 @@ fn write_global_hooks_record(path: &Path, base: &Value) {
         return;
     }
     let tmp = crate::platform::fs::unique_tmp_path(path);
-    let result = crate::platform::fs::write_new_private(&tmp, &body)
-        .and_then(|()| crate::platform::fs::secure_file(&tmp))
-        .and_then(|()| crate::platform::fs::atomic_replace(&tmp, path));
+    let result = match crate::platform::fs::write_new_private_retained(&tmp, &body) {
+        Ok(writer) => crate::platform::fs::secure_file(&tmp).and_then(|()| writer.replace(path)),
+        Err(_) => {
+            // The private writer cleans a failed creation; a collision is unowned.
+            warn!(
+                error_kind = "global_hooks_record_write_failed",
+                "last-known-good global hooks record could not be written"
+            );
+            return;
+        }
+    };
     if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
         warn!(
             error_kind = "global_hooks_record_write_failed",
             "last-known-good global hooks record could not be written"
@@ -2188,11 +2210,9 @@ fn materialize_handle_settings_inner(
     let (tmp, record) =
         prepare_handle_settings(handle_dir, claude_home, config_dir, uuid_settings_path)?;
     let settings_path = handle_dir.join("settings.json");
-    commit_prepared_handle_settings(&tmp, &settings_path).map_err(|e| {
-        CredentialError::Corrupt {
-            path: settings_path,
-            reason: format!("atomic replace: {e}"),
-        }
+    commit_prepared_handle_settings(tmp, &settings_path).map_err(|e| CredentialError::Corrupt {
+        path: settings_path,
+        reason: format!("atomic replace: {e}"),
     })?;
     write_layer_record(handle_dir, &record);
     Ok(())
@@ -2223,9 +2243,31 @@ fn materialize_handle_settings_inner(
 /// below stay unchanged, and because callers here propagate a bare
 /// `std::io::Error` (`CredentialError::Io { source: e }`) rather than
 /// `PlatformError`.
+#[cfg(all(test, unix))]
 fn create_tmp_exclusive(tmp: &Path, content: &[u8]) -> std::io::Result<()> {
     crate::platform::fs::write_new_private(tmp, content)
         .map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+fn create_tmp_exclusive_retained(
+    tmp: &Path,
+    content: &[u8],
+) -> std::io::Result<crate::platform::fs::WrittenPrivateFile> {
+    crate::platform::fs::write_new_private_retained(tmp, content)
+        .map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+/// Settings prepared by the private writer, retaining its handle until commit.
+/// Drop removes an abandoned tmp; successful publication has already renamed it away.
+struct PreparedHandleSettings {
+    tmp: PathBuf,
+    writer: crate::platform::fs::WrittenPrivateFile,
+}
+
+impl AsRef<Path> for PreparedHandleSettings {
+    fn as_ref(&self) -> &Path {
+        &self.tmp
+    }
 }
 
 /// S-H1/D-F1: merges the settings JSON for `config_dir`/`uuid_settings_path`
@@ -2246,7 +2288,7 @@ fn prepare_handle_settings_tmp(
     claude_home: &Path,
     config_dir: &Path,
     uuid_settings_path: Option<&Path>,
-) -> Result<PathBuf, CredentialError> {
+) -> Result<PreparedHandleSettings, CredentialError> {
     prepare_handle_settings(handle_dir, claude_home, config_dir, uuid_settings_path)
         .map(|(tmp, _)| tmp)
 }
@@ -2259,7 +2301,7 @@ fn prepare_handle_settings(
     claude_home: &Path,
     config_dir: &Path,
     uuid_settings_path: Option<&Path>,
-) -> Result<(PathBuf, LayerRecord), CredentialError> {
+) -> Result<(PreparedHandleSettings, LayerRecord), CredentialError> {
     let (base, base_usable, _) = read_settings_layer(&claude_home.join("settings.json"), true);
     let settings_path = handle_dir.join("settings.json");
     let (mut previous, previous_usable, previous_absent) =
@@ -2415,24 +2457,24 @@ fn prepare_handle_settings(
     // `create_tmp_exclusive` (below) opens with `O_EXCL` + `mode(0o600)`
     // rather than `std::fs::write`'s `O_CREAT`-without-`O_EXCL` at
     // umask-default permissions — see that fn's doc for why.
-    if let Err(e) = create_tmp_exclusive(&tmp, json.as_bytes()) {
-        // create_tmp_exclusive already cleaned up its own tmp on a
-        // WRITE failure; an `open` refusal (planted symlink/file, or a
-        // genuine PID+counter collision) never created anything to clean
-        // up in the first place.
-        return Err(CredentialError::Io {
-            path: tmp,
-            source: e,
-        });
-    }
+    let writer = match create_tmp_exclusive_retained(&tmp, json.as_bytes()) {
+        Ok(writer) => writer,
+        Err(e) => {
+            // The writer cleaned its own failed creation; an open refusal
+            // (including a collision) never created anything to remove.
+            return Err(CredentialError::Io {
+                path: tmp,
+                source: e,
+            });
+        }
+    };
     if let Err(e) = crate::platform::fs::secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
         return Err(CredentialError::Corrupt {
             path: tmp,
             reason: format!("secure_file: {e}"),
         });
     }
-    Ok((tmp, record))
+    Ok((PreparedHandleSettings { tmp, writer }, record))
 }
 
 /// S-H1/D-F1: commits a temp file prepared by [`prepare_handle_settings_tmp`]
@@ -2449,17 +2491,18 @@ fn prepare_handle_settings(
 /// failure the temp file is removed here (`atomic_replace`'s underlying
 /// `rename(2)` leaves the source in place on error) — the caller never
 /// needs to clean it up itself.
-fn commit_prepared_handle_settings(tmp: &Path, settings_path: &Path) -> std::io::Result<()> {
+fn commit_prepared_handle_settings(
+    prepared: PreparedHandleSettings,
+    settings_path: &Path,
+) -> std::io::Result<()> {
     // S-H1/D-F1 test-only fault seam — see the `thread_local!` block above
     // `repoint_lock_path` for the full contract.
     if repoint_fail_settings_commit_for_test() {
-        let _ = std::fs::remove_file(tmp);
         return Err(std::io::Error::other(
             "injected test failure (repoint_fail_settings_commit_for_test)",
         ));
     }
-    if let Err(e) = crate::platform::fs::atomic_replace(tmp, settings_path) {
-        let _ = std::fs::remove_file(tmp);
+    if let Err(e) = prepared.writer.replace(settings_path) {
         return Err(match e {
             crate::error::PlatformError::Io(io_err) => io_err,
             other => std::io::Error::other(other.to_string()),
@@ -3782,13 +3825,12 @@ fn repoint_handle_dir_impl(
     // `Corrupt` reads to the caller identically to every other refusal,
     // and the caller's operator line loops "run `csq swap N` again" forever
     // on this one (retrying does not remove the blocking file). On this
-    // path `settings_tmp` was prepared but never committed — remove it so
+    // path `settings_tmp` was prepared but never committed — its owner drops so
     // no stray temp file survives a refusal.
     for item in &processing_order {
         let link_path = handle_dir.join(item);
         if let Ok(meta) = link_path.symlink_metadata() {
             if !meta.file_type().is_symlink() {
-                let _ = std::fs::remove_file(&settings_tmp);
                 return Err(CredentialError::RepointRefusedRealFile { item });
             }
         }
@@ -3846,7 +3888,6 @@ fn repoint_handle_dir_impl(
                 }
             };
             Some(staged_native.map_err(|failure| {
-                let _ = std::fs::remove_file(&settings_tmp);
                 warn!(
                     error_kind = "swap_native_metadata_not_reconciled",
                     reason = failure.fixed_tag(),
@@ -3906,8 +3947,7 @@ fn repoint_handle_dir_impl(
             // `settings_tmp` was prepared but never committed at this
             // point (the commit happens after this whole loop) — it is
             // not one of `snapshots`/`repointed`, so `rollback_repoint`
-            // does not and should not touch it; clean it up directly.
-            let _ = std::fs::remove_file(&settings_tmp);
+            // does not and should not touch it; its writer cleans up on Drop.
             let rolled_back = rollback_repoint(handle_dir, &snapshots, &repointed);
             warn!(
                 item,
@@ -3943,8 +3983,7 @@ fn repoint_handle_dir_impl(
             let _ = std::fs::remove_file(&tmp_path);
             // See the temp-symlink-create failure arm above: `settings_tmp`
             // is not tracked by `snapshots`/`repointed` and must be cleaned
-            // up directly.
-            let _ = std::fs::remove_file(&settings_tmp);
+            // up by its writer on Drop.
             let rolled_back = rollback_repoint(handle_dir, &snapshots, &repointed);
             warn!(
                 item,
@@ -3981,7 +4020,6 @@ fn repoint_handle_dir_impl(
         match staged.commit() {
             Ok(published) => published_native = Some(published),
             Err(failure) => {
-                let _ = std::fs::remove_file(&settings_tmp);
                 let rolled_back = rollback_repoint(handle_dir, &snapshots, &repointed);
                 warn!(
                     error_kind = "swap_native_metadata_not_reconciled",
@@ -4029,7 +4067,7 @@ fn repoint_handle_dir_impl(
     // rolled back" while the account had in fact fully switched — the
     // shape this fold prevents from ever being constructible).
     let settings_path = handle_dir.join("settings.json");
-    if let Err(e) = commit_prepared_handle_settings(&settings_tmp, &settings_path) {
+    if let Err(e) = commit_prepared_handle_settings(settings_tmp, &settings_path) {
         let native_restored = prior_native
             .as_ref()
             .zip(published_native.as_deref())
@@ -4893,9 +4931,10 @@ fn stage_claude_json_for_swap_legacy_context(
 /// compare-and-replace in [`Self::commit`] runs after the loop, inside the
 /// rollback-tracked set. Dropping an uncommitted stage removes the tmp file
 /// (security.md 5a: the tmp carries the account email).
-#[derive(Debug)]
 struct StagedNativeMetadata {
+    #[cfg(test)]
     tmp: PathBuf,
+    writer: crate::platform::fs::WrittenPrivateFile,
     path: PathBuf,
     handle_dir: PathBuf,
     expected: Option<String>,
@@ -4917,17 +4956,10 @@ impl StagedNativeMetadata {
             Ok(_) => return Err(Failure::ContextChanged),
             Err(_) => return Err(Failure::ReadUnavailable),
         }
-        crate::platform::fs::atomic_replace(&self.tmp, &self.path)
+        self.writer
+            .replace(&self.path)
             .map_err(|_| Failure::WriteFailed)?;
-        Ok(self.published.clone())
-    }
-}
-
-impl Drop for StagedNativeMetadata {
-    fn drop(&mut self) {
-        // After a successful commit the tmp was renamed away (NotFound);
-        // on every other path this removes the leftover secret-bearing tmp.
-        let _ = std::fs::remove_file(&self.tmp);
+        Ok(self.published)
     }
 }
 
@@ -4940,12 +4972,13 @@ fn stage_native_swap_metadata(
     let path = handle_dir.join(".claude.json");
     let published = serde_json::to_string(&json).map_err(|_| Failure::WriteFailed)?;
     let tmp = crate::platform::fs::unique_tmp_path(&path);
-    if crate::platform::fs::write_new_private(&tmp, published.as_bytes()).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(Failure::WriteFailed);
-    }
+    // The writer removes its own failed creation; a collision is not ours to delete.
+    let writer = crate::platform::fs::write_new_private_retained(&tmp, published.as_bytes())
+        .map_err(|_| Failure::WriteFailed)?;
     Ok(StagedNativeMetadata {
+        #[cfg(test)]
         tmp,
+        writer,
         path,
         handle_dir: handle_dir.to_path_buf(),
         expected: expected_native.map(str::to_owned),
@@ -4970,17 +5003,17 @@ fn restore_native_metadata(handle_dir: &Path, prior: Option<&str>, published: &s
         },
         Some(raw) => {
             let tmp = crate::platform::fs::unique_tmp_path(&path);
-            if crate::platform::fs::write_new_private(&tmp, raw.as_bytes()).is_err() {
-                let _ = std::fs::remove_file(&tmp);
-                return false;
-            }
+            let writer = match crate::platform::fs::write_new_private_retained(&tmp, raw.as_bytes())
+            {
+                Ok(writer) => writer,
+                // The writer owns failure cleanup; a collision stays untouched.
+                Err(_) => return false,
+            };
             if !matches!(read_native_swap_raw(handle_dir), Ok(Some(current)) if current == published)
             {
-                let _ = std::fs::remove_file(&tmp);
                 return false;
             }
-            if crate::platform::fs::atomic_replace(&tmp, &path).is_err() {
-                let _ = std::fs::remove_file(&tmp);
+            if writer.replace(&path).is_err() {
                 return false;
             }
             true
@@ -8218,6 +8251,121 @@ mod tests {
         assert!(
             leaked.is_empty(),
             "§5a leaked settings.json temp files: {leaked:?}"
+        );
+    }
+
+    fn prepared_settings_fixture(root: &Path) -> PreparedHandleSettings {
+        let global = root.join("global");
+        let config = root.join("config");
+        let handle = root.join("handle");
+        for path in [&global, &config, &handle] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(global.join("settings.json"), b"{}").unwrap();
+        std::fs::write(config.join("settings.json"), b"{}").unwrap();
+        prepare_handle_settings(&handle, &global, &config, None)
+            .unwrap()
+            .0
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_settings_drop_preserves_foreign_tmp_occupant() {
+        let dir = TempDir::new().unwrap();
+        let prepared = prepared_settings_fixture(dir.path());
+        let tmp = prepared.tmp.clone();
+        let moved = dir.path().join("relocated-settings.json");
+        std::fs::rename(&tmp, &moved).unwrap();
+        std::fs::write(&tmp, b"foreign fixture").unwrap();
+        drop(prepared);
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"foreign fixture");
+        assert!(moved.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_metadata_drop_preserves_foreign_tmp_occupant() {
+        let dir = TempDir::new().unwrap();
+        let staged = stage_native_swap_metadata(dir.path(), &serde_json::json!({}), None).unwrap();
+        let tmp = staged.tmp.clone();
+        let moved = dir.path().join("relocated-native.json");
+        std::fs::rename(&tmp, &moved).unwrap();
+        std::fs::write(&tmp, b"foreign fixture").unwrap();
+        drop(staged);
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"foreign fixture");
+        assert!(moved.exists());
+    }
+
+    #[test]
+    fn abandoned_prepared_settings_removes_its_tmp() {
+        let dir = TempDir::new().unwrap();
+        let prepared = prepared_settings_fixture(dir.path());
+        let tmp = prepared.tmp.clone();
+        assert!(tmp.exists());
+        drop(prepared);
+        assert!(!tmp.exists());
+        assert!(!dir.path().join("handle/settings.json").exists());
+    }
+
+    #[test]
+    fn prepared_settings_failed_commit_removes_its_tmp() {
+        let dir = TempDir::new().unwrap();
+        let prepared = prepared_settings_fixture(dir.path());
+        let target = dir.path().join("absent/settings.json");
+        let tmp = prepared.tmp.clone();
+        assert!(commit_prepared_handle_settings(prepared, &target).is_err());
+        assert!(!tmp.exists());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn native_metadata_abandonment_and_context_refusal_remove_staged_tmp() {
+        for refuse in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let staged = stage_native_swap_metadata(
+                dir.path(),
+                &serde_json::json!({"projects":{"fixture":true}}),
+                None,
+            )
+            .unwrap();
+            let tmp = staged.tmp.clone();
+            assert!(tmp.exists());
+            if refuse {
+                let target = dir.path().join(".claude.json");
+                std::fs::write(&target, b"{}").unwrap();
+                assert_eq!(
+                    staged.commit(),
+                    Err(NativeMetadataReconcileFailure::ContextChanged)
+                );
+                assert_eq!(std::fs::read(target).unwrap(), b"{}");
+            } else {
+                drop(staged);
+            }
+            assert!(!tmp.exists());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_settings_and_native_metadata_deny_tmp_relocation_and_publish_original() {
+        let dir = TempDir::new().unwrap();
+        let prepared = prepared_settings_fixture(dir.path());
+        let target = dir.path().join("handle/settings.json");
+        let tmp = prepared.tmp.clone();
+        let original = std::fs::read(&tmp).unwrap();
+        assert!(std::fs::rename(&tmp, dir.path().join("relocated-settings.json")).is_err());
+        commit_prepared_handle_settings(prepared, &target).unwrap();
+        assert!(!tmp.exists());
+        assert_eq!(std::fs::read(target).unwrap(), original);
+
+        let staged = stage_native_swap_metadata(dir.path(), &serde_json::json!({}), None).unwrap();
+        let tmp = staged.tmp.clone();
+        assert!(std::fs::rename(&tmp, dir.path().join("relocated-native.json")).is_err());
+        staged.commit().unwrap();
+        assert!(!tmp.exists());
+        assert_eq!(
+            std::fs::read(dir.path().join(".claude.json")).unwrap(),
+            b"{}"
         );
     }
 

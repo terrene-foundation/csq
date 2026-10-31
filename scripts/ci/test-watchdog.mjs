@@ -474,6 +474,15 @@ async function sampleGroup() {
 // that window then settled and exited, DISCARDING the KILL that was still being
 // armed. Now the first call starts the one reap and every later caller receives
 // the SAME promise, so no exit path can pass a reap that has not finished.
+// A SKIP IS NEVER SILENT (zero-tolerance Rule 3). The identity gate below refuses
+// to signal a pid whose START TIME changed since the snapshot that named it: that
+// is a recycled pid (a stranger), and signalling it would kill the wrong process.
+// The skip is correct; saying nothing about it is not. A pid that is PRESENT with
+// a different start time is reported by name and phase (term | kill); a pid that
+// has simply GONE is the normal outcome of a TERM and is never reported.
+function reportIdentityChanged(pid, phase) {
+  process.stderr.write(`CSQ_TEST_WATCHDOG_TREE_IDENTITY_CHANGED pid=${pid} phase=${phase}\n`);
+}
 let treeReap = null;
 function beginTreeReap() {
   // EVERY EXIT PATH RUNS THIS (D237 R2 corr MED-1): the stall tick, the stop
@@ -488,7 +497,15 @@ function beginTreeReap() {
     // command has closed, its pid may be reaped or recycled and no snapshot can
     // attribute a tree to it. Whatever it left alive is the leg-level
     // leader-exit sweep's to reap, never a numerical descendance claim here.
-    if (childClosed) return null;
+    // NOT SILENT (zero-tolerance: a kill path must never skip without a
+    // reason): a caller that expected a tree line gets WHY there is none,
+    // instead of an output file that explains nothing.
+    if (childClosed) {
+      // A spawn that never produced a pid leaves child.pid undefined; say so
+      // rather than printing the literal string "undefined" as if it were a pid.
+      process.stdout.write(`CSQ_TEST_WATCHDOG_TREE_UNAVAILABLE reason=leader-exited:pid=${child.pid ?? 'none'}\n`);
+      return null;
+    }
     let snapshot;
     try { snapshot = await psSnapshot(); }
     catch (e) {
@@ -525,7 +542,8 @@ function beginTreeReap() {
     const freshBy = new Map(fresh.map((p) => [p.pid, p]));
     for (const t of targets) {
       const now = freshBy.get(t.pid);
-      if (!now || now.started !== t.started) continue;
+      if (!now) continue;
+      if (now.started !== t.started) { reportIdentityChanged(t.pid, 'term'); continue; }
       try { process.kill(t.pid, 'SIGTERM'); } catch { /* ESRCH / already gone */ }
     }
     // OWNED escalation: survivors take SIGKILL at the grace. It is INSIDE the
@@ -543,7 +561,8 @@ function beginTreeReap() {
         const laterBy = new Map(later.map((p) => [p.pid, p]));
         for (const t of targets) {
           const now = laterBy.get(t.pid);
-          if (!now || now.started !== t.started) continue;
+          if (!now) continue;
+          if (now.started !== t.started) { reportIdentityChanged(t.pid, 'kill'); continue; }
           try { process.kill(t.pid, 'SIGKILL'); } catch { /* gone */ }
         }
         resolve();

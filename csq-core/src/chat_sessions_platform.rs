@@ -249,17 +249,10 @@ pub(super) fn create_private_temp(path: &Path) -> Result<File, StoreError> {
     .map_err(|e| acl_error("create_temp", e))
 }
 
-/// NTSTATUS values that mean "this rename information class is not supported here"
-/// (an older Windows or a non-NTFS volume), the only ones that select the legacy
-/// class: INVALID_INFO_CLASS 0xC0000003, INVALID_PARAMETER 0xC000000D,
-/// INVALID_DEVICE_REQUEST 0xC0000010, NOT_SUPPORTED 0xC00000BB.
-#[cfg(any(windows, test))]
-fn rename_class_unsupported(status: i32) -> bool {
-    matches!(
-        status as u32,
-        0xC000_0003 | 0xC000_000D | 0xC000_0010 | 0xC000_00BB
-    )
-}
+// Keep transcript publication and the general atomic writer on the same
+// unsupported-class policy; access/sharing failures must not select fallback.
+#[cfg(windows)]
+use crate::platform::fs::windows_rename_class_unsupported as rename_class_unsupported;
 
 /// Publish `source` (the open handle the caller created through
 /// `create_private_temp`) as `leaf` inside `directory`, REPLACING any existing
@@ -517,18 +510,7 @@ mod windows_acl_tests;
 
 #[cfg(test)]
 mod identity_tests {
-    use super::{file_id_unsupported, rename_class_unsupported, Node};
-    // Only the four "class unsupported" NTSTATUS values select the legacy rename class;
-    // ACCESS_DENIED, a name collision or success never do. Reds if the match widened.
-    #[test]
-    fn only_class_unsupported_statuses_select_the_legacy_rename() {
-        for status in [0xC000_0003_u32, 0xC000_000D, 0xC000_0010, 0xC000_00BB] {
-            assert!(rename_class_unsupported(status as i32), "{status:#x}");
-        }
-        for status in [0xC000_0022_u32, 0xC000_0035, 0xC000_0043, 0, 1] {
-            assert!(!rename_class_unsupported(status as i32), "{status:#x}");
-        }
-    }
+    use super::{file_id_unsupported, Node};
     // The 128-bit identity is replaced by the 64-bit-index fallback only for the
     // three "unsupported" codes (1, 50, 87); any other failure stays an error.
     #[test]

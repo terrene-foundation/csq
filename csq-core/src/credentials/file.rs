@@ -8,7 +8,7 @@ use crate::accounts::identity_store::{
 };
 use crate::accounts::profiles;
 use crate::error::CredentialError;
-use crate::platform::fs::{atomic_replace, secure_file};
+use crate::platform::fs::{secure_file, WrittenPrivateFile};
 use crate::providers::catalog::Surface;
 use crate::types::AccountNum;
 use std::path::{Path, PathBuf};
@@ -45,7 +45,8 @@ pub fn load(path: &Path) -> Result<CredentialFile, CredentialError> {
     })
 }
 
-/// Saves a credential file to disk with atomic write + secure permissions.
+/// Saves a credential file with synced contents, atomic publication, and secure permissions.
+/// This does not sync the parent directory or guarantee directory-entry durability after power loss.
 pub fn save(path: &Path, creds: &CredentialFile) -> Result<(), CredentialError> {
     let json = serde_json::to_string_pretty(creds).map_err(|e| CredentialError::Corrupt {
         path: path.to_path_buf(),
@@ -62,36 +63,19 @@ pub fn save(path: &Path, creds: &CredentialFile) -> Result<(), CredentialError> 
         })?;
     }
 
-    // Use a unique temp file name to prevent race conditions when
-    // multiple callers save to the same path concurrently (per-PID
-    // AND per-thread via atomic counter).
-    let tmp = crate::platform::fs::unique_tmp_path(path);
+    // Retry exclusive-create collisions using fresh candidates beside the final target.
 
-    // Per security.md MUST Rule 5a: every failure branch after the tmp
-    // write MUST best-effort `remove_file(&tmp)` before returning. Without
-    // cleanup, an early `?` leaves an OAuth-token-bearing file at
-    // umask-default (typically 0o644) until the next GC. Same B2 class
-    // closed elsewhere in an internal journal entry
-    //
-    // `write_new_private` creates the tmp file at 0o600 AT CREATION
-    // (`create_new` + `mode(0o600)`), so the separate `secure_file` step
-    // this pipeline used to need is now redundant — there is no window
-    // where the tmp file exists at umask-default mode.
-    if let Err(e) = crate::platform::fs::write_new_private(&tmp, json.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(CredentialError::Io {
-            path: tmp,
-            source: std::io::Error::other(e.to_string()),
-        });
-    }
-
-    if let Err(e) = atomic_replace(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(CredentialError::Io {
+    // Cleanup belongs to the creating writer, including write and publication failures.
+    // An exclusive-create collision does not authorize removing the colliding entry.
+    let written = crate::platform::fs::write_private_tmp_synced_retained(path, json.as_bytes())
+        .map_err(|e| CredentialError::Io {
             path: path.to_path_buf(),
             source: std::io::Error::other(e.to_string()),
-        });
-    }
+        })?;
+    written.replace(path).map_err(|e| CredentialError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::other(e.to_string()),
+    })?;
 
     Ok(())
 }
@@ -185,6 +169,15 @@ fn preserve_subscription_metadata(
     to_save
 }
 
+// Distinguish a final publication target from an explicit staging filename.
+pub(crate) struct FinalTarget<'a>(&'a Path);
+
+impl<'a> FinalTarget<'a> {
+    fn as_path(&self) -> &'a Path {
+        self.0
+    }
+}
+
 /// Inner write function for UUID-keyed credentials — injectable for §5a testing.
 ///
 /// **PRIMARY METHODOLOGICAL DIRECTIVE (from `redteam-discipline.md` Rule 5):**
@@ -193,15 +186,16 @@ fn preserve_subscription_metadata(
 /// Three distinct closure-injected tests, three distinct branches.
 ///
 /// Per `rules/security.md` §5a: every failure branch after the tmp write MUST
-/// `let _ = std::fs::remove_file(&tmp)` before returning. The tmp file carries
-/// an OAuth-token-bearing payload; leaving it at umask-default (0o644) after
-/// an early return is the §5a failure class.
+/// let the retained creating writer discard its own file before returning. The tmp carries
+/// an OAuth-token-bearing payload; the creating handle owns cleanup on failure.
+/// A failed exclusive create must never unlink an entry owned by someone else.
 ///
 /// All three closures use `std::io::Error` as the error type for uniformity:
 /// - Production wraps `PlatformError` via `std::io::Error::other(e.to_string())`
 /// - Tests inject `Err(std::io::Error::other("injected …"))` directly
+// The factory receives the final target; secure and replace use its owned staging path.
 fn write_uuid_credentials_inner<W, S, R>(
-    tmp: &Path,
+    target: &Path,
     final_path: &Path,
     bytes: &[u8],
     write_fn: W,
@@ -209,20 +203,22 @@ fn write_uuid_credentials_inner<W, S, R>(
     replace_fn: R,
 ) -> Result<(), CredentialError>
 where
-    W: FnOnce(&Path, &[u8]) -> std::io::Result<()>,
+    W: for<'target> FnOnce(FinalTarget<'target>, &[u8]) -> std::io::Result<WrittenPrivateFile>,
     S: FnOnce(&Path) -> std::io::Result<()>,
-    R: FnOnce(&Path, &Path) -> std::io::Result<()>,
+    R: FnOnce(&Path, &Path, WrittenPrivateFile) -> std::io::Result<()>,
 {
-    if let Err(e) = write_fn(tmp, bytes) {
-        let _ = std::fs::remove_file(tmp);
-        return Err(CredentialError::Io {
-            path: tmp.to_path_buf(),
-            source: e,
-        });
-    }
+    let identity = match write_fn(FinalTarget(target), bytes) {
+        Ok(identity) => identity,
+        Err(e) => {
+            return Err(CredentialError::Io {
+                path: target.to_path_buf(),
+                source: e,
+            });
+        }
+    };
 
-    if let Err(e) = secure_fn(tmp) {
-        let _ = std::fs::remove_file(tmp);
+    let tmp = identity.path().to_path_buf();
+    if let Err(e) = secure_fn(&tmp) {
         // Report final_path (not tmp) — the caller cares which credential
         // file failed to secure, not the transient tmp name (LOW-3).
         return Err(CredentialError::Io {
@@ -231,8 +227,7 @@ where
         });
     }
 
-    if let Err(e) = replace_fn(tmp, final_path) {
-        let _ = std::fs::remove_file(tmp);
+    if let Err(e) = replace_fn(&tmp, final_path, identity) {
         return Err(CredentialError::Io {
             path: final_path.to_path_buf(),
             source: e,
@@ -386,23 +381,26 @@ fn save_uuid_credentials_prepared(
         }
     }
 
-    let tmp = crate::platform::fs::unique_tmp_path(&uuid_path);
-
-    // §5a: `write_new_private` creates the tmp file at 0o600 at creation,
-    // so the paired `secure_file` closure below is now a redundant (but
-    // harmless) re-chmod — kept as-is so the three-closure injectable
+    // §5a: the synced retained writer creates the tmp file at 0o600 and
+    // completes file sync_all before publication. Parent-directory durability
+    // after power loss is unchanged. The paired `secure_file` below is a
+    // redundant (but harmless) re-chmod — retained so the three-closure injectable
     // failure-branch test structure (`redteam-discipline.md` Rule 5) stays
     // unchanged for the `secure` and `replace` branches.
     write_uuid_credentials_inner(
-        &tmp,
+        &uuid_path,
         &uuid_path,
         json.as_bytes(),
-        |p, b| {
-            crate::platform::fs::write_new_private(p, b)
+        |target: FinalTarget<'_>, b| {
+            crate::platform::fs::write_private_tmp_synced_retained(target.as_path(), b)
                 .map_err(|e| std::io::Error::other(e.to_string()))
         },
         |p| secure_file(p).map_err(|e| std::io::Error::other(e.to_string())),
-        |t, f| atomic_replace(t, f).map_err(|e| std::io::Error::other(e.to_string())),
+        |_t, f, written| {
+            written
+                .replace(f)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        },
     )?;
 
     // `keychain-fix-r8.md` C-F1 (PRIMARY DIRECTIVE): every canonical-store
@@ -543,16 +541,16 @@ fn acquire_post_commit_lock(
 /// Three distinct closure-injected tests, three distinct branches.
 ///
 /// Per `rules/security.md` §5a: every failure branch after the tmp write MUST
-/// `let _ = std::fs::remove_file(&tmp)` before returning. The tmp file carries
+/// let the retained creating writer discard its own file before returning. The tmp carries
 /// the Codex tokens payload (`access_token`, `refresh_token`, `id_token` — all
-/// JWT-bearing secrets); leaving it at umask-default (0o644) after an early
-/// return is the §5a failure class.
+/// JWT-bearing secrets); only its retained creating writer may discard it.
+/// A failed exclusive create must never unlink a colliding entry.
 ///
 /// All three closures use `std::io::Error` as the error type for uniformity:
 /// - Production wraps `PlatformError` via `std::io::Error::other(e.to_string())`
 /// - Tests inject `Err(std::io::Error::other("injected …"))` directly
 fn save_codex_canonical_for_uuid_inner<W, S, R>(
-    tmp: &Path,
+    target: &Path,
     final_path: &Path,
     bytes: &[u8],
     write_fn: W,
@@ -560,20 +558,22 @@ fn save_codex_canonical_for_uuid_inner<W, S, R>(
     replace_fn: R,
 ) -> Result<(), CredentialError>
 where
-    W: FnOnce(&Path, &[u8]) -> std::io::Result<()>,
+    W: for<'target> FnOnce(FinalTarget<'target>, &[u8]) -> std::io::Result<WrittenPrivateFile>,
     S: FnOnce(&Path) -> std::io::Result<()>,
-    R: FnOnce(&Path, &Path) -> std::io::Result<()>,
+    R: FnOnce(&Path, &Path, WrittenPrivateFile) -> std::io::Result<()>,
 {
-    if let Err(e) = write_fn(tmp, bytes) {
-        let _ = std::fs::remove_file(tmp);
-        return Err(CredentialError::Io {
-            path: tmp.to_path_buf(),
-            source: e,
-        });
-    }
+    let identity = match write_fn(FinalTarget(target), bytes) {
+        Ok(identity) => identity,
+        Err(e) => {
+            return Err(CredentialError::Io {
+                path: target.to_path_buf(),
+                source: e,
+            });
+        }
+    };
 
-    if let Err(e) = secure_fn(tmp) {
-        let _ = std::fs::remove_file(tmp);
+    let tmp = identity.path().to_path_buf();
+    if let Err(e) = secure_fn(&tmp) {
         // Report final_path (not tmp) — the caller cares which credential
         // file failed to secure, not the transient tmp name (LOW-3 parity
         // with `write_uuid_credentials_inner`).
@@ -583,8 +583,7 @@ where
         });
     }
 
-    if let Err(e) = replace_fn(tmp, final_path) {
-        let _ = std::fs::remove_file(tmp);
+    if let Err(e) = replace_fn(&tmp, final_path, identity) {
         return Err(CredentialError::Io {
             path: final_path.to_path_buf(),
             source: e,
@@ -615,7 +614,7 @@ where
 ///
 /// §5a: the tmp file carries the Codex tokens payload (`access_token`,
 /// `refresh_token`, `id_token` — JWT-bearing). Every failure branch in
-/// `save_codex_canonical_for_uuid_inner` calls `remove_file(&tmp)` before
+/// `save_codex_canonical_for_uuid_inner` drops its retained writer before
 /// propagating.
 pub fn save_codex_canonical_for_uuid(
     base_dir: &Path,
@@ -917,22 +916,26 @@ fn save_codex_canonical_for_uuid_checked(
         },
     )?;
 
-    let tmp = crate::platform::fs::unique_tmp_path(&uuid_path);
-
-    // §5a: `write_new_private` creates the tmp file at 0o600 at creation;
+    // §5a: the synced retained writer creates the tmp file at 0o600 and
+    // completes file sync_all before publication; parent-directory durability
+    // after power loss is unchanged.
     // `secure_file` below is now a redundant (but harmless) re-chmod, kept
     // so the three-closure injectable failure-branch test structure stays
     // unchanged for the `secure` and `replace` branches.
     save_codex_canonical_for_uuid_inner(
-        &tmp,
+        &uuid_path,
         &uuid_path,
         json.as_bytes(),
-        |p, b| {
-            crate::platform::fs::write_new_private(p, b)
+        |target: FinalTarget<'_>, b| {
+            crate::platform::fs::write_private_tmp_synced_retained(target.as_path(), b)
                 .map_err(|e| std::io::Error::other(e.to_string()))
         },
         |p| secure_file(p).map_err(|e| std::io::Error::other(e.to_string())),
-        |t, f| atomic_replace(t, f).map_err(|e| std::io::Error::other(e.to_string())),
+        |_t, f, written| {
+            written
+                .replace(f)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        },
     )?;
     remove_own_rescue_record(rescue_record.as_deref());
     Ok(true)
@@ -950,16 +953,16 @@ fn save_codex_canonical_for_uuid_checked(
 /// Three distinct closure-injected tests, three distinct branches.
 ///
 /// Per `rules/security.md` §5a: every failure branch after the tmp write MUST
-/// `let _ = std::fs::remove_file(&tmp)` before returning. The tmp file carries
+/// let the retained creating writer discard its own file before returning. The tmp carries
 /// a settings payload that may include `ANTHROPIC_AUTH_TOKEN` (3P key in env
-/// block); leaving it at umask-default (0o644) after an early return is the
-/// §5a failure class.
+/// block); only its retained creating writer may discard it.
+/// A failed exclusive create must never unlink a colliding entry.
 ///
 /// M4-2: renamed from `write_uuid_settings_inner` to `save_uuid_settings_inner`
 /// for naming parity with the M4-1 / M2-2 chokepoints (`save_uuid_credentials`,
 /// `save_codex_canonical_for_uuid`). Same shape — three injectable Fn closures.
 pub(crate) fn save_uuid_settings_inner<W, S, R>(
-    tmp: &Path,
+    target: &Path,
     final_path: &Path,
     bytes: &[u8],
     write_fn: W,
@@ -967,20 +970,22 @@ pub(crate) fn save_uuid_settings_inner<W, S, R>(
     replace_fn: R,
 ) -> Result<(), CredentialError>
 where
-    W: FnOnce(&Path, &[u8]) -> std::io::Result<()>,
+    W: for<'target> FnOnce(FinalTarget<'target>, &[u8]) -> std::io::Result<WrittenPrivateFile>,
     S: FnOnce(&Path) -> std::io::Result<()>,
-    R: FnOnce(&Path, &Path) -> std::io::Result<()>,
+    R: FnOnce(&Path, &Path, WrittenPrivateFile) -> std::io::Result<()>,
 {
-    if let Err(e) = write_fn(tmp, bytes) {
-        let _ = std::fs::remove_file(tmp);
-        return Err(CredentialError::Io {
-            path: tmp.to_path_buf(),
-            source: e,
-        });
-    }
+    let identity = match write_fn(FinalTarget(target), bytes) {
+        Ok(identity) => identity,
+        Err(e) => {
+            return Err(CredentialError::Io {
+                path: target.to_path_buf(),
+                source: e,
+            });
+        }
+    };
 
-    if let Err(e) = secure_fn(tmp) {
-        let _ = std::fs::remove_file(tmp);
+    let tmp = identity.path().to_path_buf();
+    if let Err(e) = secure_fn(&tmp) {
         // Report final_path so the caller knows which settings file failed.
         return Err(CredentialError::Io {
             path: final_path.to_path_buf(),
@@ -988,8 +993,7 @@ where
         });
     }
 
-    if let Err(e) = replace_fn(tmp, final_path) {
-        let _ = std::fs::remove_file(tmp);
+    if let Err(e) = replace_fn(&tmp, final_path, identity) {
         return Err(CredentialError::Io {
             path: final_path.to_path_buf(),
             source: e,
@@ -1033,7 +1037,7 @@ where
 ///
 /// §5a: the tmp file may carry `ANTHROPIC_AUTH_TOKEN` from the slot's 3P env
 /// block. Every failure branch in `save_uuid_settings_inner` calls
-/// `remove_file(&tmp)` before propagating.
+/// retained-writer cleanup before propagating.
 pub fn save_uuid_settings(
     base_dir: &Path,
     uuid: IdentityId,
@@ -1084,22 +1088,26 @@ pub(crate) fn save_uuid_settings_lock_held(
 ) -> Result<(), CredentialError> {
     let uuid_path = settings_path_for(base_dir, uuid);
 
-    let tmp = crate::platform::fs::unique_tmp_path(&uuid_path);
-
-    // §5a: `write_new_private` creates the tmp file at 0o600 at creation;
+    // §5a: the synced retained writer creates the tmp file at 0o600 and
+    // completes file sync_all before publication; parent-directory durability
+    // after power loss is unchanged.
     // `secure_file` below is now a redundant (but harmless) re-chmod, kept
     // so the three-closure injectable failure-branch test structure stays
     // unchanged for the `secure` and `replace` branches.
     save_uuid_settings_inner(
-        &tmp,
+        &uuid_path,
         &uuid_path,
         bytes,
-        |p, b| {
-            crate::platform::fs::write_new_private(p, b)
+        |target: FinalTarget<'_>, b| {
+            crate::platform::fs::write_private_tmp_synced_retained(target.as_path(), b)
                 .map_err(|e| std::io::Error::other(e.to_string()))
         },
         |p| secure_file(p).map_err(|e| std::io::Error::other(e.to_string())),
-        |t, f| atomic_replace(t, f).map_err(|e| std::io::Error::other(e.to_string())),
+        |_t, f, written| {
+            written
+                .replace(f)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        },
     )
 }
 
@@ -2125,6 +2133,225 @@ mod tests {
         })
     }
 
+    // Observe the platform's completed sync_all on the production-selected
+    // writer, while the old canonical file is still published. The helper does
+    // not inject a writer into any of the generic failure-branch seams.
+    fn assert_production_sync_before_publication(
+        final_path: &Path,
+        old_bytes: &[u8],
+        new_bytes: &[u8],
+        operation: impl FnOnce(),
+    ) {
+        let parent = final_path.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        std::fs::write(final_path, old_bytes).unwrap();
+
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let callback_observed = std::rc::Rc::clone(&observed);
+        let expected_parent = parent.to_path_buf();
+        let expected_final = final_path.to_path_buf();
+        let expected_old = old_bytes.to_vec();
+        let expected_new = new_bytes.to_vec();
+        crate::platform::fs::with_private_sync_observer_for_test(
+            move |tmp| {
+                // Other writes (for example token history) cannot stand in
+                // for this production credential/settings writer's sync.
+                if tmp.parent() != Some(expected_parent.as_path())
+                    || std::fs::read(tmp).unwrap() != expected_new
+                {
+                    return;
+                }
+                assert_eq!(
+                    std::fs::read(&expected_final).unwrap(),
+                    expected_old,
+                    "sync_all must complete before the new bytes are published"
+                );
+                callback_observed.borrow_mut().push(tmp.to_path_buf());
+            },
+            operation,
+        );
+
+        assert_eq!(
+            observed.borrow().len(),
+            1,
+            "production writer must complete sync_all before publication"
+        );
+        assert_eq!(std::fs::read(final_path).unwrap(), new_bytes);
+        assert!(
+            !observed.borrow()[0].exists(),
+            "publication must consume the synchronized temporary file"
+        );
+    }
+
+    #[test]
+    fn save_syncs_private_file_before_publication() {
+        let _env = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("credentials.json");
+        let old = ai_credential("sync-save-old", 4_102_444_800_000, None);
+        let new = ai_credential("sync-save-new", 4_102_444_801_000, None);
+        let old_bytes = serde_json::to_vec_pretty(&old).unwrap();
+        let new_bytes = serde_json::to_vec_pretty(&new).unwrap();
+
+        assert_production_sync_before_publication(&path, &old_bytes, &new_bytes, || {
+            save(&path, &new).unwrap();
+        });
+    }
+
+    #[test]
+    fn save_uuid_credentials_syncs_private_file_before_publication() {
+        let _env = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(2);
+        let path = credentials_path_for(dir.path(), uuid);
+        let old = ai_credential("sync-uuid-old", 4_102_444_800_000, None);
+        let new = ai_credential("sync-uuid-new", 4_102_444_801_000, None);
+        let old_bytes = serde_json::to_vec_pretty(&old).unwrap();
+        let new_bytes = serde_json::to_vec_pretty(&new).unwrap();
+
+        assert_production_sync_before_publication(&path, &old_bytes, &new_bytes, || {
+            save_uuid_credentials_prepared(dir.path(), uuid, &new, false).unwrap();
+        });
+    }
+
+    #[test]
+    fn save_codex_canonical_for_uuid_syncs_private_file_before_publication() {
+        let _env = crate::platform::test_env::lock();
+        let dir = crate::testing::identity_fixtures::coexisting_fixture(3);
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(2);
+        let path = credentials_codex_path_for(dir.path(), uuid);
+        let old = sample_codex_creds();
+        let mut new = sample_codex_creds();
+        new.codex_mut().unwrap().tokens.access_token =
+            "eyJhbGciOiJIUzI1NiJ9.sync-before-publication.sig".into();
+        let old_bytes = serde_json::to_vec_pretty(&old).unwrap();
+        let new_bytes = serde_json::to_vec_pretty(&new).unwrap();
+
+        assert_production_sync_before_publication(&path, &old_bytes, &new_bytes, || {
+            save_codex_canonical_for_uuid(dir.path(), uuid, &new).unwrap();
+        });
+    }
+
+    #[test]
+    fn save_uuid_settings_syncs_private_file_before_publication() {
+        let _env = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(2);
+        let path = settings_path_for(dir.path(), uuid);
+        let old_bytes = br#"{"env":{"ANTHROPIC_AUTH_TOKEN":"old-test-key"}}"#;
+        let new_bytes = br#"{"env":{"ANTHROPIC_AUTH_TOKEN":"new-test-key"}}"#;
+
+        assert_production_sync_before_publication(&path, old_bytes, new_bytes, || {
+            save_uuid_settings(dir.path(), uuid, new_bytes).unwrap();
+        });
+    }
+
+    fn assert_production_collision_retry(
+        final_path: &Path,
+        old_bytes: &[u8],
+        new_bytes: &[u8],
+        operation: impl FnOnce() -> Result<(), CredentialError>,
+    ) {
+        let foreign = std::rc::Rc::new(std::cell::RefCell::new(None::<PathBuf>));
+        let callback_foreign = std::rc::Rc::clone(&foreign);
+        let expected_parent = final_path.parent().unwrap().to_path_buf();
+        crate::platform::fs::with_private_create_observer_for_test(
+            move |candidate| {
+                if candidate.parent() == Some(expected_parent.as_path())
+                    && callback_foreign.borrow().is_none()
+                {
+                    std::fs::write(candidate, b"foreign credential candidate").unwrap();
+                    *callback_foreign.borrow_mut() = Some(candidate.to_path_buf());
+                }
+            },
+            || {
+                assert_production_sync_before_publication(final_path, old_bytes, new_bytes, || {
+                    let result = operation();
+                    let candidate = foreign
+                        .borrow()
+                        .as_ref()
+                        .expect("production CREATE observer must fire before result assertion")
+                        .clone();
+                    assert_eq!(
+                        std::fs::read(&candidate).unwrap(),
+                        b"foreign credential candidate"
+                    );
+                    eprintln!("F4_PRIVATE_CREATE_COLLISION_PLANTED");
+                    assert!(
+                            result.is_ok(),
+                            "production writer must save successfully after a create collision: {result:?}"
+                        );
+                });
+            },
+        );
+        let candidate = foreign.borrow();
+        let candidate = candidate
+            .as_ref()
+            .expect("production CREATE observer must fire");
+        assert_eq!(
+            std::fs::read(candidate).unwrap(),
+            b"foreign credential candidate"
+        );
+        assert_eq!(std::fs::read(final_path).unwrap(), new_bytes);
+    }
+
+    #[test]
+    fn save_retries_create_collision_and_preserves_foreign_candidate() {
+        let _env = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("credentials.json");
+        let old = ai_credential("collision-save-old", 4_102_444_800_000, None);
+        let new = ai_credential("collision-save-new", 4_102_444_801_000, None);
+        let old_bytes = serde_json::to_vec_pretty(&old).unwrap();
+        let new_bytes = serde_json::to_vec_pretty(&new).unwrap();
+        assert_production_collision_retry(&path, &old_bytes, &new_bytes, || save(&path, &new));
+    }
+
+    #[test]
+    fn save_uuid_credentials_retries_create_collision_and_preserves_foreign_candidate() {
+        let _env = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(2);
+        let path = credentials_path_for(dir.path(), uuid);
+        let old = ai_credential("collision-uuid-old", 4_102_444_800_000, None);
+        let new = ai_credential("collision-uuid-new", 4_102_444_801_000, None);
+        let old_bytes = serde_json::to_vec_pretty(&old).unwrap();
+        let new_bytes = serde_json::to_vec_pretty(&new).unwrap();
+        assert_production_collision_retry(&path, &old_bytes, &new_bytes, || {
+            save_uuid_credentials_prepared(dir.path(), uuid, &new, false)
+        });
+    }
+
+    #[test]
+    fn save_codex_canonical_for_uuid_retries_create_collision_and_preserves_foreign_candidate() {
+        let _env = crate::platform::test_env::lock();
+        let dir = crate::testing::identity_fixtures::coexisting_fixture(3);
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(2);
+        let path = credentials_codex_path_for(dir.path(), uuid);
+        let old = sample_codex_creds();
+        let mut new = sample_codex_creds();
+        new.codex_mut().unwrap().tokens.access_token =
+            "eyJhbGciOiJIUzI1NiJ9.collision-retry.sig".into();
+        let old_bytes = serde_json::to_vec_pretty(&old).unwrap();
+        let new_bytes = serde_json::to_vec_pretty(&new).unwrap();
+        assert_production_collision_retry(&path, &old_bytes, &new_bytes, || {
+            save_codex_canonical_for_uuid(dir.path(), uuid, &new).map(|_| ())
+        });
+    }
+
+    #[test]
+    fn save_uuid_settings_retries_create_collision_and_preserves_foreign_candidate() {
+        let _env = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let uuid = crate::testing::identity_fixtures::fixture_uuid_for_slot(2);
+        let path = settings_path_for(dir.path(), uuid);
+        let old_bytes = br#"{"env":{"ANTHROPIC_AUTH_TOKEN":"collision-old-test-key"}}"#;
+        let new_bytes = br#"{"env":{"ANTHROPIC_AUTH_TOKEN":"collision-new-test-key"}}"#;
+        assert_production_collision_retry(&path, old_bytes, new_bytes, || {
+            save_uuid_settings(dir.path(), uuid, new_bytes)
+        });
+    }
+
     // ── Migrated identity-authority fixtures (2026-10-10) ────────────────────
     //
     // The raw Anthropic canonical write authority (`save_canonical_for` on the
@@ -2324,9 +2551,9 @@ mod tests {
 
     /// Regression: per security.md MUST Rule 5a (an internal journal entry B2 class),
     /// every failure branch in `save` after the tmp file would-be-write
-    /// must best-effort `remove_file(&tmp)` before propagating. This test
-    /// drives the atomic_replace failure branch by making the parent dir
-    /// read-only, then asserts no `*.tmp.*` files remain.
+    /// must let the creating writer clean up before propagating. This test
+    /// drives exclusive-create failure by making the parent dir read-only,
+    /// then asserts no `*.tmp.*` files remain.
     ///
     /// /redteam round 3 (2026-05-09) found `save` had been missed by the
     /// original B2 fix — same pattern as the cache_write test in coc/cache.rs.
@@ -3573,6 +3800,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn uuid_secret_write_seams_forward_writer_identity() {
+        // All three seams pass the retained creating writer to publication.
+        macro_rules! exercise {
+            ($write:path) => {{
+                let dir = tempfile::TempDir::new().unwrap();
+                let tmp = dir.path().join("written.tmp");
+                let target = dir.path().join("published.json");
+                std::fs::write(&target, b"old").unwrap();
+                $write(
+                    &tmp,
+                    &target,
+                    b"new",
+                    |target: FinalTarget<'_>, bytes| {
+                        crate::platform::fs::write_new_private_retained(target.as_path(), bytes)
+                            .map_err(|e| std::io::Error::other(e.to_string()))
+                    },
+                    |path| {
+                        assert_eq!(std::fs::read(path)?, b"new");
+                        Ok(())
+                    },
+                    |_path, target, written: WrittenPrivateFile| {
+                        written
+                            .replace(target)
+                            .map_err(|e| std::io::Error::other(e.to_string()))
+                    },
+                )
+                .unwrap();
+                assert_eq!(std::fs::read(target).unwrap(), b"new");
+                assert!(!tmp.exists());
+            }};
+        }
+        exercise!(write_uuid_credentials_inner);
+        exercise!(save_codex_canonical_for_uuid_inner);
+        exercise!(save_uuid_settings_inner);
+    }
+
+    #[test]
+    fn uuid_secret_write_seams_preserve_exclusive_create_collision() {
+        macro_rules! exercise {
+            ($write:path) => {{
+                let dir = tempfile::TempDir::new().unwrap();
+                let tmp = dir.path().join("occupied.tmp");
+                let target = dir.path().join("credentials.json");
+                std::fs::write(&tmp, b"foreign entry").unwrap();
+                std::fs::write(&target, b"old credential").unwrap();
+                let result = $write(
+                    &tmp,
+                    &target,
+                    b"candidate",
+                    |target: FinalTarget<'_>, bytes| {
+                        crate::platform::fs::write_new_private_retained(target.as_path(), bytes)
+                            .map_err(|e| std::io::Error::other(e.to_string()))
+                    },
+                    |_path| panic!("a failed exclusive create must not reach secure"),
+                    |_path, _target, _written: WrittenPrivateFile| {
+                        panic!("a failed exclusive create must not reach replace")
+                    },
+                );
+                assert!(result.is_err());
+                assert_eq!(std::fs::read(&tmp).unwrap(), b"foreign entry");
+                assert_eq!(std::fs::read(&target).unwrap(), b"old credential");
+            }};
+        }
+        exercise!(write_uuid_credentials_inner);
+        exercise!(save_codex_canonical_for_uuid_inner);
+        exercise!(save_uuid_settings_inner);
+    }
+
     /// Criterion 6: §5a — tmp cleanup on `write` failure.
     ///
     /// Uses closure injection per PRIMARY METHODOLOGICAL DIRECTIVE in
@@ -3593,12 +3889,16 @@ mod tests {
             &tmp,
             &final_path,
             b"{\"test\":1}",
-            // write_fn: always fails
-            |_p, _b| Err(std::io::Error::other("injected write failure")),
+            // Create a partial artifact before failing so cleanup is observable.
+            |target: FinalTarget<'_>, b| {
+                let _written = crate::platform::fs::write_new_private_retained(target.as_path(), b)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                Err(std::io::Error::other("injected write failure"))
+            },
             // secure_fn: would succeed (never reached)
             |_p| Ok(()),
             // replace_fn: would succeed (never reached)
-            |_t, _f| Ok(()),
+            |_t, _f, _identity: WrittenPrivateFile| Ok(()),
         );
 
         assert!(
@@ -3630,11 +3930,14 @@ mod tests {
             &final_path,
             b"{\"test\":2}",
             // write_fn: succeeds (creates tmp file)
-            |p, b| std::fs::write(p, b),
+            |target: FinalTarget<'_>, b| {
+                crate::platform::fs::write_new_private_retained(target.as_path(), b)
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            },
             // secure_fn: always fails
             |_p| Err(std::io::Error::other("injected secure_file failure")),
             // replace_fn: would succeed (never reached)
-            |_t, _f| Ok(()),
+            |_t, _f, _identity: WrittenPrivateFile| Ok(()),
         );
 
         assert!(
@@ -3666,11 +3969,16 @@ mod tests {
             &final_path,
             b"{\"test\":3}",
             // write_fn: succeeds
-            |p, b| std::fs::write(p, b),
+            |target: FinalTarget<'_>, b| {
+                crate::platform::fs::write_new_private_retained(target.as_path(), b)
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            },
             // secure_fn: succeeds (no-op — permissions are non-essential for this test)
             |_p| Ok(()),
             // replace_fn: always fails
-            |_t, _f| Err(std::io::Error::other("injected atomic_replace failure")),
+            |_t, _f, _identity: WrittenPrivateFile| {
+                Err(std::io::Error::other("injected atomic_replace failure"))
+            },
         );
 
         assert!(
@@ -3709,14 +4017,15 @@ mod tests {
             &final_path,
             b"{\"key\":1}",
             // write_fn: creates tmp then fails
-            |p, b| {
-                std::fs::write(p, b)?; // actually writes the file first
+            |target: FinalTarget<'_>, b| {
+                let _written = crate::platform::fs::write_new_private_retained(target.as_path(), b)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                 Err(std::io::Error::other("injected write_fn failure"))
             },
             // secure_fn: never reached
             |_p| Ok(()),
             // replace_fn: never reached
-            |_t, _f| Ok(()),
+            |_t, _f, _identity: WrittenPrivateFile| Ok(()),
         );
 
         assert!(
@@ -3747,11 +4056,14 @@ mod tests {
             &final_path,
             b"{\"key\":2}",
             // write_fn: succeeds
-            |p, b| std::fs::write(p, b),
+            |target: FinalTarget<'_>, b| {
+                crate::platform::fs::write_new_private_retained(target.as_path(), b)
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            },
             // secure_fn: fails
             |_p| Err(std::io::Error::other("injected secure_fn failure")),
             // replace_fn: never reached
-            |_t, _f| Ok(()),
+            |_t, _f, _identity: WrittenPrivateFile| Ok(()),
         );
 
         assert!(
@@ -3781,11 +4093,16 @@ mod tests {
             &final_path,
             b"{\"key\":3}",
             // write_fn: succeeds
-            |p, b| std::fs::write(p, b),
+            |target: FinalTarget<'_>, b| {
+                crate::platform::fs::write_new_private_retained(target.as_path(), b)
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            },
             // secure_fn: succeeds (no-op)
             |_p| Ok(()),
             // replace_fn: fails
-            |_t, _f| Err(std::io::Error::other("injected replace_fn failure")),
+            |_t, _f, _identity: WrittenPrivateFile| {
+                Err(std::io::Error::other("injected replace_fn failure"))
+            },
         );
 
         assert!(
@@ -4404,12 +4721,16 @@ mod tests {
             &tmp,
             &final_path,
             b"{\"test\":1}",
-            // write_fn: always fails
-            |_p, _b| Err(std::io::Error::other("injected write failure")),
+            // Create a partial artifact before failing so cleanup is observable.
+            |target: FinalTarget<'_>, b| {
+                let _written = crate::platform::fs::write_new_private_retained(target.as_path(), b)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                Err(std::io::Error::other("injected write failure"))
+            },
             // secure_fn: would succeed (never reached)
             |_p| Ok(()),
             // replace_fn: would succeed (never reached)
-            |_t, _f| Ok(()),
+            |_t, _f, _identity: WrittenPrivateFile| Ok(()),
         );
 
         assert!(
@@ -4439,11 +4760,14 @@ mod tests {
             &final_path,
             b"{\"test\":2}",
             // write_fn: succeeds (creates tmp file)
-            |p, b| std::fs::write(p, b),
+            |target: FinalTarget<'_>, b| {
+                crate::platform::fs::write_new_private_retained(target.as_path(), b)
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            },
             // secure_fn: always fails
             |_p| Err(std::io::Error::other("injected secure_file failure")),
             // replace_fn: would succeed (never reached)
-            |_t, _f| Ok(()),
+            |_t, _f, _identity: WrittenPrivateFile| Ok(()),
         );
 
         assert!(
@@ -4473,11 +4797,16 @@ mod tests {
             &final_path,
             b"{\"test\":3}",
             // write_fn: succeeds
-            |p, b| std::fs::write(p, b),
+            |target: FinalTarget<'_>, b| {
+                crate::platform::fs::write_new_private_retained(target.as_path(), b)
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            },
             // secure_fn: succeeds (no-op)
             |_p| Ok(()),
             // replace_fn: always fails
-            |_t, _f| Err(std::io::Error::other("injected atomic_replace failure")),
+            |_t, _f, _identity: WrittenPrivateFile| {
+                Err(std::io::Error::other("injected atomic_replace failure"))
+            },
         );
 
         assert!(

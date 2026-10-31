@@ -405,14 +405,15 @@ impl VendorLoginGrant {
             ));
         }
         let path = self.home.join("lease.json");
-        let tmp = fs::unique_tmp_path(&path);
         let bytes = serde_json::to_vec(&self.lease).map_err(|_| {
             // serde's Display can echo field names, so only the fixed tag.
             anyhow!("lease_step=serialize kind=non_io errno=-1")
         })?;
-        fs::write_new_private_synced(&tmp, &bytes)
+        let written = fs::write_private_tmp_synced_retained(&path, &bytes)
             .map_err(|e| anyhow!(LeaseStep::Write.detail(&e)))?;
-        fs::atomic_replace(&tmp, &path).map_err(|e| anyhow!(LeaseStep::Rename.detail(&e)))?;
+        written
+            .replace(&path)
+            .map_err(|e| anyhow!(LeaseStep::Rename.detail(&e)))?;
         #[cfg(unix)]
         std::fs::File::open(&self.home)
             .and_then(|dir| dir.sync_all())
@@ -625,6 +626,35 @@ impl Drop for VendorLoginGrant {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn f_a_lease_save_retries_first_sibling_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut grant = VendorLoginGrant::new(dir.path()).unwrap();
+        let target = grant.config_dir().join("lease.json");
+        let parent = target.parent().unwrap().to_path_buf();
+        let collision = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let planted = collision.clone();
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |candidate| {
+                assert_eq!(candidate.parent(), Some(parent.as_path()));
+                if planted.borrow().is_none() {
+                    std::fs::write(candidate, b"foreign-lease-stage").unwrap();
+                    *planted.borrow_mut() = Some(candidate.to_path_buf());
+                }
+            },
+            || grant.begin_launch(),
+        );
+        let foreign = collision
+            .borrow()
+            .clone()
+            .expect("production create observed");
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign-lease-stage");
+        result.expect("lease save must retry the first sibling collision");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+        assert_eq!(saved, serde_json::to_value(&grant.lease).unwrap());
+    }
     use super::*;
 
     fn orphan(base: &Path, state: LaunchState) -> PathBuf {

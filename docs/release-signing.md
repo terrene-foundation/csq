@@ -238,7 +238,16 @@ if ! echo "$LIPO_OUT" | grep -q 'x86_64' || ! echo "$LIPO_OUT" | grep -q 'arm64'
   echo "::error::then re-run \`npx tauri build --target universal-apple-darwin\`."
   exit 1
 fi
-echo "Bundle freshness + version coherence + universal slices OK: v$PLIST_VERSION, fresh."
+
+# (e) compiled features (an internal ticket FIX5 P-2). The csq binary must carry exactly one
+#     CSQ-BUILD-FEATURES marker naming a listed set, with neither csq nor
+#     csq-core compiled with native-harness. Run BEFORE signing; the publish
+#     job re-runs the same check on the uploaded tarball.
+if ! bash scripts/verify/built-binary-features.sh "$APP_BUNDLE/Contents/MacOS/csq" scripts/check-enterprise-deny.sh; then
+  echo "::error::$APP_BUNDLE/Contents/MacOS/csq failed the built-binary feature check. DO NOT sign."
+  exit 1
+fi
+echo "Bundle freshness + version coherence + universal slices + compiled features OK: v$PLIST_VERSION, fresh."
 ```
 
 ### 2. Sign the `.app`

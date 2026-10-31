@@ -42,6 +42,10 @@ pub enum SdkErrorCode {
     InvalidIdempotencyKey,
     /// A `--provider` was named but no healthy slot serves it.
     NoHealthySlot,
+    /// No admitted pool key is eligible within the configured budget.
+    PoolExhausted,
+    /// Pool configuration, credential custody, or its budget ledger is unavailable.
+    PoolUnavailable,
     /// The named provider / slot does not resolve to a known surface.
     ProviderNotFound,
     /// The provider adapter for the requested surface is not available in this
@@ -191,6 +195,8 @@ impl SdkErrorCode {
             Self::InvalidInput => "invalid_input",
             Self::InvalidIdempotencyKey => "invalid_idempotency_key",
             Self::NoHealthySlot => "no_healthy_slot",
+            Self::PoolExhausted => "pool_exhausted",
+            Self::PoolUnavailable => "pool_unavailable",
             Self::ProviderNotFound => "provider_not_found",
             Self::Unsupported => "unsupported",
             Self::SpawnFailed => "spawn_failed",
@@ -306,6 +312,8 @@ mod tests {
                 "invalid_idempotency_key",
             ),
             (SdkErrorCode::NoHealthySlot, "no_healthy_slot"),
+            (SdkErrorCode::PoolExhausted, "pool_exhausted"),
+            (SdkErrorCode::PoolUnavailable, "pool_unavailable"),
             (SdkErrorCode::ProviderNotFound, "provider_not_found"),
             (SdkErrorCode::Unsupported, "unsupported"),
             (SdkErrorCode::SpawnFailed, "spawn_failed"),

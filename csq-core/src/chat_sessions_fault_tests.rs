@@ -191,7 +191,15 @@ fn production_shards_keep_numeric_load_bearing_line_budget() {
         include_str!("chat_sessions_cleanup.rs"),
         include_str!("chat_sessions_directory.rs"),
         include_str!("chat_sessions_failure.rs"),
-        include_str!("platform/fs_windows_acl.rs"),
+        // fs_windows_acl is a directory module: every PRODUCTION shard is
+        // budgeted here. `windows_tests.rs` is excluded — it holds the cfg(test)
+        // helpers and the windows-only unit tests, exactly the code the
+        // former inline `#[cfg(test)]` items carried.
+        include_str!("platform/fs_windows_acl/mod.rs"),
+        include_str!("platform/fs_windows_acl/sid.rs"),
+        include_str!("platform/fs_windows_acl/descriptor.rs"),
+        include_str!("platform/fs_windows_acl/open.rs"),
+        include_str!("platform/fs_windows_acl/check.rs"),
     ] {
         assert!(load_bearing(source) <= 500);
     }

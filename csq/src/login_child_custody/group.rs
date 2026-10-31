@@ -11,13 +11,14 @@ use std::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GroupSignal {
+    #[cfg(any(feature = "cli", test))]
     Interrupt,
     Kill,
-    #[cfg(unix)]
+    #[cfg(all(unix, any(feature = "cli", test)))]
     Terminate,
-    #[cfg(unix)]
+    #[cfg(all(unix, any(feature = "cli", test)))]
     Hangup,
-    #[cfg(unix)]
+    #[cfg(all(unix, any(feature = "cli", test)))]
     Quit,
 }
 // Ten existing 200ms custody polls after an explicit stop intent. Expiration
@@ -49,6 +50,24 @@ struct Inner {
 #[derive(Clone)]
 pub(crate) struct GroupControl(Arc<Inner>);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StdinPolicy {
+    #[cfg(any(unix, feature = "cli", test))]
+    Inherit,
+    #[cfg(any(unix, feature = "desktop", test))]
+    Null,
+    #[cfg(test)]
+    Caller,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GroupStop {
+    Signal(i32),
+    // The member census observes state, not the signal that stopped it.
+    Unknown,
+}
+
 #[cfg(any(feature = "desktop", all(test, unix)))]
 pub(crate) enum GroupStopDecision {
     StopRequested,
@@ -69,6 +88,7 @@ impl VendorFinalizedReceipt {
 }
 
 impl GroupControl {
+    #[cfg(any(feature = "cli", test))]
     pub(crate) fn check_wait_lease(&self) -> io::Result<()> {
         let lease = self
             .0
@@ -110,25 +130,41 @@ impl GroupControl {
             .unwrap_or_else(|e| e.into_inner())
             .take()
     }
-    /// Whether ANY member of the group is observed STOPPED (job control). The
-    /// leader is read with WSTOPPED|WNOWAIT; other members from the process
-    /// table (`scan_members`, heavier, so the caller rate-limits it). Read-only:
-    /// never reaps. Requires csq still to hold the wait lease, so a numeric
-    /// PGID is only ever read while our unreaped leader reserves it.
+    /// A stop observed under the retained wait lease. The leader's signal
+    /// comes from waitid(WSTOPPED|WNOWAIT); the optional member census observes
+    /// only stopped state. A positive census refreshes the leader once before
+    /// reporting an unknown signal. Read-only: never reaps. The unreaped leader
+    /// reserves the numeric PGID.
     #[cfg(unix)]
-    pub(crate) fn stopped_member(&self, scan_members: bool) -> bool {
+    pub(crate) fn stop_observation(&self, scan_members: bool) -> Option<GroupStop> {
         let Ok(lease) = self.0.lease.lock() else {
-            return false;
+            return None;
         };
         if *lease != WaitLease::Retained {
-            return false;
+            return None;
         }
         // A leader that has already exited (unreaped) means the login is over:
         // its members are the freeze/census's to reap, never a suspension, so an
         // exit-0 login is not turned into a cancellation by a stopped helper.
         if leader_has_exited(self.id()) {
-            return false;
+            return None;
         }
+        if let Some(signal) = self.leader_stop_signal() {
+            return Some(GroupStop::Signal(signal));
+        }
+        if scan_members && group_has_stopped_member(self.id()) {
+            // The leader may have stopped after the first waitid but before
+            // the census. Refresh once under this same retained lease before
+            // classifying the stop as an unidentified nonleader observation.
+            return Some(
+                self.leader_stop_signal()
+                    .map_or(GroupStop::Unknown, GroupStop::Signal),
+            );
+        }
+        None
+    }
+    #[cfg(unix)]
+    fn leader_stop_signal(&self) -> Option<i32> {
         // SAFETY: initialized C output; WSTOPPED|WNOWAIT only observe our child.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         // SAFETY: query only our direct child.
@@ -147,10 +183,15 @@ impl GroupControl {
             #[cfg(target_os = "macos")]
             let observed = info.si_pid;
             if observed == self.id() as libc::pid_t && info.si_code == libc::CLD_STOPPED {
-                return true;
+                #[cfg(target_os = "linux")]
+                // SAFETY: waitid initialized the SIGCHLD arm.
+                let signal = unsafe { info.si_status() };
+                #[cfg(target_os = "macos")]
+                let signal = info.si_status;
+                return Some(signal);
             }
         }
-        scan_members && group_has_stopped_member(self.id())
+        None
     }
     pub(crate) fn mark_readers_joined(&self) {
         // Serialize both completion orders with reaping and stop decisions.
@@ -171,6 +212,7 @@ impl GroupControl {
     pub(crate) fn id(&self) -> u32 {
         self.0.pid
     }
+    #[cfg(any(feature = "cli", test))]
     pub(crate) fn set_signal_pump(
         &self,
         pump: impl FnMut(&Self) -> io::Result<()> + Send + 'static,
@@ -249,10 +291,14 @@ impl GroupControl {
                 }
             };
             let signal = match signal {
+                #[cfg(any(feature = "cli", test))]
                 GroupSignal::Interrupt => libc::SIGINT,
                 GroupSignal::Kill => libc::SIGKILL,
+                #[cfg(any(feature = "cli", test))]
                 GroupSignal::Terminate => libc::SIGTERM,
+                #[cfg(any(feature = "cli", test))]
                 GroupSignal::Hangup => libc::SIGHUP,
+                #[cfg(any(feature = "cli", test))]
                 GroupSignal::Quit => libc::SIGQUIT,
             };
             // SAFETY: waitid(WNOWAIT) just proved our unreaped leader reserves this PGID.
@@ -309,7 +355,13 @@ impl GroupControl {
             }
             match observe_unreaped(self.id()) {
                 Ok(false) => return Ok(None),
-                Ok(true) => {}
+                Ok(true) => {
+                    // Darwin can fill a stopped child's siginfo under WEXITED.
+                    // Freeze only after its actual exit code is observed.
+                    if !leader_has_exited(self.id()) {
+                        return Ok(None);
+                    }
+                }
                 Err(error) => {
                     if error.raw_os_error() == Some(libc::ECHILD) {
                         *lease = WaitLease::Lost;
@@ -385,30 +437,111 @@ impl GroupControl {
     }
 }
 
-pub(crate) fn spawn(command: &mut Command) -> io::Result<(Child, GroupControl)> {
-    spawn_with(command, false)
+// Only the desktop login commands (and this module's tests) spawn an
+// unattended group; a `--no-default-features --features cli` build has no
+// caller, so the function is compiled only where one exists.
+#[cfg(any(feature = "desktop", test))]
+pub(crate) fn spawn(
+    command: &mut Command,
+    stdin_policy: StdinPolicy,
+) -> io::Result<(Child, GroupControl)> {
+    spawn_with(command, false, true, stdin_policy)
 }
 
-/// [`spawn`] for an ATTENDED login (csq's own stdin is its controlling
+/// Spawn an ATTENDED login (csq's own stdin is its controlling
 /// terminal, as in `csq login N`): the vendor's new process group is also made
 /// the terminal's foreground group, so the vendor may use the tty without
 /// being stopped by SIGTTOU/SIGTTIN. Foreground returns to csq when the leader
-/// is reaped or the group handle drops. With no such terminal (desktop, pipes,
-/// a backgrounded csq) this is exactly [`spawn`].
-pub(crate) fn spawn_attended(command: &mut Command) -> io::Result<(Child, GroupControl)> {
-    spawn_with(command, true)
+/// is reaped or the group handle drops. When csq has no foreground terminal
+/// custody (including a background job), the vendor instead starts a detached
+/// session. Inherit policy then becomes Null; Caller preserves configured
+/// input. Stdout/stderr configuration is preserved. Desktop callers use `spawn`.
+#[cfg(any(feature = "cli", test))]
+pub(crate) fn spawn_attended(
+    command: &mut Command,
+    stdin_policy: StdinPolicy,
+) -> io::Result<(Child, GroupControl)> {
+    spawn_with(command, true, false, stdin_policy)
 }
 
-fn spawn_with(command: &mut Command, attended: bool) -> io::Result<(Child, GroupControl)> {
+// Synthetic custody fixtures control lifetime over an explicit stdin pipe and
+// may join a sibling to the leader's group in the test process's own session.
+// Production desktop callers continue to use the detached `spawn` above.
+#[cfg(test)]
+pub(crate) fn spawn_controlled_fixture_for_test(
+    command: &mut Command,
+) -> io::Result<(Child, GroupControl)> {
+    spawn_with(command, false, false, StdinPolicy::Caller)
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn spawn_legacy_unattended_for_tty_test(
+    command: &mut Command,
+) -> io::Result<(Child, GroupControl)> {
+    spawn_with(command, false, false, StdinPolicy::Caller)
+}
+
+/// Stdin is an explicit caller policy (I-3), never inferred from Command.
+/// Null replaces configured input; Caller preserves it. Inherit selects the
+/// parent's input except when a Unix attended handoff is declined, when it
+/// becomes Null. Desktop callers select Null; input-bearing fixtures select
+/// Caller. Both detached routes preserve the caller's stdout/stderr settings.
+///
+/// A caller-supplied process_group is applied by std before pre_exec (I-4).
+/// If it makes the detached child a group leader, setsid refuses with EPERM;
+/// spawn returns the error. The foreground route sets process_group(0).
+/// These one-shot Commands retain their registered handoff/detachment hooks.
+fn spawn_with(
+    command: &mut Command,
+    attended: bool,
+    detached: bool,
+    stdin_policy: StdinPolicy,
+) -> io::Result<(Child, GroupControl)> {
+    // Arm before selecting the route: a declined handoff must not leave the
+    // vendor in another background group of the controlling session.
+    #[cfg(unix)]
+    let mut foreground = if attended {
+        TerminalCustody::arm(command)?
+    } else {
+        None
+    };
+    #[cfg(unix)]
+    let attended_fallback = attended && foreground.is_none();
+    #[cfg(unix)]
+    let stdin_policy = if attended_fallback && stdin_policy == StdinPolicy::Inherit {
+        StdinPolicy::Null
+    } else {
+        stdin_policy
+    };
+    match stdin_policy {
+        #[cfg(any(unix, feature = "cli", test))]
+        StdinPolicy::Inherit => {
+            command.stdin(std::process::Stdio::inherit());
+        }
+        #[cfg(any(unix, feature = "desktop", test))]
+        StdinPolicy::Null => {
+            command.stdin(std::process::Stdio::null());
+        }
+        #[cfg(test)]
+        StdinPolicy::Caller => {}
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        command.process_group(0);
-        let mut foreground = if attended {
-            TerminalCustody::arm(command)?
+        if detached || attended_fallback {
+            // SAFETY: setsid is async-signal-safe and touches only this new
+            // child. It also makes pid == pgid, preserving owned group signals.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
         } else {
-            None
-        };
+            command.process_group(0);
+        }
         let child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -436,7 +569,7 @@ fn spawn_with(command: &mut Command, attended: bool) -> io::Result<(Child, Group
     }
     #[cfg(windows)]
     {
-        let _ = attended;
+        let _ = (attended, detached);
         win::spawn(command)
     }
 }
@@ -1145,6 +1278,7 @@ mod win {
             returned: *mut u32,
         ) -> i32;
         fn CloseHandle(handle: Handle) -> i32;
+        #[cfg(any(feature = "cli", test))]
         fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> i32;
         fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
     }
@@ -1189,12 +1323,14 @@ mod win {
             Ok(info.active)
         }
         pub(super) fn signal(&self, pid: u32, signal: GroupSignal) -> io::Result<()> {
+            #[cfg(not(any(feature = "cli", test)))]
+            let _ = pid;
             // SAFETY: retained job owns descendants; console event targets the own process group.
             let rc = unsafe {
-                if signal == GroupSignal::Interrupt {
-                    GenerateConsoleCtrlEvent(1, pid)
-                } else {
-                    TerminateJobObject(self.0, 130)
+                match signal {
+                    #[cfg(any(feature = "cli", test))]
+                    GroupSignal::Interrupt => GenerateConsoleCtrlEvent(1, pid),
+                    GroupSignal::Kill => TerminateJobObject(self.0, 130),
                 }
             };
             if rc == 0 {

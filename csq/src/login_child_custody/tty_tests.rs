@@ -112,10 +112,55 @@ fn attended_vendor_keeps_running_and_terminal_returns_to_csq() {
 }
 
 #[test]
+fn backgrounded_attended_vendor_detaches_without_touching_terminal() {
+    assert_role("background_stty");
+}
+
+#[test]
+fn backgrounded_attended_vendor_preserves_explicit_input_and_output() {
+    assert_role("background_io");
+}
+
+#[test]
+fn stopped_vendor_without_terminal_custody_is_cancelled() {
+    assert_role("background_stop");
+}
+
+#[test]
+fn foreground_inherit_policy_uses_terminal_input() {
+    assert_role("foreground_inherit");
+}
+
+#[test]
+fn foreground_null_policy_replaces_builder_input() {
+    assert_role("foreground_null");
+}
+
+#[test]
+fn desktop_null_policy_replaces_builder_input() {
+    assert_role("desktop_null");
+}
+
+#[test]
+fn claude_cli_caller_inherits_foreground_input() {
+    assert_role("claude_cli_input_policy");
+}
+
+#[test]
+fn native_cli_caller_inherits_foreground_input() {
+    assert_role("native_cli_input_policy");
+}
+
+#[test]
+fn codex_cli_caller_inherits_foreground_input() {
+    assert_role("codex_cli_input_policy");
+}
+
+#[test]
 fn unattended_spawn_leaves_the_terminal_alone() {
-    // Control: the plain `spawn` (desktop shape) must NOT take the terminal, so
-    // a tty-touching vendor is stopped there. Proves the pty harness makes
-    // SIGTTOU real, which is what gives the test above its discriminating power.
+    // Control: the explicit legacy background-group fixture retains its tty,
+    // so a tty-touching vendor stops. Production desktop spawn now detaches;
+    // this fixture still proves the attended test can discriminate SIGTTOU.
     assert_role("plain");
 }
 
@@ -238,6 +283,141 @@ fn fg_is(pgrp: libc::pid_t) -> bool {
     unsafe { libc::tcgetpgrp(0) == pgrp }
 }
 
+// A session leader cannot move itself to another pgrp. The foreground
+// dispatcher re-execs this same entry in a background group of its session.
+fn background_role(role: &str) -> ! {
+    use super::{LoginWatchdog, OwnedLoginChild, RefusalReason};
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    // SAFETY: read-only queries on this private fixture's controlling tty.
+    let (own, foreground) = unsafe { (libc::getpgrp(), libc::tcgetpgrp(0)) };
+    assert!(
+        foreground > 0 && foreground != own,
+        "worker must be background"
+    );
+    let before = termios_of(0);
+    if role == "background_stop_inner" {
+        let mut command = sh("kill -STOP $$; sleep 20");
+        let (child, group) =
+            group::spawn_attended(&mut command, group::StdinPolicy::Inherit).expect("spawn vendor");
+        assert!(
+            group.take_terminal().is_none(),
+            "background worker took custody"
+        );
+        let watchdog = LoginWatchdog::new(Duration::from_secs(20), super::DeliveryPhase::Unknown);
+        let mut owner = OwnedLoginChild::adopt_group(child, group.clone(), watchdog, ());
+        let started = Instant::now();
+        let result = owner.wait_vendor_cancelled(
+            || Ok(true),
+            |_| {},
+            move || group.signal(group::GroupSignal::Kill),
+            || false,
+        );
+        let reason = result.as_ref().err().map(|refusal| refusal.reason);
+        assert_eq!(
+            reason,
+            Some(RefusalReason::Cancelled),
+            "stop not cancelled: {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "stop waited for deadline"
+        );
+        assert!(
+            owner.custody_finalized(),
+            "stopped vendor custody unresolved"
+        );
+        done(role)
+    }
+    for piped in [true, false] {
+        let io_probe = role == "background_io_inner";
+        let mut command = if io_probe {
+            sh("IFS= read -r line; printf OUT:%s $line; printf ERR:%s $line >&2")
+        } else {
+            sh("stty -echo; exit 0")
+        };
+        if io_probe {
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            if piped {
+                command.stdin(Stdio::piped());
+            } else {
+                let mut input = tempfile::tempfile().expect("input file");
+                input
+                    .write_all(b"fixture-input\n")
+                    .expect("write input file");
+                input.seek(SeekFrom::Start(0)).expect("rewind input file");
+                command.stdin(Stdio::from(input));
+            }
+        }
+        let policy = if io_probe {
+            group::StdinPolicy::Caller
+        } else {
+            group::StdinPolicy::Inherit
+        };
+        let (mut child, group) = group::spawn_attended(&mut command, policy).expect("spawn vendor");
+        assert!(
+            group.take_terminal().is_none(),
+            "background worker took custody"
+        );
+        if io_probe && piped {
+            child
+                .stdin
+                .take()
+                .expect("explicit input pipe preserved")
+                .write_all(b"fixture-input\n")
+                .expect("write input pipe");
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if stopped(child.id()) {
+                group
+                    .signal(group::GroupSignal::Kill)
+                    .expect("kill stopped vendor");
+                child.wait().expect("reap stopped vendor");
+                panic!("BACKGROUND_VENDOR_STOPPED_BY_TTY");
+            }
+            if let Some(status) = group.try_reap(&mut child, true).expect("reap vendor") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                group
+                    .signal(group::GroupSignal::Kill)
+                    .expect("kill timed out vendor");
+                child.wait().expect("reap timed out vendor");
+                panic!("BACKGROUND_VENDOR_TIMEOUT");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(status.success(), "background vendor failed: {status:?}");
+        if io_probe {
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            child
+                .stdout
+                .take()
+                .expect("stdout pipe")
+                .read_to_string(&mut stdout)
+                .expect("read stdout");
+            child
+                .stderr
+                .take()
+                .expect("stderr pipe")
+                .read_to_string(&mut stderr)
+                .expect("read stderr");
+            assert_eq!(stdout, "OUT:fixture-input", "stdout changed, piped={piped}");
+            assert_eq!(stderr, "ERR:fixture-input", "stderr changed, piped={piped}");
+        } else {
+            assert_eq!(
+                termios_of(0).c_lflag & libc::ECHO,
+                before.c_lflag & libc::ECHO,
+                "background vendor changed terminal echo"
+            );
+            break;
+        }
+    }
+    done(role)
+}
+
 #[test]
 #[ignore = "private subprocess dispatcher"]
 fn tty_session_entry() {
@@ -246,6 +426,9 @@ fn tty_session_entry() {
         return;
     };
     let role = role.to_str().expect("role").to_owned();
+    if role.ends_with("_inner") {
+        background_role(&role);
+    }
     // SAFETY: queries on this process's own controlling terminal.
     let own = unsafe { libc::getpgrp() };
     assert!(fg_is(own), "session starts foreground");
@@ -254,7 +437,8 @@ fn tty_session_entry() {
     let ttou_at_entry = ttou_disposition();
     let owned_run = |script: &str, secs: u64, census: Option<group::GroupCensus>| {
         let mut command = sh(script);
-        let (child, group) = group::spawn_attended(&mut command).expect("spawn vendor");
+        let (child, group) =
+            group::spawn_attended(&mut command, group::StdinPolicy::Inherit).expect("spawn vendor");
         let watchdog = LoginWatchdog::new(Duration::from_secs(secs), super::DeliveryPhase::Unknown);
         let mut owner = OwnedLoginChild::adopt_group(child, group.clone(), watchdog, ());
         group::inject_census_for_test(census);
@@ -270,6 +454,144 @@ fn tty_session_entry() {
         (owner, result, started.elapsed())
     };
     match role.as_str() {
+        "claude_cli_input_policy" | "native_cli_input_policy" | "codex_cli_input_policy" => {
+            let mut command = sh("test -t 0 && printf INPUT_POLICY_OK");
+            // Deliberately opposite to the production caller's Inherit intent.
+            // Either Null or Caller would leave this vendor without tty stdin.
+            command.stdin(Stdio::null());
+            if role == "codex_cli_input_policy" {
+                // Match the real Codex constructor's captured stdout contract.
+                command.stdout(Stdio::piped());
+            }
+            let mut cancellation = crate::login_cancel_guard::ScopedLoginCancellation::install()
+                .expect("private caller cancellation scope");
+            let mut output = Vec::new();
+            let success = match role.as_str() {
+                "claude_cli_input_policy" => crate::login_cancel_guard::spawn_cli_login_scoped(
+                    &mut command,
+                    Duration::from_secs(10),
+                    (),
+                    |_| panic!("foreground Claude policy unexpectedly timed out"),
+                    &cancellation,
+                    &mut false,
+                )
+                .map(|status| status.success()),
+                "native_cli_input_policy" => {
+                    crate::login_cancel_guard::spawn_cli_inherited_login_scoped(
+                        &mut command,
+                        Duration::from_secs(10),
+                        (),
+                        "private-native",
+                        |_| panic!("foreground native policy unexpectedly timed out"),
+                        &cancellation,
+                    )
+                    .map(|status| status.success())
+                }
+                "codex_cli_input_policy" => {
+                    crate::login_cancel_guard::spawn_cli_piped_login_scoped(
+                        &mut command,
+                        Duration::from_secs(10),
+                        (),
+                        "private-codex",
+                        |line| output.push(line),
+                        |_| panic!("foreground Codex policy unexpectedly timed out"),
+                        &cancellation,
+                    )
+                    .map(|status| status.success())
+                }
+                _ => unreachable!(),
+            }
+            .expect("actual CLI caller policy completion");
+            assert!(success, "CLI caller failed to inherit foreground tty input");
+            if role == "codex_cli_input_policy" {
+                assert_eq!(
+                    output,
+                    vec!["INPUT_POLICY_OK"],
+                    "actual Codex reader lost stdout"
+                );
+            }
+            assert!(!cancellation
+                .close()
+                .expect("close private caller cancellation"));
+            assert!(fg_is(own), "CLI caller policy did not restore foreground");
+            done(&role)
+        }
+        "foreground_inherit" | "foreground_null" | "desktop_null" => {
+            let inherit = role == "foreground_inherit";
+            let mut command = if inherit {
+                sh("test -t 0")
+            } else {
+                sh("if IFS= read -r line; then exit 17; fi; exit 0")
+            };
+            // Policies override deliberately opposite builder input settings.
+            command.stdin(if inherit {
+                Stdio::null()
+            } else {
+                Stdio::piped()
+            });
+            let policy = if inherit {
+                group::StdinPolicy::Inherit
+            } else {
+                group::StdinPolicy::Null
+            };
+            let (child, group) = if role == "desktop_null" {
+                group::spawn(&mut command, policy)
+            } else {
+                group::spawn_attended(&mut command, policy)
+            }
+            .expect("spawn policy probe");
+            assert!(
+                child.stdin.is_none(),
+                "input policy retained a builder pipe"
+            );
+            let watchdog =
+                LoginWatchdog::new(Duration::from_secs(10), super::DeliveryPhase::Unknown);
+            let mut owner = OwnedLoginChild::adopt_group(child, group.clone(), watchdog, ());
+            let result = owner.wait_vendor_cancelled(
+                || Ok(true),
+                |_| {},
+                move || group.signal(group::GroupSignal::Kill),
+                || false,
+            );
+            assert!(result.expect("input policy probe finalized").success());
+            assert!(owner.custody_finalized(), "input policy custody unresolved");
+            assert!(fg_is(own), "input policy failed to restore foreground");
+            done(&role)
+        }
+        "background_stty" | "background_io" | "background_stop" => {
+            let inner = format!("{role}_inner");
+            let mut command = Command::new(std::env::current_exe().expect("test binary"));
+            command
+                .args([
+                    "--ignored",
+                    "--exact",
+                    ENTRY,
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(ROLE, &inner)
+                .stdin(Stdio::inherit())
+                .process_group(0);
+            let output = command.output().expect("spawn background dispatcher");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "background dispatcher failed: {stdout} {stderr}"
+            );
+            assert!(
+                stdout.contains(&format!("TTY_SENTINEL role={inner} ok")),
+                "background dispatcher did not run: {stdout} {stderr}"
+            );
+            if role == "background_stop" {
+                assert!(
+                    stderr.contains("was stopped by signal SIGSTOP"),
+                    "uncustodied stop signal identity missing: {stderr}"
+                );
+            }
+            assert!(fg_is(own), "background login stole foreground");
+            done(&role)
+        }
         "unresolved" => {
             // The leader exits, the census keeps refusing: custody ends
             // UNRESOLVED and Drop deliberately leaks the group handle.
@@ -353,7 +675,8 @@ fn tty_session_entry() {
         }
         "drop_stop" => {
             let mut command = sh("kill -STOP $$; sleep 20");
-            let (child, group) = group::spawn_attended(&mut command).expect("spawn vendor");
+            let (child, group) = group::spawn_attended(&mut command, group::StdinPolicy::Inherit)
+                .expect("spawn vendor");
             let watchdog =
                 LoginWatchdog::new(Duration::from_secs(20), super::DeliveryPhase::Unknown);
             let owner = OwnedLoginChild::adopt_group(child, group, watchdog, ());
@@ -424,9 +747,9 @@ fn tty_session_entry() {
     let attended = role == "fg";
     let mut command = sh("stty -echo; exit 0");
     let (mut child, group) = if attended {
-        group::spawn_attended(&mut command)
+        group::spawn_attended(&mut command, group::StdinPolicy::Inherit)
     } else {
-        group::spawn(&mut command)
+        group::spawn_legacy_unattended_for_tty_test(&mut command)
     }
     .expect("spawn vendor stand-in");
     let pid = child.id();

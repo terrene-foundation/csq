@@ -2,6 +2,7 @@
 //! admission; filesystem replacement faults model publication ambiguity. Neither
 //! reproduces the unobserved host incident. Include under cfg(all(test, unix)).
 use super::run_with_wait;
+use crate::platform::fs::WrittenPrivateFile;
 use crate::{
     error::PlatformError,
     messaging::{
@@ -167,8 +168,8 @@ fn und_retry_published_prepared_receipt_recovers_before_second_write() {
     let waits = RefCell::new(Vec::new());
     let before = RefCell::new(None);
     let real = real_fs();
-    let replace = |a: &Path, b: &Path| {
-        (real.replace)(a, b)?;
+    let replace = |a: &Path, b: &Path, identity: WrittenPrivateFile| {
+        (real.replace)(a, b, identity)?;
         if b.parent() == Some(store::store_dir(base.path()).as_path())
             && b.file_stem()
                 .and_then(|s| s.to_str())
@@ -356,7 +357,7 @@ fn und_retry_unpinned_legacy_send_never_retries_or_looks_up() {
     );
     let attempts = Cell::new(0);
     let real = real_fs();
-    let replace = |_: &Path, _: &Path| {
+    let replace = |_: &Path, _: &Path, _: WrittenPrivateFile| {
         Err(PlatformError::Io(io::Error::new(
             io::ErrorKind::WouldBlock,
             "legacy fixture",
@@ -402,7 +403,7 @@ fn und_retry_missing_or_corrupt_prepared_record_refuses_republication() {
         let public_writes = Cell::new(0);
         let before = RefCell::new(None);
         let real = real_fs();
-        let replace = |a: &Path, b: &Path| {
+        let replace = |a: &Path, b: &Path, identity: WrittenPrivateFile| {
             let public = b.parent() == Some(store::store_dir(base.path()).as_path())
                 && b.file_stem()
                     .and_then(|s| s.to_str())
@@ -410,7 +411,7 @@ fn und_retry_missing_or_corrupt_prepared_record_refuses_republication() {
             if public {
                 public_writes.set(public_writes.get() + 1);
                 if corrupt {
-                    (real.replace)(a, b)?;
+                    (real.replace)(a, b, identity)?;
                     std::fs::write(b, "{").unwrap();
                 }
                 return Err(PlatformError::Io(io::Error::new(
@@ -418,7 +419,7 @@ fn und_retry_missing_or_corrupt_prepared_record_refuses_republication() {
                     "prepared fixture",
                 )));
             }
-            (real.replace)(a, b)
+            (real.replace)(a, b, identity)
         };
         let fs = FsOps {
             replace: &replace,

@@ -67,7 +67,7 @@ use unicode_general_category::{get_general_category, GeneralCategory};
 use super::{same_start, START_TOLERANCE_SECS};
 use crate::error::PlatformError;
 use crate::platform::fs::{
-    atomic_replace, secure_dir, secure_file, unique_tmp_path, write_new_private,
+    secure_dir, secure_file, unique_tmp_path, write_new_private_retained, WrittenPrivateFile,
 };
 
 /// A directive is deleted this long after its last transition.
@@ -244,25 +244,34 @@ impl std::fmt::Display for DirectiveError {
 
 impl std::error::Error for DirectiveError {}
 
-type WriteFn<'a> = &'a dyn Fn(&Path, &[u8]) -> Result<(), PlatformError>;
+type WriteFn<'a, T> = &'a dyn Fn(&Path, &[u8]) -> Result<T, PlatformError>;
 
 /// Injected filesystem primitives for the write pipeline.
-pub struct FsOps<'a> {
-    /// Create the tmp file with the payload, mode 0600 at creation.
-    pub write_tmp: WriteFn<'a>,
+pub struct FsOps<'a, T = WrittenPrivateFile> {
+    /// Create the tmp file at mode 0600. The returned owner cleans up on Drop;
+    /// a failed creation cleans up only its own file before returning.
+    pub write_tmp: WriteFn<'a, T>,
     /// Narrow the tmp file's mode.
     pub secure: &'a dyn Fn(&Path) -> Result<(), PlatformError>,
     /// Rename the tmp over the target.
-    pub replace: &'a dyn Fn(&Path, &Path) -> Result<(), PlatformError>,
+    pub replace: &'a dyn Fn(&Path, &Path, T) -> Result<(), PlatformError>,
+}
+
+fn replace_retained(
+    _tmp: &Path,
+    target: &Path,
+    writer: WrittenPrivateFile,
+) -> Result<(), PlatformError> {
+    writer.replace(target)
 }
 
 /// The real `platform::fs` primitives.
 #[must_use]
 pub fn real_fs() -> FsOps<'static> {
     FsOps {
-        write_tmp: &write_new_private,
+        write_tmp: &write_new_private_retained,
         secure: &secure_file,
-        replace: &atomic_replace,
+        replace: &replace_retained,
     }
 }
 
@@ -683,10 +692,10 @@ pub(crate) fn ensure_dir(dir: &Path) -> Result<(), DirectiveError> {
     ensure_dir_as(DIRECTIVE_LABEL, dir)
 }
 
-pub(crate) fn write_atomic(
+pub(crate) fn write_atomic<T>(
     path: &Path,
     bytes: &[u8],
-    fs: &FsOps<'_>,
+    fs: &FsOps<'_, T>,
 ) -> Result<(), DirectiveError> {
     write_atomic_as(DIRECTIVE_LABEL, path, bytes, fs)
 }
@@ -761,53 +770,53 @@ fn is_leading_zero_index_alias(name: &str) -> bool {
     }
 }
 
-/// Write `bytes` to `path` via tmp -> secure -> replace. The tmp is removed on every
-/// failure branch (`security.md` §5a) EXCEPT when `write_tmp` itself reported
-/// `AlreadyExists`: the file at that name was then not created by this call and is not ours
-/// to delete.
-pub(crate) fn write_atomic_as(
+/// Write `bytes` to `path` via tmp -> secure -> replace. The returned writer owns
+/// cleanup on every failure branch (`security.md` §5a). A failed exclusive create
+/// never grants this pipeline ownership of the temporary pathname.
+pub(crate) fn write_atomic_as<T>(
     label: &str,
     path: &Path,
     bytes: &[u8],
-    fs: &FsOps<'_>,
+    fs: &FsOps<'_, T>,
 ) -> Result<(), DirectiveError> {
     let tmp = stage_atomic_as(label, path, bytes, fs)?;
-    commit_atomic_as(label, &tmp, path, fs)
+    commit_atomic_as(label, tmp, path, fs)
+}
+
+/// The writer owner stays beside the tmp through staging and commit.
+struct StagedAtomic<T> {
+    tmp: PathBuf,
+    identity: T,
 }
 
 /// The first two steps of [`write_atomic`]: a secured tmp file next to `path` holding
 /// `bytes`, removed on every failure branch.
-fn stage_atomic_as(
+fn stage_atomic_as<T>(
     label: &str,
     path: &Path,
     bytes: &[u8],
-    fs: &FsOps<'_>,
-) -> Result<PathBuf, DirectiveError> {
+    fs: &FsOps<'_, T>,
+) -> Result<StagedAtomic<T>, DirectiveError> {
     let tmp = unique_tmp_path(path);
-    if let Err(e) = (fs.write_tmp)(&tmp, bytes) {
-        let not_ours =
-            matches!(&e, PlatformError::Io(io_e) if io_e.kind() == io::ErrorKind::AlreadyExists);
-        if !not_ours {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        return Err(DirectiveError::undet(format!("{label}: write failed")));
-    }
+    // A failed exclusive create did not grant ownership of this pathname.
+    // Successful tokens own cleanup, including secure and publish failures.
+    let identity = (fs.write_tmp)(&tmp, bytes)
+        .map_err(|_| DirectiveError::undet(format!("{label}: write failed")))?;
     if (fs.secure)(&tmp).is_err() {
-        let _ = std::fs::remove_file(&tmp);
         return Err(DirectiveError::undet(format!("{label}: secure failed")));
     }
-    Ok(tmp)
+    Ok(StagedAtomic { tmp, identity })
 }
 
 /// The last step of [`write_atomic`]: rename the staged `tmp` over `path`, removing it on failure.
-fn commit_atomic_as(
+fn commit_atomic_as<T>(
     label: &str,
-    tmp: &Path,
+    staged: StagedAtomic<T>,
     path: &Path,
-    fs: &FsOps<'_>,
+    fs: &FsOps<'_, T>,
 ) -> Result<(), DirectiveError> {
-    if (fs.replace)(tmp, path).is_err() {
-        let _ = std::fs::remove_file(tmp);
+    let tmp = &staged.tmp;
+    if (fs.replace)(tmp, path, staged.identity).is_err() {
         return Err(DirectiveError::undet(format!("{label}: replace failed")));
     }
     Ok(())
@@ -5570,12 +5579,12 @@ mod tests {
     fn tmp_is_removed_when_replace_fails() {
         let t = dir();
         let replaced = Cell::new(0);
-        let replace = |_: &Path, _: &Path| {
+        let replace = |_: &Path, _: &Path, _: WrittenPrivateFile| {
             replaced.set(replaced.get() + 1);
             Err(fail())
         };
         let fs = FsOps {
-            write_tmp: &write_new_private,
+            write_tmp: &write_new_private_retained,
             secure: &secure_file,
             replace: &replace,
         };
@@ -5591,13 +5600,89 @@ mod tests {
     }
 
     #[test]
+    fn staged_atomic_routes_the_original_writer_token() {
+        let t = dir();
+        let target = t.path().join("token.json");
+        let written = Cell::new(0u64);
+        let published = Cell::new(0u64);
+        let write = |tmp: &Path, bytes: &[u8]| {
+            let writer = write_new_private_retained(tmp, bytes)?;
+            written.set(written.get() + 1);
+            Ok((written.get(), writer))
+        };
+        let replace = |_: &Path, path: &Path, (identity, writer): (u64, WrittenPrivateFile)| {
+            assert_eq!(identity, 1, "commit must receive the staged writer token");
+            published.set(identity);
+            writer.replace(path)
+        };
+        let fs = FsOps {
+            write_tmp: &write,
+            secure: &secure_file,
+            replace: &replace,
+        };
+        let staged = stage_atomic_as("test", &target, b"first", &fs).unwrap();
+        // A later write returns a different token; it must not replace the
+        // first stage's token through an ambient or global side channel.
+        let later = stage_atomic_as("test", &target, b"second", &fs).unwrap();
+        drop(later);
+        commit_atomic_as("test", staged, &target, &fs).unwrap();
+        assert_eq!(published.get(), 1);
+        assert_eq!(written.get(), 2);
+        assert_eq!(std::fs::read(target).unwrap(), b"first");
+        assert_eq!(std::fs::read_dir(t.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_stage_drop_preserves_foreign_tmp_occupant() {
+        let t = dir();
+        let target = t.path().join("target.json");
+        let staged = stage_atomic_as("test", &target, b"fixture", &real_fs()).unwrap();
+        let tmp = staged.tmp.clone();
+        let moved = t.path().join("relocated.json");
+        std::fs::rename(&tmp, &moved).unwrap();
+        std::fs::write(&tmp, b"foreign fixture").unwrap();
+        drop(staged);
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"foreign fixture");
+        assert_eq!(std::fs::read(&moved).unwrap(), b"fixture");
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn abandoned_atomic_stage_removes_its_tmp_without_publishing() {
+        let t = dir();
+        let target = t.path().join("abandoned.json");
+        let staged = stage_atomic_as("test", &target, b"fixture", &real_fs()).unwrap();
+        let tmp = staged.tmp.clone();
+        assert!(tmp.exists());
+        drop(staged);
+        assert!(!tmp.exists());
+        assert!(!target.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_atomic_stage_denies_tmp_relocation_and_publishes_original() {
+        let t = dir();
+        let target = t.path().join("target.json");
+        std::fs::write(&target, b"old fixture").unwrap();
+        let fs = real_fs();
+        let staged = stage_atomic_as("test", &target, b"original fixture", &fs).unwrap();
+        let tmp = staged.tmp.clone();
+        assert!(std::fs::rename(&tmp, t.path().join("relocated.json")).is_err());
+        commit_atomic_as("test", staged, &target, &fs).unwrap();
+        assert_eq!(std::fs::read(target).unwrap(), b"original fixture");
+        assert!(!tmp.exists());
+    }
+
+    #[test]
     fn tmp_is_removed_when_secure_fails() {
         let t = dir();
         let secure = |_: &Path| Err(fail());
         let fs = FsOps {
-            write_tmp: &write_new_private,
+            write_tmp: &write_new_private_retained,
             secure: &secure,
-            replace: &atomic_replace,
+            replace: &replace_retained,
         };
         assert_eq!(
             deliver_with_fs(t.path(), &fs).unwrap_err().code,
@@ -5610,15 +5695,15 @@ mod tests {
     #[test]
     fn tmp_is_removed_when_write_fails_after_creating_it() {
         let t = dir();
-        // a writer that created the file and then failed (the shape §5a guards against)
+        // The private writer owns cleanup if it creates a file before failing.
         let write = |p: &Path, b: &[u8]| {
-            std::fs::write(p, b).unwrap();
+            let _writer = write_new_private_retained(p, b)?;
             Err(fail())
         };
         let fs = FsOps {
             write_tmp: &write,
             secure: &secure_file,
-            replace: &atomic_replace,
+            replace: &replace_retained,
         };
         assert_eq!(
             deliver_with_fs(t.path(), &fs).unwrap_err().code,
@@ -5631,9 +5716,9 @@ mod tests {
     fn failed_ack_write_leaves_the_record_unchanged() {
         let t = dir();
         deliver_at(t.path(), NOW, &json(&dv(ID1, "a"))).unwrap();
-        let replace = |_: &Path, _: &Path| Err(fail());
+        let replace = |_: &Path, _: &Path, _: WrittenPrivateFile| Err(fail());
         let fs = FsOps {
-            write_tmp: &write_new_private,
+            write_tmp: &write_new_private_retained,
             secure: &secure_file,
             replace: &replace,
         };
@@ -5888,15 +5973,15 @@ mod tests {
     #[test]
     fn an_index_write_that_failed_is_repaired_by_the_next_mutating_call() {
         let t = dir();
-        let replace = |tmp: &Path, target: &Path| {
+        let replace = |_: &Path, target: &Path, identity: WrittenPrivateFile| {
             if target.extension().is_some_and(|e| e == "idx") {
                 Err(fail())
             } else {
-                atomic_replace(tmp, target)
+                identity.replace(target)
             }
         };
         let fs = FsOps {
-            write_tmp: &write_new_private,
+            write_tmp: &write_new_private_retained,
             secure: &secure_file,
             replace: &replace,
         };
@@ -5921,12 +6006,12 @@ mod tests {
         let writes = Cell::new(0);
         let write = |p: &Path, b: &[u8]| {
             writes.set(writes.get() + 1);
-            write_new_private(p, b)
+            write_new_private_retained(p, b)
         };
         let fs = FsOps {
             write_tmp: &write,
             secure: &secure_file,
-            replace: &atomic_replace,
+            replace: &replace_retained,
         };
         let r = deliver_with_fs(t.path(), &fs).unwrap();
         assert_eq!(r.status, "queued");
@@ -6048,9 +6133,9 @@ mod tests {
             f.sort();
             f
         };
-        let replace = |_: &Path, _: &Path| Err(fail());
+        let replace = |_: &Path, _: &Path, _: WrittenPrivateFile| Err(fail());
         let fs = FsOps {
-            write_tmp: &write_new_private,
+            write_tmp: &write_new_private_retained,
             secure: &secure_file,
             replace: &replace,
         };
@@ -6653,7 +6738,7 @@ mod tests {
         let fs = FsOps {
             write_tmp: &write,
             secure: &secure_file,
-            replace: &atomic_replace,
+            replace: &replace_retained,
         };
         let target = t.path().join("x.json");
         let e = write_atomic(&target, b"{}", &fs).unwrap_err();
@@ -7759,7 +7844,7 @@ mod tests {
         let fs = FsOps {
             write_tmp: &|_: &Path, _: &[u8]| Err(fail()),
             secure: &secure_file,
-            replace: &atomic_replace,
+            replace: &replace_retained,
         };
         let e = deliver_with_fs(t.path(), &fs).unwrap_err();
         assert_eq!(e.code, SdkErrorCode::Undetermined);
@@ -7778,15 +7863,15 @@ mod tests {
         // From here no tombstone file exists and every rename onto it fails: the horizon
         // alone must carry the refusal.
         let replaced = Cell::new(0);
-        let replace = |from: &Path, to: &Path| {
+        let replace = |_: &Path, to: &Path, identity: WrittenPrivateFile| {
             if to.file_name().is_some_and(|n| n == TOMBSTONE_FILE) {
                 replaced.set(replaced.get() + 1);
                 return Err(fail());
             }
-            atomic_replace(from, to)
+            identity.replace(to)
         };
         let fs = FsOps {
-            write_tmp: &write_new_private,
+            write_tmp: &write_new_private_retained,
             secure: &secure_file,
             replace: &replace,
         };
@@ -7906,12 +7991,12 @@ mod tests {
                 reached.set(reached.get() + 1);
                 return Err(fail());
             }
-            write_new_private(p, b)
+            write_new_private_retained(p, b)
         };
         let fs = FsOps {
             write_tmp: &write,
             secure: &secure_file,
-            replace: &atomic_replace,
+            replace: &replace_retained,
         };
         let r = deliver_inner(
             t.path(),

@@ -142,7 +142,6 @@ pub fn cli_shim_is_current(verified: Option<&str>, expected: &str) -> bool {
 /// Publish one complete receipt; a failure preserves the previous receipt and
 /// removes only the temporary file created by this call.
 pub fn write_refresh_receipt(base_dir: &Path, receipt: &ShimRefreshReceipt) -> Result<()> {
-    use std::io::Write;
     std::fs::create_dir_all(base_dir).context("create CLI-refresh receipt directory")?;
     let path = base_dir.join(RECEIPT_FILENAME);
     let bytes = serde_json::to_vec_pretty(receipt).context("serialize CLI-refresh receipt")?;
@@ -151,30 +150,11 @@ pub fn write_refresh_receipt(base_dir: &Path, receipt: &ShimRefreshReceipt) -> R
         "CLI-refresh receipt too large"
     );
     let tmp = crate::platform::fs::unique_tmp_path(&path);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    // Exclusive open: an existing file/symlink is foreign and is never deleted.
-    let mut file = options
-        .open(&tmp)
-        .context("create CLI-refresh receipt temp file")?;
-    let result = (|| {
-        #[cfg(not(unix))]
-        crate::platform::fs::secure_file(&tmp)?;
-        file.write_all(&bytes)
-            .context("write CLI-refresh receipt")?;
-        file.sync_all().context("sync CLI-refresh receipt")?;
-        drop(file);
-        crate::platform::fs::atomic_replace(&tmp, &path).context("replace CLI-refresh receipt")
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
+    // Paths can identify the user. Retain the synced private writer through
+    // publication; its cleanup leaves an existing temp entry untouched.
+    let writer = crate::platform::fs::write_new_private_synced_retained(&tmp, &bytes)
+        .context("write CLI-refresh receipt temp file")?;
+    writer.replace(&path).context("replace CLI-refresh receipt")
 }
 
 /// Read the last attempt. Absence is distinct from an unreadable/corrupt receipt.
@@ -201,6 +181,37 @@ pub fn read_refresh_receipt(base_dir: &Path) -> Result<Option<ShimRefreshReceipt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_receipt_publish_failure_removes_tmp_and_preserves_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(RECEIPT_FILENAME);
+        std::fs::create_dir(&path).unwrap();
+        let sentinel = path.join("keep");
+        std::fs::write(&sentinel, b"destination sentinel").unwrap();
+        let receipt = ShimRefreshReceipt {
+            outcome: "updated".into(),
+            target_path: Some(dir.path().join("csq")),
+            expected_version_line: "csq 2.21.0 (enterprise)".into(),
+            verified_version_line: None,
+            plist_decision: "repaired".into(),
+            stale_plist_decision: "none".into(),
+            timestamp: 100,
+        };
+
+        let error = write_refresh_receipt(dir.path(), &receipt).unwrap_err();
+        assert_eq!(error.to_string(), "replace CLI-refresh receipt");
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"destination sentinel");
+        let remaining: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![path],
+            "failed publication must remove its tmp"
+        );
+    }
 
     #[test]
     fn refresh_receipt_records_repair_and_replaces_previous_failure_privately() {

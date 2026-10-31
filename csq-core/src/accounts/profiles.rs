@@ -24,7 +24,6 @@
 use crate::accounts::identity_store::{self, IdentityId};
 use crate::accounts::profiles_lock::ProfilesFileLock;
 use crate::error::ConfigError;
-use crate::platform::fs::atomic_replace;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -414,20 +413,29 @@ pub fn save(path: &Path, profiles: &ProfilesFile) -> Result<(), ConfigError> {
     }
 
     let tmp = crate::platform::fs::unique_tmp_path(path);
+    write_profiles_json_at(path, &json, tmp)
+}
+
+fn write_profiles_json_at(
+    path: &Path,
+    json: &str,
+    tmp: std::path::PathBuf,
+) -> Result<(), ConfigError> {
     // §5a: profiles.json carries email + method + provider PII.
     // `write_new_private` creates the tmp file at 0o600 AT CREATION
     // (`create_new` + `mode(0o600)`), closing the window a separate
     // `std::fs::write` + `secure_file` pair used to leave open.
-    if let Err(e) = crate::platform::fs::write_new_private(&tmp, json.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(ConfigError::InvalidJson {
-            path: tmp,
-            reason: format!("write: {e}"),
-        });
-    }
+    let writer = match crate::platform::fs::write_new_private_retained(&tmp, json.as_bytes()) {
+        Ok(writer) => writer,
+        Err(e) => {
+            return Err(ConfigError::InvalidJson {
+                path: tmp,
+                reason: format!("write: {e}"),
+            });
+        }
+    };
 
-    if let Err(e) = atomic_replace(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = writer.replace(path) {
         return Err(ConfigError::InvalidJson {
             path: path.to_path_buf(),
             reason: format!("atomic replace: {e}"),
@@ -5661,5 +5669,75 @@ mod tests {
             .unwrap()
             .by_slot
             .is_empty());
+    }
+}
+
+#[cfg(test)]
+mod retained_writer_regression_tests {
+    use super::*;
+
+    #[test]
+    fn profiles_temp_collision_preserves_foreign_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let tmp = dir.path().join("profiles.tmp");
+        std::fs::write(&path, b"old profiles").unwrap();
+        std::fs::write(&tmp, b"foreign temporary entry").unwrap();
+        let result = write_profiles_json_at(&path, "{}", tmp.clone());
+        assert!(
+            matches!(result, Err(ConfigError::InvalidJson { path: p, reason })
+            if p == tmp && reason.starts_with("write: "))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"old profiles");
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"foreign temporary entry");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profiles_temp_collision_preserves_foreign_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let tmp = dir.path().join("profiles.tmp");
+        let foreign = dir.path().join("foreign.json");
+        std::fs::write(&foreign, b"foreign payload").unwrap();
+        std::os::unix::fs::symlink(&foreign, &tmp).unwrap();
+        assert!(write_profiles_json_at(&path, "{}", tmp.clone()).is_err());
+        assert_eq!(std::fs::read_link(&tmp).unwrap(), foreign);
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign payload");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn profiles_replace_failure_cleans_owned_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let tmp = dir.path().join("profiles.tmp");
+        std::fs::create_dir(&path).unwrap();
+        let result = write_profiles_json_at(&path, "{}", tmp.clone());
+        assert!(
+            matches!(result, Err(ConfigError::InvalidJson { path: p, reason })
+            if p == path && reason.starts_with("atomic replace: "))
+        );
+        assert!(path.is_dir());
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn profiles_replace_publishes_complete_private_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let tmp = dir.path().join("profiles.tmp");
+        std::fs::write(&path, b"old profiles").unwrap();
+        write_profiles_json_at(&path, r#"{"by_slot":{}}"#, tmp.clone()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), br#"{"by_slot":{}}"#);
+        assert!(!tmp.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 }

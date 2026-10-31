@@ -3334,7 +3334,10 @@ fn native_vendor_with_operation<K: Send + Sync + 'static>(
         Arc::clone(&slot),
         operation,
     ));
-    let (child, group) = crate::login_child_custody::group::spawn(&mut command)?;
+    let (child, group) = crate::login_child_custody::group::spawn(
+        &mut command,
+        crate::login_child_custody::group::StdinPolicy::Null,
+    )?;
     let mut owned = crate::login_child_custody::OwnedLoginChild::adopt_group(
         child,
         group,
@@ -3755,7 +3758,12 @@ fn begin_claude_login_for_base(
 ) -> Result<ClaudeLoginView, String> {
     let base = std::fs::canonicalize(base).map_err(|_| "identity base refused".to_string())?;
     let prior = csq_core::accounts::anthropic_identity::capture_login_prior(&base, account)
-        .map_err(|e| format!("identity capture failed: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "identity capture failed: {}",
+                csq_core::accounts::login::LoginCommitOutcome::describe_prior_capture_error(&e)
+            )
+        })?;
     csq_core::oauth::login::start_login_with_prior(store, account, base, prior)
         .map(ClaudeLoginView::from)
         .map_err(|e| e.to_string())
@@ -3833,7 +3841,12 @@ pub async fn start_claude_login(base_dir: String, account: u16) -> Result<u16, S
         // by absolute path so the Finder-default $PATH gap can't
         // bite us.
         let prior = csq_core::accounts::anthropic_identity::capture_login_prior(&base, account_num)
-            .map_err(|e| format!("identity capture failed: {e}"))?;
+            .map_err(|e| {
+                format!(
+                    "identity capture failed: {}",
+                    csq_core::accounts::login::LoginCommitOutcome::describe_prior_capture_error(&e)
+                )
+            })?;
         let status = std::process::Command::new(&claude_bin)
             .args(["auth", "login"])
             .env("CLAUDE_CONFIG_DIR", &config_dir)
@@ -4057,6 +4070,64 @@ fn complete_pending_claude_login_using(
 #[cfg(test)]
 mod pending_oauth_context_tests {
     use super::*;
+
+    /// Exercises the real pre-login boundary. The production profiles-lock budget
+    /// expires before any OAuth state is created; no vendor transport is called.
+    #[test]
+    fn prior_capture_busy_reports_retry_without_creating_pending_oauth() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = csq_core::oauth::OAuthStateStore::new();
+        let base = dir.path().to_path_buf();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let error = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let _holder =
+                    csq_core::accounts::profiles_lock::ProfilesFileLock::acquire(&base).unwrap();
+                ready_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            });
+            ready_rx.recv().unwrap();
+            let result =
+                begin_claude_login_for_base(&store, dir.path(), AccountNum::try_from(7).unwrap());
+            drop(release_tx);
+            result.err().expect("held profiles lock must refuse login")
+        });
+        assert_eq!(
+            error,
+            "identity capture failed: another csq operation holds the profiles store; retry the login in a moment (oauth_identity_busy)"
+        );
+        assert!(
+            store.is_empty(),
+            "refused capture must not mint pending state"
+        );
+    }
+
+    #[test]
+    fn prior_capture_invalid_profiles_keeps_remedy_and_bytes_without_pending_oauth() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = csq_core::oauth::OAuthStateStore::new();
+        let path = csq_core::accounts::profiles::profiles_path(dir.path());
+        let before = b"fixture-invalid-profiles";
+        std::fs::write(&path, before).unwrap();
+        csq_core::platform::fs::secure_file(&path).unwrap();
+        let error =
+            begin_claude_login_for_base(&store, dir.path(), AccountNum::try_from(7).unwrap())
+                .err()
+                .expect("invalid profiles must refuse login");
+        assert_eq!(
+            error,
+            format!(
+                "identity capture failed: {}",
+                csq_core::accounts::anthropic_identity::IdentityError::ProfilesReadRefused
+            )
+        );
+        assert!(
+            store.is_empty(),
+            "refused capture must not mint pending state"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
     #[test]
     fn quit_gate_refuses_existing_paste_code_helper_before_mint_transport() {
         csq_core::platform::test_env::with_in_memory_secret_backend(|| {
@@ -6259,7 +6330,10 @@ fn codex_vendor_with_command_impl<R: tauri::Runtime, K: Send + Sync + 'static>(
         Arc::clone(&slot_custody),
         operation,
     ));
-    let (child, group) = crate::login_child_custody::group::spawn(&mut command)?;
+    let (child, group) = crate::login_child_custody::group::spawn(
+        &mut command,
+        crate::login_child_custody::group::StdinPolicy::Null,
+    )?;
     let mut owned = crate::login_child_custody::OwnedLoginChild::adopt_group(
         child,
         group,
@@ -8135,7 +8209,7 @@ mod tests {
 
         let executor_thread = std::thread::current().id();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let mut read = Box::pin(run_desktop_read("fixture", move || {
             let _ = started_tx.send(std::thread::current().id());
             // Fixture cleanup bound only: no elapsed-time assertion. An inline
@@ -12659,7 +12733,7 @@ mod tests {
             manifest["rates"] = serde_json::json!([{
                 "match_kind": "exact", "patterns": ["deepseek-flash"], "strip_context_hint": false,
                 "epochs": [{"start_unix": null, "end_unix": null, "peak": null,
-                    "rate": {"input_per_1m_usd": price, "output_per_1m_usd": 0.0, "cache_read_per_1m_usd": null, "cache_write_per_1m_usd": null}}],
+                    "rate": {"input_per_1m_usd": price, "output_per_1m_usd": 1.0, "cache_read_per_1m_usd": null, "cache_write_per_1m_usd": null}}],
                 "evidence": "Private synthetic fixture, not vendor pricing"
             }]);
             std::fs::write(

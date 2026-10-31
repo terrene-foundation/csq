@@ -890,8 +890,8 @@ Apache License
 
 Used by:
 
-- [csq-redact 2.21.3](https://github.com/terrene-foundation/csq)
-- [csq-sdk 2.21.3](https://github.com/terrene-foundation/csq)
+- [csq-redact 2.21.4](https://github.com/terrene-foundation/csq)
+- [csq-sdk 2.21.4](https://github.com/terrene-foundation/csq)
 - [ryu 1.0.23](https://github.com/dtolnay/ryu)
 - [sync_wrapper 1.0.2](https://github.com/Actyx/sync_wrapper)
 

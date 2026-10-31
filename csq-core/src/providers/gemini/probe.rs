@@ -40,7 +40,7 @@ use super::settings::{
     extract_model_name, extract_selected_type, extract_system_instruction,
     merge_managed_into_existing, SELECTED_TYPE_API_KEY, SELECTED_TYPE_OAUTH_PERSONAL,
 };
-use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+use crate::platform::fs::secure_file;
 use std::path::{Path, PathBuf};
 
 /// Maps a binding's auth mode to the `pin_selected_type` parameter
@@ -217,34 +217,44 @@ fn reassert_with_system_instruction_internal(
         requested_system_instruction,
         pin,
     );
-    let tmp = unique_tmp_path(&settings_path);
-    if let Err(e) = std::fs::write(&tmp, body.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(ProbeError::Io {
-            path: tmp,
-            source: e,
-        });
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(ProbeError::RewriteFailed {
-            path: settings_path,
-            reason: format!("secure_file: {e}"),
-        });
-    }
-    if let Err(e) = atomic_replace(&tmp, &settings_path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(ProbeError::RewriteFailed {
-            path: settings_path,
-            reason: format!("atomic replace: {e}"),
-        });
-    }
+    write_settings_at(settings_path, &body)?;
 
     Ok(if existing.is_some() {
         DriftOutcome::Corrected
     } else {
         DriftOutcome::SeededFresh
     })
+}
+
+fn write_settings_at(settings_path: PathBuf, body: &str) -> Result<(), ProbeError> {
+    let writer =
+        match crate::platform::fs::write_private_tmp_retained(&settings_path, body.as_bytes()) {
+            Ok(writer) => writer,
+            Err(error) => {
+                let source = match error {
+                    crate::error::PlatformError::Io(source) => source,
+                    other => std::io::Error::other(other),
+                };
+                return Err(ProbeError::Io {
+                    path: settings_path,
+                    source,
+                });
+            }
+        };
+    if let Err(e) = secure_file(writer.path()) {
+        return Err(ProbeError::RewriteFailed {
+            path: settings_path,
+            reason: format!("secure_file: {e}"),
+        });
+    }
+    if let Err(e) = writer.replace(&settings_path) {
+        return Err(ProbeError::RewriteFailed {
+            path: settings_path,
+            reason: format!("atomic replace: {e}"),
+        });
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -586,5 +596,74 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&written).unwrap();
         assert_eq!(v["mcpServers"]["filesystem"]["command"], "mcp-fs");
         assert_eq!(v["ui"]["theme"], "dark");
+    }
+}
+
+#[cfg(test)]
+mod retained_writer_regression_tests {
+    use super::*;
+
+    #[test]
+    fn settings_reassert_retries_real_create_collision() {
+        use std::{
+            cell::{Cell, RefCell},
+            rc::Rc,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let gemini = dir.path().join(".gemini");
+        let path = gemini.join("settings.json");
+        std::fs::create_dir_all(&gemini).unwrap();
+        std::fs::write(&path, r#"{"model":{"name":"old"},"ui":{"theme":"dark"}}"#).unwrap();
+        let foreign = Rc::new(RefCell::new(None));
+        let observed_foreign = foreign.clone();
+        let planted = Cell::new(false);
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |candidate| {
+                if candidate.parent() == Some(gemini.as_path())
+                    && candidate
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .starts_with("settings.tmp.")
+                    && !planted.replace(true)
+                {
+                    std::fs::write(candidate, b"foreign temporary entry").unwrap();
+                    *observed_foreign.borrow_mut() = Some(candidate.to_path_buf());
+                }
+            },
+            || {
+                reassert_settings_drift_with_system_instruction(
+                    dir.path(),
+                    "gemini-2.5-pro",
+                    Some("fixture instruction"),
+                    &AuthMode::ApiKey,
+                )
+            },
+        );
+        let foreign = foreign
+            .borrow()
+            .clone()
+            .expect("production CREATE hook hit");
+        assert!(
+            matches!(result, Ok(DriftOutcome::Corrected)),
+            "settings reassert must succeed after collision: {result:?}"
+        );
+        let written = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            extract_model_name(&written).as_deref(),
+            Some("gemini-2.5-pro")
+        );
+        assert_eq!(
+            extract_selected_type(&written).as_deref(),
+            Some("gemini-api-key")
+        );
+        assert_eq!(
+            extract_system_instruction(&written).as_deref(),
+            Some("fixture instruction")
+        );
+        let json: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(json["ui"]["theme"], "dark");
+        assert_eq!(std::fs::read(foreign).unwrap(), b"foreign temporary entry");
     }
 }

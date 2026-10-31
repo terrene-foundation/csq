@@ -141,21 +141,22 @@ pub(crate) fn write_anthropic_metadata_new(
     metadata: &serde_json::Value,
 ) -> Result<(), std::io::Error> {
     // SEC-2.15 (unified, R1 M1): both directories via the one shared
-    // fail-closed helper (0o700 at creation, symlink-refusing). The
-    // never-overwrite guarantee lives at the file level: `write_new_private`
-    // below refuses an existing `identity.json`.
+    // fail-closed helper (0o700 at creation, symlink-refusing). Retained
+    // no-replace publication below grants the final name only when absent;
+    // an existing or racing identity.json is refused without replacement.
     ensure_private_identity_dir(base, id)
         .map_err(|_| std::io::Error::other("identity_namespace_refused"))?;
     let path = identity_json_path_for(base, id);
     let bytes =
         zeroize::Zeroizing::new(serde_json::to_vec(metadata).map_err(std::io::Error::other)?);
-    let tmp = crate::platform::fs::unique_tmp_path(&path);
-    let result = crate::platform::fs::write_new_private(&tmp, &bytes)
-        .and_then(|_| crate::platform::fs::atomic_replace(&tmp, &path));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    let result = crate::platform::fs::write_private_tmp_synced_retained(&path, &bytes)
+        .and_then(|writer| writer.publish_noreplace(&path));
+    match result {
+        Ok(crate::platform::fs::PublishOutcome::Published) => Ok(()),
+        Ok(crate::platform::fs::PublishOutcome::AlreadyExists) | Err(_) => {
+            Err(std::io::Error::other("identity_metadata_stage_failed"))
+        }
     }
-    result.map_err(|_| std::io::Error::other("identity_metadata_stage_failed"))
 }
 
 /// Returns `<base>/identities/<uuid>/credentials.json`.
@@ -925,6 +926,123 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::path::PathBuf;
+
+    #[test]
+    fn f_a_identity_metadata_refuses_existing_final_target() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = IdentityId::new_v4();
+        ensure_private_identity_dir(dir.path(), id).unwrap();
+        let target = identity_json_path_for(dir.path(), id);
+        let original = b"foreign final identity metadata";
+        std::fs::write(&target, original).unwrap();
+        let stage = std::rc::Rc::new(std::cell::RefCell::new(None::<PathBuf>));
+        let observed = std::rc::Rc::clone(&stage);
+        let selected_target = target.clone();
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |candidate| {
+                assert_eq!(candidate.parent(), selected_target.parent());
+                assert_ne!(candidate, selected_target.as_path());
+                assert!(
+                    observed.borrow().is_none(),
+                    "fixture expects one private stage"
+                );
+                *observed.borrow_mut() = Some(candidate.to_path_buf());
+            },
+            || {
+                write_anthropic_metadata_new(
+                    dir.path(),
+                    id,
+                    &serde_json::json!({"provider": "anthropic", "email": "new@example.invalid"}),
+                )
+            },
+        );
+        let stage = stage
+            .borrow()
+            .clone()
+            .expect("private CREATE must be observed");
+        assert!(!stage.exists(), "owned private stage must be cleaned");
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        let error = result.expect_err("existing final identity must refuse publication");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "identity_metadata_stage_failed");
+    }
+
+    #[test]
+    fn f_a_identity_metadata_refuses_racing_final_target() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = IdentityId::new_v4();
+        ensure_private_identity_dir(dir.path(), id).unwrap();
+        let target = identity_json_path_for(dir.path(), id);
+        let original = b"foreign final identity metadata";
+        let stage = std::rc::Rc::new(std::cell::RefCell::new(None::<PathBuf>));
+        let observed = std::rc::Rc::clone(&stage);
+        let selected_target = target.clone();
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |candidate| {
+                assert_eq!(candidate.parent(), selected_target.parent());
+                assert_ne!(candidate, selected_target.as_path());
+                assert!(
+                    observed.borrow().is_none(),
+                    "fixture expects one private stage"
+                );
+                assert!(!selected_target.exists());
+                std::fs::write(&selected_target, original).unwrap();
+                *observed.borrow_mut() = Some(candidate.to_path_buf());
+            },
+            || {
+                write_anthropic_metadata_new(
+                    dir.path(),
+                    id,
+                    &serde_json::json!({"provider": "anthropic", "email": "new@example.invalid"}),
+                )
+            },
+        );
+        let stage = stage
+            .borrow()
+            .clone()
+            .expect("private CREATE must be observed");
+        assert!(!stage.exists(), "owned private stage must be cleaned");
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        let error = result.expect_err("existing final identity must refuse publication");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "identity_metadata_stage_failed");
+    }
+
+    #[test]
+    fn f_a_identity_metadata_retries_sibling_collision() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = IdentityId::new_v4();
+        let metadata = serde_json::json!({
+            "provider": "anthropic", "email": "fixture@example.invalid"
+        });
+        let target = identity_json_path_for(dir.path(), id);
+        let foreign = std::rc::Rc::new(std::cell::RefCell::new(None::<std::path::PathBuf>));
+        let planted = std::rc::Rc::clone(&foreign);
+        let selected_target = target.clone();
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |candidate| {
+                assert_eq!(candidate.parent(), selected_target.parent());
+                assert_ne!(candidate, selected_target.as_path());
+                if planted.borrow().is_none() {
+                    std::fs::write(candidate, b"foreign collision sentinel").unwrap();
+                    *planted.borrow_mut() = Some(candidate.to_path_buf());
+                }
+            },
+            || write_anthropic_metadata_new(dir.path(), id, &metadata),
+        );
+        let foreign = foreign.borrow().clone().expect("create observer must run");
+        assert_eq!(
+            std::fs::read(&foreign).unwrap(),
+            b"foreign collision sentinel"
+        );
+        assert!(
+            result.is_ok(),
+            "first temporary collision must not fail the save"
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+        assert_eq!(saved, metadata);
+    }
 
     /// R2 M2: the tighten-only identity entry point never resurrects a
     /// removed identity dir — the race window is a directory removed (by

@@ -44,7 +44,7 @@ use crate::accounts::{discovery, AccountSource};
 use crate::credentials::{self, file as cred_file};
 use crate::error::redact_tokens;
 use crate::http::codex::{parse_wham_response, WhamSnapshot};
-use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+use crate::platform::fs::write_private_tmp_retained;
 use crate::providers::catalog::Surface;
 use crate::quota::{state as quota_state, AccountQuota, UsageWindow};
 use crate::types::AccountNum;
@@ -601,19 +601,15 @@ fn write_redacted(path: &Path, body: &[u8]) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let redacted = redact_pii_json(body);
-    let tmp = unique_tmp_path(path);
-    if let Err(e) = std::fs::write(&tmp, redacted.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    if let Err(e) = secure_file(&tmp).map_err(|pe| std::io::Error::other(pe.to_string())) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    if let Err(e) = atomic_replace(&tmp, path).map_err(|pe| std::io::Error::other(pe.to_string())) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
+    // Redaction is best-effort (including non-JSON bodies); unknown fields can
+    // still contain secrets/PII. Create privately and bind the actual writer.
+    let writer = write_private_tmp_retained(path, redacted.as_bytes()).map_err(|e| match e {
+        crate::error::PlatformError::Io(io) => io,
+        other => std::io::Error::other(other.to_string()),
+    })?;
+    writer
+        .replace(path)
+        .map_err(|pe| std::io::Error::other(pe.to_string()))?;
     Ok(())
 }
 
@@ -670,6 +666,51 @@ fn redact_pii_value(value: &mut serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f4_collision_redacted_capture_retries_without_touching_foreign() {
+        let dir = TempDir::new().unwrap();
+        let target = raw_capture_path(dir.path());
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"old capture").unwrap();
+        let collision = std::rc::Rc::new(std::cell::RefCell::new(None::<std::path::PathBuf>));
+        let planted = std::rc::Rc::clone(&collision);
+        let sandbox = dir.path().to_path_buf();
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |candidate| {
+                assert!(candidate.starts_with(&sandbox));
+                if planted.borrow().is_none() {
+                    std::fs::write(candidate, b"foreign collision sentinel").unwrap();
+                    *planted.borrow_mut() = Some(candidate.to_path_buf());
+                }
+            },
+            || {
+                write_raw_capture(
+                    dir.path(),
+                    br#"{"email":"fixture@example.invalid","value":"new"}"#,
+                )
+            },
+        );
+        let foreign = collision
+            .borrow()
+            .clone()
+            .expect("production create observer must run");
+        assert_eq!(
+            std::fs::read(foreign).unwrap(),
+            b"foreign collision sentinel"
+        );
+        assert!(
+            result.is_ok(),
+            "redacted capture must publish after collision: {result:?}"
+        );
+        let published: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(target).unwrap()).unwrap();
+        assert_eq!(
+            published,
+            serde_json::json!({"email": "REDACTED@example.invalid", "value": "new"})
+        );
+    }
+
     use crate::credentials::{
         self, file as cred_file, CodexCredentialFile, CodexTokensFile, CredentialFile,
     };

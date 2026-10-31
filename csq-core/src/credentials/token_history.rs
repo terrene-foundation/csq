@@ -27,7 +27,6 @@
 use crate::accounts::identity_store::{token_history_path_for, IdentityId};
 use crate::accounts::{anthropic_identity as ai, profiles_lock::ProfilesFileLock};
 use crate::credentials::CredentialFile;
-use crate::platform::fs::atomic_replace;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -366,9 +365,8 @@ fn enqueue_pending_intent(
         );
         return false;
     };
-    let tmp = crate::platform::fs::unique_tmp_path(&path);
-    if std::fs::write(&tmp, json.as_bytes()).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    let Ok(written) = crate::platform::fs::write_private_tmp_retained(&path, json.as_bytes())
+    else {
         warn!(
             error_kind = "token_history_pending_write_failed",
             caller,
@@ -376,9 +374,8 @@ fn enqueue_pending_intent(
              segment intent could NOT be made durable"
         );
         return false;
-    }
-    if crate::platform::fs::secure_file(&tmp).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    };
+    if crate::platform::fs::secure_file(written.path()).is_err() {
         warn!(
             error_kind = "token_history_pending_write_failed",
             caller,
@@ -387,8 +384,7 @@ fn enqueue_pending_intent(
         );
         return false;
     }
-    if atomic_replace(&tmp, &path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    if written.replace(&path).is_err() {
         warn!(
             error_kind = "token_history_pending_write_failed",
             caller,
@@ -1169,52 +1165,53 @@ fn write_history_json(path: &Path, file: &HistoryFile, caller: &str) -> bool {
     // §5a: treated as secret-bearing (fingerprints of Anthropic refresh
     // tokens — a hash, not the raw token, but §5a's own table names "OAuth
     // tokens, refresh tokens" without a fingerprint carve-out, so ambiguity
-    // resolves toward secret-bearing here). `write_new_private` creates
-    // the tmp file at 0o600 at creation, closing the window a separate
-    // write + secure_file pair would leave open.
-    let tmp = crate::platform::fs::unique_tmp_path(&path);
-    if let Err(e) = crate::platform::fs::write_new_private(&tmp, json.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        // `keychain-fix-r11.md` S-LOW-2: this function no longer calls
-        // `create_dir_all`/`secure_dir` on the parent at all — that was the
-        // SAME resurrection hazard `ensure_identity_dir` (S-N-2) already
-        // named and was supposed to have closed: `ensure_identity_dir`'s
-        // check and this write are two SEPARATE steps, and if `csq logout`
-        // removes the identity dir in the window between them (nothing
-        // requires the two to share a lock), a `create_dir_all` here would
-        // silently recreate an empty, credential-less ghost directory —
-        // exactly what `ensure_identity_dir`'s own doc says must never
-        // happen. `ENOENT` (parent gone) now surfaces as an ordinary write
-        // failure and is skipped cleanly, never resurrected.
-        // `write_new_private`'s only failure paths are `open()` (parent
-        // missing surfaces here as an ordinary io::Error) and `write_all`,
-        // both wrapped as `PlatformError::Io` — so this match preserves the
-        // ENOENT distinction the old `e.kind()` check made directly on the
-        // io::Error `std::fs::write` used to return.
-        let parent_gone = matches!(
-            &e,
-            crate::error::PlatformError::Io(io_err)
-                if io_err.kind() == std::io::ErrorKind::NotFound
-        );
-        if parent_gone {
-            warn!(
-                error_kind = "token_history_identity_dir_absent",
-                caller,
-                "token-history write: identity dir does not exist (removed \
-                 concurrently, e.g. by logout) — skipped, never resurrected"
-            );
-        } else {
-            warn!(
-                error_kind = "token_history_write_failed",
-                caller,
-                "token-history write: write failed: {}",
-                crate::error::redact_tokens(&e.to_string())
-            );
-        }
-        return false;
-    }
-    if let Err(e) = atomic_replace(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
+    // resolves toward secret-bearing here). The retrying private factory
+    // creates the tmp at 0o600 and syncs it before publication, closing the
+    // window a separate write + secure_file pair would leave open.
+    let written =
+        match crate::platform::fs::write_private_tmp_synced_retained(&path, json.as_bytes()) {
+            Ok(written) => written,
+            Err(e) => {
+                // `keychain-fix-r11.md` S-LOW-2: this function no longer calls
+                // `create_dir_all`/`secure_dir` on the parent at all — that was the
+                // SAME resurrection hazard `ensure_identity_dir` (S-N-2) already
+                // named and was supposed to have closed: `ensure_identity_dir`'s
+                // check and this write are two SEPARATE steps, and if `csq logout`
+                // removes the identity dir in the window between them (nothing
+                // requires the two to share a lock), a `create_dir_all` here would
+                // silently recreate an empty, credential-less ghost directory —
+                // exactly what `ensure_identity_dir`'s own doc says must never
+                // happen. `ENOENT` (parent gone) now surfaces as an ordinary write
+                // failure and is skipped cleanly, never resurrected.
+                // The retained writer can fail during exclusive creation, private
+                // owner/ACL/label validation, writing, or identity capture. Only an
+                // Io(NotFound) means the parent disappeared; other failures keep the
+                // generic write-failed classification. The writer removes only a file
+                // it created, so an exclusive-create collision grants no cleanup right.
+                let parent_gone = matches!(
+                    &e,
+                    crate::error::PlatformError::Io(io_err)
+                        if io_err.kind() == std::io::ErrorKind::NotFound
+                );
+                if parent_gone {
+                    warn!(
+                        error_kind = "token_history_identity_dir_absent",
+                        caller,
+                        "token-history write: identity dir does not exist (removed \
+                     concurrently, e.g. by logout) — skipped, never resurrected"
+                    );
+                } else {
+                    warn!(
+                        error_kind = "token_history_write_failed",
+                        caller,
+                        "token-history write: write failed: {}",
+                        crate::error::redact_tokens(&e.to_string())
+                    );
+                }
+                return false;
+            }
+        };
+    if let Err(e) = written.replace(&path) {
         warn!(
             error_kind = "token_history_replace_failed",
             caller,
@@ -1568,13 +1565,10 @@ pub(crate) fn record_owner_verified_v2_locked(
     let Ok(bytes) = serde_json::to_vec(&file) else {
         return OwnerVerifiedRecord::Failed;
     };
-    let tmp = crate::platform::fs::unique_tmp_path(&path);
-    if crate::platform::fs::write_new_private(&tmp, &bytes).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    let Ok(written) = crate::platform::fs::write_private_tmp_synced_retained(&path, &bytes) else {
         return OwnerVerifiedRecord::Failed;
-    }
-    if atomic_replace(&tmp, &path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    };
+    if written.replace(&path).is_err() {
         return OwnerVerifiedRecord::Failed;
     }
     OwnerVerifiedRecord::Written
@@ -1669,6 +1663,111 @@ pub(crate) fn record_write(base: &Path, id: IdentityId, creds: &CredentialFile) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f_a_token_history_retries_sibling_collision() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = IdentityId::new_v4();
+        plant_identity_dir(dir.path(), id);
+        let fingerprint = Fingerprint::of_refresh_token("synthetic-history-collision");
+        let entry = HistoryEntry::new(fingerprint, 42);
+        let target = token_history_path_for(dir.path(), id);
+        let foreign = std::rc::Rc::new(std::cell::RefCell::new(None::<std::path::PathBuf>));
+        let planted = std::rc::Rc::clone(&foreign);
+        let selected_target = target.clone();
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |candidate| {
+                assert_eq!(candidate.parent(), selected_target.parent());
+                assert_ne!(candidate, selected_target.as_path());
+                if planted.borrow().is_none() {
+                    std::fs::write(candidate, b"foreign collision sentinel").unwrap();
+                    *planted.borrow_mut() = Some(candidate.to_path_buf());
+                }
+            },
+            || write_history_file(dir.path(), id, &[entry], "collision_test"),
+        );
+        let foreign = foreign.borrow().clone().expect("create observer must run");
+        assert_eq!(
+            std::fs::read(&foreign).unwrap(),
+            b"foreign collision sentinel"
+        );
+        assert!(result, "first temporary collision must not fail the save");
+        let saved: HistoryFile = serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+        assert_eq!(saved.fingerprints, vec![fingerprint.to_hex()]);
+        assert_eq!(saved.captured_at_unix_nanos, vec![42]);
+    }
+
+    #[test]
+    fn f_a_owner_proof_v2_retries_sibling_collision() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (binding, proof) = org_identity_proof_fixture(dir.path());
+        let target = owner_verified_v2_path_for(dir.path(), binding.identity());
+        let foreign = std::rc::Rc::new(std::cell::RefCell::new(None::<std::path::PathBuf>));
+        let planted = std::rc::Rc::clone(&foreign);
+        let selected_target = target.clone();
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |candidate| {
+                assert_eq!(candidate.parent(), selected_target.parent());
+                assert_ne!(candidate, selected_target.as_path());
+                if planted.borrow().is_none() {
+                    std::fs::write(candidate, b"foreign collision sentinel").unwrap();
+                    *planted.borrow_mut() = Some(candidate.to_path_buf());
+                }
+            },
+            || record_owner_verified_v2(dir.path(), &binding, &proof),
+        );
+        let foreign = foreign.borrow().clone().expect("create observer must run");
+        assert_eq!(
+            std::fs::read(&foreign).unwrap(),
+            b"foreign collision sentinel"
+        );
+        assert!(
+            matches!(result, OwnerVerifiedRecord::Written),
+            "first temporary collision must not fail the save"
+        );
+        assert_eq!(
+            read_owner_verified_for_slot(dir.path(), binding.slot()),
+            vec![proof.fingerprint()]
+        );
+        assert!(target.is_file());
+    }
+
+    #[test]
+    fn f4_collision_pending_intent_retries_without_touching_foreign() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = IdentityId::new_v4();
+        let intent = PendingHistoryIntent::Append {
+            fingerprint: Fingerprint::of_refresh_token("synthetic-collision-fixture").to_hex(),
+            captured_at_unix_nanos: 42,
+        };
+        let expected = serde_json::to_vec(&intent).unwrap();
+        let collision = std::rc::Rc::new(std::cell::RefCell::new(None::<std::path::PathBuf>));
+        let planted = std::rc::Rc::clone(&collision);
+        let sandbox = dir.path().to_path_buf();
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |candidate| {
+                assert!(candidate.starts_with(&sandbox));
+                if planted.borrow().is_none() {
+                    std::fs::write(candidate, b"foreign collision sentinel").unwrap();
+                    *planted.borrow_mut() = Some(candidate.to_path_buf());
+                }
+            },
+            || enqueue_pending_intent(dir.path(), id, intent, "test"),
+        );
+        let foreign = collision
+            .borrow()
+            .clone()
+            .expect("production create observer must run");
+        assert_eq!(
+            std::fs::read(foreign).unwrap(),
+            b"foreign collision sentinel"
+        );
+        assert!(result, "pending intent must publish after collision");
+        let paths = pending_history_files(dir.path(), id);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), expected);
+    }
+
     use crate::credentials::{
         AnthropicCredentialFile, CodexCredentialFile, CodexTokensFile, OAuthPayload,
     };

@@ -734,6 +734,7 @@ mod tests {
                 context_window: Some(900_000),
                 output_limit: Some(100_000),
                 aliases: vec![],
+                served_model_ids: vec![],
             });
         std::fs::write(
             model_manifest::manifest_path(dir.path()),

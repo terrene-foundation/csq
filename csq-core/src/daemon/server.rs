@@ -822,6 +822,7 @@ async fn refresh_status_one_handler(
 /// # Errors
 ///
 /// - **400 Bad Request** — account id is outside 1..=999.
+/// - **409 Conflict** — the profiles store is busy; retry the login.
 /// - **503 Service Unavailable** — the daemon was started without
 ///   an OAuth state store (`oauth_store: None`). Tests and custom
 ///   builds can disable OAuth; real daemons always enable it.
@@ -844,30 +845,61 @@ async fn login_handler(
 
     let base = Arc::clone(&state.base_dir);
     let store = Arc::clone(store);
-    let request = tokio::task::spawn_blocking(move || {
-        let base = std::fs::canonicalize(&*base).map_err(|_| "identity base refused")?;
-        let prior = crate::accounts::anthropic_identity::capture_login_prior(&base, account)
-            .map_err(|_| "identity capture failed")?;
-        crate::oauth::login::start_login_with_prior(&store, account, base, prior)
-            .map_err(|_| "login initiation failed")
-    })
-    .await
-    .map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "login initiation failed".to_string(),
-        )
-    })?;
-    request.map(Json).map_err(|e| {
-        // start_login is effectively infallible for valid
-        // AccountNum on supported platforms; if it ever errors we
-        // map to 500 without echoing internal details.
-        tracing::warn!(error = %e, "start_login failed");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "oauth login initiation failed".to_string(),
-        )
-    })
+    let request = tokio::task::spawn_blocking(move || initiate_oauth_login(&base, &store, account))
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "login initiation failed".to_string(),
+            )
+        })?;
+    request.map(Json).map_err(LoginInitiationFailure::response)
+}
+
+/// Retains lock contention across the blocking worker without exposing internal
+/// filesystem or OAuth errors in the HTTP response.
+#[derive(Debug)]
+enum LoginInitiationFailure {
+    Busy,
+    Internal(&'static str),
+}
+
+impl LoginInitiationFailure {
+    fn response(self) -> (StatusCode, String) {
+        match self {
+            Self::Busy => (
+                StatusCode::CONFLICT,
+                crate::accounts::login::LoginCommitOutcome::describe_prior_capture_error(
+                    &crate::accounts::anthropic_identity::IdentityError::BindingBusy,
+                ),
+            ),
+            Self::Internal(reason) => {
+                tracing::warn!(error_kind = reason, "start_login failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "oauth login initiation failed".to_string(),
+                )
+            }
+        }
+    }
+}
+
+fn initiate_oauth_login(
+    base: &Path,
+    store: &OAuthStateStore,
+    account: AccountNum,
+) -> Result<LoginRequest, LoginInitiationFailure> {
+    use crate::accounts::anthropic_identity::IdentityError;
+    let base = std::fs::canonicalize(base)
+        .map_err(|_| LoginInitiationFailure::Internal("identity_base_refused"))?;
+    let prior = crate::accounts::anthropic_identity::capture_login_prior(&base, account).map_err(
+        |error| match error {
+            IdentityError::BindingBusy => LoginInitiationFailure::Busy,
+            _ => LoginInitiationFailure::Internal("identity_capture_failed"),
+        },
+    )?;
+    crate::oauth::login::start_login_with_prior(store, account, base, prior)
+        .map_err(|_| LoginInitiationFailure::Internal("login_initiation_failed"))
 }
 
 /// Request body for `POST /api/oauth/exchange`.
@@ -3922,6 +3954,48 @@ mod tests {
         let refused = finish_oauth_login_credentials(dir.path(), account, Err(E::ProfileRefused))
             .unwrap_err();
         assert_eq!(login_outcome_response(&refused).0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn login_initiation_profiles_contention_returns_retryable_conflict_without_state() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = OAuthStateStore::new();
+        let account = AccountNum::try_from(1).unwrap();
+        let holder = crate::accounts::profiles_lock::HeldOnOtherThread::profiles(dir.path());
+        let budget = crate::accounts::profiles_lock::ProfilesBudgetOverrideGuard::install(1);
+
+        let error = initiate_oauth_login(dir.path(), &store, account).unwrap_err();
+        assert!(matches!(error, LoginInitiationFailure::Busy));
+        let (status, body) = error.response();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, "another csq operation holds the profiles store; retry the login in a moment (oauth_identity_busy)");
+        assert!(
+            store.is_empty(),
+            "refused initiation must not publish PKCE state"
+        );
+        assert!(!dir.path().join("profiles.json").exists());
+        assert!(!dir.path().join("config-1").exists());
+
+        drop(budget);
+        drop(holder);
+        let request = initiate_oauth_login(dir.path(), &store, account).unwrap();
+        assert_eq!(request.account, 1);
+        assert_eq!(store.len(), 1, "retry after release must initiate login");
+    }
+
+    #[test]
+    fn login_initiation_io_refusal_stays_sanitized_internal_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // A directory at the lock-file path causes real lock I/O refusal.
+        std::fs::create_dir(dir.path().join(".profiles.lock")).unwrap();
+        let store = OAuthStateStore::new();
+        let error =
+            initiate_oauth_login(dir.path(), &store, AccountNum::try_from(1).unwrap()).unwrap_err();
+        assert!(matches!(error, LoginInitiationFailure::Internal(_)));
+        let (status, body) = error.response();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, "oauth login initiation failed");
+        assert!(store.is_empty());
     }
 
     /// Builds a minimal RouterState for tests. Both caches start

@@ -236,9 +236,14 @@ fn add(
             .map_err(|e| e.to_string())
     })
 }
-fn remove(pool: &Pool, snapshot: &RemovalSnapshot) -> Result<(), String> {
+#[derive(Debug, serde::Serialize)]
+pub struct PoolRemovalOutcome {
+    vault_file_missing: bool,
+}
+fn remove(pool: &Pool, snapshot: &RemovalSnapshot) -> Result<PoolRemovalOutcome, String> {
     csq_core::credentials::keychain::with_interactive_keychain(|| {
-        pool.remove_if_unchanged(snapshot)
+        pool.remove_if_unchanged_with_outcome(snapshot)
+            .map(|vault_file_missing| PoolRemovalOutcome { vault_file_missing })
             .map_err(|e| e.to_string())
     })
 }
@@ -293,7 +298,7 @@ pub async fn pool_remove<R: Runtime>(
     window: WebviewWindow<R>,
     requester: PoolRequester,
     name: String,
-) -> Result<(), String> {
+) -> Result<PoolRemovalOutcome, String> {
     authorize(&window, &requester)?;
     PoolName::new(&name).map_err(|e| e.to_string())?;
     window.manage(RemovalGate::default());
@@ -566,14 +571,17 @@ mod tests {
         let output = serde_json::to_string(&rows).unwrap();
         assert!(!output.contains(secret));
         assert!(!output.contains("secret_id"));
-        ipc(
+        let outcome: serde_json::Value = ipc(
             &window,
             "pool_remove",
             serde_json::json!({"name":"desktop"}),
             None,
             "tauri://localhost",
         )
+        .unwrap()
+        .deserialize()
         .unwrap();
+        assert_eq!(outcome, serde_json::json!({"vault_file_missing": false}));
         let rows: serde_json::Value = ipc(
             &window,
             "pool_list",

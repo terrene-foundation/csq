@@ -19,6 +19,12 @@ pub mod gate;
 pub mod http;
 pub mod messaging;
 pub mod oauth;
+/// Whether THIS csq-core was compiled with `native-harness`. Cargo unifies
+/// features across the workspace, so a sibling crate can switch csq-core's
+/// feature on while csq's own `native-harness` stays off; csq embeds this in
+/// its `CSQ-BUILD-FEATURES` marker so the built-binary check reads csq-core's
+/// real state, not csq's (an internal ticket FIX5 P-1).
+pub const BUILD_NATIVE_HARNESS: bool = cfg!(feature = "native-harness");
 pub mod platform;
 pub mod pool;
 pub mod probe;

@@ -598,19 +598,19 @@ fn save_cache(cache_path: &Path, entries: Vec<Cache>, max_bytes: u64) {
         );
         return;
     }
-    let tmp = crate::platform::fs::unique_tmp_path(cache_path);
-    if std::fs::write(&tmp, &bytes).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        tracing::debug!(
-            error_kind = "cost_cache_write",
-            "statusline cost cache write failed"
-        );
-        return;
-    }
-    if crate::platform::fs::secure_file(&tmp).is_err()
-        || crate::platform::fs::atomic_replace(&tmp, cache_path).is_err()
-    {
-        let _ = std::fs::remove_file(&tmp);
+    // Transcript paths may identify the user. Failed private creation owns its
+    // cleanup and leaves collisions untouched; publication owns the temp below.
+    let writer = match crate::platform::fs::write_private_tmp_retained(cache_path, &bytes) {
+        Ok(writer) => writer,
+        Err(_) => {
+            tracing::debug!(
+                error_kind = "cost_cache_write",
+                "statusline cost cache write failed"
+            );
+            return;
+        }
+    };
+    if writer.replace(cache_path).is_err() {
         tracing::debug!(
             error_kind = "cost_cache_write",
             "statusline cost cache write failed"
@@ -1140,6 +1140,45 @@ fn statusline_cost_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f4_collision_cost_cache_retries_without_touching_foreign() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cache.json");
+        std::fs::write(&path, b"old cache").unwrap();
+        let expected = serde_json::to_vec(&CacheFile {
+            v: CACHE_VERSION,
+            entries: vec![Cache::default()],
+        })
+        .unwrap();
+        let collision = std::rc::Rc::new(std::cell::RefCell::new(None::<std::path::PathBuf>));
+        let planted = std::rc::Rc::clone(&collision);
+        let sandbox = dir.path().to_path_buf();
+        crate::platform::fs::with_private_create_observer_for_test(
+            move |candidate| {
+                assert!(candidate.starts_with(&sandbox));
+                if planted.borrow().is_none() {
+                    std::fs::write(candidate, b"foreign collision sentinel").unwrap();
+                    *planted.borrow_mut() = Some(candidate.to_path_buf());
+                }
+            },
+            || save_cache(&path, vec![Cache::default()], u64::MAX),
+        );
+        let foreign = collision
+            .borrow()
+            .clone()
+            .expect("production create observer must run");
+        assert_eq!(
+            std::fs::read(foreign).unwrap(),
+            b"foreign collision sentinel"
+        );
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            expected,
+            "cache must publish after collision"
+        );
+    }
+
     use std::cell::RefCell;
     use std::io::Write;
     use tempfile::TempDir;
@@ -1150,6 +1189,28 @@ mod tests {
 
     fn bundled() -> anyhow::Result<ModelManifest> {
         Ok(ModelManifest::bundled())
+    }
+
+    #[test]
+    fn cost_cache_publish_failure_removes_tmp_and_preserves_destination() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cache.json");
+        std::fs::create_dir(&path).unwrap();
+        let sentinel = path.join("keep");
+        std::fs::write(&sentinel, b"destination sentinel").unwrap();
+
+        save_cache(&path, vec![Cache::default()], u64::MAX);
+
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"destination sentinel");
+        let remaining: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![path],
+            "failed publication must remove its tmp"
+        );
     }
 
     fn line(req: &str, model: &str, ts: &str, i: u64, o: u64) -> String {

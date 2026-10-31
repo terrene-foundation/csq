@@ -18,8 +18,8 @@
 //! - Payload size is bounded by the file-size cap (1 MiB) plus the header.
 //! - Tmp files written with `create_new(true)` + mode 0o600 before rename
 //!   to prevent TOCTOU at write time.
-//! - Partial-failure cleanup per security.md §5a: `remove_file(&tmp)` before
-//!   propagating any error from `secure_file` or `atomic_replace`.
+//! - Partial-failure cleanup per security.md §5a: the private creator removes
+//!   owned write failures; failed identity-bound publication removes the tmp.
 //!
 //! Per `internal-design-docs` the per-artifact signing
 //! apparatus (`COC.sig`, `COC_SIGNING_PUBLIC_KEY_BYTES`, first-pull trust
@@ -30,6 +30,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
@@ -130,6 +131,7 @@ const CACHE_MAX_FILE_SIZE: u64 = 1_048_576;
 
 /// Per-process counter for unique tmp-file naming (PID + counter prevents
 /// intra-process collision between concurrent writers in different threads).
+#[cfg(unix)]
 static CACHE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Returns the cache directory for a `.coc/` root.
@@ -334,9 +336,8 @@ fn read_cache_bytes(reader: impl io::Read, observed_len: u64) -> io::Result<Vec<
 
 /// Write a `CocSet` binary parse cache for the given `lock_sha`.
 ///
-/// Uses the tmp → secure_file → atomic_replace pattern with partial-failure
-/// cleanup per security.md §5a. Any error from `secure_file` or
-/// `atomic_replace` cleans up the tmp file before propagating.
+/// Uses private-at-creation tmp → identity-bound atomic replacement with
+/// partial-failure cleanup per security.md §5a. Creation collisions are unowned.
 pub fn write_parsed_cache(coc_root: &Path, lock_sha: &[u8; 32], set: &CocSet) -> io::Result<()> {
     write_cache_payload(
         coc_root,
@@ -417,11 +418,14 @@ fn write_cache_payload(
     buf.extend_from_slice(lock_sha.as_ref());
     buf.extend_from_slice(&payload);
 
-    // Tmp filename: parsed-<sha>.bin.tmp.<pid>.<counter>
-    // Suffix .tmp comes AFTER .bin so the sweeper's glob `parsed-*.bin`
-    // does NOT match tmp files (R2/B72).
+    // Unix temp: parsed-<sha>.bin.tmp.<pid>.<counter>.
+    // Windows factory temp: parsed-<sha>.tmp.<pid>.<counter> (.bin is replaced).
+    // Neither shape ends in .bin, so the sweeper's glob `parsed-*.bin`
+    // does NOT match temp files (R2/B72).
     let target = cache_file(coc_root, lock_sha);
+    #[cfg(unix)]
     let counter = CACHE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    #[cfg(unix)]
     let tmp = {
         let mut p = target.clone();
         let stem = p
@@ -433,32 +437,25 @@ fn write_cache_payload(
         p
     };
 
-    // Write tmp with create_new=true + mode 0o600 (blocks attacker pre-created tmp).
+    // Artifact bodies and unknown frontmatter are arbitrary source text, so
+    // preserve private creation and bind publication to that actual writer.
+    // The creator cleans up owned failures and never unlinks a name collision.
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        use std::io::Write as _;
-        f.write_all(&buf)?;
-    }
+    let writer =
+        crate::platform::fs::write_new_private_retained(&tmp, &buf).map_err(|e| match e {
+            crate::error::PlatformError::Io(io) => io,
+            other => io::Error::other(other),
+        })?;
+
     #[cfg(not(unix))]
-    {
-        std::fs::write(&tmp, &buf)?;
-    }
+    let writer =
+        crate::platform::fs::write_private_tmp_retained(&target, &buf).map_err(|e| match e {
+            crate::error::PlatformError::Io(io) => io,
+            other => io::Error::other(other),
+        })?;
 
-    // secure_file — on error, clean up tmp.
-    if let Err(e) = crate::platform::fs::secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(io::Error::other(e));
-    }
-
-    // atomic_replace — on error, clean up tmp.
-    if let Err(e) = crate::platform::fs::atomic_replace(&tmp, &target) {
-        let _ = std::fs::remove_file(&tmp);
+    // Publication consumes the writer; its Drop cleans up an owned failure.
+    if let Err(e) = writer.replace(&target) {
         return Err(io::Error::other(e));
     }
 
@@ -575,6 +572,41 @@ pub fn read_lock(coc_dir: &Path) -> Result<Option<Vec<u8>>, CacheError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(unix))]
+    #[test]
+    fn cache_write_retries_a_stale_stage_without_deleting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_sha = test_lock_sha();
+        let set = fixture_coc_set();
+        write_parsed_cache(dir.path(), &lock_sha, &set).unwrap();
+        let target = cache_file(dir.path(), &lock_sha);
+        let expected = std::fs::read(&target).unwrap();
+        std::fs::remove_file(&target).unwrap();
+        let planted = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed = std::rc::Rc::clone(&planted);
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |stage| {
+                if observed.borrow().is_none() {
+                    std::fs::write(stage, b"foreign cache stage").unwrap();
+                    *observed.borrow_mut() = Some(stage.to_path_buf());
+                }
+            },
+            || write_parsed_cache(dir.path(), &lock_sha, &set),
+        );
+        let stage = planted
+            .borrow_mut()
+            .take()
+            .expect("cache create observer must run");
+        assert_eq!(std::fs::read(&stage).unwrap(), b"foreign cache stage");
+        eprintln!("F4_COLLISION_WITNESS observer_hit=true foreign_preserved=true");
+        assert!(
+            result.is_ok(),
+            "non-Unix cache write must retry a stale stage: {result:?}"
+        );
+        assert_eq!(std::fs::read(target).unwrap(), expected);
+        assert_eq!(std::fs::read(stage).unwrap(), b"foreign cache stage");
+    }
 
     include!("rule_origin_cache_tests.rs");
     include!("cache_read_bound_tests.rs");
@@ -912,19 +944,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn cache_write_secure_file_failure_cleans_tmp_file() {
-        // We can't easily make secure_file fail in a portable way, but we can
-        // verify the cleanup path doesn't panic when the tmp file doesn't exist.
-        // This is a compile-time structural test: the cleanup `let _ = fs::remove_file(&tmp)`
-        // before propagating the error is present in the implementation.
-        // The runtime behavior is validated by cache_write_partial_failure_cleans_tmp_file.
+    fn cache_write_publishes_nonempty_file() {
         let root = tempfile::tempdir().unwrap();
         let lock_sha = test_lock_sha();
         let set = fixture_coc_set();
-        // Normal write must succeed — confirms the happy path works.
         write_parsed_cache(root.path(), &lock_sha, &set).unwrap();
         let path = cache_file(root.path(), &lock_sha);
-        assert!(path.exists(), "cache file must exist after write");
+        assert!(!std::fs::read(path).unwrap().is_empty());
     }
 
     #[test]
@@ -941,35 +967,25 @@ mod tests {
 
     #[test]
     fn cache_write_atomic_replace_failure_cleans_tmp_file() {
-        // Verified structurally: the implementation calls
-        // `let _ = fs::remove_file(&tmp)` before propagating errors from
-        // both `secure_file` and `atomic_replace`. The happy path exercises
-        // the write-then-exists pattern; round-trip is covered by
-        // cache_round_trip_basic.
         let root = tempfile::tempdir().unwrap();
         let lock_sha = test_lock_sha();
         let set = fixture_coc_set();
-        write_parsed_cache(root.path(), &lock_sha, &set).unwrap();
         let path = cache_file(root.path(), &lock_sha);
-        // File must exist and be non-empty.
-        assert!(path.exists(), "cache file must exist after write");
-        let data = std::fs::read(&path).unwrap();
-        assert!(!data.is_empty(), "cache file must be non-empty");
-        // No tmp files should remain.
+        // A real directory blocks publication after a successful private write.
+        std::fs::create_dir_all(&path).unwrap();
+        let sentinel = path.join("keep");
+        std::fs::write(&sentinel, b"destination sentinel").unwrap();
+        assert!(write_parsed_cache(root.path(), &lock_sha, &set).is_err());
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"destination sentinel");
         let dir = cache_dir(root.path());
-        let tmp_count = std::fs::read_dir(&dir)
+        let remaining: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
-            .flatten()
-            .filter(|e| {
-                e.file_name()
-                    .to_str()
-                    .map(|n| n.contains(".tmp."))
-                    .unwrap_or(false)
-            })
-            .count();
+            .map(|entry| entry.unwrap().path())
+            .collect();
         assert_eq!(
-            tmp_count, 0,
-            "no tmp files must linger after successful write"
+            remaining,
+            vec![path],
+            "failed publication must remove its tmp"
         );
     }
 
@@ -1006,16 +1022,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn cache_create_new_true_mode_0600_for_tmp_blocks_attacker_pre_created_tmp() {
-        // Pre-create the tmp file path that would be used.
-        // The write uses create_new=true so it must fail with EEXIST.
-        // The pre-existing tmp file must NOT be clobbered.
+    fn cache_write_leaves_no_tmp_after_success() {
         let root = tempfile::tempdir().unwrap();
         let lock_sha = test_lock_sha();
         std::fs::create_dir_all(cache_dir(root.path())).unwrap();
 
-        // We can't predict the exact PID+counter, so we test the property
-        // differently: after a successful write, no extra tmp files exist.
+        // This checks successful-write cleanup, not create-new collision safety.
         let set = fixture_coc_set();
         write_parsed_cache(root.path(), &lock_sha, &set).unwrap();
 

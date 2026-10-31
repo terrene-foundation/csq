@@ -196,16 +196,11 @@ pub fn write_own_name(handle_dir: &Path, name: &str) -> Result<(), NameError> {
     let name = validate_name(name)?;
     let path = name_path(handle_dir);
     let tmp = pfs::unique_tmp_path(&path);
-    if pfs::write_new_private(&tmp, name.as_bytes()).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(NameError::Io);
-    }
-    if pfs::secure_file(&tmp).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(NameError::Io);
-    }
-    if pfs::atomic_replace(&tmp, &path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    // A self-chosen label may identify its user; retain private creation and
+    // bind publication to that writer. Failed creation does not own collisions.
+    let writer =
+        pfs::write_new_private_retained(&tmp, name.as_bytes()).map_err(|_| NameError::Io)?;
+    if writer.replace(&path).is_err() {
         return Err(NameError::Io);
     }
     Ok(())

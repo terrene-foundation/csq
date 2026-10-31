@@ -29,7 +29,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::audit::seam::SeamError;
-use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+use crate::platform::fs::{secure_file, write_private_tmp_retained};
 
 /// Bounded wait for a missing intra-operator prev_link predecessor. A held event
 /// whose file age exceeds this links with `predecessor_missing: Some(true)`
@@ -331,17 +331,20 @@ pub fn list_held(csq_runs: &Path, now_unix: i64) -> Vec<HeldEvent> {
 
 /// Write a held custody file via the §5a tmp-cleanup pipeline.
 fn write_held_file(path: &Path, raw: &[u8]) -> Result<(), SeamError> {
-    let tmp = unique_tmp_path(path);
-    if let Err(e) = std::fs::write(&tmp, raw) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(SeamError::Io(e));
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
+    let writer = match write_private_tmp_retained(path, raw) {
+        Ok(writer) => writer,
+        Err(e) => {
+            let source = match e {
+                crate::error::PlatformError::Io(source) => source,
+                other => std::io::Error::other(other.to_string()),
+            };
+            return Err(SeamError::Io(source));
+        }
+    };
+    if let Err(e) = secure_file(writer.path()) {
         return Err(SeamError::Io(std::io::Error::other(e.to_string())));
     }
-    if let Err(e) = atomic_replace(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = writer.replace(path) {
         return Err(SeamError::Io(std::io::Error::other(e.to_string())));
     }
     Ok(())
@@ -350,7 +353,55 @@ fn write_held_file(path: &Path, raw: &[u8]) -> Result<(), SeamError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f4_collision_held_file_retries_without_touching_foreign() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("held.json");
+        std::fs::write(&target, b"old held event").unwrap();
+        let collision = std::rc::Rc::new(std::cell::RefCell::new(None::<std::path::PathBuf>));
+        let planted = std::rc::Rc::clone(&collision);
+        let sandbox = dir.path().to_path_buf();
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |candidate| {
+                assert!(candidate.starts_with(&sandbox));
+                if planted.borrow().is_none() {
+                    std::fs::write(candidate, b"foreign collision sentinel").unwrap();
+                    *planted.borrow_mut() = Some(candidate.to_path_buf());
+                }
+            },
+            || write_held_file(&target, b"new held event"),
+        );
+        let foreign = collision
+            .borrow()
+            .clone()
+            .expect("production create observer must run");
+        assert_eq!(
+            std::fs::read(foreign).unwrap(),
+            b"foreign collision sentinel"
+        );
+        assert!(
+            result.is_ok(),
+            "held event must publish after collision: {result:?}"
+        );
+        assert_eq!(std::fs::read(target).unwrap(), b"new held event");
+    }
+
     use tempfile::TempDir;
+
+    #[test]
+    fn held_publication_failure_removes_secret_temp() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("occupied");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), b"existing evidence").unwrap();
+        assert!(write_held_file(&target, b"raw secret fixture").is_err());
+        assert_eq!(
+            std::fs::read(target.join("keep")).unwrap(),
+            b"existing evidence"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     fn tmp() -> TempDir {
         tempfile::tempdir().expect("tempdir")

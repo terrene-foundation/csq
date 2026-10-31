@@ -59,7 +59,7 @@
 //! # §5a compliance
 //!
 //! The final bundle write uses `unique_tmp_path → write → secure_file →
-//! atomic_replace` with `remove_file(&tmp)` on every failure branch. The tar
+//! private publication` with creating-writer cleanup on every failure branch. The tar
 //! bytes contain audit records (no OAuth tokens), but the bundle is treated as
 //! secret-bearing for cleanup discipline since chain records may carry
 //! operator-identifying payloads.
@@ -77,7 +77,7 @@ use crate::audit::persist::{canonical_bytes_for, sha256_hex};
 use crate::audit::traits::SigningKey as _;
 use crate::audit::types::{KeyId, SignedRecord};
 use crate::audit::verify::{verify_chain, VerifyConfig};
-use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+use crate::platform::fs::{secure_file, write_private_tmp_retained};
 
 /// The embedded verify-script template (PRIMARY DIRECTIVE 1).
 ///
@@ -480,7 +480,7 @@ NOT yet applied — exporting the WHOLE chain (partial-range export is Phase B)"
     })
 }
 
-/// §5a-compliant bundle write with tmp cleanup on every failure branch.
+/// §5a-compliant bundle write with cleanup owned by the retained creating writer.
 fn write_bundle_atomic(bundle_path: &Path, tar_bytes: &[u8]) -> Result<(), ExportError> {
     if let Some(parent) = bundle_path.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
@@ -489,21 +489,20 @@ fn write_bundle_atomic(bundle_path: &Path, tar_bytes: &[u8]) -> Result<(), Expor
             })?;
         }
     }
-    let tmp = unique_tmp_path(bundle_path);
-    if let Err(e) = std::fs::write(&tmp, tar_bytes) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(ExportError::Io {
-            message: format!("write bundle tmp: {e}"),
-        });
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
+    let written = match write_private_tmp_retained(bundle_path, tar_bytes) {
+        Ok(written) => written,
+        Err(e) => {
+            return Err(ExportError::Io {
+                message: format!("write bundle tmp: {e}"),
+            });
+        }
+    };
+    if let Err(e) = secure_file(written.path()) {
         return Err(ExportError::Io {
             message: format!("secure bundle tmp: {e}"),
         });
     }
-    if let Err(e) = atomic_replace(&tmp, bundle_path) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = written.replace(bundle_path) {
         return Err(ExportError::Io {
             message: format!("atomic replace bundle: {e}"),
         });
@@ -929,6 +928,35 @@ mod tests {
         SignedRecord,
     };
     use tempfile::TempDir;
+
+    #[test]
+    fn bundle_write_retries_actual_stage_collision() {
+        let _env = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("bundle.tar");
+        let foreign = std::rc::Rc::new(std::cell::RefCell::new(None::<std::path::PathBuf>));
+        let observed = std::rc::Rc::clone(&foreign);
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |path| {
+                if observed.borrow().is_none() {
+                    std::fs::write(path, b"foreign-stage").unwrap();
+                    *observed.borrow_mut() = Some(path.to_path_buf());
+                    eprintln!("F4_PRIVATE_CREATE_COLLISION_PLANTED");
+                }
+            },
+            || write_bundle_atomic(&target, b"new-bundle-bytes"),
+        );
+        let path = foreign
+            .borrow()
+            .clone()
+            .expect("production create observer must be hit");
+        assert_eq!(std::fs::read(path).unwrap(), b"foreign-stage");
+        assert!(
+            result.is_ok(),
+            "bundle writer must retry a planted create collision"
+        );
+        assert_eq!(std::fs::read(target).unwrap(), b"new-bundle-bytes");
+    }
 
     /// Interpreter resolution for the tests below that shell out to Python.
     ///

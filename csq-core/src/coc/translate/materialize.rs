@@ -105,7 +105,7 @@ use std::path::Path;
 
 use super::flatten::{FlatArtifact, SurfaceArtifacts};
 use crate::cli_deps::sanitize::redact_path;
-use crate::platform::fs::secure_file;
+use crate::platform::fs::write_private_tmp_retained;
 
 /// Minimal Claude Code plugin name embedded in the emitted `plugin.json`.
 const PLUGIN_NAME: &str = "csq-coc";
@@ -683,7 +683,7 @@ fn validate_id(id: &str) -> Result<(), MaterializeError> {
 /// Writes `agents/`, `skills/`, and `commands/` (rules are excluded — they
 /// stay Level-1 prose). Returns the deterministic [`MaterializedManifest`].
 ///
-/// Every written file is chmod `0o600` via [`secure_file`], matching the
+/// Every written file is private at creation, matching the
 /// existing per-spawn handle-dir materialization discipline.
 ///
 /// # Caller contract (S2 owns the ephemeral-dir lifecycle)
@@ -1110,12 +1110,13 @@ fn cleanup_partial_write(dest: &Path, manifest: &MaterializedManifest, prior: &P
             // left exactly as found (the contract this function's doc
             // states), not minus the prior version.
             let abs = dest.join(rel);
-            let tmp = crate::platform::fs::unique_tmp_path(&abs);
-            let restored = std::fs::write(&tmp, bytes).is_ok()
-                && secure_file(&tmp).is_ok()
-                && crate::platform::fs::atomic_replace(&tmp, &abs).is_ok();
+            // Prior bytes are unrestricted. The private creator owns failure
+            // cleanup; do not unlink an unowned create-new collision.
+            let restored = match write_private_tmp_retained(&abs, bytes) {
+                Ok(writer) => writer.replace(&abs).is_ok(),
+                Err(_) => false,
+            };
             if !restored {
-                let _ = std::fs::remove_file(&tmp);
                 let _ = std::fs::remove_file(&abs);
                 // R9 LOW: the restore failed (e.g. ENOSPC, correlated with
                 // the emit's own failure) and the prior artifact is now
@@ -1579,8 +1580,8 @@ fn snapshot_prior_if_exists(
 ///
 /// R4/D4-4: the persistent-dest emitters write into credential-bearing
 /// vendor homes (`<KIMI_CODE_HOME>`, `$GROK_HOME`), so the credential-file
-/// discipline (security.md §4) is the right standard even though the
-/// payload itself is non-secret prose: a plain `std::fs::write` leaves a
+/// discipline (security.md §4) is the right standard. Artifact bodies are
+/// unrestricted user text and may contain secrets; a plain write leaves a
 /// truncated file behind on SIGKILL/power loss, and no reconcile pass is
 /// wired to detect it. Once the wiring shard lands, kimi_merge's merged
 /// `config.toml` output (which DOES carry OAuth wiring) MUST also go
@@ -1741,23 +1742,18 @@ fn write_file(
             });
         }
     }
-    let tmp = crate::platform::fs::unique_tmp_path(&abs);
-    if let Err(e) = std::fs::write(&tmp, content) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(MaterializeError::Io {
+    // The private creator removes only owned partial writes, not collisions.
+    let writer = write_private_tmp_retained(&abs, content.as_bytes()).map_err(|e| match e {
+        crate::error::PlatformError::Io(source) => MaterializeError::Io {
             path: redact_path(&abs),
-            source: e,
-        });
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(MaterializeError::Secure {
+            source,
+        },
+        other => MaterializeError::Secure {
             path: redact_path(&abs),
-            reason: e.to_string(),
-        });
-    }
-    if let Err(e) = crate::platform::fs::atomic_replace(&tmp, &abs) {
-        let _ = std::fs::remove_file(&tmp);
+            reason: other.to_string(),
+        },
+    })?;
+    if let Err(e) = writer.replace(&abs) {
         return Err(MaterializeError::Secure {
             path: redact_path(&abs),
             reason: e.to_string(),
@@ -1773,6 +1769,72 @@ mod tests {
     use super::*;
     use crate::coc::translate::flatten::{FlatArtifact, SurfaceArtifacts};
     use std::fs;
+
+    fn collide_first_create<T>(operation: impl FnOnce() -> T) -> T {
+        let _env = crate::platform::test_env::lock();
+        let foreign = std::rc::Rc::new(std::cell::RefCell::new(None::<std::path::PathBuf>));
+        let observed = std::rc::Rc::clone(&foreign);
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |path| {
+                if observed.borrow().is_none() {
+                    fs::write(path, b"foreign-stage").unwrap();
+                    *observed.borrow_mut() = Some(path.to_path_buf());
+                    eprintln!("F4_PRIVATE_CREATE_COLLISION_PLANTED");
+                }
+            },
+            operation,
+        );
+        let path = foreign
+            .borrow()
+            .clone()
+            .expect("production create observer must be hit");
+        assert_eq!(fs::read(path).unwrap(), b"foreign-stage");
+        result
+    }
+
+    #[test]
+    fn artifact_writer_retries_actual_stage_collision() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut manifest = MaterializedManifest::default();
+        let mut seen = BTreeMap::new();
+        let result = collide_first_create(|| {
+            write_file(
+                dir.path(),
+                "artifact.md".into(),
+                "new-artifact-bytes",
+                MaterializedKind::Agent,
+                &mut manifest,
+                &mut seen,
+            )
+        });
+        assert!(
+            result.is_ok(),
+            "artifact writer must retry a planted create collision"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("artifact.md")).unwrap(),
+            b"new-artifact-bytes"
+        );
+        assert!(manifest.files.contains_key("artifact.md"));
+    }
+
+    #[test]
+    fn rollback_writer_retries_actual_stage_collision() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut manifest = MaterializedManifest::default();
+        manifest
+            .files
+            .insert("artifact.md".into(), MaterializedKind::Agent);
+        let mut prior = PriorContents::new();
+        prior.insert("artifact.md".into(), b"prior-artifact-bytes".to_vec());
+        fs::write(dir.path().join("artifact.md"), b"partial-new-artifact").unwrap();
+        collide_first_create(|| cleanup_partial_write(dir.path(), &manifest, &prior));
+        assert_eq!(
+            fs::read(dir.path().join("artifact.md")).ok().as_deref(),
+            Some(b"prior-artifact-bytes".as_slice()),
+            "rollback must retry a planted create collision"
+        );
+    }
 
     fn art(id: &str, body: &str) -> FlatArtifact {
         FlatArtifact {

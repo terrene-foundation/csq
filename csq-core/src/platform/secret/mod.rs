@@ -323,6 +323,10 @@ pub enum SecretError {
     NamedOutcomeUnknown,
     #[error("no secret stored for named key")]
     NamedNotFound,
+    /// A matched named item's encoded value is malformed. This is never used
+    /// for ambiguous authentication, KDF, authorization or service failures.
+    #[error("named secret item is unreadable")]
+    NamedItemUnreadable,
     /// No secret stored for the given slot. Distinct from
     /// `BackendUnavailable` so the UI can prompt provisioning rather
     /// than show a backend warning.
@@ -393,6 +397,7 @@ impl SecretError {
         match self {
             SecretError::NamedOutcomeUnknown => "vault_named_outcome_unknown",
             SecretError::NamedNotFound => "vault_not_found",
+            SecretError::NamedItemUnreadable => "vault_named_item_unreadable",
             SecretError::NotFound { .. } => "vault_not_found",
             SecretError::PermissionDenied { .. } => "vault_permission_denied",
             SecretError::Locked => "vault_locked",
@@ -427,9 +432,19 @@ impl SecretError {
 /// derived key is one step removed from the secret material, while
 /// the cleartext is the secret itself.
 pub trait Vault: Send + Sync {
+    /// Whether the named-secret store exists and is readable. False denotes
+    /// confirmed file absence only; native services have no file to restore.
+    fn named_store_present(&self) -> Result<bool, SecretError> {
+        Ok(true)
+    }
     /// Additive named operations fail closed for legacy custom implementations.
     fn set_named(&self, _key: &NamedKey, _secret: &SecretString) -> Result<(), SecretError> {
         Err(named_unsupported())
+    }
+    /// Write into an existing named store. Native services keep their ordinary
+    /// semantics; file-backed implementations must refuse file creation here.
+    fn set_named_existing(&self, key: &NamedKey, secret: &SecretString) -> Result<(), SecretError> {
+        self.set_named(key, secret)
     }
     fn get_named(&self, _key: &NamedKey) -> Result<SecretString, SecretError> {
         Err(named_unsupported())
@@ -805,6 +820,7 @@ mod tests {
             SecretError::BackendUnavailable { reason: "x".into() }.error_kind_tag(),
             SecretError::EncryptionFailed { reason: "x".into() }.error_kind_tag(),
             SecretError::DecryptionFailed.error_kind_tag(),
+            SecretError::NamedItemUnreadable.error_kind_tag(),
             SecretError::InvalidKey { reason: "x".into() }.error_kind_tag(),
             SecretError::Timeout.error_kind_tag(),
             SecretError::Io {

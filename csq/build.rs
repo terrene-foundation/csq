@@ -38,6 +38,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rustc-env=CSQ_IMAGE_REVISION={revision}");
     println!("cargo:rustc-env=CSQ_IMAGE_SOURCE_STATE={state}");
     println!("cargo:rustc-env=CSQ_IMAGE_TARGET={target}");
+    // an internal ticket R3 N-2: the compiled feature set for `csq --build-info`. Cargo sets
+    // CARGO_FEATURE_<NAME> (upper-case, `-` as `_`) for each enabled feature of
+    // THIS crate; csq's feature names use only `-`, so the mapping back is exact.
+    let mut features: Vec<String> = std::env::vars_os()
+        .filter_map(|(k, _)| {
+            k.to_str()
+                .and_then(|k| k.strip_prefix("CARGO_FEATURE_"))
+                .map(|f| f.to_ascii_lowercase().replace('_', "-"))
+        })
+        .filter(|f| f != "default")
+        .collect();
+    features.sort_unstable();
+    println!("cargo:rustc-env=CSQ_BUILD_FEATURES={}", features.join(","));
     if std::env::var("CARGO_FEATURE_DESKTOP").is_ok() {
         tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
             tauri_build::AppManifest::new().commands(&[

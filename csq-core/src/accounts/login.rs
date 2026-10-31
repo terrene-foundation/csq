@@ -331,11 +331,19 @@ impl LoginCommitOutcome {
     /// Message for a failure BEFORE any login ran (the `capture_login_prior`
     /// snapshot). Nothing was published, so the commit-time wording of
     /// [`Self::describe_error`] ("credential publication failed") would be
-    /// wrong; this is the raw identity error text, like the CLI surface shows.
+    /// wrong. Contention uses the shared retry message; other failures retain
+    /// their specific identity text, like the CLI surface shows.
     pub fn describe_prior_capture_error(
         error: &crate::accounts::anthropic_identity::IdentityError,
     ) -> String {
-        error.to_string()
+        if matches!(
+            error,
+            crate::accounts::anthropic_identity::IdentityError::BindingBusy
+        ) {
+            Self::describe_error(error)
+        } else {
+            error.to_string()
+        }
     }
 }
 
@@ -1387,6 +1395,21 @@ mod tests {
         assert!(
             !LoginCommitOutcome::describe_error(&E::BindingBusy).contains("anthropic_identity_")
         );
+    }
+
+    #[test]
+    fn prior_capture_busy_is_retryable_and_other_errors_keep_identity_remedies() {
+        use crate::accounts::anthropic_identity::IdentityError as E;
+        assert_eq!(
+            LoginCommitOutcome::describe_prior_capture_error(&E::BindingBusy),
+            "another csq operation holds the profiles store; retry the login in a moment (oauth_identity_busy)"
+        );
+        for error in [E::Io, E::ProfilesReadRefused, E::InvalidMetadata] {
+            assert_eq!(
+                LoginCommitOutcome::describe_prior_capture_error(&error),
+                error.to_string()
+            );
+        }
     }
 
     /// A damaged organization record is refused with its own tag and remedy. `csq login`

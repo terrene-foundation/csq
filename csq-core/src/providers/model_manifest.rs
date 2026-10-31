@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -91,8 +91,8 @@ impl RatePrices {
         .into_iter()
         .flatten()
         {
-            if !value.is_finite() || !(0.0..=1_000_000.0).contains(&value) {
-                bail!("prices must be finite USD/1M values between 0 and 1000000");
+            if !value.is_finite() || value <= 0.0 || value > 1_000_000.0 {
+                bail!("prices must be finite positive USD/1M values at most 1000000");
             }
         }
         Ok(())
@@ -447,6 +447,20 @@ impl ModelManifest {
             if model.aliases.len() > 128 {
                 bail!("too many model aliases");
             }
+            if model.served_model_ids.len() > 128 {
+                bail!("too many served model ids");
+            }
+            let mut served_ids = HashSet::new();
+            for id in &model.served_model_ids {
+                bounded_text(id, 256, "served model id")?;
+                if id
+                    .chars()
+                    .any(|ch| ch.is_whitespace() || matches!(ch, '[' | ']' | '@' | '*' | '?'))
+                    || !served_ids.insert(id)
+                {
+                    bail!("served model ids must be unique literal API ids without selectors or whitespace");
+                }
+            }
             for value in std::iter::once(&model.id).chain(&model.aliases) {
                 bounded_text(value, 256, "model id or alias")?;
                 let base = lookup_key(value);
@@ -728,6 +742,108 @@ mod tests {
     }
 
     #[test]
+    fn served_model_ids_default_empty_and_round_trip_separately_from_picker_aliases() {
+        let mut value = fixture();
+        value["models"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("served_model_ids");
+        let original = parse(&value).unwrap();
+        assert_eq!(
+            serde_json::to_value(&original).unwrap()["models"][0]["served_model_ids"],
+            json!([])
+        );
+        value["models"][0]["served_model_ids"] = json!(["fixture-served-20261026"]);
+        let manifest = parse(&value).unwrap();
+        let serialized = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(
+            serialized["models"][0]["served_model_ids"],
+            json!(["fixture-served-20261026"])
+        );
+        assert_eq!(
+            serialized["models"][0]["aliases"],
+            value["models"][0]["aliases"]
+        );
+        assert!(manifest.catalog().find("fixture-served-20261026").is_none());
+        assert!(manifest
+            .rate_for_model_at("fixture-served-20261026", None)
+            .is_none());
+    }
+
+    #[test]
+    fn served_model_ids_require_bounded_unique_literal_ids() {
+        for ids in [
+            json!([""]),
+            json!([" dated-id"]),
+            json!(["dated id"]),
+            json!(["dated\nid"]),
+            json!(["dated-id[1m]"]),
+            json!(["dated-id@default"]),
+            json!(["dated-*"]),
+            json!(["dated-?"]),
+            json!(["dated-id", "dated-id"]),
+            json!(["x".repeat(257)]),
+            json!((0..129).map(|i| format!("dated-{i}")).collect::<Vec<_>>()),
+        ] {
+            let mut value = fixture();
+            value["models"][0]["served_model_ids"] = ids;
+            assert!(parse(&value).is_err());
+        }
+        let mut value = fixture();
+        value["models"][0]["served_model_ids"] = json!(["dated-id", "Dated-id"]);
+        value["models"][1]["served_model_ids"] = json!(["dated-id"]);
+        assert!(
+            parse(&value).is_ok(),
+            "served IDs are exact, scoped to the admitted row"
+        );
+    }
+
+    #[test]
+    fn zero_prices_in_base_or_peak_are_rejected_in_every_present_dimension() {
+        for tier in ["rate", "peak"] {
+            for dimension in [
+                "input_per_1m_usd",
+                "output_per_1m_usd",
+                "cache_read_per_1m_usd",
+                "cache_write_per_1m_usd",
+            ] {
+                for (epoch_index, zero) in [(0, 0.0), (0, -0.0), (1, 0.0), (1, -0.0)] {
+                    let mut value = fixture();
+                    let base = value["rates"][0]["epochs"][0]["rate"].clone();
+                    let peak = json!({"weekdays":[1], "windows_utc":[[0,60]], "rate":base});
+                    value["rates"][0]["epochs"] = json!([
+                        {"start_unix":null,"end_unix":0,"rate":base,"peak":peak},
+                        {"start_unix":0,"end_unix":null,"rate":base,"peak":peak}]);
+                    parse(&value).unwrap();
+                    let rate = if tier == "rate" {
+                        &mut value["rates"][0]["epochs"][epoch_index]["rate"]
+                    } else {
+                        &mut value["rates"][0]["epochs"][epoch_index]["peak"]["rate"]
+                    };
+                    rate[dimension] = json!(zero);
+                    assert!(
+                        parse(&value).is_err(),
+                        "epoch{epoch_index}/{tier}/{dimension}"
+                    );
+                }
+            }
+        }
+        let mut value = fixture();
+        for dimension in [
+            "input_per_1m_usd",
+            "output_per_1m_usd",
+            "cache_read_per_1m_usd",
+            "cache_write_per_1m_usd",
+        ] {
+            value["rates"][0]["epochs"][0]["rate"][dimension] = json!(1e-300);
+        }
+        assert!(
+            parse(&value).is_ok(),
+            "positive finite tiny prices stay valid"
+        );
+    }
+
+    #[test]
     fn negative_nonfinite_and_unbounded_prices_are_rejected() {
         let mut value = fixture();
         value["rates"][0]["epochs"][0]["rate"]["input_per_1m_usd"] = json!(-1.0);
@@ -737,7 +853,7 @@ mod tests {
         assert!(manifest.validate().is_err());
         manifest.rates[0].epochs[0].rate.output_per_1m_usd = 1_000_001.0;
         assert!(manifest.validate().is_err());
-        manifest.rates[0].epochs[0].rate.output_per_1m_usd = 0.0;
+        manifest.rates[0].epochs[0].rate.output_per_1m_usd = 1.0;
         manifest.rates[0].epochs[0].rate.cache_read_per_1m_usd = Some(-0.01);
         assert!(manifest.validate().is_err());
     }

@@ -18,8 +18,8 @@
 //!
 //! # §5a tmp-cleanup
 //!
-//! Every write of `dev-enrollment.json` uses `unique_tmp_path → write →
-//! secure_file → atomic_replace` with `remove_file(&tmp)` on every failure
+//! Every write of `dev-enrollment.json` uses `unique_tmp_path → private write →
+//! identity-bound atomic replace` with writer-owned cleanup on every failure
 //! branch (per `rules/security.md §5a`).
 //!
 //! # Human-present gate (CRITICAL-2 mitigation)
@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::audit::types::Ed25519PublicKey;
-use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+use crate::platform::fs::write_private_tmp_retained;
 
 use super::error::DevIdentityError;
 
@@ -146,7 +146,7 @@ impl EnrollmentTable {
 
     /// Save the enrollment table to `<base>/audit/dev-enrollment.json`.
     ///
-    /// Uses `unique_tmp_path → write → secure_file → atomic_replace` with
+    /// Uses `unique_tmp_path → private write → identity-bound atomic replace` with
     /// §5a tmp-cleanup on every failure branch.
     pub fn save(&self, base: &Path) -> Result<(), DevIdentityError> {
         let path = enrollment_path(base);
@@ -159,19 +159,10 @@ impl EnrollmentTable {
         let json = serde_json::to_vec_pretty(self)
             .map_err(|_| DevIdentityError::Io("serialize enrollment table"))?;
 
-        let tmp = unique_tmp_path(&path);
-
-        // §5a: write → secure_file → atomic_replace, with remove_file on every failure.
-        if std::fs::write(&tmp, &json).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(DevIdentityError::Io("write enrollment tmp"));
-        }
-        if secure_file(&tmp).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(DevIdentityError::Io("secure enrollment tmp"));
-        }
-        if atomic_replace(&tmp, &path).is_err() {
-            let _ = std::fs::remove_file(&tmp);
+        // The private writer cleans up its own failed writes, but never a collision.
+        let writer = write_private_tmp_retained(&path, &json)
+            .map_err(|_| DevIdentityError::Io("write enrollment tmp"))?;
+        if writer.replace(&path).is_err() {
             return Err(DevIdentityError::Io("atomic replace enrollment"));
         }
         Ok(())
@@ -316,6 +307,64 @@ mod tests {
     }
     fn confirm_no(_: &str) -> bool {
         false
+    }
+
+    #[test]
+    fn enrollment_save_retries_a_stale_stage_without_deleting_it() {
+        let dir = tmp();
+        let table = EnrollmentTable::default();
+        let expected = serde_json::to_vec_pretty(&table).unwrap();
+        let planted = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed = std::rc::Rc::clone(&planted);
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |stage| {
+                if observed.borrow().is_none() {
+                    std::fs::write(stage, b"foreign enrollment stage").unwrap();
+                    *observed.borrow_mut() = Some(stage.to_path_buf());
+                }
+            },
+            || table.save(dir.path()),
+        );
+        let stage = planted
+            .borrow_mut()
+            .take()
+            .expect("enrollment create observer must run");
+        assert_eq!(std::fs::read(&stage).unwrap(), b"foreign enrollment stage");
+        eprintln!("F4_COLLISION_WITNESS observer_hit=true foreign_preserved=true");
+        assert!(
+            result.is_ok(),
+            "enrollment save must retry a stale stage: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read(enrollment_path(dir.path())).unwrap(),
+            expected
+        );
+        assert_eq!(std::fs::read(stage).unwrap(), b"foreign enrollment stage");
+    }
+
+    #[test]
+    fn enrollment_publish_failure_removes_private_tmp_and_preserves_destination() {
+        let dir = tmp();
+        let path = enrollment_path(dir.path());
+        std::fs::create_dir_all(&path).unwrap();
+        let sentinel = path.join("keep");
+        std::fs::write(&sentinel, b"destination sentinel").unwrap();
+
+        let error = EnrollmentTable::default().save(dir.path()).unwrap_err();
+        assert!(matches!(
+            error,
+            DevIdentityError::Io("atomic replace enrollment")
+        ));
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"destination sentinel");
+        let remaining: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![path],
+            "failed publication must remove its tmp"
+        );
     }
 
     #[test]

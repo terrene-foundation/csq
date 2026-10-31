@@ -116,6 +116,10 @@ pub async fn start_claude_login_subprocess(
 // policy. The renderer can reach only the production constructor above.
 type ClaudeCommandFactory =
     Box<dyn FnOnce(&std::path::Path) -> Result<std::process::Command, String> + Send>;
+#[cfg(all(test, unix, feature = "test-utils"))]
+type VendorGroupObserver =
+    std::sync::Arc<dyn Fn(crate::login_child_custody::group::GroupControl) + Send + Sync>;
+
 pub(crate) struct ClaudeLoginIo {
     command: ClaudeCommandFactory,
     timeout: std::time::Duration,
@@ -124,6 +128,8 @@ pub(crate) struct ClaudeLoginIo {
     #[cfg(all(test, feature = "test-utils"))]
     pub(crate) seal_observer: Option<std::sync::Arc<dyn Fn(bool) + Send + Sync>>,
     notify: bool,
+    #[cfg(all(test, unix, feature = "test-utils"))]
+    group_observer: Option<VendorGroupObserver>,
 }
 impl ClaudeLoginIo {
     fn production() -> Self {
@@ -134,7 +140,9 @@ impl ClaudeLoginIo {
                 let mut command = std::process::Command::new(binary);
                 command
                     .args(["auth", "login"])
-                    .env("CLAUDE_CONFIG_DIR", config);
+                    .env("CLAUDE_CONFIG_DIR", config)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
                 Ok(command)
             }),
             timeout: crate::login_child_custody::login_timeout(),
@@ -143,6 +151,8 @@ impl ClaudeLoginIo {
             #[cfg(all(test, feature = "test-utils"))]
             seal_observer: None,
             notify: true,
+            #[cfg(all(test, unix, feature = "test-utils"))]
+            group_observer: None,
         }
     }
     #[cfg(all(test, unix, feature = "test-utils"))]
@@ -162,7 +172,13 @@ impl ClaudeLoginIo {
             profile: Some(profile),
             seal_observer,
             notify: false,
+            group_observer: None,
         }
+    }
+    #[cfg(all(test, unix, feature = "test-utils"))]
+    fn observing_group(mut self, observer: VendorGroupObserver) -> Self {
+        self.group_observer = Some(observer);
+        self
     }
 }
 
@@ -274,20 +290,17 @@ async fn start_claude_login_owned_unredacted(
                     std::sync::Arc::clone(&ticket), std::sync::Arc::clone(&grant),
                 ),
                 watchdog.clone(), std::sync::Arc::clone(&operation), Some(std::sync::Arc::clone(&grant)),
+                #[cfg(all(test, unix, feature = "test-utils"))]
+                io.group_observer,
                 move || grant_for_refusal.lock().map_err(|_| "login_grant_state_poisoned".to_string())?
                     .cleanup().map_err(|e| format!("LOGIN_GRANT_CLEANUP_FAILED: {}", redact_tokens(&e.to_string()))),
             )
             .await?;
-            vendor_completed_successfully = status.success();
+            let vendor_exit = crate::login_child_custody::VendorExit::from(status);
+            vendor_completed_successfully = vendor_exit.success();
 
-            if !status.success() {
-                let code = status
-                    .code()
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "killed by signal".to_string());
-                return Err(format!(
-                    "CC_EXITED_NONZERO: `claude auth login` exited with non-zero status ({code})"
-                ));
+            if !vendor_exit.success() {
+                return Err(desktop_vendor_exit_error(status));
             }
 
             // CC commits the freshly minted token to the macOS Keychain, and that
@@ -425,6 +438,421 @@ async fn start_claude_login_owned_unredacted(
         .map_err(|_| "INTERNAL: owned desktop login failed".to_string())?
 }
 
+fn desktop_vendor_exit_error(status: std::process::ExitStatus) -> String {
+    format!(
+        "CC_EXITED_NONZERO: `claude auth login` {}",
+        crate::login_child_custody::VendorExit::from(status)
+    )
+}
+
+#[cfg(all(test, unix))]
+mod vendor_exit_diagnostic_tests {
+    use super::desktop_vendor_exit_error;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    #[test]
+    fn desktop_vendor_exit_error_names_numeric_exit() {
+        assert_eq!(
+            desktop_vendor_exit_error(ExitStatus::from_raw(23 << 8)),
+            "CC_EXITED_NONZERO: `claude auth login` exited with status 23"
+        );
+    }
+
+    #[test]
+    fn desktop_vendor_exit_error_names_terminating_signal() {
+        assert_eq!(
+            desktop_vendor_exit_error(ExitStatus::from_raw(libc::SIGTTOU)),
+            "CC_EXITED_NONZERO: `claude auth login` was terminated by signal SIGTTOU",
+            "DESKTOP_VENDOR_SIGNAL_IDENTITY_LOST"
+        );
+    }
+
+    #[test]
+    fn desktop_vendor_exit_error_names_stopping_signal() {
+        assert_eq!(
+            desktop_vendor_exit_error(ExitStatus::from_raw((libc::SIGTTOU << 8) | 0x7f)),
+            "CC_EXITED_NONZERO: `claude auth login` was stopped by signal SIGTTOU",
+            "DESKTOP_VENDOR_STOP_IDENTITY_LOST"
+        );
+    }
+}
+
+#[cfg(all(test, unix, feature = "test-utils"))]
+mod desktop_vendor_process_tests {
+    use super::{start_claude_login_owned_unredacted, ClaudeLoginIo};
+    use csq_core::types::AccountNum;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const ROLE: &str = "CSQ_PRIVATE_DESKTOP_VENDOR_ROLE";
+    const ROOT: &str = "CSQ_PRIVATE_DESKTOP_VENDOR_ROOT";
+    const ENTRY: &str = "desktop::commands::claude_login_subprocess::desktop_vendor_process_tests::desktop_vendor_pty_entry";
+
+    struct VendorGroupCleanup {
+        marker: PathBuf,
+        group: std::sync::Arc<
+            std::sync::Mutex<Option<crate::login_child_custody::group::GroupControl>>,
+        >,
+        armed: bool,
+    }
+
+    impl VendorGroupCleanup {
+        fn new(marker: PathBuf) -> Self {
+            Self {
+                marker,
+                group: Default::default(),
+                armed: true,
+            }
+        }
+
+        fn observer(&self) -> super::VendorGroupObserver {
+            let captured = std::sync::Arc::clone(&self.group);
+            std::sync::Arc::new(move |group| {
+                // This observer only records the actual spawned authority;
+                // poisoning cannot make it panic before child adoption.
+                *captured.lock().unwrap_or_else(|error| error.into_inner()) = Some(group);
+            })
+        }
+
+        fn captured_group(&self) -> Option<crate::login_child_custody::group::GroupControl> {
+            self.group
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        }
+
+        fn clear_marker(&self) {
+            if let Err(error) = std::fs::remove_file(&self.marker) {
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "private vendor marker cleanup failed: {error}"
+                );
+            }
+        }
+
+        fn disarm_completed(&mut self) {
+            self.armed = false;
+            self.clear_marker();
+        }
+
+        fn owns_unreaped_child(pid: u32) -> std::io::Result<bool> {
+            // SAFETY: initialized output; WNOWAIT does not consume a status.
+            // ECHILD rejects a reaped child or a process we do not parent.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: a non-reaping query of the captured actual child PID.
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WSTOPPED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if rc == 0 {
+                Ok(true)
+            } else {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+
+        fn cleanup_unresolved(&mut self) {
+            if !self.armed {
+                return;
+            }
+            self.armed = false;
+            let Some(group) = self.captured_group() else {
+                self.clear_marker();
+                return;
+            };
+            match Self::owns_unreaped_child(group.id()) {
+                Ok(false) => self.clear_marker(),
+                Ok(true) => {
+                    // SAFETY: read-only group/session checks for the captured
+                    // direct child; signal authority still comes from the lease.
+                    let detached_group = unsafe {
+                        libc::getpgid(group.id() as libc::pid_t) == group.id() as libc::pid_t
+                            && libc::getsid(group.id() as libc::pid_t) == group.id() as libc::pid_t
+                    };
+                    if !detached_group {
+                        eprintln!("DESKTOP_VENDOR_CLEANUP_UNDETERMINED: detached group identity unconfirmed");
+                        return;
+                    }
+                    // GroupControl rechecks WNOWAIT while holding the SAME
+                    // lease as the production reap. The earlier query alone
+                    // cannot authorize a numeric signal across that race.
+                    if let Err(error) =
+                        group.signal(crate::login_child_custody::group::GroupSignal::Kill)
+                    {
+                        eprintln!("DESKTOP_VENDOR_CLEANUP_UNDETERMINED: owned group signal refused: {error}");
+                    }
+                }
+                Err(error) => eprintln!(
+                    "DESKTOP_VENDOR_CLEANUP_UNDETERMINED: child ownership query failed: {error}"
+                ),
+            }
+        }
+
+        fn clear_after_reap(&self) {
+            if !self.marker.exists() {
+                return;
+            }
+            match self
+                .captured_group()
+                .map(|group| Self::owns_unreaped_child(group.id()))
+            {
+                None | Some(Ok(false)) => self.clear_marker(),
+                _ => eprintln!("DESKTOP_VENDOR_CLEANUP_UNDETERMINED: vendor reap unconfirmed"),
+            }
+        }
+    }
+
+    impl Drop for VendorGroupCleanup {
+        fn drop(&mut self) {
+            self.cleanup_unresolved();
+        }
+    }
+
+    fn run_desktop_vendor_in_pty(role: &str) {
+        let sandbox = tempfile::tempdir().expect("private desktop pty fixture");
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: valid output pointers; default tty settings and size.
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(opened, 0, "desktop openpty");
+        // SAFETY: openpty returned two distinct owned descriptors.
+        let (master, slave) =
+            unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+        for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+            // SAFETY: both descriptors remain owned through spawn.
+            let marked = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+            assert_eq!(marked, 0);
+        }
+        let slave_fd = slave.as_raw_fd();
+        let mut command = Command::new(std::env::current_exe().expect("desktop test executable"));
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                ENTRY,
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("HOME", sandbox.path())
+            .env("CSQ_BASE_DIR", sandbox.path().join("accounts"))
+            .env("PATH", "/usr/bin:/bin")
+            .env("LANG", "C")
+            .env("LC_ALL", "C")
+            .env(ROLE, role)
+            .env(ROOT, sandbox.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // SAFETY: only async-signal-safe libc operations before exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setsid() < 0
+                    || libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) < 0
+                    || libc::dup2(slave_fd, 0) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::signal(libc::SIGTTOU, libc::SIG_DFL) == libc::SIG_ERR
+                    || libc::signal(libc::SIGTTIN, libc::SIG_DFL) == libc::SIG_ERR
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().expect("private desktop pty dispatcher");
+        drop(slave);
+        // The product watchdog below is 3s. This outer 15s limit only bounds
+        // a broken dispatcher/runtime shutdown; it is never the pass oracle.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll desktop pty dispatcher") {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("stop wedged private dispatcher");
+                child.wait().expect("reap private dispatcher");
+                let marker = sandbox.path().join("vendor.pid");
+                if marker.exists() {
+                    // The dispatcher was our child; its vendor was not. With
+                    // no vendor wait lease, refuse every numeric-PGID signal.
+                    eprintln!("DESKTOP_VENDOR_CLEANUP_UNDETERMINED: dispatcher timed out; vendor may survive; refusing unowned numeric signal");
+                    std::fs::remove_file(marker).expect("clear marker with no signal authority");
+                }
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let mut output = String::new();
+        use std::io::Read;
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        drop(master);
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "DESKTOP_VENDOR_{role}_FAILED: {output}"
+        );
+        assert!(
+            output.contains(&format!("DESKTOP_VENDOR_REAL_PATH role={role} ok")),
+            "desktop production path sentinel missing: {output}"
+        );
+    }
+
+    #[test]
+    fn desktop_owned_login_detaches_tty_touching_vendor_without_deadline_refusal() {
+        run_desktop_vendor_in_pty("tty");
+    }
+
+    #[test]
+    fn desktop_owned_login_reports_real_sigterm_exit() {
+        run_desktop_vendor_in_pty("term");
+    }
+
+    #[test]
+    #[ignore = "requires private PTY/session setup; run by the two desktop_owned_login process tests"]
+    fn desktop_vendor_pty_entry() {
+        let _env = csq_core::platform::test_env::lock();
+        let role = std::env::var(ROLE).expect("private desktop vendor role");
+        let root = PathBuf::from(std::env::var_os(ROOT).expect("private fixture root"));
+        // SAFETY: queries refer to this dispatcher's own session/terminal.
+        unsafe {
+            assert_eq!(libc::isatty(0), 1, "fixture must inherit a tty");
+            assert_eq!(
+                libc::getsid(0),
+                libc::getpid(),
+                "fixture must own its session"
+            );
+            assert_eq!(
+                libc::tcgetpgrp(0),
+                libc::getpgrp(),
+                "fixture starts foreground"
+            );
+        }
+        let base = root.join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        let script = match role.as_str() {
+            "tty" => concat!(
+                "printf '%s\\n' \"$$\" > \"$1/vendor.pid\"; ",
+                "if [ -t 0 ]; then printf inherited; else printf null; fi > \"$1/stdin\"; ",
+                "if ( : </dev/tty ) 2>/dev/null; then printf attached; ",
+                "else printf detached; fi > \"$1/session\"; ",
+                "stty -echo; exit 23"
+            ),
+            "term" => "printf '%s\\n' \"$$\" > \"$1/vendor.pid\"; kill -TERM $$",
+            _ => panic!("unknown desktop vendor fixture role"),
+        };
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", script, "csq-private-vendor"])
+            .arg(&root)
+            .env_clear()
+            .env("HOME", &root)
+            .env("CSQ_BASE_DIR", &base)
+            .env("PATH", "/usr/bin:/bin")
+            .env("LANG", "C")
+            .env("LC_ALL", "C")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let profile: csq_core::daemon::usage_poller::HttpGetFn =
+            std::sync::Arc::new(|_, _, _| panic!("nonzero vendor must not read a profile"));
+        let mut vendor_cleanup = VendorGroupCleanup::new(root.join("vendor.pid"));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let result = runtime.block_on(start_claude_login_owned_unredacted(
+            base,
+            AccountNum::try_from(46_u16).unwrap(),
+            ClaudeLoginIo::fixture(command, Duration::from_secs(3), profile, None)
+                .observing_group(vendor_cleanup.observer()),
+        ));
+        // A normal result carries the production reap receipt. Only an
+        // unresolved result may request fixture cleanup through the real lease.
+        if result.is_ok()
+            || result
+                .as_ref()
+                .is_err_and(|error| error.starts_with("CC_EXITED_NONZERO:"))
+        {
+            vendor_cleanup.disarm_completed();
+        } else {
+            vendor_cleanup.cleanup_unresolved();
+        }
+        runtime.shutdown_timeout(Duration::from_secs(2));
+        vendor_cleanup.clear_after_reap();
+        let error = result.expect_err("private vendor deliberately exits nonzero");
+        assert!(
+            error.starts_with("CC_EXITED_NONZERO:"),
+            "DESKTOP_VENDOR_DEADLINE_OR_EARLY_REFUSAL: {error}"
+        );
+        match role.as_str() {
+            "tty" => {
+                assert!(
+                    error.contains("exited with status 23"),
+                    "DESKTOP_TTY_VENDOR_DID_NOT_COMPLETE: {error}"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(root.join("stdin")).unwrap(),
+                    "null",
+                    "desktop vendor stdin still names the controlling tty"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(root.join("session")).unwrap(),
+                    "detached",
+                    "desktop vendor still owns the parent's controlling tty"
+                );
+            }
+            "term" => assert!(
+                error.contains("was terminated by signal SIGTERM"),
+                "DESKTOP_REAL_SIGTERM_IDENTITY_LOST: {error}"
+            ),
+            _ => unreachable!(),
+        }
+        assert!(
+            !error.contains("login_timeout"),
+            "desktop vendor silently reached its deadline"
+        );
+        // SAFETY: query of our controlling tty after the actual desktop wait.
+        let foreground = unsafe { libc::tcgetpgrp(0) };
+        // SAFETY: query of this dispatcher's own process group.
+        let own_group = unsafe { libc::getpgrp() };
+        assert_eq!(foreground, own_group);
+        println!("DESKTOP_VENDOR_REAL_PATH role={role} ok");
+    }
+}
+
 fn read_fresh_vendor_credentials(
     config: &std::path::Path,
 ) -> Result<csq_core::credentials::CredentialFile, String> {
@@ -469,6 +897,8 @@ pub(crate) async fn desktop_vendor_status_impl<K: Send + Sync + 'static>(
         watchdog,
         operation,
         None,
+        #[cfg(all(test, unix, feature = "test-utils"))]
+        None,
         cleanup_refused_grant,
     )
     .await
@@ -479,6 +909,7 @@ async fn desktop_vendor_status_with_grant<K: Send + Sync + 'static>(
     watchdog: crate::login_child_custody::LoginWatchdog,
     operation: std::sync::Arc<crate::desktop::login_custody::ChildRegistration>,
     grant: Option<super::SharedVendorGrant>,
+    #[cfg(all(test, unix, feature = "test-utils"))] group_observer: Option<VendorGroupObserver>,
     cleanup_refused_grant: impl FnOnce() -> Result<(), String> + Send + 'static,
 ) -> Result<std::process::ExitStatus, String> {
     use crate::login_child_custody::OwnedLoginChild;
@@ -495,19 +926,27 @@ async fn desktop_vendor_status_with_grant<K: Send + Sync + 'static>(
                 .begin_launch()
                 .map_err(|e| redact_tokens(&format!("{e:#}")))?;
         }
-        let (child, group) =
-            crate::login_child_custody::group::spawn(&mut command).map_err(|e| {
-                let quarantine = grant
-                    .as_ref()
-                    .and_then(|grant| grant.lock().ok().map(|grant| grant.quarantine_message()))
-                    .unwrap_or_else(|| "vendor login quarantine state unavailable".into());
-                format!(
-                    "SPAWN_FAILED: {}; {quarantine}",
-                    redact_tokens(&e.to_string())
-                )
-            })?;
+        let (child, group) = crate::login_child_custody::group::spawn(
+            &mut command,
+            crate::login_child_custody::group::StdinPolicy::Null,
+        )
+        .map_err(|e| {
+            let quarantine = grant
+                .as_ref()
+                .and_then(|grant| grant.lock().ok().map(|grant| grant.quarantine_message()))
+                .unwrap_or_else(|| "vendor login quarantine state unavailable".into());
+            format!(
+                "SPAWN_FAILED: {}; {quarantine}",
+                redact_tokens(&e.to_string())
+            )
+        })?;
+        #[cfg(all(test, unix, feature = "test-utils"))]
+        if let Some(observer) = group_observer {
+            observer(group.clone());
+        }
         // Adoption is infallible and immediately follows successful spawn.
-        // This inherited-stdio flow owns no pipe readers or forwarder.
+        // The production Claude command discards stdout/stderr; this flow
+        // owns no pipe readers or forwarder.
         let mut child = OwnedLoginChild::adopt_group(
             child,
             group,
@@ -610,7 +1049,7 @@ async fn notify_daemon_after_login_off_runtime(base: std::path::PathBuf, account
 /// Error text for a failure of the pre-login identity snapshot. Nothing was
 /// published at that point, so this deliberately does NOT go through the
 /// commit-time `describe_error` ("credential publication failed"); it matches
-/// the CLI twin, which shows the raw identity message.
+/// the CLI twin's specific identity remedy, including retryable contention.
 fn prior_capture_failure(error: &csq_core::accounts::anthropic_identity::IdentityError) -> String {
     format!(
         "IDENTITY_FAILED: {}",
@@ -621,6 +1060,19 @@ fn prior_capture_failure(error: &csq_core::accounts::anthropic_identity::Identit
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prior_capture_busy_reaches_desktop_with_retry_message_and_stable_code() {
+        use csq_core::accounts::anthropic_identity::IdentityError;
+        assert_eq!(
+            prior_capture_failure(&IdentityError::BindingBusy),
+            "IDENTITY_FAILED: another csq operation holds the profiles store; retry the login in a moment (oauth_identity_busy)"
+        );
+        assert_eq!(
+            prior_capture_failure(&IdentityError::ProfilesReadRefused),
+            format!("IDENTITY_FAILED: {}", IdentityError::ProfilesReadRefused)
+        );
+    }
 
     /// N-3: an Io error while capturing the pre-login snapshot must not read
     /// as a publication failure.

@@ -289,10 +289,20 @@ enum Command {
         /// Mutually exclusive with `--slot`.
         #[arg(long)]
         provider: Option<String>,
-        /// Model alias or id to request (`opus`, `sonnet`, or a full model id).
+        /// Execute directly using admitted API-pool keys for `anthropic` or `openai`.
+        /// Mutually exclusive with `--slot` and `--provider`.
+        #[arg(long)]
+        pool: Option<String>,
+        /// Maximum completion tokens. Required and positive in pool mode only.
+        #[arg(long)]
+        max_tokens: Option<u64>,
+        /// Maximum combined prompt and system UTF-8 bytes (pool mode; default 200000).
+        #[arg(long)]
+        max_input_bytes: Option<usize>,
+        /// Model alias or id for CLI execution; a supported explicit id is required with `--pool`.
         #[arg(long)]
         model: Option<String>,
-        /// A system prompt to append (maps to Claude's `--append-system-prompt`).
+        /// System prompt (maps to Claude's `--append-system-prompt` in CLI mode).
         #[arg(long)]
         system: Option<String>,
         /// Correlation id echoed back verbatim on the envelope's `id` field.
@@ -2335,6 +2345,9 @@ pub fn run() -> Result<()> {
             stdin,
             slot,
             provider,
+            pool,
+            max_tokens,
+            max_input_bytes,
             model,
             system,
             id,
@@ -2353,6 +2366,9 @@ pub fn run() -> Result<()> {
                     system,
                     id,
                     timeout_secs: timeout,
+                    pool,
+                    max_tokens,
+                    max_input_bytes,
                 },
             )
         }

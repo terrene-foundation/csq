@@ -1095,7 +1095,7 @@ dependencies = [
 
 [[package]]
 name = "csq"
-version = "2.21.3"
+version = "2.21.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1139,7 +1139,7 @@ dependencies = [
 
 [[package]]
 name = "csq-core"
-version = "2.21.3"
+version = "2.21.4"
 dependencies = [
  "aes 0.8.4",
  "aes 0.9.3",
@@ -1197,7 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "csq-ledger"
-version = "2.21.3"
+version = "2.21.4"
 dependencies = [
  "async-trait",
  "axum",
@@ -1224,7 +1224,7 @@ dependencies = [
 
 [[package]]
 name = "csq-merkle"
-version = "2.21.3"
+version = "2.21.4"
 dependencies = [
  "hex",
  "sha2 0.10.9",
@@ -1232,14 +1232,14 @@ dependencies = [
 
 [[package]]
 name = "csq-redact"
-version = "2.21.3"
+version = "2.21.4"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "csq-sdk"
-version = "2.21.3"
+version = "2.21.4"
 dependencies = [
  "csq-redact",
  "serde",

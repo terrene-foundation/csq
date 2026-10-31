@@ -45,7 +45,7 @@
 //! - Token exchange goes over TLS to `oauth2.googleapis.com`.
 //! - `oauth_creds.json` is written via `atomic_replace` + chmod 0600.
 
-use crate::platform::fs::{atomic_replace, unique_tmp_path, write_new_private};
+use crate::platform::fs::write_private_tmp_synced_retained;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -949,25 +949,34 @@ fn write_oauth_creds(creds: &OauthCreds) -> Result<(), OauthFlowError> {
         reason: format!("mkdir: {e}"),
     })?;
     let path = gemini_dir.join("oauth_creds.json");
+    write_oauth_creds_at_path(&path, creds)
+}
+
+// The production writer accepts an explicit destination so filesystem fixtures
+// can exercise it without changing process-wide home resolution.
+fn write_oauth_creds_at_path(
+    path: &std::path::Path,
+    creds: &OauthCreds,
+) -> Result<(), OauthFlowError> {
     let json = serde_json::to_string_pretty(creds).map_err(|e| OauthFlowError::WriteFailed {
-        path: path.clone(),
+        path: path.to_path_buf(),
         reason: format!("serialize: {e}"),
     })?;
     // §5a: `write_new_private` creates the tmp file at 0o600 at creation,
     // closing the window a separate `std::fs::write` + `secure_file` pair
     // would leave open for this OAuth-credential-bearing tmp file.
-    let tmp = unique_tmp_path(&path);
-    if let Err(e) = write_new_private(&tmp, json.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
+    let writer = match write_private_tmp_synced_retained(path, json.as_bytes()) {
+        Ok(writer) => writer,
+        Err(e) => {
+            return Err(OauthFlowError::WriteFailed {
+                path: path.to_path_buf(),
+                reason: format!("write: {e}"),
+            });
+        }
+    };
+    if let Err(e) = writer.replace(path) {
         return Err(OauthFlowError::WriteFailed {
-            path: tmp,
-            reason: format!("write: {e}"),
-        });
-    }
-    if let Err(e) = atomic_replace(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(OauthFlowError::WriteFailed {
-            path,
+            path: path.to_path_buf(),
             reason: format!("atomic_replace: {e}"),
         });
     }
@@ -1237,6 +1246,43 @@ pub(crate) fn write_creds_for_test(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn f_a_oauth_creds_save_retries_first_sibling_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("oauth_creds.json");
+        let creds = OauthCreds {
+            access_token: "fixture-access".into(),
+            refresh_token: "fixture-refresh".into(),
+            scope: "fixture-scope".into(),
+            token_type: "Bearer".into(),
+            id_token: "fixture-id".into(),
+            expiry_date: 123456789,
+        };
+        let expected = serde_json::to_value(&creds).unwrap();
+        let parent = dir.path().to_path_buf();
+        let collision = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let planted = collision.clone();
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |candidate| {
+                assert_eq!(candidate.parent(), Some(parent.as_path()));
+                if planted.borrow().is_none() {
+                    std::fs::write(candidate, b"foreign-oauth-stage").unwrap();
+                    *planted.borrow_mut() = Some(candidate.to_path_buf());
+                }
+            },
+            || write_oauth_creds_at_path(&target, &creds),
+        );
+        let foreign = collision
+            .borrow()
+            .clone()
+            .expect("production create observed");
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign-oauth-stage");
+        result.expect("OAuth credentials save must retry the first sibling collision");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+        assert_eq!(saved, expected);
+    }
     use super::*;
 
     // ── Debug redaction (credential-type-hygiene Rule 1) ─────────

@@ -3,8 +3,12 @@ import { spawnSync } from 'node:child_process';
 import { resolve, join, delimiter, basename, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
-import { capture, parseFooter, retainOutput, LEG_QUEUE_WAIT_S, LEG_ATTEMPTS, attemptMsFor, budgetDeadlineMsFor, admissionWaitMsFor } from './preflight-runtime.mjs';
+import { scrubShellEnvironment, capture, parseFooter, retainOutput, LEG_QUEUE_WAIT_S, LEG_ATTEMPTS, attemptMsFor, budgetDeadlineMsFor, admissionWaitMsFor } from './preflight-runtime.mjs';
 import { installStopHandlers, exitAfterBackstops, stopSignal } from './child-supervisor.mjs';
+// FIRST statement after the imports, before any spawn: this module is also the
+// shard-leg worker entry point, whose per-test capture('bash') would otherwise
+// import exported functions into every self-test.
+scrubShellEnvironment();
 
 // ── ALLOWLIST-ONLY OUTPUT HELPERS (shared with dev-preflight.mjs) ─────────────
 // Operator-facing preflight text is a fixed vocabulary plus values that pass one
@@ -60,8 +64,25 @@ export function shownTestName(n) {
   return isRelPath(n) ? n : 'test name not recognised';
 }
 
+// PARKED (owner's fleet-dismantle order, 2026-10-31): the self-tests named in
+// scripts/ci/parked-shell-tests.txt are off the blocking path. Parse contract,
+// identical to test.yml's "Run shell gate self-tests" reader: drop every CR,
+// trim surrounding whitespace, skip blank lines and lines starting with '#'.
+// An ABSENT list parks nothing (every test runs: the fail-safe direction); any
+// other read failure throws, which the caller reports as UNDETERMINED.
+export function parseParkedList(text) {
+  return new Set(String(text).replace(/\r/g, '').split('\n').map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('#')));
+}
+export function parkedShellTests(root) {
+  let text;
+  try { text = readFileSync(join(root, 'scripts/ci/parked-shell-tests.txt'), 'utf8'); }
+  catch (e) { if (e && e.code === 'ENOENT') return new Set(); throw e; }
+  return parseParkedList(text);
+}
 export function testNames(root) {
-  return readdirSync(join(root, 'scripts/tests')).filter((n) => n.endsWith('.test.sh')).sort();
+  const parked = parkedShellTests(root);
+  return readdirSync(join(root, 'scripts/tests')).filter((n) => n.endsWith('.test.sh') && !parked.has(n)).sort();
 }
 function exitState(rows) {
   // A LATCHED STOP IS NEVER GREEN (D237 R2 sec L5). A stop that lands after
@@ -364,7 +385,7 @@ export function shardDeadlineMs(ceilingMs) {
 export function shardAttemptFor({ shard, shards, ceilingMs, perTestMs, remainingMs }) {
   const boundMs = shardCallerTimeoutMs(ceilingMs);
   return {
-    args: ['run', '--os', 'linux', '--wait-s', String(LEG_QUEUE_WAIT_S), '--', 'node',
+    args: ['run', '--os', 'linux', '--wait-s', String(LEG_QUEUE_WAIT_S), '--', 'env', '-u', 'NODE_OPTIONS', 'node',
       'scripts/ci/preflight-shell-tests.mjs', '--shard', String(shard), '--shards', String(shards),
       '--ceiling-ms', String(ceilingMs), '--per-test-ms', String(perTestMs)],
     timeoutMs: boundMs,

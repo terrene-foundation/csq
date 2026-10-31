@@ -6,7 +6,7 @@
 //! (on-disk layout) and §7.3.3 (login sequence); any drift between
 //! the spec and this module is a spec violation.
 
-use crate::platform::fs::{atomic_replace, unique_tmp_path};
+use crate::platform::fs::{atomic_replace, unique_tmp_path, WrittenPrivateFile};
 use crate::providers;
 use crate::types::AccountNum;
 use sha2::{Digest, Sha256};
@@ -1184,9 +1184,11 @@ impl std::error::Error for ExchangeRaced {}
 /// kept), and a failed third exchange (the newest file is restored with a plain replace).
 /// Every such branch fails with [`ExchangeRaced`] and flags the slot. When the swap-back
 /// succeeds and the tmp path holds csq's inode, csq's bytes are not left over the concurrent
-/// write, so the race only LOSES csq's write. An absent target uses a hard-link publish
-/// (atomic, never replaces), or create-exclusive-then-rename where the filesystem has no
-/// hard links ([`SlotWriteStatus::ExchangeUnsupported`]). A platform or filesystem without the
+/// write, so the race only LOSES csq's write. On Windows an absent target uses a validated
+/// writer-handle rename with replacement disabled: readers see absence or the complete file,
+/// and a concurrent creator wins. Other platforms use hard-link publication (atomic, never
+/// replaces), or create-exclusive-then-rename where hard links are unavailable
+/// ([`SlotWriteStatus::ExchangeUnsupported`]). A platform or filesystem without the
 /// exchange falls back to compare-then-rename (the instant between them stays open) and flags
 /// the slot the same way.
 pub(crate) fn write_config_toml_contents_if_unchanged(
@@ -1211,6 +1213,8 @@ pub(crate) mod test_seam {
     type Hook = Box<dyn Fn(&Path)>;
     thread_local! {
         pub(crate) static BEFORE_RENAME: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        /// Runs after selecting a tmp pathname, before exclusive creation.
+        pub(crate) static BEFORE_TMP_CREATE: RefCell<Option<Hook>> = const { RefCell::new(None) };
         pub(crate) static AFTER_EXCHANGE: RefCell<Option<Hook>> = const { RefCell::new(None) };
         /// Forces `exchange_paths` to report "no atomic exchange here".
         pub(crate) static NO_EXCHANGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1344,10 +1348,16 @@ fn write_config_toml_inner(
     // may carry user-configured MCP auth) AND fsyncs before returning,
     // preserving `write_and_sync`'s durability guarantee for this file
     // (immediately consumed by a spawned Codex subprocess).
-    if let Err(e) = crate::platform::fs::write_new_private_synced(&tmp, contents.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(io::Error::other(e.to_string()));
-    }
+    #[cfg(test)]
+    test_seam::BEFORE_TMP_CREATE.with(|h| {
+        if let Some(hook) = h.borrow().as_ref() {
+            hook(&tmp);
+        }
+    });
+    // The writer owns partial-failure cleanup. In particular, a failed exclusive create
+    // grants no authority to remove an entry that already occupied the tmp pathname.
+    let writer = crate::platform::fs::write_new_private_synced_retained(&tmp, contents.as_bytes())
+        .map_err(|e| io::Error::other(e.to_string()))?;
     #[cfg(test)]
     test_seam::BEFORE_RENAME.with(|h| {
         if let Some(hook) = h.borrow().as_ref() {
@@ -1355,17 +1365,41 @@ fn write_config_toml_inner(
         }
     });
     match extant {
-        Extant::Absent => publish_absent(&tmp, target, parent),
-        Extant::Bytes(expected) => publish_by_exchange(&tmp, target, expected),
+        Extant::Absent => publish_absent(&tmp, target, parent, writer),
+        Extant::Bytes(expected) => publish_by_exchange(&tmp, target, expected, writer),
     }
 }
 
-/// Publishes `tmp` at an ABSENT `target`. A hard link never replaces: it fails when a
-/// concurrent writer created the file. Where the filesystem has no hard links the fallback
-/// claims the name with an exclusive create (a concurrent creator still wins, `Changed`) and
-/// renames `tmp` over the claim; the claim is momentarily empty, so the slot is flagged
-/// [`SlotWriteStatus::ExchangeUnsupported`].
-fn publish_absent(tmp: &Path, target: &Path, config_dir: &Path) -> io::Result<ConditionalWrite> {
+/// Publishes the complete private file at an absent Windows target through its retained
+/// writer handle. Replacement is disabled, so a concurrent creator wins without any empty
+/// claim or overwrite window.
+#[cfg(windows)]
+fn publish_absent(
+    _tmp: &Path,
+    target: &Path,
+    _config_dir: &Path,
+    writer: WrittenPrivateFile,
+) -> io::Result<ConditionalWrite> {
+    use crate::platform::fs::PublishOutcome;
+    writer
+        .publish_noreplace(target)
+        .map(|outcome| match outcome {
+            PublishOutcome::Published => ConditionalWrite::Written,
+            PublishOutcome::AlreadyExists => ConditionalWrite::Changed,
+        })
+        .map_err(|e| io::Error::other(e.to_string()))
+}
+
+/// Other platforms use a hard link, which never replaces a concurrent creator. The existing
+/// no-hard-link fallback claims the name exclusively, flags its empty-claim limitation, and
+/// replaces the claim. The retained writer cleans only its own tmp entry on every return.
+#[cfg(not(windows))]
+fn publish_absent(
+    tmp: &Path,
+    target: &Path,
+    config_dir: &Path,
+    writer: WrittenPrivateFile,
+) -> io::Result<ConditionalWrite> {
     #[cfg(test)]
     let linked = if test_seam::NO_HARDLINK.with(std::cell::Cell::get) {
         Err(io::Error::new(
@@ -1378,12 +1412,8 @@ fn publish_absent(tmp: &Path, target: &Path, config_dir: &Path) -> io::Result<Co
     #[cfg(not(test))]
     let linked = std::fs::hard_link(tmp, target);
     match linked {
-        Ok(()) => {
-            let _ = std::fs::remove_file(tmp);
-            return Ok(ConditionalWrite::Written);
-        }
+        Ok(()) => return Ok(ConditionalWrite::Written),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            let _ = std::fs::remove_file(tmp);
             return Ok(ConditionalWrite::Changed);
         }
         Err(_) => {}
@@ -1399,16 +1429,11 @@ fn publish_absent(tmp: &Path, target: &Path, config_dir: &Path) -> io::Result<Co
     match opts.open(target) {
         Ok(claim) => drop(claim),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            let _ = std::fs::remove_file(tmp);
             return Ok(ConditionalWrite::Changed);
         }
-        Err(e) => {
-            let _ = std::fs::remove_file(tmp);
-            return Err(e);
-        }
+        Err(e) => return Err(e),
     }
-    if let Err(e) = atomic_replace(tmp, target) {
-        let _ = std::fs::remove_file(tmp);
+    if let Err(e) = writer.replace(target) {
         // Remove OUR still-empty claim; a claim a writer already filled is theirs.
         if std::fs::metadata(target).is_ok_and(|m| m.len() == 0) {
             let _ = std::fs::remove_file(target);
@@ -1416,14 +1441,6 @@ fn publish_absent(tmp: &Path, target: &Path, config_dir: &Path) -> io::Result<Co
         return Err(io::Error::other(e.to_string()));
     }
     Ok(ConditionalWrite::Written)
-}
-
-fn replace_or_cleanup(tmp: &Path, target: &Path) -> io::Result<()> {
-    if let Err(e) = atomic_replace(tmp, target) {
-        let _ = std::fs::remove_file(tmp);
-        return Err(io::Error::other(e.to_string()));
-    }
-    Ok(())
 }
 
 /// `(device, inode)` of the entry at `path`, without following a final symlink.
@@ -1455,14 +1472,18 @@ fn file_id(_path: &Path) -> io::Result<(u64, u64)> {
 
 /// The publish-by-exchange protocol; see `write_config_toml_contents_if_unchanged` for the
 /// contract and the failure branches. `tmp` holds csq's complete, fsynced file.
-fn publish_by_exchange(tmp: &Path, target: &Path, expected: &[u8]) -> io::Result<ConditionalWrite> {
+fn publish_by_exchange(
+    tmp: &Path,
+    target: &Path,
+    expected: &[u8],
+    writer: WrittenPrivateFile,
+) -> io::Result<ConditionalWrite> {
     let config_dir = target.parent().unwrap_or(Path::new("."));
     // csq's own file identity, recorded before anything is exchanged.
     let csq_id = match file_id(tmp) {
         Ok(id) => Some(id),
         Err(e) if e.kind() == io::ErrorKind::Unsupported => None,
         Err(e) => {
-            let _ = std::fs::remove_file(tmp);
             return Err(e);
         }
     };
@@ -1470,11 +1491,9 @@ fn publish_by_exchange(tmp: &Path, target: &Path, expected: &[u8]) -> io::Result
         Ok(x) => x,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             // The target vanished since the caller read it.
-            let _ = std::fs::remove_file(tmp);
             return Ok(ConditionalWrite::Changed);
         }
         Err(e) => {
-            let _ = std::fs::remove_file(tmp);
             return Err(e);
         }
     };
@@ -1482,10 +1501,12 @@ fn publish_by_exchange(tmp: &Path, target: &Path, expected: &[u8]) -> io::Result
         // No atomic exchange here: compare, then rename (the instant between them is open).
         set_slot_status(config_dir, SlotWriteStatus::ExchangeUnsupported);
         if read_slot_bytes(target).as_deref() != Some(expected) {
-            let _ = std::fs::remove_file(tmp);
             return Ok(ConditionalWrite::Changed);
         }
-        return replace_or_cleanup(tmp, target).map(|()| ConditionalWrite::Written);
+        return writer
+            .replace(target)
+            .map(|()| ConditionalWrite::Written)
+            .map_err(|e| io::Error::other(e.to_string()));
     }
     #[cfg(test)]
     test_seam::AFTER_EXCHANGE.with(|h| {
@@ -1494,8 +1515,10 @@ fn publish_by_exchange(tmp: &Path, target: &Path, expected: &[u8]) -> io::Result
         }
     });
     // Every failure branch below flags the slot; `keep` leaves the tmp path alone.
-    let raced = |keep_tmp: bool| {
-        if !keep_tmp {
+    let raced = |keep_tmp: bool, writer: WrittenPrivateFile| {
+        if keep_tmp {
+            writer.keep();
+        } else {
             let _ = std::fs::remove_file(tmp);
         }
         set_slot_status(config_dir, SlotWriteStatus::Raced);
@@ -1504,10 +1527,10 @@ fn publish_by_exchange(tmp: &Path, target: &Path, expected: &[u8]) -> io::Result
     // `tmp` now holds the file csq displaced from `target`. Record its identity, then judge
     // it. On a metadata error nothing more is done: csq cannot tell what is where.
     let Some(csq_id) = csq_id else {
-        return Err(raced(true));
+        return Err(raced(true, writer));
     };
     let Ok(displaced_id) = file_id(tmp) else {
-        return Err(raced(true));
+        return Err(raced(true, writer));
     };
     if read_slot_bytes(tmp).as_deref() == Some(expected) {
         let _ = std::fs::remove_file(tmp);
@@ -1522,7 +1545,7 @@ fn publish_by_exchange(tmp: &Path, target: &Path, expected: &[u8]) -> io::Result
             // one. Put the displaced file back with a plain replace.
             // If even that fails the tmp file is kept; the slot is flagged either way.
             let _restored = atomic_replace(tmp, target);
-            return Err(raced(true));
+            return Err(raced(true, writer));
         }
     }
     #[cfg(test)]
@@ -1534,27 +1557,27 @@ fn publish_by_exchange(tmp: &Path, target: &Path, expected: &[u8]) -> io::Result
     // What the swap-back displaced from `target` is at `tmp`: csq's own file (identity, not
     // bytes) when nothing else landed.
     let Ok(back_id) = file_id(tmp) else {
-        return Err(raced(true));
+        return Err(raced(true, writer));
     };
     if back_id == csq_id {
-        let _ = std::fs::remove_file(tmp);
+        writer.discard();
         return Ok(ConditionalWrite::Changed);
     }
     if back_id == displaced_id {
         // Neither a third file nor csq's: the state is not what the protocol produces.
-        return Err(raced(true));
+        return Err(raced(true, writer));
     }
     // A THIRD file (a newer concurrent write) was displaced by the swap-back: `target` holds
     // the older displaced file. Put the newest back, verify, and refuse.
     match exchange_paths(tmp, target) {
         Ok(true) => match file_id(tmp) {
-            Ok(id) if id == displaced_id => Err(raced(false)),
-            _ => Err(raced(true)),
+            Ok(id) if id == displaced_id => Err(raced(false, writer)),
+            _ => Err(raced(true, writer)),
         },
         _ => {
             // The newest is at `tmp`, the older at `target`: restore the newest.
             let _ = atomic_replace(tmp, target);
-            Err(raced(true))
+            Err(raced(true, writer))
         }
     }
 }
@@ -1686,15 +1709,17 @@ fn store_lines(dir: &Path, set: &[StatusLine]) -> io::Result<()> {
     }
     let text: String = set.iter().map(StatusLine::render).collect();
     let tmp = unique_tmp_path(&path);
-    if let Err(e) = crate::platform::fs::write_new_private_synced(&tmp, text.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(io::Error::other(e.to_string()));
-    }
-    if let Err(e) = atomic_replace(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(io::Error::other(e.to_string()));
-    }
-    Ok(())
+    #[cfg(test)]
+    test_seam::BEFORE_TMP_CREATE.with(|h| {
+        if let Some(hook) = h.borrow().as_ref() {
+            hook(&tmp);
+        }
+    });
+    let writer = crate::platform::fs::write_new_private_synced_retained(&tmp, text.as_bytes())
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    writer
+        .replace(&path)
+        .map_err(|e| io::Error::other(e.to_string()))
 }
 
 fn update_lines(dir: &Path, f: impl FnOnce(&mut Vec<StatusLine>) -> bool) {
@@ -2298,15 +2323,19 @@ pub(super) fn write_config_toml_contents(target: &Path, contents: &str) -> io::R
     // may carry user-configured MCP auth) AND fsyncs before returning,
     // preserving `write_and_sync`'s durability guarantee for this file
     // (immediately consumed by a spawned Codex subprocess).
-    if let Err(e) = crate::platform::fs::write_new_private_synced(&tmp, contents.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(io::Error::other(e.to_string()));
-    }
-    if let Err(e) = atomic_replace(&tmp, target) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(io::Error::other(e.to_string()));
-    }
-    Ok(())
+    #[cfg(test)]
+    test_seam::BEFORE_TMP_CREATE.with(|h| {
+        if let Some(hook) = h.borrow().as_ref() {
+            hook(&tmp);
+        }
+    });
+    // The writer owns partial-failure cleanup. In particular, a failed exclusive create
+    // grants no authority to remove an entry that already occupied the tmp pathname.
+    let writer = crate::platform::fs::write_new_private_synced_retained(&tmp, contents.as_bytes())
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    writer
+        .replace(target)
+        .map_err(|e| io::Error::other(e.to_string()))
 }
 
 /// Outcome of [`regenerate_slot_config`].
@@ -4737,7 +4766,6 @@ status_line_use_colors = false
     // ── R3: publish-by-exchange, conditional writers ───────────────────────
 
     /// Runs `f` once, on the FIRST call of the pre-exchange seam, then never again.
-    #[cfg(unix)]
     fn once_before_exchange(f: impl Fn(&Path) + 'static) -> SeamReset {
         let fired = std::rc::Rc::new(std::cell::Cell::new(false));
         test_seam::BEFORE_RENAME.with(|h| {
@@ -4751,12 +4779,11 @@ status_line_use_colors = false
     }
 
     /// Clears both thread-local seams on drop (panic included).
-    #[cfg(unix)]
     struct SeamReset;
-    #[cfg(unix)]
     impl Drop for SeamReset {
         fn drop(&mut self) {
             test_seam::BEFORE_RENAME.with(|h| *h.borrow_mut() = None);
+            test_seam::BEFORE_TMP_CREATE.with(|h| *h.borrow_mut() = None);
             test_seam::AFTER_EXCHANGE.with(|h| *h.borrow_mut() = None);
             test_seam::AFTER_SWAP_BACK.with(|h| *h.borrow_mut() = None);
             test_seam::NO_EXCHANGE.with(|c| c.set(false));
@@ -4961,8 +4988,9 @@ status_line_use_colors = false
         std::fs::write(&target, "d = 4 # concurrent\n").unwrap();
         let big = "#".repeat((1 << 20) + 16);
         let tmp = unique_tmp_path(&target);
-        crate::platform::fs::write_new_private_synced(&tmp, big.as_bytes()).unwrap();
-        let r = publish_by_exchange(&tmp, &target, b"e = 1\n");
+        let writer =
+            crate::platform::fs::write_new_private_synced_retained(&tmp, big.as_bytes()).unwrap();
+        let r = publish_by_exchange(&tmp, &target, b"e = 1\n", writer);
         assert!(
             matches!(r, Ok(ConditionalWrite::Changed)),
             "a clean swap-back is Changed, got {r:?}"
@@ -4973,6 +5001,149 @@ status_line_use_colors = false
             "csq's oversize file replaced the concurrent write"
         );
         assert!(!tmp.exists(), "csq's own tmp was left behind");
+    }
+
+    /// The retained Windows writer closes the source-substitution window before absent
+    /// publication and keeps the complete private payload on the same handle until rename.
+    #[cfg(windows)]
+    #[test]
+    fn absent_config_holds_its_writer_until_complete_publication() {
+        let d = TempDir::new().unwrap();
+        let target = d.path().join("config.toml");
+        let tmp = unique_tmp_path(&target);
+        let bytes = b"mcp_token = 'fixture-original'\n";
+        let writer = crate::platform::fs::write_new_private_synced_retained(&tmp, bytes).unwrap();
+        assert!(std::fs::rename(&tmp, d.path().join("held-original")).is_err());
+        assert!(std::fs::OpenOptions::new().write(true).open(&tmp).is_err());
+        assert!(!target.exists());
+
+        assert_eq!(
+            publish_absent(&tmp, &target, d.path(), writer).unwrap(),
+            ConditionalWrite::Written
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+        assert!(!tmp.exists());
+        assert!(!read_statuses(d.path()).contains(&SlotWriteStatus::ExchangeUnsupported));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn existing_config_holds_its_writer_until_complete_publication() {
+        let d = TempDir::new().unwrap();
+        let target = d.path().join("config.toml");
+        std::fs::write(&target, b"enabled = false\n").unwrap();
+        let tmp = unique_tmp_path(&target);
+        let writer =
+            crate::platform::fs::write_new_private_synced_retained(&tmp, b"enabled = true\n")
+                .unwrap();
+        assert!(std::fs::rename(&tmp, d.path().join("held-original")).is_err());
+        assert!(std::fs::OpenOptions::new().write(true).open(&tmp).is_err());
+
+        assert_eq!(
+            publish_by_exchange(&tmp, &target, b"enabled = false\n", writer).unwrap(),
+            ConditionalWrite::Written
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"enabled = true\n");
+        assert!(!tmp.exists());
+    }
+
+    /// Exclusive-create failure must never unlink the existing occupant of the selected
+    /// tmp pathname. Exercise every retained writer in this module with a real collision.
+    #[test]
+    fn a_tmp_creation_collision_preserves_the_foreign_entry_and_existing_target() {
+        for which in ["conditional", "unconditional", "status"] {
+            let _reset = SeamReset;
+            let d = TempDir::new().unwrap();
+            let target = d.path().join(if which == "status" {
+                SLOT_STATUS_FILE
+            } else {
+                "config.toml"
+            });
+            let original = b"existing = true\n";
+            std::fs::write(&target, original).unwrap();
+            let occupied = std::rc::Rc::new(std::cell::RefCell::new(None::<PathBuf>));
+            let observed = occupied.clone();
+            test_seam::BEFORE_TMP_CREATE.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |tmp| {
+                    std::fs::write(tmp, b"foreign = true\n").unwrap();
+                    *observed.borrow_mut() = Some(tmp.to_owned());
+                }));
+            });
+            let result = match which {
+                "conditional" => write_config_toml_contents_if_unchanged(
+                    &target,
+                    "replacement = true\n",
+                    Some(original),
+                )
+                .map(|_| ()),
+                "unconditional" => write_config_toml_contents(&target, "replacement = true\n"),
+                _ => store_lines(
+                    d.path(),
+                    &[StatusLine {
+                        status: SlotWriteStatus::Raced,
+                        handle: None,
+                    }],
+                ),
+            };
+            assert!(result.is_err(), "{which} accepted a tmp pathname collision");
+            let occupied = occupied.borrow();
+            let occupied = occupied.as_ref().expect("tmp-creation seam did not run");
+            assert_eq!(
+                std::fs::read(occupied).unwrap(),
+                b"foreign = true\n",
+                "{which}"
+            );
+            assert_eq!(std::fs::read(&target).unwrap(), original, "{which}");
+        }
+    }
+
+    /// A concurrent creator wins the absent-target race, with its complete bytes preserved
+    /// and csq's private tmp cleaned. This also runs through the Windows no-replace path.
+    #[test]
+    fn an_absent_config_yields_to_a_concurrent_creator_without_a_claim() {
+        let d = TempDir::new().unwrap();
+        let target = d.path().join("config.toml");
+        let _reset = once_before_exchange(|target| {
+            assert!(!target.exists());
+            std::fs::write(target, b"concurrent = true\n").unwrap();
+        });
+        assert_eq!(
+            write_config_toml_contents_if_unchanged(&target, "csq = true\n", None).unwrap(),
+            ConditionalWrite::Changed
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"concurrent = true\n");
+        let names: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("config.toml")]);
+    }
+
+    /// On Unix a source can be renamed while its writer is held. Cleanup must leave a
+    /// substituted tmp entry untouched, and must not chase the relocated original inode.
+    #[cfg(unix)]
+    #[test]
+    fn a_changed_config_preserves_a_foreign_tmp_substitution_during_cleanup() {
+        let _reset = SeamReset;
+        test_seam::NO_EXCHANGE.with(|c| c.set(true));
+        let d = TempDir::new().unwrap();
+        let target = d.path().join("config.toml");
+        std::fs::write(&target, b"concurrent = true\n").unwrap();
+        let tmp = unique_tmp_path(&target);
+        let writer =
+            crate::platform::fs::write_new_private_synced_retained(&tmp, b"private = true\n")
+                .unwrap();
+        let held = d.path().join("held-original");
+        std::fs::rename(&tmp, &held).unwrap();
+        std::fs::write(&tmp, b"foreign = true\n").unwrap();
+
+        assert_eq!(
+            publish_by_exchange(&tmp, &target, b"expected = true\n", writer).unwrap(),
+            ConditionalWrite::Changed
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"concurrent = true\n");
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"foreign = true\n");
+        assert_eq!(std::fs::read(&held).unwrap(), b"private = true\n");
     }
 
     /// r4 item 1 (sec L1a): the swap-back exchange itself fails. The concurrent file is

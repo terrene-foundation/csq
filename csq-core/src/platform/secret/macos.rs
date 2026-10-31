@@ -85,8 +85,7 @@ impl Vault for MacosKeychainVault {
                     }
                 })?,
             );
-            let value = std::str::from_utf8(&bytes).map_err(|_| SecretError::DecryptionFailed)?;
-            Ok(SecretString::new(value.to_owned().into()))
+            decode_named_secret(&bytes)
         })
     }
     fn delete_named(&self, key: &NamedKey) -> Result<(), SecretError> {
@@ -204,6 +203,11 @@ impl Vault for MacosKeychainVault {
     }
 }
 
+fn decode_named_secret(bytes: &[u8]) -> Result<SecretString, SecretError> {
+    let value = std::str::from_utf8(bytes).map_err(|_| SecretError::NamedItemUnreadable)?;
+    Ok(SecretString::new(value.to_owned().into()))
+}
+
 /// Maps a generic `security_framework::base::Error` to our
 /// [`SecretError`] variant. Without an OSStatus accessor on the
 /// older `security-framework` API surface we use the rendered
@@ -318,6 +322,15 @@ mod tests {
     fn backend_id_is_macos_keychain() {
         let v = MacosKeychainVault::new();
         assert_eq!(v.backend_id(), "macos-keychain");
+    }
+
+    #[test]
+    fn named_invalid_utf8_is_an_item_failure_without_native_keychain_access() {
+        assert!(matches!(
+            decode_named_secret(&[0xff]),
+            Err(SecretError::NamedItemUnreadable)
+        ));
+        assert!(decode_named_secret(b"synthetic-named-item").is_ok());
     }
 
     #[test]

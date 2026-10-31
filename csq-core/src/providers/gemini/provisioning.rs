@@ -42,7 +42,7 @@
 use crate::accounts::profiles_lock::ProfilesFileLock;
 use crate::credentials::file::canonical_path_for;
 use crate::error::PlatformError;
-use crate::platform::fs::{atomic_replace, unique_tmp_path, write_new_private};
+use crate::platform::fs::{unique_tmp_path, write_new_private_retained};
 use crate::platform::secret::{SecretError, SlotKey, Vault};
 use crate::providers::catalog::Surface;
 use crate::providers::gemini::SURFACE_GEMINI;
@@ -629,15 +629,16 @@ fn write_binding_locked(
     // `write_new_private` creates the tmp file at 0o600 at creation,
     // closing the window a separate write + secure_file pair left open.
     let tmp = unique_tmp_path(&path);
-    if let Err(e) = write_new_private(&tmp, json.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(ProvisionError::Io {
-            path: tmp,
-            source: std::io::Error::other(e.to_string()),
-        });
-    }
-    if let Err(e) = atomic_replace(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
+    let writer = match write_new_private_retained(&tmp, json.as_bytes()) {
+        Ok(writer) => writer,
+        Err(e) => {
+            return Err(ProvisionError::Io {
+                path: tmp,
+                source: std::io::Error::other(e.to_string()),
+            });
+        }
+    };
+    if let Err(e) = writer.replace(&path) {
         return Err(ProvisionError::AtomicReplace {
             path,
             reason: format!("atomic replace: {e}"),

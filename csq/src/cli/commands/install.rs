@@ -268,12 +268,14 @@ fn patch_settings_json(claude_home: &Path) -> Result<()> {
     // file at 0o600 at creation, closing that outright.
     let json = serde_json::to_string_pretty(&value)?;
     let tmp = csq_core::platform::fs::unique_tmp_path(&path);
-    if let Err(e) = csq_core::platform::fs::write_new_private(&tmp, json.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(anyhow!(e)).with_context(|| format!("writing temp file {}", tmp.display()));
-    }
-    if let Err(e) = csq_core::platform::fs::atomic_replace(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
+    let writer = match csq_core::platform::fs::write_new_private_retained(&tmp, json.as_bytes()) {
+        Ok(writer) => writer,
+        // The private writer cleans up only files it created; collisions stay untouched.
+        Err(e) => {
+            return Err(anyhow!(e)).with_context(|| format!("writing temp file {}", tmp.display()));
+        }
+    };
+    if let Err(e) = writer.replace(&path) {
         return Err(anyhow!("atomic replace: {e}"));
     }
     Ok(())
@@ -461,12 +463,14 @@ fn strip_legacy_statusline_from_file(settings_path: &Path) -> Result<bool> {
     // transient window) — `write_new_private` closes it outright.
     let json = serde_json::to_string_pretty(&value)?;
     let tmp = csq_core::platform::fs::unique_tmp_path(settings_path);
-    if let Err(e) = csq_core::platform::fs::write_new_private(&tmp, json.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(anyhow!(e)).with_context(|| format!("writing temp file {}", tmp.display()));
-    }
-    if let Err(e) = csq_core::platform::fs::atomic_replace(&tmp, settings_path) {
-        let _ = std::fs::remove_file(&tmp);
+    let writer = match csq_core::platform::fs::write_new_private_retained(&tmp, json.as_bytes()) {
+        Ok(writer) => writer,
+        // The private writer cleans up only files it created; collisions stay untouched.
+        Err(e) => {
+            return Err(anyhow!(e)).with_context(|| format!("writing temp file {}", tmp.display()));
+        }
+    };
+    if let Err(e) = writer.replace(settings_path) {
         return Err(anyhow!("atomic replace: {e}"));
     }
 

@@ -25,12 +25,17 @@
 //!
 //! ### Windows note
 //!
-//! On Windows, a running process cannot replace its own executable. We use
-//! `platform::fs::atomic_replace` which calls `MoveFileExW` — this works
-//! when the target file is not memory-mapped, which is the case after the
-//! process has fully loaded. If the move fails (ACCESS_DENIED), the error is
-//! returned and the user is instructed to close and restart csq before
-//! updating.
+//! On Windows, `platform::fs::atomic_replace` requires the temp and target to
+//! have the same parent path. It pins that parent, validates the source as a
+//! regular, non-reparse, single-link file, and renames through that source handle.
+//! It first requests POSIX replacement semantics; only an unsupported rename
+//! class/status selects the plain replacing rename through the same handle.
+//! Neither path deletes the target first or creates an empty target placeholder.
+//! The validated source handle pins its identity against rename/delete, but the
+//! path-based updater does not retain its original writer or freeze content.
+//! Windows may refuse replacement of a mapped executable or a file held without
+//! compatible sharing. The bounded retry policy can absorb transient contention;
+//! a final failure is returned to the caller rather than treated as an update.
 
 #[cfg(not(unix))]
 use crate::platform::fs::secure_file;

@@ -1,6 +1,6 @@
 # 04 csq Daemon Architecture
 
-Spec version: 1.14.2 | Status: DRAFT | Governs: daemon subsystems, IPC surface, refresh logic, sweep, supervisor
+Spec version: 1.14.3 | Status: DRAFT | Governs: daemon subsystems, IPC surface, refresh logic, sweep, supervisor
 
 ---
 
@@ -242,7 +242,7 @@ Every flipped site routes via `crate::accounts::profiles::resolve_slot_to_uuid(b
 1. **Resolve UUID once.** `resolve_uuid_for_account(base, slot)` is called once at the top of the mutex-held section; the UUID is held through all writes (resolve-once).
 2. **UUID-only canonical write (daemon refresher).** `save_canonical_for` writes `identities/<UUID>/credentials.json` only; the numeric `credentials/<N>.json` write is not performed on the refresh path. UUID absent is a fail-closed `NoCredentials` error. All read paths resolve the UUID-keyed path; the legacy fallback path covers pre-mint installs that have no `by_slot` entry. Only the initial login/binding paths retain a legacy write (for backward-compatible existence detection).
 3. **Subscription-metadata guard at the canonical site.** `preserve_subscription_metadata(incoming, existing_uuid_path)` is applied to the UUID-keyed write — Anthropic's token endpoint does not return `subscription_type` or `rate_limit_tier`; the guard backfills from the existing `identities/<UUID>/credentials.json`. The Codex call site short-circuits (Codex carries no subscription metadata); structural parity is preserved so future Codex-shape preservation lands without re-plumbing.
-4. **Atomic-write cleanup compliance.** `save_uuid_credentials` and `save_codex_canonical_for_uuid` in `credentials/file.rs` use the injectable `write_uuid_credentials_inner<W,S,R>` and `save_codex_canonical_for_uuid_inner<W,S,R>` shapes respectively, with tmp-file cleanup on every failure branch (write / secure_file / atomic_replace) so a secret-bearing temp file is never left readable on disk after a partial write.
+4. **Atomic-write cleanup compliance.** `save_uuid_credentials` and `save_codex_canonical_for_uuid` in `credentials/file.rs` use `write_uuid_credentials_inner` and `save_codex_canonical_for_uuid_inner` respectively. The creating private writer remains owned through permission checks and publication; its drop handles cleanup on later failure. A failed exclusive create grants no ownership and never authorizes unlinking the colliding path.
 
 **Codex/Gemini chokepoint divergence:** Codex and Gemini do NOT route through `finalize_login`. They have separate authentication flows that do not call the identity mint hook at login time. Codex/Gemini identities are minted only by the daemon Pass 0 walk (when their `config-N/` dirs appear on the next daemon start).
 

@@ -93,6 +93,8 @@ pub struct PoolRow {
     #[serde(flatten)]
     pub entry: PoolEntry,
     pub present: bool,
+    #[serde(default)]
+    pub vault_file_missing: bool,
 }
 
 pub(crate) fn validate_provider(provider: &str) -> Result<()> {

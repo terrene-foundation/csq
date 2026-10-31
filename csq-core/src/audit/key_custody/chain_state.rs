@@ -10,7 +10,7 @@
 //! # §5a compliance (PRIMARY METHODOLOGICAL DIRECTIVE)
 //!
 //! Every write path uses `unique_tmp_path → write → secure_file →
-//! atomic_replace` with `remove_file(&tmp)` on every failure branch, per
+//! atomic_replace` with writer-owned cleanup on every failure branch, per
 //! `rules/security.md §5a`. The audit primitive:
 //!
 //! ```bash
@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audit::key_custody::KeyCustodyError;
 use crate::audit::types::{Ed25519PublicKey, KeyId};
-use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+use crate::platform::fs::{secure_file, write_private_tmp_retained};
 
 /// M04-extended view of `chain.json`.
 ///
@@ -217,28 +217,27 @@ impl ChainState {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| KeyCustodyError::ChainParse(format!("serialize: {e}")))?;
 
-        // §5a: unique_tmp_path → write → secure_file → atomic_replace,
-        // with remove_file(&tmp) on every failure branch.
-        let tmp = unique_tmp_path(&path);
+        // §5a: fresh private stage → secure_file → atomic_replace,
+        // with writer-owned cleanup on every failure branch.
+        let writer = match write_private_tmp_retained(&path, json.as_bytes()) {
+            Ok(writer) => writer,
+            Err(e) => {
+                return Err(KeyCustodyError::ChainIo(format!(
+                    "write tmp {}: {e}",
+                    path.display()
+                )));
+            }
+        };
 
-        if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(KeyCustodyError::ChainIo(format!(
-                "write tmp {}: {e}",
-                tmp.display()
-            )));
-        }
-
+        let tmp = writer.path().to_path_buf();
         if let Err(e) = secure_file(&tmp) {
-            let _ = std::fs::remove_file(&tmp);
             return Err(KeyCustodyError::ChainIo(format!(
                 "secure_file {}: {e}",
                 tmp.display()
             )));
         }
 
-        if let Err(e) = atomic_replace(&tmp, &path) {
-            let _ = std::fs::remove_file(&tmp);
+        if let Err(e) = writer.replace(&path) {
             return Err(KeyCustodyError::ChainIo(format!(
                 "atomic_replace {} → {}: {e}",
                 tmp.display(),
@@ -289,6 +288,43 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f4_collision_chain_state_retries_without_touching_foreign() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("eatp-runs").join("chain.json");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"old chain").unwrap();
+        let state = ChainState::new("new-chain");
+        let expected = serde_json::to_string_pretty(&state).unwrap();
+        let collision = std::rc::Rc::new(std::cell::RefCell::new(None::<std::path::PathBuf>));
+        let planted = std::rc::Rc::clone(&collision);
+        let sandbox = dir.path().to_path_buf();
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |candidate| {
+                assert!(candidate.starts_with(&sandbox));
+                if planted.borrow().is_none() {
+                    std::fs::write(candidate, b"foreign collision sentinel").unwrap();
+                    *planted.borrow_mut() = Some(candidate.to_path_buf());
+                }
+            },
+            || state.save_in(dir.path(), "eatp-runs"),
+        );
+        let foreign = collision
+            .borrow()
+            .clone()
+            .expect("production create observer must run");
+        assert_eq!(
+            std::fs::read(foreign).unwrap(),
+            b"foreign collision sentinel"
+        );
+        assert!(
+            result.is_ok(),
+            "chain state must publish after collision: {result:?}"
+        );
+        assert_eq!(std::fs::read(target).unwrap(), expected.as_bytes());
+    }
+
     use tempfile::TempDir;
 
     fn tmp_base() -> TempDir {

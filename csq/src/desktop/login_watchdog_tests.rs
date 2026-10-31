@@ -548,6 +548,7 @@ fn owned_desktop_vendor_entry() {
             "hold"
                 | "success"
                 | "stdout-held"
+                | "stdin-probe"
                 | "invalid-data-held"
                 | "group-parent"
                 | "group-child"
@@ -598,6 +599,21 @@ fn owned_desktop_vendor_entry() {
     #[cfg(all(unix, feature = "test-utils"))]
     if role.starts_with("handler-") {
         handler_vendor_write(role, &root);
+    }
+    #[cfg(unix)]
+    if role == "stdin-probe" {
+        let mut bytes = Vec::new();
+        // Null and both policy alternatives use finite <64-byte seed files.
+        std::io::stdin()
+            .lock()
+            .take(64)
+            .read_to_end(&mut bytes)
+            .expect("private actual fd0 read");
+        publish_fixture_receipt(
+            &root.join("stdin-observed.json"),
+            serde_json::json!({"pid":std::process::id(),"fd":0,"bytes":bytes}).to_string(),
+        )
+        .expect("actual fd0 receipt");
     }
     if role == "success" {
         std::fs::write(root.join("completed"), b"inert desktop transaction\n").expect("completed");
@@ -743,6 +759,51 @@ async fn result(observer: &mut Observer) -> Result<Result<(), String>, String> {
         .map_err(|_| "DESKTOP_FIXTURE_CUSTODY_UNKNOWN: adapter observation cap reached")?
         .map_err(|_| "DESKTOP_FIXTURE_CUSTODY_UNKNOWN: adapter task failed".into())
 }
+/// A forced deadline must have taken the Timeout latch; an already-finished
+/// operation is a different fixture failure than an absent one and is named.
+fn forced_deadline_verdict(
+    forced: crate::login_child_custody::ForcedDeadline,
+) -> Result<(), String> {
+    match forced {
+        crate::login_child_custody::ForcedDeadline::Latched => Ok(()),
+        crate::login_child_custody::ForcedDeadline::AlreadyFinished => Err(
+            "DESKTOP_FIXTURE_CUSTODY_UNKNOWN: forced deadline target already refused or sealed before the force".into(),
+        ),
+    }
+}
+/// Claude timeout case: a long deadline the test itself forces after the actual
+/// child is bound. A real short deadline starts in `LoginWatchdog::new`, before
+/// the reservation and spawn, and on a loaded host can pass before the child exists.
+fn start_claude_forceable(
+    fixture: &DesktopFixture,
+    slot: u16,
+    post: Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<(Observer, crate::login_child_custody::LoginWatchdog), String> {
+    let command = fixture.command("hold").map_err(|e| e.to_string())?;
+    let lock = private_lock(fixture.root(), slot)?;
+    let key = ChildKey::new(LoginProvider::Claude, account(slot));
+    let watchdog = crate::login_child_custody::LoginWatchdog::new(
+        Duration::from_secs(60),
+        crate::login_child_custody::DeliveryPhase::Unknown,
+    );
+    let operation = login_custody::global().reserve_child(key, watchdog.clone())?;
+    let worker_watchdog = watchdog.clone();
+    let observer = login_custody::global().spawn_with_ticket(move |ticket| async move {
+        let status = super::commands::claude_login_subprocess::desktop_vendor_status_impl(
+            command,
+            (ticket, lock),
+            worker_watchdog,
+            operation,
+            || Ok(()),
+        )
+        .await?;
+        if status.success() {
+            post.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(())
+    })?;
+    Ok((observer, watchdog))
+}
 fn start_claude(
     fixture: &DesktopFixture,
     slot: u16,
@@ -764,17 +825,20 @@ async fn claude_case(drop_observer: bool, cancel: bool) -> Result<(), String> {
     let mut fixture = DesktopFixture::new().map_err(|e| e.to_string())?;
     let post = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let key = ChildKey::new(LoginProvider::Claude, account(1));
-    let mut observer = start_claude(
-        &fixture,
-        1,
-        if drop_observer || cancel {
-            Duration::from_secs(60)
-        } else {
-            Duration::from_secs(2)
-        },
-        Arc::clone(&post),
-    )?;
+    let timeout_case = !drop_observer && !cancel;
+    let (mut observer, timeout_watchdog) = if timeout_case {
+        let (observer, watchdog) = start_claude_forceable(&fixture, 1, Arc::clone(&post))?;
+        (observer, Some(watchdog))
+    } else {
+        (
+            start_claude(&fixture, 1, Duration::from_secs(60), Arc::clone(&post))?,
+            None,
+        )
+    };
     bind(&mut fixture, key).await?;
+    if let Some(watchdog) = &timeout_watchdog {
+        forced_deadline_verdict(watchdog.force_deadline_for_test())?;
+    }
     if cancel {
         let operation_id = login_custody::global()
             .pending_logins()?
@@ -918,10 +982,12 @@ async fn native_case() -> Result<(), String> {
     let base = fixture.root().join("base");
     let key = ChildKey::new(LoginProvider::Grok, account(3));
     let lock = private_lock(fixture.root(), 3)?;
+    // Forced after bind: a real 2s deadline can pass before the child is spawned.
     let watchdog = crate::login_child_custody::LoginWatchdog::new(
-        Duration::from_secs(2),
+        Duration::from_secs(60),
         crate::login_child_custody::DeliveryPhase::Unknown,
     );
+    let forced_watchdog = watchdog.clone();
     let worker_watchdog = watchdog.clone();
     let mut observer = login_custody::global().spawn_with_ticket(move |ticket| async move {
         let worker = tokio::task::spawn_blocking(move || {
@@ -951,6 +1017,7 @@ async fn native_case() -> Result<(), String> {
         super::commands::observe_desktop_login(worker, watchdog).await
     })?;
     bind(&mut fixture, key).await?;
+    forced_deadline_verdict(forced_watchdog.force_deadline_for_test())?;
     let refusal = result(&mut observer)
         .await?
         .err()
@@ -981,14 +1048,13 @@ async fn codex_case(exit_request: bool) -> Result<(), String> {
     let command = fixture.command("stdout-held").map_err(|e| e.to_string())?;
     let lock = private_lock(fixture.root(), 4)?;
     let key = ChildKey::new(LoginProvider::Codex, account(4));
+    // The reader-timeout case forces its deadline after bind (a real 2s deadline
+    // can pass before the child is spawned on a loaded host).
     let watchdog = crate::login_child_custody::LoginWatchdog::new(
-        if exit_request {
-            Duration::from_secs(60)
-        } else {
-            Duration::from_secs(2)
-        },
+        Duration::from_secs(60),
         crate::login_child_custody::DeliveryPhase::Unknown,
     );
+    let forced_watchdog = watchdog.clone();
     let worker_watchdog = watchdog.clone();
     let mut observer = login_custody::global().spawn_with_ticket(move |ticket| async move {
         let worker = tokio::task::spawn_blocking(move || {
@@ -1047,6 +1113,7 @@ async fn codex_case(exit_request: bool) -> Result<(), String> {
         }
         return Ok(());
     }
+    forced_deadline_verdict(forced_watchdog.force_deadline_for_test())?;
     let refusal = result(&mut observer)
         .await?
         .err()
@@ -1068,6 +1135,153 @@ async fn codex_case(exit_request: bool) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
+const DESKTOP_PARENT_STDIN_SEED: &[u8] = b"private-parent-stdin-seed\n";
+#[cfg(unix)]
+const DESKTOP_CALLER_STDIN_SEED: &[u8] = b"private-builder-stdin-seed\n";
+
+#[cfg(unix)]
+async fn desktop_stdin_policy_case(caller: &str) -> Result<(), String> {
+    use csq_core::providers::{catalog::Surface, native_login::login_native_with};
+    let mut parent_seed = Vec::new();
+    std::io::stdin()
+        .lock()
+        .take(64)
+        .read_to_end(&mut parent_seed)
+        .map_err(|error| error.to_string())?;
+    if parent_seed != DESKTOP_PARENT_STDIN_SEED {
+        return Err("DESKTOP_FIXTURE_CUSTODY_UNKNOWN: dispatcher stdin seed absent".into());
+    }
+    // SAFETY: fd0 belongs to this private dispatcher and is a seeded regular
+    // file. Rewind it so a wrong Inherit policy exposes the parent seed.
+    if unsafe { libc::lseek(libc::STDIN_FILENO, 0, libc::SEEK_SET) } != 0 {
+        return Err("DESKTOP_FIXTURE_CUSTODY_UNKNOWN: dispatcher stdin rewind failed".into());
+    }
+    let mut fixture = DesktopFixture::new().map_err(|error| error.to_string())?;
+    let seed_path = fixture.root().join("builder-stdin");
+    std::fs::write(&seed_path, DESKTOP_CALLER_STDIN_SEED).map_err(|error| error.to_string())?;
+    let mut command = fixture
+        .command("stdin-probe")
+        .map_err(|error| error.to_string())?;
+    command.stdin(std::fs::File::open(seed_path).map_err(|error| error.to_string())?);
+    let (provider, slot) = match caller {
+        "native" => (LoginProvider::Grok, 13),
+        "codex" => (LoginProvider::Codex, 14),
+        "claude" => (LoginProvider::Claude, 15),
+        _ => return Err("DESKTOP_FIXTURE_CUSTODY_UNKNOWN: unknown stdin caller".into()),
+    };
+    let key = ChildKey::new(provider, account(slot));
+    let lock = private_lock(fixture.root(), slot)?;
+    let watchdog = crate::login_child_custody::LoginWatchdog::new(
+        Duration::from_secs(30),
+        crate::login_child_custody::DeliveryPhase::Unknown,
+    );
+    let app = (caller == "codex").then(tauri::test::mock_app);
+    let mut observer = match caller {
+        "claude" => login_custody::global().spawn_with_ticket(move |ticket| async move {
+            super::commands::claude_login_subprocess::desktop_vendor_status_registered_with_timeout(
+                command,
+                (ticket, lock),
+                Duration::from_secs(30),
+                key,
+            )
+            .await
+            .map(|_| ())
+        })?,
+        "native" => {
+            let base = fixture.root().join("base");
+            let worker_watchdog = watchdog.clone();
+            login_custody::global().spawn_with_ticket(move |ticket| async move {
+                let worker = tokio::task::spawn_blocking(move || {
+                    let children: super::commands::NativeLoginChildren =
+                        Arc::new(Mutex::new(std::collections::HashMap::new()));
+                    let spawned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    login_native_with(
+                        &base,
+                        account(slot),
+                        Surface::Grok,
+                        move |_, _, _, _| {
+                            super::commands::native_vendor_with_command(
+                                command,
+                                "owned-private-native",
+                                Surface::Grok,
+                                &children,
+                                &spawned,
+                                worker_watchdog,
+                                (ticket, lock),
+                                key,
+                            )
+                        },
+                        |_| {},
+                    )
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:#}"))
+                });
+                super::commands::observe_desktop_login(worker, watchdog).await
+            })?
+        }
+        "codex" => {
+            let handle = app
+                .as_ref()
+                .expect("private mock Codex app")
+                .handle()
+                .clone();
+            let worker_watchdog = watchdog.clone();
+            login_custody::global().spawn_with_ticket(move |ticket| async move {
+                let worker = tokio::task::spawn_blocking(move || {
+                    let child_slot = Arc::new(Mutex::new(None));
+                    let mut on_code = |_| {};
+                    super::commands::codex_vendor_with_command(
+                        command,
+                        &mut on_code,
+                        &handle,
+                        &child_slot,
+                        worker_watchdog,
+                        (ticket, lock),
+                        key,
+                    )
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:#}"))
+                });
+                super::commands::observe_desktop_login(worker, watchdog).await
+            })?
+        }
+        _ => unreachable!(),
+    };
+    bind(&mut fixture, key).await?;
+    let receipt_path = fixture.root().join("stdin-observed.json");
+    let probe_reached = until(Duration::from_secs(5), || receipt_path.is_file()).await;
+    // The actor reads only fd0, then waits on the existing release-file
+    // protocol. A nonzero exit prevents provider credential finalization.
+    fixture.release(7).map_err(|error| error.to_string())?;
+    let _adapter_outcome = result(&mut observer).await?;
+    let drain = login_custody::global().close();
+    let status = drain_complete(&drain, &mut fixture).await?;
+    drain.reopen()?;
+    if !probe_reached || status.code() != Some(7) {
+        return Err(
+            "DESKTOP_FIXTURE_CUSTODY_UNKNOWN: actual stdin actor receipt/reap absent".into(),
+        );
+    }
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(receipt_path).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    if receipt["pid"].as_u64() != fixture.pid.map(u64::from) || receipt["fd"] != 0 {
+        return Err(
+            "DESKTOP_FIXTURE_CUSTODY_UNKNOWN: stdin receipt is not the retained actor".into(),
+        );
+    }
+    let bytes: Vec<u8> =
+        serde_json::from_value(receipt["bytes"].clone()).map_err(|error| error.to_string())?;
+    if !bytes.is_empty() {
+        return Err(format!(
+            "DESKTOP_STDIN_NULL_POLICY_REQUIRED: caller={caller}; inherited_parent={}; retained_caller={}",
+            bytes == DESKTOP_PARENT_STDIN_SEED, bytes == DESKTOP_CALLER_STDIN_SEED,
+        ));
+    }
+    Ok(())
+}
+
 fn run_desktop_case_driver(role: &str, root: &Path) -> ! {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1082,6 +1296,12 @@ fn run_desktop_case_driver(role: &str, root: &Path) -> ! {
                 "case-claude-timeout" => claude_case(false, false).await,
                 "case-confirm-cancel" => claude_case(false, true).await,
                 "case-native-reader" => native_case().await,
+                #[cfg(unix)]
+                "case-stdin-native" => desktop_stdin_policy_case("native").await,
+                #[cfg(unix)]
+                "case-stdin-codex" => desktop_stdin_policy_case("codex").await,
+                #[cfg(unix)]
+                "case-stdin-claude" => desktop_stdin_policy_case("claude").await,
                 "case-native-invalid" => native_invalid_case().await,
                 #[cfg(unix)]
                 "case-reservation" => reservation_case().await,
@@ -1241,6 +1461,15 @@ fn case_process(role: &str) {
     command
         .stdout(std::fs::File::create(fixture.root().join("case.out")).expect("case stdout"))
         .stderr(std::fs::File::create(fixture.root().join("case.err")).expect("case stderr"));
+    #[cfg(unix)]
+    if matches!(
+        role,
+        "case-stdin-native" | "case-stdin-codex" | "case-stdin-claude"
+    ) {
+        let seed = fixture.root().join("dispatcher-stdin");
+        std::fs::write(&seed, DESKTOP_PARENT_STDIN_SEED).expect("private dispatcher stdin seed");
+        command.stdin(std::fs::File::open(seed).expect("private dispatcher stdin file"));
+    }
     let child = spawn_owned_case(&mut command).expect("owned exact case entry");
     let pid = child.id();
     fixture.pid = Some(pid);
@@ -1401,6 +1630,22 @@ fn case_process(role: &str) {
         fixture.root().join("case-completed").is_file(),
         "actual adapter/drain completion receipt required"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn native_desktop_spawner_always_supplies_null_stdin() {
+    case_process("case-stdin-native");
+}
+#[cfg(unix)]
+#[test]
+fn codex_desktop_spawner_always_supplies_null_stdin() {
+    case_process("case-stdin-codex");
+}
+#[cfg(unix)]
+#[test]
+fn claude_desktop_spawner_always_supplies_null_stdin() {
+    case_process("case-stdin-claude");
 }
 
 #[test]
@@ -2439,11 +2684,12 @@ async fn handler_case(role: &str) -> Result<(), String> {
         }
     });
     let hooks = if late || end { None } else { Some(seal) };
-    let timeout = if late {
-        Duration::from_secs(2)
-    } else {
-        Duration::from_secs(60)
-    };
+    // The deadline never decides ordering here. A late case forces it below,
+    // after the actual vendor has written the grant: a real short deadline
+    // races pre-spawn setup and child startup, and on a loaded host passes
+    // before the child exists (the spawn is then refused and no grant is ever
+    // written).
+    let timeout = Duration::from_secs(60);
     let mut observer: Observer = if claude {
         let profile: csq_core::daemon::usage_poller::HttpGetFn = Arc::new(|url, token, _| {
             assert_eq!(url, "https://api.anthropic.com/api/oauth/profile");
@@ -2566,6 +2812,19 @@ async fn handler_case(role: &str) -> Result<(), String> {
         .operation_id;
     let outcome;
     if late {
+        match login_custody::global().force_deadline_for_test(&key) {
+            login_custody::DeadlineForce::Forced(forced) => forced_deadline_verdict(forced)?,
+            login_custody::DeadlineForce::Absent => {
+                return Err(
+                    "DESKTOP_FIXTURE_CUSTODY_UNKNOWN: late deadline target operation absent".into(),
+                )
+            }
+            login_custody::DeadlineForce::RegistryPoisoned => {
+                return Err(
+                    "DESKTOP_FIXTURE_CUSTODY_UNKNOWN: late deadline registry lock poisoned".into(),
+                )
+            }
+        }
         outcome = result(&mut observer).await?;
         if outcome.is_ok() {
             return Err("HANDLER_LATE_ZERO_PERSISTENCE".into());

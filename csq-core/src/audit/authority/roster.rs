@@ -63,7 +63,7 @@
 //! # §5a write path
 //!
 //! `save_roster` uses `unique_tmp_path → write → secure_file → atomic_replace`
-//! with `remove_file(&tmp)` on every failure branch (per `rules/security.md §5a`).
+//! with writer-owned cleanup on every failure branch (per `rules/security.md §5a`).
 //! `save_detached_roster` uses the same pattern for BOTH files (roster + sidecar),
 //! with byte-preserving writes (no re-serialization — the sidecar covers raw bytes).
 
@@ -74,7 +74,7 @@ use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 
 use crate::audit::types::{Ed25519PublicKey, Ed25519Signature};
-use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+use crate::platform::fs::{secure_file, write_private_tmp_retained};
 
 use super::error::AuthorityError;
 use super::grant::{AuthorityGrant, EnrolledKey, PactDefinition};
@@ -439,7 +439,7 @@ pub fn verify_detached_roster(
 /// Save a `SignedRoster` to `<base>/audit/authority-roster.json`.
 ///
 /// Uses `unique_tmp_path → write → secure_file → atomic_replace` with
-/// `remove_file(&tmp)` on every failure branch (§5a).
+/// writer-owned cleanup on every failure branch (§5a).
 ///
 /// Creates `<base>/audit/` if it does not exist.
 pub fn save_roster(base: &Path, signed: &SignedRoster) -> Result<(), AuthorityError> {
@@ -464,21 +464,19 @@ pub fn save_roster(base: &Path, signed: &SignedRoster) -> Result<(), AuthorityEr
         serde_json::to_string_pretty(signed).map_err(|_| AuthorityError::Io("serialize roster"))?;
 
     // §5a: unique_tmp_path → write → secure_file → atomic_replace
-    // with remove_file(&tmp) on every failure branch.
-    let tmp = unique_tmp_path(&path);
+    // with writer-owned cleanup on every failure branch.
+    let writer = match write_private_tmp_retained(&path, json.as_bytes()) {
+        Ok(writer) => writer,
+        Err(_) => {
+            return Err(AuthorityError::Io("write roster tmp"));
+        }
+    };
 
-    if std::fs::write(&tmp, json.as_bytes()).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(AuthorityError::Io("write roster tmp"));
-    }
-
-    if secure_file(&tmp).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    if secure_file(writer.path()).is_err() {
         return Err(AuthorityError::Io("secure_file roster tmp"));
     }
 
-    if atomic_replace(&tmp, &path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    if writer.replace(&path).is_err() {
         return Err(AuthorityError::Io("atomic_replace roster"));
     }
 
@@ -492,7 +490,7 @@ pub fn save_roster(base: &Path, signed: &SignedRoster) -> Result<(), AuthorityEr
 /// The sidecar covers the raw bytes; we MUST NOT re-serialize — any difference
 /// in whitespace or field ordering would break the signature. Both files are
 /// written via `unique_tmp_path → write → secure_file → atomic_replace` with
-/// `remove_file(&tmp)` on every failure branch (§5a, per `rules/security.md`).
+/// writer-owned cleanup on every failure branch (§5a, per `rules/security.md`).
 ///
 /// Creates `<base>/audit/` if it does not exist.
 pub fn save_detached_roster(
@@ -529,34 +527,30 @@ pub fn save_detached_roster(
     // closed). Roster-first would instead always leave a new-roster/old-
     // sidecar pair that fails verification and bricks startup until re-install.
     // --- Write sidecar file ---
-    let tmp_sig = unique_tmp_path(&sig_p);
-
-    if std::fs::write(&tmp_sig, sidecar_hex.as_bytes()).is_err() {
-        let _ = std::fs::remove_file(&tmp_sig);
-        return Err(AuthorityError::Io("write sidecar tmp"));
-    }
-    if secure_file(&tmp_sig).is_err() {
-        let _ = std::fs::remove_file(&tmp_sig);
+    let writer = match write_private_tmp_retained(&sig_p, sidecar_hex.as_bytes()) {
+        Ok(writer) => writer,
+        Err(_) => {
+            return Err(AuthorityError::Io("write sidecar tmp"));
+        }
+    };
+    if secure_file(writer.path()).is_err() {
         return Err(AuthorityError::Io("secure_file sidecar tmp"));
     }
-    if atomic_replace(&tmp_sig, &sig_p).is_err() {
-        let _ = std::fs::remove_file(&tmp_sig);
+    if writer.replace(&sig_p).is_err() {
         return Err(AuthorityError::Io("atomic_replace sidecar"));
     }
 
     // --- Write roster file (byte-preserving — no re-serialize) ---
-    let tmp_roster = unique_tmp_path(&roster_p);
-
-    if std::fs::write(&tmp_roster, raw_roster_bytes).is_err() {
-        let _ = std::fs::remove_file(&tmp_roster);
-        return Err(AuthorityError::Io("write detached roster tmp"));
-    }
-    if secure_file(&tmp_roster).is_err() {
-        let _ = std::fs::remove_file(&tmp_roster);
+    let writer = match write_private_tmp_retained(&roster_p, raw_roster_bytes) {
+        Ok(writer) => writer,
+        Err(_) => {
+            return Err(AuthorityError::Io("write detached roster tmp"));
+        }
+    };
+    if secure_file(writer.path()).is_err() {
         return Err(AuthorityError::Io("secure_file detached roster tmp"));
     }
-    if atomic_replace(&tmp_roster, &roster_p).is_err() {
-        let _ = std::fs::remove_file(&tmp_roster);
+    if writer.replace(&roster_p).is_err() {
         return Err(AuthorityError::Io("atomic_replace detached roster"));
     }
 
@@ -807,6 +801,101 @@ mod tests {
 
     fn tmp() -> TempDir {
         tempfile::tempdir().expect("tempdir")
+    }
+
+    fn collide_roster_stage(
+        target: std::path::PathBuf,
+        stage: usize,
+        operation: impl FnOnce() -> Result<(), AuthorityError>,
+    ) -> (Result<(), AuthorityError>, std::path::PathBuf) {
+        use std::{
+            cell::{Cell, RefCell},
+            rc::Rc,
+        };
+        let parent = target.parent().unwrap().to_path_buf();
+        let prefix = format!("{}.tmp.", target.file_stem().unwrap().to_str().unwrap());
+        let creates = Rc::new(Cell::new(0));
+        let planted = Cell::new(false);
+        let foreign = Rc::new(RefCell::new(None));
+        let observed_creates = creates.clone();
+        let observed_foreign = foreign.clone();
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |candidate| {
+                if candidate.parent() != Some(parent.as_path()) {
+                    return;
+                }
+                let current = observed_creates.get();
+                observed_creates.set(current + 1);
+                let matches_stage = candidate
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with(&prefix);
+                if current == stage && matches_stage && !planted.replace(true) {
+                    std::fs::write(candidate, b"foreign roster stage").unwrap();
+                    *observed_foreign.borrow_mut() = Some(candidate.to_path_buf());
+                }
+            },
+            operation,
+        );
+        let foreign_path = foreign
+            .borrow()
+            .clone()
+            .expect("production CREATE hook hit");
+        (result, foreign_path)
+    }
+
+    #[test]
+    fn save_roster_retries_real_create_collision() {
+        let base = tmp();
+        let (sk, pk) = gen_keypair();
+        let signed = sign_roster(&sk, &minimal_roster(2), pk);
+        let expected = serde_json::to_vec_pretty(&signed).unwrap();
+        let (result, foreign) = collide_roster_stage(roster_path(base.path()), 0, || {
+            save_roster(base.path(), &signed)
+        });
+        assert!(
+            result.is_ok(),
+            "save_roster must succeed after collision: {result:?}"
+        );
+        assert_eq!(std::fs::read(roster_path(base.path())).unwrap(), expected);
+        assert_eq!(std::fs::read(foreign).unwrap(), b"foreign roster stage");
+    }
+
+    fn detached_roster_retries_stage(stage: usize) {
+        let base = tmp();
+        let (sk, pk) = gen_keypair();
+        let raw = make_unsigned_file(&minimal_roster(3), pk);
+        let sidecar = sign_raw(&sk, &raw);
+        let target = if stage == 0 {
+            roster_sig_path(base.path())
+        } else {
+            roster_path(base.path())
+        };
+        let (result, foreign) = collide_roster_stage(target, stage, || {
+            save_detached_roster(base.path(), &raw, &sidecar)
+        });
+        assert!(
+            result.is_ok(),
+            "detached save must succeed after collision: {result:?}"
+        );
+        assert_eq!(std::fs::read(roster_path(base.path())).unwrap(), raw);
+        assert_eq!(
+            std::fs::read(roster_sig_path(base.path())).unwrap(),
+            sidecar.as_bytes()
+        );
+        assert_eq!(std::fs::read(foreign).unwrap(), b"foreign roster stage");
+    }
+
+    #[test]
+    fn save_detached_roster_retries_sidecar_create_collision() {
+        detached_roster_retries_stage(0);
+    }
+
+    #[test]
+    fn save_detached_roster_retries_primary_create_collision() {
+        detached_roster_retries_stage(1);
     }
 
     /// Generate a fresh Ed25519 keypair for testing using getrandom.

@@ -50,7 +50,7 @@
 //! (`~/.claude/settings.json`, etc.) are NOT touched. Those are the
 //! user's own CC config and csq must not edit them.
 
-use crate::platform::fs::{atomic_replace, unique_tmp_path, write_new_private};
+use crate::platform::fs::{unique_tmp_path, write_new_private_retained};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
@@ -223,12 +223,13 @@ fn migrate_one(path: &Path) -> Result<bool> {
     // `std::fs::write` + `secure_file` pair would leave open for this
     // ANTHROPIC_AUTH_TOKEN-bearing settings file.
     let tmp = unique_tmp_path(path);
-    if let Err(e) = write_new_private(&tmp, json.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(anyhow!(e).context(format!("write tmp {}", tmp.display())));
-    }
-    if let Err(e) = atomic_replace(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
+    let writer = match write_new_private_retained(&tmp, json.as_bytes()) {
+        Ok(writer) => writer,
+        Err(e) => {
+            return Err(anyhow!(e).context(format!("write tmp {}", tmp.display())));
+        }
+    };
+    if let Err(e) = writer.replace(path) {
         return Err(anyhow!("atomic replace {}: {e}", path.display()));
     }
 

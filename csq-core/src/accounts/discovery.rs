@@ -1135,7 +1135,7 @@ pub fn save_manual_account(
     base_dir: &Path,
     info: AccountInfo,
 ) -> Result<(), crate::error::ConfigError> {
-    // §5a: `write_new_private` creates the tmp file at 0o600 at creation;
+    // §5a: the retained tmp factory creates at 0o600 and retries collisions;
     // `secure_file` below is now a redundant (but harmless) re-chmod, kept
     // so the three-closure injectable failure-branch test structure
     // (redteam-discipline.md Rule 5) stays unchanged for the `secure` and
@@ -1143,19 +1143,28 @@ pub fn save_manual_account(
     save_manual_account_inner(
         base_dir,
         info,
-        |tmp, bytes| {
-            crate::platform::fs::write_new_private(tmp, bytes)
+        |target: FinalTarget<'_>, bytes| {
+            crate::platform::fs::write_private_tmp_retained(target.as_path(), bytes)
                 .map_err(|e| std::io::Error::other(e.to_string()))
         },
         crate::platform::fs::secure_file,
-        crate::platform::fs::atomic_replace,
+        |_tmp, target, owner| owner.replace(target),
     )
+}
+
+// Distinguish a final publication target from an explicit staging filename.
+struct FinalTarget<'a>(&'a Path);
+
+impl<'a> FinalTarget<'a> {
+    fn as_path(&self) -> &'a Path {
+        self.0
+    }
 }
 
 /// Closure-injected core of [`save_manual_account`] so each §5a failure
 /// branch (write / secure_file / atomic_replace) has a regression test
 /// without chmod tricks (redteam-discipline Rule 5; mirrors
-/// `desktop::preferences::save_desktop_prefs_inner`).
+/// `desktop::preferences::save_desktop_prefs_inner`). The writer receives the final target.
 fn save_manual_account_inner<W, S, R, ES, ER>(
     base_dir: &Path,
     info: AccountInfo,
@@ -1164,13 +1173,16 @@ fn save_manual_account_inner<W, S, R, ES, ER>(
     replace: R,
 ) -> Result<(), crate::error::ConfigError>
 where
-    W: FnOnce(&Path, &[u8]) -> std::io::Result<()>,
+    W: for<'target> FnOnce(
+        FinalTarget<'target>,
+        &[u8],
+    ) -> std::io::Result<crate::platform::fs::WrittenPrivateFile>,
     S: FnOnce(&Path) -> Result<(), ES>,
-    R: FnOnce(&Path, &Path) -> Result<(), ER>,
+    R: FnOnce(&Path, &Path, crate::platform::fs::WrittenPrivateFile) -> Result<(), ER>,
     ES: std::fmt::Display,
     ER: std::fmt::Display,
 {
-    let path = base_dir.join("dashboard-accounts.json");
+    let target = base_dir.join("dashboard-accounts.json");
     let mut accounts = discover_manual(base_dir);
 
     // Replace existing entry with same ID, or append
@@ -1182,37 +1194,38 @@ where
 
     let json = serde_json::to_string_pretty(&accounts).map_err(|e| {
         crate::error::ConfigError::InvalidJson {
-            path: path.clone(),
+            path: target.clone(),
             reason: format!("serialization: {e}"),
         }
     })?;
 
-    let tmp = crate::platform::fs::unique_tmp_path(&path);
-    // §5a cleanup: AccountInfo.label may carry email PII per accounts/mod.rs.
-    // Partial-failure leaves PII-bearing tmp at umask 0o644.
-    if let Err(e) = write(&tmp, json.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(crate::error::ConfigError::InvalidJson {
-            path: tmp,
-            reason: format!("write: {e}"),
-        });
-    }
+    // AccountInfo.label may carry PII. Retain the creating writer through
+    // secure/publish; only it cleans up, never a caller on failed create.
+    let identity = match write(FinalTarget(&target), json.as_bytes()) {
+        Ok(identity) => identity,
+        Err(e) => {
+            return Err(crate::error::ConfigError::InvalidJson {
+                path: target.clone(),
+                reason: format!("write: {e}"),
+            });
+        }
+    };
+
+    let tmp = identity.path().to_path_buf();
 
     // Fail closed: a secure_file failure would publish the PII-bearing tmp
-    // at umask default. Remove the tmp and surface the error (mirrors the
+    // at umask default. Drop the owner and surface the error (mirrors the
     // fail-closed posture in `accounts::profiles::save`).
     if let Err(e) = secure(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
         return Err(crate::error::ConfigError::InvalidJson {
             path: tmp,
             reason: format!("secure_file: {e}"),
         });
     }
 
-    if let Err(e) = replace(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = replace(&tmp, &target, identity) {
         return Err(crate::error::ConfigError::InvalidJson {
-            path: path.clone(),
+            path: target.clone(),
             reason: format!("atomic replace: {e}"),
         });
     }
@@ -2679,6 +2692,123 @@ mod tests {
         });
     }
 
+    #[test]
+    fn save_manual_account_forwards_retained_writer() {
+        let dir = TempDir::new().unwrap();
+        let info = AccountInfo {
+            id: 203,
+            label: "identity-test@example.invalid".into(),
+            oauth_email: None,
+            source: AccountSource::Manual,
+            surface: Surface::ClaudeCode,
+            method: "api_key".into(),
+            has_credentials: false,
+            billing_mode: BillingMode::Subscription,
+        };
+        save_manual_account_inner(
+            dir.path(),
+            info,
+            |target: FinalTarget<'_>, bytes| {
+                crate::platform::fs::write_private_tmp_retained(target.as_path(), bytes)
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            },
+            crate::platform::fs::secure_file,
+            |tmp, target, written: crate::platform::fs::WrittenPrivateFile| {
+                assert!(tmp.exists());
+                written.replace(target)
+            },
+        )
+        .unwrap();
+        let accounts = discover_manual(dir.path());
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id, 203);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn save_manual_account_target_create_collision_preserves_foreign_file() {
+        let dir = TempDir::new().unwrap();
+        let info = AccountInfo {
+            id: 203,
+            label: "identity-test@example.invalid".into(),
+            oauth_email: None,
+            source: AccountSource::Manual,
+            surface: Surface::ClaudeCode,
+            method: "api_key".into(),
+            has_credentials: false,
+            billing_mode: BillingMode::Subscription,
+        };
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed = captured.clone();
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |target| {
+                *observed.borrow_mut() = Some(target.to_path_buf());
+                std::fs::write(target, b"foreign collision fixture").unwrap();
+            },
+            || {
+                save_manual_account_inner(
+                    dir.path(),
+                    info,
+                    |target: FinalTarget<'_>, bytes| {
+                        crate::platform::fs::write_new_private_retained(target.as_path(), bytes)
+                            .map_err(|e| std::io::Error::other(e.to_string()))
+                    },
+                    |_| -> std::io::Result<()> {
+                        panic!("secure must not run after target-create collision")
+                    },
+                    |_, _, _: crate::platform::fs::WrittenPrivateFile| -> std::io::Result<()> {
+                        panic!("publish must not run after target-create collision")
+                    },
+                )
+            },
+        );
+        assert!(result.is_err());
+        let target = captured.borrow().clone().unwrap();
+        assert_eq!(
+            std::fs::read(&target).ok().as_deref(),
+            Some(b"foreign collision fixture".as_slice()),
+            "manual account writer must preserve the foreign file after target-create collision"
+        );
+    }
+
+    #[test]
+    fn save_manual_account_retries_first_create_collision() {
+        let dir = TempDir::new().unwrap();
+        let info = AccountInfo {
+            id: 203,
+            label: "retry-test@example.invalid".into(),
+            oauth_email: None,
+            source: AccountSource::Manual,
+            surface: Surface::ClaudeCode,
+            method: "api_key".into(),
+            has_credentials: false,
+            billing_mode: BillingMode::Subscription,
+        };
+        let collision = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed = collision.clone();
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |tmp| {
+                if observed.borrow().is_none() {
+                    std::fs::write(tmp, b"foreign collision fixture").unwrap();
+                    *observed.borrow_mut() = Some(tmp.to_path_buf());
+                }
+            },
+            || save_manual_account(dir.path(), info),
+        );
+        let tmp = collision.borrow().clone().unwrap();
+        assert_eq!(
+            std::fs::read(&tmp).ok().as_deref(),
+            Some(b"foreign collision fixture".as_slice()),
+            "manual account retry must preserve the first foreign collision"
+        );
+        assert!(
+            result.is_ok(),
+            "manual account production save must retry the first create collision: {result:?}"
+        );
+        assert_eq!(discover_manual(dir.path())[0].id, 203);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
     /// §5a regression (redteam 2026-06-11 R1): `secure_file` failure MUST
     /// fail closed — remove the PII-bearing tmp and propagate the error.
     /// The pre-fix code was `secure_file(&tmp).ok()` (fail-open): a chmod
@@ -2702,9 +2832,12 @@ mod tests {
         let err = save_manual_account_inner(
             dir.path(),
             info,
-            |tmp, bytes| std::fs::write(tmp, bytes),
+            |target: FinalTarget<'_>, bytes| {
+                crate::platform::fs::write_private_tmp_retained(target.as_path(), bytes)
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            },
             |_tmp| Err("injected chmod failure"),
-            |_tmp, _path| -> Result<(), &str> {
+            |_tmp, _path, _owner: crate::platform::fs::WrittenPrivateFile| -> Result<(), &str> {
                 panic!("replace must not run after secure_file failure")
             },
         )
@@ -2748,9 +2881,14 @@ mod tests {
         let err = save_manual_account_inner(
             dir.path(),
             info,
-            |tmp, bytes| std::fs::write(tmp, bytes),
+            |target: FinalTarget<'_>, bytes| {
+                crate::platform::fs::write_private_tmp_retained(target.as_path(), bytes)
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            },
             |_tmp| -> Result<(), &str> { Ok(()) },
-            |_tmp, _path| Err("injected rename failure"),
+            |_tmp, _path, _owner: crate::platform::fs::WrittenPrivateFile| {
+                Err("injected rename failure")
+            },
         )
         .unwrap_err();
 

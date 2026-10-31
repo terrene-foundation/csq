@@ -728,11 +728,11 @@ fn identity_json_content_codex(synthetic_key: &str, created_at: &str) -> String 
 /// false).
 ///
 /// §5a compliance: email is PII → secret-bearing payload.
-/// All three failure branches call `let _ = remove_file(&tmp)` before
-/// propagating the error.
+/// The private writer owns cleanup on write, secure, and publication failure;
+/// failed exclusive creation never removes a pre-existing entry.
 ///
-/// Production code: uses real `std::fs::write`, `secure_file`, and
-/// `atomic_replace`.  Tests inject closures via `write_identity_json_inner`
+/// Production code retains the private writer through `secure_file` and
+/// replacement. Tests inject closures via `write_identity_json_inner`
 /// to exercise each failure branch independently.
 fn write_identity_json(base_dir: &Path, id: IdentityId, content: &str) -> Result<(), ConfigError> {
     // SEC-2.15 (unified, R1 M1): destination derived from the identity key —
@@ -747,19 +747,21 @@ fn write_identity_json(base_dir: &Path, id: IdentityId, content: &str) -> Result
         }
     })?;
 
-    // §5a: `write_new_private` creates the tmp file at 0o600 at creation;
-    // `secure_file` below is now a redundant (but harmless) re-chmod, kept
-    // so the three-closure injectable failure-branch test structure stays
-    // unchanged for the `secure` and `replace` branches.
+    // The retained private writer creates at 0o600 and owns cleanup. Keep
+    // secure_file's existing failure boundary and publish through that writer.
     write_identity_json_inner(
         &dest,
         content,
         |tmp, body| {
-            crate::platform::fs::write_new_private(tmp, body)
+            crate::platform::fs::write_new_private_retained(tmp, body)
                 .map_err(|e| std::io::Error::other(e.to_string()))
         },
         |tmp| secure_file(tmp).map_err(|e| std::io::Error::other(e.to_string())),
-        |tmp, dst| atomic_replace(tmp, dst).map_err(|e| std::io::Error::other(e.to_string())),
+        |_tmp, dst, writer| {
+            writer
+                .replace(dst)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        },
     )
 }
 
@@ -772,10 +774,9 @@ fn write_identity_json(base_dir: &Path, id: IdentityId, content: &str) -> Result
 /// Production callers use `write_identity_json`.  Tests call this directly
 /// with closures that fail at a specific branch.
 ///
-/// §5a: every failure branch calls `let _ = std::fs::remove_file(&tmp)` before
-/// propagating the error.  The `replace_fn` closure consumes `tmp` on success
-/// (via `atomic_replace`/rename), so no cleanup is needed on the success path.
-fn write_identity_json_inner<W, S, R>(
+/// The write closure owns partial-write cleanup and returns an owner whose Drop
+/// cleans up after secure or replacement failure. No branch unlinks by pathname.
+fn write_identity_json_inner<T, W, S, R>(
     dest: &Path,
     content: &str,
     write_fn: W,
@@ -783,24 +784,25 @@ fn write_identity_json_inner<W, S, R>(
     replace_fn: R,
 ) -> Result<(), ConfigError>
 where
-    W: FnOnce(&std::path::Path, &[u8]) -> std::io::Result<()>,
+    W: FnOnce(&std::path::Path, &[u8]) -> std::io::Result<T>,
     S: FnOnce(&std::path::Path) -> std::io::Result<()>,
-    R: FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+    R: FnOnce(&std::path::Path, &std::path::Path, T) -> std::io::Result<()>,
 {
     let tmp = unique_tmp_path(dest);
 
     // §5a: cleanup on write failure (email PII in payload)
-    if let Err(e) = write_fn(&tmp, content.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(ConfigError::InvalidJson {
-            path: tmp,
-            reason: format!("write: {e}"),
-        });
-    }
+    let writer = match write_fn(&tmp, content.as_bytes()) {
+        Ok(writer) => writer,
+        Err(e) => {
+            return Err(ConfigError::InvalidJson {
+                path: tmp,
+                reason: format!("write: {e}"),
+            });
+        }
+    };
 
     // §5a: cleanup on secure_file failure (best-effort on FAT/network mounts).
     if let Err(e) = secure_fn(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
         return Err(ConfigError::InvalidJson {
             path: tmp,
             reason: format!("secure_file: {e}"),
@@ -808,8 +810,7 @@ where
     }
 
     // §5a: cleanup on atomic_replace failure
-    if let Err(e) = replace_fn(&tmp, dest) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = replace_fn(&tmp, dest, writer) {
         return Err(ConfigError::InvalidJson {
             path: dest.to_path_buf(),
             reason: format!("atomic replace: {e}"),
@@ -2044,15 +2045,13 @@ mod tests {
 
     /// §5a: cleanup on `write` failure — tmp file must not remain on disk.
     ///
-    /// The `write_fn` closure returns an error immediately.  Neither
-    /// `secure_fn` nor `replace_fn` is called.  The tmp path (computed by
+    /// The `write_fn` closure returns an error after a partial write. Neither
+    /// `secure_fn` nor `replace_fn` is called. The tmp path (computed by
     /// `unique_tmp_path` inside the inner fn) is created by `write_fn` and
     /// must be deleted before the error propagates.
     ///
-    /// Note: `write_fn` returns an error WITHOUT writing any bytes to `tmp`,
-    /// so the file never exists on disk.  The `remove_file` call in the
-    /// cleanup branch is a no-op (file absent).  The test confirms the
-    /// function returns `Err` and that no tmp artifacts remain in the parent.
+    /// The writer creates a partial artifact before failing so removal is
+    /// observable independently of error propagation.
     #[test]
     fn write_identity_json_cleans_tmp_on_write_failure() {
         // Arrange
@@ -2061,13 +2060,19 @@ mod tests {
         std::fs::create_dir_all(&parent).unwrap();
         let dest = parent.join("identity.json");
 
-        // Act: write_fn fails immediately; secure_fn and replace_fn never called
+        // Act: write_fn creates a partial file and fails; later ops never run.
         let result = write_identity_json_inner(
             &dest,
             r#"{"email":"w@test.invalid"}"#,
-            |_tmp, _body| Err(std::io::Error::other("simulated write fail")),
+            |tmp, body| {
+                let _writer = crate::platform::fs::write_new_private_retained(tmp, body)
+                    .map_err(std::io::Error::other)?;
+                Err(std::io::Error::other("simulated write fail"))
+            },
             |_tmp| panic!("secure_fn must not be called after write failure"),
-            |_tmp, _dst| panic!("replace_fn must not be called after write failure"),
+            |_tmp, _dst, _writer: crate::platform::fs::WrittenPrivateFile| {
+                panic!("replace_fn must not be called after write failure")
+            },
         );
 
         // Assert: Err returned; no orphan files in parent (dest absent, tmp absent)
@@ -2102,9 +2107,14 @@ mod tests {
         let result = write_identity_json_inner(
             &dest,
             r#"{"email":"sf@test.invalid"}"#,
-            |tmp, body| std::fs::write(tmp, body), // writes content to tmp
+            |tmp, body| {
+                crate::platform::fs::write_new_private_retained(tmp, body)
+                    .map_err(std::io::Error::other)
+            },
             |_tmp| Err(std::io::Error::other("simulated secure_file fail")),
-            |_tmp, _dst| panic!("replace_fn must not be called after secure_file failure"),
+            |_tmp, _dst, _writer: crate::platform::fs::WrittenPrivateFile| {
+                panic!("replace_fn must not be called after secure_file failure")
+            },
         );
 
         // Assert: Err returned; tmp cleaned up; dest does not exist (replace never ran)
@@ -2147,9 +2157,14 @@ mod tests {
         let result = write_identity_json_inner(
             &dest,
             r#"{"email":"ar@test.invalid"}"#,
-            |tmp, body| std::fs::write(tmp, body),
+            |tmp, body| {
+                crate::platform::fs::write_new_private_retained(tmp, body)
+                    .map_err(std::io::Error::other)
+            },
             |_tmp| Ok(()), // secure_fn no-op succeeds
-            |_tmp, _dst| Err(std::io::Error::other("simulated atomic_replace fail")),
+            |_tmp, _dst, _writer: crate::platform::fs::WrittenPrivateFile| {
+                Err(std::io::Error::other("simulated atomic_replace fail"))
+            },
         );
 
         // Assert: Err returned; tmp cleaned up; dest does not exist
@@ -2172,6 +2187,85 @@ mod tests {
             "§5a: tmp must be cleaned up after atomic_replace failure, found: {:?}",
             remaining
         );
+    }
+
+    #[test]
+    fn write_identity_json_preserves_foreign_temp_on_exclusive_create_failure() {
+        let dir = TempDir::new().unwrap();
+        let dest = dir.path().join("identity.json");
+        let planted = std::cell::RefCell::new(None);
+        let result = write_identity_json_inner(
+            &dest,
+            "replacement",
+            |tmp, body| {
+                std::fs::write(tmp, b"foreign-entry")?;
+                *planted.borrow_mut() = Some(tmp.to_path_buf());
+                crate::platform::fs::write_new_private_retained(tmp, body)
+                    .map_err(std::io::Error::other)
+            },
+            |_| panic!("exclusive creation must fail before securing"),
+            |_, _, _: crate::platform::fs::WrittenPrivateFile| {
+                panic!("exclusive creation must fail before replacement")
+            },
+        );
+        assert!(result.is_err());
+        let tmp = planted.into_inner().unwrap();
+        assert_eq!(std::fs::read(tmp).unwrap(), b"foreign-entry");
+        assert!(!dest.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_identity_json_preserves_substituted_temp_on_secure_failure() {
+        let dir = TempDir::new().unwrap();
+        let dest = dir.path().join("identity.json");
+        let planted = std::cell::RefCell::new(None);
+        let result = write_identity_json_inner(
+            &dest,
+            "replacement",
+            |tmp, body| {
+                crate::platform::fs::write_new_private_retained(tmp, body)
+                    .map_err(std::io::Error::other)
+            },
+            |tmp| {
+                std::fs::remove_file(tmp)?;
+                std::fs::write(tmp, b"foreign-entry")?;
+                *planted.borrow_mut() = Some(tmp.to_path_buf());
+                Err(std::io::Error::other("injected secure failure"))
+            },
+            |_, _, _: crate::platform::fs::WrittenPrivateFile| {
+                panic!("secure failure must prevent replacement")
+            },
+        );
+        assert!(result.is_err());
+        let tmp = planted.into_inner().unwrap();
+        assert_eq!(std::fs::read(tmp).unwrap(), b"foreign-entry");
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn write_identity_json_forwards_writer_identity() {
+        let dir = TempDir::new().unwrap();
+        let dest = dir.path().join("identity.json");
+        std::fs::write(&dest, b"old").unwrap();
+        let token = Box::new(43_u8);
+        let address = &*token as *const u8;
+        write_identity_json_inner(
+            &dest,
+            "new",
+            |tmp, body| {
+                std::fs::write(tmp, body)?;
+                Ok(token)
+            },
+            |tmp| std::fs::metadata(tmp).map(|_| ()),
+            |tmp, path, written: Box<u8>| {
+                assert_eq!(&*written as *const u8, address);
+                std::fs::rename(tmp, path)
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     /// §5a: happy path — identity.json written, no tmp remains.

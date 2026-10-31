@@ -72,8 +72,8 @@ pub fn active_label() -> Option<&'static str> {
 }
 
 /// Installs this hook process-wide, replacing the default. Idempotent via
-/// `std::sync::OnceLock`: the first call stores its label in `LABEL`,
-/// installs the hook with it, and every later call reports `false` without
+/// `std::sync::OnceLock`: the first call installs the hook before publishing
+/// its label in `LABEL`, and every later call waits for it, reporting `false` without
 /// touching the process hook — safe to call on every daemon-session start
 /// (the supervised loop restarts sessions in-process on a transient
 /// failure) without stacking hooks or re-wrapping an already-installed one.
@@ -86,22 +86,26 @@ pub fn active_label() -> Option<&'static str> {
 /// read.
 pub fn install(label: &'static str) -> bool {
     let mut installed_now = false;
-    let active: &'static str = LABEL.get_or_init(|| {
+    LABEL.get_or_init(|| {
+        #[cfg(test)]
+        if let Some(before_install) = BEFORE_HOOK_INSTALL.get() {
+            before_install();
+        }
+        std::panic::set_hook(Box::new(move |info| {
+            tracing::error!(error_kind = label, "{}", format_panic_message(label, info));
+        }));
+        INSTALLED.store(true, std::sync::atomic::Ordering::Release);
         installed_now = true;
         label
     });
-    if installed_now {
-        std::panic::set_hook(Box::new(move |info| {
-            tracing::error!(
-                error_kind = active,
-                "{}",
-                format_panic_message(active, info)
-            );
-        }));
-        INSTALLED.store(true, std::sync::atomic::Ordering::Release);
-    }
     installed_now
 }
+
+// An isolated child can pause at the real set_hook boundary without delaying
+// or replacing the production installation path. Never set by ordinary tests.
+#[cfg(test)]
+static BEFORE_HOOK_INSTALL: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> =
+    std::sync::OnceLock::new();
 
 #[cfg(test)]
 mod tests {
@@ -233,6 +237,106 @@ mod tests {
         );
         assert!(formatted.contains("panic_hook.rs"));
         assert!(!formatted.contains("foreign panic capture"));
+    }
+
+    /// A fresh process keeps OnceLock and the process hook hermetic. The gate
+    /// pauses exactly before set_hook: LABEL must still be unpublished there,
+    /// and both racing callers must observe the completed installation when
+    /// they return. No sleep or scheduler-dependent "did it return yet" probe.
+    #[test]
+    fn concurrent_install_publishes_only_after_hook_is_installed() {
+        const CHILD: &str = "CSQ_PANIC_HOOK_INSTALL_CHILD";
+        let _env_guard = crate::platform::test_env::lock();
+        if std::env::var_os(CHILD).is_none() {
+            let sandbox = tempfile::tempdir().unwrap();
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.env_clear();
+            for key in [
+                "PATH",
+                "LANG",
+                "LC_ALL",
+                "TERM",
+                "USER",
+                "TMPDIR",
+                "SYSTEMROOT",
+                "SystemRoot",
+                "TEMP",
+                "TMP",
+                "USERPROFILE",
+                "APPDATA",
+                "LOCALAPPDATA",
+                "WINDIR",
+                "ComSpec",
+                "PATHEXT",
+                "NUMBER_OF_PROCESSORS",
+            ] {
+                if let Some(value) = std::env::var_os(key) {
+                    cmd.env(key, value);
+                }
+            }
+            let output = cmd
+                .env("HOME", sandbox.path())
+                .env("CSQ_BASE_DIR", sandbox.path().join("base"))
+                .env(CHILD, "1")
+                .args([
+                    "--exact",
+                    "daemon::panic_hook::tests::concurrent_install_publishes_only_after_hook_is_installed",
+                    "--nocapture",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated install regression failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("INSTALL_CHILD_PROVED"));
+            return;
+        }
+
+        assert_eq!(active_label(), None);
+        assert!(!is_installed());
+        let prior_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let prior_calls_hook = Arc::clone(&prior_calls);
+        std::panic::set_hook(Box::new(move |_| {
+            prior_calls_hook.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let release_rx = Mutex::new(release_rx);
+        assert!(BEFORE_HOOK_INSTALL
+            .set(Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }))
+            .is_ok());
+        let first = std::thread::spawn(|| install("daemon_panic"));
+        entered_rx.recv().unwrap();
+        // Save the observation, then always release/join before asserting it,
+        // so a RED publication-order mutation cannot strand a blocked thread.
+        let label_during_install = active_label();
+        let installed_during_install = is_installed();
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::sync_channel(0);
+        let second = std::thread::spawn(move || {
+            attempt_tx.send(()).unwrap();
+            let installed_now = install("desktop_panic");
+            (installed_now, is_installed(), active_label())
+        });
+        attempt_rx.recv().unwrap();
+        release_tx.send(()).unwrap();
+        let first_installed = first.join().unwrap();
+        let second_result = second.join().unwrap();
+        assert_eq!(
+            label_during_install, None,
+            "label published before set_hook"
+        );
+        assert!(!installed_during_install);
+        assert!(first_installed);
+        assert_eq!(second_result, (false, true, Some("daemon_panic")));
+        assert!(std::panic::catch_unwind(|| panic!("installed hook probe")).is_err());
+        assert_eq!(prior_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        println!("INSTALL_CHILD_PROVED");
     }
 
     /// `install()` MUST be idempotent — calling it twice must not panic,

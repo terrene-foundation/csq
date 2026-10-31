@@ -1365,11 +1365,16 @@ fn publish_metadata(path: &Path, metadata: &serde_json::Value) -> Result<(), Ide
 }
 fn publish_metadata_bytes(path: &Path, bytes: &[u8]) -> Result<(), IdentityError> {
     let tmp = crate::platform::fs::unique_tmp_path(path);
-    let result = crate::platform::fs::write_new_private(&tmp, bytes)
-        .and_then(|_| crate::platform::fs::atomic_replace(&tmp, path));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    publish_metadata_bytes_at(path, bytes, tmp)
+}
+
+fn publish_metadata_bytes_at(
+    path: &Path,
+    bytes: &[u8],
+    tmp: std::path::PathBuf,
+) -> Result<(), IdentityError> {
+    let result = crate::platform::fs::write_new_private_retained(&tmp, bytes)
+        .and_then(|writer| writer.replace(path));
     result.map_err(|_| IdentityError::Io)
 }
 fn validate_upgrade_index(
@@ -2025,7 +2030,9 @@ fn capture_prior_binding(
     })
 }
 pub fn capture_login_prior(base: &Path, slot: AccountNum) -> Result<LoginPrior, IdentityError> {
-    let lock = ProfilesFileLock::acquire(base).map_err(|_| IdentityError::Io)?;
+    let lock = ProfilesFileLock::acquire_bounded(base)
+        .map_err(|_| IdentityError::Io)?
+        .ok_or(IdentityError::BindingBusy)?;
     let pf = profiles::load(&profiles::profiles_path(base)).map_err(profiles_read_error)?;
     let binding = pf
         .by_slot
@@ -2388,11 +2395,14 @@ fn commit_verified_login_sealed(
     // budget by another publication's canonical wait. Rescue FIRST, before
     // ANY lock.
     let mut prelock_rescue = PrelockLoginRescue::write(base, &prior, incoming, &verified);
-    let lock = match ProfilesFileLock::acquire(base) {
+    let lock = match ProfilesFileLock::acquire_bounded(base)
+        .map_err(|_| IdentityError::Io)
+        .and_then(|lock| lock.ok_or(IdentityError::BindingBusy))
+    {
         Ok(lock) => lock,
-        Err(_) => {
+        Err(error) => {
             prelock_rescue.keep();
-            return Err(IdentityError::Io);
+            return Err(error);
         }
     };
     publish_login_locked_rescued(
@@ -8105,6 +8115,63 @@ mod tests {
         assert!(rescue::rescue_record_pending(&identity_dir).is_none());
     }
 
+    /// RED with the former acquire/map-to-Io boundary: a real held lock
+    /// must retain its busy diagnostic before login starts.
+    #[test]
+    fn capture_login_prior_profiles_lock_expiry_is_binding_busy() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let _holder = crate::accounts::profiles_lock::HeldOnOtherThread::profiles(base);
+        let _budget = crate::accounts::profiles_lock::ProfilesBudgetOverrideGuard::install(1);
+
+        let error = capture_login_prior(base, slot(1)).unwrap_err();
+        assert_eq!(error, IdentityError::BindingBusy);
+        assert_eq!(error.to_string(), "anthropic_identity_profiles_busy");
+    }
+
+    #[test]
+    fn capture_login_prior_profiles_parent_io_refusal_remains_io() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("not-a-directory");
+        std::fs::write(&base, b"fixture").unwrap();
+        let _budget = crate::accounts::profiles_lock::ProfilesBudgetOverrideGuard::install(1);
+
+        let error = capture_login_prior(&base, slot(1)).unwrap_err();
+        assert_eq!(error, IdentityError::Io);
+        assert_eq!(error.to_string(), "anthropic_identity_io_refused");
+    }
+
+    // Unix opens the lock path as a file; a directory deterministically
+    // exercises the real lock-file I/O failure rather than budget expiry.
+    #[cfg(unix)]
+    #[test]
+    fn login_profiles_lock_file_io_refusal_remains_io() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let prior = capture_login_prior(base, slot(1)).unwrap();
+        let lock_path = ProfilesFileLock::lock_path(base);
+        std::fs::remove_file(&lock_path).unwrap();
+        std::fs::create_dir(&lock_path).unwrap();
+        let _budget = crate::accounts::profiles_lock::ProfilesBudgetOverrideGuard::install(1);
+
+        assert_eq!(
+            capture_login_prior(base, slot(1)).unwrap_err(),
+            IdentityError::Io
+        );
+        let incoming = credential("profiles-io-refusal", 100);
+        let error = commit_anthropic_login_with(
+            base,
+            slot(1),
+            &incoming,
+            &transport(&incoming, context(20)),
+            None,
+            prior,
+        )
+        .unwrap_err();
+        assert_eq!(error, IdentityError::Io);
+        assert_eq!(error.to_string(), "anthropic_identity_io_refused");
+    }
+
     /// ROW N4 (profiles lock; D237 round-2 corr N4 / sec M4): a login whose
     /// profiles acquisition expires past the OLD 2 s bound no longer loses
     /// the consumed grant. The rescue is written BEFORE the profiles lock,
@@ -8137,7 +8204,8 @@ mod tests {
         );
         drop(budget);
         let error = result.expect_err("profiles contention must refuse the publication");
-        assert!(matches!(error, IdentityError::Io), "got {error:?}");
+        assert_eq!(error, IdentityError::BindingBusy);
+        assert_eq!(error.to_string(), "anthropic_identity_profiles_busy");
 
         // The consumed grant is durable even though the publication failed.
         let canonical = identity_store::credentials_path_for(base, id);
@@ -9335,5 +9403,25 @@ mod tests {
             vec!["rescue-orphan.json.tmp.notpid.4".to_string()],
             "{left:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod retained_writer_regression_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_temp_collision_preserves_foreign_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+        let tmp = dir.path().join("identity.tmp");
+        std::fs::write(&path, b"old metadata").unwrap();
+        std::fs::write(&tmp, b"foreign temporary entry").unwrap();
+        assert!(matches!(
+            publish_metadata_bytes_at(&path, b"{}", tmp.clone()),
+            Err(IdentityError::Io)
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"old metadata");
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"foreign temporary entry");
     }
 }

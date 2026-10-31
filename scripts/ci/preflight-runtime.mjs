@@ -5,6 +5,28 @@ import { tmpdir } from 'node:os';
 import { join, delimiter, resolve, dirname, basename } from 'node:path';
 import { performance } from 'node:perf_hooks';
 
+// Remove every environment entry through which the HOST can change what a gate
+// shell or node worker runs: exported bash functions (BASH_FUNC_<name>%% on
+// bash 4+, __BASH_FUNC<name>() on the vendor-patched 3.2 spelling), shell
+// startup files (BASH_ENV, ENV) and NODE_OPTIONS (a --require preload). Bash
+// imports an exported function with no startup file, so `bash --noprofile
+// --norc` and `env -u BASH_ENV` do not stop it: an exported `python3() { return
+// 0; }` turns a derived gate GREEN with nothing measured. Called as the first
+// statement of both preflight entry points, before any spawn, so every
+// sh/tryRun/capture/fork/trestle launch inherits the scrubbed environment (the
+// same set scripts/ci/s1-landing-preflight.sh strips for the push queue).
+// Returns the removed key names (names only; values may be arbitrary code).
+export function scrubShellEnvironment(env = process.env) {
+  const removed = [];
+  for (const key of Object.keys(env)) {
+    if (/^BASH_FUNC_/.test(key) || /^__BASH_FUNC</.test(key) || key === 'NODE_OPTIONS' || key === 'BASH_ENV' || key === 'ENV') {
+      delete env[key];
+      removed.push(key);
+    }
+  }
+  return removed;
+}
+
 export const FLEET_SHARE_CAP = 6;
 // Captured-output cap for a supervised child's stdout+stderr, in CHARACTERS.
 // ONE cap for capture() and for gate workers: unbounded concatenation reaches
@@ -107,6 +129,27 @@ export const LEG_QUEUE_WAIT_S = 2700;
 if (!(LEG_QUEUE_WAIT_S >= TRESTLE_IO_COOLDOWN_S + LEG_QUEUE_WAIT_MARGIN_S)) {
   throw new Error('leg queue wait must outlast the trestle io cool-down by the stated margin');
 }
+// The workflow's Python provision step calls a bare `python -m venv`, but every
+// leg runs under enforced `bash --noprofile --norc -p` with host init stripped
+// (BASH_ENV/ENV removed), so a host whose PATH carries no bare `python` is
+// normal — measured 2026-10-31 on ovh-1: `/bin/bash: line 7: python: command
+// not found`, exit 127. When `python` does NOT resolve, expose an absolute
+// interpreter from a fixed list as `python` through a private shim dir inside
+// the leg's own temp dir; never rely on host init. When the host or CI PATH
+// already carries `python`, that interpreter WINS and no shim is created — a
+// fixture or managed environment that provides its own python must not be
+// shadowed. `exit 125` is the leg's cannot-measure code.
+export const PYTHON_SHIM_PRELUDE = `if ! command -v python >/dev/null 2>&1; then
+  csq_python=
+  for csq_py in /usr/bin/python3 /usr/local/bin/python3 /opt/homebrew/bin/python3; do
+    if [ -x "$csq_py" ]; then csq_python="$csq_py"; break; fi
+  done
+  [ -n "$csq_python" ] || { echo 'dev-preflight: no python3 on the fixed search list (/usr/bin/python3, /usr/local/bin/python3, /opt/homebrew/bin/python3)' >&2; exit 125; }
+  mkdir -p -- "$csq_step_tmp/bin" || exit 125
+  printf '#!/bin/sh\nexec %s "$@"\n' "$csq_python" > "$csq_step_tmp/bin/python" || exit 125
+  chmod +x "$csq_step_tmp/bin/python" || exit 125
+  export PATH="$csq_step_tmp/bin:$PATH"
+fi`;
 // One attempt's caller bound: the --wait-s spent INSIDE the trestle invocation
 // plus the leg (or a shard's ceiling and transport room). `queueWaitMs`
 // defaults to LEG_QUEUE_WAIT_S; only a fixture with a stubbed trestle (which
@@ -287,6 +330,9 @@ export function parseFooter(output) {
 // cap on readdir entries scanned keeps one pass bounded. Where the platform has
 // no uid (Windows), the ownership check is skipped; the other checks still apply.
 export const EVIDENCE_DIR_RE = /^csq-preflight-output-[A-Za-z0-9]{6}$/;
+// A Svelte leg's private clone/HOME dir (mktemp -d, mode 0700). A leg killed by
+// SIGKILL never runs its own cleanup, so the same age-gated prune reaps it.
+export const SVELTE_TEMP_DIR_RE = /^csq-svelte\.[A-Za-z0-9]{6}$/;
 const EVIDENCE_RETAIN_MS = 3 * 24 * 60 * 60 * 1000;
 const EVIDENCE_PRUNE_MAX = 2048;
 const EVIDENCE_SCAN_MAX = 262144;
@@ -298,12 +344,14 @@ export function pruneEvidenceDirs({ tmpdirPath = tmpdir(), now = Date.now(), ret
   for (const name of names) {
     if (examined >= maxCandidates || scanned >= maxScanned) break;
     scanned++;
-    if (!EVIDENCE_DIR_RE.test(name)) continue;
+    const svelteTemp = SVELTE_TEMP_DIR_RE.test(name);
+    if (!svelteTemp && !EVIDENCE_DIR_RE.test(name)) continue;
     const path = join(tmpdirPath, name);
     let info;
     try { info = lstatSync(path); } catch { continue; }
     if (!info.isDirectory() || info.isSymbolicLink()) continue;
     if (uid !== undefined && info.uid !== uid) continue;
+    if (svelteTemp && (info.mode & 0o777) !== 0o700) continue;
     if (now - info.mtimeMs < retainMs) continue;
     examined++;
     try { rmSync(path, { recursive: true, force: true }); removed++; } catch { /* not removable: leave it */ }

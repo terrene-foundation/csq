@@ -1,7 +1,19 @@
 //! Community API-key custody, independent of account slots and Claude launch configuration.
 mod env_file;
+pub mod execution;
+mod execution_ledger;
+#[cfg(test)]
+mod execution_ledger_tests;
+mod execution_pricing;
+mod execution_transport;
 mod store;
 mod types;
+/// Hang guard for real waits in pool tests (handshakes, sockets, workers, custody
+/// deadlines). Messages and the injected clock decide outcomes; this cap never does.
+#[cfg(test)]
+pub(crate) const REAL_WAIT_CAP: std::time::Duration = std::time::Duration::from_secs(300);
+pub use execution::{execute, execute_with_deadline, PoolExecRequest};
+pub(crate) use store::{ExecutionAdmission, LedgerIdentity, LedgerState};
 pub use store::{Pool, RemovalSnapshot};
 pub use types::{KeySource, PoolEntry, PoolName, PoolRow, Reset};
 
@@ -32,6 +44,8 @@ pub enum PoolError {
     ManifestInvalid,
     #[error("pool_manifest_unavailable")]
     ManifestUnavailable,
+    #[error("pool_manifest_write_unavailable")]
+    ManifestWriteUnavailable,
     #[error("pool_env_file_invalid")]
     EnvFileInvalid,
     #[error("pool_env_file_unavailable")]
@@ -44,6 +58,14 @@ pub enum PoolError {
     StoreUnavailable,
     #[error("pool_custody_busy")]
     Busy,
+    #[error("pool_ledger_identity_mismatch")]
+    LedgerIdentityMismatch,
+    #[error("pool_ledger_mirror_unavailable")]
+    LedgerMirrorUnavailable,
+    #[error("pool_unrelated_key_unavailable")]
+    UnrelatedKeyUnavailable,
+    #[error("pool_item_read_unavailable")]
+    ItemReadUnavailable,
     #[error("pool_mutation_refused")]
     MutationRefused,
     #[error("pool_partial_failure_recovery_required")]

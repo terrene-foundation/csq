@@ -117,6 +117,10 @@ journal/*-data/
 **/.session-notes.shared.md
 .session-notes.migrated
 **/.session-notes.migrated
+# Per-session wave tracker (CLAUDE.md Directive 0 working index); same
+# ephemeral, per-machine class as .session-notes.d/.
+.wave-tracker.d/
+**/.wave-tracker.d/
 
 # IDE settings
 .vscode/

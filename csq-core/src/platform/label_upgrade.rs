@@ -25,10 +25,14 @@
 //!
 //! Concurrency. The pass does not take the per-account credential mutex. Each
 //! object's handle is opened with sharing that includes DELETE and is held only for
-//! the inspect-and-stamp (microseconds), never across the walk; a concurrent
-//! `atomic_replace` (`MoveFileExW` REPLACE_EXISTING) can still get ACCESS_DENIED while
-//! it is open, which `atomic_replace`'s bounded retry (5 attempts, 100 ms apart)
-//! absorbs. Because the background continuation would keep competing with the live
+//! inspect-and-stamp, never across the walk. A concurrent `atomic_replace` pins the
+//! common parent, validates the source, and renames through that same source handle.
+//! POSIX replacement supports a target reader with delete sharing; only an
+//! unsupported rename class/status selects the plain replacing rename. That
+//! compatibility path can still return ACCESS_DENIED for an open target. Selected
+//! contention failures have at most five attempts with 100 ms between attempts;
+//! this limits retry delays, not the duration of Windows calls. Because the
+//! background continuation would keep competing with the live
 //! refresher long after startup, it never walks `credentials/`, `identities/` or the
 //! `config-*/` slot directories (which hold the live `.credentials.json` the refresher
 //! writes): the foreground pass must finish those (they come first in

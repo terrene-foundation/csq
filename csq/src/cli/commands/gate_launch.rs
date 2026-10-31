@@ -3,7 +3,7 @@
 use anyhow::{anyhow, bail, Result};
 use clap::Args;
 use csq_core::gate::{legacy::VerifiedPackage, pin::Pin, registry::Event};
-use csq_core::platform::fs::{atomic_replace, unique_tmp_path, write_new_private_synced};
+use csq_core::platform::fs::{unique_tmp_path, write_new_private_synced_retained};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs::{self, File};
@@ -170,9 +170,10 @@ fn read_private(_: &Path) -> Result<Option<Vec<u8>>> {
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = unique_tmp_path(path);
     // A failed exclusive creation confers no authority to delete a collision.
-    write_new_private_synced(&tmp, bytes).map_err(|_| anyhow!("gate state write failed"))?;
-    if atomic_replace(&tmp, path).is_err() {
-        let _ = fs::remove_file(&tmp);
+    // Composed statusLine.command values can contain inline credentials.
+    let writer = write_new_private_synced_retained(&tmp, bytes)
+        .map_err(|_| anyhow!("gate state write failed"))?;
+    if writer.replace(path).is_err() {
         bail!("gate state install failed");
     }
     File::open(
@@ -388,6 +389,32 @@ fn absolute(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_settings_publish_failure_cleans_tmp_and_preserves_destination() {
+        let base = tempfile::tempdir().unwrap();
+        let destination = base.path().join("settings.json");
+        fs::create_dir(&destination).unwrap();
+        let sentinel = destination.join("keep");
+        fs::write(&sentinel, b"existing destination").unwrap();
+        let settings = json!({"statusLine": {
+            "type": "command", "command": "fixture --token fixture-secret"
+        }});
+
+        let error =
+            write_private(&destination, &serde_json::to_vec(&settings).unwrap()).unwrap_err();
+        assert_eq!(error.to_string(), "gate state install failed");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"existing destination");
+        let entries: Vec<_> = fs::read_dir(base.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![destination],
+            "private settings tmp survived refusal"
+        );
+    }
 
     #[test]
     fn no_opt_in_leaves_argv_untouched_and_creates_nothing() {

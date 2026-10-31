@@ -27,11 +27,12 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
-chrono.workspace = true
+chrono = { workspace = true, features = ["clock"] }
 tokio.workspace = true
 tracing.workspace = true
 hex.workspace = true
 sha2.workspace = true
+hmac = "=0.12.1"
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 unicode-normalization.workspace = true
 unicode-general-category.workspace = true
@@ -154,7 +155,6 @@ seccompiler = { version = "0.5.0", optional = true, default-features = false }
 # a daemon launched as SYSTEM would have a different DPAPI scope from
 # a user-launched CLI, breaking the multi-process credential view.
 [target.'cfg(target_os = "windows")'.dependencies]
-hmac = "0.12"
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_Globalization",

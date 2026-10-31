@@ -33,11 +33,35 @@ impl std::fmt::Display for SecureDatabaseError {
 impl std::error::Error for SecureDatabaseError {}
 
 /// Keeps directory ancestry, database and sidecars observed during checks open.
-/// Existing directories are never created or chmodded; a missing DB is created
-/// exclusively at mode0600 after ancestry checks. Existing files are not truncated.
+/// Existing directories are never created or chmodded. `acquire` creates a missing
+/// DB exclusively at mode0600 (Unix) or with the owner-only DACL applied at
+/// creation (Windows) after ancestry checks; `acquire_existing` refuses absence
+/// through its no-create open path. Existing files are not truncated.
 pub struct SecureDatabase {
     #[cfg(unix)]
     held: unix::HeldDatabase,
+    #[cfg(windows)]
+    held: windows::HeldDatabase,
+}
+
+/// The Windows process token's user SID. An unreadable token is a refusal, never
+/// an empty identity.
+#[cfg(windows)]
+fn current_user() -> Result<crate::platform::fs_windows_acl::UserSid, SecureDatabaseError> {
+    crate::platform::fs_windows_acl::UserSid::current()
+        .map_err(|_| SecureDatabaseError::Unavailable)
+}
+
+/// Which leaf a caller guarantees. `Strict` is the default: an at-creation
+/// protected leaf and at-creation sidecars. `PoolLedger` is the ONE mode for the
+/// directory SQLite writes into: the leaf carries the INHERITABLE owner-only
+/// shape and a sidecar is accepted only as a child that inherited it. Only the
+/// pool execution ledger uses the pool mode (R1 M2); on unix both modes are the
+/// same code path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum LeafPolicy {
+    Strict,
+    PoolLedger,
 }
 
 impl SecureDatabase {
@@ -45,27 +69,102 @@ impl SecureDatabase {
         private_dir: &Path,
         name: &std::ffi::OsStr,
     ) -> Result<Self, SecureDatabaseError> {
+        Self::acquire_with(private_dir, name, LeafPolicy::Strict)
+    }
+
+    /// The pool-ledger mode: the leaf is the INHERITING owner-only directory
+    /// SQLite creates its sidecars in, and a sidecar is accepted only in the
+    /// shape it inherited from that leaf. Every other caller stays on `acquire`.
+    pub fn acquire_pool_ledger(
+        private_dir: &Path,
+        name: &std::ffi::OsStr,
+    ) -> Result<Self, SecureDatabaseError> {
+        Self::acquire_with(private_dir, name, LeafPolicy::PoolLedger)
+    }
+
+    fn acquire_with(
+        private_dir: &Path,
+        name: &std::ffi::OsStr,
+        policy: LeafPolicy,
+    ) -> Result<Self, SecureDatabaseError> {
         #[cfg(unix)]
         {
+            let _ = policy;
             // SAFETY: geteuid has no preconditions and changes no process state.
             let uid = unsafe { libc::geteuid() };
             Ok(Self {
                 held: unix::HeldDatabase::acquire(private_dir, name, uid)?,
             })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            let _ = (private_dir, name);
+            Ok(Self {
+                held: windows::HeldDatabase::acquire(private_dir, name, &current_user()?, policy)?,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (private_dir, name, policy);
+            Err(SecureDatabaseError::UnsupportedPlatform)
+        }
+    }
+
+    /// Acquire a previously initialized database without any creation fallback.
+    /// The same no-follow open and held-file checks as `acquire` apply; ENOENT
+    /// returns an error at that open boundary, including if the file disappears.
+    pub fn acquire_existing(
+        private_dir: &Path,
+        name: &std::ffi::OsStr,
+    ) -> Result<Self, SecureDatabaseError> {
+        Self::acquire_existing_with(private_dir, name, LeafPolicy::Strict)
+    }
+
+    /// [`Self::acquire_existing`] in the pool-ledger leaf mode.
+    pub fn acquire_pool_ledger_existing(
+        private_dir: &Path,
+        name: &std::ffi::OsStr,
+    ) -> Result<Self, SecureDatabaseError> {
+        Self::acquire_existing_with(private_dir, name, LeafPolicy::PoolLedger)
+    }
+
+    fn acquire_existing_with(
+        private_dir: &Path,
+        name: &std::ffi::OsStr,
+        policy: LeafPolicy,
+    ) -> Result<Self, SecureDatabaseError> {
+        #[cfg(unix)]
+        {
+            let _ = policy;
+            // SAFETY: geteuid has no preconditions and changes no process state.
+            let uid = unsafe { libc::geteuid() };
+            Ok(Self {
+                held: unix::HeldDatabase::acquire_existing(private_dir, name, uid)?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                held: windows::HeldDatabase::acquire_existing(
+                    private_dir,
+                    name,
+                    &current_user()?,
+                    policy,
+                )?,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (private_dir, name, policy);
             Err(SecureDatabaseError::UnsupportedPlatform)
         }
     }
 
     pub fn recheck(&self) -> Result<(), SecureDatabaseError> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             self.held.recheck()
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             Err(SecureDatabaseError::UnsupportedPlatform)
         }
@@ -78,20 +177,30 @@ impl SecureDatabase {
         &self,
         operation: impl FnOnce(&std::fs::File) -> std::io::Result<T>,
     ) -> Result<T, SecureDatabaseError> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             self.recheck()?;
-            let result = operation(&self.held.database.file);
+            let result = operation(self.database_file());
             self.recheck()?;
             result.map_err(|_| SecureDatabaseError::OperationFailed)
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = operation;
             Err(SecureDatabaseError::UnsupportedPlatform)
         }
     }
+
+    /// The held database handle the operation may use; never a fresh open.
+    #[cfg(any(unix, windows))]
+    fn database_file(&self) -> &std::fs::File {
+        &self.held.database.file
+    }
 }
+
+#[cfg(windows)]
+#[path = "secure_windows.rs"]
+mod windows;
 
 #[cfg(unix)]
 mod unix {
@@ -338,6 +447,12 @@ mod unix {
 
     impl HeldDatabase {
         pub(super) fn acquire(dir: &Path, name: &OsStr, uid: u32) -> Result<Self, Error> {
+            Self::acquire_mode(dir, name, uid, true)
+        }
+        pub(super) fn acquire_existing(dir: &Path, name: &OsStr, uid: u32) -> Result<Self, Error> {
+            Self::acquire_mode(dir, name, uid, false)
+        }
+        fn acquire_mode(dir: &Path, name: &OsStr, uid: u32, create: bool) -> Result<Self, Error> {
             name_cstring(name)?;
             if name.as_bytes().len() > 247
                 || !dir.is_absolute()
@@ -397,7 +512,7 @@ mod unix {
             let path = dir.join(name);
             let file = match open_at(&parent.file, name, libc::O_RDWR | FILE_FLAGS) {
                 Ok(file) => file,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && create => {
                     directories_recheck(&directories, uid)?;
                     sidecars_recheck(parent, name, &mut sidecars, uid)?;
                     open_at(
@@ -406,6 +521,9 @@ mod unix {
                         libc::O_RDWR | FILE_FLAGS | libc::O_CREAT | libc::O_EXCL,
                     )
                     .map_err(|_| Error::Unavailable)?
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(Error::Unavailable)
                 }
                 Err(_) => return Err(Error::UnsafeFile),
             };
@@ -527,6 +645,50 @@ mod tests {
     #[cfg(unix)]
     fn acquire(dir: &Path) -> Result<SecureDatabase, SecureDatabaseError> {
         SecureDatabase::acquire(dir, OsStr::new("messages.sqlite"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_database_existing_only_absence_never_creates_a_file() {
+        let _env = crate::platform::test_env::lock();
+        let (_tmp, dir) = fixture();
+        let path = dir.join("messages.sqlite");
+        let result = SecureDatabase::acquire_existing(&dir, OsStr::new("messages.sqlite"));
+        assert!(
+            !path.exists(),
+            "existing-only acquisition must never create the missing database"
+        );
+        assert!(matches!(result, Err(SecureDatabaseError::Unavailable)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_database_existing_only_accepts_safe_file_without_truncation() {
+        let _env = crate::platform::test_env::lock();
+        let (_tmp, dir) = fixture();
+        let path = dir.join("messages.sqlite");
+        private_file(&path);
+        let database =
+            SecureDatabase::acquire_existing(&dir, OsStr::new("messages.sqlite")).unwrap();
+        database.recheck().unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_database_existing_only_refuses_symlink_without_touching_target() {
+        let _env = crate::platform::test_env::lock();
+        let (_tmp, dir) = fixture();
+        let target = dir.join("target");
+        private_file(&target);
+        let path = dir.join("messages.sqlite");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(matches!(
+            SecureDatabase::acquire_existing(&dir, OsStr::new("messages.sqlite")),
+            Err(SecureDatabaseError::UnsafeFile)
+        ));
+        assert_eq!(fs::read(target).unwrap(), b"fixture");
+        assert!(fs::symlink_metadata(path).unwrap().file_type().is_symlink());
     }
 
     #[cfg(unix)]
@@ -1109,7 +1271,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     #[test]
     fn secure_database_nonunix_refuses_before_writes() {
         let _env = crate::platform::test_env::lock();
@@ -1121,5 +1283,710 @@ mod tests {
         ));
         assert!(!dir.exists());
         assert!(!dir.join("messages.sqlite").exists());
+    }
+
+    // Native Windows only: cross compilation checks the code, never the ACLs and
+    // share modes these tests observe. The fixture leaf is created with the
+    // INHERITABLE owner-only descriptor, as the pool's directory is; its
+    // ancestors are the ordinary %TEMP% chain, so the ancestry policy is
+    // exercised against real Windows default ACLs.
+    #[cfg(windows)]
+    fn windows_fixture() -> (TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("private");
+        crate::platform::fs_windows_acl::create_private_directory_inheriting(&dir).unwrap();
+        (tmp, dir)
+    }
+    /// R1 F4: libtest captures `print!`/`eprintln!` from a PASSING test unless
+    /// the run passes `--nocapture`; a direct stderr write is not captured, so
+    /// these native diagnostics reach the CI log with no workflow change.
+    #[cfg(windows)]
+    fn emit_diagnostic(line: &str) {
+        use std::io::Write as _;
+        let _ = std::io::stderr().write_all(format!("{line}\n").as_bytes());
+    }
+    #[cfg(windows)]
+    fn windows_private_file(path: &std::path::Path) {
+        drop(crate::platform::fs_windows_acl::create_new_private_file(path).unwrap());
+    }
+    #[cfg(windows)]
+    fn windows_acquire(dir: &std::path::Path) -> Result<SecureDatabase, SecureDatabaseError> {
+        // The fixture leaf is the POOL shape (inheriting), so the pool mode is
+        // the one that applies to it (R1 M2); strict mode is tested separately.
+        SecureDatabase::acquire_pool_ledger(dir, OsStr::new("messages.sqlite"))
+    }
+    #[cfg(windows)]
+    fn windows_acquire_existing(
+        dir: &std::path::Path,
+    ) -> Result<SecureDatabase, SecureDatabaseError> {
+        SecureDatabase::acquire_pool_ledger_existing(dir, OsStr::new("messages.sqlite"))
+    }
+    /// The strict (default) constructors, for the mode-separation tests.
+    #[cfg(windows)]
+    fn windows_strict_acquire(
+        dir: &std::path::Path,
+    ) -> Result<SecureDatabase, SecureDatabaseError> {
+        SecureDatabase::acquire(dir, OsStr::new("messages.sqlite"))
+    }
+    #[cfg(windows)]
+    fn windows_strict_acquire_existing(
+        dir: &std::path::Path,
+    ) -> Result<SecureDatabase, SecureDatabaseError> {
+        SecureDatabase::acquire_existing(dir, OsStr::new("messages.sqlite"))
+    }
+    /// A SID from its sub-authorities under SECURITY_NT_AUTHORITY (5).
+    #[cfg(windows)]
+    fn windows_sid(parts: &[u32]) -> Vec<u8> {
+        let mut bytes = vec![1, parts.len() as u8, 0, 0, 0, 0, 0, 5];
+        for part in parts {
+            bytes.extend(part.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_secure_database_existing_only_absence_never_creates_a_file() {
+        let _env = crate::platform::test_env::lock();
+        let (_tmp, dir) = windows_fixture();
+        let path = dir.join("messages.sqlite");
+        let result = windows_acquire_existing(&dir);
+        assert!(
+            !path.exists(),
+            "existing-only acquisition must never create the missing database"
+        );
+        assert!(matches!(result, Err(SecureDatabaseError::Unavailable)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_secure_database_refuses_a_broad_dacl_database() {
+        let _env = crate::platform::test_env::lock();
+        let (_tmp, dir) = windows_fixture();
+        let path = dir.join("messages.sqlite");
+        // Owner-only DACL replaced by Everyone full control: the shape the old
+        // UnsupportedPlatform stub could never see.
+        drop(
+            crate::platform::fs_windows_acl_tests::file_with_sddl(&path, "D:P(A;;FA;;;WD)")
+                .unwrap(),
+        );
+        assert!(
+            matches!(windows_acquire(&dir), Err(SecureDatabaseError::UnsafeFile)),
+            "a database readable and writable by Everyone must be refused"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_secure_database_refuses_synthetic_different_owner() {
+        let _env = crate::platform::test_env::lock();
+        let (_tmp, dir) = windows_fixture();
+        // Only the expected identity is synthetic: a foreign-OWNED file cannot be
+        // constructed on an unprivileged host, so the SAME owner policy is driven
+        // with a SID that is not the token's.
+        let foreign =
+            crate::platform::fs_windows_acl::UserSid::synthetic(&windows_sid(&[21, 42, 8]));
+        assert!(matches!(
+            super::windows::HeldDatabase::acquire(
+                &dir,
+                OsStr::new("messages.sqlite"),
+                &foreign,
+                LeafPolicy::PoolLedger,
+            ),
+            Err(SecureDatabaseError::UnsafeDirectory)
+        ));
+        assert!(!dir.join("messages.sqlite").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_secure_database_rejects_a_hardlinked_database() {
+        let _env = crate::platform::test_env::lock();
+        let (_tmp, dir) = windows_fixture();
+        let path = dir.join("messages.sqlite");
+        windows_private_file(&path);
+        std::fs::hard_link(&path, dir.join("alias")).unwrap();
+        assert!(
+            matches!(windows_acquire(&dir), Err(SecureDatabaseError::UnsafeFile)),
+            "hardlinked private database must be refused"
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_secure_database_refuses_a_symlink_at_the_database_path() {
+        let _env = crate::platform::test_env::lock();
+        let (_tmp, dir) = windows_fixture();
+        let target = dir.join("target");
+        windows_private_file(&target);
+        let path = dir.join("messages.sqlite");
+        std::os::windows::fs::symlink_file(&target, &path)
+            .expect("creating a file symlink needs Developer Mode or elevation");
+        assert!(matches!(
+            windows_acquire(&dir),
+            Err(SecureDatabaseError::UnsafeFile)
+        ));
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::metadata(&target).unwrap().len(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_secure_database_recheck_detects_a_replaced_database() {
+        use std::io::Write;
+        let _env = crate::platform::test_env::lock();
+        let (_tmp, dir) = windows_fixture();
+        let path = dir.join("messages.sqlite");
+        windows_private_file(&path);
+        let database = windows_acquire(&dir).unwrap();
+        database.recheck().unwrap();
+        std::fs::rename(&path, dir.join("retired.sqlite")).unwrap();
+        windows_private_file(&path);
+        assert!(matches!(
+            database.recheck(),
+            Err(SecureDatabaseError::NamespaceChanged)
+        ));
+        let mut called = false;
+        assert!(database
+            .with_file(|_| {
+                called = true;
+                Ok(())
+            })
+            .is_err());
+        assert!(!called, "namespace refusal must precede callback");
+        assert!(database
+            .with_file(|mut file| file.write_all(b"changed"))
+            .is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_secure_database_creates_a_missing_database_privately() {
+        let _env = crate::platform::test_env::lock();
+        let (_tmp, dir) = windows_fixture();
+        let database = windows_acquire(&dir).unwrap();
+        database.recheck().unwrap();
+        let path = dir.join("messages.sqlite");
+        let file = crate::platform::fs_windows_acl::open_private_shared(&path, false)
+            .expect("the created database carries the owner-only descriptor");
+        drop(file);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_secure_database_acquires_and_uses_existing_held_file() {
+        use std::io::{Read, Seek, Write};
+        let _env = crate::platform::test_env::lock();
+        let (_tmp, dir) = windows_fixture();
+        let path = dir.join("messages.sqlite");
+        windows_private_file(&path);
+        let database = windows_acquire(&dir).unwrap();
+        database
+            .with_file(|mut file| file.write_all(b"changed"))
+            .unwrap();
+        // Read back through the SAME held handle: the write went to the guarded
+        // file, not to some path that merely shares its name.
+        let contents = database
+            .with_file(|mut file| {
+                file.seek(std::io::SeekFrom::Start(0))?;
+                let mut contents = String::new();
+                file.read_to_string(&mut contents)?;
+                Ok(contents)
+            })
+            .unwrap();
+        assert_eq!(contents, "changed");
+        database.recheck().unwrap();
+        // A co-opening client uses the Win32 default share mode, which our held
+        // access must not violate; this is the SQLite open sequence.
+        let peer = crate::platform::fs_windows_acl::open_private_shared(&path, true).unwrap();
+        drop(peer);
+        database.recheck().unwrap();
+    }
+
+    // Each sidecar is validated BEFORE the database is created, as on unix: a
+    // broad-DACL `-wal` refuses acquisition and nothing is created beside it.
+    #[cfg(windows)]
+    #[test]
+    fn windows_secure_database_validates_an_existing_sidecar_before_creation() {
+        let _env = crate::platform::test_env::lock();
+        let (_tmp, dir) = windows_fixture();
+        let side = dir.join("messages.sqlite-wal");
+        drop(
+            crate::platform::fs_windows_acl_tests::file_with_sddl(&side, "D:P(A;;FA;;;WD)")
+                .unwrap(),
+        );
+        assert!(matches!(
+            windows_acquire(&dir),
+            Err(SecureDatabaseError::UnsafeFile)
+        ));
+        assert!(!dir.join("messages.sqlite").exists());
+        std::fs::remove_file(&side).unwrap();
+        // A dangling symlink at a sidecar name is not genuine absence either.
+        std::os::windows::fs::symlink_file(dir.join("missing"), &side)
+            .expect("creating a file symlink needs Developer Mode or elevation");
+        assert!(matches!(
+            windows_acquire(&dir),
+            Err(SecureDatabaseError::UnsafeFile)
+        ));
+        std::fs::remove_file(&side).unwrap();
+        assert!(windows_acquire(&dir).is_ok(), "control: absent sidecars");
+    }
+
+    // The sidecar SQLite creates for itself: a plain `CreateFileW` inside the
+    // leaf, so the DACL and the NW|NR label are INHERITED rather than written by
+    // csq. That is the shape the pool's journal has, and it must be accepted —
+    // while the database itself keeps the explicit protected shape.
+    #[cfg(windows)]
+    #[test]
+    fn windows_secure_database_accepts_a_sidecar_that_inherited_the_private_shape() {
+        let _env = crate::platform::test_env::lock();
+        let (_tmp, dir) = windows_fixture();
+        let side = dir.join("messages.sqlite-wal");
+        std::fs::File::create(&side).unwrap();
+        // Control: the file really did inherit (the exact check refuses it) and
+        // the inherited-aware check is what accepts it.
+        let inherited = crate::platform::fs_windows_acl::open_unchecked_shared_handle(&side, false)
+            .expect("the inherited grant allows a read handle");
+        // Native diagnostic (ROOT condition 1): print the runner's REAL owner and
+        // DACL for the leaf and the SQLite-style sidecar BEFORE any assertion, so
+        // a red run shows which token/owner path was exercised. Fixed tag.
+        emit_diagnostic(&format!(
+            "[pool-sidecar-sddl] sidecar={}",
+            crate::platform::fs_windows_acl::observed_sddl(&inherited)
+                .unwrap_or_else(|_| "<unreadable>".to_string())
+        ));
+        emit_diagnostic(&format!(
+            "[pool-sidecar-sddl] leaf={}",
+            crate::platform::fs_windows_acl::observed_sddl_at(&dir)
+                .unwrap_or_else(|_| "<unreadable>".to_string())
+        ));
+        assert!(
+            crate::platform::fs_windows_acl::check_private_handle(&inherited).is_err(),
+            "an inherited DACL is not the at-creation protected shape"
+        );
+        assert!(
+            crate::platform::fs_windows_acl::check_private_inherited_handle_as(
+                &inherited,
+                &crate::platform::fs_windows_acl::UserSid::current().unwrap()
+            )
+            .is_ok()
+        );
+        drop(inherited);
+        let database = windows_acquire(&dir).expect("an inherited private sidecar is accepted");
+        emit_diagnostic(&format!(
+            "[pool-sidecar-sddl] database={}",
+            crate::platform::fs_windows_acl::observed_sddl_at(&dir.join("messages.sqlite"))
+                .unwrap_or_else(|_| "<unreadable>".to_string())
+        ));
+        database.recheck().unwrap();
+        assert!(dir.join("messages.sqlite").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_secure_database_rejects_relative_path_and_component_escape() {
+        let _env = crate::platform::test_env::lock();
+        let (_tmp, dir) = windows_fixture();
+        assert!(matches!(
+            windows_acquire(std::path::Path::new("relative")),
+            Err(SecureDatabaseError::InvalidPath)
+        ));
+        for name in [
+            "",
+            ".",
+            "..",
+            "nested/db",
+            "nested\\db",
+            "bad:name",
+            "bad\0name",
+        ] {
+            assert!(
+                matches!(
+                    SecureDatabase::acquire(&dir, OsStr::new(name)),
+                    Err(SecureDatabaseError::InvalidPath)
+                ),
+                "{name:?} must be refused"
+            );
+        }
+        assert!(matches!(
+            windows_acquire(&dir.join("..")),
+            Err(SecureDatabaseError::InvalidPath)
+        ));
+        assert!(!dir.join("messages.sqlite").exists());
+    }
+
+    // R1 M2 census: the pool mode has exactly ONE production caller (the pool
+    // execution ledger). Comment-only mentions (docs) do not count. Reds if a
+    // second call site appears anywhere in the Rust sources.
+    #[test]
+    fn only_the_execution_ledger_calls_the_pool_mode() {
+        let root = crate::testing::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the workspace root above csq-core")
+            .to_path_buf();
+        let allowed = ["csq-core/src/pool/execution_ledger.rs"];
+        let mut offenders = Vec::new();
+        let mut files = 0_usize;
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("scan a workspace directory") {
+                let entry = entry.expect("directory entry");
+                let name = entry.file_name();
+                // Hidden directories are tooling, not sources — they include the
+                // repo's `.csq-wt/` worktree root, whose full copies of the crate
+                // would otherwise appear as a second "caller" of this path.
+                if name.to_string_lossy().starts_with('.')
+                    || name == "target"
+                    || name == "node_modules"
+                {
+                    continue;
+                }
+                let path = entry.path();
+                if entry.file_type().expect("entry type").is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|extension| extension != "rs") {
+                    continue;
+                }
+                files += 1;
+                let text = std::fs::read_to_string(&path).expect("read a Rust source");
+                let call = text.lines().any(|line| {
+                    let line = line.trim_start();
+                    !line.starts_with("//") && line.contains("acquire_pool_ledger")
+                });
+                let relative = path
+                    .strip_prefix(&root)
+                    .expect("path under the workspace root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                // This module defines the mode and exercises it in its tests.
+                let defining_module = relative == "csq-core/src/messaging/storage/secure.rs";
+                if call && !defining_module && !allowed.contains(&relative.as_str()) {
+                    offenders.push(relative);
+                }
+            }
+        }
+        assert!(
+            files > 100,
+            "the census must have scanned the workspace, saw {files} Rust files"
+        );
+        assert!(
+            offenders.is_empty(),
+            "the pool mode must have one production caller, found {offenders:?}"
+        );
+    }
+
+    // R1 M1: a sidecar in the AT-CREATION (Exact) shape can only have been
+    // planted there — csq never creates a sidecar — so pool mode refuses it.
+    #[cfg(windows)]
+    #[test]
+    fn windows_pool_mode_refuses_an_at_creation_shaped_sidecar() {
+        let _env = crate::platform::test_env::lock();
+        let (_tmp, dir) = windows_fixture();
+        windows_private_file(&dir.join("messages.sqlite-wal"));
+        assert!(matches!(
+            windows_acquire(&dir),
+            Err(SecureDatabaseError::UnsafeFile)
+        ));
+        assert!(!dir.join("messages.sqlite").exists());
+    }
+
+    // R1 F1: breaking inheritance on a sidecar (`icacls /inheritance:d`) gives
+    // a PROTECTED DACL — refused on recheck and again on reopen, untouched.
+    #[cfg(windows)]
+    #[test]
+    fn windows_pool_mode_refuses_a_sidecar_whose_inheritance_was_converted() {
+        let _env = crate::platform::test_env::lock();
+        let (_tmp, dir) = windows_fixture();
+        let side = dir.join("messages.sqlite-wal");
+        drop(std::fs::File::create(&side).unwrap());
+        let database = windows_acquire(&dir).expect("the inherited sidecar is accepted");
+        let sid = crate::platform::fs_windows_acl::current_user_sid_text().unwrap();
+        // `icacls /inheritance:d`: a PROTECTED DACL. The unprotected setter
+        // re-inherits the leaf's ACE, which is not the converted shape.
+        crate::platform::fs_windows_acl::set_file_dacl_protected(
+            &side,
+            &format!("D:P(A;;FA;;;{sid})"),
+        )
+        .unwrap();
+        let converted_acl = crate::platform::fs_windows_acl::observed_acl_at(&side).unwrap();
+        assert!(
+            converted_acl.dacl_protected(),
+            "premise: the DACL is protected (AI beside P is legal): {converted_acl:?}"
+        );
+        assert_eq!(
+            converted_acl.dacl.len(),
+            1,
+            "premise: exactly the owner ACE: {converted_acl:?}"
+        );
+        let converted_ace = &converted_acl.dacl[0];
+        assert!(
+            converted_ace.is_access_allowed()
+                && converted_ace.is_file_all_access()
+                && converted_ace.sid == sid,
+            "premise: the owner-only FILE_ALL_ACCESS grant: {converted_acl:?}"
+        );
+        assert_eq!(
+            converted_ace.flags, 0,
+            "premise: the converted ACE does not inherit: {converted_acl:?}"
+        );
+        assert!(matches!(
+            database.recheck(),
+            Err(SecureDatabaseError::UnsafeFile)
+        ));
+        assert!(matches!(
+            database.with_file(|_| Ok(())),
+            Err(SecureDatabaseError::UnsafeFile)
+        ));
+        drop(database);
+        assert!(matches!(
+            windows_acquire_existing(&dir),
+            Err(SecureDatabaseError::UnsafeFile)
+        ));
+        assert_eq!(
+            crate::platform::fs_windows_acl::observed_acl_at(&side).unwrap(),
+            converted_acl,
+            "a refusal must not re-ACL the sidecar"
+        );
+    }
+
+    // R1 F1: a label-stripped sidecar is refused and never re-stamped (csq has
+    // no stamping fallback for a third-party file).
+    #[cfg(windows)]
+    #[test]
+    fn windows_pool_mode_refuses_a_label_stripped_sidecar_without_restamping() {
+        let _env = crate::platform::test_env::lock();
+        let (_tmp, dir) = windows_fixture();
+        let side = dir.join("messages.sqlite-wal");
+        drop(std::fs::File::create(&side).unwrap());
+        let database = windows_acquire(&dir).expect("the inherited sidecar is accepted");
+        crate::platform::fs_windows_acl::clear_file_label(&side).unwrap();
+        let stripped = crate::platform::fs_windows_acl::observed_acl_at(&side).unwrap();
+        assert!(
+            stripped.label.is_empty(),
+            "premise: no label ACE remains: {stripped:?}"
+        );
+        assert!(matches!(
+            database.recheck(),
+            Err(SecureDatabaseError::UnsafeFile)
+        ));
+        drop(database);
+        assert!(matches!(
+            windows_acquire_existing(&dir),
+            Err(SecureDatabaseError::UnsafeFile)
+        ));
+        assert_eq!(
+            crate::platform::fs_windows_acl::observed_acl_at(&side).unwrap(),
+            stripped,
+            "a refused label-stripped sidecar must not be re-stamped"
+        );
+    }
+
+    // R1 F2 condition 4: an ACE added to the DATABASE after acquisition is
+    // refused on recheck and on reopen.
+    #[cfg(windows)]
+    #[test]
+    fn windows_database_with_an_added_ace_is_refused_on_recheck_and_reopen() {
+        let _env = crate::platform::test_env::lock();
+        let (_tmp, dir) = windows_fixture();
+        let database = windows_acquire(&dir).expect("the ledger database is created");
+        let path = dir.join("messages.sqlite");
+        let sid = crate::platform::fs_windows_acl::current_user_sid_text().unwrap();
+        crate::platform::fs_windows_acl::set_file_dacl(
+            &path,
+            &format!("D:P(A;;FA;;;{sid})(A;;FR;;;WD)"),
+        )
+        .unwrap();
+        assert!(matches!(
+            database.recheck(),
+            Err(SecureDatabaseError::UnsafeFile)
+        ));
+        drop(database);
+        assert!(matches!(
+            windows_acquire_existing(&dir),
+            Err(SecureDatabaseError::UnsafeFile)
+        ));
+    }
+
+    // R1 F2 condition 4: an explicit ACE added to an INHERITED sidecar keeps
+    // the DACL unprotected and leaves two ACEs — refused on recheck and reopen.
+    #[cfg(windows)]
+    #[test]
+    fn windows_pool_mode_refuses_a_sidecar_with_an_added_ace() {
+        let _env = crate::platform::test_env::lock();
+        let (_tmp, dir) = windows_fixture();
+        let side = dir.join("messages.sqlite-wal");
+        drop(std::fs::File::create(&side).unwrap());
+        let database = windows_acquire(&dir).expect("the inherited sidecar is accepted");
+        crate::platform::fs_windows_acl::set_file_dacl(&side, "D:(A;;FR;;;WD)").unwrap();
+        let added = crate::platform::fs_windows_acl::observed_acl_at(&side).unwrap();
+        // Parsed premise (R2 N6): the DACL stays auto-inherited and now carries
+        // an Everyone ACE beside the user's inherited grant.
+        assert!(
+            !added.dacl_protected(),
+            "premise: the sidecar's DACL stays auto-inherited: {added:?}"
+        );
+        assert!(
+            added
+                .dacl
+                .iter()
+                .any(|ace| ace.is_access_allowed() && ace.sid == "S-1-1-0"),
+            "premise: the added Everyone ACE is present: {added:?}"
+        );
+        let sid = crate::platform::fs_windows_acl::current_user_sid_text().unwrap();
+        assert!(
+            added.dacl_sids().contains(&sid.as_str()),
+            "premise: the user's inherited ACE remains: {added:?}"
+        );
+        assert!(matches!(
+            database.recheck(),
+            Err(SecureDatabaseError::UnsafeFile)
+        ));
+        drop(database);
+        assert!(matches!(
+            windows_acquire_existing(&dir),
+            Err(SecureDatabaseError::UnsafeFile)
+        ));
+    }
+
+    // R1 F8: an EXACT protected non-inheriting leaf is refused in pool mode,
+    // untouched, and the fixture really is the strict shape.
+    #[cfg(windows)]
+    #[test]
+    fn windows_pool_mode_refuses_a_strict_leaf_untouched() {
+        let _env = crate::platform::test_env::lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("strict");
+        crate::platform::fs_windows_acl::create_private_directory(&dir).unwrap();
+        let before = crate::platform::fs_windows_acl::observed_acl_at(&dir).unwrap();
+        assert!(
+            before.dacl_protected() && before.dacl.len() == 1,
+            "premise: a protected single-ACE leaf: {before:?}"
+        );
+        let grant = &before.dacl[0];
+        assert!(
+            grant.is_access_allowed()
+                && grant.is_file_all_access()
+                && !grant.inherits_to_children(),
+            "premise: the strict non-inheriting FILE_ALL_ACCESS leaf: {before:?}"
+        );
+        assert!(
+            crate::platform::fs_windows_acl::open_private_directory_inheriting(&dir).is_err(),
+            "premise: the strict leaf is not the inheriting shape"
+        );
+        assert!(matches!(
+            windows_acquire(&dir),
+            Err(SecureDatabaseError::UnsafeDirectory)
+        ));
+        assert_eq!(
+            crate::platform::fs_windows_acl::observed_acl_at(&dir).unwrap(),
+            before,
+            "a wrong-shape leaf must never be adopted or re-ACLed"
+        );
+        assert!(!dir.join("messages.sqlite").exists());
+    }
+
+    // R1 F8: an inheriting leaf carrying an EXTRA ACE is refused untouched.
+    #[cfg(windows)]
+    #[test]
+    fn windows_pool_mode_refuses_an_inheriting_leaf_with_an_extra_ace() {
+        let _env = crate::platform::test_env::lock();
+        let (_tmp, dir) = windows_fixture();
+        let sid = crate::platform::fs_windows_acl::current_user_sid_text().unwrap();
+        crate::platform::fs_windows_acl::set_file_dacl(
+            &dir,
+            &format!("D:P(A;OICI;FA;;;{sid})(A;;FR;;;WD)"),
+        )
+        .unwrap();
+        let before = crate::platform::fs_windows_acl::observed_acl_at(&dir).unwrap();
+        assert!(
+            before.dacl_protected(),
+            "premise: the planted leaf DACL is protected: {before:?}"
+        );
+        assert!(
+            before
+                .dacl
+                .iter()
+                .any(|ace| ace.is_access_allowed() && ace.sid == "S-1-1-0"),
+            "premise: the extra Everyone ACE is present: {before:?}"
+        );
+        assert!(
+            before
+                .dacl
+                .iter()
+                .any(|ace| ace.sid == sid && ace.is_access_allowed() && ace.inherits_to_children()),
+            "premise: the user's inheriting ACE is present: {before:?}"
+        );
+        assert!(matches!(
+            windows_acquire(&dir),
+            Err(SecureDatabaseError::UnsafeDirectory)
+        ));
+        assert_eq!(
+            crate::platform::fs_windows_acl::observed_acl_at(&dir).unwrap(),
+            before,
+            "a wrong-shape leaf must never be adopted or re-ACLed"
+        );
+        assert!(!dir.join("messages.sqlite").exists());
+    }
+
+    // R1 F8: an inheriting leaf with NO label is refused untouched.
+    #[cfg(windows)]
+    #[test]
+    fn windows_pool_mode_refuses_an_inheriting_leaf_without_a_label() {
+        let _env = crate::platform::test_env::lock();
+        let (_tmp, dir) = windows_fixture();
+        crate::platform::fs_windows_acl::clear_file_label(&dir).unwrap();
+        let before = crate::platform::fs_windows_acl::observed_acl_at(&dir).unwrap();
+        assert!(
+            before.label.is_empty(),
+            "premise: the leaf has no label: {before:?}"
+        );
+        assert!(matches!(
+            windows_acquire(&dir),
+            Err(SecureDatabaseError::UnsafeDirectory)
+        ));
+        assert_eq!(
+            crate::platform::fs_windows_acl::observed_acl_at(&dir).unwrap(),
+            before,
+            "a wrong-shape leaf must never be adopted or re-ACLed"
+        );
+    }
+
+    // R1 M2: the default constructors stay STRICT on Windows — an inheriting
+    // leaf is refused, while strict mode creates and accepts its own leaf.
+    #[cfg(windows)]
+    #[test]
+    fn windows_strict_mode_refuses_an_inheriting_leaf_and_keeps_its_own_shape() {
+        let _env = crate::platform::test_env::lock();
+        let (_tmp, inheriting) = windows_fixture();
+        assert!(matches!(
+            windows_strict_acquire(&inheriting),
+            Err(SecureDatabaseError::UnsafeDirectory)
+        ));
+        assert!(!inheriting.join("messages.sqlite").exists());
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("strict");
+        let database = windows_strict_acquire(&dir).expect("strict mode creates its leaf");
+        database.recheck().unwrap();
+        drop(database);
+        // The strict EXISTING path stays available over the same leaf.
+        let existing =
+            windows_strict_acquire_existing(&dir).expect("strict mode reopens its own database");
+        existing.recheck().unwrap();
+        drop(existing);
+        drop(
+            crate::platform::fs_windows_acl::open_private_directory(&dir)
+                .expect("strict mode's leaf is the at-creation protected shape"),
+        );
+        assert!(
+            crate::platform::fs_windows_acl::open_private_directory_inheriting(&dir).is_err(),
+            "strict mode must not create the pool shape"
+        );
     }
 }

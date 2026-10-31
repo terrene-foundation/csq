@@ -12,6 +12,19 @@
 //! that reds under a deep runner `TMPDIR`; `short_root` is the one source of
 //! truth that keeps the kernel pathname bounded regardless of the ambient
 //! environment.
+//!
+//! Why the fixed `/tmp` root is safe: `Builder::tempdir_in` CREATES a fresh
+//! directory with `create_dir` and retries a new name on `EEXIST`; it never
+//! opens or adopts a pre-existing entry, so a planted symlink of that shape is
+//! inert. That property is inherited from `tempfile` — an upgrade that switched
+//! creation to open-or-follow would weaken every caller silently, so it is
+//! stated here with the dependency rather than left implicit. The re-assert
+//! `set_permissions` in `short_root` FORCES 0700 regardless of the process umask
+//! — on a restrictive umask that adds owner bits rather than removing them —
+//! and never grants anything to group/other. It follows a symlink if one
+//! replaced the directory between creation and that call; the target is then
+//! either already controlled by the same user, or not owned by it (`EPERM`,
+//! which `short_root` returns as an error).
 
 use std::fs;
 use std::io;

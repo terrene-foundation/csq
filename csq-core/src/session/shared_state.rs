@@ -2045,12 +2045,14 @@ fn merge_jsonl(
         // embed anything the user pasted into a session, including secrets.
         // `write_new_private` creates the tmp file at 0o600 at creation.
         let tmp = crate::platform::fs::unique_tmp_path(shared_file);
-        if let Err(e) = crate::platform::fs::write_new_private(&tmp, content.as_bytes()) {
-            let _ = fs::remove_file(&tmp);
-            return Err(ShareError::io(&tmp, io::Error::other(e.to_string())));
-        }
-        if let Err(e) = crate::platform::fs::atomic_replace(&tmp, shared_file) {
-            let _ = fs::remove_file(&tmp);
+        let writer = match crate::platform::fs::write_new_private_retained(&tmp, content.as_bytes())
+        {
+            Ok(writer) => writer,
+            Err(e) => {
+                return Err(ShareError::io(&tmp, io::Error::other(e.to_string())));
+            }
+        };
+        if let Err(e) = writer.replace(shared_file) {
             return Err(ShareError::io(shared_file, io::Error::other(e.to_string())));
         }
     }

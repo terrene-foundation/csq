@@ -285,27 +285,11 @@ pub(crate) fn write_private_atomic(target: &Path, bytes: &[u8]) -> std::io::Resu
 }
 
 fn write_private_atomic_with_temp(target: &Path, bytes: &[u8], tmp: &Path) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    }
-    // A collision belongs to somebody else: never follow or clean it up.
-    let mut file = options.open(tmp)?;
-    let result = (|| {
-        #[cfg(not(unix))]
-        crate::platform::fs::secure_file(tmp).map_err(std::io::Error::other)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        crate::platform::fs::atomic_replace(tmp, target).map_err(std::io::Error::other)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(tmp);
-    }
-    result
+    // Retain the synced private writer through publication. Its cleanup owns only
+    // the created entry; a create-new collision remains untouched.
+    let writer = crate::platform::fs::write_new_private_synced_retained(tmp, bytes)
+        .map_err(std::io::Error::other)?;
+    writer.replace(target).map_err(std::io::Error::other)
 }
 
 #[cfg(test)]
@@ -717,6 +701,51 @@ mod tests {
             "fresh rearm must survive reconcile/write"
         );
         assert_eq!(read(d.path()).unwrap().generation, 1);
+    }
+
+    #[test]
+    fn private_atomic_temp_collision_preserves_foreign_regular_file() {
+        let d = TempDir::new().unwrap();
+        let target = d.path().join("target");
+        let tmp = d.path().join("planted-temp");
+        std::fs::write(&tmp, b"foreign-entry").unwrap();
+        assert!(write_private_atomic_with_temp(&target, b"replacement", &tmp).is_err());
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"foreign-entry");
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn private_atomic_replace_failure_removes_owned_temp() {
+        let d = TempDir::new().unwrap();
+        let target = d.path().join("target-directory");
+        let tmp = d.path().join("owned-temp");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("sentinel"), b"unchanged").unwrap();
+        assert!(write_private_atomic_with_temp(&target, b"replacement", &tmp).is_err());
+        assert!(!tmp.exists());
+        assert_eq!(
+            std::fs::read(target.join("sentinel")).unwrap(),
+            b"unchanged"
+        );
+    }
+
+    #[test]
+    fn private_atomic_replaces_existing_file_with_retained_writer() {
+        let d = TempDir::new().unwrap();
+        let target = d.path().join("target");
+        let tmp = d.path().join("owned-temp");
+        std::fs::write(&target, b"previous").unwrap();
+        write_private_atomic_with_temp(&target, b"replacement", &tmp).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+        assert!(!tmp.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[cfg(unix)]

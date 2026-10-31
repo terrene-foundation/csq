@@ -585,6 +585,20 @@ mod credential_error_kind_tag_tests {
     }
 }
 
+/// Display omits absolute ancestors; typed fields retain their paths for callers.
+struct AtomicReplaceParentMismatchDisplay<'a>(&'a PathBuf, &'a PathBuf);
+
+impl std::fmt::Display for AtomicReplaceParentMismatchDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let source = self.0.file_name().unwrap_or_default().to_string_lossy();
+        let target = self.1.file_name().unwrap_or_default().to_string_lossy();
+        write!(
+            f,
+            "atomic_replace: same parent required: {source} -> {target}"
+        )
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum PlatformError {
     #[error("lock contention on {path} (held by another process)")]
@@ -604,6 +618,13 @@ pub enum PlatformError {
 
     #[error("windows error: code {code}, {message}")]
     Win32 { code: u32, message: String },
+
+    /// Windows publication pins one parent object for source and destination.
+    #[error("{}", AtomicReplaceParentMismatchDisplay(.source_parent, .target_parent))]
+    AtomicReplaceParentMismatch {
+        source_parent: PathBuf,
+        target_parent: PathBuf,
+    },
 
     /// Returned by `symlink_exclusive` when the link path already exists.
     ///

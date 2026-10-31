@@ -21,7 +21,7 @@
 //! append MUST NOT block `csq run` / `csq swap` — billing telemetry is
 //! diagnostic, not load-bearing. Failures log at WARN with `error_kind` tag.
 
-use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+use crate::platform::fs::write_private_tmp_retained;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -77,17 +77,13 @@ pub fn append(base_dir: &Path, event: &LaunchEvent) -> Result<(), AppendError> {
     let mut content = existing;
     content.extend_from_slice(line.as_bytes());
 
-    let tmp = unique_tmp_path(&path);
-    if let Err(e) = std::fs::write(&tmp, &content) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(AppendError::Io(e));
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(AppendError::Platform(e));
-    }
-    if let Err(e) = atomic_replace(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
+    // Project paths can identify the user. Private creation owns partial-write
+    // cleanup and leaves collisions untouched; publication retains its writer.
+    let writer = write_private_tmp_retained(&path, &content).map_err(|e| match e {
+        crate::error::PlatformError::Io(io) => AppendError::Io(io),
+        other => AppendError::Platform(other),
+    })?;
+    if let Err(e) = writer.replace(&path) {
         return Err(AppendError::Platform(e));
     }
     Ok(())
@@ -167,6 +163,39 @@ mod tests {
             pid,
             project_path: project.into(),
         }
+    }
+
+    #[test]
+    fn append_retries_a_stale_stage_without_deleting_it() {
+        let dir = TempDir::new().unwrap();
+        let event = ev("2026-05-06T10:00:00Z", "run", 1, 12345, "/fixture/repo");
+        let expected = format!("{}\n", event.to_ndjson_line().unwrap());
+        let planted = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed = std::rc::Rc::clone(&planted);
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |stage| {
+                if observed.borrow().is_none() {
+                    std::fs::write(stage, b"foreign launch stage").unwrap();
+                    *observed.borrow_mut() = Some(stage.to_path_buf());
+                }
+            },
+            || append(dir.path(), &event),
+        );
+        let stage = planted
+            .borrow_mut()
+            .take()
+            .expect("launch create observer must run");
+        assert_eq!(std::fs::read(&stage).unwrap(), b"foreign launch stage");
+        eprintln!("F4_COLLISION_WITNESS observer_hit=true foreign_preserved=true");
+        assert!(
+            result.is_ok(),
+            "launch append must retry a stale stage: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read(launch_log_path(dir.path())).unwrap(),
+            expected.as_bytes()
+        );
+        assert_eq!(std::fs::read(stage).unwrap(), b"foreign launch stage");
     }
 
     #[test]

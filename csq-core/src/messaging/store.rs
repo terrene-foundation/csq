@@ -34,6 +34,7 @@ use super::model::{
     Message, MessageView, Receipt, Recipient, Sender, Status, VerifiedSession, SCHEMA,
 };
 use crate::error::PlatformError;
+use crate::platform::fs::WrittenPrivateFile;
 use crate::sessions::directives::{
     acquire_message_store_lock_as, acquire_store_lock_attempts_as, canonical_uuid,
     check_store_dir_as, ensure_dir_as, prune_rejected_as, quarantine_entry_as,
@@ -838,7 +839,9 @@ fn with_denial_hint<T>(
     };
     let write = |p: &Path, b: &[u8]| (fs.write_tmp)(p, b).inspect_err(note);
     let secure = |p: &Path| (fs.secure)(p).inspect_err(note);
-    let replace = |a: &Path, b: &Path| (fs.replace)(a, b).inspect_err(note);
+    let replace = |a: &Path, b: &Path, identity: WrittenPrivateFile| {
+        (fs.replace)(a, b, identity).inspect_err(note)
+    };
     let wrapped = FsOps {
         write_tmp: &write,
         secure: &secure,
@@ -1880,12 +1883,20 @@ mod tests {
     use crate::messaging::frame::{clean_body, contains_frame_phrase, render, render_note};
     use crate::messaging::limits::*;
     use crate::messaging::model::{Status, Surface};
-    use crate::platform::fs::{atomic_replace, secure_file, write_new_private};
+    use crate::platform::fs::{secure_file, write_new_private, write_new_private_retained};
     #[cfg(unix)]
     use crate::sessions::directives::acquire_store_lock_as;
     use crate::sessions::directives::{is_forbidden_char, real_fs, STALE_TMP_SECS};
     use std::cell::Cell;
     use tempfile::TempDir;
+
+    fn replace_retained(
+        _tmp: &Path,
+        target: &Path,
+        writer: WrittenPrivateFile,
+    ) -> Result<(), PlatformError> {
+        writer.replace(target)
+    }
 
     const T0: u64 = 1_000_000;
     const W: u64 = RATE_WINDOW_SECS;
@@ -2974,7 +2985,7 @@ mod tests {
         )
         .unwrap();
         let calls = std::cell::Cell::new(0);
-        let rep = |a: &Path, b: &Path| {
+        let rep = |a: &Path, b: &Path, identity: WrittenPrivateFile| {
             if b == record_path(&store_dir(d.path()), &first.id)
                 || b == record_path(&store_dir(d.path()), &second.id)
             {
@@ -2985,10 +2996,10 @@ mod tests {
                     )));
                 }
             }
-            atomic_replace(a, b)
+            replace_retained(a, b, identity)
         };
         let fs = FsOps {
-            write_tmp: &write_new_private,
+            write_tmp: &write_new_private_retained,
             secure: &secure_file,
             replace: &rep,
         };
@@ -4177,11 +4188,11 @@ mod tests {
         )
         .unwrap();
         let before = files(d.path());
-        let rep = |_: &Path, _: &Path| -> Result<(), PlatformError> {
+        let rep = |_: &Path, _: &Path, _: WrittenPrivateFile| -> Result<(), PlatformError> {
             Err(PlatformError::Io(std::io::Error::other("boom")))
         };
         let fs = FsOps {
-            write_tmp: &write_new_private,
+            write_tmp: &write_new_private_retained,
             secure: &secure_file,
             replace: &rep,
         };
@@ -4366,14 +4377,14 @@ mod tests {
         let parent_file = record_path(&store_dir(d.path()), &parent.id);
         let real = real_fs();
         let hit = Cell::new(false);
-        let replace = |a: &Path, b: &Path| {
+        let replace = |a: &Path, b: &Path, identity: WrittenPrivateFile| {
             if b == parent_file {
                 hit.set(true);
                 Err(PlatformError::Io(std::io::Error::from(
                     std::io::ErrorKind::PermissionDenied,
                 )))
             } else {
-                (real.replace)(a, b)
+                (real.replace)(a, b, identity)
             }
         };
         let fault = FsOps {
@@ -4422,13 +4433,13 @@ mod tests {
         let real = real_fs();
         request::initialize(d.path(), T0, &real).unwrap();
         let key = request::mint(T0);
-        let replace = |a: &Path, b: &Path| {
+        let replace = |a: &Path, b: &Path, identity: WrittenPrivateFile| {
             if b == parent_file {
                 Err(PlatformError::Io(std::io::Error::from(
                     std::io::ErrorKind::PermissionDenied,
                 )))
             } else {
-                (real.replace)(a, b)
+                (real.replace)(a, b, identity)
             }
         };
         let fault = FsOps {
@@ -4496,14 +4507,14 @@ mod tests {
         let id = request::request_id(&sender, &key).unwrap();
         let record = record_path(&dir, &id);
         let denied = Cell::new(false);
-        let replace = |a: &Path, b: &Path| {
+        let replace = |a: &Path, b: &Path, identity: WrittenPrivateFile| {
             if b == ledger && (!after_publication || record.exists()) {
                 denied.set(true);
                 Err(PlatformError::Io(std::io::Error::from(
                     std::io::ErrorKind::PermissionDenied,
                 )))
             } else {
-                (real.replace)(a, b)
+                (real.replace)(a, b, identity)
             }
         };
         let fault = FsOps {
@@ -4610,13 +4621,13 @@ mod tests {
         let erofs =
             || PlatformError::Io(std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem));
         let d = TempDir::new().unwrap();
-        let w = |_: &Path, _: &[u8]| -> Result<(), PlatformError> { Err(eperm()) };
+        let w = |_: &Path, _: &[u8]| -> Result<WrittenPrivateFile, PlatformError> { Err(eperm()) };
         let e = send_with(
             d.path(),
             &FsOps {
                 write_tmp: &w,
                 secure: &secure_file,
-                replace: &atomic_replace,
+                replace: &replace_retained,
             },
         );
         assert_eq!(code(&e), SdkErrorCode::Undetermined);
@@ -4627,11 +4638,13 @@ mod tests {
                 && !e.to_string().contains(d.path().to_str().unwrap())
         );
         let d = TempDir::new().unwrap();
-        let r = |_: &Path, _: &Path| -> Result<(), PlatformError> { Err(erofs()) };
+        let r = |_: &Path, _: &Path, _: WrittenPrivateFile| -> Result<(), PlatformError> {
+            Err(erofs())
+        };
         let e = send_with(
             d.path(),
             &FsOps {
-                write_tmp: &write_new_private,
+                write_tmp: &write_new_private_retained,
                 secure: &secure_file,
                 replace: &r,
             },
@@ -4639,7 +4652,7 @@ mod tests {
         assert_eq!(e.message, STORE_WRITE_DENIED);
         // a NON-denial failure is untouched: the hint must not mask other causes
         let d = TempDir::new().unwrap();
-        let w = |_: &Path, _: &[u8]| -> Result<(), PlatformError> {
+        let w = |_: &Path, _: &[u8]| -> Result<WrittenPrivateFile, PlatformError> {
             Err(PlatformError::Io(std::io::Error::other("boom")))
         };
         let e = send_with(
@@ -4647,7 +4660,7 @@ mod tests {
             &FsOps {
                 write_tmp: &w,
                 secure: &secure_file,
-                replace: &atomic_replace,
+                replace: &replace_retained,
             },
         );
         assert_eq!(code(&e), SdkErrorCode::Undetermined);
@@ -4704,15 +4717,15 @@ mod tests {
         // write_tmp fails AFTER creating the tmp (partial write)
         let d = TempDir::new().unwrap();
         let wrote = std::cell::Cell::new(false);
-        let write = |p: &Path, b: &[u8]| -> Result<(), PlatformError> {
+        let write = |p: &Path, b: &[u8]| -> Result<WrittenPrivateFile, PlatformError> {
             wrote.set(true);
-            std::fs::write(p, &b[..1]).unwrap();
+            let _writer = write_new_private_retained(p, &b[..1])?;
             Err(boom())
         };
         let fs = FsOps {
             write_tmp: &write,
             secure: &secure_file,
-            replace: &atomic_replace,
+            replace: &replace_retained,
         };
         let e = send(
             d.path(),
@@ -4738,9 +4751,9 @@ mod tests {
             Err(boom())
         };
         let fs = FsOps {
-            write_tmp: &write_new_private,
+            write_tmp: &write_new_private_retained,
             secure: &sec,
-            replace: &atomic_replace,
+            replace: &replace_retained,
         };
         let e = send(
             d.path(),
@@ -4760,12 +4773,12 @@ mod tests {
         // replace fails after write+secure
         let d = TempDir::new().unwrap();
         let replaced = std::cell::Cell::new(false);
-        let rep = |_: &Path, _: &Path| -> Result<(), PlatformError> {
+        let rep = |_: &Path, _: &Path, _: WrittenPrivateFile| -> Result<(), PlatformError> {
             replaced.set(true);
             Err(boom())
         };
         let fs = FsOps {
-            write_tmp: &write_new_private,
+            write_tmp: &write_new_private_retained,
             secure: &secure_file,
             replace: &rep,
         };
@@ -5030,14 +5043,14 @@ mod tests {
         let victim = record_path(&store_dir(d.path()), &ids[1]);
         let real = real_fs();
         let hit = Cell::new(false);
-        let replace = |x: &Path, y: &Path| {
+        let replace = |x: &Path, y: &Path, identity: WrittenPrivateFile| {
             if !hit.get() {
                 hit.set(true);
                 std::fs::remove_file(&victim).unwrap();
                 std::fs::create_dir(&victim).unwrap();
                 std::fs::write(victim.join("keep"), b"x").unwrap();
             }
-            (real.replace)(x, y)
+            (real.replace)(x, y, identity)
         };
         let fault = FsOps {
             write_tmp: real.write_tmp,
@@ -5344,14 +5357,14 @@ mod tests {
         )
         .unwrap();
         let writes = Cell::new(0u32);
-        let wt = |p: &Path, b: &[u8]| -> Result<(), PlatformError> {
+        let wt = |p: &Path, b: &[u8]| -> Result<WrittenPrivateFile, PlatformError> {
             writes.set(writes.get() + 1);
-            write_new_private(p, b)
+            write_new_private_retained(p, b)
         };
         let fs = FsOps {
             write_tmp: &wt,
             secure: &secure_file,
-            replace: &atomic_replace,
+            replace: &replace_retained,
         };
         let mark = |now: u64, m: Mark| {
             inbox(d.path(), now, &fs, &live, &ses(2), false, Some(m)).unwrap();
@@ -5456,7 +5469,7 @@ mod tests {
         )
         .unwrap();
         let calls = std::cell::Cell::new(0);
-        let rep = |a: &Path, b: &Path| {
+        let rep = |a: &Path, b: &Path, identity: WrittenPrivateFile| {
             if b == record_path(&store_dir(d.path()), &first.id)
                 || b == record_path(&store_dir(d.path()), &second.id)
             {
@@ -5467,10 +5480,10 @@ mod tests {
                     )));
                 }
             }
-            atomic_replace(a, b)
+            replace_retained(a, b, identity)
         };
         let fs = FsOps {
-            write_tmp: &write_new_private,
+            write_tmp: &write_new_private_retained,
             secure: &secure_file,
             replace: &rep,
         };

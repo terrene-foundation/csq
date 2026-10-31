@@ -1,5 +1,6 @@
 #[cfg(test)]
 use super::*;
+use crate::platform::fs::WrittenPrivateFile;
 use crate::{
     error::PlatformError,
     messaging::{model::Surface, store::Mark},
@@ -262,7 +263,7 @@ fn actual_atomic_write_failures_never_republish_ambiguous_prepared_requests() {
         let key = mint(NOW);
         let count = std::cell::Cell::new(0);
         let real = real_fs();
-        let replace = |a: &Path, b: &Path| {
+        let replace = |a: &Path, b: &Path, identity: WrittenPrivateFile| {
             let ledger = b.file_name().is_some_and(|n| n == "ledger.json");
             if ledger {
                 count.set(count.get() + 1);
@@ -277,7 +278,7 @@ fn actual_atomic_write_failures_never_republish_ambiguous_prepared_requests() {
             {
                 return Err(fail());
             }
-            (real.replace)(a, b)?;
+            (real.replace)(a, b, identity)?;
             if phase == "after_public" && public {
                 return Err(fail());
             }
@@ -789,11 +790,11 @@ fn prepared_persistence_crossing_deadline_refuses_publication_and_stays_und() {
     let started = Instant::now()
         .checked_sub(Duration::from_secs(WINDOW_SECS) - HEADROOM)
         .unwrap();
-    let replace = |a: &Path, b: &Path| {
+    let replace = |a: &Path, b: &Path, identity: WrittenPrivateFile| {
         let prepared = b.file_name().is_some_and(|n| n == "ledger.json")
             && serde_json::from_slice::<Ledger>(&std::fs::read(a).unwrap())
                 .is_ok_and(|ledger| ledger.entries.values().any(|entry| !entry.committed));
-        (real.replace)(a, b)?;
+        (real.replace)(a, b, identity)?;
         if prepared && !delayed.replace(true) {
             let deadline = started + Duration::from_secs(WINDOW_SECS);
             std::thread::sleep(
@@ -1337,7 +1338,7 @@ fn p0_stage_prepared(base: &Path, key: &str, publish: bool) -> (Receipt, Recipie
     let real = real_fs();
     let public_writer_reached = std::cell::Cell::new(false);
     let dir = store::store_dir(base);
-    let replace = |a: &Path, b: &Path| {
+    let replace = |a: &Path, b: &Path, identity: WrittenPrivateFile| {
         let public = b.parent() == Some(dir.as_path())
             && b.file_stem()
                 .and_then(|s| s.to_str())
@@ -1348,7 +1349,7 @@ fn p0_stage_prepared(base: &Path, key: &str, publish: bool) -> (Receipt, Recipie
                 return Err(fail());
             }
         }
-        (real.replace)(a, b)?;
+        (real.replace)(a, b, identity)?;
         if public {
             return Err(fail());
         }

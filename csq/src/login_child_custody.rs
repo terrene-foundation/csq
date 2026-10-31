@@ -13,6 +13,114 @@ pub(crate) mod group;
 mod tty_tests;
 use group::{ErrorAction, ErrorBudget, GroupControl, GroupSignal};
 
+/// How a vendor login ended, worded for the operator. Fixed vocabulary only:
+/// a numeric exit code or a signal name, never paths, arguments or output.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VendorExit(std::process::ExitStatus);
+
+impl From<std::process::ExitStatus> for VendorExit {
+    fn from(status: std::process::ExitStatus) -> Self {
+        Self(status)
+    }
+}
+
+impl VendorExit {
+    pub(crate) fn success(&self) -> bool {
+        self.0.success()
+    }
+}
+
+impl std::fmt::Display for VendorExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(signal) = self.0.signal() {
+                return write!(f, "was terminated by signal {}", signal_name(signal));
+            }
+            if let Some(signal) = self.0.stopped_signal() {
+                return write!(f, "was stopped by signal {}", signal_name(signal));
+            }
+        }
+        match self.0.code() {
+            Some(code) => write!(f, "exited with status {code}"),
+            None => f.write_str("ended without an exit status"),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_name(signal: i32) -> String {
+    let name = match signal {
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGINT => "SIGINT",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGILL => "SIGILL",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGUSR1 => "SIGUSR1",
+        libc::SIGUSR2 => "SIGUSR2",
+        libc::SIGSYS => "SIGSYS",
+        libc::SIGTRAP => "SIGTRAP",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGSTOP => "SIGSTOP",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGTSTP => "SIGTSTP",
+        libc::SIGTTIN => "SIGTTIN",
+        libc::SIGTTOU => "SIGTTOU",
+        other => return other.to_string(),
+    };
+    name.to_owned()
+}
+
+#[cfg(all(test, unix))]
+mod vendor_exit_tests {
+    use super::VendorExit;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    const ADDITIONAL_SIGNALS: [(i32, &str); 7] = [
+        (libc::SIGBUS, "SIGBUS"),
+        (libc::SIGILL, "SIGILL"),
+        (libc::SIGFPE, "SIGFPE"),
+        (libc::SIGUSR1, "SIGUSR1"),
+        (libc::SIGUSR2, "SIGUSR2"),
+        (libc::SIGSYS, "SIGSYS"),
+        (libc::SIGTRAP, "SIGTRAP"),
+    ];
+
+    #[test]
+    fn termination_wording_names_additional_signals() {
+        let actual = ADDITIONAL_SIGNALS
+            .map(|(signal, _)| VendorExit::from(ExitStatus::from_raw(signal)).to_string());
+        let expected =
+            ADDITIONAL_SIGNALS.map(|(_, name)| format!("was terminated by signal {name}"));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn stopped_wording_names_unconditional_job_control_signals() {
+        let signals = [(libc::SIGSTOP, "SIGSTOP"), (libc::SIGTSTP, "SIGTSTP")];
+        let actual = signals.map(|(signal, _)| {
+            VendorExit::from(ExitStatus::from_raw((signal << 8) | 0x7f)).to_string()
+        });
+        let expected = signals.map(|(_, name)| format!("was stopped by signal {name}"));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn stopped_wording_names_additional_signals() {
+        let actual = ADDITIONAL_SIGNALS.map(|(signal, _)| {
+            VendorExit::from(ExitStatus::from_raw((signal << 8) | 0x7f)).to_string()
+        });
+        let expected = ADDITIONAL_SIGNALS.map(|(_, name)| format!("was stopped by signal {name}"));
+        assert_eq!(actual, expected);
+    }
+}
+
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 pub(crate) fn parse_timeout(raw: Option<&str>) -> Duration {
@@ -153,6 +261,33 @@ struct State {
     custody_pgid: Option<u32>,
     #[cfg(test)]
     reaped: Option<ExitStatus>,
+    /// Test-only: the deadline is declared reached by the test itself, after
+    /// the event the test needs to precede it. See `force_deadline_for_test`.
+    #[cfg(test)]
+    deadline_forced: bool,
+}
+impl State {
+    fn deadline_forced(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.deadline_forced
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+}
+
+/// Result of `LoginWatchdog::force_deadline_for_test`: whether this call took the
+/// Timeout latch, or the operation had already left Running (earlier refusal or seal).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Same path-included integration crates as `force_deadline_for_test` never name it.
+#[allow(dead_code)]
+pub(crate) enum ForcedDeadline {
+    Latched,
+    AlreadyFinished,
 }
 
 /// Independent observer metadata; it never owns or drops a child handle.
@@ -178,6 +313,8 @@ impl LoginWatchdog {
                 custody_pgid: None,
                 #[cfg(test)]
                 reaped: None,
+                #[cfg(test)]
+                deadline_forced: false,
             })),
             deadline,
             #[cfg(test)]
@@ -208,6 +345,7 @@ impl LoginWatchdog {
                 outcome: Outcome::Running,
                 custody_pgid: None,
                 reaped: None,
+                deadline_forced: false,
             })),
             deadline: None,
             phase: DeliveryPhase::Unknown,
@@ -253,8 +391,38 @@ impl LoginWatchdog {
     /// Pure deadline read: the deadline ACTION is due whether or not an
     /// earlier refusal already won, so a setup failure cannot suppress it.
     pub(crate) fn deadline_reached(&self) -> bool {
+        #[cfg(test)]
+        if self.state().deadline_forced {
+            return true;
+        }
         self.deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+    /// Test-only ordering control for "the deadline passes AFTER event X".
+    /// A real short deadline races a wall clock against pre-spawn setup and
+    /// child startup, so on a loaded host it can pass before the child exists
+    /// and the case never reaches X. This declares the deadline reached now,
+    /// on the state every clone shares, through the same `Refused(Timeout)`
+    /// latch the real deadline takes. The flag and the latch are set under ONE
+    /// guard, so the vendor worker's own `observe_deadline` cannot win the latch
+    /// between them; `Latched` therefore means this call took it, and
+    /// `AlreadyFinished` means the operation had left Running before the call.
+    #[cfg(test)]
+    // Not called by the five path-included integration test crates (login_ctrlc,
+    // login_native_ctrlc, login_codex_ctrlc, login_subprocess_timeout,
+    // login_publication_signal): each compiles this file under cfg(test) without
+    // the desktop fixtures that call it.
+    #[allow(dead_code)]
+    pub(crate) fn force_deadline_for_test(&self) -> ForcedDeadline {
+        let mut state = self.state();
+        state.deadline_forced = true;
+        // Inline `refuse(Timeout)`: it re-locks, and it only sets the outcome.
+        if matches!(state.outcome, Outcome::Running) {
+            state.outcome = Outcome::Refused(RefusalReason::Timeout);
+            ForcedDeadline::Latched
+        } else {
+            ForcedDeadline::AlreadyFinished
+        }
     }
     #[cfg(test)]
     pub(crate) fn is_refused(&self) -> bool {
@@ -308,9 +476,10 @@ impl LoginWatchdog {
         // A late first poll cannot authorize publication merely because no
         // observer happened to wake exactly at the deadline.
         if matches!(state.outcome, Outcome::Running)
-            && self
-                .deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
+            && (state.deadline_forced()
+                || self
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline))
         {
             state.outcome = Outcome::Refused(RefusalReason::Timeout);
         }
@@ -356,7 +525,9 @@ pub(crate) struct OwnedLoginChild<K> {
     /// custody end (reap, refusal, suspension, the leaked-unresolved branch).
     #[cfg(unix)]
     terminal_custody: Option<group::TerminalCustody>,
+    #[cfg(feature = "cli")]
     attended: bool,
+    #[cfg(any(unix, feature = "cli"))]
     suspended: bool,
     #[cfg(unix)]
     last_stop_scan: Option<Instant>,
@@ -370,14 +541,16 @@ impl<K> OwnedLoginChild<K> {
     ) -> Self {
         #[cfg(unix)]
         let terminal_custody = group.take_terminal();
-        #[cfg(unix)]
+        #[cfg(all(feature = "cli", unix))]
         let attended = terminal_custody.is_some();
-        #[cfg(not(unix))]
+        #[cfg(all(feature = "cli", not(unix)))]
         let attended = false;
         Self {
             #[cfg(unix)]
             terminal_custody,
+            #[cfg(feature = "cli")]
             attended,
+            #[cfg(any(unix, feature = "cli"))]
             suspended: false,
             #[cfg(unix)]
             last_stop_scan: None,
@@ -409,6 +582,7 @@ impl<K> OwnedLoginChild<K> {
     /// Death by SIGINT/SIGQUIT (or exit 130) is a cancellation. A vendor that
     /// exits 0 after a SIGINT completed its OAuth in the browser by the user's
     /// own action: that is a success and is NOT reported here (owner ruling).
+    #[cfg(feature = "cli")]
     pub(crate) fn operator_stop(&self, status: Option<&ExitStatus>) -> Option<&'static str> {
         if self.suspended {
             return Some("login cancelled (suspended)");
@@ -430,12 +604,12 @@ impl<K> OwnedLoginChild<K> {
             None
         }
     }
-    /// A vendor stopped (Ctrl-Z) while owning the terminal cannot be resumed by
-    /// the shell, which does not know its group: give the terminal back, then
-    /// end the login through the ordinary kill/census path. No job-control proxy.
+    /// A stopped vendor cannot complete sign-in. Release any terminal custody,
+    /// then end the login through the ordinary owned kill/census path, including
+    /// vendors spawned without foreground custody. No job-control proxy.
     #[cfg(unix)]
     fn observe_suspension(&mut self) {
-        if self.terminal_custody.is_none() || self.suspended || self.reaped.is_some() {
+        if self.suspended || self.reaped.is_some() {
             return;
         }
         // The leader is read every pass; the process-table scan for a stopped
@@ -447,12 +621,22 @@ impl<K> OwnedLoginChild<K> {
         if scan {
             self.last_stop_scan = Some(Instant::now());
         }
-        if !self.group.stopped_member(scan) {
+        let Some(stop) = self.group.stop_observation(scan) else {
             return;
-        }
+        };
         self.suspended = true;
         self.release_terminal();
-        eprintln!("login_vendor_suspended pgid={}", self.group.id());
+        match stop {
+            group::GroupStop::Signal(signal) => eprintln!(
+                "login_vendor_suspended pgid={} was stopped by signal {}",
+                self.group.id(),
+                signal_name(signal)
+            ),
+            group::GroupStop::Unknown => eprintln!(
+                "login_vendor_suspended pgid={} stopped (signal unknown)",
+                self.group.id()
+            ),
+        }
         self.watchdog.refuse_cancelled_unconditional();
         if self.group.signal(GroupSignal::Kill).is_err() {
             eprintln!(
@@ -623,6 +807,7 @@ impl<K> OwnedLoginChild<K> {
     }
     /// Whether the caller's deadline stop actually succeeded; callers carry
     /// this out of the wait (the CLI operator paragraph keys on it).
+    #[cfg(any(feature = "cli", test))]
     pub(crate) fn deadline_stopped(&self) -> bool {
         self.deadline_stopped
     }

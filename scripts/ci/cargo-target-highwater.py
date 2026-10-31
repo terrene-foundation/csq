@@ -75,7 +75,18 @@ DIRECTORY = (os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
 class Undetermined(Exception):
-    pass
+    def __init__(self, reason, offenders=None, offender_count=0, complete=True):
+        super().__init__(reason)
+        self.offenders = offenders or []
+        self.offender_count = offender_count or len(self.offenders)
+        self.offender_scan_complete = complete
+
+
+# Per-entry refusals whose receipt names the offending entries (metadata only,
+# never contents). Bounded so a wholly unsafe tree cannot flood the receipt.
+OFFENDER_REASONS = ("foreign-owner", "unsafe-permissions", "unreadable-directory",
+                    "unreadable-or-special-entry")
+MAX_OFFENDERS = 20
 
 
 def require(condition, reason):
@@ -127,6 +138,38 @@ def owned(st, directory=False):
     else:
         require(stat.S_ISREG(st.st_mode) and st.st_mode & 0o400,
                 "unreadable-or-special-entry")
+
+
+def entry_type(mode):
+    for test, name in ((stat.S_ISLNK, "symlink"), (stat.S_ISDIR, "directory"),
+                       (stat.S_ISREG, "file"), (stat.S_ISFIFO, "fifo"),
+                       (stat.S_ISSOCK, "socket"), (stat.S_ISCHR, "char-device"),
+                       (stat.S_ISBLK, "block-device")):
+        if test(mode):
+            return name
+    return "other"
+
+
+def offender(st, relative, reason):
+    return {"path": str(relative), "type": entry_type(st.st_mode),
+            "mode": format(stat.S_IMODE(st.st_mode), "04o"), "uid": st.st_uid,
+            "reason": reason}
+
+
+def owned_at(st, relative, directory=False, link=False):
+    """owned(), or the symlink owner-only exemption, naming the entry on refusal."""
+    try:
+        if link:
+            require(st.st_uid == os.getuid(), "foreign-owner")
+        else:
+            owned(st, directory)
+    except Undetermined as error:
+        if str(error) not in OFFENDER_REASONS:
+            raise
+        # A single-entry check scans nothing beyond this entry (Cache.evict stops
+        # here), so never claim completeness; measure() re-raises with its own.
+        raise Undetermined(str(error), [offender(st, relative, str(error))],
+                           complete=False) from None
 
 
 def open_chain(path):
@@ -463,12 +506,29 @@ class Cache:
         self.binding()
         seen, entries, total = set(), 0, 0
         start = time.monotonic()
+        offenders, offender_count = [], 0
+
+        def check(st, relative, directory=False, link=False):
+            # Record a per-entry refusal and keep scanning so the receipt can
+            # name every offender; the admission still refuses after the scan.
+            nonlocal offender_count
+            try:
+                owned_at(st, relative, directory, link)
+            except Undetermined as error:
+                if not error.offenders:
+                    raise
+                offender_count += 1
+                if len(offenders) < MAX_OFFENDERS:
+                    offenders.extend(error.offenders)
+                return str(error) != "unreadable-directory"
+            return True
 
         def visit(fd, relative, depth):
-            nonlocal entries, total
+            nonlocal entries, total, offender_count
             require(depth <= MAX_DEPTH, "traversal-depth-bound")
             st = os.fstat(fd)
-            owned(st, True)
+            if not check(st, relative, True):
+                return
             if identity(st) not in seen:
                 total += st.st_blocks * 512
                 seen.add(identity(st))
@@ -478,10 +538,17 @@ class Cache:
                     require(entries <= MAX_ENTRIES and time.monotonic() - start < MAX_SECONDS,
                             "traversal-bound")
                     rel = relative / entry.name
-                    require(not protected_interior(entry.name, rel), "protected-interior")
+                    before = entry.stat(follow_symlinks=False)
+                    if protected_interior(entry.name, rel):
+                        # Name the protected entry exactly like every other
+                        # per-entry refusal, then keep scanning: admission still
+                        # refuses, and the receipt says WHICH entry and where.
+                        offender_count += 1
+                        if len(offenders) < MAX_OFFENDERS:
+                            offenders.append(offender(before, rel, "protected-interior"))
+                        continue
                     path = self.target / rel
                     require(path not in self.mounts and not os.path.ismount(path), "interior-mount")
-                    before = entry.stat(follow_symlinks=False)
                     require(before.st_dev == self.subject[0], "foreign-filesystem")
                     if stat.S_ISDIR(before.st_mode):
                         child = os.open(entry.name, DIRECTORY, dir_fd=fd)
@@ -493,13 +560,23 @@ class Cache:
                     else:
                         if stat.S_ISLNK(before.st_mode):
                             # Symlinks are opaque leaves, including broken links and venvs.
-                            require(before.st_uid == os.getuid(), "foreign-owner")
+                            check(before, rel, link=True)
                         else:
-                            owned(before)
+                            check(before, rel)
                         if identity(before) not in seen:
                             total += before.st_blocks * 512
                             seen.add(identity(before))
-        visit(self.fd, Path(), 0)
+        try:
+            visit(self.fd, Path(), 0)
+        except (Undetermined, OSError):
+            # The first offender preceded this failure, so it remains the refusal
+            # reason, as it was when the scan stopped at the first offender.
+            if not offender_count:
+                raise
+            raise Undetermined(offenders[0]["reason"], offenders, offender_count,
+                               complete=False) from None
+        if offender_count:
+            raise Undetermined(offenders[0]["reason"], offenders, offender_count)
         self.binding()
         return total
 
@@ -665,13 +742,13 @@ class Cache:
             except FileNotFoundError:
                 return False
             if stat.S_ISLNK(before.st_mode):
-                require(before.st_uid == os.getuid(), "foreign-owner")
+                owned_at(before, relative, link=True)
                 os.unlink(name, dir_fd=parent)
                 return True
             fd = os.open(name, DIRECTORY, dir_fd=parent)
             require(identity(before) == identity(os.fstat(fd)), "entry-changed")
             try:
-                owned(os.fstat(fd), True)
+                owned_at(os.fstat(fd), relative, True)
                 require(os.fstat(fd).st_dev == self.subject[0], "foreign-filesystem")
                 count, started = 0, time.monotonic()
                 def remove(contents, rel, depth):
@@ -687,10 +764,13 @@ class Cache:
                                     "interior-mount")
                             st = entry.stat(follow_symlinks=False)
                             require(st.st_dev == self.subject[0], "foreign-filesystem")
-                            require(not protected_interior(entry.name, rel / entry.name),
-                                    "protected-interior")
+                            if protected_interior(entry.name, rel / entry.name):
+                                raise Undetermined(
+                                    "protected-interior",
+                                    [offender(st, rel / entry.name, "protected-interior")],
+                                    complete=False)
                             if stat.S_ISDIR(st.st_mode):
-                                owned(st, True)
+                                owned_at(st, rel / entry.name, True)
                                 nested = os.open(entry.name, DIRECTORY, dir_fd=contents)
                                 try:
                                     require(identity(st) == identity(os.fstat(nested)), "entry-changed")
@@ -700,9 +780,9 @@ class Cache:
                                 os.rmdir(entry.name, dir_fd=contents)
                             else:
                                 if stat.S_ISLNK(st.st_mode):
-                                    require(st.st_uid == os.getuid(), "foreign-owner")
+                                    owned_at(st, rel / entry.name, link=True)
                                 else:
-                                    owned(st)
+                                    owned_at(st, rel / entry.name)
                                 os.unlink(entry.name, dir_fd=contents)
                 remove(fd, relative, 0)
                 require(identity(os.fstat(fd)) == identity(os.stat(name, dir_fd=parent,
@@ -773,17 +853,30 @@ REMEDIATION = {
 
 
 def receipt(status, cap, before=None, after=None, actions=None, reason=None, skipped=None,
-            holders="UNKNOWN", fstype=None):
+            holders="UNKNOWN", fstype=None, refusal=None):
     remediation = None
     if status == "UNDETERMINED":
         remediation = REMEDIATION.get(reason, "Repair the helper unclassified admission failure before retrying.")
-    print(json.dumps({"instrument": "cargo-target-highwater",
-                      "scope": "exclusive-cargo-target", "status": status,
-                      "cap_bytes": cap, "before_bytes": before, "after_bytes": after,
-                      "actions": actions or [], "reason": reason,
-                      "remediation": remediation, "skipped_profiles": skipped or [],
-                      "lease_holders": holders, "filesystem_type": fstype or "UNKNOWN"}, sort_keys=True),
-          file=sys.stderr, flush=True)
+    body = {"instrument": "cargo-target-highwater",
+            "scope": "exclusive-cargo-target", "status": status,
+            "cap_bytes": cap, "before_bytes": before, "after_bytes": after,
+            "actions": actions or [], "reason": reason,
+            "remediation": remediation, "skipped_profiles": skipped or [],
+            "lease_holders": holders, "filesystem_type": fstype or "UNKNOWN"}
+    if refusal is not None and refusal.offenders:
+        first = refusal.offenders[0]
+        more = refusal.offender_count - 1
+        # Entry metadata only; json.dumps quotes the path so control bytes stay escaped.
+        print("cargo-target-highwater: refused " + reason + ": first offender " +
+              json.dumps(first["path"]) + " (" + first["type"] + ", mode " + first["mode"] +
+              ", uid " + str(first["uid"]) + ")" +
+              (", " + str(more) + " more" if more > 0 else "") +
+              ("" if refusal.offender_scan_complete else ", scan stopped early"),
+              file=sys.stderr, flush=True)
+        body["offenders"] = refusal.offenders
+        body["offender_count"] = refusal.offender_count
+        body["offender_scan_complete"] = refusal.offender_scan_complete
+    print(json.dumps(body, sort_keys=True), file=sys.stderr, flush=True)
 
 
 def main():
@@ -863,7 +956,8 @@ def main():
             reason = "helper-internal-error"
         receipt("UNDETERMINED", args.cap_bytes, before, after, actions, reason, skipped,
                 holders=cache.holders if cache is not None else "UNKNOWN",
-                fstype=cache.fstype if cache is not None else None)
+                fstype=cache.fstype if cache is not None else None,
+                refusal=error if isinstance(error, Undetermined) else None)
         return 75
     finally:
         if cache is not None:

@@ -695,24 +695,53 @@ pub fn record_keychain_account_hint(config_dir: &Path) {
         return;
     }
     let target = config_dir.join(RECORDED_ACCOUNT_FILE);
-    let tmp = crate::platform::fs::unique_tmp_path(&target);
-    if std::fs::write(&tmp, account.as_bytes()).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    let Ok(writer) = stage_keychain_account_hint(&target, account.as_bytes()) else {
         tracing::warn!(
             error_kind = "keychain_account_hint_write_failed",
             "could not record this handle dir's keychain account; daemon-side \
              keychain paths fall back to their own username derivation"
         );
         return;
-    }
-    if crate::platform::fs::atomic_replace(&tmp, &target).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    };
+    if writer.replace(&target).is_err() {
         tracing::warn!(
             error_kind = "keychain_account_hint_write_failed",
             "could not record this handle dir's keychain account; daemon-side \
              keychain paths fall back to their own username derivation"
         );
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn stage_keychain_account_hint(
+    target: &Path,
+    bytes: &[u8],
+) -> Result<crate::platform::fs::WrittenPrivateFile, PlatformError> {
+    crate::platform::fs::write_private_tmp_synced_retained(target, bytes)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn stage_pending_clears(
+    target: &Path,
+    bytes: &[u8],
+) -> Result<crate::platform::fs::WrittenPrivateFile, PlatformError> {
+    crate::platform::fs::write_private_tmp_synced_retained(target, bytes)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn stage_pending_clear_spool(
+    target: &Path,
+    bytes: &[u8],
+) -> Result<crate::platform::fs::WrittenPrivateFile, PlatformError> {
+    crate::platform::fs::write_private_tmp_synced_retained(target, bytes)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn stage_quarantined_keychain_payload(
+    target: &Path,
+    bytes: &[u8],
+) -> Result<crate::platform::fs::WrittenPrivateFile, PlatformError> {
+    crate::platform::fs::write_private_tmp_synced_retained(target, bytes)
 }
 
 /// KC4-2: records the keychain-account hint ONLY when none is already
@@ -4081,34 +4110,27 @@ fn is_well_formed_service_name(s: &str) -> bool {
 #[cfg(target_os = "macos")]
 fn save_pending_clears(base_dir: &Path, clears: &PendingClears, context: &str) -> bool {
     let path = pending_clears_path(base_dir);
-    let tmp = crate::platform::fs::unique_tmp_path(&path);
     let json = match serde_json::to_string(clears) {
         Ok(j) => j,
         Err(_) => return false, // unreachable for this shape; nothing to persist
     };
-    if std::fs::write(&tmp, json.as_bytes()).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    let Ok(writer) = stage_pending_clears(&path, json.as_bytes()) else {
+        warn!(
+            error_kind = "keychain_pending_clears_write_failed",
+            context, "failed to persist the keychain pending-clear queue (non-fatal)"
+        );
+        return false;
+    };
+    // The private writer protects service names and email hints at creation.
+    // The retained writer owns §5a cleanup if this secure step fails.
+    if crate::platform::fs::secure_file(writer.path()).is_err() {
         warn!(
             error_kind = "keychain_pending_clears_write_failed",
             context, "failed to persist the keychain pending-clear queue (non-fatal)"
         );
         return false;
     }
-    // `keychain-fix-r10.md` S-L-3, security.md §5a: `std::fs::write` creates
-    // `tmp` at umask-default permissions (typically 0o644) with the queue
-    // content (service names, account numbers, email hints) inside. Clamp to
-    // 0o600 BEFORE the atomic rename, with the same cleanup-on-failure this
-    // function already applies to its other two fallible steps.
-    if crate::platform::fs::secure_file(&tmp).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        warn!(
-            error_kind = "keychain_pending_clears_write_failed",
-            context, "failed to persist the keychain pending-clear queue (non-fatal)"
-        );
-        return false;
-    }
-    if crate::platform::fs::atomic_replace(&tmp, &path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    if writer.replace(&path).is_err() {
         warn!(
             error_kind = "keychain_pending_clears_write_failed",
             context, "failed to persist the keychain pending-clear queue (non-fatal)"
@@ -4256,18 +4278,15 @@ fn spool_pending_clear(base_dir: &Path, record: &PendingClearEntry) -> bool {
         );
         return false;
     };
-    let tmp = crate::platform::fs::unique_tmp_path(&path);
-    if std::fs::write(&tmp, json.as_bytes()).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    let Ok(writer) = stage_pending_clear_spool(&path, json.as_bytes()) else {
         tracing::error!(
             error_kind = "keychain_pending_clears_spool_failed",
             "could not write a pending-clear spool file — this clear record \
              could NOT be made durable"
         );
         return false;
-    }
-    if crate::platform::fs::secure_file(&tmp).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    };
+    if crate::platform::fs::secure_file(writer.path()).is_err() {
         tracing::error!(
             error_kind = "keychain_pending_clears_spool_failed",
             "could not secure a pending-clear spool file — this clear record \
@@ -4275,8 +4294,7 @@ fn spool_pending_clear(base_dir: &Path, record: &PendingClearEntry) -> bool {
         );
         return false;
     }
-    if crate::platform::fs::atomic_replace(&tmp, &path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    if writer.replace(&path).is_err() {
         tracing::error!(
             error_kind = "keychain_pending_clears_spool_failed",
             "could not publish a pending-clear spool file — this clear record \
@@ -8529,7 +8547,7 @@ fn dir_may_own_service(abs: &Path, canonical: bool, svc: &str) -> bool {
 /// saved, in which case the caller MUST NOT discard the item.
 #[cfg(target_os = "macos")]
 fn quarantine_foreign_item(base: &Path, svc: &str, raw: &str) -> Result<(), PlatformError> {
-    use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+    use crate::platform::fs::secure_file;
     let dir = base.join(QUARANTINE_DIR_NAME);
     // R2 M3: route through the shared fail-closed helper — a symlinked
     // quarantine dir is refused (no write through the link), 0o700 is
@@ -8558,19 +8576,14 @@ fn quarantine_foreign_item(base: &Path, svc: &str, raw: &str) -> Result<(), Plat
         .map(|t| t.format("%Y%m%dT%H%M%S%3fZ").to_string())
         .unwrap_or_else(|| now_ms().to_string());
     let target = dir.join(format!("{stamp}-{hash}.json"));
-    let tmp = unique_tmp_path(&target);
-    if let Err(e) = std::fs::write(&tmp, raw.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    if let Err(e) = atomic_replace(&tmp, &target) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
+    let writer = match stage_quarantined_keychain_payload(&target, raw.as_bytes()) {
+        Ok(writer) => writer,
+        Err(e) => {
+            return Err(e);
+        }
+    };
+    secure_file(writer.path())?;
+    writer.replace(&target)?;
     prune_quarantine(&dir, QUARANTINE_KEEP, QUARANTINE_MAX_AGE);
     Ok(())
 }
@@ -11547,6 +11560,147 @@ fn apply_cc_keychain_write(
 mod tests {
     use super::*;
 
+    fn assert_private_stage_synced_before_publish(
+        stage: fn(&Path, &[u8]) -> Result<crate::platform::fs::WrittenPrivateFile, PlatformError>,
+        assertion_message: &'static str,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("published.json");
+        let synced = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&synced);
+        let actual_tmp = Arc::new(std::sync::Mutex::new(None));
+        let observed_tmp = Arc::clone(&actual_tmp);
+        let unpublished_target = target.clone();
+        crate::platform::fs::with_private_sync_observer_for_test(
+            move |path| {
+                assert_eq!(path.parent(), unpublished_target.parent());
+                assert_ne!(path, unpublished_target.as_path());
+                assert!(
+                    !unpublished_target.exists(),
+                    "publication preceded sync_all"
+                );
+                *observed_tmp.lock().unwrap() = Some(path.to_path_buf());
+                observed.store(true, Ordering::SeqCst);
+            },
+            || {
+                let writer = stage(&target, b"private fixture").unwrap();
+                assert!(synced.load(Ordering::SeqCst), "{assertion_message}");
+                writer.replace(&target).unwrap();
+            },
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"private fixture");
+        assert!(!actual_tmp.lock().unwrap().as_ref().unwrap().exists());
+    }
+
+    #[test]
+    fn account_hint_stage_syncs_before_publish() {
+        assert_private_stage_synced_before_publish(
+            stage_keychain_account_hint,
+            "account hint sync_all was not observed before publication",
+        );
+    }
+
+    #[test]
+    fn pending_clears_stage_syncs_before_publish() {
+        assert_private_stage_synced_before_publish(
+            stage_pending_clears,
+            "pending-clear queue sync_all was not observed before publication",
+        );
+    }
+
+    #[test]
+    fn pending_clear_spool_stage_syncs_before_publish() {
+        assert_private_stage_synced_before_publish(
+            stage_pending_clear_spool,
+            "pending-clear spool sync_all was not observed before publication",
+        );
+    }
+
+    #[test]
+    fn quarantined_payload_stage_syncs_before_publish() {
+        assert_private_stage_synced_before_publish(
+            stage_quarantined_keychain_payload,
+            "quarantined payload sync_all was not observed before publication",
+        );
+    }
+
+    fn assert_private_stage_retries_create_collision(
+        stage: fn(&Path, &[u8]) -> Result<crate::platform::fs::WrittenPrivateFile, PlatformError>,
+        assertion_message: &'static str,
+    ) {
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("published.json");
+        std::fs::write(&target, b"before").unwrap();
+        let foreign = Arc::new(Mutex::new(None));
+        let planted = Arc::clone(&foreign);
+        let selected_target = target.clone();
+        crate::platform::fs::with_private_create_observer_for_test(
+            move |candidate| {
+                assert_eq!(candidate.parent(), selected_target.parent());
+                assert_ne!(candidate, selected_target.as_path());
+                let mut first = planted.lock().unwrap();
+                if first.is_none() {
+                    std::fs::write(candidate, b"FOREIGN").unwrap();
+                    *first = Some(candidate.to_path_buf());
+                }
+            },
+            || {
+                let staged = stage(&target, b"after");
+                let candidate = foreign
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .expect("pre-create observer must run before result assertion")
+                    .clone();
+                assert_eq!(std::fs::read(&candidate).unwrap(), b"FOREIGN");
+                eprintln!("F4_PRIVATE_CREATE_COLLISION_PLANTED");
+                assert!(staged.is_ok(), "{assertion_message}");
+                staged.unwrap().replace(&target).unwrap();
+            },
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"after");
+        let foreign = foreign.lock().unwrap();
+        let foreign = foreign.as_ref().expect("pre-create observer did not run");
+        assert_eq!(std::fs::read(foreign).unwrap(), b"FOREIGN");
+    }
+
+    #[test]
+    fn account_hint_stage_retries_create_collision() {
+        assert_private_stage_retries_create_collision(
+            stage_keychain_account_hint,
+            "account hint collision prevented publication",
+        );
+    }
+
+    #[test]
+    fn pending_clears_stage_retries_create_collision() {
+        assert_private_stage_retries_create_collision(
+            stage_pending_clears,
+            "pending-clear queue collision prevented publication",
+        );
+    }
+
+    #[test]
+    fn pending_clear_spool_stage_retries_create_collision() {
+        assert_private_stage_retries_create_collision(
+            stage_pending_clear_spool,
+            "pending-clear spool collision prevented publication",
+        );
+    }
+
+    #[test]
+    fn quarantined_payload_stage_retries_create_collision() {
+        assert_private_stage_retries_create_collision(
+            stage_quarantined_keychain_payload,
+            "quarantined payload collision prevented publication",
+        );
+    }
+
     #[cfg(target_os = "macos")]
     fn stage_known_login_fixture(
         base: &Path,
@@ -13214,10 +13368,8 @@ mod tests {
     /// to 0o600 before the atomic rename, same as every other secret-bearing
     /// tmp write in this module.
     ///
-    /// RED: removing the `secure_file(&tmp)` call from `save_pending_clears`
-    /// (leaving `std::fs::write` -> `atomic_replace` directly) makes this
-    /// assertion fail on the umask-default mode (typically 0o644) the file
-    /// is created at.
+    /// The private writer sets permissions at creation; the explicit secure
+    /// step reasserts them before identity-bound publication.
     #[cfg(target_os = "macos")]
     #[test]
     fn save_pending_clears_secures_file_permissions() {

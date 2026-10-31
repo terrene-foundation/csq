@@ -818,7 +818,12 @@ pub async fn start_claude_login_race(
     })
     .await
     .map_err(|_| "identity capture task failed".to_string())?
-    .map_err(|e| format!("identity capture failed: {e}"))?;
+    .map_err(|e| {
+        format!(
+            "identity capture failed: {}",
+            csq_core::accounts::login::LoginCommitOutcome::describe_prior_capture_error(&e)
+        )
+    })?;
 
     // Two-phase race: prepare binds the loopback listener and mints
     // the URLs SYNCHRONOUSLY (microseconds), then drive blocks on

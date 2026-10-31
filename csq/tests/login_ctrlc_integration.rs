@@ -24,6 +24,11 @@ use std::time::{Duration, Instant};
 const ENTRY: &str = "login_ctrlc_private_entry";
 const ROLE: &str = "CSQ_PRIVATE_CTRLC_ROLE";
 const ROOT: &str = "CSQ_PRIVATE_CTRLC_ROOT";
+/// Fixture-only seam: the driver sleeps this many ms AFTER the guard returned
+/// (its lock is already dropped with the owner) and BEFORE it writes the
+/// receipt, so the "lock free, no receipt yet" window the fixture itself
+/// creates can be made wide enough to hit on every run.
+const RECEIPT_STALL: &str = "CSQ_PRIVATE_CTRLC_RECEIPT_STALL_MS";
 const NOTICE: &str = "Cancelling — waiting for Claude login to exit";
 const DEFAULT_ASSERTION: &str = "LOGIN_CTRLC_DEFAULT_REAP_CANCEL130";
 const RETAIN_ASSERTION: &str = "LOGIN_CTRLC_RETAIN_LOCK_PING";
@@ -235,6 +240,12 @@ fn run_driver(root: &Path, role: &str) -> ! {
         lock,
         |_| {},
     );
+    if let Some(ms) = std::env::var(RECEIPT_STALL)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
     let vendor_pid: u32 = std::fs::read_to_string(root.join("vendor-ready"))
         .expect("selected actual vendor reached entry")
         .parse()
@@ -370,6 +381,12 @@ struct Driver {
 
 impl Driver {
     fn spawn(role: &'static str) -> Self {
+        Self::spawn_stalled(role, None)
+    }
+
+    /// [`Driver::spawn`] whose driver stalls `receipt_stall_ms` between the
+    /// guard's return and the receipt write (see [`RECEIPT_STALL`]).
+    fn spawn_stalled(role: &'static str, receipt_stall_ms: Option<u64>) -> Self {
         let sandbox = tempfile::tempdir().unwrap();
         let life_path = sandbox.path().join("vendor-life");
         let life_c = std::ffi::CString::new(life_path.as_os_str().as_encoded_bytes()).unwrap();
@@ -382,6 +399,9 @@ impl Driver {
             .unwrap();
         let mut command = selected_command(sandbox.path(), role).unwrap();
         command.process_group(0).stdin(Stdio::piped());
+        if let Some(ms) = receipt_stall_ms {
+            command.env(RECEIPT_STALL, ms.to_string());
+        }
         let mut child = command.spawn().unwrap();
         let input = child.stdin.take();
         let pid = libc::pid_t::try_from(child.id()).unwrap();
@@ -748,8 +768,22 @@ fn login_ctrlc_restores_default_handler_after_actual_reap() {
 
 #[test]
 fn login_ctrlc_second_interrupt_kills_vendor_130_no_post_lock_until_reap() {
+    second_interrupt_kills_vendor(None);
+}
+
+/// The receipt is the fixture's OWN file, written after the guard returned, and
+/// the guard drops the lock on return: "lock free, receipt not yet written" is
+/// the normal state between those two points, never evidence of an early
+/// release. Stalling the driver 1.5s there makes that window certain; the row
+/// must still pass because the vendor was already reaped when the lock freed.
+#[test]
+fn login_ctrlc_lock_free_between_reap_and_receipt_is_not_an_early_release() {
+    second_interrupt_kills_vendor(Some(1500));
+}
+
+fn second_interrupt_kills_vendor(receipt_stall_ms: Option<u64>) {
     let _env_guard = csq_core::platform::test_env::lock();
-    let mut driver = Driver::spawn("driver-ignore");
+    let mut driver = Driver::spawn_stalled("driver-ignore", receipt_stall_ms);
     let ready = driver.ready();
     if ready {
         driver.signal_group();
@@ -767,15 +801,25 @@ fn login_ctrlc_second_interrupt_kills_vendor_130_no_post_lock_until_reap() {
         driver.signal_group();
         poll(|| driver.vendor_exited())
     };
-    // Until the receipt exists the lock must stay held. A sample that sees the
-    // lock free and then no receipt proves it was released before the reap.
+    // The lock must stay held until the vendor is REAPED. The receipt cannot
+    // witness that: the guard drops the lock when it returns and the fixture
+    // writes the receipt after, so "lock free, no receipt yet" is the normal
+    // state between the two. The reap itself is observable: the vendor is the
+    // driver's child, a zombie answers kill(pid, 0) with success until the
+    // driver reaps it, then ESRCH. Order is the proof: sample the lock FIRST,
+    // then the reap. A lock seen free at t1 with the vendor still unreaped at
+    // t2 > t1 means it was unreaped at t1 as well (a reap never un-happens), so
+    // the lock was released before the reap. Free then reaped proves nothing,
+    // and is not counted.
     let mut released_early = false;
     if killed {
+        // `killed` implies `ready()` ran, which recorded the vendor PID.
+        let vendor = libc::pid_t::try_from(driver.vendor_pid.expect("ready vendor PID")).unwrap();
         poll(|| {
             let free = !held(driver.root());
-            let receipt = driver.root().join("reaped-receipt").exists();
-            released_early |= free && !receipt;
-            receipt || released_early
+            let reaped = pid_gone(vendor);
+            released_early |= free && !reaped;
+            driver.root().join("reaped-receipt").exists() || released_early
         });
     }
     let receipt = driver.receipt();

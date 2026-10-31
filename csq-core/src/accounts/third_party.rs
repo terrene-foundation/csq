@@ -20,7 +20,6 @@ use crate::accounts::profiles;
 use crate::accounts::profiles::AccountProfile;
 use crate::accounts::profiles_lock::ProfilesFileLock;
 use crate::error::ConfigError;
-use crate::platform::fs::atomic_replace;
 use crate::providers;
 use crate::providers::catalog::Surface;
 use crate::session::merge::MODEL_KEYS;
@@ -548,16 +547,19 @@ pub fn bind_provider_to_slot(
     // §5a: `write_new_private` creates the tmp file at 0o600 at creation,
     // closing the window a separate `std::fs::write` + `secure_file` pair
     // would leave open for this API-key-bearing settings file (red-team B2).
-    let tmp = crate::platform::fs::unique_tmp_path(&settings_path);
-    if let Err(e) = crate::platform::fs::write_new_private(&tmp, json.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(ConfigError::InvalidJson {
-            path: tmp.clone(),
-            reason: format!("write: {e}"),
-        });
-    }
-    if let Err(e) = atomic_replace(&tmp, &settings_path) {
-        let _ = std::fs::remove_file(&tmp);
+    let writer = match crate::platform::fs::write_private_tmp_synced_retained(
+        &settings_path,
+        json.as_bytes(),
+    ) {
+        Ok(writer) => writer,
+        Err(e) => {
+            return Err(ConfigError::InvalidJson {
+                path: settings_path.clone(),
+                reason: format!("write: {e}"),
+            });
+        }
+    };
+    if let Err(e) = writer.replace(&settings_path) {
         return Err(ConfigError::InvalidJson {
             path: settings_path.clone(),
             reason: format!("atomic replace: {e}"),
@@ -878,16 +880,19 @@ pub fn bind_cloud_claude_backend_to_slot(
     // §5a: `write_new_private` creates the tmp file at 0o600 at creation,
     // closing the window a separate `std::fs::write` + `secure_file` pair
     // would leave open for this Bedrock-bearer-token-bearing settings file.
-    let tmp = crate::platform::fs::unique_tmp_path(&settings_path);
-    if let Err(e) = crate::platform::fs::write_new_private(&tmp, json.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(ConfigError::InvalidJson {
-            path: tmp.clone(),
-            reason: format!("write: {e}"),
-        });
-    }
-    if let Err(e) = atomic_replace(&tmp, &settings_path) {
-        let _ = std::fs::remove_file(&tmp);
+    let writer = match crate::platform::fs::write_private_tmp_synced_retained(
+        &settings_path,
+        json.as_bytes(),
+    ) {
+        Ok(writer) => writer,
+        Err(e) => {
+            return Err(ConfigError::InvalidJson {
+                path: settings_path.clone(),
+                reason: format!("write: {e}"),
+            });
+        }
+    };
+    if let Err(e) = writer.replace(&settings_path) {
         return Err(ConfigError::InvalidJson {
             path: settings_path.clone(),
             reason: format!("atomic replace: {e}"),
@@ -1102,16 +1107,19 @@ pub fn unbind_provider_from_slot(base_dir: &Path, slot: AccountNum) -> Result<bo
     // umask-default artifact would be surprising. `write_new_private`
     // creates the tmp file at 0o600 at creation (§5a), closing the
     // window a separate `std::fs::write` + `secure_file` pair left open.
-    let tmp = crate::platform::fs::unique_tmp_path(&settings_path);
-    if let Err(e) = crate::platform::fs::write_new_private(&tmp, json.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(ConfigError::InvalidJson {
-            path: tmp.clone(),
-            reason: format!("write: {e}"),
-        });
-    }
-    if let Err(e) = atomic_replace(&tmp, &settings_path) {
-        let _ = std::fs::remove_file(&tmp);
+    let writer = match crate::platform::fs::write_private_tmp_synced_retained(
+        &settings_path,
+        json.as_bytes(),
+    ) {
+        Ok(writer) => writer,
+        Err(e) => {
+            return Err(ConfigError::InvalidJson {
+                path: settings_path.clone(),
+                reason: format!("write: {e}"),
+            });
+        }
+    };
+    if let Err(e) = writer.replace(&settings_path) {
         return Err(ConfigError::InvalidJson {
             path: settings_path.clone(),
             reason: format!("atomic replace: {e}"),
@@ -1215,6 +1223,87 @@ pub fn is_third_party_slot_with(
 
 #[cfg(test)]
 mod tests {
+
+    fn with_first_settings_collision<T>(target: &Path, operation: impl FnOnce() -> T) -> T {
+        let parent = target.parent().unwrap().to_path_buf();
+        let collision = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let planted = collision.clone();
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |candidate| {
+                if candidate.parent() == Some(parent.as_path())
+                    && candidate
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with("settings.tmp."))
+                    && planted.borrow().is_none()
+                {
+                    std::fs::write(candidate, b"foreign-settings-stage").unwrap();
+                    *planted.borrow_mut() = Some(candidate.to_path_buf());
+                }
+            },
+            operation,
+        );
+        let foreign = collision
+            .borrow()
+            .clone()
+            .expect("settings create observed");
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign-settings-stage");
+        result
+    }
+
+    #[test]
+    fn f_a_api_binding_save_retries_first_sibling_collision() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(9u16).unwrap();
+        let target = dir.path().join("config-9/settings.json");
+        let result = with_first_settings_collision(&target, || {
+            bind_provider_to_slot(dir.path(), "mm", slot, Some("fixture-minimax-key"), None)
+        });
+        result.expect("API binding save must retry the first sibling collision");
+        let saved: Value = serde_json::from_slice(&std::fs::read(target).unwrap()).unwrap();
+        assert_eq!(saved["env"]["ANTHROPIC_AUTH_TOKEN"], "fixture-minimax-key");
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn f_a_cloud_binding_save_retries_first_sibling_collision() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(8u16).unwrap();
+        let target = dir.path().join("config-8/settings.json");
+        let result = with_first_settings_collision(&target, || {
+            bind_cloud_claude_backend_to_slot(
+                dir.path(),
+                slot,
+                &CloudClaudeBackendSpec::Bedrock {
+                    region: "us-east-1",
+                    bearer_token: "fixture-bedrock-bearer",
+                    model: None,
+                },
+            )
+        });
+        result.expect("cloud binding save must retry the first sibling collision");
+        let saved: Value = serde_json::from_slice(&std::fs::read(target).unwrap()).unwrap();
+        assert_eq!(
+            saved["env"]["AWS_BEARER_TOKEN_BEDROCK"],
+            "fixture-bedrock-bearer"
+        );
+    }
+
+    #[test]
+    fn f_a_unbind_save_retries_first_sibling_collision() {
+        let dir = TempDir::new().unwrap();
+        let slot = AccountNum::try_from(2u16).unwrap();
+        bind_provider_to_slot(dir.path(), "mm", slot, Some("fixture-minimax-key"), None).unwrap();
+        let target = dir.path().join("config-2/settings.json");
+        let mut settings: Value = serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+        settings["env"]["NODE_ENV"] = Value::String("fixture-customization".into());
+        std::fs::write(&target, serde_json::to_vec(&settings).unwrap()).unwrap();
+        let result =
+            with_first_settings_collision(&target, || unbind_provider_from_slot(dir.path(), slot));
+        assert!(result.expect("unbind save must retry the first sibling collision"));
+        let saved: Value = serde_json::from_slice(&std::fs::read(target).unwrap()).unwrap();
+        assert_eq!(saved["env"]["NODE_ENV"], "fixture-customization");
+        assert!(saved["env"].get("ANTHROPIC_AUTH_TOKEN").is_none());
+    }
     use super::*;
     use crate::accounts::discovery;
     use tempfile::TempDir;

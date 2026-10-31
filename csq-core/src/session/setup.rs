@@ -53,15 +53,16 @@ pub fn mark_onboarding_complete(config_dir: &Path) -> Result<(), CredentialError
     // `write_new_private` creates the tmp file at 0o600 at creation, and
     // that mode carries through `atomic_replace`'s rename.
     let tmp = crate::platform::fs::unique_tmp_path(&path);
-    if let Err(e) = crate::platform::fs::write_new_private(&tmp, json.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(CredentialError::Io {
-            path: tmp,
-            source: std::io::Error::other(e.to_string()),
-        });
-    }
-    if let Err(e) = crate::platform::fs::atomic_replace(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
+    let writer = match crate::platform::fs::write_new_private_retained(&tmp, json.as_bytes()) {
+        Ok(writer) => writer,
+        Err(e) => {
+            return Err(CredentialError::Io {
+                path: tmp,
+                source: std::io::Error::other(e.to_string()),
+            });
+        }
+    };
+    if let Err(e) = writer.replace(&path) {
         return Err(CredentialError::Io {
             path: path.clone(),
             source: std::io::Error::other(e.to_string()),

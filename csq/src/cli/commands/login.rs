@@ -418,7 +418,7 @@ fn reset_handle_dir_codex(base_dir: &Path, account: AccountNum) -> Result<()> {
 /// Uses atomic_replace + write_new_private (§5a cleanup) to ensure the file
 /// is never left in a half-written state.
 fn reset_handle_dir_gemini(base_dir: &Path, account: AccountNum) -> Result<()> {
-    use csq_core::platform::fs::{atomic_replace, unique_tmp_path, write_new_private};
+    use csq_core::platform::fs::{unique_tmp_path, write_new_private_retained};
 
     let gemini_dir = base_dir.join(format!("config-{}", account)).join(".gemini");
     let settings_path = gemini_dir.join("settings.json");
@@ -462,15 +462,17 @@ fn reset_handle_dir_gemini(base_dir: &Path, account: AccountNum) -> Result<()> {
     // closing the window a separate std::fs::write + secure_file pair
     // would leave open.
     let tmp = unique_tmp_path(&settings_path);
-    if let Err(e) = write_new_private(&tmp, updated.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(anyhow!(
-            "write Gemini settings tmp {}: {e}",
-            redact_path(&tmp)
-        ));
-    }
-    if let Err(e) = atomic_replace(&tmp, &settings_path) {
-        let _ = std::fs::remove_file(&tmp);
+    let writer = match write_new_private_retained(&tmp, updated.as_bytes()) {
+        Ok(writer) => writer,
+        // The private writer cleans up only files it created; collisions stay untouched.
+        Err(e) => {
+            return Err(anyhow!(
+                "write Gemini settings tmp {}: {e}",
+                redact_path(&tmp)
+            ));
+        }
+    };
+    if let Err(e) = writer.replace(&settings_path) {
         return Err(anyhow!(
             "atomic_replace {} -> {}: {e}",
             redact_path(&tmp),
@@ -580,6 +582,27 @@ fn kill_hint(pid: u32) -> String {
     }
 }
 
+/// `capture_login_prior` for the CLI login paths. A bare `?` printed the
+/// profiles-lock contention tag (`anthropic_identity_profiles_busy`) with no
+/// remedy; contention now goes through the shared retry wording, and every
+/// other identity error is returned unchanged (same text, same error type).
+fn capture_prior_for_cli(
+    base_dir: &Path,
+    account: AccountNum,
+) -> Result<csq_core::accounts::anthropic_identity::LoginPrior> {
+    capture_login_prior(base_dir, account).map_err(prior_capture_error_for_cli)
+}
+
+fn prior_capture_error_for_cli(
+    error: csq_core::accounts::anthropic_identity::IdentityError,
+) -> anyhow::Error {
+    if error == csq_core::accounts::anthropic_identity::IdentityError::BindingBusy {
+        anyhow!(csq_core::accounts::login::LoginCommitOutcome::describe_prior_capture_error(&error))
+    } else {
+        anyhow::Error::from(error)
+    }
+}
+
 /// In-process parallel-race flow. **No longer reachable from the CLI**:
 /// Anthropic's authorize endpoint rejects the IPv4 loopback
 /// `redirect_uri=http://127.0.0.1:<port>/callback` for this
@@ -595,7 +618,7 @@ fn handle_race(base_dir: &Path, account: AccountNum) -> Result<()> {
     // returns (or panics) — at which point the kernel releases the
     // flock automatically.
     let _lock = acquire_login_lock(base_dir, account, Some("--legacy-shell"))?;
-    let prior = capture_login_prior(base_dir, account)?;
+    let prior = capture_prior_for_cli(base_dir, account)?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1667,7 +1690,7 @@ fn handle_direct(base_dir: &Path, account: AccountNum, json: bool) -> Result<()>
             account,
             Some("--legacy-shell"),
         )?);
-        let prior = capture_login_prior(base_dir, account)?;
+        let prior = capture_prior_for_cli(base_dir, account)?;
         csq_core::platform::fs::ensure_private_dir_root(base_dir)
             .map_err(|error| anyhow!("accounts_root_refused: {error}"))?;
         let grant = std::sync::Arc::new(std::sync::Mutex::new(
@@ -1758,7 +1781,7 @@ fn handle_direct_flow(
 ) -> Result<()> {
     // UX-R1-H3 (lock symmetry): serialise concurrent invocations.
     let _lock = acquire_login_lock(base_dir, account, Some("--legacy-shell"))?;
-    let prior = capture_login_prior(base_dir, account)?;
+    let prior = capture_prior_for_cli(base_dir, account)?;
 
     // SEC-2.15 (unified, R1 M1): secure the accounts root (config-N's
     // parent) fail-closed before creating the handle dir.
@@ -1995,6 +2018,18 @@ fn wake_usage_poller(base_dir: &Path, account: AccountNum) {
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[test]
+    fn cli_prior_capture_contention_prints_the_retry_remedy_not_the_bare_tag() {
+        use csq_core::accounts::anthropic_identity::IdentityError as E;
+        let busy = prior_capture_error_for_cli(E::BindingBusy).to_string();
+        assert!(busy.contains("retry the login"), "{busy}");
+        assert_ne!(busy, "anthropic_identity_profiles_busy");
+        // Every other identity error keeps its exact text and type.
+        let other = prior_capture_error_for_cli(E::MissingBinding);
+        assert_eq!(other.to_string(), E::MissingBinding.to_string());
+        assert_eq!(other.downcast_ref::<E>(), Some(&E::MissingBinding));
+    }
+
     use super::*;
 
     #[cfg(unix)]

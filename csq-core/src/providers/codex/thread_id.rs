@@ -741,19 +741,30 @@ pub fn write_captured_thread_id(handle_dir: &Path, id: &str) -> std::io::Result<
             "not a thread id",
         ));
     }
-    let tmp = handle_dir.join(format!("{CAPTURED_THREAD_FILE}.tmp-{}", std::process::id()));
-    // A leftover from a crashed writer with a recycled pid is removed first; `remove_file`
-    // unlinks a planted symlink itself rather than following it. The create is exclusive
-    // (`create_new`, which fails on ANY existing entry, symlink included) at mode 0600, so a
-    // link planted after the unlink is refused, never written through.
-    let _ = std::fs::remove_file(&tmp);
-    crate::platform::fs::write_new_private(&tmp, id.as_bytes())
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let res = std::fs::rename(&tmp, handle_dir.join(CAPTURED_THREAD_FILE));
-    if res.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    let path = handle_dir.join(CAPTURED_THREAD_FILE);
+    crate::platform::fs::write_private_tmp_retained(&path, id.as_bytes())
+        .and_then(|written| written.replace(&path))
+        .map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+#[cfg(all(test, unix))]
+fn write_captured_thread_id_with_tmp(
+    handle_dir: &Path,
+    id: &str,
+    tmp: &Path,
+) -> std::io::Result<()> {
+    if !is_uuid(id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a thread id",
+        ));
     }
-    res
+    let path = handle_dir.join(CAPTURED_THREAD_FILE);
+    // A UUID contains no credential material; retain the private writer so publication
+    // still validates the file it created, and a create collision never authorizes unlink.
+    crate::platform::fs::write_new_private_retained(tmp, id.as_bytes())
+        .and_then(|written| written.replace(&path))
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 /// The captured thread id of the handle dir `codex_home`, or `None`. The file is opened
@@ -1534,8 +1545,8 @@ mod capture_tests {
         assert!(got.contains(A));
     }
 
-    /// L1: a symlink planted at the predictable tmp name is never written through.
-    /// Falsifier: `std::fs::write` on the tmp path overwrites `victim` with the id.
+    /// L1: a symlink at the selected tmp name is neither written through nor removed.
+    /// Falsifiers: in-place writing changes `victim`; caller cleanup removes the symlink.
     #[test]
     fn write_never_follows_a_planted_tmp_symlink() {
         let t = TempDir::new().unwrap();
@@ -1545,9 +1556,11 @@ mod capture_tests {
             .path()
             .join(format!("{CAPTURED_THREAD_FILE}.tmp-{}", std::process::id()));
         std::os::unix::fs::symlink(&victim, &tmp).unwrap();
-        // A stale link is replaced by an exclusive create; either way the victim is intact.
-        let _ = write_captured_thread_id(t.path(), A);
+        assert!(write_captured_thread_id_with_tmp(t.path(), A, &tmp).is_err());
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert!(tmp.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(!t.path().join(CAPTURED_THREAD_FILE).exists());
+        write_captured_thread_id(t.path(), A).unwrap();
         // mode 0600 on the published file
         use std::os::unix::fs::PermissionsExt;
         let m = std::fs::metadata(t.path().join(CAPTURED_THREAD_FILE)).unwrap();
@@ -1573,6 +1586,38 @@ mod capture_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_thread_writer_retries_actual_stage_collision() {
+        let _env = crate::platform::test_env::lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = "01234567-89ab-cdef-0123-456789abcdef";
+        let foreign = std::rc::Rc::new(std::cell::RefCell::new(None::<std::path::PathBuf>));
+        let observed = std::rc::Rc::clone(&foreign);
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |path| {
+                if observed.borrow().is_none() {
+                    std::fs::write(path, b"foreign-stage").unwrap();
+                    *observed.borrow_mut() = Some(path.to_path_buf());
+                    eprintln!("F4_PRIVATE_CREATE_COLLISION_PLANTED");
+                }
+            },
+            || write_captured_thread_id(dir.path(), id),
+        );
+        let path = foreign
+            .borrow()
+            .clone()
+            .expect("production create observer must be hit");
+        assert_eq!(std::fs::read(path).unwrap(), b"foreign-stage");
+        assert!(
+            result.is_ok(),
+            "thread writer must retry a planted create collision"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CAPTURED_THREAD_FILE)).unwrap(),
+            id.as_bytes()
+        );
+    }
 
     fn uuid(n: u8) -> String {
         format!("01a0db{n:02x}-b7b7-7441-a2fe-81bfeef9916{n:x}")

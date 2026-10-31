@@ -12,13 +12,13 @@
 //!
 //! Per `rules/security.md §5a`: every tmp write uses the
 //! `unique_tmp_path → write → secure_file → atomic_replace` pipeline
-//! with `remove_file(&tmp)` on every failure branch.
+//! with writer-owned cleanup on every failure branch.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::audit::seam::SeamError;
-use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+use crate::platform::fs::{secure_file, write_private_tmp_retained};
 
 /// Hard ceiling on per-custody-directory file count.
 ///
@@ -138,17 +138,23 @@ fn platform_to_io(e: crate::error::PlatformError) -> io::Error {
 
 /// Write `raw` to `path` with the §5a tmp-cleanup pipeline.
 fn write_custody_file(path: &Path, raw: &[u8]) -> io::Result<()> {
-    let tmp = unique_tmp_path(path);
-    if let Err(e) = std::fs::write(&tmp, raw) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
+    let writer = write_private_tmp_retained(path, raw).map_err(platform_to_io)?;
+    secure_file(writer.path()).map_err(platform_to_io)?;
+    writer.replace(path).map_err(platform_to_io)
+}
+
+#[cfg(test)]
+fn write_custody_file_at_tmp(path: &Path, raw: &[u8], tmp: &Path) -> io::Result<()> {
+    let writer = match crate::platform::fs::write_new_private_retained(tmp, raw) {
+        Ok(writer) => writer,
+        Err(e) => {
+            return Err(platform_to_io(e));
+        }
+    };
+    if let Err(e) = secure_file(tmp) {
         return Err(platform_to_io(e));
     }
-    if let Err(e) = atomic_replace(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = writer.replace(path) {
         return Err(platform_to_io(e));
     }
     Ok(())
@@ -199,4 +205,67 @@ fn check_hard_cap_and_warn(dir: &Path, label: &'static str) -> io::Result<bool> 
         );
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custody_write_retries_actual_stage_collision() {
+        let _env = crate::platform::test_env::lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("custody.json");
+        let foreign = std::rc::Rc::new(std::cell::RefCell::new(None::<std::path::PathBuf>));
+        let observed = std::rc::Rc::clone(&foreign);
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |path| {
+                if observed.borrow().is_none() {
+                    std::fs::write(path, b"foreign-stage").unwrap();
+                    *observed.borrow_mut() = Some(path.to_path_buf());
+                    eprintln!("F4_PRIVATE_CREATE_COLLISION_PLANTED");
+                }
+            },
+            || write_custody_file(&target, b"new-custody-bytes"),
+        );
+        let path = foreign
+            .borrow()
+            .clone()
+            .expect("production create observer must be hit");
+        assert_eq!(std::fs::read(path).unwrap(), b"foreign-stage");
+        assert!(
+            result.is_ok(),
+            "custody writer must retry a planted create collision"
+        );
+        assert_eq!(std::fs::read(target).unwrap(), b"new-custody-bytes");
+    }
+
+    #[test]
+    fn custody_temp_collision_preserves_foreign_file_and_destination() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("custody.json");
+        let tmp = dir.path().join("custody.tmp");
+        std::fs::write(&target, b"existing custody").unwrap();
+        std::fs::write(&tmp, b"foreign temp entry").unwrap();
+
+        let error = write_custody_file_at_tmp(&target, b"replacement", &tmp).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&target).unwrap(), b"existing custody");
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"foreign temp entry");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn custody_publication_failure_removes_secret_temp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("occupied");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), b"existing evidence").unwrap();
+        assert!(write_custody_file(&target, b"raw secret fixture").is_err());
+        assert_eq!(
+            std::fs::read(target.join("keep")).unwrap(),
+            b"existing evidence"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 }

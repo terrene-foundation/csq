@@ -3,7 +3,7 @@
   import { onMount, onDestroy, tick } from 'svelte';
 
   type Reset = { day_of_month: number } | { date: string };
-  type Row = { name: string; provider: string; source: 'env-file' | 'secret-store'; reset: Reset | null; monthly_cap_usd: number | null; added_at: string; present: boolean };
+  type Row = { name: string; provider: string; source: 'env-file' | 'secret-store'; reset: Reset | null; monthly_cap_usd: number | null; added_at: string; present: boolean; vault_file_missing?: boolean };
   let rows = $state<Row[]>([]);
   let busy = $state(true);
   let error = $state('');
@@ -29,6 +29,7 @@
     pool_invalid_key: 'Enter an API key without whitespace (up to 4096 bytes).',
     pool_manifest_invalid: 'Pool metadata is invalid. Repair it with your administrator before retrying.',
     pool_manifest_unavailable: 'Pool metadata is unavailable. Check file access and retry.',
+    pool_manifest_write_unavailable: 'Pool metadata could not be saved. Check disk space and file access, then retry.',
     pool_env_file_invalid: 'The configured env file is invalid. Correct its entries and retry.',
     pool_env_file_unavailable: 'The configured env file is unavailable. Check file access and retry.',
     pool_key_missing: 'The key is missing. Restore its source or remove the entry.',
@@ -109,9 +110,16 @@
   async function remove(name: string): Promise<void> {
     if (busy) return;
     clearKey(); pendingRemove = null; busy = true; error = ''; status = '';
-    try { await invoke('pool_remove', { name }); if (!disposed) { if (editing === name) clearEditor(); await load(); } }
+    try {
+      const outcome = await invoke<{ vault_file_missing: boolean }>('pool_remove', { name });
+      if (!disposed) {
+        if (editing === name) clearEditor();
+        await load();
+        if (outcome?.vault_file_missing) status = 'Pool entry removed. The vault file was missing; no stored key remained to delete.';
+      }
+    }
     catch (e) { if (!disposed) showError(e); }
-    finally { clearKey(); if (!disposed) { busy = false; status = ''; } }
+    finally { clearKey(); if (!disposed) busy = false; }
   }
 </script>
 
@@ -126,7 +134,8 @@
       <li>
         <strong>{row.name}</strong> · {row.provider}
         <span>{row.source === 'env-file' ? 'Env file' : 'Secret store'} · {row.present ? 'Present' : 'Missing'}</span>
-        {#if !row.present}<span>Editing the reset does not restore this key. Restore its source or remove this entry.</span>{/if}
+        {#if row.vault_file_missing}<span>Vault file missing: restore it, or remove these entries.</span>
+        {:else if !row.present}<span>Editing the reset does not restore this key. Restore its source or remove this entry.</span>{/if}
         <span>Reset: {row.reset === null ? 'None' : 'day_of_month' in row.reset ? `Day ${row.reset.day_of_month}` : row.reset.date} · Cap: {row.monthly_cap_usd === null ? 'None' : `$${row.monthly_cap_usd}/month`}</span>
         <div class="actions"><button type="button" disabled={busy} onclick={() => edit(row)} aria-label={`Edit reset for ${row.name}`}>Edit reset</button><button type="button" disabled={busy} onclick={(event) => void requestRemove(row.name, event.currentTarget)} aria-label={`Remove ${row.name}`}>Remove</button></div>
       </li>

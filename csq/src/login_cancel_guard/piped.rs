@@ -64,9 +64,10 @@ impl PipedCustodyHooks {
     }
 }
 
-// The production representation still contains only the original gate/observer
-// pair. Optional custody callbacks and every invocation compile only for tests.
+// The production hooks carry the explicit stdin policy and gate/observer pair.
+// Optional custody callbacks and every invocation compile only for tests.
 struct PipedReaderHooks<'a, G, O> {
+    stdin_policy: crate::login_child_custody::group::StdinPolicy,
     scope: Option<&'a ScopedLoginCancellation>,
     callbacks: (G, O),
     #[cfg(test)]
@@ -74,8 +75,12 @@ struct PipedReaderHooks<'a, G, O> {
 }
 
 impl<'a, G, O> PipedReaderHooks<'a, G, O> {
-    fn new(callbacks: (G, O)) -> Self {
+    fn new(
+        callbacks: (G, O),
+        stdin_policy: crate::login_child_custody::group::StdinPolicy,
+    ) -> Self {
         Self {
+            stdin_policy,
             callbacks,
             scope: None,
             #[cfg(test)]
@@ -446,7 +451,10 @@ pub(crate) fn spawn_cli_piped_login<K>(
         vendor,
         on_line,
         notice,
-        PipedReaderHooks::new((|| {}, |_| {})),
+        PipedReaderHooks::new(
+            (|| {}, |_| {}),
+            crate::login_child_custody::group::StdinPolicy::Caller,
+        ),
     )
     .map(|receipt| receipt.status)
 }
@@ -467,7 +475,11 @@ pub(crate) fn spawn_cli_piped_login_scoped<K>(
         vendor,
         on_line,
         notice,
-        PipedReaderHooks::new((|| {}, |_| {})).with_scope(cancellation),
+        PipedReaderHooks::new(
+            (|| {}, |_| {}),
+            crate::login_child_custody::group::StdinPolicy::Inherit,
+        )
+        .with_scope(cancellation),
     )
     .map(|receipt| receipt.status)
 }
@@ -495,6 +507,7 @@ where
         on_line,
         notice,
         PipedReaderHooks {
+            stdin_policy: crate::login_child_custody::group::StdinPolicy::Caller,
             scope: Some(scope),
             callbacks: (hooks.reader_finish_gate, hooks.observe),
             custody: hooks.custody,
@@ -520,7 +533,10 @@ pub(crate) fn spawn_cli_piped_login_receipt<K>(
         vendor,
         on_line,
         notice,
-        PipedReaderHooks::new((reader_finish_gate, |_| {})),
+        PipedReaderHooks::new(
+            (reader_finish_gate, |_| {}),
+            crate::login_child_custody::group::StdinPolicy::Caller,
+        ),
     )
 }
 
@@ -544,6 +560,7 @@ pub(crate) fn spawn_cli_piped_login_observed_receipt<K>(
         on_line,
         notice,
         PipedReaderHooks {
+            stdin_policy: crate::login_child_custody::group::StdinPolicy::Caller,
             scope: None,
             callbacks: (hooks.reader_finish_gate, hooks.observe),
             custody: hooks.custody,
@@ -564,6 +581,7 @@ fn spawn_cli_piped_login_inner<K>(
         impl FnMut(PipedLoginObservation),
     >,
 ) -> anyhow::Result<CliLoginReceipt> {
+    let stdin_policy = reader_hooks.stdin_policy;
     let scope = reader_hooks.scope;
     let reader_finish_gate = reader_hooks.callbacks.0;
     #[cfg(test)]
@@ -600,19 +618,20 @@ fn spawn_cli_piped_login_inner<K>(
     }
     #[cfg(test)]
     custody.spawn_outcome(PipedLoginSpawnOutcome::SpawnAttemptStarted);
-    let (child, group) = match crate::login_child_custody::group::spawn_attended(command) {
-        Ok(child) => child,
-        Err(error) => {
-            #[cfg(test)]
-            custody.spawn_outcome(PipedLoginSpawnOutcome::NotSpawned);
-            drop(pending_reader);
-            if cancellation.cancelled() {
-                eprintln!("Cancelling — waiting for {vendor} login to exit");
-                return Err(cancelled_before_spawn());
+    let (child, group) =
+        match crate::login_child_custody::group::spawn_attended(command, stdin_policy) {
+            Ok(child) => child,
+            Err(error) => {
+                #[cfg(test)]
+                custody.spawn_outcome(PipedLoginSpawnOutcome::NotSpawned);
+                drop(pending_reader);
+                if cancellation.cancelled() {
+                    eprintln!("Cancelling — waiting for {vendor} login to exit");
+                    return Err(cancelled_before_spawn());
+                }
+                return Err(error).context("failed to spawn sign-in program");
             }
-            return Err(error).context("failed to spawn sign-in program");
-        }
-    };
+        };
     #[cfg(test)]
     let child_id = child.id();
     let mut owned = OwnedLoginChild::adopt_group(child, group.clone(), watchdog.clone(), keepalive);

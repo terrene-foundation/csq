@@ -281,7 +281,7 @@ fn persist(dir: &Path, ledger: &Ledger, fs: &FsOps<'_>) -> Result<(), DirectiveE
 }
 fn synced_write(path: &Path, bytes: &[u8], fs: &FsOps<'_>) -> Result<(), DirectiveError> {
     let synced = FsOps {
-        write_tmp: &crate::platform::fs::write_new_private_synced,
+        write_tmp: &crate::platform::fs::write_new_private_synced_retained,
         secure: fs.secure,
         replace: fs.replace,
     };

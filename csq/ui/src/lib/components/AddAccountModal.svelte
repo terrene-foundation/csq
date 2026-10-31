@@ -884,6 +884,11 @@
       // through a higher-level wrapper), `String(e)` prefixes
       // "Error: " before the tag. The tag itself (`LOCK_HELD:` etc.)
       // is unique enough that substring is unambiguous.
+      const isSignalExit = errStr.includes('CC_EXITED_NONZERO:') &&
+        (errStr.includes('terminated by signal ') || errStr.includes('stopped by signal '));
+      const message = isSignalExit
+        ? `${errStr} Try signing in again. If it happens again, restart the desktop app and retry.`
+        : errStr;
       const isLockContention =
         errStr.includes('LOCK_HELD:') ||
         errStr.includes('LOCK_FAILED:') ||
@@ -896,7 +901,7 @@
       ) {
         step = isLockContention
           ? { kind: 'login-in-progress', account, message: errStr }
-          : { kind: 'error', message: errStr };
+          : { kind: 'error', message };
       }
     }
   }

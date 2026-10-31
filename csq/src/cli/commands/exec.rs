@@ -1,7 +1,7 @@
 //! `csq exec --json` (`csq.exec.v1`) — a single non-interactive completion, and
 //! `csq sdk capabilities --json` (`csq.capabilities.v1`) — op discovery.
 //!
-//! `csq exec` is a **spawn-capture** executor (SDK-plan corrected ground truth #1): it
+//! Legacy `csq exec` is a **spawn-capture** executor (SDK-plan corrected ground truth #1): it
 //! spawns the slot's provider CLI non-interactively — `claude --print
 //! --output-format json` (Claude/3P), `gemini --prompt … --output-format json`
 //! (Gemini), or `codex exec --json` (Codex, an internal ticket) — captures the child's stdout,
@@ -27,11 +27,9 @@
 //! - **HIGH-3** — the child is killed on `--timeout` expiry; on Linux it is also killed
 //!   on parent death via `PR_SET_PDEATHSIG`.
 //!
-//! ## Ground-truth deviation from the plan (spec-accuracy)
-//! The plan listed `--max-tokens?` as an exec input. Claude Code's `--print` mode
-//! exposes no output-token cap, so S1's Claude adapter does NOT surface `--max-tokens`
-//! — exposing a flag that silently does nothing would violate `rules/spec-accuracy.md`.
-//! It returns when an adapter that supports it lands (native/direct-API).
+//! `--pool` instead invokes the direct API executor with an explicit output-token
+//! bound and a bounded prompt read. Pool-only flags are rejected on legacy CLI
+//! execution, whose provider CLIs do not enforce this token bound.
 
 use std::io::Read;
 use std::path::Path;
@@ -126,6 +124,12 @@ pub struct ExecArgs {
     pub id: Option<String>,
     /// Seconds to wait before killing the child.
     pub timeout_secs: u64,
+    /// Use admitted API-pool keys instead of a legacy slot/provider selector.
+    pub pool: Option<String>,
+    /// Required positive completion bound for pool mode; absent on legacy calls.
+    pub max_tokens: Option<u64>,
+    /// Combined system and prompt byte limit; defaults to 200000 in pool mode.
+    pub max_input_bytes: Option<usize>,
 }
 
 /// Successful outcome of [`run_exec`]: the parsed completion plus per-stream
@@ -230,6 +234,16 @@ fn run_exec(base_dir: &Path, claude_home: &Path, args: &ExecArgs) -> Result<Exec
     // is baked.
     #[cfg(feature = "enterprise")]
     enforce_license(base_dir)?;
+
+    if let Some(provider) = args.pool.as_deref() {
+        return run_pool_exec(base_dir, provider, args);
+    }
+    if args.max_tokens.is_some() || args.max_input_bytes.is_some() {
+        return Err(SdkError::trusted(
+            SdkErrorCode::InvalidInput,
+            "--max-tokens and --max-input-bytes require --pool",
+        ));
+    }
 
     let prompt = resolve_prompt(args)?;
     let (slot, surface) = resolve_slot(base_dir, args)?;
@@ -505,6 +519,191 @@ fn run_exec(base_dir: &Path, claude_home: &Path, args: &ExecArgs) -> Result<Exec
     }
 }
 
+/// Pool execution never resolves a subscription slot or creates a CLI handle.
+fn run_pool_exec(base_dir: &Path, provider: &str, args: &ExecArgs) -> Result<ExecResult, SdkError> {
+    let started = Instant::now();
+    if args.slot.is_some() || args.provider.is_some() {
+        return Err(SdkError::trusted(
+            SdkErrorCode::InvalidInput,
+            "--pool cannot be combined with --slot or --provider",
+        ));
+    }
+    if !matches!(provider, "anthropic" | "openai") {
+        return Err(SdkError::trusted(
+            SdkErrorCode::ProviderNotFound,
+            "pool provider must be anthropic or openai",
+        ));
+    }
+    let max_tokens = args.max_tokens.filter(|value| *value > 0).ok_or_else(|| {
+        SdkError::trusted(
+            SdkErrorCode::InvalidInput,
+            "pool execution requires an explicit positive --max-tokens",
+        )
+    })?;
+    let model = args
+        .model
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            SdkError::trusted(
+                SdkErrorCode::InvalidInput,
+                "pool execution requires an explicit --model",
+            )
+        })?;
+    let max_input_bytes = args.max_input_bytes.unwrap_or(200_000);
+    if max_input_bytes == 0 || args.timeout_secs == 0 {
+        return Err(SdkError::trusted(
+            SdkErrorCode::InvalidInput,
+            "pool --max-input-bytes and --timeout must be positive",
+        ));
+    }
+    let deadline = started
+        .checked_add(Duration::from_secs(args.timeout_secs))
+        .ok_or_else(|| {
+            SdkError::trusted(SdkErrorCode::InvalidInput, "pool timeout is too large")
+        })?;
+    let prompt = resolve_pool_prompt(args, max_input_bytes, deadline)?;
+    let completion = csq_core::pool::execute_with_deadline(
+        base_dir,
+        csq_core::pool::PoolExecRequest {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            prompt,
+            system: args.system.clone(),
+            max_tokens,
+            max_input_bytes,
+            timeout_secs: args.timeout_secs,
+        },
+        deadline,
+    )?;
+    Ok(ExecResult {
+        completion,
+        stdout_truncated: false,
+        stderr_truncated: false,
+    })
+}
+
+fn pool_input_too_large() -> SdkError {
+    SdkError::trusted(
+        SdkErrorCode::InvalidInput,
+        "combined system and prompt UTF-8 bytes exceed --max-input-bytes",
+    )
+}
+
+/// Read at most the remaining budget plus one sentinel byte, before custody or
+/// reservation. A too-large input is never retained in full or echoed in errors.
+fn read_pool_prompt(reader: impl Read, max_prompt_bytes: usize) -> Result<String, SdkError> {
+    let read_limit = u64::try_from(max_prompt_bytes)
+        .ok()
+        .and_then(|limit| limit.checked_add(1))
+        .ok_or_else(|| {
+            SdkError::trusted(SdkErrorCode::InvalidInput, "input byte limit is too large")
+        })?;
+    let mut bytes = Vec::new();
+    reader
+        .take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            SdkError::trusted(
+                SdkErrorCode::InvalidInput,
+                "failed to read prompt from stdin",
+            )
+        })?;
+    if bytes.len() > max_prompt_bytes {
+        return Err(pool_input_too_large());
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        SdkError::trusted(
+            SdkErrorCode::InvalidInput,
+            "stdin prompt must be valid UTF-8",
+        )
+    })
+}
+
+fn pool_time_remaining(deadline: Instant) -> Result<Duration, SdkError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| SdkError::trusted(SdkErrorCode::Timeout, "pool_deadline_exceeded"))
+}
+
+fn receive_pool_prompt(
+    receiver: std::sync::mpsc::Receiver<Result<String, SdkError>>,
+    deadline: Instant,
+) -> Result<String, SdkError> {
+    let remaining = pool_time_remaining(deadline)?;
+    let result = receiver
+        .recv_timeout(remaining)
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => {
+                SdkError::trusted(SdkErrorCode::Timeout, "pool_deadline_exceeded")
+            }
+            std::sync::mpsc::RecvTimeoutError::Disconnected => SdkError::trusted(
+                SdkErrorCode::InvalidInput,
+                "stdin reader stopped before returning input",
+            ),
+        })?;
+    pool_time_remaining(deadline)?;
+    result
+}
+
+fn resolve_pool_prompt(
+    args: &ExecArgs,
+    max_input_bytes: usize,
+    deadline: Instant,
+) -> Result<String, SdkError> {
+    pool_time_remaining(deadline)?;
+    let system_bytes = args.system.as_deref().map_or(0, str::len);
+    let remaining = max_input_bytes
+        .checked_sub(system_bytes)
+        .ok_or_else(pool_input_too_large)?;
+    let prompt = match (args.prompt.as_deref(), args.stdin) {
+        (Some(_), true) => {
+            return Err(SdkError::trusted(
+                SdkErrorCode::InvalidInput,
+                "provide the prompt as a positional argument OR --stdin, not both",
+            ));
+        }
+        (None, false) => {
+            return Err(SdkError::trusted(
+                SdkErrorCode::InvalidInput,
+                "no prompt: pass a positional prompt or --stdin",
+            ));
+        }
+        (Some(prompt), false) => {
+            if prompt.len() > remaining {
+                return Err(pool_input_too_large());
+            }
+            prompt.to_string()
+        }
+        (None, true) => {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let _reader_thread = thread::Builder::new()
+                .name("csq-pool-stdin".to_string())
+                .spawn(move || {
+                    // Construct the non-Send stdin lock inside its owning worker.
+                    // This worker only reads bounded input; it never accesses pool
+                    // custody. On timeout the handler emits and exits the process,
+                    // without waiting for a caller that keeps stdin open.
+                    let result = read_pool_prompt(std::io::stdin().lock(), remaining);
+                    let _ = sender.send(result);
+                })
+                .map_err(|_| {
+                    SdkError::trusted(SdkErrorCode::Internal, "failed to start stdin reader")
+                })?;
+            receive_pool_prompt(receiver, deadline)?
+        }
+    };
+    if prompt.trim().is_empty() {
+        return Err(SdkError::trusted(
+            SdkErrorCode::InvalidInput,
+            "prompt must not be empty",
+        ));
+    }
+    pool_time_remaining(deadline)?;
+    Ok(prompt)
+}
+
 #[cfg(test)]
 pub(crate) fn provider_session_test_run_exec(
     base_dir: &Path,
@@ -523,6 +722,9 @@ pub(crate) fn provider_session_test_run_exec(
             system: None,
             id: None,
             timeout_secs: 1,
+            pool: None,
+            max_tokens: None,
+            max_input_bytes: None,
         },
     )
     .map(|_| ())
@@ -1644,6 +1846,9 @@ mod tests {
             system: None,
             id: None,
             timeout_secs: 120,
+            pool: None,
+            max_tokens: None,
+            max_input_bytes: None,
         }
     }
 
@@ -1651,6 +1856,68 @@ mod tests {
     fn prompt_and_stdin_both_is_invalid_input() {
         let err = resolve_prompt(&args(Some("hi"), true, None, None)).unwrap_err();
         assert_eq!(err.code, SdkErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn pool_stdin_stops_after_the_budget_and_one_sentinel_byte() {
+        let mut reader = std::io::Cursor::new(b"synthetic secret prompt");
+        let err = read_pool_prompt(&mut reader, 3).unwrap_err();
+        assert_eq!(err.code, SdkErrorCode::InvalidInput);
+        assert_eq!(reader.position(), 4);
+        assert!(!err.message.as_str().contains("synthetic"));
+    }
+
+    #[test]
+    fn pool_stdin_accepts_exact_utf8_byte_boundary() {
+        assert_eq!(read_pool_prompt("éé".as_bytes(), 4).unwrap(), "éé");
+    }
+
+    #[test]
+    fn pool_stdin_rejects_invalid_utf8_without_echoing_input() {
+        let err = read_pool_prompt(&b"synthetic secret prompt\xff"[..], 100).unwrap_err();
+        assert_eq!(err.code, SdkErrorCode::InvalidInput);
+        assert!(!err.message.as_str().contains("synthetic"));
+    }
+
+    #[test]
+    fn pool_prompt_subtracts_system_utf8_bytes_from_the_budget() {
+        let mut request = args(Some("éé"), false, None, None);
+        request.system = Some("é".into());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        assert_eq!(resolve_pool_prompt(&request, 6, deadline).unwrap(), "éé");
+        assert_eq!(
+            resolve_pool_prompt(&request, 5, deadline).unwrap_err().code,
+            SdkErrorCode::InvalidInput
+        );
+    }
+
+    #[test]
+    fn pool_stdin_deadline_refuses_to_wait_for_a_still_open_input() {
+        // Keeping the sender alive models stdin with no bytes and no EOF. An
+        // already-expired budget makes the oracle deterministic, without sleeps
+        // or a blocking worker that the test would need to join.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let err = receive_pool_prompt(receiver, Instant::now()).unwrap_err();
+        drop(sender);
+        assert_eq!(err.code, SdkErrorCode::Timeout);
+        assert_eq!(err.message.as_str(), "pool_deadline_exceeded");
+    }
+
+    #[test]
+    fn pool_positional_prompt_obeys_the_same_expired_deadline() {
+        let request = args(Some("synthetic secret prompt"), false, None, None);
+        let err = resolve_pool_prompt(&request, 100, Instant::now()).unwrap_err();
+        assert_eq!(err.code, SdkErrorCode::Timeout);
+        assert_eq!(err.message.as_str(), "pool_deadline_exceeded");
+    }
+
+    #[test]
+    fn pool_stdin_deadline_accepts_input_that_is_already_ready() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(Ok("synthetic prompt".to_string())).unwrap();
+        let prompt =
+            receive_pool_prompt(receiver, Instant::now() + Duration::from_secs(30)).unwrap();
+        assert_eq!(prompt, "synthetic prompt");
     }
 
     /// Gate-coverage wiring (task #77): the `csq exec` license gate delegates to the shared

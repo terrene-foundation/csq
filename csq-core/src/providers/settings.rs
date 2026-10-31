@@ -2,7 +2,6 @@
 
 use super::catalog::{get_provider, Provider};
 use crate::error::ConfigError;
-use crate::platform::fs::atomic_replace;
 use crate::session::merge::{repair_truncated_json, set_model};
 use crate::types::ApiKey;
 use serde::{Deserialize, Serialize};
@@ -595,15 +594,16 @@ fn write_global_profile(path: &Path, settings: &ProviderSettings) -> Result<(), 
     // red-team B2. On any write failure the tmp file this call created is
     // removed before propagating, same fail-closed intent as before.
     let tmp = crate::platform::fs::unique_tmp_path(path);
-    if let Err(e) = crate::platform::fs::write_new_private(&tmp, json.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(ConfigError::InvalidJson {
-            path: tmp.clone(),
-            reason: format!("write: {e}"),
-        });
-    }
-    if let Err(e) = atomic_replace(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
+    let writer = match crate::platform::fs::write_new_private_retained(&tmp, json.as_bytes()) {
+        Ok(writer) => writer,
+        Err(e) => {
+            return Err(ConfigError::InvalidJson {
+                path: tmp.clone(),
+                reason: format!("write: {e}"),
+            });
+        }
+    };
+    if let Err(e) = writer.replace(path) {
         return Err(ConfigError::InvalidJson {
             path: path.to_path_buf(),
             reason: format!("atomic replace: {e}"),

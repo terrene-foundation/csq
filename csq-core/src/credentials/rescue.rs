@@ -80,9 +80,10 @@
 //! # Secret handling
 //!
 //! The payload is live OAuth material. The record is written with
-//! `crate::platform::fs::write_new_private` (mode 0600 at creation),
-//! `secure_file`, then `atomic_replace`, and every failure branch removes
-//! the temp file (`rules/security.md` §5a). No log line or error carries
+//! `crate::platform::fs::write_new_private_synced_retained` (mode 0600 at
+//! creation and file sync before publication), then `secure_file` and retained
+//! replacement. The creating writer owns temporary-file cleanup on failure.
+//! No log line or error carries
 //! token text: errors carry paths and fixed `error_kind` tags only.
 //!
 //! # Reader hardening (D237 round-2 security M1)
@@ -759,23 +760,22 @@ fn write_record_to(path: &Path, record: &RescueRecord) -> Result<(), CredentialE
             reason: format!("rescue_record_serialize_failed: {error}"),
         }
     })?);
-    let tmp = crate::platform::fs::unique_tmp_path(path);
-    if let Err(error) = crate::platform::fs::write_new_private(&tmp, &bytes) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(CredentialError::Io {
-            path: tmp,
-            source: std::io::Error::other(error.to_string()),
-        });
-    }
-    if let Err(error) = crate::platform::fs::secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
+    let writer = match crate::platform::fs::write_private_tmp_synced_retained(path, &bytes) {
+        Ok(writer) => writer,
+        Err(error) => {
+            return Err(CredentialError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::other(error.to_string()),
+            });
+        }
+    };
+    if let Err(error) = crate::platform::fs::secure_file(writer.path()) {
         return Err(CredentialError::Io {
             path: path.to_path_buf(),
             source: std::io::Error::other(error.to_string()),
         });
     }
-    if let Err(error) = crate::platform::fs::atomic_replace(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(error) = writer.replace(path) {
         return Err(CredentialError::Io {
             path: path.to_path_buf(),
             source: std::io::Error::other(error.to_string()),
@@ -1550,33 +1550,27 @@ fn refusal_mark(path: &Path, record: &RescueRecord) -> RefusalMark {
     }
 }
 
-/// Writes a fixed-body marker under §5a: a `unique_tmp_path` temp file
-/// created 0o600 by `write_new_private`, re-secured, then atomically
-/// renamed; the temp file is removed on EVERY failure branch.
+/// Writes a fixed-body marker through a retained private writer. The creating
+/// handle owns cleanup on failure; an exclusive-create collision is never removed.
 fn write_marker(marker: &Path, bytes: &[u8]) -> Result<(), CredentialError> {
-    let tmp = crate::platform::fs::unique_tmp_path(marker);
     let failed = |stage: &str| CredentialError::Io {
         path: marker.to_path_buf(),
         source: std::io::Error::other(format!("rescue_marker_{stage}_failed")),
     };
-    if marker_write_fault(MarkerStage::Write, marker)
-        || crate::platform::fs::write_new_private(&tmp, bytes).is_err()
-    {
-        let _ = std::fs::remove_file(&tmp);
+    if marker_write_fault(MarkerStage::Write, marker) {
         return Err(failed("write"));
     }
+    let written = crate::platform::fs::write_private_tmp_retained(marker, bytes)
+        .map_err(|_| failed("write"))?;
     if marker_write_fault(MarkerStage::Secure, marker)
-        || crate::platform::fs::secure_file(&tmp).is_err()
+        || crate::platform::fs::secure_file(written.path()).is_err()
     {
-        let _ = std::fs::remove_file(&tmp);
         return Err(failed("secure"));
     }
-    if marker_write_fault(MarkerStage::Replace, marker)
-        || crate::platform::fs::atomic_replace(&tmp, marker).is_err()
-    {
-        let _ = std::fs::remove_file(&tmp);
+    if marker_write_fault(MarkerStage::Replace, marker) {
         return Err(failed("replace"));
     }
+    written.replace(marker).map_err(|_| failed("replace"))?;
     Ok(())
 }
 
@@ -2362,27 +2356,49 @@ fn evaluate_record(
 
 /// Writes canonical credential bytes atomically, owner-only.
 ///
-/// Mirrors `file.rs`'s §5a discipline: `write_new_private` creates the temp
-/// file at 0o600, `secure_file` re-asserts the mode, `atomic_replace`
-/// commits, and every failure branch removes the temp file.
+/// The synced retained writer creates the temp file at 0o600 and syncs its
+/// contents before publication. `secure_file` re-asserts the mode; replacement
+/// retains ownership through publication and cleanup of the created temp.
 fn write_canonical_private(path: &Path, bytes: &[u8]) -> Result<(), CredentialError> {
-    let tmp = crate::platform::fs::unique_tmp_path(path);
-    if let Err(error) = crate::platform::fs::write_new_private(&tmp, bytes) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(CredentialError::Io {
-            path: tmp,
-            source: std::io::Error::other(error.to_string()),
-        });
-    }
-    if let Err(error) = crate::platform::fs::secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
+    let writer =
+        crate::platform::fs::write_private_tmp_synced_retained(path, bytes).map_err(|error| {
+            CredentialError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::other(error.to_string()),
+            }
+        })?;
+    publish_canonical_private(path, writer)
+}
+
+#[cfg(test)]
+fn write_canonical_private_with_tmp(
+    path: &Path,
+    bytes: &[u8],
+    tmp: PathBuf,
+) -> Result<(), CredentialError> {
+    let writer = match crate::platform::fs::write_new_private_synced_retained(&tmp, bytes) {
+        Ok(writer) => writer,
+        Err(error) => {
+            return Err(CredentialError::Io {
+                path: tmp,
+                source: std::io::Error::other(error.to_string()),
+            });
+        }
+    };
+    publish_canonical_private(path, writer)
+}
+
+fn publish_canonical_private(
+    path: &Path,
+    writer: crate::platform::fs::WrittenPrivateFile,
+) -> Result<(), CredentialError> {
+    if let Err(error) = crate::platform::fs::secure_file(writer.path()) {
         return Err(CredentialError::Io {
             path: path.to_path_buf(),
             source: std::io::Error::other(error.to_string()),
         });
     }
-    if let Err(error) = crate::platform::fs::atomic_replace(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(error) = writer.replace(path) {
         return Err(CredentialError::Io {
             path: path.to_path_buf(),
             source: std::io::Error::other(error.to_string()),
@@ -2409,6 +2425,202 @@ mod tests {
     use crate::accounts::anthropic_identity::{RescueKnownContext, RescueWitnessKind};
     use crate::credentials::{AnthropicCredentialFile, CredentialFile, OAuthPayload};
     use crate::types::{AccessToken, RefreshToken};
+
+    fn assert_rescue_sync_before_publish(
+        assertion_message: &'static str,
+        operation: impl FnOnce(&Path),
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("published.json");
+        let synced = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&synced);
+        let unpublished_target = target.clone();
+        crate::platform::fs::with_private_sync_observer_for_test(
+            move |path| {
+                assert_eq!(path.parent(), unpublished_target.parent());
+                assert_ne!(path, unpublished_target.as_path());
+                assert!(
+                    !unpublished_target.exists(),
+                    "publication preceded sync_all"
+                );
+                observed.store(true, Ordering::SeqCst);
+            },
+            || operation(&target),
+        );
+        assert!(synced.load(Ordering::SeqCst), "{assertion_message}");
+        assert!(target.is_file());
+    }
+
+    #[test]
+    fn rescue_record_syncs_before_publish() {
+        assert_rescue_sync_before_publish(
+            "rescue record sync_all was not observed before publication",
+            |path| {
+                let record = RescueRecord {
+                    schema: RESCUE_SCHEMA.to_string(),
+                    provider: "codex".to_string(),
+                    uuid: "00000000-0000-4000-8000-000000000001".to_string(),
+                    written_at_ms: 1,
+                    reason: "post_commit_lock_timeout".to_string(),
+                    payload: serde_json::json!({"access_token": "fixture-only"}),
+                    anthropic_witness: None,
+                    codex_expected_source: None,
+                };
+                write_record_to(path, &record).unwrap();
+                let published: RescueRecord =
+                    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                assert_eq!(published.payload, record.payload);
+            },
+        );
+    }
+
+    #[test]
+    fn canonical_rescue_syncs_before_publish() {
+        assert_rescue_sync_before_publish(
+            "canonical rescue sync_all was not observed before publication",
+            |path| {
+                write_canonical_private(path, b"private fixture").unwrap();
+                assert_eq!(std::fs::read(path).unwrap(), b"private fixture");
+            },
+        );
+    }
+
+    fn assert_rescue_retries_create_collision(
+        assertion_message: &'static str,
+        operation: impl FnOnce(&Path) -> Result<(), CredentialError>,
+    ) {
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("published.json");
+        std::fs::write(&target, b"before").unwrap();
+        let foreign = Arc::new(Mutex::new(None));
+        let planted = Arc::clone(&foreign);
+        let selected_target = target.clone();
+        crate::platform::fs::with_private_create_observer_for_test(
+            move |candidate| {
+                assert_eq!(candidate.parent(), selected_target.parent());
+                assert_ne!(candidate, selected_target.as_path());
+                let mut first = planted.lock().unwrap();
+                if first.is_none() {
+                    std::fs::write(candidate, b"FOREIGN").unwrap();
+                    *first = Some(candidate.to_path_buf());
+                }
+            },
+            || {
+                let result = operation(&target);
+                let candidate = foreign
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .expect("pre-create observer must run before result assertion")
+                    .clone();
+                assert_eq!(std::fs::read(&candidate).unwrap(), b"FOREIGN");
+                eprintln!("F4_PRIVATE_CREATE_COLLISION_PLANTED");
+                assert!(result.is_ok(), "{assertion_message}");
+            },
+        );
+        assert_ne!(std::fs::read(&target).unwrap(), b"before");
+        let foreign = foreign.lock().unwrap();
+        let foreign = foreign.as_ref().expect("pre-create observer did not run");
+        assert_eq!(std::fs::read(foreign).unwrap(), b"FOREIGN");
+    }
+
+    #[test]
+    fn rescue_record_retries_create_collision() {
+        assert_rescue_retries_create_collision(
+            "rescue record collision prevented publication",
+            |path| {
+                let record = RescueRecord {
+                    schema: RESCUE_SCHEMA.to_string(),
+                    provider: "codex".to_string(),
+                    uuid: "00000000-0000-4000-8000-000000000001".to_string(),
+                    written_at_ms: 1,
+                    reason: "post_commit_lock_timeout".to_string(),
+                    payload: serde_json::json!({"access_token": "fixture-only"}),
+                    anthropic_witness: None,
+                    codex_expected_source: None,
+                };
+                write_record_to(path, &record)
+            },
+        );
+    }
+
+    #[test]
+    fn f_a_rescue_marker_retries_sibling_collision() {
+        assert_rescue_retries_create_collision(
+            "rescue marker collision prevented publication",
+            |path| {
+                write_marker(path, b"after")?;
+                assert_eq!(std::fs::read(path).unwrap(), b"after");
+                Ok(())
+            },
+        );
+    }
+
+    #[test]
+    fn canonical_rescue_retries_create_collision() {
+        assert_rescue_retries_create_collision(
+            "canonical rescue collision prevented publication",
+            |path| write_canonical_private(path, b"after"),
+        );
+    }
+
+    #[test]
+    fn atomic_write_collision_preserves_foreign_temporary_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("credentials.json");
+        let tmp = dir.path().join("occupied.tmp");
+        std::fs::write(&path, b"canonical-before").unwrap();
+        std::fs::write(&tmp, b"foreign-before").unwrap();
+
+        let result = write_canonical_private_with_tmp(&path, b"replacement", tmp.clone());
+
+        assert!(matches!(result, Err(CredentialError::Io { path, .. }) if path == tmp));
+        assert_eq!(std::fs::read(&path).unwrap(), b"canonical-before");
+        assert_eq!(
+            std::fs::read(&tmp).ok().as_deref(),
+            Some(&b"foreign-before"[..])
+        );
+    }
+
+    #[test]
+    fn atomic_write_failed_replace_cleans_owned_temporary_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("destination-directory");
+        let tmp = dir.path().join("owned.tmp");
+        std::fs::create_dir(&path).unwrap();
+
+        let result = write_canonical_private_with_tmp(&path, b"replacement", tmp.clone());
+
+        assert!(matches!(result, Err(CredentialError::Io { path: failed, .. }) if failed == path));
+        assert!(path.is_dir());
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn atomic_write_replaces_complete_canonical_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("credentials.json");
+        let tmp = dir.path().join("owned.tmp");
+        std::fs::write(&path, b"canonical-before").unwrap();
+
+        write_canonical_private_with_tmp(&path, b"canonical-after", tmp.clone()).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"canonical-after");
+        assert!(!tmp.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
 
     /// R3 sec L-4: an identity directory holding more records than the
     /// policy cap is not a state this protocol produces. Enumeration FAILS

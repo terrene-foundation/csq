@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use crate::accounts::identity_store::settings_path_for;
 use crate::accounts::profiles;
-use crate::platform::fs::{atomic_replace, unique_tmp_path, write_new_private};
+use crate::platform::fs::{unique_tmp_path, write_new_private_retained};
 use crate::types::AccountNum;
 use serde_json::Value;
 
@@ -181,15 +181,16 @@ pub(crate) fn write_settings_bytes_private(
     // §5a: settings.json may carry ANTHROPIC_AUTH_TOKEN. `write_new_private`
     // creates the tmp file at 0o600 at creation, closing the window a
     // separate std::fs::write + secure_file pair left open.
-    if let Err(e) = write_new_private(&tmp, bytes) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!(
-            "write tmp {}: {e}",
-            crate::cli_deps::sanitize::redact_path(&tmp)
-        ));
-    }
-    if let Err(e) = atomic_replace(&tmp, settings_path) {
-        let _ = std::fs::remove_file(&tmp);
+    let writer = match write_new_private_retained(&tmp, bytes) {
+        Ok(writer) => writer,
+        Err(e) => {
+            return Err(format!(
+                "write tmp {}: {e}",
+                crate::cli_deps::sanitize::redact_path(&tmp)
+            ));
+        }
+    };
+    if let Err(e) = writer.replace(settings_path) {
         return Err(format!("atomic replace: {e}"));
     }
     Ok(())

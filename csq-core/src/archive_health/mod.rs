@@ -107,7 +107,7 @@ pub struct ArchiveFinding {
 
 impl ArchiveChecks {
     /// Every non-OK check, in a fixed order, each with the hint computed for
-    /// its own state (see [`check_jobs`] for the upload-job hints).
+    /// its own state (see `check_jobs` for the upload-job hints).
     pub fn findings(&self) -> Vec<ArchiveFinding> {
         let rows: [(&'static str, &CheckState); 5] = [
             ("upload_jobs", &self.upload_jobs),

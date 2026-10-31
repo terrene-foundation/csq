@@ -116,7 +116,7 @@ impl VendorFixture {
                 command.env(key, value);
             }
         }
-        let (mut child, group) = group::spawn(&mut command)?;
+        let (mut child, group) = group::spawn_controlled_fixture_for_test(&mut command)?;
         let input = child.stdin.take();
         let spawned_pid = child.id();
         let fixture = Self {
@@ -1519,7 +1519,8 @@ fn census_gate_run(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let (child, group) = group::spawn(&mut command).expect("spawn census leader");
+    let (child, group) =
+        group::spawn_controlled_fixture_for_test(&mut command).expect("spawn census leader");
     let pgid = group.id();
     let member = in_group(pgid);
     let watchdog = LoginWatchdog::new(Duration::from_secs(30), DeliveryPhase::Unknown);
@@ -1972,7 +1973,8 @@ mod finalized_stop_receipt_tests {
     fn stop_after_leader_exit_before_reap_is_not_an_error() {
         let _environment = csq_core::platform::test_env::lock();
         let mut command = std::process::Command::new("/usr/bin/true");
-        let (mut child, control) = group::spawn(&mut command).expect("spawn exiting leader");
+        let (mut child, control) =
+            group::spawn(&mut command, group::StdinPolicy::Null).expect("spawn exiting leader");
         let pid = child.id();
         let exited = poll_private(Duration::from_secs(5), || {
             // SAFETY: plain C output struct, written by waitid below.
@@ -2360,8 +2362,8 @@ mod owned_group_causal {
         vendor
             .stdout(Stdio::piped())
             .stderr(std::fs::File::create(root.join("vendor.stderr")).unwrap());
-        let (child, production_group) =
-            group::spawn(&mut vendor).expect("actual production group spawn");
+        let (child, production_group) = group::spawn(&mut vendor, group::StdinPolicy::Caller)
+            .expect("actual production group spawn");
         let pid = child.id();
         // Infallible guard adoption is immediate. It remains in scope across
         // setup failures, semantic RED, and the controlled panic below.
@@ -2506,8 +2508,8 @@ mod owned_group_causal {
         command
             .stdout(Stdio::piped())
             .stderr(std::fs::File::create(root.join("leader.stderr")).unwrap());
-        let (child, production_group) =
-            group::spawn(&mut command).expect("actual production leader group");
+        let (child, production_group) = group::spawn(&mut command, group::StdinPolicy::Caller)
+            .expect("actual production leader group");
         let pid = child.id();
         // The role cannot exit until leader-exit is atomically released below:
         // adoption therefore precedes intentional exit and captures live PGID.

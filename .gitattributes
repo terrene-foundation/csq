@@ -10,6 +10,10 @@ csq-core/tests/fixtures/hook-registry/** -text
 # refused (Windows CI run 38993121327). Keep the Git-object LF bytes on every platform.
 csq-core/tests/fixtures/codex-state5-threads-0.159.2.sql -text
 
+# Native libtest output intentionally ends pending test rows with a space.
+# Preserve this SHA-bound literal frame and allow only its native trailing blanks.
+scripts/tests/fixtures/proof-native-framing-r1-18.txt -text whitespace=-blank-at-eol
+
 # Rust source always checks out with LF, on every platform: tests scan source text
 # at fixed `\n` boundaries.
 *.rs text eol=lf

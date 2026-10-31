@@ -47,7 +47,7 @@ use crate::audit::persist::{write_record_to, AuditRecord};
 use crate::credentials::file as cred_file;
 use crate::credentials::mutex::AccountMutexTable;
 use crate::daemon::identity_mint::{self, MintSummary};
-use crate::platform::fs::{atomic_replace, secure_file_readonly};
+use crate::platform::fs::secure_file_readonly;
 use crate::providers::catalog::Surface;
 use crate::providers::codex::surface as codex_surface;
 use crate::types::AccountNum;
@@ -1071,21 +1071,22 @@ fn heal_copy_legacy_to_identity(
     // would leave open — `bytes` is a byte-copy of a legacy credential file.
     let tmp = crate::platform::fs::unique_tmp_path(identity_path);
 
-    if let Err(e) = crate::platform::fs::write_new_private(&tmp, &bytes) {
-        let _ = std::fs::remove_file(&tmp);
-        warn!(
-            error_kind = "heal_write_failed",
-            identity = %identity_path.display(),
-            "phase4 self-heal: tmp write failed: {}",
-            crate::error::redact_tokens(&e.to_string())
-        );
-        return Phase4HealOutcome::CopyFailed {
-            error_kind: "heal_write_failed".to_string(),
-        };
-    }
+    let writer = match crate::platform::fs::write_new_private_retained(&tmp, &bytes) {
+        Ok(writer) => writer,
+        Err(e) => {
+            warn!(
+                error_kind = "heal_write_failed",
+                identity = %identity_path.display(),
+                "phase4 self-heal: tmp write failed: {}",
+                crate::error::redact_tokens(&e.to_string())
+            );
+            return Phase4HealOutcome::CopyFailed {
+                error_kind: "heal_write_failed".to_string(),
+            };
+        }
+    };
 
-    if let Err(e) = atomic_replace(&tmp, identity_path) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = writer.replace(identity_path) {
         warn!(
             error_kind = "heal_atomic_replace_failed",
             identity = %identity_path.display(),

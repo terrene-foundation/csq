@@ -68,7 +68,9 @@
 //! key is wiped on `Drop` via `zeroize`.
 
 use super::{NamedKey, SecretError, SlotKey, Vault};
-use crate::platform::fs::{atomic_replace, unique_tmp_path, write_new_private};
+#[cfg(test)]
+use crate::platform::fs::write_new_private_retained;
+use crate::platform::fs::write_private_tmp_synced_retained;
 use crate::types::AccountNum;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
@@ -213,16 +215,13 @@ impl FileVault {
     pub fn open(base_dir: &Path) -> Result<Self, SecretError> {
         let passphrase = read_passphrase()?;
         let path = base_dir.join(VAULT_FILE_NAME);
-        let kdf_params = if path.exists() {
-            // Existing store: KDF parameters are pinned in the file
-            // header. Verify algorithm match before deriving against
-            // them.
-            let file = read_file(&path)?;
-            if file.kdf.algo != "argon2id" {
-                return Err(SecretError::DecryptionFailed);
-            }
-            file.kdf
-        } else {
+        // R2 N3: the first-use decision is FAIL-CLOSED. `path.exists()` reports
+        // false on any stat error (and on a dangling symlink), which would mint a
+        // fresh salt and rewrite the header — permanent credential loss for an
+        // existing store. `vault_first_use` returns `true` only for a
+        // determinate absence and ERRORS on a stat failure, a symlink, or a
+        // non-file entry.
+        let kdf_params = if vault_first_use(&path)? {
             // First use: ensure the directory exists, mint a fresh
             // salt, and persist a header-only file. Subsequent writes
             // append entries via `set`.
@@ -251,6 +250,15 @@ impl FileVault {
             };
             write_file(&path, &empty)?;
             kdf
+        } else {
+            // Existing store: KDF parameters are pinned in the file
+            // header. Verify algorithm match before deriving against
+            // them.
+            let file = read_file(&path)?;
+            if file.kdf.algo != "argon2id" {
+                return Err(SecretError::DecryptionFailed);
+            }
+            file.kdf
         };
 
         let master_key = derive_key(passphrase.expose_secret(), &kdf_params)?;
@@ -312,22 +320,32 @@ impl FileVault {
     }
 }
 
-impl Vault for FileVault {
-    fn set_named(&self, key: &NamedKey, secret: &SecretString) -> Result<(), SecretError> {
+impl FileVault {
+    fn write_named(
+        &self,
+        key: &NamedKey,
+        secret: &SecretString,
+        create_allowed: bool,
+    ) -> Result<(), SecretError> {
         if secret.expose_secret().is_empty() {
             return Err(SecretError::InvalidKey {
                 reason: "secret must not be empty".into(),
             });
         }
-        let mut file = if self.pool_path.exists() {
+        let initially_exists = !vault_file_absent(&self.pool_path)?;
+        let mut file = if initially_exists {
             read_file(&self.pool_path)?
-        } else {
+        } else if create_allowed {
             VaultFile {
                 version: CURRENT_VERSION,
                 kdf: clone_kdf(&self.pool_kdf),
                 entries: Vec::new(),
                 named_entries: Vec::new(),
             }
+        } else {
+            return Err(SecretError::BackendUnavailable {
+                reason: "named vault file is unavailable".into(),
+            });
         };
         let mut nonce = [0u8; AEAD_NONCE_LEN];
         getrandom::getrandom(&mut nonce).map_err(|_| SecretError::EncryptionFailed {
@@ -358,11 +376,24 @@ impl Vault for FileVault {
         } else {
             file.named_entries.push(entry);
         }
-        write_file(&self.pool_path, &file)
+        write_file_with_policy(&self.pool_path, &file, initially_exists)
+    }
+}
+
+impl Vault for FileVault {
+    fn set_named(&self, key: &NamedKey, secret: &SecretString) -> Result<(), SecretError> {
+        self.write_named(key, secret, true)
+    }
+    fn set_named_existing(&self, key: &NamedKey, secret: &SecretString) -> Result<(), SecretError> {
+        self.write_named(key, secret, false)
     }
     fn get_named(&self, key: &NamedKey) -> Result<SecretString, SecretError> {
-        if !self.pool_path.exists() {
-            return Err(SecretError::NamedNotFound);
+        if vault_file_absent(&self.pool_path)? {
+            // The store disappeared, rather than one item inside a readable
+            // store. Callers with published native rows must stop execution.
+            return Err(SecretError::BackendUnavailable {
+                reason: "named vault file is unavailable".into(),
+            });
         }
         let file = read_file(&self.pool_path)?;
         if file.kdf != self.pool_kdf {
@@ -375,13 +406,18 @@ impl Vault for FileVault {
             .ok_or(SecretError::NamedNotFound)?;
         let nonce = B64
             .decode(&e.nonce)
-            .map_err(|_| SecretError::DecryptionFailed)?;
+            .map_err(|_| SecretError::NamedItemUnreadable)?;
         if nonce.len() != AEAD_NONCE_LEN {
-            return Err(SecretError::DecryptionFailed);
+            return Err(SecretError::NamedItemUnreadable);
         }
         let ciphertext = B64
             .decode(&e.ciphertext)
-            .map_err(|_| SecretError::DecryptionFailed)?;
+            .map_err(|_| SecretError::NamedItemUnreadable)?;
+        // Aes256Gcm stores its 128-bit authentication tag with the ciphertext.
+        // Fewer bytes cannot be a complete item under any passphrase.
+        if ciphertext.len() < 16 {
+            return Err(SecretError::NamedItemUnreadable);
+        }
         let aad = format!("v1:{}", key.native_name());
         let clear = zeroize::Zeroizing::new(
             build_cipher(self.master_key.as_slice())?
@@ -394,11 +430,11 @@ impl Vault for FileVault {
                 )
                 .map_err(|_| SecretError::DecryptionFailed)?,
         );
-        let value = std::str::from_utf8(&clear).map_err(|_| SecretError::DecryptionFailed)?;
+        let value = std::str::from_utf8(&clear).map_err(|_| SecretError::NamedItemUnreadable)?;
         Ok(SecretString::new(value.to_owned().into()))
     }
     fn delete_named(&self, key: &NamedKey) -> Result<(), SecretError> {
-        if !self.pool_path.exists() {
+        if vault_file_absent(&self.pool_path)? {
             return Ok(());
         }
         let mut file = read_file(&self.pool_path)?;
@@ -406,13 +442,26 @@ impl Vault for FileVault {
             return Err(SecretError::DecryptionFailed);
         }
         file.named_entries.retain(|e| e.name != key.name());
-        write_file(&self.pool_path, &file)
+        write_file_with_policy(&self.pool_path, &file, true)
     }
     fn contains_named(&self, key: &NamedKey) -> Result<bool, SecretError> {
-        Ok(read_file_or_empty(&self.pool_path)?
+        if vault_file_absent(&self.pool_path)? {
+            return Ok(false);
+        }
+        Ok(read_file(&self.pool_path)?
             .named_entries
             .iter()
             .any(|e| e.name == key.name()))
+    }
+    fn named_store_present(&self) -> Result<bool, SecretError> {
+        if vault_file_absent(&self.pool_path)? {
+            return Ok(false);
+        }
+        let file = read_file(&self.pool_path)?;
+        if file.kdf != self.pool_kdf {
+            return Err(SecretError::DecryptionFailed);
+        }
+        Ok(true)
     }
 
     fn set(&self, slot: SlotKey, secret: &SecretString) -> Result<(), SecretError> {
@@ -615,6 +664,149 @@ fn aad_for(slot: SlotKey) -> String {
     )
 }
 
+/// The FIRST-USE decision for `FileVault::open`: `Ok(true)` only when `path` is
+/// determinately absent — the parent resolves to a real directory (or is itself
+/// absent, in which case the child cannot exist) and the entry does not exist.
+/// A stat error, a symlink (dangling or not), or a non-file entry is an ERROR,
+/// never "first use": minting a new salt and rewriting the header over an
+/// existing or unreadable store is permanent credential loss (R2 N3).
+fn vault_first_use(path: &Path) -> Result<bool, SecretError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() && !meta.file_type().is_symlink() => Ok(false),
+        Ok(_) => Err(SecretError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::other("the vault path exists but is not a regular file"),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match path.parent() {
+            Some(parent) => match std::fs::metadata(parent) {
+                Ok(meta) if meta.is_dir() => Ok(true),
+                // The parent is absent: the child cannot exist either.
+                Err(parent_error) if parent_error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(true)
+                }
+                Ok(_) => Err(SecretError::Io {
+                    path: parent.to_path_buf(),
+                    source: std::io::Error::other("the vault parent is not a directory"),
+                }),
+                Err(source) => Err(SecretError::Io {
+                    path: parent.to_path_buf(),
+                    source,
+                }),
+            },
+            None => Ok(true),
+        },
+        Err(source) => Err(SecretError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// `true` only when `path` is GENUINELY absent. A non-directory component on the
+/// way to `path` makes every child open fail with `ERROR_DIRECTORY` /
+/// `ERROR_PATH_NOT_FOUND`, which `std` reports as `ErrorKind::NotFound`; reading
+/// that as "the vault is absent" lets a removal confirm a store it never opened
+/// (native run 41157525966; guard-reader-writer parity MUST-2 — a destructive
+/// path fails CLOSED). The parent must therefore resolve to a real directory;
+/// a symlinked/reparse parent that does resolve is allowed, matching the rest of
+/// this backend, but a file standing where the directory belongs is not.
+fn vault_file_absent(path: &Path) -> Result<bool, SecretError> {
+    let Some(parent) = path.parent() else {
+        return Ok(false);
+    };
+    let parent_meta = std::fs::metadata(parent).map_err(|source| SecretError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    if !parent_meta.is_dir() {
+        return Err(SecretError::BackendUnavailable {
+            reason: "the vault parent is not a directory; a child open failure there is not \
+                     evidence the vault is absent"
+                .into(),
+        });
+    }
+    // The identity of the directory the parent path reaches, captured BEFORE
+    // the child lookup. A Windows `Metadata` cannot supply it (std's
+    // `volume_serial_number`/`file_index` are still unstable, rust-lang#63010),
+    // so every platform captures through [`directory_identity`].
+    let before = directory_identity(parent).ok_or_else(|| SecretError::BackendUnavailable {
+        reason: "the vault parent's identity could not be read; absence cannot be confirmed".into(),
+    })?;
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Re-verify the parent AFTER the child lookup: a parent swapped for
+            // another directory (or for a file) between the two lookups makes
+            // this child lookup report NotFound for a store that is really
+            // there. Only the SAME directory that was checked may confirm
+            // absence (R2 NEW-6).
+            #[cfg(test)]
+            BEFORE_ABSENCE_RECHECK.with(|slot| {
+                let hook = slot.borrow_mut().take();
+                if let Some(hook) = hook {
+                    hook(parent);
+                }
+            });
+            let after_meta = std::fs::metadata(parent).map_err(|source| SecretError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+            if !after_meta.is_dir() || directory_identity(parent) != Some(before) {
+                return Err(SecretError::BackendUnavailable {
+                    reason: "the vault parent changed while its absence was checked".into(),
+                });
+            }
+            Ok(true)
+        }
+        Err(source) => Err(SecretError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// The identity of the directory `path` resolves to: device+inode on unix.
+#[cfg(unix)]
+fn directory_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+/// Windows: open a no-follow directory handle and read
+/// `BY_HANDLE_FILE_INFORMATION`'s volume serial + file index. std's `Metadata`
+/// accessors for both are still unstable (rust-lang/rust#63010), so a handle is
+/// the only stable source.
+#[cfg(windows)]
+fn directory_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .ok()?;
+    // SAFETY: `BY_HANDLE_FILE_INFORMATION` is plain old data; a zeroed value is
+    // fully initialised and the API fills it for a live handle.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: live handle owned by `file` and a valid output slot.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
+        return None;
+    }
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Some((u64::from(info.dwVolumeSerialNumber), index))
+}
+#[cfg(not(any(unix, windows)))]
+fn directory_identity(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
 /// Reads + parses the vault file. Returns `BackendUnavailable` when
 /// the file does not exist — `open` always writes the header at first
 /// use, so a missing file mid-process means an external actor (or a
@@ -660,66 +852,162 @@ fn read_file(path: &Path) -> Result<VaultFile, SecretError> {
 }
 
 /// Read variant for query paths (`get`, `list_slots`) — synthesizes an
-/// empty entry list when the file does not exist so the trait's
+/// empty entry list when the file is GENUINELY absent so the trait's
 /// `NotFound` / empty-list contracts hold without a hard error. Does
 /// NOT touch the salt: the synthesized header carries placeholder KDF
 /// fields that are ONLY used to satisfy `serde` round-trip; query
 /// paths never use the synthesized salt for derivation because they
 /// reuse the cached master key from `FileVault::open`.
+///
+/// Absence is decided by [`vault_file_absent`], never by a child open
+/// failure: a parent replaced by a file makes every child open fail with
+/// `ERROR_PATH_NOT_FOUND`, which `std` reports as `NotFound` — reading that as
+/// "no entries" would report an empty store for one that was never opened
+/// (native run 41157525966). A broken parent therefore propagates
+/// `BackendUnavailable`; only a missing file under a real directory is empty.
 fn read_file_or_empty(path: &Path) -> Result<VaultFile, SecretError> {
-    match read_file(path) {
-        Ok(file) => Ok(file),
-        // `BackendUnavailable` is the disappeared-file signal from
-        // `read_file`; map it to an empty view so query paths return
-        // `NotFound` per slot or an empty `list_slots`. Other errors
-        // (corrupt JSON, version mismatch) propagate.
-        Err(SecretError::BackendUnavailable { .. }) => Ok(VaultFile {
-            version: CURRENT_VERSION,
-            kdf: KdfParams {
-                algo: "argon2id".into(),
-                // Empty salt is a sentinel — never used for derivation
-                // because the cached `master_key` was already derived
-                // from the on-disk salt at `open` time.
-                salt: String::new(),
-                m_kib: KDF_M_KIB,
-                t_cost: KDF_T_COST,
-                p_cost: KDF_P_COST,
-            },
-            entries: Vec::new(),
-            named_entries: Vec::new(),
-        }),
-        Err(other) => Err(other),
+    if !vault_file_absent(path)? {
+        return read_file(path);
     }
+    Ok(VaultFile {
+        version: CURRENT_VERSION,
+        kdf: KdfParams {
+            algo: "argon2id".into(),
+            // Empty salt is a sentinel — never used for derivation
+            // because the cached `master_key` was already derived
+            // from the on-disk salt at `open` time.
+            salt: String::new(),
+            m_kib: KDF_M_KIB,
+            t_cost: KDF_T_COST,
+            p_cost: KDF_P_COST,
+        },
+        entries: Vec::new(),
+        named_entries: Vec::new(),
+    })
 }
 
 /// Writes the vault file via the platform atomic-replace + secure
-/// permissions pattern. Cleans up the temp file on every failure path
+/// permissions pattern. The retained writer cleans up its temp on failure
 /// per `rules/security.md` §5a — a partial write of vault data left
 /// at world-readable mode would be a downgrade vs the keychain.
 fn write_file(path: &Path, file: &VaultFile) -> Result<(), SecretError> {
+    write_file_with_policy(path, file, false)
+}
+
+#[cfg(test)]
+type NamedPublishHook = Box<dyn FnOnce(&Path)>;
+#[cfg(test)]
+thread_local! {
+    static BEFORE_NAMED_PUBLISH: std::cell::RefCell<Option<NamedPublishHook>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn with_named_publish_hook<T>(
+    hook: impl FnOnce(&Path) + 'static,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<NamedPublishHook>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BEFORE_NAMED_PUBLISH.with(|slot| {
+                *slot.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let _restore =
+        Restore(BEFORE_NAMED_PUBLISH.with(|slot| slot.borrow_mut().replace(Box::new(hook))));
+    operation()
+}
+
+// Seam between the child lookup and the parent re-check inside
+// `vault_file_absent`: a test swaps the parent here to prove the absence
+// re-check refuses a different directory (R2 NEW-6).
+#[cfg(test)]
+thread_local! {
+    static BEFORE_ABSENCE_RECHECK: std::cell::RefCell<Option<NamedPublishHook>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn with_absence_recheck_hook<T>(
+    hook: impl FnOnce(&Path) + 'static,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<NamedPublishHook>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BEFORE_ABSENCE_RECHECK.with(|slot| {
+                *slot.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let _restore =
+        Restore(BEFORE_ABSENCE_RECHECK.with(|slot| slot.borrow_mut().replace(Box::new(hook))));
+    operation()
+}
+
+fn write_file_with_policy(
+    path: &Path,
+    file: &VaultFile,
+    require_existing: bool,
+) -> Result<(), SecretError> {
     let json = serde_json::to_vec_pretty(file).map_err(|e| SecretError::Io {
         path: path.to_path_buf(),
         source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
     })?;
-    // §5a: `write_new_private` creates the tmp file at 0o600 at creation,
-    // closing the window a separate `std::fs::write` + `secure_file` pair
-    // would leave open for this encrypted-vault-bearing tmp file.
-    let tmp = unique_tmp_path(path);
-    if let Err(e) = write_new_private(&tmp, &json) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(SecretError::Io {
-            path: tmp,
-            source: std::io::Error::other(format!("write: {e}")),
-        });
-    }
-    if let Err(e) = atomic_replace(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(SecretError::Io {
+    // The target factory retains private staging custody and syncs before publication.
+    let writer = write_private_tmp_synced_retained(path, &json).map_err(|e| SecretError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::other(format!("write: {e}")),
+    })?;
+    publish_file_with_policy(path, writer, require_existing)
+}
+
+// Explicit-path collision fixture: production writes use the target factory above.
+#[cfg(test)]
+fn write_file_bytes_with_tmp(path: &Path, json: &[u8], tmp: PathBuf) -> Result<(), SecretError> {
+    let writer = write_new_private_retained(&tmp, json).map_err(|e| SecretError::Io {
+        path: tmp,
+        source: std::io::Error::other(format!("write: {e}")),
+    })?;
+    publish_file_with_policy(path, writer, false)
+}
+
+fn publish_file_with_policy(
+    path: &Path,
+    writer: crate::platform::fs::WrittenPrivateFile,
+    require_existing: bool,
+) -> Result<(), SecretError> {
+    // Retained custody replaces the former path-only UnpublishedFile guard:
+    // early returns and hook unwind drop only the file this writer created.
+    #[cfg(test)]
+    BEFORE_NAMED_PUBLISH.with(|slot| {
+        let hook = slot.borrow_mut().take();
+        if let Some(hook) = hook {
+            hook(path);
+        }
+    });
+    // This checks loss after reading and staging, immediately before publish.
+    // Pool custody remains held by callers. POSIX rename has a residual
+    // final-check-to-rename window; this is not a compare-and-replace primitive.
+    //
+    // NB: this presence check is fail-CLOSED — a false, including a broken
+    // parent's ERROR_PATH_NOT_FOUND (which `try_exists` reports as false),
+    // REFUSES the write, so no absence is assumed here and `vault_file_absent`
+    // is intentionally not applied: an internal ticket reworks this exact check-to-rename
+    // window as a compare-and-replace, and duplicating the parent check here
+    // would collide with that change.
+    if require_existing
+        && !path.try_exists().map_err(|source| SecretError::Io {
             path: path.to_path_buf(),
-            source: std::io::Error::other(format!("atomic replace: {e}")),
+            source,
+        })?
+    {
+        return Err(SecretError::BackendUnavailable {
+            reason: "named vault file is unavailable".into(),
         });
     }
-    Ok(())
+    writer.replace(path).map_err(|e| SecretError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::other(format!("atomic replace: {e}")),
+    })
 }
 
 /// Manual clone for `KdfParams` — `serde` derive does not give us
@@ -736,6 +1024,7 @@ fn clone_kdf(k: &KdfParams) -> KdfParams {
 
 #[cfg(test)]
 mod tests {
+
     //! Unit tests run on every platform. They verify the crypto
     //! contract independent of dispatch — `open_default_vault` only
     //! routes to this backend on Linux, but the bytes-in / bytes-out
@@ -750,6 +1039,54 @@ mod tests {
     use crate::types::AccountNum;
     use std::sync::Mutex;
     use tempfile::TempDir;
+
+    #[test]
+    fn f_a_vault_save_retries_first_sibling_collision() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("vault-store.json");
+        let vault = read_file_or_empty(&target).unwrap();
+        let expected = serde_json::to_value(&vault).unwrap();
+        let parent = dir.path().to_path_buf();
+        let collision = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let planted = collision.clone();
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |candidate| {
+                assert_eq!(candidate.parent(), Some(parent.as_path()));
+                if planted.borrow().is_none() {
+                    std::fs::write(candidate, b"foreign-vault-stage").unwrap();
+                    *planted.borrow_mut() = Some(candidate.to_path_buf());
+                }
+            },
+            || write_file(&target, &vault),
+        );
+        let foreign = collision
+            .borrow()
+            .clone()
+            .expect("production create observed");
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign-vault-stage");
+        result.expect("vault save must retry the first sibling collision");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+        assert_eq!(saved, expected);
+    }
+
+    #[test]
+    fn atomic_write_collision_preserves_foreign_vault_temporary_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("vault-store.json");
+        let tmp = dir.path().join("occupied.tmp");
+        std::fs::write(&path, b"canonical-before").unwrap();
+        std::fs::write(&tmp, b"foreign-before").unwrap();
+
+        let result = write_file_bytes_with_tmp(&path, b"{}", tmp.clone());
+
+        assert!(matches!(result, Err(SecretError::Io { path, .. }) if path == tmp));
+        assert_eq!(std::fs::read(&path).unwrap(), b"canonical-before");
+        assert_eq!(
+            std::fs::read(&tmp).ok().as_deref(),
+            Some(&b"foreign-before"[..])
+        );
+    }
 
     /// Surface tag for the only vault-using surface today. Resolved
     /// from [`Surface::Gemini::as_str()`] so the file-vault fixtures
@@ -902,6 +1239,161 @@ mod tests {
     }
 
     #[test]
+    fn named_existing_write_refuses_absence_but_first_write_can_initialize() {
+        let dir = TempDir::new().unwrap();
+        let vault = FileVault::open_test(dir.path()).unwrap();
+        let key = NamedKey::pool("fixture").unwrap();
+        std::fs::remove_file(&vault.pool_path).unwrap();
+        assert!(
+            matches!(
+                vault.set_named_existing(&key, &SecretString::from("synthetic-value")),
+                Err(SecretError::BackendUnavailable { .. })
+            ),
+            "must-exist named writes must refuse an absent file"
+        );
+        assert!(!vault.pool_path.try_exists().unwrap());
+        vault
+            .set_named(&key, &SecretString::from("synthetic-value"))
+            .unwrap();
+        assert!(vault.named_store_present().unwrap());
+    }
+
+    fn assert_loss_after_staging_refuses_publish(
+        operation: impl FnOnce(&FileVault, &NamedKey) -> Result<(), SecretError>,
+        message: &str,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let vault = FileVault::open_test(dir.path()).unwrap();
+        let key = NamedKey::pool("fixture").unwrap();
+        vault
+            .set_named(&key, &SecretString::from("synthetic-before-loss"))
+            .unwrap();
+        let hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = hit.clone();
+        let result = with_named_publish_hook(
+            move |path| {
+                // Slot file, named file, then the encrypted staged replacement.
+                assert_eq!(
+                    std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+                    3
+                );
+                std::fs::remove_file(path).unwrap();
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+            || operation(&vault, &key),
+        );
+        assert!(hit.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            matches!(result, Err(SecretError::BackendUnavailable { .. })),
+            "{message}"
+        );
+        assert!(!vault.pool_path.try_exists().unwrap());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn named_existing_write_refuses_loss_after_staging_before_publish() {
+        assert_loss_after_staging_refuses_publish(
+            |vault, key| vault.set_named_existing(key, &SecretString::from("synthetic-after-loss")),
+            "existing named write must refuse loss after staging before publish",
+        );
+    }
+
+    #[test]
+    fn named_delete_refuses_loss_after_staging_before_publish() {
+        assert_loss_after_staging_refuses_publish(
+            |vault, key| vault.delete_named(key),
+            "named delete must refuse loss after staging before publish",
+        );
+    }
+
+    #[test]
+    fn named_creation_allowed_write_preserves_initial_existence_requirement() {
+        assert_loss_after_staging_refuses_publish(
+            |vault, key| vault.set_named(key, &SecretString::from("synthetic-after-loss")),
+            "creation-allowed named write must not recreate an initially existing file",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_publish_refuses_undeterminable_presence_after_staging() {
+        let dir = TempDir::new().unwrap();
+        let vault = FileVault::open_test(dir.path()).unwrap();
+        let key = NamedKey::pool("fixture").unwrap();
+        let result = with_named_publish_hook(
+            |path| {
+                assert_eq!(
+                    std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+                    3
+                );
+                std::fs::remove_file(path).unwrap();
+                std::os::unix::fs::symlink("pool-vault-store.json", path).unwrap();
+            },
+            || vault.set_named_existing(&key, &SecretString::from("synthetic-value")),
+        );
+        assert!(
+            matches!(result, Err(SecretError::Io { .. })),
+            "undeterminable final presence must refuse named publication"
+        );
+        assert!(std::fs::symlink_metadata(&vault.pool_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn named_publish_hook_unwind_restores_scope_and_cleans_staging() {
+        let dir = TempDir::new().unwrap();
+        let vault = FileVault::open_test(dir.path()).unwrap();
+        let key = NamedKey::pool("fixture").unwrap();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_named_publish_hook(
+                |_| panic!("synthetic before-publish unwind"),
+                || vault.set_named_existing(&key, &SecretString::from("synthetic-value")),
+            )
+        }));
+        assert!(panicked.is_err());
+        assert!(BEFORE_NAMED_PUBLISH.with(|slot| slot.borrow().is_none()));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        vault
+            .set_named_existing(&key, &SecretString::from("synthetic-after-unwind"))
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_set_refuses_an_undeterminable_store_instead_of_recreating_it() {
+        let dir = TempDir::new().unwrap();
+        let vault = FileVault::open_test(dir.path()).unwrap();
+        let key = NamedKey::pool("fixture").unwrap();
+        std::fs::remove_file(&vault.pool_path).unwrap();
+        std::os::unix::fs::symlink("pool-vault-store.json", &vault.pool_path).unwrap();
+        assert!(
+            matches!(
+                vault.set_named(&key, &SecretString::from("synthetic-value")),
+                Err(SecretError::Io { .. })
+            ),
+            "an undeterminable store must not be recreated by set_named"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_delete_refuses_an_undeterminable_store_instead_of_claiming_success() {
+        let dir = TempDir::new().unwrap();
+        let vault = FileVault::open_test(dir.path()).unwrap();
+        let key = NamedKey::pool("fixture").unwrap();
+        std::fs::remove_file(&vault.pool_path).unwrap();
+        std::os::unix::fs::symlink("pool-vault-store.json", &vault.pool_path).unwrap();
+        assert!(
+            matches!(vault.delete_named(&key), Err(SecretError::Io { .. })),
+            "an undeterminable store must not count as a successful delete"
+        );
+    }
+
+    #[test]
     fn named_presence_does_not_decode_or_decrypt_payload() {
         let dir = TempDir::new().unwrap();
         let vault = FileVault::open_test(dir.path()).unwrap();
@@ -913,10 +1405,19 @@ mod tests {
         file.named_entries[0].nonce = "invalid-base64".into();
         file.named_entries[0].ciphertext = "invalid-base64".into();
         write_file(&vault.pool_path, &file).unwrap();
+        // F7: malformed named-item bytes are item-local; presence stays metadata-only.
         assert!(vault.contains_named(&key).unwrap());
         assert!(matches!(
             vault.get_named(&key),
-            Err(SecretError::DecryptionFailed)
+            Err(SecretError::NamedItemUnreadable)
+        ));
+
+        // A corrupt pool file remains a vault-wide I/O error under F7.
+        std::fs::write(&vault.pool_path, b"{broken-json").unwrap();
+        assert!(matches!(
+            vault.get_named(&key),
+            Err(SecretError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::InvalidData
         ));
     }
 
@@ -1134,6 +1635,56 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn named_wrong_key_remains_a_vault_wide_decryption_failure() {
+        let dir = TempDir::new().unwrap();
+        let writer = fast_open(dir.path());
+        let name = NamedKey::pool(&"11".repeat(16)).unwrap();
+        writer
+            .set_named(&name, &SecretString::from("synthetic-written-with-key-a"))
+            .unwrap();
+        let reader = FileVault {
+            pool_path: writer.pool_path.clone(),
+            pool_kdf: clone_kdf(&writer.pool_kdf),
+            path: writer.path().to_path_buf(),
+            master_key: SecretBytes(vec![0x99; AEAD_KEY_LEN]),
+        };
+        assert!(matches!(
+            reader.get_named(&name),
+            Err(SecretError::DecryptionFailed)
+        ));
+    }
+
+    #[test]
+    fn named_authenticated_invalid_utf8_is_an_item_read_failure() {
+        let dir = TempDir::new().unwrap();
+        let vault = fast_open(dir.path());
+        let name = NamedKey::pool(&"22".repeat(16)).unwrap();
+        vault
+            .set_named(&name, &SecretString::from("synthetic-original-item"))
+            .unwrap();
+        let mut stored = read_file(&vault.pool_path).unwrap();
+        let nonce = [1_u8; AEAD_NONCE_LEN];
+        let aad = format!("v1:{}", name.native_name());
+        let ciphertext = build_cipher(vault.master_key.as_slice())
+            .unwrap()
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &[0xff],
+                    aad: aad.as_bytes(),
+                },
+            )
+            .unwrap();
+        stored.named_entries[0].nonce = B64.encode(nonce);
+        stored.named_entries[0].ciphertext = B64.encode(ciphertext);
+        write_file(&vault.pool_path, &stored).unwrap();
+        assert!(matches!(
+            vault.get_named(&name),
+            Err(SecretError::NamedItemUnreadable)
+        ));
+    }
+
     /// Plaintext MUST NOT appear in the on-disk file. The most basic
     /// regression — if someone accidentally serializes the cleartext
     /// alongside the ciphertext, this test breaks loudly.
@@ -1333,6 +1884,123 @@ mod tests {
         }
         let listed = v.list_slots(GEMINI).unwrap();
         assert!(listed.is_empty());
+    }
+
+    /// Same query paths, but through a BROKEN parent: the base directory is
+    /// replaced by a regular file, so every child open fails with
+    /// `ERROR_PATH_NOT_FOUND` — `std` reports `NotFound`. Absence must NOT be
+    /// inferred from that: `get` and `list_slots` must Err, never return the
+    /// empty view (the slot-vault sibling of native run 41157525966). On unix
+    /// the same replacement fails with ENOTDIR, which `read_file` already maps
+    /// to an error, so only the Windows target can RED; the native run is the
+    /// instrument.
+    #[cfg(windows)]
+    #[test]
+    fn a_parent_replaced_by_a_file_is_not_an_absent_vault() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("base");
+        // `fast_open` writes the header but does not create the directory
+        // (production `open` does); the fixture owns that step.
+        std::fs::create_dir_all(&base).unwrap();
+        let vault = fast_open(&base);
+        vault
+            .set(slot(1), &SecretString::from("synthetic-value"))
+            .unwrap();
+        drop(vault);
+        let aside = dir.path().join("base.moved");
+        std::fs::rename(&base, &aside).unwrap();
+        std::fs::write(&base, b"not a directory").unwrap();
+        let vault = FileVault {
+            path: base.join(VAULT_FILE_NAME),
+            pool_path: base.join("pool-vault-store.json"),
+            ..fast_open(&aside)
+        };
+        assert!(
+            matches!(
+                vault.get(slot(1)),
+                Err(SecretError::BackendUnavailable { .. })
+            ),
+            "get through a broken parent must refuse, not report NotFound"
+        );
+        assert!(
+            matches!(
+                vault.list_slots(GEMINI),
+                Err(SecretError::BackendUnavailable { .. })
+            ),
+            "list_slots through a broken parent must refuse, not report an empty store"
+        );
+    }
+
+    /// R2 NEW-6: the parent is swapped for a DIFFERENT directory between the
+    /// child lookup and the re-check, so the child `NotFound` was produced by a
+    /// path that no longer leads to the checked store. Absence must refuse.
+    #[test]
+    fn absence_recheck_refuses_a_parent_swapped_between_lookups() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        let replacement = dir.path().join("replacement");
+        std::fs::create_dir(&replacement).unwrap();
+        let aside = dir.path().join("base.moved");
+        let target = base.join("pool-vault-store.json");
+        let result = with_absence_recheck_hook(
+            move |parent| {
+                std::fs::rename(parent, &aside).unwrap();
+                std::fs::rename(&replacement, parent).unwrap();
+            },
+            || vault_file_absent(&target),
+        );
+        assert!(
+            matches!(result, Err(SecretError::BackendUnavailable { .. })),
+            "a parent swapped between the lookups must refuse absence: {result:?}"
+        );
+    }
+
+    /// Control: with the parent unchanged, a missing child under a real
+    /// directory is determinately absent.
+    #[test]
+    fn absence_recheck_confirms_absence_under_an_unchanged_parent() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        assert!(vault_file_absent(&base.join("pool-vault-store.json")).unwrap());
+    }
+
+    /// R2 N3: a dangling symlink at `vault.json` must never be read as "first
+    /// use". Minting a new salt there would create the link target and rewrite
+    /// the header — permanent credential loss.
+    #[cfg(unix)]
+    #[test]
+    fn open_refuses_a_dangling_vault_symlink() {
+        let _shared_env_guard = crate::platform::test_env::lock();
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture();
+        std::env::remove_var(ENV_PASSPHRASE);
+        let pass_dir = TempDir::new().unwrap();
+        let pass_path = pass_dir.path().join("pass.txt");
+        std::fs::write(&pass_path, "synthetic-passphrase\n").unwrap();
+        std::env::set_var(ENV_PASSPHRASE_FILE, &pass_path);
+
+        let vault_dir = TempDir::new().unwrap();
+        let link = vault_dir.path().join(VAULT_FILE_NAME);
+        let missing = vault_dir.path().join("missing-target.json");
+        std::os::unix::fs::symlink(&missing, &link).unwrap();
+        let result = FileVault::open(vault_dir.path());
+        assert!(
+            matches!(result, Err(SecretError::Io { .. })),
+            "a dangling vault symlink must refuse first use: {result:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&missing).is_err(),
+            "the refused open must not create the symlink target"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must be untouched"
+        );
     }
 
     /// Future version numbers MUST be rejected explicitly so a

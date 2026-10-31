@@ -205,6 +205,19 @@ impl ProfilesFileLock {
     /// called best-effort AFTER the lock is taken (non-fatal on filesystems
     /// that cannot honour 0o600).
     pub fn acquire(base_dir: &Path) -> Result<Self, ConfigError> {
+        Self::acquire_bounded(base_dir)?.ok_or_else(|| ConfigError::InvalidJson {
+            path: Self::lock_path(base_dir),
+            // Fixed vocabulary: no `{e}`, no holder identity, no path.
+            reason: format!(
+                "profiles_lock_busy: lock not acquired within the {PROFILES_LOCK_BUDGET_MS} ms budget"
+            ),
+        })
+    }
+
+    /// Waits within the same budget as [`Self::acquire`], preserving the
+    /// distinction between expiry (`Ok(None)`) and local I/O refusal (`Err`).
+    /// Callers can classify contention without inspecting diagnostic text.
+    pub(crate) fn acquire_bounded(base_dir: &Path) -> Result<Option<Self>, ConfigError> {
         let path = Self::lock_path(base_dir);
 
         // SEC-2.15 (unified, R1 M1): the lock lives directly in the
@@ -226,27 +239,20 @@ impl ProfilesFileLock {
         // Create (or open) the lock file and take the exclusive lock within
         // the derived budget. Opening happens ONCE; only the lock attempts
         // are retried (`try_lock_file_bounded`).
-        let guard = lock::try_lock_file_bounded(
-            &path,
-            profiles_lock_attempts(),
-            PROFILES_LOCK_DELAY,
-        )
-        .map_err(|e| ConfigError::InvalidJson {
-            path: path.clone(),
-            // R3 corr L-1: the io kind is part of the durable failure text so
-            // a non-contention fault is never mistaken for busy.
-            reason: format!(
-                "profiles_lock_refused: {:?}",
-                crate::credentials::rescue::platform_error_kind(&e)
-            ),
-        })?
-        .ok_or_else(|| ConfigError::InvalidJson {
-            path: path.clone(),
-            // Fixed vocabulary: no `{e}`, no holder identity, no path.
-            reason: format!(
-                "profiles_lock_busy: lock not acquired within the {PROFILES_LOCK_BUDGET_MS} ms budget"
-            ),
-        })?;
+        let Some(guard) =
+            lock::try_lock_file_bounded(&path, profiles_lock_attempts(), PROFILES_LOCK_DELAY)
+                .map_err(|e| ConfigError::InvalidJson {
+                    path: path.clone(),
+                    // R3 corr L-1: the io kind is part of the durable failure text so
+                    // a non-contention fault is never mistaken for busy.
+                    reason: format!(
+                        "profiles_lock_refused: {:?}",
+                        crate::credentials::rescue::platform_error_kind(&e)
+                    ),
+                })?
+        else {
+            return Ok(None);
+        };
 
         // Best-effort secure_file AFTER the lock is taken — on a fresh
         // install the file does not exist before the lock call creates it, so
@@ -254,10 +260,10 @@ impl ProfilesFileLock {
         // carries no secrets; failure is non-fatal on FAT/network mounts.
         secure_file(&path).ok();
 
-        Ok(Self {
+        Ok(Some(Self {
             _guard: guard,
             path,
-        })
+        }))
     }
 
     /// A nonblocking authority witness for bounded keychain operations.

@@ -1,7 +1,7 @@
 //! Account-independent API-key pool configuration. No key argument exists.
 use anyhow::Result;
 use clap::Subcommand;
-use csq_core::pool::{Pool, PoolError, Reset};
+use csq_core::pool::{Pool, PoolError, PoolName, Reset};
 use secrecy::SecretString;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -40,10 +40,63 @@ pub enum PoolCommand {
     Remove { name: String },
     /// Recover an interrupted custody operation once its writer has stopped
     Recover,
+    /// Settle a key's uncertain execution holds at their full reserved cost
+    Resolve { name: String },
+    /// Lower the admission clock to now without refunding or deleting holds
+    RebaselineClock,
 }
 fn reset(day: Option<u8>, date: Option<String>) -> Option<Reset> {
     day.map(|day_of_month| Reset::Day { day_of_month })
         .or_else(|| date.map(|date| Reset::Date { date }))
+}
+fn write_pool_list(
+    output: &mut impl Write,
+    rows: &[csq_core::pool::PoolRow],
+    json: bool,
+) -> Result<()> {
+    if json {
+        writeln!(output, "{}", serde_json::to_string(rows)?)?;
+    } else {
+        for row in rows {
+            writeln!(
+                output,
+                "{}\t{}\t{}\treset={}\tcap={}\tpresent={}",
+                row.entry.name.as_str(),
+                row.entry.provider,
+                match row.entry.source {
+                    csq_core::pool::KeySource::EnvFile => "env-file",
+                    csq_core::pool::KeySource::SecretStore => "secret-store",
+                },
+                serde_json::to_string(&row.entry.reset)?,
+                serde_json::to_string(&row.entry.monthly_cap_usd)?,
+                row.present
+            )?;
+        }
+        if rows.iter().any(|row| row.vault_file_missing) {
+            writeln!(
+                output,
+                "vault file missing: restore it, or remove these entries"
+            )?;
+        }
+    }
+    Ok(())
+}
+fn write_pool_remove(output: &mut impl Write, vault_file_missing: bool, json: bool) -> Result<()> {
+    if json {
+        writeln!(
+            output,
+            "{}",
+            serde_json::json!({"removed": true, "vault_file_missing": vault_file_missing})
+        )?;
+    } else if vault_file_missing {
+        writeln!(
+            output,
+            "Pool entry removed. The vault file was missing; no stored key remained to delete."
+        )?;
+    } else {
+        writeln!(output, "Pool entry removed.")?;
+    }
+    Ok(())
 }
 pub fn handle(base_dir: &Path, action: PoolCommand, json: bool) -> Result<()> {
     let pool = Pool::new(base_dir);
@@ -82,24 +135,7 @@ pub fn handle(base_dir: &Path, action: PoolCommand, json: bool) -> Result<()> {
         }
         PoolCommand::List => {
             let rows = pool.list()?;
-            if json {
-                println!("{}", serde_json::to_string(&rows)?);
-            } else {
-                for row in rows {
-                    println!(
-                        "{}\t{}\t{}\treset={}\tcap={}\tpresent={}",
-                        row.entry.name.as_str(),
-                        row.entry.provider,
-                        match row.entry.source {
-                            csq_core::pool::KeySource::EnvFile => "env-file",
-                            csq_core::pool::KeySource::SecretStore => "secret-store",
-                        },
-                        serde_json::to_string(&row.entry.reset)?,
-                        serde_json::to_string(&row.entry.monthly_cap_usd)?,
-                        row.present
-                    );
-                }
-            }
+            write_pool_list(&mut std::io::stdout().lock(), &rows, json)?;
         }
         PoolCommand::SetReset {
             name,
@@ -121,15 +157,11 @@ pub fn handle(base_dir: &Path, action: PoolCommand, json: bool) -> Result<()> {
             );
         }
         PoolCommand::Remove { name } => {
-            csq_core::credentials::keychain::with_interactive_keychain(|| pool.remove(&name))?;
-            println!(
-                "{}",
-                if json {
-                    "{\"removed\":true}"
-                } else {
-                    "Pool entry removed."
-                }
-            );
+            let vault_file_missing =
+                csq_core::credentials::keychain::with_interactive_keychain(|| {
+                    pool.remove_with_outcome(&name)
+                })?;
+            write_pool_remove(&mut std::io::stdout().lock(), vault_file_missing, json)?;
         }
         PoolCommand::Recover => {
             csq_core::credentials::keychain::with_interactive_keychain(|| pool.recover_pending())?;
@@ -142,9 +174,44 @@ pub fn handle(base_dir: &Path, action: PoolCommand, json: bool) -> Result<()> {
                 }
             );
         }
+        PoolCommand::Resolve { name } => {
+            let name = PoolName::new(&name)?;
+            csq_core::pool::execution::resolve(base_dir, &name).map_err(resolve_error)?;
+            println!(
+                "{}",
+                if json {
+                    "{\"resolved\":true}"
+                } else {
+                    "Pool holds settled at full reserved cost."
+                }
+            );
+        }
+        PoolCommand::RebaselineClock => {
+            csq_core::pool::execution::rebaseline_clock(base_dir).map_err(resolve_error)?;
+            println!(
+                "{}",
+                if json {
+                    "{\"clock_rebaselined\":true}"
+                } else {
+                    "Pool admission clock rebaselined; spend and holds preserved."
+                }
+            );
+        }
     }
     Ok(())
 }
+
+// The core owns resolution and its uncertainty accounting. Only closed codes
+// and this exact invariant refusal cross the adapter, never arbitrary messages.
+fn resolve_error(error: csq_core::sdk::SdkError) -> anyhow::Error {
+    if error.code == csq_core::sdk::SdkErrorCode::PoolUnavailable
+        && error.message.as_str() == "pool_resolve_invariant_violation"
+    {
+        return anyhow::anyhow!("pool_resolve_invariant_violation");
+    }
+    anyhow::anyhow!(error.code.as_str())
+}
+
 fn read_input(reader: &mut impl Read) -> csq_core::pool::Result<SecretString> {
     // The extra byte bounds capacity without reallocating unwiped key prefixes.
     let mut bytes = Zeroizing::new(Vec::<u8>::with_capacity(4097));
@@ -318,6 +385,69 @@ impl Drop for EchoGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pool_cli_missing_vault_notice_is_once_per_list_and_absent_from_json() {
+        let rows: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|name| csq_core::pool::PoolRow {
+                entry: csq_core::pool::PoolEntry {
+                    name: PoolName::new(name).unwrap(),
+                    provider: "openai".into(),
+                    source: csq_core::pool::KeySource::SecretStore,
+                    reset: None,
+                    monthly_cap_usd: None,
+                    added_at: "2026-10-29T00:00:00Z".into(),
+                },
+                present: false,
+                vault_file_missing: true,
+            })
+            .collect();
+        let mut output = Vec::new();
+        write_pool_list(&mut output, &rows, false).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(
+            text.matches("vault file missing: restore it, or remove these entries")
+                .count(),
+            1,
+            "the CLI must print the vault recovery guidance once per list"
+        );
+        assert!(text.contains("first\topenai") && text.contains("second\topenai"));
+        let mut output = Vec::new();
+        write_pool_list(&mut output, &rows, true).unwrap();
+        let values: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(values.as_array().unwrap().len(), 2);
+        assert!(values
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["vault_file_missing"] == true));
+        let mut output = Vec::new();
+        write_pool_list(&mut output, &[], false).unwrap();
+        assert!(output.is_empty());
+    }
+    #[test]
+    fn pool_cli_remove_text_and_json_report_the_actual_vault_outcome() {
+        for vault_file_missing in [true, false] {
+            let mut output = Vec::new();
+            write_pool_remove(&mut output, vault_file_missing, false).unwrap();
+            assert_eq!(
+                String::from_utf8(output).unwrap(),
+                if vault_file_missing {
+                    "Pool entry removed. The vault file was missing; no stored key remained to delete.\n"
+                } else {
+                    "Pool entry removed.\n"
+                },
+                "the CLI removal text must describe the actual vault outcome"
+            );
+            let mut output = Vec::new();
+            write_pool_remove(&mut output, vault_file_missing, true).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&output).unwrap(),
+                serde_json::json!({"removed": true, "vault_file_missing": vault_file_missing}),
+                "the CLI removal JSON must preserve the vault_file_missing boolean"
+            );
+        }
+    }
     use secrecy::ExposeSecret;
     #[test]
     fn pool_stdin_is_bounded_and_key_errors_never_echo_input() {
@@ -380,6 +510,7 @@ mod tests {
         use clap::Parser;
         assert!(Cli::try_parse_from(["csq", "pool", "list", "--json"]).is_ok());
         assert!(Cli::try_parse_from(["csq", "pool", "recover"]).is_ok());
+        assert!(Cli::try_parse_from(["csq", "--json", "pool", "resolve", "one"]).is_ok());
         assert!(Cli::try_parse_from(["csq", "pool", "add", "one", "--provider", "openai"]).is_ok());
         assert!(
             Cli::try_parse_from(["csq", "pool", "add", "one", "--key", "synthetic-argv-key"])
@@ -422,5 +553,60 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.to_string(), "pool_invalid_cap");
         assert!(!dir.path().join("pool").exists());
+    }
+
+    #[test]
+    fn pool_resolve_error_discards_names_and_free_form_messages() {
+        let error = csq_core::sdk::SdkError::trusted(
+            csq_core::sdk::SdkErrorCode::PoolUnavailable,
+            "synthetic-key-name synthetic-key-value /synthetic/private/path",
+        );
+        assert_eq!(resolve_error(error).to_string(), "pool_unavailable");
+    }
+
+    #[test]
+    fn pool_clock_command_requires_no_confirmation_or_key_argument() {
+        use crate::cli::Cli;
+        use clap::Parser;
+        assert!(Cli::try_parse_from(["csq", "pool", "rebaseline-clock"]).is_ok());
+        assert!(Cli::try_parse_from(["csq", "--json", "pool", "rebaseline-clock"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "csq",
+            "pool",
+            "rebaseline-clock",
+            "--key",
+            "synthetic-argv-key",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn pool_resolve_error_preserves_exact_allowlisted_invariant_refusal() {
+        let error = csq_core::sdk::SdkError::trusted(
+            csq_core::sdk::SdkErrorCode::PoolUnavailable,
+            "pool_resolve_invariant_violation",
+        );
+        assert_eq!(
+            resolve_error(error).to_string(),
+            "pool_resolve_invariant_violation"
+        );
+    }
+
+    #[test]
+    fn pool_resolve_error_suppresses_invariant_message_with_wrong_code() {
+        let error = csq_core::sdk::SdkError::trusted(
+            csq_core::sdk::SdkErrorCode::Undetermined,
+            "pool_resolve_invariant_violation",
+        );
+        assert_eq!(resolve_error(error).to_string(), "undetermined");
+    }
+
+    #[test]
+    fn pool_resolve_error_suppresses_suffixed_invariant_message() {
+        let error = csq_core::sdk::SdkError::trusted(
+            csq_core::sdk::SdkErrorCode::PoolUnavailable,
+            "pool_resolve_invariant_violation synthetic-key-name synthetic-key-value",
+        );
+        assert_eq!(resolve_error(error).to_string(), "pool_unavailable");
     }
 }

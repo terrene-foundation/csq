@@ -2012,12 +2012,17 @@ mod tests {
         // reads identity.json. A LegacyUnknown context (provider + email) is
         // the state a pre-Known install leaves, and the witness records the
         // same legacy email, so the record is genuinely installable.
-        crate::accounts::identity_store::write_anthropic_metadata_new(
-            dir.path(),
-            uuid,
+        // This fixture replaces its own seeded metadata to model a legacy install.
+        // The create-only production helper must refuse an existing final target.
+        let metadata_path = identity_store::identity_json_path_for(dir.path(), uuid);
+        let legacy_metadata = serde_json::to_vec(
             &serde_json::json!({"provider": "anthropic", "email": "same@test.invalid"}),
         )
         .unwrap();
+        crate::platform::fs::write_private_tmp_synced_retained(&metadata_path, &legacy_metadata)
+            .unwrap()
+            .replace(&metadata_path)
+            .unwrap();
 
         // The witness's SOURCE is the live canonical: adoption can prove it.
         let rescued = make_creds("rescued-at", "rescued-rt", now_secs_test() + 3600);

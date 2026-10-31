@@ -57,7 +57,7 @@
 //! the WARN.  Spec 12 §12.4 documents the contract.
 
 use csq_core::audit::{AuditRecord, Decision, RedactedString, ResultState};
-use csq_core::platform::fs::{atomic_replace, unique_tmp_path, write_new_private};
+use csq_core::platform::fs::{unique_tmp_path, write_new_private_retained};
 #[cfg(unix)]
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -665,21 +665,27 @@ fn write_pending(pending_dir: &Path, run_id: &str, bytes: &[u8]) -> Result<(), S
 
     let target = pending_dir.join(format!("{run_id}.jsonl"));
     let tmp = unique_tmp_path(&target);
+    write_pending_at_tmp(&target, &tmp, bytes)
+}
 
+// Keep the selected temporary path explicit so collision handling can be
+// exercised without predicting the process-wide unique-path counter.
+fn write_pending_at_tmp(target: &Path, tmp: &Path, bytes: &[u8]) -> Result<(), String> {
     // §5a: `write_new_private` creates the tmp file at 0o600 at creation,
     // closing the window a separate write + secure_file pair would leave
     // open. Treated as secret-bearing under ambiguity-resolves-closed —
     // an audit record for a `csq run` invocation may embed sensitive
     // command args or output.
-    if let Err(e) = write_new_private(&tmp, bytes) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!(
-            "write .pending/ tmp: {}",
-            csq_core::error::redact_tokens(&e.to_string())
-        ));
-    }
-    if let Err(e) = atomic_replace(&tmp, &target) {
-        let _ = std::fs::remove_file(&tmp);
+    let writer = match write_new_private_retained(tmp, bytes) {
+        Ok(writer) => writer,
+        Err(e) => {
+            return Err(format!(
+                "write .pending/ tmp: {}",
+                csq_core::error::redact_tokens(&e.to_string())
+            ));
+        }
+    };
+    if let Err(e) = writer.replace(target) {
         return Err(format!(
             "atomic-replace .pending/ file: {}",
             csq_core::error::redact_tokens(&e.to_string())
@@ -789,6 +795,44 @@ mod tests {
             dir_mode, 0o700,
             ".pending/ dir must be mode 0o700, got 0o{dir_mode:o}"
         );
+    }
+
+    #[test]
+    fn write_pending_exclusive_create_collision_preserves_foreign_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("synthetic-run.jsonl");
+        let tmp = dir.path().join("foreign.tmp");
+        std::fs::write(&target, b"previous audit record").unwrap();
+        std::fs::write(&tmp, b"foreign temporary payload").unwrap();
+
+        let error = write_pending_at_tmp(&target, &tmp, b"new private audit").unwrap_err();
+
+        assert!(error.starts_with("write .pending/ tmp:"), "{error}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"previous audit record");
+        assert_eq!(
+            std::fs::read(&tmp).unwrap(),
+            b"foreign temporary payload",
+            "failed exclusive creation must preserve the file it did not create"
+        );
+    }
+
+    #[test]
+    fn write_pending_publish_failure_removes_tmp_and_preserves_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending_dir = dir.path().join(".pending");
+        let destination = pending_dir.join("synthetic-run.jsonl");
+        std::fs::create_dir_all(&destination).unwrap();
+        let sentinel = destination.join("sentinel");
+        std::fs::write(&sentinel, b"unchanged").unwrap();
+
+        // A nonempty directory forces publication to fail after the tmp write.
+        assert!(write_pending(&pending_dir, "synthetic-run", b"synthetic-private-audit").is_err());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+        let names: Vec<_> = std::fs::read_dir(&pending_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("synthetic-run.jsonl")]);
     }
 
     // ── write_pending: §5a tmp-cleanup on readonly parent ─────────────────

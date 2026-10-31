@@ -210,11 +210,9 @@ where
 
 fn write_marker(marker: &Path) {
     let tmp = crate::platform::fs::unique_tmp_path(marker);
-    let written = crate::platform::fs::write_new_private(&tmp, b"1\n")
-        .map_err(|_| ())
-        .and_then(|()| crate::platform::fs::atomic_replace(&tmp, marker).map_err(|_| ()));
+    let written = crate::platform::fs::write_new_private_retained(&tmp, b"1\n")
+        .and_then(|written| written.replace(marker));
     if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
         warn!(
             event = "kimi_model_migration_marker_write_failed",
             "kimi model migration: one-shot marker not written; the next launch re-runs it"

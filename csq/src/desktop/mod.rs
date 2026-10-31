@@ -2820,29 +2820,160 @@ mod tests {
 
 #[cfg(test)]
 mod startup_wiring_tests {
-    /// Whether `src`'s setup closure contains a LIVE call (not a comment) to
-    /// `daemon_supervisor::install_panic_hook(`. The call must sit between
-    /// `.setup(...)` and the `.build(tauri::generate_context!())` that closes
-    /// the builder chain.
-    ///
-    /// A commented-out call does NOT satisfy this: the line is skipped when
-    /// its trimmed text starts with `//`, so disabling the install by
-    /// commenting it out reds the real-source test instead of passing it.
+    fn is_ident_char(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
+    }
+
+    /// True when the text after an already-consumed `r` (or before it, for a
+    /// `b` prefix) opens a raw string: `#`* then `"`.
+    fn raw_string_opens(first: char, chars: &std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+        let mut look = chars.clone();
+        if first == 'b' {
+            look.next(); // the `r`
+        }
+        while look.peek() == Some(&'#') {
+            look.next();
+        }
+        look.peek() == Some(&'"')
+    }
+
+    /// Number of chars AFTER an opening `'` that belong to a char literal
+    /// (body plus closing quote), or None when the `'` starts a lifetime.
+    fn char_literal_len(chars: &std::iter::Peekable<std::str::Chars<'_>>) -> Option<usize> {
+        let mut look = chars.clone();
+        match look.next()? {
+            '\\' => {
+                let mut n = 2; // the backslash and the escaped char
+                look.next()?;
+                for c in look {
+                    n += 1;
+                    if c == '\'' {
+                        return Some(n);
+                    }
+                    if n > 12 {
+                        return None;
+                    }
+                }
+                None
+            }
+            '\'' => None,
+            _ => (look.next()? == '\'').then_some(2),
+        }
+    }
+
+    /// Lexical source assertion: require an unconditional, standalone statement
+    /// in the setup closure. Nested blocks and attributed statements do not
+    /// establish startup wiring. This deliberately accepts no cfg attributes.
     fn setup_calls_install_panic_hook(src: &str) -> bool {
-        let Some(setup_start) = src.find(".setup(|app| {") else {
+        // Mask comments and quoted strings before counting braces. Block
+        // comments nest in Rust; preserve newlines only for readable fixtures.
+        let mut chars = src.chars().peekable();
+        let mut code = String::new();
+        let mut block_depth = 0;
+        let mut quoted = false;
+        while let Some(c) = chars.next() {
+            if block_depth > 0 {
+                if c == '/' && chars.peek() == Some(&'*') {
+                    chars.next();
+                    block_depth += 1;
+                } else if c == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    block_depth -= 1;
+                    code.push(' ');
+                }
+            } else if quoted {
+                if c == '\\' {
+                    chars.next();
+                } else if c == '"' {
+                    quoted = false;
+                }
+            } else if c == '"' {
+                quoted = true;
+                code.push(' ');
+            } else if (c == 'r' || (c == 'b' && chars.peek() == Some(&'r')))
+                && !code.chars().next_back().is_some_and(is_ident_char)
+                && raw_string_opens(c, &chars)
+            {
+                // Raw string r"..", r#".."#, br"..": no escapes, closed only
+                // by a quote followed by the same number of `#`.
+                if c == 'b' {
+                    chars.next();
+                }
+                let mut hashes = 0;
+                while chars.peek() == Some(&'#') {
+                    chars.next();
+                    hashes += 1;
+                }
+                chars.next(); // the opening quote
+                let mut run = 0;
+                for c in chars.by_ref() {
+                    if c == '"' {
+                        run = 1;
+                    } else if c == '#' && run > 0 {
+                        run += 1;
+                    } else {
+                        run = 0;
+                    }
+                    if run == hashes + 1 {
+                        break;
+                    }
+                }
+                code.push(' ');
+            } else if c == '\'' && char_literal_len(&chars).is_some() {
+                // Char literal ('"', '{', '\'', '\u{41}'): a lifetime such as
+                // 'a is NOT one and stays code.
+                for _ in 0..char_literal_len(&chars).unwrap_or(0) {
+                    chars.next();
+                }
+                code.push(' ');
+            } else if c == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                block_depth = 1;
+                code.push(' ');
+            } else if c == '/' && chars.peek() == Some(&'/') {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+                code.push(' ');
+            } else {
+                code.push(c);
+            }
+        }
+        let setup = ".setup(|app| {";
+        let Some(start) = code.find(setup) else {
             return false;
         };
-        let Some(relative_end) = src[setup_start..].find(".build(tauri::generate_context!())")
-        else {
+        let body = &code[start + setup.len()..];
+        let Some(end) = body.find(".build(tauri::generate_context!())") else {
             return false;
         };
-        src[setup_start..setup_start + relative_end]
-            .lines()
-            .any(|line| {
-                let trimmed = line.trim();
-                !trimmed.starts_with("//")
-                    && trimmed.starts_with("daemon_supervisor::install_panic_hook(")
-            })
+        let mut depth = 0;
+        let mut statement = String::new();
+        for c in body[..end].chars().filter(|c| !c.is_whitespace()) {
+            match c {
+                '{' => depth += 1,
+                '}' if depth == 0 => return false,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        statement.clear();
+                        continue;
+                    }
+                }
+                ';' if depth == 0 => {
+                    if statement == "daemon_supervisor::install_panic_hook()" {
+                        return true;
+                    }
+                    statement.clear();
+                    continue;
+                }
+                _ => {}
+            }
+            statement.push(c);
+        }
+        false
     }
 
     /// The app's setup closure must install the redacting panic hook before
@@ -2869,8 +3000,105 @@ mod startup_wiring_tests {
     }
 
     #[test]
+    fn a_block_commented_install_call_does_not_count() {
+        let src = ".setup(|app| {\n/* outer /* nested */\n\
+                   daemon_supervisor::install_panic_hook();\n*/\n})\n\
+                   .build(tauri::generate_context!())";
+        assert!(!setup_calls_install_panic_hook(src));
+    }
+
+    #[test]
+    fn an_if_false_install_call_does_not_count() {
+        let src = ".setup(|app| {\nif false {\n\
+                   daemon_supervisor::install_panic_hook();\n}\n})\n\
+                   .build(tauri::generate_context!())";
+        assert!(!setup_calls_install_panic_hook(src));
+    }
+
+    #[test]
+    fn a_cfg_disabled_install_call_does_not_count() {
+        let src = ".setup(|app| {\n#[cfg(any())]\n\
+                   daemon_supervisor::install_panic_hook();\n})\n\
+                   .build(tauri::generate_context!())";
+        assert!(!setup_calls_install_panic_hook(src));
+    }
+
+    #[test]
     fn a_live_install_call_counts() {
         let src = ".setup(|app| {\n    daemon_supervisor::install_panic_hook();\n})\n\
+                   .build(tauri::generate_context!())";
+        assert!(setup_calls_install_panic_hook(src));
+    }
+
+    #[test]
+    fn a_quote_char_literal_does_not_open_a_string() {
+        let src = ".setup(|app| {\nlet q = '\"';\n\
+                   daemon_supervisor::install_panic_hook();\n})\n\
+                   .build(tauri::generate_context!())";
+        assert!(setup_calls_install_panic_hook(src));
+    }
+
+    #[test]
+    fn a_brace_char_literal_does_not_unbalance_the_body() {
+        let src = ".setup(|app| {\nlet open = '{';\nlet esc = '\\'';\n\
+                   daemon_supervisor::install_panic_hook();\n})\n\
+                   .build(tauri::generate_context!())";
+        assert!(setup_calls_install_panic_hook(src));
+        let wrong = ".setup(|app| {\nlet open = '{';\n})\n\
+                     .build(tauri::generate_context!())";
+        assert!(!setup_calls_install_panic_hook(wrong));
+    }
+
+    #[test]
+    fn a_lifetime_is_code_not_a_char_literal() {
+        let src = ".setup(|app| {\nlet _f: fn(&'a str) = |_| {};\n\
+                   daemon_supervisor::install_panic_hook();\n})\n\
+                   .build(tauri::generate_context!())";
+        assert!(setup_calls_install_panic_hook(src));
+    }
+
+    #[test]
+    fn a_call_inside_a_raw_string_does_not_count() {
+        let src = ".setup(|app| {\nlet s = r#\"a\" ; \
+                   daemon_supervisor::install_panic_hook(); \"#;\n})\n\
+                   .build(tauri::generate_context!())";
+        assert!(!setup_calls_install_panic_hook(src));
+    }
+
+    #[test]
+    fn a_byte_raw_string_hides_a_call_inside_it() {
+        let src = ".setup(|app| {\nlet s = br#\"a\" ; \
+                   daemon_supervisor::install_panic_hook(); \"#;\n})\n\
+                   .build(tauri::generate_context!())";
+        assert!(!setup_calls_install_panic_hook(src));
+    }
+
+    #[test]
+    fn a_multi_hash_raw_string_closes_only_on_the_same_hash_count() {
+        // `"#` inside an r##"…"## string does not close it; the call after the
+        // inner `"#` is still inside the string and must not count.
+        let hidden = ".setup(|app| {\nlet s = r##\"x\"# ; \
+                      daemon_supervisor::install_panic_hook(); \"##;\n})\n\
+                      .build(tauri::generate_context!())";
+        assert!(!setup_calls_install_panic_hook(hidden));
+        let live = ".setup(|app| {\nlet s = r##\"x\"# \"##;\n\
+                    daemon_supervisor::install_panic_hook();\n})\n\
+                    .build(tauri::generate_context!())";
+        assert!(setup_calls_install_panic_hook(live));
+    }
+
+    #[test]
+    fn a_raw_identifier_is_code_not_a_raw_string() {
+        let src = ".setup(|app| {\nlet r#type = 1;\n\
+                   daemon_supervisor::install_panic_hook();\n})\n\
+                   .build(tauri::generate_context!())";
+        assert!(setup_calls_install_panic_hook(src));
+    }
+
+    #[test]
+    fn a_raw_string_ending_in_a_backslash_does_not_swallow_the_call() {
+        let src = ".setup(|app| {\nlet s = r\"\\\";\n\
+                   daemon_supervisor::install_panic_hook();\n})\n\
                    .build(tauri::generate_context!())";
         assert!(setup_calls_install_panic_hook(src));
     }

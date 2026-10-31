@@ -80,7 +80,7 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 use crate::audit::key_custody::KeyCustodyError;
-use crate::platform::fs::{atomic_replace, secure_dir, unique_tmp_path, write_new_private};
+use crate::platform::fs::{secure_dir, unique_tmp_path, write_new_private_retained};
 
 /// Which key slot within a chain's keystore.
 ///
@@ -161,7 +161,7 @@ fn ensure_parent_dir(
 ///
 /// The payload is private-key material; the write follows the §5a pipeline
 /// (`unique_tmp_path → write_new_private(0o600 at creation) → atomic_replace`)
-/// with `remove_file(&tmp)` on EVERY failure branch so a crash mid-write
+/// with writer-owned cleanup on EVERY failure branch so a crash mid-write
 /// cannot leave the seed readable at a umask-default mode.
 ///
 /// `payload` is taken as `&Zeroizing<String>` so the caller's copy is zeroed on
@@ -184,12 +184,14 @@ pub fn store_payload(
     // §5a: `write_new_private` creates the tmp file at 0o600 at creation,
     // closing the window a separate write + secure_file pair would leave
     // open for this private-key-material tmp file.
-    if let Err(e) = write_new_private(&tmp, payload.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(KeyCustodyError::ChainIo(format!("seed file write: {e}")));
-    }
-    if let Err(e) = atomic_replace(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
+    let writer = match write_new_private_retained(&tmp, payload.as_bytes()) {
+        Ok(writer) => writer,
+        // The private writer cleans up only files it created; collisions stay untouched.
+        Err(e) => {
+            return Err(KeyCustodyError::ChainIo(format!("seed file write: {e}")));
+        }
+    };
+    if let Err(e) = writer.replace(&path) {
         return Err(KeyCustodyError::ChainIo(format!(
             "seed file atomic replace: {e}"
         )));
@@ -296,6 +298,34 @@ mod tests {
             .expect("load ok")
             .expect("present");
         assert_eq!(got.as_str(), pl.as_str());
+    }
+
+    #[test]
+    fn seed_publish_failure_removes_private_tmp_and_preserves_destination() {
+        let t = tmp();
+        let path = seed_file_path(t.path(), "CHAIN1", KeySlot::Active);
+        std::fs::create_dir_all(&path).unwrap();
+        let sentinel = path.join("keep");
+        std::fs::write(&sentinel, b"destination sentinel").unwrap();
+
+        let error = store_payload(
+            t.path(),
+            "CHAIN1",
+            KeySlot::Active,
+            &payload(&"b".repeat(64)),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("seed file atomic replace"));
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"destination sentinel");
+        let remaining: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![path],
+            "failed publication must remove its tmp"
+        );
     }
 
     #[test]

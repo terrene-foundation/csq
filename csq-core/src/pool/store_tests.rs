@@ -10,6 +10,235 @@ fn fixture() -> (tempfile::TempDir, Pool) {
 }
 const SYNTHETIC: &str = "synthetic-pool-value-not-a-real-key";
 
+#[derive(Clone)]
+struct LossBeforeWriteVault {
+    inner: std::sync::Arc<FileVault>,
+    path: PathBuf,
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl LossBeforeWriteVault {
+    fn before_write(&self) {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            std::fs::remove_file(&self.path).unwrap();
+        }
+    }
+}
+impl Vault for LossBeforeWriteVault {
+    fn named_store_present(&self) -> std::result::Result<bool, secret::SecretError> {
+        self.inner.named_store_present()
+    }
+    fn set_named(
+        &self,
+        key: &NamedKey,
+        secret: &SecretString,
+    ) -> std::result::Result<(), secret::SecretError> {
+        self.before_write();
+        self.inner.set_named(key, secret)
+    }
+    fn set_named_existing(
+        &self,
+        key: &NamedKey,
+        secret: &SecretString,
+    ) -> std::result::Result<(), secret::SecretError> {
+        self.before_write();
+        self.inner.set_named_existing(key, secret)
+    }
+    fn get_named(&self, key: &NamedKey) -> std::result::Result<SecretString, secret::SecretError> {
+        self.inner.get_named(key)
+    }
+    fn delete_named(&self, key: &NamedKey) -> std::result::Result<(), secret::SecretError> {
+        self.inner.delete_named(key)
+    }
+    fn contains_named(&self, key: &NamedKey) -> std::result::Result<bool, secret::SecretError> {
+        self.inner.contains_named(key)
+    }
+    fn set(
+        &self,
+        _: secret::SlotKey,
+        _: &SecretString,
+    ) -> std::result::Result<(), secret::SecretError> {
+        panic!("fixture named-only")
+    }
+    fn get(&self, _: secret::SlotKey) -> std::result::Result<SecretString, secret::SecretError> {
+        panic!("fixture named-only")
+    }
+    fn delete(&self, _: secret::SlotKey) -> std::result::Result<(), secret::SecretError> {
+        panic!("fixture named-only")
+    }
+    fn list_slots(
+        &self,
+        _: &'static str,
+    ) -> std::result::Result<Vec<crate::types::AccountNum>, secret::SecretError> {
+        panic!("fixture named-only")
+    }
+    fn backend_id(&self) -> &'static str {
+        self.inner.backend_id()
+    }
+}
+fn loss_before_write_fixture() -> (tempfile::TempDir, Pool, LossBeforeWriteVault) {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = LossBeforeWriteVault {
+        inner: std::sync::Arc::new(
+            FileVault::open_test(&dir.path().join("fixture-vault")).unwrap(),
+        ),
+        path: dir.path().join("fixture-vault/pool-vault-store.json"),
+        armed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let pool = Pool::with_vault(dir.path(), Box::new(vault.clone()));
+    (dir, pool, vault)
+}
+
+#[test]
+fn pool_add_losing_vault_after_presence_check_refuses_without_recreation() {
+    let (dir, pool, vault) = loss_before_write_fixture();
+    pool.add("a", "openai", SYNTHETIC.into(), None, Some(1.0))
+        .unwrap();
+    let env = dir.path().join("fixture.env");
+    fs::write_new_private_synced(&env, b"b=synthetic-env-b\n").unwrap();
+    pool.add_env_file(&env, &["b".into()], "openai", None, Some(1.0))
+        .unwrap();
+    vault.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        pool.add("c", "openai", "synthetic-native-c".into(), None, Some(1.0)),
+        Err(PoolError::StoreUnavailable),
+        "add must refuse when the native vault disappears at its writer"
+    );
+    assert!(
+        !vault.path.try_exists().unwrap(),
+        "refused add must not recreate the vault"
+    );
+    assert_eq!(pool.load().unwrap().entries.len(), 2);
+    assert!(!pool.root.join("transaction.json").exists());
+}
+
+#[test]
+fn pool_remove_backup_losing_vault_refuses_without_recreation() {
+    let (_dir, pool, vault) = loss_before_write_fixture();
+    pool.add("a", "openai", SYNTHETIC.into(), None, Some(1.0))
+        .unwrap();
+    pool.add("c", "openai", "synthetic-native-c".into(), None, Some(1.0))
+        .unwrap();
+    vault.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        pool.remove("a"),
+        Err(PoolError::StoreUnavailable),
+        "remove backup must refuse when the native vault disappears at its writer"
+    );
+    assert!(
+        !vault.path.try_exists().unwrap(),
+        "refused remove must not recreate the vault"
+    );
+    assert_eq!(pool.load().unwrap().entries.len(), 2);
+    assert!(!pool.root.join("transaction.json").exists());
+}
+
+#[test]
+fn pool_oversized_json_is_invalid_before_any_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join("manifest.json");
+    let oversized = "x".repeat(MAX_MANIFEST_BYTES as usize + 1);
+    assert_eq!(
+        write_json(&destination, &oversized),
+        Err(PoolError::ManifestInvalid),
+        "oversized metadata is invalid, not a write failure"
+    );
+    assert!(!destination.exists());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn pool_lost_native_vault_blocks_add_before_recreating_the_store() {
+    let (dir, pool) = fixture();
+    pool.add("a", "openai", SYNTHETIC.into(), None, Some(1.0))
+        .unwrap();
+    let env = dir.path().join("fixture.env");
+    fs::write_new_private_synced(&env, b"b=synthetic-env-b\n").unwrap();
+    pool.add_env_file(&env, &["b".into()], "openai", None, Some(1.0))
+        .unwrap();
+    let vault = dir.path().join("fixture-vault/pool-vault-store.json");
+    std::fs::remove_file(&vault).unwrap();
+    assert_eq!(
+        pool.add("c", "openai", "synthetic-native-c".into(), None, Some(1.0)),
+        Err(PoolError::StoreUnavailable),
+        "a lost native store must refuse add before recreating it"
+    );
+    assert!(!vault.try_exists().unwrap());
+    assert!(!pool.root.join("transaction.json").exists());
+}
+
+#[test]
+fn pool_missing_vault_list_distinguishes_file_outage_from_missing_item() {
+    let (dir, pool) = fixture();
+    pool.add("a", "openai", SYNTHETIC.into(), None, None)
+        .unwrap();
+    let env = dir.path().join("fixture.env");
+    fs::write_new_private_synced(&env, b"b=synthetic-env-b\n").unwrap();
+    pool.add_env_file(&env, &["b".into()], "openai", None, None)
+        .unwrap();
+    std::fs::remove_file(dir.path().join("fixture-vault/pool-vault-store.json")).unwrap();
+    let rows = pool.list().unwrap();
+    let native = rows
+        .iter()
+        .find(|row| row.entry.name.as_str() == "a")
+        .unwrap();
+    assert!(
+        native.vault_file_missing,
+        "listing must expose the missing vault file explicitly"
+    );
+    assert!(!native.present);
+    let env = rows
+        .iter()
+        .find(|row| row.entry.name.as_str() == "b")
+        .unwrap();
+    assert!(env.present);
+    assert!(!env.vault_file_missing);
+    assert_eq!(
+        serde_json::to_value(native).unwrap()["vault_file_missing"],
+        true
+    );
+}
+
+#[test]
+fn pool_confirmed_missing_vault_allows_manifest_row_removal() {
+    let (dir, pool) = fixture();
+    pool.add("a", "openai", SYNTHETIC.into(), None, None)
+        .unwrap();
+    pool.add("c", "openai", "synthetic-native-c".into(), None, None)
+        .unwrap();
+    std::fs::remove_file(dir.path().join("fixture-vault/pool-vault-store.json")).unwrap();
+    let snapshot = pool.removal_snapshot("a").unwrap();
+    assert_eq!(
+        pool.remove_if_unchanged_with_outcome(&snapshot),
+        Ok(true),
+        "confirmed absent vault must allow explicit removal of its manifest row"
+    );
+    assert_eq!(pool.remove_with_outcome("c"), Ok(true));
+    assert!(pool.list().unwrap().is_empty());
+    assert!(!pool.root.join("transaction.json").exists());
+}
+
+#[test]
+fn pool_unreadable_native_vault_refuses_add_and_remove_as_store_wide() {
+    let (dir, pool) = fixture();
+    pool.add("a", "openai", SYNTHETIC.into(), None, None)
+        .unwrap();
+    std::fs::write(
+        dir.path().join("fixture-vault/pool-vault-store.json"),
+        b"invalid-json",
+    )
+    .unwrap();
+    assert_eq!(
+        pool.add("c", "openai", "synthetic-native-c".into(), None, None),
+        Err(PoolError::StoreUnavailable)
+    );
+    assert_eq!(
+        pool.remove("a"),
+        Err(PoolError::StoreUnavailable),
+        "an unreadable vault must refuse removal as a store-wide outage"
+    );
+    assert_eq!(pool.load().unwrap().entries.len(), 1);
+}
+
 #[test]
 fn pool_file_custody_add_list_reset_read_remove_never_serializes_secret() {
     let (dir, pool) = fixture();
@@ -151,10 +380,13 @@ fn pool_env_file_is_literal_allowlisted_and_reread_per_request() {
 fn pool_presence_does_not_parse_value_and_ambiguous_admitted_values_refuse() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("input.env");
-    crate::platform::fs::write_new_private_synced(&path, b"one='unterminated\n").unwrap();
+    crate::platform::fs::write_new_private_synced(&path, b"one=synthetic-initial\n").unwrap();
     let pool = Pool::new(dir.path());
     pool.add_env_file(&path, &["one".into()], "anthropic", None, None)
         .unwrap();
+    // Admission now fingerprints a valid value. Listing still checks only
+    // assignment presence after a later source edit makes its value invalid.
+    std::fs::write(&path, b"one='unterminated\n").unwrap();
     assert!(pool.list().unwrap()[0].present);
     assert_eq!(pool.read_key("one").unwrap_err(), PoolError::EnvFileInvalid);
     std::fs::write(&path, "one=synthetic-one\none=synthetic-two\n").unwrap();
@@ -343,6 +575,9 @@ impl Vault for FaultVault {
             }
             3 => {
                 self.inner.set_named(name, value)?;
+                // The salt is already durable before the native mutation.
+                // Replace that manifest with an irregular target to fail publication.
+                std::fs::remove_file(&self.manifest).unwrap();
                 std::fs::create_dir(&self.manifest).unwrap();
                 Ok(())
             }
@@ -449,7 +684,7 @@ fn pool_add_publication_failure_compensates_native_item_inline() {
     let (_dir, pool, vault) = fault_fixture(3);
     assert_eq!(
         pool.add("one", "openai", SYNTHETIC.into(), None, None),
-        Err(PoolError::MutationRefused)
+        Err(PoolError::ManifestWriteUnavailable)
     );
     assert!(!pool.root.join("transaction.json").exists());
     let name = vault.last_named.lock().unwrap().clone().unwrap();
@@ -931,6 +1166,13 @@ impl Vault for NativeFileFixture {
         s: &SecretString,
     ) -> std::result::Result<(), secret::SecretError> {
         self.0.set_named(k, s)
+    }
+    fn set_named_existing(
+        &self,
+        k: &NamedKey,
+        s: &SecretString,
+    ) -> std::result::Result<(), secret::SecretError> {
+        self.0.set_named_existing(k, s)
     }
     fn get_named(&self, k: &NamedKey) -> std::result::Result<SecretString, secret::SecretError> {
         self.0.get_named(k)

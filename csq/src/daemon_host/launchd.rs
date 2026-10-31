@@ -510,7 +510,7 @@ fn ensure_managed_daemon_plist_at_with_identity(
         job_state,
         |operation, path| execute(managed_daemon_launchctl_command(operation, path, euid)?),
         rollback_identity,
-        |from, to| csq_core::platform::fs::atomic_replace(from, to).map_err(Into::into),
+        |_from, to, writer| writer.replace(to).map_err(Into::into),
     )
 }
 
@@ -670,7 +670,7 @@ fn ensure_managed_daemon_plist_with(
         job_state,
         launchctl,
         managed_daemon_rollback_identity_checker(),
-        |from, to| csq_core::platform::fs::atomic_replace(from, to).map_err(Into::into),
+        |_from, to, writer| writer.replace(to).map_err(Into::into),
     )
 }
 
@@ -933,7 +933,11 @@ fn ensure_managed_daemon_plist_with_operations(
     mut job_state: impl FnMut() -> ManagedJobState,
     mut launchctl: impl FnMut(&str, &Path) -> Result<()>,
     mut rollback_identity: impl FnMut(&Path, bool) -> bool,
-    mut atomic_replace: impl FnMut(&Path, &Path) -> Result<()>,
+    mut atomic_replace: impl FnMut(
+        &Path,
+        &Path,
+        csq_core::platform::fs::WrittenPrivateFile,
+    ) -> Result<()>,
 ) -> Result<ManagedPlistOutcome> {
     let original = match std::fs::read(plist_path) {
         Ok(bytes) => Some(bytes),
@@ -971,15 +975,14 @@ fn ensure_managed_daemon_plist_with_operations(
         }
     }
 
-    let rollback = if needs_bootout {
+    let mut rollback = if needs_bootout {
         let bytes = original
             .as_deref()
             .context("managed_plist_rollback_unavailable")?;
-        let staged = stage_managed_daemon_plist(plist_path, bytes)?;
+        let staged = stage_managed_daemon_plist_written(plist_path, bytes)?;
         // Decode the preserved snapshot, not mutable on-disk metadata. Never
         // reload an arbitrary Label after a repair error.
-        if !rollback_identity(&staged, false) {
-            let _ = std::fs::remove_file(&staged);
+        if !rollback_identity(&staged.0, false) {
             anyhow::bail!("managed_plist_rollback_identity_unknown");
         }
         Some(staged)
@@ -987,16 +990,8 @@ fn ensure_managed_daemon_plist_with_operations(
         None
     };
 
-    let candidate = if !content_matches {
-        match stage_managed_daemon_plist(plist_path, expected) {
-            Ok(staged) => Some(staged),
-            Err(error) => {
-                if let Some(rollback) = &rollback {
-                    let _ = std::fs::remove_file(rollback);
-                }
-                return Err(error);
-            }
-        }
+    let mut candidate = if !content_matches {
+        Some(stage_managed_daemon_plist_written(plist_path, expected)?)
     } else {
         None
     };
@@ -1017,8 +1012,9 @@ fn ensure_managed_daemon_plist_with_operations(
             }
             booted_out = true;
         }
-        if let Some(candidate) = &candidate {
-            atomic_replace(candidate, plist_path).context("replace managed daemon plist")?;
+        if let Some(candidate) = candidate.take() {
+            atomic_replace(&candidate.0, plist_path, candidate.1)
+                .context("replace managed daemon plist")?;
         }
         load_attempted = true;
         launchctl("load", plist_path).context("could not load managed daemon plist")?;
@@ -1036,14 +1032,15 @@ fn ensure_managed_daemon_plist_with_operations(
                     .as_deref()
                     .context("managed_plist_rollback_unavailable")?;
                 let rollback = rollback
-                    .as_deref()
+                    .take()
                     .context("managed_plist_rollback_unavailable")?;
                 // A failed rename (e.g. an immutable destination) may have
                 // preserved the old bytes; do not require another rename then.
                 if !std::fs::read(plist_path).is_ok_and(|bytes| bytes == original) {
-                    atomic_replace(rollback, plist_path).context("restore managed daemon plist")?;
+                    atomic_replace(&rollback.0, plist_path, rollback.1)
+                        .context("restore managed daemon plist")?;
                 }
-                if !rollback_identity(rollback, true) {
+                if !rollback_identity(&rollback.0, true) {
                     anyhow::bail!("managed_plist_rollback_executable_unverifiable");
                 }
                 launchctl("load", plist_path).context("reload previous managed daemon plist")?;
@@ -1068,12 +1065,8 @@ fn ensure_managed_daemon_plist_with_operations(
         }
         Ok(()) => Ok(()),
     };
-    for staged in [candidate.as_deref(), rollback.as_deref()]
-        .into_iter()
-        .flatten()
-    {
-        let _ = std::fs::remove_file(staged);
-    }
+    drop(candidate);
+    drop(rollback);
     repair?;
 
     Ok(if drifted {
@@ -1085,25 +1078,24 @@ fn ensure_managed_daemon_plist_with_operations(
 
 #[cfg(target_os = "macos")]
 fn stage_managed_daemon_plist(plist_path: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    // Merge-only staging is later rewritten by Foundation, never published.
     let staged = csq_core::platform::fs::unique_tmp_path(plist_path);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    use std::os::unix::fs::OpenOptionsExt;
-    options.mode(0o600);
-    // Exclusive create: an existing temp path is foreign and never removed.
-    let mut file = options
-        .open(&staged)
+    csq_core::platform::fs::write_new_private_synced(&staged, bytes)
         .context("stage managed daemon plist")?;
-    let result = (|| -> Result<()> {
-        std::io::Write::write_all(&mut file, bytes).context("write staged managed daemon plist")?;
-        file.sync_all().context("sync staged managed daemon plist")
-    })();
-    drop(file);
-    if let Err(error) = result {
-        let _ = std::fs::remove_file(&staged);
-        return Err(error);
-    }
     Ok(staged)
+}
+
+/// Candidate and rollback bytes may retain user environment secrets. Preserve
+/// the synced private writer through publication and owned cleanup.
+#[cfg(target_os = "macos")]
+fn stage_managed_daemon_plist_written(
+    plist_path: &Path,
+    bytes: &[u8],
+) -> Result<(PathBuf, csq_core::platform::fs::WrittenPrivateFile)> {
+    let staged = csq_core::platform::fs::unique_tmp_path(plist_path);
+    let writer = csq_core::platform::fs::write_new_private_synced_retained(&staged, bytes)
+        .context("stage managed daemon plist")?;
+    Ok((staged, writer))
 }
 
 /// Separates observed job removal from actual disk removal and an absent no-op.
@@ -3050,7 +3042,7 @@ mod tests {
                     anyhow::bail!("fixture bootout failed")
                 },
                 fixture_rollback_identity,
-                |from, to| csq_core::platform::fs::atomic_replace(from, to).map_err(Into::into),
+                |_from, to, writer| writer.replace(to).map_err(Into::into),
             );
             assert!(result.is_err());
             assert_eq!(std::fs::read_to_string(&plist).unwrap(), original);
@@ -3071,7 +3063,7 @@ mod tests {
                     Ok(())
                 },
                 fixture_rollback_identity,
-                |from, to| csq_core::platform::fs::atomic_replace(from, to).map_err(Into::into),
+                |_from, to, writer| writer.replace(to).map_err(Into::into),
             )
             .unwrap();
             assert_eq!(result, ManagedPlistOutcome::Repaired);
@@ -3119,12 +3111,12 @@ mod tests {
                     Ok(())
                 },
                 fixture_rollback_identity,
-                |from, to| {
+                |from, to, writer| {
                     replace_calls.set(replace_calls.get() + 1);
                     if fail_replace && std::fs::read_to_string(from)? == expected {
                         anyhow::bail!("fixture_replace_failed");
                     }
-                    csq_core::platform::fs::atomic_replace(from, to).map_err(Into::into)
+                    writer.replace(to).map_err(Into::into)
                 },
             );
             assert!(
@@ -3183,7 +3175,7 @@ mod tests {
                 || ManagedJobState::Loaded,
                 |_, _| panic!("unknown rollback identity must not stop or reload a job"),
                 fixture_rollback_identity,
-                |_, _| panic!("unknown rollback identity must preserve disk bytes"),
+                |_, _, _| panic!("unknown rollback identity must preserve disk bytes"),
             );
             assert_eq!(
                 result.unwrap_err().to_string(),
@@ -3221,7 +3213,7 @@ mod tests {
                     Ok(())
                 },
                 |_, _| true,
-                |from, to| std::fs::rename(from, to).map_err(Into::into),
+                |from, to, _| std::fs::rename(from, to).map_err(Into::into),
             )
             .unwrap_err();
             assert_eq!(
@@ -3252,7 +3244,7 @@ mod tests {
                     anyhow::bail!("timeout")
                 },
                 |_, _| true,
-                |_, _| panic!("uncertain job must not rewrite"),
+                |_, _, _| panic!("uncertain job must not rewrite"),
             )
             .unwrap_err();
             assert_eq!(error.to_string(), "managed_plist_bootout_state_unknown");
@@ -3291,7 +3283,7 @@ mod tests {
                     });
                 },
                 fixture_rollback_identity,
-                |from, to| csq_core::platform::fs::atomic_replace(from, to).map_err(Into::into),
+                |_from, to, writer| writer.replace(to).map_err(Into::into),
             );
             let error = result.unwrap_err();
             assert_eq!(error.to_string(), "managed_plist_restoration_failed");
@@ -3354,7 +3346,7 @@ mod tests {
                             |_| false,
                         )
                     },
-                    |from, to| std::fs::rename(from, to).map_err(Into::into),
+                    |from, to, _| std::fs::rename(from, to).map_err(Into::into),
                 )
                 .unwrap();
                 assert_eq!(result, ManagedPlistOutcome::Repaired);

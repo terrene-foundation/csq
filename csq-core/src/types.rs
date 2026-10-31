@@ -162,7 +162,7 @@ impl ApiKey {
     }
 
     /// Returns a masked fingerprint: `prefix6...suffix4`.
-    /// Unless at least [`DISPLAY_MIN_HIDDEN_CHARS`] chars stay hidden (keys
+    /// Unless at least `DISPLAY_MIN_HIDDEN_CHARS` chars stay hidden (keys
     /// under 26 chars) it is `(short)`, so a short key never has 10 of its
     /// chars shown. Same disclosure rule as `Display`.
     pub fn fingerprint(&self) -> String {

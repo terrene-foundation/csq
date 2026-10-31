@@ -52,34 +52,23 @@ def check_cancelled():
 # exactly that leader. Any other listed pid is live-or-unknown (it may fork
 # before dying), so it fails closed; an empty, errored, truncated,
 # partially-read or leader-less listing is not emptiness either.
-LIBPROC = None
+GROUP_ORACLE = None
 def group_other_members(leader):
-    # Listed group members other than the pinned leader; raises RuntimeError
-    # whenever the listing cannot be read completely.
-    global LIBPROC
-    if sys.platform != 'darwin':
-        raise RuntimeError('group membership evidence unavailable')
-    import ctypes
-    if LIBPROC is None:
+    # Load the shared oracle from this checkout, never an ambient module name.
+    global GROUP_ORACLE
+    if GROUP_ORACLE is None:
+        import importlib.util
         try:
-            LIBPROC = ctypes.CDLL('libproc.dylib', use_errno=True)
-        except OSError as error:
-            raise RuntimeError('group membership evidence unavailable') from error
-        LIBPROC.proc_listpids.restype = ctypes.c_int
-        LIBPROC.proc_listpids.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int]
-    ctypes.set_errno(0)
-    size = LIBPROC.proc_listpids(2, leader, None, 0)
-    if size <= 0 or size > 65536 * 4 or size % 4 or ctypes.get_errno() != 0:
-        raise RuntimeError('group membership evidence unreadable')
-    listing = ctypes.create_string_buffer(size)
-    ctypes.set_errno(0)
-    written = LIBPROC.proc_listpids(2, leader, listing, size)
-    if written <= 0 or written >= size or written % 4 or ctypes.get_errno() != 0:
-        raise RuntimeError('group membership evidence unreadable')
-    pids = [int.from_bytes(listing.raw[index:index + 4], 'little') for index in range(0, written, 4)]
-    if leader not in pids:
-        raise RuntimeError('group membership listing missing the pinned leader')
-    return [pid for pid in pids if pid != leader]
+            spec = importlib.util.spec_from_file_location(
+                'csq_owned_group_oracle', root / 'scripts/lib/proof_child_groups.py')
+            if spec is None or spec.loader is None:
+                raise RuntimeError('shared group oracle unavailable')
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            GROUP_ORACLE = module.group_other_members
+        except Exception as error:
+            raise RuntimeError('shared group oracle unavailable') from error
+    return GROUP_ORACLE(leader)
 
 def leader_exited(leader):
     # Non-reaping leader-death observation. waitid WNOWAIT where available;

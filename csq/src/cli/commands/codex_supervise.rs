@@ -4022,16 +4022,24 @@ pub(crate) mod tests {
             .arg("--ignored")
             .output()
             .expect("spawn self as relaunch-failure helper");
-        assert!(
-            !output.status.success(),
-            "a failed relaunch must exit non-zero"
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "relaunch helper must reach exit(1): status={:?}; stdout={stdout:?}; stderr={stderr:?}",
+            output.status,
         );
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
         let base_dir_line = stdout
             .lines()
             .find_map(|l| l.strip_prefix("CSQ_TEST_BASE_DIR="))
-            .expect("helper must print its base_dir marker");
+            .unwrap_or_else(|| {
+                panic!(
+                    "helper must print its base_dir marker: status={:?}; stdout={stdout:?}; stderr={stderr:?}",
+                    output.status,
+                )
+            });
         let base_dir = PathBuf::from(base_dir_line);
         // Manual cleanup: `process::exit` in the helper skipped its
         // `TempDir::drop`, so this directory is not otherwise reclaimed.
@@ -4115,7 +4123,9 @@ pub(crate) mod tests {
         // the parent test (`relaunch_failure_flushes_a_final_audit_record`)
         // can locate and inspect its `.pending/` directory, then clean it up
         // itself.
-        println!("CSQ_TEST_BASE_DIR={}", base_dir.path().display());
+        // libtest can leave its test-name prefix on this line under --nocapture.
+        // Frame the marker separately so the parent keeps a strict line-start parser.
+        println!("\nCSQ_TEST_BASE_DIR={}", base_dir.path().display());
 
         let handle_dir_for_writer = dir.path().to_path_buf();
         std::thread::spawn(move || {

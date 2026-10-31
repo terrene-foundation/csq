@@ -1515,6 +1515,7 @@ fn write_binding(path: &Path, binding: &BackendBinding) -> io::Result<()> {
             .map_err(|_| protocol("native binding serialization failed"))?;
         file.write_all(&bytes)?;
         file.sync_all()?;
+        drop(file);
         crate::platform::fs::atomic_replace(&tmp, path).map_err(io::Error::other)
     })();
     if result.is_err() {
@@ -1632,6 +1633,65 @@ fn stopped() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "watcher stopped")
 }
 
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy)]
+enum RpcSendStage {
+    InitializedRequest,
+    InitializedNotice,
+    Other,
+}
+
+#[cfg(all(test, unix))]
+impl RpcSendStage {
+    fn from_value(value: &serde_json::Value) -> Self {
+        match value.get("method").and_then(serde_json::Value::as_str) {
+            Some("initialize") => Self::InitializedRequest,
+            Some("initialized") => Self::InitializedNotice,
+            _ => Self::Other,
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            Self::InitializedRequest => "initialized_request",
+            Self::InitializedNotice => "initialized_notice",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+fn rpc_send_failure_diagnostic(
+    value: &serde_json::Value,
+    error: &tungstenite::Error,
+    deadline_elapsed_at_observation: bool,
+) -> String {
+    let (io_kind, raw_os_error) = match error {
+        tungstenite::Error::Io(error) => {
+            let kind = match error.kind() {
+                io::ErrorKind::BrokenPipe => "BrokenPipe",
+                io::ErrorKind::TimedOut => "TimedOut",
+                io::ErrorKind::ConnectionReset => "ConnectionReset",
+                io::ErrorKind::WouldBlock => "WouldBlock",
+                io::ErrorKind::NotConnected => "NotConnected",
+                io::ErrorKind::WriteZero => "WriteZero",
+                io::ErrorKind::Interrupted => "Interrupted",
+                io::ErrorKind::UnexpectedEof => "UnexpectedEof",
+                _ => "other",
+            };
+            (kind, error.raw_os_error())
+        }
+        _ => ("other", None),
+    };
+    let raw_os_error = raw_os_error
+        .map(|code| format!(" raw_os_error={code}"))
+        .unwrap_or_default();
+    format!(
+        "native_rpc_send_failed stage={} io_kind={io_kind}{raw_os_error} deadline_elapsed_at_observation={deadline_elapsed_at_observation}",
+        RpcSendStage::from_value(value).tag(),
+    )
+}
+
 #[cfg(unix)]
 impl<'a> RpcClient<'a> {
     /// A plain client: pre-fix behaviour, bounded only by the caller's
@@ -1724,7 +1784,19 @@ impl<'a> RpcClient<'a> {
         self.socket.get_ref().check()?;
         self.socket
             .send(tungstenite::Message::Text(value.to_string().into()))
-            .map_err(|_| protocol("native RPC write failed"))
+            .map_err(|error| {
+                #[cfg(all(test, unix))]
+                eprintln!(
+                    "{}",
+                    rpc_send_failure_diagnostic(
+                        &value,
+                        &error,
+                        Instant::now() >= self.socket.get_ref().deadline,
+                    )
+                );
+                let _ = error;
+                protocol("native RPC write failed")
+            })
     }
 
     /// One request/response exchange. A client configured with an exchange cap
@@ -2094,6 +2166,110 @@ mod tests {
             .unwrap();
         assert_eq!(receive(&mut socket)["method"], "initialized");
         socket
+    }
+
+    #[test]
+    fn rpc_send_diagnostic_redacts_io_error_and_unknown_method() {
+        const SENTINEL: &str = "PRIVATE_RPC_SENTINEL_nonce_payload_path";
+        let value = json!({
+            "method": SENTINEL,
+            "id": SENTINEL,
+            "params": {"payload": SENTINEL, "nonce": SENTINEL, "path": SENTINEL},
+        });
+        for (kind, tag) in [
+            (io::ErrorKind::BrokenPipe, "BrokenPipe"),
+            (io::ErrorKind::TimedOut, "TimedOut"),
+            (io::ErrorKind::ConnectionReset, "ConnectionReset"),
+            (io::ErrorKind::WouldBlock, "WouldBlock"),
+            (io::ErrorKind::NotConnected, "NotConnected"),
+            (io::ErrorKind::WriteZero, "WriteZero"),
+            (io::ErrorKind::Interrupted, "Interrupted"),
+            (io::ErrorKind::UnexpectedEof, "UnexpectedEof"),
+            (io::ErrorKind::PermissionDenied, "other"),
+        ] {
+            let error = tungstenite::Error::Io(io::Error::new(kind, SENTINEL));
+            let line = rpc_send_failure_diagnostic(&value, &error, false);
+            assert_eq!(
+                line,
+                format!(
+                    "native_rpc_send_failed stage=other io_kind={tag} deadline_elapsed_at_observation=false"
+                )
+            );
+            assert!(!line.contains(SENTINEL));
+        }
+    }
+
+    #[test]
+    fn rpc_send_diagnostic_uses_closed_stage_and_raw_errno_tags() {
+        let error = tungstenite::Error::Io(io::Error::from_raw_os_error(libc::EPIPE));
+        for (method, stage) in [
+            ("initialize", "initialized_request"),
+            ("initialized", "initialized_notice"),
+            ("PRIVATE_RPC_UNKNOWN_METHOD", "other"),
+        ] {
+            let value = json!({"method": method, "params": "PRIVATE_RPC_PAYLOAD"});
+            let line = rpc_send_failure_diagnostic(&value, &error, true);
+            assert_eq!(
+                line,
+                format!(
+                    "native_rpc_send_failed stage={stage} io_kind=BrokenPipe raw_os_error={} deadline_elapsed_at_observation=true",
+                    libc::EPIPE,
+                )
+            );
+            assert!(!line.contains("PRIVATE_RPC"));
+        }
+    }
+
+    #[test]
+    fn rpc_send_diagnostic_redacts_non_io_payload() {
+        const SENTINEL: &str = "PRIVATE_RPC_NON_IO_PAYLOAD";
+        let payload = tungstenite::Message::Text(SENTINEL.into());
+        let error = tungstenite::Error::WriteBufferFull(Box::new(payload));
+        let value = json!({"method": SENTINEL, "params": SENTINEL});
+        let line = rpc_send_failure_diagnostic(&value, &error, false);
+        assert_eq!(
+            line,
+            "native_rpc_send_failed stage=other io_kind=other deadline_elapsed_at_observation=false"
+        );
+        assert!(!line.contains(SENTINEL));
+    }
+
+    #[test]
+    fn rpc_send_closing_websocket_preserves_error_contract() {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let deadline = Instant::now() + HANG_GUARD;
+        let socket = tungstenite::WebSocket::from_raw_socket(
+            DeadlineStream {
+                stream,
+                deadline,
+                slice: None,
+            },
+            tungstenite::protocol::Role::Client,
+            None,
+        );
+        let mut client = RpcClient {
+            socket,
+            nonce: "PRIVATE_RPC_NONCE".to_owned(),
+            next_id: 0,
+            pending: std::collections::VecDeque::new(),
+            pending_set: std::collections::HashSet::new(),
+            resync: false,
+            poisoned: false,
+            exchange_cap: None,
+            stop: None,
+        };
+        // Exercise the closing WebSocket while its owned OS peer stays open.
+        client.socket.close(None).expect("close live WebSocket");
+        let error = client
+            .send(json!({"method": "initialized", "params": "PRIVATE_RPC_PAYLOAD"}))
+            .expect_err("a closing WebSocket must reject a new message");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        // Check the existing public error contract; diagnostics never format it.
+        assert_eq!(error.to_string(), "native RPC write failed");
+        assert_eq!(client.socket.get_ref().deadline, deadline);
+        assert_eq!(client.next_id, 0);
+        assert!(!client.poisoned);
+        drop(peer);
     }
 
     #[test]

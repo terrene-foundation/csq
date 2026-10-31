@@ -28,6 +28,35 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 describe('API pool through closed settings → open settings', () => {
+  it('explains missing-vault recovery when settings first opens', async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => cmd === 'pool_list' ? [{ ...row, present: false, vault_file_missing: true }] : false);
+    const view = await open();
+    expect(view.getByText('Vault file missing: restore it, or remove these entries.')).toBeTruthy();
+    expect(view.queryByText('Editing the reset does not restore this key. Restore its source or remove this entry.')).toBeNull();
+    expect(view.getByRole('button', { name: 'Remove pool.one' })).toBeTruthy();
+  });
+  it('explains metadata publication failure after adding a key', async () => {
+    const view = await open();
+    await fill(view, 'synthetic-write-failure-key');
+    mockInvoke.mockImplementation(async (cmd: string) => { if (cmd === 'pool_add') throw 'pool_manifest_write_unavailable'; return []; });
+    await fireEvent.submit(view.getByRole('button', { name: 'Add key' }).closest('form')!);
+    await waitFor(() => expect(view.getByRole('alert').textContent).toBe('Pool metadata could not be saved. Check disk space and file access, then retry.'));
+    expect((view.getByLabelText('API key') as HTMLInputElement).value).toBe('');
+  });
+  it('acknowledges removal of a row whose vault file was missing', async () => {
+    let removed = false;
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'pool_list') return removed ? [] : [{ ...row, present: false, vault_file_missing: true }];
+      if (cmd === 'pool_remove') { removed = true; return { vault_file_missing: true }; }
+      return false;
+    });
+    const view = await open();
+    await fireEvent.click(view.getByRole('button', { name: 'Remove pool.one' }));
+    await fireEvent.click(view.getByRole('button', { name: 'Confirm remove pool.one' }));
+    await waitFor(() => expect(view.getByRole('status').textContent).toBe('Pool entry removed. The vault file was missing; no stored key remained to delete.'));
+    expect(view.queryByText('pool.one')).toBeNull();
+    expect(view.getByText('No API keys yet. Add one below.')).toBeTruthy();
+  });
   it('loads metadata on first open and exposes empty state without a key response', async () => {
     const view = await open();
     expect(view.getByText('No API keys yet. Add one below.')).toBeTruthy();
@@ -172,7 +201,7 @@ describe('API pool through closed settings → open settings', () => {
     const view = render(SettingsPopover);
     await fireEvent.click(view.getByRole('button', { name: 'Settings' }));
     await waitFor(() => expect(view.getByRole('alert').textContent).toContain('Unlock it and retry.'));
-    const tags = ['pool_invalid_name', 'pool_invalid_provider', 'pool_invalid_reset', 'pool_invalid_cap', 'pool_invalid_key', 'pool_manifest_invalid', 'pool_manifest_unavailable', 'pool_env_file_invalid', 'pool_env_file_unavailable', 'pool_key_missing', 'pool_name_exists', 'pool_custody_busy', 'pool_mutation_refused', 'pool_partial_failure_recovery_required', 'pool_recovery_writer_alive', 'pool_removal_cancelled', 'pool_permission_denied', 'pool_base_unavailable', 'pool_worker_unavailable'];
+    const tags = ['pool_invalid_name', 'pool_invalid_provider', 'pool_invalid_reset', 'pool_invalid_cap', 'pool_invalid_key', 'pool_manifest_invalid', 'pool_manifest_unavailable', 'pool_manifest_write_unavailable', 'pool_env_file_invalid', 'pool_env_file_unavailable', 'pool_key_missing', 'pool_name_exists', 'pool_custody_busy', 'pool_mutation_refused', 'pool_partial_failure_recovery_required', 'pool_recovery_writer_alive', 'pool_removal_cancelled', 'pool_permission_denied', 'pool_base_unavailable', 'pool_worker_unavailable'];
     for (const tag of tags) {
       mockInvoke.mockImplementation(async (cmd: string) => { if (cmd === 'pool_list') throw tag; return false; });
       await fireEvent.click(view.getByRole('button', { name: 'Retry pool' }));

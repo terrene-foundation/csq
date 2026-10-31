@@ -638,7 +638,7 @@ pub fn get_with_headers_full(url: &str, headers: &[(&str, &str)]) -> Result<Full
 }
 
 /// [`get_with_headers_full`] with an explicit body cap (over-cap is the fixed
-/// [`RESPONSE_OVER_CAP`] error, never any body content). For a caller whose
+/// `RESPONSE_OVER_CAP` error, never any body content). For a caller whose
 /// legitimate body can exceed the default 1 MiB (the license CRL).
 pub fn get_with_headers_full_capped(
     url: &str,

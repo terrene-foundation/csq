@@ -1826,7 +1826,7 @@ describe("AddAccountModal", () => {
       if (cmd === "get_pending_logins") return Promise.resolve([]);
       if (cmd === "start_claude_login_subprocess") {
         return Promise.reject(
-          new Error("`claude auth login` exited with non-zero status (1)"),
+          new Error("CC_EXITED_NONZERO: `claude auth login` exited with status 1"),
         );
       }
       if (cmd in mockResponses) return Promise.resolve(mockResponses[cmd]);
@@ -1836,7 +1836,9 @@ describe("AddAccountModal", () => {
     await settleClaude();
     await pickAnthropic(container);
 
-    expect(container.textContent).toContain("exited with non-zero status");
+    expect(container.querySelector(".error-banner")?.textContent).toBe(
+      "Error: CC_EXITED_NONZERO: `claude auth login` exited with status 1",
+    );
     // onAccountAdded MUST NOT fire when the subprocess failed —
     // there are no credentials to surface in the dashboard.
     expect(onAccountAdded).not.toHaveBeenCalled();
@@ -1845,6 +1847,51 @@ describe("AddAccountModal", () => {
       (b) => b.textContent?.includes("Try again"),
     );
     expect(tryAgain).toBeDefined();
+  });
+
+  it.each([
+    ["terminated", "was terminated by signal SIGTERM", false],
+    ["wrapped termination", "was terminated by signal SIGTTOU", true],
+    ["stopped", "was stopped by signal SIGTTOU", false],
+  ])("offers retry guidance for a signal-ended sign-in (%s)", async (_, status, wrapped) => {
+    const onAccountAdded = vi.fn();
+    const failure = `CC_EXITED_NONZERO: \`claude auth login\` ${status}`;
+    let shouldFail = true;
+    setupMocks({ list_providers: [ANTHROPIC_PROVIDER] });
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_pending_logins") return Promise.resolve([]);
+      if (cmd === "start_claude_login_subprocess" && shouldFail) {
+        return Promise.reject(wrapped ? new Error(failure) : failure);
+      }
+      if (cmd in mockResponses) return Promise.resolve(mockResponses[cmd]);
+      return Promise.resolve(undefined);
+    });
+    const { container, rerender } = renderModal({ isOpen: false, onAccountAdded });
+    await settleClaude();
+    expect(mockInvoke.mock.calls.some(([cmd]) => cmd === "start_claude_login_subprocess")).toBe(false);
+    await rerender({ isOpen: true });
+    await waitForProviderCards(container, 1);
+    await pickAnthropic(container);
+
+    expect(mockInvoke).toHaveBeenCalledWith("start_claude_login_subprocess", {
+      baseDir: "/home/test/.claude/accounts",
+      account: 3,
+    });
+    expect(container.querySelector(".error-banner")?.textContent).toBe(
+      `${wrapped ? "Error: " : ""}${failure} Try signing in again. If it happens again, restart the desktop app and retry.`,
+    );
+    expect(onAccountAdded).not.toHaveBeenCalled();
+
+    const tryAgain = Array.from(container.querySelectorAll("button")).find(
+      button => button.textContent?.includes("Try again"),
+    );
+    expect(tryAgain).toBeDefined();
+    shouldFail = false;
+    await fireEvent.click(tryAgain!);
+    await waitForProviderCards(container, 1);
+    await pickAnthropic(container);
+    expect(onAccountAdded).toHaveBeenCalledOnce();
+    expect(container.textContent).toContain("Account 3 added successfully");
   });
 
   it("renders login-in-progress recovery UI when AccountLoginLock contends (LOCK_HELD prefix)", async () => {

@@ -27,7 +27,7 @@ use csq_core::audit::verify::{verify_chain, VerifyConfig};
 use csq_core::audit::ChainState;
 use csq_core::daemon::detect::{detect_daemon, DetectResult};
 use csq_core::error::redact_tokens;
-use csq_core::platform::fs::{atomic_replace, unique_tmp_path, write_new_private};
+use csq_core::platform::fs::{atomic_replace, unique_tmp_path, write_new_private_retained};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -546,12 +546,14 @@ fn write_secure_bytes(path: &Path, bytes: &[u8], what: &'static str) -> Result<(
     // closing the window a separate write + secure_file pair would leave
     // open — this path carries the root signing PRIVATE key on one call.
     let tmp = unique_tmp_path(path);
-    if let Err(e) = write_new_private(&tmp, bytes) {
-        let _ = std::fs::remove_file(&tmp);
-        bail!("failed to write {what}: {}", redact_tokens(&e.to_string()));
-    }
-    if let Err(e) = atomic_replace(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
+    let writer = match write_new_private_retained(&tmp, bytes) {
+        Ok(writer) => writer,
+        // The private writer cleans up only files it created; collisions stay untouched.
+        Err(e) => {
+            bail!("failed to write {what}: {}", redact_tokens(&e.to_string()));
+        }
+    };
+    if let Err(e) = writer.replace(path) {
         bail!(
             "failed to finalize {what}: {}",
             redact_tokens(&e.to_string())

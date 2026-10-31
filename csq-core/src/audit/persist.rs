@@ -33,7 +33,9 @@
 //! record before any signature is attached.
 
 use crate::audit::types::SignedRecord;
-use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+use crate::platform::fs::{
+    atomic_replace, secure_file, unique_tmp_path, write_private_tmp_retained,
+};
 use serde::{Deserialize, Serialize};
 use std::num::Wrapping;
 use std::path::{Path, PathBuf};
@@ -1483,17 +1485,20 @@ fn write_record_v2_impl(
     };
     existing.extend_from_slice(&line_bytes);
 
-    let tmp = unique_tmp_path(&chain_jsonl);
-    if let Err(e) = std::fs::write(&tmp, &existing) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(AuditV2Error::Io(e));
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
+    let writer = match write_private_tmp_retained(&chain_jsonl, &existing) {
+        Ok(writer) => writer,
+        Err(e) => {
+            let source = match e {
+                crate::error::PlatformError::Io(source) => source,
+                other => std::io::Error::other(other.to_string()),
+            };
+            return Err(AuditV2Error::Io(source));
+        }
+    };
+    if let Err(e) = secure_file(writer.path()) {
         return Err(AuditV2Error::Io(std::io::Error::other(e.to_string())));
     }
-    if let Err(e) = atomic_replace(&tmp, &chain_jsonl) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = writer.replace(&chain_jsonl) {
         return Err(AuditV2Error::Io(std::io::Error::other(e.to_string())));
     }
 
@@ -1705,20 +1710,23 @@ fn append_dedup_index(csq_runs: &Path, key: &str) -> Result<(), AuditV2Error> {
 
 /// Write a non-chain sidecar under csq-runs/ via the §5a tmp-cleanup pipeline
 /// (`unique_tmp_path → write → secure_file → atomic_replace`, cleanup on every
-/// failure branch). The sidecar carries only `decision_id`s / counters — no
-/// secret material — but uses the same atomic+0600 discipline as chain writes.
+/// failure branch). The dedup index includes MCP session nonces whose ingress
+/// validation bounds length, not content, so it uses the private bound writer.
 fn write_sidecar_atomic(path: &Path, body: &[u8]) -> Result<(), AuditV2Error> {
-    let tmp = unique_tmp_path(path);
-    if let Err(e) = std::fs::write(&tmp, body) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(AuditV2Error::Io(e));
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
+    let writer = match write_private_tmp_retained(path, body) {
+        Ok(writer) => writer,
+        Err(e) => {
+            let source = match e {
+                crate::error::PlatformError::Io(source) => source,
+                other => std::io::Error::other(other.to_string()),
+            };
+            return Err(AuditV2Error::Io(source));
+        }
+    };
+    if let Err(e) = secure_file(writer.path()) {
         return Err(AuditV2Error::Io(std::io::Error::other(e.to_string())));
     }
-    if let Err(e) = atomic_replace(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = writer.replace(path) {
         return Err(AuditV2Error::Io(std::io::Error::other(e.to_string())));
     }
     Ok(())
@@ -1735,7 +1743,7 @@ fn write_sidecar_atomic(path: &Path, body: &[u8]) -> Result<(), AuditV2Error> {
 ///    on overflow.
 /// 4. Write to `<audit_dir>/<run_id>.jsonl` using the canonical
 ///    `unique_tmp_path → write → secure_file → atomic_replace` pipeline
-///    with §5a cleanup on every error branch.
+///    with writer-owned §5a cleanup on every error branch.
 ///
 /// The `base_dir` parameter allows tests to supply a `TempDir`-backed path
 /// instead of the real `~/.claude/accounts`.  Production callers pass
@@ -1823,21 +1831,23 @@ pub(crate) fn write_record_to(
     }
 
     let target = dir.join(format!("{}.jsonl", record.run_id));
-    let tmp = unique_tmp_path(&target);
+    // §5a: the retained writer owns tmp cleanup on every failure branch.
+    let writer = match write_private_tmp_retained(&target, &bytes) {
+        Ok(writer) => writer,
+        Err(e) => {
+            let source = match e {
+                crate::error::PlatformError::Io(source) => source,
+                other => std::io::Error::other(other.to_string()),
+            };
+            return Err(AuditError::Io(source));
+        }
+    };
 
-    // §5a: clean up tmp on every failure branch after fs::write.
-    if let Err(e) = std::fs::write(&tmp, &bytes) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(AuditError::Io(e));
-    }
-
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = secure_file(writer.path()) {
         return Err(AuditError::Io(std::io::Error::other(e.to_string())));
     }
 
-    if let Err(e) = atomic_replace(&tmp, &target) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = writer.replace(&target) {
         return Err(AuditError::Io(std::io::Error::other(e.to_string())));
     }
 
@@ -1852,6 +1862,97 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
     use tempfile::TempDir;
+
+    fn with_one_stale_private_stage<T>(operation: impl FnOnce() -> T) -> (T, std::path::PathBuf) {
+        let planted = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed = std::rc::Rc::clone(&planted);
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |stage| {
+                if observed.borrow().is_none() {
+                    std::fs::write(stage, b"foreign audit stage").unwrap();
+                    *observed.borrow_mut() = Some(stage.to_path_buf());
+                }
+            },
+            operation,
+        );
+        let stage = planted
+            .borrow_mut()
+            .take()
+            .expect("audit create observer must run");
+        assert_eq!(std::fs::read(&stage).unwrap(), b"foreign audit stage");
+        eprintln!("F4_COLLISION_WITNESS observer_hit=true foreign_preserved=true");
+        (result, stage)
+    }
+
+    #[test]
+    fn sidecar_write_retries_a_stale_stage_without_deleting_it() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("sidecar");
+        let (result, stage) =
+            with_one_stale_private_stage(|| write_sidecar_atomic(&target, b"new audit sidecar"));
+        assert!(
+            result.is_ok(),
+            "audit sidecar must retry a stale stage: {result:?}"
+        );
+        assert_eq!(std::fs::read(target).unwrap(), b"new audit sidecar");
+        assert_eq!(std::fs::read(stage).unwrap(), b"foreign audit stage");
+    }
+
+    #[test]
+    fn v1_record_write_retries_a_stale_stage_without_deleting_it() {
+        let dir = TempDir::new().unwrap();
+        let record = sample_record();
+        let target = dir
+            .path()
+            .join("csq-runs")
+            .join(format!("{}.jsonl", record.run_id));
+        let expected = serde_json::to_vec(&record).unwrap();
+        let (result, stage) =
+            with_one_stale_private_stage(|| write_record_to(record, Some(dir.path())));
+        assert!(
+            result.is_ok(),
+            "v1 audit record must retry a stale stage: {result:?}"
+        );
+        assert_eq!(std::fs::read(target).unwrap(), expected);
+        assert_eq!(std::fs::read(stage).unwrap(), b"foreign audit stage");
+    }
+
+    #[test]
+    fn v2_record_append_retries_a_stale_stage_without_deleting_it() {
+        let _env = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        let dir = TempDir::new().unwrap();
+        write_record_v2(sample_v2_record(), Some(dir.path())).unwrap();
+        let genesis: ChainGenesis =
+            serde_json::from_slice(&std::fs::read(dir.path().join("csq-runs/chain.json")).unwrap())
+                .unwrap();
+        let target = dir
+            .path()
+            .join("csq-runs")
+            .join(format!("{}.jsonl", genesis.chain_id));
+        let before = std::fs::read(&target).unwrap();
+        let (result, stage) =
+            with_one_stale_private_stage(|| write_record_v2(sample_v2_record(), Some(dir.path())));
+        assert!(
+            result.is_ok(),
+            "v2 audit append must retry a stale stage: {result:?}"
+        );
+        let bytes = std::fs::read(target).unwrap();
+        assert!(bytes.starts_with(&before));
+        let records: Vec<crate::audit::types::SignedRecord> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].seq, 1);
+        assert_eq!(
+            serde_json::to_value(&records[1].payload).unwrap(),
+            serde_json::to_value(&sample_v2_record().payload).unwrap()
+        );
+        assert_eq!(std::fs::read(stage).unwrap(), b"foreign audit stage");
+    }
 
     fn sample_record() -> AuditRecord {
         AuditRecord {

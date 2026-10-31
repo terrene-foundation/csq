@@ -208,12 +208,9 @@ impl Pin {
         let bytes = self.to_bytes()?;
         // A create_new collision grants no cleanup authority. This helper
         // already removes its own incomplete file on write/fsync failure.
-        crate::platform::fs::write_new_private_synced(&tmp, &bytes).map_err(|_| PinError::Io)?;
-        let result = crate::platform::fs::atomic_replace(&tmp, &path).map_err(|_| PinError::Io);
-        if result.is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
-        result
+        let written = crate::platform::fs::write_new_private_synced_retained(&tmp, &bytes)
+            .map_err(|_| PinError::Io)?;
+        written.replace(&path).map_err(|_| PinError::Io)
     }
     pub fn read_private(path: &Path) -> Result<Self, PinError> {
         #[cfg(not(unix))]

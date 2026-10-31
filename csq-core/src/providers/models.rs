@@ -18,6 +18,10 @@ pub struct ModelInfo {
     pub output_limit: Option<u64>,
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// Exact response model ids authorized for this row's admitted bounds and prices.
+    /// Kept separate from picker aliases; pool settlement compares these literally.
+    #[serde(default)]
+    pub served_model_ids: Vec<String>,
 }
 
 /// Maps a DeepSeek Flash API model to its Claude Code context selector.

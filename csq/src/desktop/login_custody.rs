@@ -273,6 +273,18 @@ pub(crate) fn global() -> &'static CredentialWrites {
     static WRITES: OnceLock<CredentialWrites> = OnceLock::new();
     WRITES.get_or_init(CredentialWrites::default)
 }
+/// Verdict of `CredentialWrites::force_deadline_for_test`.
+#[cfg(all(test, unix, feature = "test-utils"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeadlineForce {
+    /// No operation is registered under the key.
+    Absent,
+    /// The registry lock was poisoned; the operation could not be looked up.
+    RegistryPoisoned,
+    /// The operation was found; the inner value says whether the latch was taken.
+    Forced(crate::login_child_custody::ForcedDeadline),
+}
+
 impl CredentialWrites {
     #[cfg(any(windows, test))]
     pub(crate) fn set_signin_listener(
@@ -789,6 +801,20 @@ impl CredentialWrites {
                 })
             })
             .unwrap_or(false)
+    }
+    /// Test-only: declare the registered operation's deadline reached now.
+    /// Absent, a poisoned registry lock and an already-finished operation are
+    /// three distinct verdicts, never folded into one.
+    #[cfg(all(test, unix, feature = "test-utils"))]
+    pub(crate) fn force_deadline_for_test(&self, key: &ChildKey) -> DeadlineForce {
+        let watchdog = match self.inner.state.lock() {
+            Ok(state) => state.children.get(key).map(|entry| entry.watchdog.clone()),
+            Err(_) => return DeadlineForce::RegistryPoisoned,
+        };
+        match watchdog {
+            Some(watchdog) => DeadlineForce::Forced(watchdog.force_deadline_for_test()),
+            None => DeadlineForce::Absent,
+        }
     }
     #[cfg(test)]
     pub(crate) fn registered_child_for_test(

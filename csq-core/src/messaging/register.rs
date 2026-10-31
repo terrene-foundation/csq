@@ -116,22 +116,12 @@ pub fn read_decision(handle_dir: &Path) -> Option<bool> {
 /// Record `on` as `handle_dir`'s launch decision (tmp → `atomic_replace`, tmp removed on every
 /// failure branch, `security.md` §5a; the content is not secret).
 pub fn record_decision(handle_dir: &Path, on: bool) -> Result<(), RegisterError> {
-    use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path, write_new_private};
+    use crate::platform::fs::{unique_tmp_path, write_new_private_retained};
     let path = handle_dir.join(DECISION_MARKER);
     let tmp = unique_tmp_path(&path);
-    if write_new_private(&tmp, if on { b"on" } else { b"off" }).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(RegisterError::DecisionWrite);
-    }
-    if secure_file(&tmp).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(RegisterError::DecisionWrite);
-    }
-    if atomic_replace(&tmp, &path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(RegisterError::DecisionWrite);
-    }
-    Ok(())
+    write_new_private_retained(&tmp, if on { b"on" } else { b"off" })
+        .and_then(|written| written.replace(&path))
+        .map_err(|_| RegisterError::DecisionWrite)
 }
 
 /// [`record_decision`], logging a failure with the fixed tag [`LOG_TAG_FAILED`] and the
@@ -649,7 +639,7 @@ const SETTINGS_MAX_BYTES: u64 = 4 << 20;
 /// created exclusively at 0600 and removed on every failure branch (`security.md` §5a).
 /// Only this handle dir's file is written.
 pub fn register_handle_settings(handle_dir: &Path, csq_bin: &str) -> Result<(), RegisterError> {
-    use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path, write_new_private};
+    use crate::platform::fs::{secure_file, unique_tmp_path, write_new_private_retained};
 
     let path = handle_dir.join("settings.json");
     // One open that refuses a symlink and checks the OPENED handle is a regular file: a
@@ -669,16 +659,13 @@ pub fn register_handle_settings(handle_dir: &Path, csq_bin: &str) -> Result<(), 
     apply_settings_layer(&mut settings, csq_bin)?;
     let bytes = serde_json::to_vec_pretty(&settings).map_err(|_| RegisterError::SettingsWrite)?;
     let tmp = unique_tmp_path(&path);
-    if write_new_private(&tmp, &bytes).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    let Ok(writer) = write_new_private_retained(&tmp, &bytes) else {
         return Err(RegisterError::SettingsWrite);
-    }
+    };
     if secure_file(&tmp).is_err() {
-        let _ = std::fs::remove_file(&tmp);
         return Err(RegisterError::SettingsWrite);
     }
-    if atomic_replace(&tmp, &path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    if writer.replace(&path).is_err() {
         return Err(RegisterError::SettingsWrite);
     }
     Ok(())

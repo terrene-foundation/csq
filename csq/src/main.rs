@@ -10,6 +10,7 @@
     windows_subsystem = "windows"
 )]
 
+mod build_info;
 mod mode;
 
 /// #1a-2 (daemon-auth-resilience Wave A2) — the daemon's persistent rolling
@@ -84,6 +85,17 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    // an internal ticket R3 N-2: `csq --build-info` prints the compiled feature set and
+    // exits, before mode detection, so release and install scripts can verify
+    // the BUILT binary (scripts/verify/built-binary-features.sh) before signing.
+    {
+        let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        if build_info::requested(&argv) {
+            println!("{}", build_info::line());
+            return;
+        }
+    }
 
     // an internal ticket headless self-test short-circuit. The self-test lives at the top of
     // `desktop::run()`, but `mode::detect()` only resolves `Desktop` from the

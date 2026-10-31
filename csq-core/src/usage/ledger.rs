@@ -29,7 +29,7 @@
 
 use crate::accounts::identity_store::usage_ledger_path_for;
 use crate::accounts::profiles;
-use crate::platform::fs::{atomic_replace, secure_file, unique_tmp_path};
+use crate::platform::fs::write_private_tmp_retained;
 use crate::types::AccountNum;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -204,17 +204,13 @@ pub fn append(base_dir: &Path, slot: AccountNum, event: &UsageEvent) -> Result<(
     let mut content = existing;
     content.extend_from_slice(line.as_bytes());
 
-    let tmp = unique_tmp_path(&path);
-    if let Err(e) = std::fs::write(&tmp, &content) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(LedgerError::Io(e));
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(LedgerError::Platform(e));
-    }
-    if let Err(e) = atomic_replace(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
+    // Project paths can identify the user. Private creation owns partial-write
+    // cleanup and leaves collisions untouched; publication retains its writer.
+    let writer = write_private_tmp_retained(&path, &content).map_err(|e| match e {
+        crate::error::PlatformError::Io(io) => LedgerError::Io(io),
+        other => LedgerError::Platform(other),
+    })?;
+    if let Err(e) = writer.replace(&path) {
         return Err(LedgerError::Platform(e));
     }
     Ok(())
@@ -234,7 +230,7 @@ pub fn append(base_dir: &Path, slot: AccountNum, event: &UsageEvent) -> Result<(
 /// Follows the §5a partial-failure cleanup contract (`rules/security.md`): the
 /// tmp file is removed on EVERY failure branch before the error propagates, so
 /// a crash between `write` and `atomic_replace` never leaves a 0o644 artifact
-/// behind. Mode 0o600 via [`secure_file`]. An empty `events` slice writes an
+/// behind. Mode 0o600 at private creation. An empty `events` slice writes an
 /// empty (0-byte) ledger — a legitimate "this slot has no usage" state.
 pub fn write_all(
     base_dir: &Path,
@@ -272,17 +268,13 @@ pub fn write_all(
         content.push('\n');
     }
 
-    let tmp = unique_tmp_path(&path);
-    if let Err(e) = std::fs::write(&tmp, content.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(LedgerError::Io(e));
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(LedgerError::Platform(e));
-    }
-    if let Err(e) = atomic_replace(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
+    // Project paths can identify the user. Private creation owns partial-write
+    // cleanup and leaves collisions untouched; publication retains its writer.
+    let writer = write_private_tmp_retained(&path, content.as_bytes()).map_err(|e| match e {
+        crate::error::PlatformError::Io(io) => LedgerError::Io(io),
+        other => LedgerError::Platform(other),
+    })?;
+    if let Err(e) = writer.replace(&path) {
         return Err(LedgerError::Platform(e));
     }
     Ok(())
@@ -522,6 +514,53 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use tempfile::TempDir;
+
+    fn collide_first_create<T>(operation: impl FnOnce() -> T) -> T {
+        let _env = crate::platform::test_env::lock();
+        let foreign = std::rc::Rc::new(std::cell::RefCell::new(None::<std::path::PathBuf>));
+        let observed = std::rc::Rc::clone(&foreign);
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |path| {
+                if observed.borrow().is_none() {
+                    std::fs::write(path, b"foreign-stage").unwrap();
+                    *observed.borrow_mut() = Some(path.to_path_buf());
+                    eprintln!("F4_PRIVATE_CREATE_COLLISION_PLANTED");
+                }
+            },
+            operation,
+        );
+        let path = foreign
+            .borrow()
+            .clone()
+            .expect("production create observer must be hit");
+        assert_eq!(std::fs::read(path).unwrap(), b"foreign-stage");
+        result
+    }
+
+    #[test]
+    fn append_retries_actual_stage_collision() {
+        let dir = TempDir::new().unwrap();
+        let event = ev("2100-01-01T00:00:00Z", "fixture-model", 1, 2, None);
+        let result = collide_first_create(|| append(dir.path(), slot(1), &event));
+        assert!(
+            result.is_ok(),
+            "append must retry a planted create collision"
+        );
+        assert_eq!(read_all(dir.path(), slot(1)).unwrap().events, vec![event]);
+    }
+
+    #[test]
+    fn write_all_retries_actual_stage_collision() {
+        let dir = TempDir::new().unwrap();
+        let event = ev("2100-01-01T00:00:00Z", "fixture-model", 3, 4, None);
+        let result =
+            collide_first_create(|| write_all(dir.path(), slot(1), std::slice::from_ref(&event)));
+        assert!(
+            result.is_ok(),
+            "write_all must retry a planted create collision"
+        );
+        assert_eq!(read_all(dir.path(), slot(1)).unwrap().events, vec![event]);
+    }
 
     fn slot(n: u16) -> AccountNum {
         AccountNum::try_from(n).unwrap()

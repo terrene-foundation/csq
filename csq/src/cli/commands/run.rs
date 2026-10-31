@@ -3339,9 +3339,8 @@ fn codex_command(base_dir: &Path, account: AccountNum, handle_dir: &Path) -> Res
 /// Returns the names of REMOTE (`url`-transport) MCP servers left un-gated, so the
 /// caller can warn the operator (the stdio proxy cannot interpose HTTP/SSE).
 ///
-/// Idiom: `unique_tmp_path → write → secure_file → atomic_replace`, with
-/// `let _ = remove_file(&tmp);` cleanup on every error branch per
-/// `.claude/rules/security.md` §5a.
+/// The private writer retains ownership through atomic publication and cleans
+/// up its temporary file on failure per `.claude/rules/security.md` §5a.
 pub(crate) fn materialize_handle_config_toml(
     base_dir: &Path,
     account: AccountNum,
@@ -3350,7 +3349,7 @@ pub(crate) fn materialize_handle_config_toml(
     mcp_wrap: Option<(&str, &Path)>,
 ) -> Result<Vec<String>> {
     use csq_core::coc::translate::codex_merge::merge_instructions_via_toml_value;
-    use csq_core::platform::fs::{atomic_replace, unique_tmp_path, write_new_private};
+    use csq_core::platform::fs::{unique_tmp_path, write_new_private_retained};
     use std::collections::BTreeMap;
 
     // PATH-BUILDER: constructs the config-N/config.toml path to read CC's
@@ -3407,17 +3406,19 @@ pub(crate) fn materialize_handle_config_toml(
     // open — the handle-dir config.toml's `[mcp_servers.*]` table may
     // carry user-configured MCP auth (same class as
     // `providers::codex::surface::write_config_toml_with_global`).
-    if let Err(e) = write_new_private(&tmp, content.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(anyhow!("write {}: {e}", redact_path(&tmp)));
-    }
-    // atomic_replace is rename(2) on Unix / retry-loop MoveFileExW on
-    // Windows; both atomically replace whatever was at `target`
-    // (symlink or regular file) with the new regular file. No
+    let writer = match write_new_private_retained(&tmp, content.as_bytes()) {
+        Ok(writer) => writer,
+        // The private writer cleans up only files it created; collisions stay untouched.
+        Err(e) => {
+            return Err(anyhow!("write {}: {e}", redact_path(&tmp)));
+        }
+    };
+    // Publication retains the original writer through the rename on Windows.
+    // Atomic replacement replaces whatever was at `target` (symlink or
+    // regular file) with the new regular file. No
     // explicit unlink needed — and skipping it closes the TOCTOU
     // window that round-1 H5 surfaced.
-    if let Err(e) = atomic_replace(&tmp, &target) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = writer.replace(&target) {
         return Err(anyhow!(
             "atomic_replace {} -> {}: {e}",
             redact_path(&tmp),

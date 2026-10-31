@@ -1033,7 +1033,7 @@ impl DirFd {
 /// the file; that holds only for files written by this version or later (a file
 /// from an older csq has no label until csq next writes or opens it), and the
 /// owner/DACL conditions still apply. The
-/// DACL travels with the file through `atomic_replace` (`MoveFileExW` keeps
+/// DACL travels with the file through `atomic_replace` (handle-based rename keeps
 /// the source's security descriptor), so the published target is
 /// owner-only too. Readers must therefore run as the same user, which csq's
 /// daemon and every spawned CLI do (the Windows secret backend refuses to
@@ -1041,7 +1041,7 @@ impl DirFd {
 ///
 /// Other non-unix targets: only the `create_new` exclusivity guarantee holds.
 pub fn write_new_private(path: &Path, bytes: &[u8]) -> Result<(), PlatformError> {
-    write_new_private_impl(path, bytes, false)
+    write_new_private_impl(path, bytes, false).map(|_| ())
 }
 
 /// Like [`write_new_private`], but additionally `fsync`s the file before
@@ -1055,14 +1055,382 @@ pub fn write_new_private(path: &Path, bytes: &[u8]) -> Result<(), PlatformError>
 /// [`write_new_private`] does not fsync, matching the pre-existing
 /// `std::fs::write`-based pipeline's behaviour at every site it replaced.
 pub fn write_new_private_synced(path: &Path, bytes: &[u8]) -> Result<(), PlatformError> {
+    write_new_private_impl(path, bytes, true).map(|_| ())
+}
+
+/// Identity sampled from an open writer, not from a subsequent path lookup.
+/// Windows records the queried file ID, its volume ID and its identity source.
+/// Filesystems may reuse IDs after deletion. This comparison is not a content hash or a
+/// perpetual identity proof.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WrittenFileIdentity {
+    #[cfg(windows)]
+    windows: WindowsFileIdentity,
+    _sealed: (),
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowsFileId {
+    Modern128([u8; 16]),
+    Legacy64(u64),
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowsFileIdentity {
+    volume_serial: u64,
+    file_id: WindowsFileId,
+}
+
+#[cfg(any(windows, test))]
+impl WindowsFileIdentity {
+    fn modern(volume_serial: u64, file_id: [u8; 16]) -> Self {
+        Self {
+            volume_serial,
+            file_id: WindowsFileId::Modern128(file_id),
+        }
+    }
+
+    fn legacy(volume_serial: u32, index_high: u32, index_low: u32) -> Self {
+        Self {
+            volume_serial: u64::from(volume_serial),
+            file_id: WindowsFileId::Legacy64((u64::from(index_high) << 32) | u64::from(index_low)),
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn query_windows_file_identity(
+    modern: impl FnOnce() -> std::io::Result<WindowsFileIdentity>,
+    legacy: impl FnOnce() -> std::io::Result<WindowsFileIdentity>,
+) -> std::io::Result<WindowsFileIdentity> {
+    match modern() {
+        Err(error) if matches!(error.raw_os_error(), Some(1 | 50 | 87)) => legacy(),
+        result => result,
+    }
+}
+
+#[doc(hidden)]
+pub fn written_file_identity(file: &std::fs::File) -> Result<WrittenFileIdentity, PlatformError> {
+    #[cfg(windows)]
+    {
+        let identity =
+            windows_written_file_identity(file).map_err(|error| PlatformError::Win32 {
+                code: error.raw_os_error().unwrap_or(1) as u32,
+                message: "Windows file identity query failed".to_owned(),
+            })?;
+        Ok(identity)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        Ok(WrittenFileIdentity { _sealed: () })
+    }
+}
+
+#[cfg(windows)]
+impl WrittenFileIdentity {
+    fn from_information(info: &windows_sys::Win32::Storage::FileSystem::FILE_ID_INFO) -> Self {
+        Self {
+            windows: WindowsFileIdentity::modern(info.VolumeSerialNumber, info.FileId.Identifier),
+            _sealed: (),
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn write_new_private_with_identity(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<WrittenFileIdentity, PlatformError> {
+    write_new_private_impl(path, bytes, false)
+}
+
+#[doc(hidden)]
+pub fn write_new_private_synced_with_identity(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<WrittenFileIdentity, PlatformError> {
     write_new_private_impl(path, bytes, true)
 }
 
-fn write_new_private_impl(path: &Path, bytes: &[u8], sync: bool) -> Result<(), PlatformError> {
-    use std::io::Write as _;
+/// A private temporary file whose creator retains cleanup ownership. On Windows
+/// the DELETE-capable writer denies other write/delete opens until publication.
+/// Dropping an unpublished writer deletes through its handle on Windows. Unix
+/// cleanup checks the original path's device/inode before a best-effort unlink;
+/// publication there retains the existing path-based filesystem semantics.
+#[derive(Debug)]
+pub struct WrittenPrivateFile {
+    file: Option<std::fs::File>,
+    path: PathBuf,
+}
 
+/// Result of publishing a temporary file without replacing an existing target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublishOutcome {
+    Published,
+    AlreadyExists,
+}
+
+impl WrittenPrivateFile {
+    /// The actual temporary path owned by this writer, including collision retries.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Borrow the original writer without exposing a replaceable owned-handle slot.
+    #[cfg(feature = "enterprise")]
+    pub(crate) fn file_mut(&self) -> Result<&std::fs::File, PlatformError> {
+        self.file
+            .as_ref()
+            .ok_or_else(|| PlatformError::Io(std::io::Error::other("private writer is closed")))
+    }
+
+    /// Atomically replace the target, retaining the writer through Windows rename.
+    pub fn replace(mut self, target: &Path) -> Result<(), PlatformError> {
+        #[cfg(windows)]
+        windows_publish(&self.path, target, None, self.file.as_ref(), false)?;
+        #[cfg(not(windows))]
+        atomic_replace(&self.path, target)?;
+        drop(self.file.take());
+        Ok(())
+    }
+
+    /// Publish the complete file only when the target is absent. A collision is
+    /// a typed outcome; it neither truncates nor replaces the existing entry.
+    pub fn publish_noreplace(mut self, target: &Path) -> Result<PublishOutcome, PlatformError> {
+        #[cfg(windows)]
+        let outcome = windows_publish(&self.path, target, None, self.file.as_ref(), true)?;
+        #[cfg(not(windows))]
+        let outcome = match std::fs::hard_link(&self.path, target) {
+            Ok(()) => PublishOutcome::Published,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                PublishOutcome::AlreadyExists
+            }
+            Err(error) => return Err(error.into()),
+        };
+        #[cfg(windows)]
+        if outcome == PublishOutcome::Published {
+            drop(self.file.take());
+        }
+        #[cfg(not(windows))]
+        let _ = &mut self;
+        Ok(outcome)
+    }
+
+    /// Explicitly discard this writer's temporary file (also done on Drop).
+    pub fn discard(self) {}
+
+    /// Leave the original temporary entry in place for caller-owned recovery.
+    /// Closes the writer without unlinking it; does not relocate the file.
+    pub fn keep(mut self) {
+        drop(self.file.take());
+    }
+}
+
+impl Drop for WrittenPrivateFile {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            discard_created(file, &self.path);
+        }
+    }
+}
+
+/// Create and write a private temporary file with automatic owned cleanup.
+pub fn write_new_private_retained(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<WrittenPrivateFile, PlatformError> {
+    write_new_private_retained_impl(path, bytes, false, true)
+}
+
+/// Like [`write_new_private_retained`], syncing the completed file before return.
+pub fn write_new_private_synced_retained(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<WrittenPrivateFile, PlatformError> {
+    write_new_private_retained_impl(path, bytes, true, true)
+}
+
+/// Create a private temporary beside `target`, retrying at most eight CREATE collisions.
+/// Permission checks and diagnostics must use the returned writer's actual [`WrittenPrivateFile::path`].
+pub fn write_private_tmp_retained(
+    target: &Path,
+    bytes: &[u8],
+) -> Result<WrittenPrivateFile, PlatformError> {
+    write_private_tmp_retained_impl(target, bytes, false)
+}
+
+/// Like [`write_private_tmp_retained`], syncing the completed file before return.
+pub fn write_private_tmp_synced_retained(
+    target: &Path,
+    bytes: &[u8],
+) -> Result<WrittenPrivateFile, PlatformError> {
+    write_private_tmp_retained_impl(target, bytes, true)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+type PrivateTmpCandidates = std::rc::Rc<dyn Fn(&Path, usize) -> PathBuf>;
+
+#[cfg(any(test, feature = "test-utils"))]
+thread_local! {
+    static PRIVATE_TMP_CANDIDATES: std::cell::RefCell<Option<PrivateTmpCandidates>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Scope deterministic temporary candidates to this thread and operation.
+/// The callback receives the final target and zero-based CREATE attempt (0..8).
+#[cfg(any(test, feature = "test-utils"))]
+pub fn with_private_tmp_candidates_for_test<T>(
+    candidate: impl Fn(&Path, usize) -> PathBuf + 'static,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct RestoreCandidates(Option<PrivateTmpCandidates>);
+    impl Drop for RestoreCandidates {
+        fn drop(&mut self) {
+            PRIVATE_TMP_CANDIDATES.with(|slot| {
+                *slot.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let previous =
+        PRIVATE_TMP_CANDIDATES.with(|slot| slot.replace(Some(std::rc::Rc::new(candidate))));
+    let _restore = RestoreCandidates(previous);
+    operation()
+}
+
+fn private_tmp_candidate(target: &Path, attempt: usize) -> PathBuf {
+    #[cfg(any(test, feature = "test-utils"))]
+    {
+        let candidate = PRIVATE_TMP_CANDIDATES.with(|slot| slot.borrow().clone());
+        if let Some(candidate) = candidate {
+            return candidate(target, attempt);
+        }
+    }
+    #[cfg(not(any(test, feature = "test-utils")))]
+    let _ = attempt;
+    unique_tmp_path(target)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+type PrivateCreateObserver = std::rc::Rc<dyn Fn(&Path)>;
+
+#[cfg(any(test, feature = "test-utils"))]
+thread_local! {
+    static PRIVATE_CREATE_OBSERVER: std::cell::RefCell<Option<PrivateCreateObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Observe the actual path immediately before an exclusive private-file create.
+/// Shared by explicit-path and retrying constructors; this hook performs no cleanup.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn with_private_create_observer_for_test<T>(
+    observer: impl Fn(&Path) + 'static,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct RestoreObserver(Option<PrivateCreateObserver>);
+    impl Drop for RestoreObserver {
+        fn drop(&mut self) {
+            PRIVATE_CREATE_OBSERVER.with(|slot| {
+                *slot.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let previous =
+        PRIVATE_CREATE_OBSERVER.with(|slot| slot.replace(Some(std::rc::Rc::new(observer))));
+    let _restore = RestoreObserver(previous);
+    operation()
+}
+
+fn write_private_tmp_retained_impl(
+    target: &Path,
+    bytes: &[u8],
+    sync: bool,
+) -> Result<WrittenPrivateFile, PlatformError> {
+    const CREATE_ATTEMPTS: usize = 8;
+    let mut attempt = 0;
+    loop {
+        let path = private_tmp_candidate(target, attempt);
+        match create_new_private_writer(&path, true) {
+            Ok(file) => return finish_private_write(file, &path, bytes, sync),
+            Err(PlatformError::Io(error))
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    && attempt + 1 < CREATE_ATTEMPTS =>
+            {
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+type PrivateSyncObserver = std::rc::Rc<dyn Fn(&Path)>;
+
+#[cfg(any(test, feature = "test-utils"))]
+thread_local! {
+    static PRIVATE_SYNC_OBSERVER: std::cell::RefCell<Option<PrivateSyncObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Observe successful private-file syncs within this thread and operation only.
+/// The prior observer is restored on return or unwind, including nested scopes.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn with_private_sync_observer_for_test<T>(
+    observer: impl Fn(&Path) + 'static,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct RestoreObserver(Option<PrivateSyncObserver>);
+    impl Drop for RestoreObserver {
+        fn drop(&mut self) {
+            PRIVATE_SYNC_OBSERVER.with(|slot| {
+                *slot.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let previous =
+        PRIVATE_SYNC_OBSERVER.with(|slot| slot.replace(Some(std::rc::Rc::new(observer))));
+    let _restore = RestoreObserver(previous);
+    operation()
+}
+
+fn write_new_private_impl(
+    path: &Path,
+    bytes: &[u8],
+    sync: bool,
+) -> Result<WrittenFileIdentity, PlatformError> {
+    let mut writer = write_new_private_retained_impl(path, bytes, sync, false)?;
+    let file = writer
+        .file
+        .as_ref()
+        .ok_or_else(|| PlatformError::Io(std::io::Error::other("private writer is closed")))?;
+    let identity = written_file_identity(file)?;
+    drop(writer.file.take());
+    Ok(identity)
+}
+
+fn write_new_private_retained_impl(
+    path: &Path,
+    bytes: &[u8],
+    sync: bool,
+    retained: bool,
+) -> Result<WrittenPrivateFile, PlatformError> {
+    let file = create_new_private_writer(path, retained)?;
+    finish_private_write(file, path, bytes, sync)
+}
+
+fn create_new_private_writer(path: &Path, retained: bool) -> Result<std::fs::File, PlatformError> {
+    #[cfg(any(test, feature = "test-utils"))]
+    {
+        let observer = PRIVATE_CREATE_OBSERVER.with(|slot| slot.borrow().clone());
+        if let Some(observer) = observer {
+            observer(path);
+        }
+    }
     #[cfg(unix)]
-    let mut file = {
+    let file = {
         use std::os::unix::fs::OpenOptionsExt as _;
         std::fs::OpenOptions::new()
             .write(true)
@@ -1079,13 +1447,37 @@ fn write_new_private_impl(path: &Path, bytes: &[u8], sync: bool) -> Result<(), P
     // an existing file/reparse point exactly as `create_new(true)` does on unix;
     // a failed post-create check deletes the file through the handle.
     #[cfg(windows)]
-    let mut file = super::fs_windows_acl::create_new_private_file(path)
-        .map_err(|e| PlatformError::Io(e.into()))?;
+    let file = if retained {
+        use windows_sys::Win32::{
+            Foundation::{GENERIC_READ, GENERIC_WRITE},
+            Storage::FileSystem::FILE_SHARE_READ,
+        };
+        super::fs_windows_acl::create_new_private_file_with(
+            path,
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ,
+        )
+    } else {
+        super::fs_windows_acl::create_new_private_file(path)
+    }
+    .map_err(|e| PlatformError::Io(e.into()))?;
+    #[cfg(not(windows))]
+    let _ = retained;
     #[cfg(not(any(unix, windows)))]
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)?;
+    Ok(file)
+}
+
+fn finish_private_write(
+    mut file: std::fs::File,
+    path: &Path,
+    bytes: &[u8],
+    sync: bool,
+) -> Result<WrittenPrivateFile, PlatformError> {
+    use std::io::Write as _;
 
     // From here `path` exists and is ours: any failure removes it before
     // propagating, so the caller never has to distinguish "never created"
@@ -1101,7 +1493,18 @@ fn write_new_private_impl(path: &Path, bytes: &[u8], sync: bool) -> Result<(), P
             return Err(e.into());
         }
     }
-    Ok(())
+    let writer = WrittenPrivateFile {
+        file: Some(file),
+        path: path.to_path_buf(),
+    };
+    #[cfg(any(test, feature = "test-utils"))]
+    if sync {
+        let observer = PRIVATE_SYNC_OBSERVER.with(|slot| slot.borrow().clone());
+        if let Some(observer) = observer {
+            observer(path);
+        }
+    }
+    Ok(writer)
 }
 
 /// Removes the file `write_new_private_impl` just created after a failed write.
@@ -1113,10 +1516,29 @@ fn discard_created(file: std::fs::File, path: &Path) {
         super::fs_windows_delete::delete_created(&file);
         drop(file);
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::MetadataExt;
+        let owns_path = file
+            .metadata()
+            .ok()
+            .zip(std::fs::symlink_metadata(path).ok())
+            .map(|(held, current)| (held.dev(), held.ino()) == (current.dev(), current.ino()))
+            .unwrap_or(false);
         drop(file);
-        let _ = std::fs::remove_file(path);
+        if owns_path {
+            let _ = std::fs::remove_file(path);
+        } else {
+            tracing::warn!(
+                error_kind = "private_tmp_cleanup_ownership_unconfirmed",
+                "private temporary file cleanup skipped"
+            );
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        drop(file);
     }
 }
 
@@ -1126,10 +1548,14 @@ fn discard_created(file: std::fs::File, path: &Path) {
 /// with an explicit `EXDEV` fallback for the case where `tmp_path` and
 /// `target` sit on different filesystems — see `atomic_replace_unix` for the
 /// fallback contract and what it does and does not guarantee.
-/// On Windows, files may be held open by other processes, so a sharing, lock
-/// or access-denied failure of `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` is
-/// retried up to 5 times with 100ms delay; access-denied on a directory
-/// target, and any other error, is returned on the first attempt. Other
+/// On Windows, source and target must have the same parent path; a different
+/// parent returns `PlatformError::AtomicReplaceParentMismatch` before opening
+/// either entry. The parent is pinned once and junctions in its path are followed.
+/// POSIX-semantics rename replaces a file even with a reader holding
+/// it open with delete sharing. An unsupported POSIX rename class tries the plain rename
+/// class through the same validated source handle. Sharing, lock, or selected
+/// access-denied failures are retried up to 5 times with 100ms delay; access-denied
+/// on a directory target, and any other error, is returned on the first attempt. Other
 /// permanent access-denied causes (read-only file, denying DACL) are retried
 /// and then returned (see `is_transient_move_error`).
 pub fn atomic_replace(tmp_path: &Path, target: &Path) -> Result<(), PlatformError> {
@@ -1139,9 +1565,32 @@ pub fn atomic_replace(tmp_path: &Path, target: &Path) -> Result<(), PlatformErro
     }
     #[cfg(windows)]
     {
-        atomic_replace_windows(tmp_path, target)?;
+        atomic_replace_windows(tmp_path, target, None)?;
     }
     Ok(())
+}
+
+/// Publish a private file only if the reopened Windows source matches the
+/// identity captured from its writer. The writer must be closed before calling.
+/// Windows requires the same parent path, as for [`atomic_replace`].
+/// On other platforms this retains `atomic_replace` semantics, including EXDEV.
+/// Failure leaves cleanup with the caller; removal of the tmp path is best effort
+/// and cannot prove deletion of an original file relocated before this call.
+#[doc(hidden)]
+pub fn atomic_replace_written(
+    tmp_path: &Path,
+    target: &Path,
+    expected: WrittenFileIdentity,
+) -> Result<(), PlatformError> {
+    #[cfg(windows)]
+    {
+        atomic_replace_windows(tmp_path, target, Some(expected))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = expected;
+        atomic_replace(tmp_path, target)
+    }
 }
 
 /// `true` only for the kernel's cross-filesystem rename refusal.
@@ -1258,13 +1707,13 @@ fn atomic_replace_cross_device(tmp_path: &Path, target: &Path) -> Result<(), Pla
     Ok(())
 }
 
-/// `true` for the `MoveFileExW` failures that another process holding the
+/// `true` for the rename failures that another process holding the
 /// target can cause and that can clear on their own, so the retry loop in
 /// [`atomic_replace_windows`] exists for them ("file may be locked"):
 /// `ERROR_SHARING_VIOLATION` (32), `ERROR_LOCK_VIOLATION` (33), and
 /// `ERROR_ACCESS_DENIED` (5).
 ///
-/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` returns 5 when the target is
+/// A plain replacing rename returns 5 when the target is
 /// briefly held open without `FILE_SHARE_DELETE` (antivirus, the indexer,
 /// csq's own readers) or is delete-pending — a refreshed OAuth token must
 /// not be lost to that on the first attempt. 5 is also returned for
@@ -1286,85 +1735,607 @@ fn is_transient_move_error(code: u32, target_is_dir: bool) -> bool {
     }
 }
 
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowsReplaceStage {
+    Open,
+    Validate,
+    Rename,
+}
+
+#[cfg(any(windows, test))]
+fn windows_replace_retry(
+    stage: WindowsReplaceStage,
+    code: u32,
+    target_is_dir: bool,
+    attempt: u32,
+) -> bool {
+    attempt < 4
+        && match stage {
+            WindowsReplaceStage::Open => matches!(code, 32 | 33),
+            WindowsReplaceStage::Validate => false,
+            WindowsReplaceStage::Rename => is_transient_move_error(code, target_is_dir),
+        }
+}
+
+#[cfg(any(windows, test))]
+fn windows_replace_source_safe(attributes: u32, links: u32) -> bool {
+    attributes & (0x400 | 0x10) == 0 && links == 1
+}
+
+#[cfg(any(windows, test))]
+fn windows_rename_failed(status: i32) -> bool {
+    status < 0
+}
+
+/// Whether Windows rejected the rename information class or its supported
+/// flags, permitting a plain FileRenameInformation retry on the same handle.
+pub fn windows_rename_class_unsupported(status: i32) -> bool {
+    matches!(
+        status as u32,
+        0xC000_0003 | 0xC000_000D | 0xC000_0010 | 0xC000_00BB
+    )
+}
+
+#[cfg(any(windows, test))]
+fn windows_replace_leaf_safe(name: &[u16]) -> bool {
+    !name.is_empty()
+        && name.len() <= u16::MAX as usize / 2
+        && !matches!(name.last().copied(), Some(0x20 | 0x2e))
+        && !name.iter().any(|c| matches!(*c, 0 | 0x2f | 0x5c | 0x3a))
+}
+
+/// This is the production dispatcher; portable tests exercise these exact calls.
+#[cfg(any(windows, test))]
+fn dispatch_windows_rename<H>(
+    source: &H,
+    parent: &H,
+    mut rename: impl FnMut(&H, &H, i32) -> i32,
+) -> Result<(), (i32, Option<i32>)> {
+    let posix = rename(source, parent, 65);
+    if !windows_rename_failed(posix) {
+        return Ok(());
+    }
+    if !windows_rename_class_unsupported(posix) {
+        return Err((posix, None));
+    }
+    let plain = rename(source, parent, 10);
+    if windows_rename_failed(plain) {
+        Err((posix, Some(plain)))
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(windows)]
-fn atomic_replace_windows(tmp_path: &Path, target: &Path) -> Result<(), PlatformError> {
-    use std::os::windows::ffi::OsStrExt;
-    use tracing::warn;
-
-    // MOVEFILE_REPLACE_EXISTING = 0x1
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-    const MAX_RETRIES: u32 = 5;
-    const RETRY_DELAY_MS: u64 = 100;
-
-    extern "system" {
-        fn MoveFileExW(
-            lpExistingFileName: *const u16,
-            lpNewFileName: *const u16,
-            dwFlags: u32,
-        ) -> i32;
-        fn GetLastError() -> u32;
+fn windows_file_information(
+    file: &std::fs::File,
+) -> std::io::Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    // SAFETY: live borrowed handle, valid synchronous output buffer.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as isize, &mut info) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(info)
     }
+}
 
-    fn to_wide(s: &Path) -> Vec<u16> {
-        s.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
+#[cfg(windows)]
+fn windows_file_id(
+    file: &std::fs::File,
+) -> std::io::Result<windows_sys::Win32::Storage::FileSystem::FILE_ID_INFO> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
+    };
+    // SAFETY: live borrowed handle and a correctly sized/aligned output buffer.
+    let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as isize,
+            FileIdInfo,
+            (&mut info as *mut FILE_ID_INFO).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    } == 0
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(info)
     }
+}
 
-    let src = to_wide(tmp_path);
-    let dst = to_wide(target);
+#[cfg(windows)]
+fn windows_written_file_identity(file: &std::fs::File) -> std::io::Result<WrittenFileIdentity> {
+    query_windows_file_identity(
+        || windows_file_id(file).map(|info| WrittenFileIdentity::from_information(&info).windows),
+        || {
+            windows_file_information(file).map(|info| {
+                WindowsFileIdentity::legacy(
+                    info.dwVolumeSerialNumber,
+                    info.nFileIndexHigh,
+                    info.nFileIndexLow,
+                )
+            })
+        },
+    )
+    .map(|windows| WrittenFileIdentity {
+        windows,
+        _sealed: (),
+    })
+}
 
-    for attempt in 0..MAX_RETRIES {
-        let result = unsafe { MoveFileExW(src.as_ptr(), dst.as_ptr(), MOVEFILE_REPLACE_EXISTING) };
-        if result != 0 {
-            return Ok(());
+#[cfg(windows)]
+struct WindowsReplaceFailure {
+    stage: WindowsReplaceStage,
+    code: u32,
+    api: &'static str,
+    nt: Option<(i32, Option<i32>)>,
+}
+
+#[cfg(windows)]
+impl WindowsReplaceFailure {
+    fn retry_code(&self) -> u32 {
+        use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+        // SAFETY: pure status translation. The attempted fallback governs retry;
+        // the original POSIX refusal remains the final reported primary code.
+        self.nt
+            .and_then(|(_, plain)| plain)
+            .map(|status| unsafe { RtlNtStatusToDosError(status) })
+            .unwrap_or(self.code)
+    }
+    fn io(stage: WindowsReplaceStage, api: &'static str, error: std::io::Error) -> Self {
+        Self {
+            stage,
+            code: error.raw_os_error().unwrap_or(1) as u32,
+            api,
+            nt: None,
         }
-        let err_code = unsafe { GetLastError() };
-        // Only consulted for access-denied: a directory target is the one
-        // permanent form of 5. Read from the entry's own attributes, NOT
-        // `Metadata::is_dir()`: std reports a junction or a directory
-        // symlink as a symlink (`is_dir() == false`), yet both carry
-        // FILE_ATTRIBUTE_DIRECTORY and no retry clears them. An unreadable
-        // target (`Err`) is treated as not-a-directory, so the bounded retry
-        // still runs and then fails loudly — never a silent success.
-        let target_is_dir = err_code == 5
-            && std::fs::symlink_metadata(target)
-                .map(|m| {
-                    use std::os::windows::fs::MetadataExt;
-                    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
-                    m.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0
-                })
-                .unwrap_or(false);
-        if !is_transient_move_error(err_code, target_is_dir) {
-            return Err(PlatformError::Win32 {
-                code: err_code,
-                message: format!(
-                    "MoveFileExW failed: {} -> {}",
-                    tmp_path.display(),
-                    target.display()
-                ),
-            });
+    }
+    fn invalid(api: &'static str) -> Self {
+        Self {
+            stage: WindowsReplaceStage::Validate,
+            code: 87,
+            api,
+            nt: None,
         }
-        if attempt + 1 < MAX_RETRIES {
-            warn!(
-                attempt = attempt + 1,
-                error_code = err_code,
-                "atomic_replace retry (file may be locked)"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
+    }
+    fn into_platform(self, source: &Path, target: &Path, attempt: u32) -> PlatformError {
+        use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+        let statuses = self
+            .nt
+            .map(|(posix, plain)| {
+                // SAFETY: pure status translation; GetLastError is unrelated.
+                let posix_code = unsafe { RtlNtStatusToDosError(posix) };
+                let plain = plain
+                    .map(|plain| {
+                        // SAFETY: pure NTSTATUS translation.
+                        let code = unsafe { RtlNtStatusToDosError(plain) };
+                        format!(" plain_nt_status={:#010x} plain_code={code}", plain as u32)
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "; posix_nt_status={:#010x} posix_code={posix_code}{plain}",
+                    posix as u32
+                )
+            })
+            .unwrap_or_default();
+        let exhausted = if attempt == 4 {
+            " after 5 attempts"
         } else {
-            return Err(PlatformError::Win32 {
-                code: err_code,
-                message: format!(
-                    "MoveFileExW failed after {MAX_RETRIES} attempts: {} -> {}",
-                    tmp_path.display(),
-                    target.display()
-                ),
-            });
+            ""
+        };
+        PlatformError::Win32 {
+            code: self.code,
+            message: format!(
+                "atomic_replace: {} failed{exhausted}{statuses}: {} -> {}",
+                self.api,
+                source.file_name().unwrap_or_default().to_string_lossy(),
+                target.file_name().unwrap_or_default().to_string_lossy()
+            ),
         }
+    }
+}
+
+#[cfg(windows)]
+fn windows_replace_path(path: &Path) -> Result<(&Path, Vec<u16>), WindowsReplaceFailure> {
+    use std::os::windows::ffi::OsStrExt;
+    // Inspect the raw suffix: Path::file_name normalizes away a trailing dot
+    // component or separator, which must not disguise the requested leaf.
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let leaf = wide
+        .rsplit(|c| matches!(*c, 0x2f | 0x5c))
+        .next()
+        .unwrap_or(&[]);
+    if !windows_replace_leaf_safe(leaf) {
+        return Err(WindowsReplaceFailure::invalid("Windows leaf validation"));
+    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    Ok((parent, leaf.to_vec()))
+}
+
+#[cfg(windows)]
+fn windows_open_parent(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ADD_FILE, FILE_FLAG_BACKUP_SEMANTICS, FILE_TRAVERSE,
+    };
+    // Follow parent junctions, matching the legacy traversal policy. Once opened
+    // this object, rather than its potentially redirected pathname, is retained.
+    std::fs::OpenOptions::new()
+        .access_mode(FILE_ADD_FILE | FILE_TRAVERSE)
+        .share_mode(7)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn windows_open_relative(
+    parent: &std::fs::File,
+    name: &[u16],
+    access: u32,
+    share: u32,
+) -> Result<std::fs::File, i32> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        NtCreateFile, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+    };
+    use windows_sys::Win32::Foundation::UNICODE_STRING;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+    let name = UNICODE_STRING {
+        Length: (name.len() * 2) as u16,
+        MaximumLength: (name.len() * 2) as u16,
+        Buffer: name.as_ptr() as *mut u16,
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: parent.as_raw_handle() as isize,
+        ObjectName: &name,
+        Attributes: 0x40,
+        SecurityDescriptor: std::ptr::null(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut handle = 0;
+    // SAFETY: checked leaf length, live name and parent, initialized output
+    // storage, and synchronous IO with SYNCHRONIZE; the API retains no pointers.
+    let status = unsafe {
+        let mut block: IO_STATUS_BLOCK = std::mem::zeroed();
+        NtCreateFile(
+            &mut handle,
+            access | 0x0010_0000,
+            &attributes,
+            &mut block,
+            std::ptr::null(),
+            0,
+            share,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status < 0 {
+        Err(status)
+    } else {
+        // SAFETY: successful NtCreateFile transfers this one owned handle.
+        Ok(unsafe { std::fs::File::from_raw_handle(handle as *mut std::ffi::c_void) })
+    }
+}
+
+#[cfg(all(windows, test))]
+type BeforeRenameHook = Box<dyn FnMut(bool)>;
+#[cfg(all(windows, test))]
+type AfterReplaceFailureHook = Box<dyn FnMut(WindowsReplaceStage, u32)>;
+
+#[cfg(all(windows, test))]
+thread_local! {
+    static REPLACE_FORCE_LEGACY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static REPLACE_BEFORE_RENAME: std::cell::RefCell<Option<BeforeRenameHook>> =
+        const { std::cell::RefCell::new(None) };
+    static REPLACE_AFTER_PARENT_PIN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static REPLACE_AFTER_FAILURE: std::cell::RefCell<Option<AfterReplaceFailureHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(any(windows, test))]
+fn dispatch_windows_replace_parent<T>(
+    source_parent: &Path,
+    target_parent: &Path,
+    dispatch: impl FnOnce() -> T,
+) -> Result<T, PlatformError> {
+    if source_parent != target_parent {
+        return Err(PlatformError::AtomicReplaceParentMismatch {
+            source_parent: source_parent.to_path_buf(),
+            target_parent: target_parent.to_path_buf(),
+        });
+    }
+    Ok(dispatch())
+}
+
+#[cfg(windows)]
+fn atomic_replace_windows(
+    tmp_path: &Path,
+    target: &Path,
+    expected: Option<WrittenFileIdentity>,
+) -> Result<(), PlatformError> {
+    windows_publish(tmp_path, target, expected, None, false).map(|_| ())
+}
+
+#[cfg(windows)]
+fn windows_publish(
+    tmp_path: &Path,
+    target: &Path,
+    expected: Option<WrittenFileIdentity>,
+    retained: Option<&std::fs::File>,
+    no_replace: bool,
+) -> Result<PublishOutcome, PlatformError> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+    let (source_parent, source_name) =
+        windows_replace_path(tmp_path).map_err(|e| e.into_platform(tmp_path, target, 0))?;
+    let (target_parent, target_name) =
+        windows_replace_path(target).map_err(|e| e.into_platform(tmp_path, target, 0))?;
+    let mut parent = None;
+    // One shared budget: unsuccessful parent opens consume attempts; after its
+    // first successful open the same parent object survives every source retry.
+    for attempt in 0..5 {
+        let opening = if parent.is_none() {
+            Some(dispatch_windows_replace_parent(
+                source_parent,
+                target_parent,
+                || windows_open_parent(target_parent),
+            )?)
+        } else {
+            None
+        };
+        let result = (|| {
+            if let Some(opening) = opening {
+                parent = Some(opening.map_err(|e| {
+                    WindowsReplaceFailure::io(
+                        WindowsReplaceStage::Rename,
+                        "CreateFileW(destination parent)",
+                        e,
+                    )
+                })?);
+                #[cfg(test)]
+                if let Some(hook) = REPLACE_AFTER_PARENT_PIN.with(|h| h.borrow_mut().take()) {
+                    hook();
+                }
+            }
+            let parent = parent
+                .as_ref()
+                .ok_or_else(|| WindowsReplaceFailure::invalid("parent acquisition"))?;
+            windows_replace_attempt(
+                parent,
+                &source_name,
+                &target_name,
+                expected,
+                retained,
+                no_replace,
+            )
+        })();
+        let failure = match result {
+            Ok(()) => return Ok(PublishOutcome::Published),
+            Err(failure) => failure,
+        };
+        let retry_code = failure.retry_code();
+        if no_replace
+            && failure.stage == WindowsReplaceStage::Rename
+            && matches!(retry_code, 80 | 183)
+        {
+            return Ok(PublishOutcome::AlreadyExists);
+        }
+        #[cfg(test)]
+        REPLACE_AFTER_FAILURE.with(|h| {
+            if let Some(hook) = h.borrow_mut().as_mut() {
+                hook(failure.stage, retry_code);
+            }
+        });
+        // A directory target is a permanent error5. Query its entry relative to
+        // the pinned parent, without following a final reparse point. If no pin
+        // or readable entry is available, retain the bounded retry on error5.
+        let target_is_dir = retry_code == 5
+            && parent
+                .as_ref()
+                .and_then(|p| windows_open_relative(p, &target_name, FILE_READ_ATTRIBUTES, 7).ok())
+                .and_then(|file| windows_file_information(&file).ok())
+                .map(|info| info.dwFileAttributes & 0x10 != 0)
+                .unwrap_or(false);
+        if !windows_replace_retry(failure.stage, retry_code, target_is_dir, attempt) {
+            return Err(failure.into_platform(tmp_path, target, attempt));
+        }
+        tracing::warn!(
+            attempt = attempt + 1,
+            error_code = retry_code,
+            "atomic_replace retry (file may be locked)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     unreachable!()
+}
+
+#[cfg(windows)]
+fn windows_replace_attempt(
+    parent: &std::fs::File,
+    source_name: &[u16],
+    target_name: &[u16],
+    expected: Option<WrittenFileIdentity>,
+    retained: Option<&std::fs::File>,
+    no_replace: bool,
+) -> Result<(), WindowsReplaceFailure> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Wdk::Storage::FileSystem::NtSetInformationFile;
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO};
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+    use WindowsReplaceStage::{Open, Rename, Validate};
+    #[cfg(target_pointer_width = "64")]
+    const _: () = {
+        assert!(std::mem::offset_of!(FILE_RENAME_INFO, RootDirectory) == 8);
+        assert!(std::mem::offset_of!(FILE_RENAME_INFO, FileNameLength) == 16);
+        assert!(std::mem::offset_of!(FILE_RENAME_INFO, FileName) == 20);
+    };
+    // Query observes one regular, non-reparse, single-link entry. Denying DELETE
+    // sharing pins that entry against competing rename/delete opens while held;
+    // sharing READ|WRITE permits writers and does not freeze content or links.
+    let access = if retained.is_some() {
+        FILE_READ_ATTRIBUTES
+    } else {
+        DELETE | FILE_READ_ATTRIBUTES | if expected.is_some() { 0x0002_0000 } else { 0 }
+    };
+    let reopened = windows_open_relative(
+        parent,
+        source_name,
+        access,
+        if retained.is_some() { 7 } else { 3 },
+    )
+    .map_err(|status| WindowsReplaceFailure {
+        stage: Open,
+        code: unsafe { RtlNtStatusToDosError(status) },
+        api: "NtCreateFile(source)",
+        nt: None,
+    })?;
+    let identity = |file: &std::fs::File| {
+        windows_written_file_identity(file)
+            .map_err(|e| WindowsReplaceFailure::io(Validate, "Windows file identity query", e))
+    };
+    let source = if let Some(writer) = retained {
+        if identity(writer)? != identity(&reopened)? {
+            return Err(WindowsReplaceFailure::invalid(
+                "retained source identity validation",
+            ));
+        }
+        writer
+    } else {
+        &reopened
+    };
+    let info = windows_file_information(source).map_err(|e| {
+        WindowsReplaceFailure::io(Validate, "GetFileInformationByHandle(source)", e)
+    })?;
+    if !windows_replace_source_safe(info.dwFileAttributes, info.nNumberOfLinks) {
+        return Err(WindowsReplaceFailure::invalid("source entry validation"));
+    }
+    if let Some(expected) = expected {
+        if identity(source)? != expected {
+            return Err(WindowsReplaceFailure::invalid(
+                "written source identity validation",
+            ));
+        }
+    }
+    if expected.is_some() || retained.is_some() {
+        super::fs_windows_acl::check_private_handle(source).map_err(|e| {
+            WindowsReplaceFailure::io(Validate, "check_private_handle(source)", e.into())
+        })?;
+    }
+    // Inspect the destination itself, relative to the same pinned parent. POSIX
+    // rename can unlink a directory reparse point successfully; a failure-only
+    // probe therefore cannot enforce the directory-destination refusal. This is
+    // a point-in-time check, not a destination identity pin across rename.
+    if !no_replace {
+        match windows_open_relative(parent, target_name, FILE_READ_ATTRIBUTES, 7) {
+            Ok(target) => {
+                let info = windows_file_information(&target).map_err(|e| {
+                    WindowsReplaceFailure::io(Validate, "destination attribute validation", e)
+                })?;
+                if info.dwFileAttributes & 0x10 != 0 {
+                    return Err(WindowsReplaceFailure::io(
+                        Validate,
+                        "destination directory validation",
+                        std::io::Error::from_raw_os_error(5),
+                    ));
+                }
+            }
+            Err(status) => {
+                // SAFETY: pure status translation; the missing leaf is allowed.
+                let code = unsafe { RtlNtStatusToDosError(status) };
+                if !matches!(code, 2 | 3) {
+                    return Err(WindowsReplaceFailure {
+                        stage: Rename,
+                        code,
+                        api: "NtCreateFile(destination validation)",
+                        nt: None,
+                    });
+                }
+            }
+        }
+    }
+    let total = std::mem::size_of::<FILE_RENAME_INFO>() + target_name.len() * 2;
+    let mut buffer = vec![0u64; total.div_ceil(8)];
+    let rename = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: aligned storage includes the checked-length UTF-16 leaf; the live
+    // parent is kept until dispatch completes. FileName excludes a trailing NUL.
+    unsafe {
+        (*rename).RootDirectory = parent.as_raw_handle() as isize;
+        (*rename).FileNameLength = (target_name.len() * 2) as u32;
+        std::ptr::copy_nonoverlapping(
+            target_name.as_ptr(),
+            std::ptr::addr_of_mut!((*rename).FileName).cast::<u16>(),
+            target_name.len(),
+        );
+    }
+    let mut rename_call = |source: &std::fs::File, _parent: &std::fs::File, class| {
+        #[cfg(test)]
+        REPLACE_BEFORE_RENAME.with(|h| {
+            if let Some(h) = h.borrow_mut().as_mut() {
+                h(class == 10);
+            }
+        });
+        #[cfg(test)]
+        if class == 65 && REPLACE_FORCE_LEGACY.with(|f| f.get()) {
+            return 0xC000_0003_u32 as i32;
+        }
+        // SAFETY: same validated DELETE handle for both synchronous calls. The
+        // union is fully overwritten (class10's BOOLEAN is 0 for no-replace).
+        unsafe {
+            (*rename).Anonymous.Flags = if no_replace {
+                0
+            } else if class == 65 {
+                3
+            } else {
+                1
+            };
+            let mut block: IO_STATUS_BLOCK = std::mem::zeroed();
+            NtSetInformationFile(
+                source.as_raw_handle() as isize,
+                &mut block,
+                rename.cast(),
+                total as u32,
+                class,
+            )
+        }
+    };
+    let result = if no_replace {
+        let status = rename_call(source, parent, 10);
+        if windows_rename_failed(status) {
+            Err((status, None))
+        } else {
+            Ok(())
+        }
+    } else {
+        dispatch_windows_rename(source, parent, &mut rename_call)
+    };
+    result.map_err(|(posix, plain)| WindowsReplaceFailure {
+        stage: Rename,
+        code: unsafe { RtlNtStatusToDosError(posix) },
+        api: if no_replace {
+            "NtSetInformationFile(FileRenameInformation; no-replace)"
+        } else {
+            "NtSetInformationFile(FileRenameInformation)"
+        },
+        nt: if no_replace {
+            None
+        } else {
+            Some((posix, plain))
+        },
+    })
 }
 
 /// Creates a symlink at `link` pointing to `target`, failing if `link` already exists.
@@ -3596,6 +4567,1275 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn windows_replace_policy_preserves_fallback_retry_and_source_dispositions() {
+        use WindowsReplaceStage::{Open, Rename, Validate};
+        for status in [0, 1, i32::MAX] {
+            assert!(!windows_rename_failed(status));
+        }
+        // Failure severity and class support are separate decisions.
+        for status in [
+            0xC000_0003_u32,
+            0xC000_000D,
+            0xC000_0010,
+            0xC000_00BB,
+            0xC000_0022,
+            0xC000_0043,
+            0xC000_0035,
+            0x8000_0001,
+        ] {
+            assert!(windows_rename_failed(status as i32), "{status:#x}");
+        }
+        for status in [0xC000_0003_u32, 0xC000_000D, 0xC000_0010, 0xC000_00BB] {
+            assert!(windows_rename_class_unsupported(status as i32));
+        }
+        for status in [0_u32, 1, 0xC000_0022, 0xC000_0043, 0xC000_0035, 0x8000_0001] {
+            assert!(!windows_rename_class_unsupported(status as i32));
+        }
+        for attempt in 0..5 {
+            for code in [32, 33] {
+                assert_eq!(
+                    windows_replace_retry(Open, code, false, attempt),
+                    attempt < 4
+                );
+                assert_eq!(
+                    windows_replace_retry(Rename, code, true, attempt),
+                    attempt < 4
+                );
+            }
+            assert_eq!(
+                windows_replace_retry(Rename, 5, false, attempt),
+                attempt < 4
+            );
+            assert!(!windows_replace_retry(Rename, 5, true, attempt));
+            for code in [0, 2, 3, 5, 80, 87, 183] {
+                assert!(!windows_replace_retry(Open, code, false, attempt));
+                assert!(!windows_replace_retry(Validate, code, false, attempt));
+            }
+        }
+        assert!(windows_replace_source_safe(0x20, 1));
+        for attributes in [0x400, 0x10, 0x410] {
+            assert!(!windows_replace_source_safe(attributes, 1));
+        }
+        for links in [0, 2, u32::MAX] {
+            assert!(!windows_replace_source_safe(0x20, links));
+        }
+    }
+
+    #[test]
+    fn windows_replace_dispatch_uses_actual_fallback_and_retains_both_statuses() {
+        for first in [0xC000_0003_u32, 0xC000_000D, 0xC000_0010, 0xC000_00BB].map(|s| s as i32) {
+            let mut trace = Vec::new();
+            let result = dispatch_windows_rename(&17, &29, |source, parent, class| {
+                trace.push((*source, *parent, class));
+                if class == 65 {
+                    first
+                } else {
+                    -7
+                }
+            });
+            assert_eq!(trace, [(17, 29, 65), (17, 29, 10)]);
+            assert_eq!(result, Err((first, Some(-7))));
+            assert!(dispatch_windows_rename(&17, &29, |_, _, class| {
+                if class == 65 {
+                    first
+                } else {
+                    1
+                }
+            })
+            .is_ok());
+        }
+        for first in [i32::MIN, -1, 0xC000_0022_u32 as i32, 0xC000_0043_u32 as i32] {
+            let mut trace = Vec::new();
+            let result = dispatch_windows_rename(&17, &29, |source, parent, class| {
+                trace.push((*source, *parent, class));
+                first
+            });
+            assert_eq!(trace, [(17, 29, 65)]);
+            assert_eq!(result, Err((first, None)));
+        }
+        for success in [0, 1, i32::MAX] {
+            let mut calls = 0;
+            assert!(dispatch_windows_rename(&17, &29, |_, _, class| {
+                calls += 1;
+                assert_eq!(class, 65);
+                success
+            })
+            .is_ok());
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn windows_replace_parent_dispatch_refuses_cross_parent_before_io() {
+        let source = Path::new("source-parent");
+        let target = Path::new("target-parent");
+        let calls = std::cell::Cell::new(0);
+        let error = dispatch_windows_replace_parent(source, target, || calls.set(1)).unwrap_err();
+        match error {
+            PlatformError::AtomicReplaceParentMismatch {
+                source_parent,
+                target_parent,
+            } => {
+                assert_eq!(source_parent.as_path(), source);
+                assert_eq!(target_parent.as_path(), target);
+            }
+            other => panic!("expected typed parent refusal, got {other:?}"),
+        }
+        assert_eq!(
+            calls.get(),
+            0,
+            "mismatch must refuse before the IO callback"
+        );
+        let value = dispatch_windows_replace_parent(source, source, || {
+            calls.set(calls.get() + 1);
+            17
+        })
+        .unwrap();
+        assert_eq!(value, 17);
+        assert_eq!(calls.get(), 1, "same-parent control must dispatch once");
+    }
+
+    #[test]
+    fn windows_replace_leaf_rejects_aliases_before_dispatch() {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "name.",
+            "name ",
+            "name:stream",
+            "a/b",
+            "a\\b",
+            "a\0b",
+        ] {
+            assert!(!windows_replace_leaf_safe(
+                &bad.encode_utf16().collect::<Vec<_>>()
+            ));
+        }
+        for good in ["tmp.123.4", "credentials.json", "non-bmp-😀"] {
+            assert!(windows_replace_leaf_safe(
+                &good.encode_utf16().collect::<Vec<_>>()
+            ));
+        }
+        assert!(!windows_replace_leaf_safe(&vec![b'a' as u16; 32768]));
+    }
+
+    #[test]
+    fn atomic_replace_written_private_writer_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let tmp = dir.path().join("tmp");
+        let target = dir.path().join("target");
+        let identity = write_new_private_synced_with_identity(&tmp, b"private").unwrap();
+        atomic_replace_written(&tmp, &target, identity).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"private");
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn retained_private_writer_publishes_without_replacing_and_owns_cleanup() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        let tmp = dir.path().join("tmp");
+        let writer = write_new_private_synced_retained(&tmp, b"complete").unwrap();
+        assert!(!target.exists());
+        assert_eq!(
+            writer.publish_noreplace(&target).unwrap(),
+            PublishOutcome::Published
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"complete");
+        assert!(!tmp.exists());
+        let writer = write_new_private_retained(&tmp, b"second").unwrap();
+        assert_eq!(
+            writer.publish_noreplace(&target).unwrap(),
+            PublishOutcome::AlreadyExists
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"complete");
+        assert!(!tmp.exists());
+        let writer = write_new_private_retained(&tmp, b"discarded").unwrap();
+        writer.discard();
+        assert!(!tmp.exists());
+        let writer = write_new_private_retained(&tmp, b"recoverable").unwrap();
+        writer.keep();
+        assert_eq!(fs::read(&tmp).unwrap(), b"recoverable");
+    }
+
+    #[test]
+    fn retained_private_writer_does_not_clean_an_uncreated_file() {
+        let dir = TempDir::new().unwrap();
+        let tmp = dir.path().join("preexisting");
+        fs::write(&tmp, b"foreign").unwrap();
+        assert!(write_new_private_retained(&tmp, b"secret").is_err());
+        assert_eq!(fs::read(&tmp).unwrap(), b"foreign");
+    }
+
+    #[test]
+    fn private_tmp_writer_retries_a_real_create_collision_and_preserves_foreign_file() {
+        for synced in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let target = dir.path().join("target");
+            let first = dir.path().join("stale");
+            let second = dir.path().join("fresh");
+            fs::write(&first, b"foreign").unwrap();
+            let expected_target = target.clone();
+            let candidates = [first.clone(), second.clone()];
+            with_private_tmp_candidates_for_test(
+                move |actual_target, attempt| {
+                    assert_eq!(actual_target, expected_target.as_path());
+                    candidates[attempt].clone()
+                },
+                || {
+                    let writer = if synced {
+                        write_private_tmp_synced_retained(&target, b"ours")
+                    } else {
+                        write_private_tmp_retained(&target, b"ours")
+                    }
+                    .expect("one pre-existing candidate must not fail the save");
+                    assert_eq!(writer.path(), second.as_path());
+                    secure_file(writer.path()).unwrap();
+                    writer.replace(&target).unwrap();
+                },
+            );
+            assert_eq!(fs::read(&first).unwrap(), b"foreign");
+            assert_eq!(fs::read(&target).unwrap(), b"ours");
+            assert!(!second.exists());
+        }
+    }
+
+    #[test]
+    fn private_tmp_writer_stops_after_eight_real_create_collisions() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        let candidates: Vec<_> = (0..8)
+            .map(|attempt| dir.path().join(format!("stale-{attempt}")))
+            .collect();
+        for candidate in &candidates {
+            fs::write(candidate, b"foreign").unwrap();
+        }
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed_calls = calls.clone();
+        let supplied = candidates.clone();
+        let error = with_private_tmp_candidates_for_test(
+            move |_, attempt| {
+                assert_eq!(attempt, observed_calls.get());
+                observed_calls.set(observed_calls.get() + 1);
+                supplied[attempt].clone()
+            },
+            || write_private_tmp_synced_retained(&target, b"ours").unwrap_err(),
+        );
+        assert!(matches!(
+            error,
+            PlatformError::Io(ref error) if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(calls.get(), 8);
+        assert!(!target.exists());
+        for candidate in candidates {
+            assert_eq!(fs::read(candidate).unwrap(), b"foreign");
+        }
+    }
+
+    #[test]
+    fn private_tmp_writer_does_not_retry_other_create_errors() {
+        let dir = TempDir::new().unwrap();
+        let missing_parent = dir.path().join("absent-parent").join("tmp");
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed_calls = calls.clone();
+        with_private_tmp_candidates_for_test(
+            move |_, _| {
+                observed_calls.set(observed_calls.get() + 1);
+                missing_parent.clone()
+            },
+            || assert!(write_private_tmp_retained(&dir.path().join("target"), b"ours").is_err()),
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn private_create_observer_plants_real_collisions_for_both_constructor_paths() {
+        for retrying in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let target = dir.path().join("target");
+            let collision = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let planted = collision.clone();
+            let result = with_private_create_observer_for_test(
+                move |path| {
+                    if planted.borrow().is_none() {
+                        fs::write(path, b"foreign").unwrap();
+                        *planted.borrow_mut() = Some(path.to_path_buf());
+                    }
+                },
+                || {
+                    if retrying {
+                        write_private_tmp_retained(&target, b"ours")
+                    } else {
+                        write_new_private_retained(&dir.path().join("explicit"), b"ours")
+                    }
+                },
+            );
+            let collision = collision.borrow().clone().unwrap();
+            assert_eq!(fs::read(&collision).unwrap(), b"foreign");
+            if retrying {
+                let writer =
+                    result.expect("a planted first-create collision must not fail the save");
+                assert_ne!(writer.path(), collision.as_path());
+                writer.replace(&target).unwrap();
+                assert_eq!(fs::read(&target).unwrap(), b"ours");
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(PlatformError::Io(ref error))
+                        if error.kind() == std::io::ErrorKind::AlreadyExists
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn private_create_observer_restores_outer_scope_after_unwind() {
+        let dir = TempDir::new().unwrap();
+        let outer = std::rc::Rc::new(std::cell::Cell::new(0));
+        let outer_seen = outer.clone();
+        with_private_create_observer_for_test(
+            move |_| outer_seen.set(outer_seen.get() + 1),
+            || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    with_private_create_observer_for_test(
+                        |_| panic!("create observer unwind control"),
+                        || {
+                            let _ = write_new_private_retained(&dir.path().join("inner"), b"ours");
+                        },
+                    );
+                }));
+                assert!(result.is_err());
+                assert!(!dir.path().join("inner").exists());
+                write_new_private_retained(&dir.path().join("outer"), b"ours")
+                    .unwrap()
+                    .discard();
+                assert_eq!(outer.get(), 1);
+            },
+        );
+    }
+
+    #[test]
+    fn retained_private_writer_replaces_complete_target() {
+        let dir = TempDir::new().unwrap();
+        let tmp = dir.path().join("tmp");
+        let target = dir.path().join("target");
+        fs::write(&target, b"old").unwrap();
+        write_new_private_synced_retained(&tmp, b"new")
+            .unwrap()
+            .replace(&target)
+            .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn private_sync_observer_records_success_before_publication_only() {
+        let dir = TempDir::new().unwrap();
+        let synced = dir.path().join("synced");
+        let target = dir.path().join("published");
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed = seen.clone();
+        with_private_sync_observer_for_test(
+            move |path| observed.borrow_mut().push(path.to_path_buf()),
+            || {
+                write_new_private_retained(&dir.path().join("unsynced"), b"plain")
+                    .unwrap()
+                    .discard();
+                assert!(seen.borrow().is_empty());
+                let writer = write_new_private_synced_retained(&synced, b"durable").unwrap();
+                assert_eq!(*seen.borrow(), vec![synced.clone()]);
+                assert!(!target.exists(), "sync witness must precede publication");
+                writer.replace(&target).unwrap();
+                assert!(write_new_private_synced_retained(&target, b"collision").is_err());
+                assert_eq!(
+                    seen.borrow().len(),
+                    1,
+                    "failed creates must not report sync"
+                );
+            },
+        );
+        write_new_private_synced_retained(&dir.path().join("outside"), b"outside")
+            .unwrap()
+            .discard();
+        assert_eq!(seen.borrow().len(), 1, "observer must be scoped");
+    }
+
+    #[test]
+    fn private_sync_observer_restores_outer_scope_after_unwind() {
+        let dir = TempDir::new().unwrap();
+        let outer = std::rc::Rc::new(std::cell::Cell::new(0));
+        let outer_seen = outer.clone();
+        let inner = std::rc::Rc::new(std::cell::Cell::new(0));
+        let inner_seen = inner.clone();
+        let tmp = dir.path().join("tmp");
+        with_private_sync_observer_for_test(
+            move |_| outer_seen.set(outer_seen.get() + 1),
+            || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    with_private_sync_observer_for_test(
+                        move |_| {
+                            inner_seen.set(inner_seen.get() + 1);
+                            panic!("observer unwind control");
+                        },
+                        || {
+                            let _ = write_new_private_synced_retained(&tmp, b"inner");
+                        },
+                    );
+                }));
+                assert!(result.is_err());
+                assert!(!tmp.exists(), "panicking observers retain owned cleanup");
+                write_new_private_synced_retained(&tmp, b"outer")
+                    .unwrap()
+                    .discard();
+                assert_eq!(outer.get(), 1, "outer observer must be restored");
+                assert_eq!(inner.get(), 1);
+            },
+        );
+    }
+
+    #[test]
+    fn retained_private_writer_cleans_failed_replacement() {
+        let dir = TempDir::new().unwrap();
+        let tmp = dir.path().join("tmp");
+        let target = dir.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("resident"), b"unchanged").unwrap();
+        let writer = write_new_private_retained(&tmp, b"secret").unwrap();
+        assert!(writer.replace(&target).is_err());
+        assert!(!tmp.exists());
+        assert_eq!(fs::read(target.join("resident")).unwrap(), b"unchanged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_private_writer_preserves_a_foreign_replacement_on_drop() {
+        let dir = TempDir::new().unwrap();
+        let tmp = dir.path().join("tmp");
+        let parked = dir.path().join("parked");
+        let writer = write_new_private_retained(&tmp, b"ours").unwrap();
+        fs::rename(&tmp, &parked).unwrap();
+        fs::write(&tmp, b"foreign").unwrap();
+        drop(writer);
+        assert_eq!(fs::read(&tmp).unwrap(), b"foreign");
+        assert_eq!(fs::read(&parked).unwrap(), b"ours");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_private_writer_warns_when_foreign_replacement_prevents_cleanup() {
+        type Fields = std::collections::BTreeMap<String, String>;
+        type Events = std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, Fields)>>>;
+        struct Capture(Events);
+        struct Visitor(Fields);
+        impl tracing::field::Visit for Visitor {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().to_owned(), value.to_owned());
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().to_owned(), format!("{value:?}"));
+            }
+        }
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+                *metadata.level() == tracing::Level::WARN
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut visitor = Visitor(Fields::new());
+                event.record(&mut visitor);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((*event.metadata().level(), visitor.0));
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let dir = TempDir::new().unwrap();
+        let tmp = dir.path().join("private-parent-payload.tmp");
+        let parked = dir.path().join("parked");
+        let writer = write_new_private_retained(&tmp, b"ours").unwrap();
+        fs::rename(&tmp, &parked).unwrap();
+        fs::write(&tmp, b"foreign").unwrap();
+        let events: Events = Default::default();
+        tracing::subscriber::with_default(Capture(events.clone()), || drop(writer));
+        assert_eq!(fs::read(&tmp).unwrap(), b"foreign");
+        assert_eq!(fs::read(&parked).unwrap(), b"ours");
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "ownership skip must emit its fixed warning"
+        );
+        assert_eq!(events[0].0, tracing::Level::WARN);
+        let expected = Fields::from([
+            (
+                "error_kind".to_owned(),
+                "private_tmp_cleanup_ownership_unconfirmed".to_owned(),
+            ),
+            (
+                "message".to_owned(),
+                "private temporary file cleanup skipped".to_owned(),
+            ),
+        ]);
+        assert_eq!(
+            events[0].1, expected,
+            "warning must expose no path or payload"
+        );
+    }
+
+    #[test]
+    fn windows_file_identity_prefers_modern_without_legacy_query() {
+        let expected = WindowsFileIdentity::modern(1_u64 << 63, [0x80; 16]);
+        let actual = query_windows_file_identity(
+            || Ok(expected),
+            || panic!("modern success must not query the legacy identity"),
+        );
+        assert_eq!(actual.unwrap(), expected);
+    }
+
+    #[test]
+    fn windows_file_identity_unsupported_queries_legacy() {
+        for code in [1, 50, 87] {
+            let called = std::cell::Cell::new(false);
+            let expected = WindowsFileIdentity::legacy(17, 0x8123_4567, 0x89ab_cdef);
+            let actual = query_windows_file_identity(
+                || Err(std::io::Error::from_raw_os_error(code)),
+                || {
+                    called.set(true);
+                    Ok(expected)
+                },
+            );
+            assert_eq!(actual.unwrap(), expected, "unsupported error {code}");
+            assert!(called.get(), "unsupported error {code} must query legacy");
+        }
+    }
+
+    #[test]
+    fn windows_file_identity_hard_errors_do_not_query_legacy() {
+        for code in [2, 5, 6, 32, 1117] {
+            let error = query_windows_file_identity(
+                || Err(std::io::Error::from_raw_os_error(code)),
+                || panic!("hard error {code} must not query legacy"),
+            )
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+        let error = query_windows_file_identity(
+            || Err(std::io::Error::other("unclassified query error")),
+            || panic!("an error without an OS code must not query legacy"),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), None);
+        assert_eq!(error.to_string(), "unclassified query error");
+    }
+
+    #[test]
+    fn windows_file_identity_legacy_query_failure_propagates() {
+        let error = query_windows_file_identity(
+            || Err(std::io::Error::from_raw_os_error(50)),
+            || Err(std::io::Error::from_raw_os_error(5)),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(5));
+    }
+
+    #[test]
+    fn windows_file_identity_sources_and_all_bits_compare_unequal() {
+        let original = WindowsFileIdentity::modern(17, [0; 16]);
+        assert_ne!(original, WindowsFileIdentity::legacy(17, 0, 0));
+        let mut high_bit = [0; 16];
+        high_bit[15] = 0x80;
+        assert_ne!(original, WindowsFileIdentity::modern(17, high_bit));
+        assert_ne!(
+            original,
+            WindowsFileIdentity::modern(17 | (1_u64 << 63), [0; 16])
+        );
+        let legacy = WindowsFileIdentity::legacy(17, 0x8123_4567, 0x89ab_cdef);
+        assert_eq!(legacy.volume_serial, 17);
+        assert_eq!(
+            legacy.file_id,
+            WindowsFileId::Legacy64(0x8123_4567_89ab_cdef)
+        );
+        assert_ne!(
+            legacy,
+            WindowsFileIdentity::legacy(18, 0x8123_4567, 0x89ab_cdef)
+        );
+        assert_ne!(
+            legacy,
+            WindowsFileIdentity::legacy(17, 0x8123_4566, 0x89ab_cdef)
+        );
+        assert_ne!(
+            legacy,
+            WindowsFileIdentity::legacy(17, 0x8123_4567, 0x89ab_cdee)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_written_identity_compares_all_file_id_bits_and_volume() {
+        use windows_sys::Win32::Storage::FileSystem::{FILE_ID_128, FILE_ID_INFO};
+        let mut info = FILE_ID_INFO {
+            VolumeSerialNumber: 17,
+            FileId: FILE_ID_128 {
+                Identifier: [0; 16],
+            },
+        };
+        let original = WrittenFileIdentity::from_information(&info);
+        info.FileId.Identifier[15] = 1;
+        assert_ne!(WrittenFileIdentity::from_information(&info), original);
+        info.FileId.Identifier[15] = 0;
+        info.VolumeSerialNumber |= 1_u64 << 63;
+        assert_ne!(WrittenFileIdentity::from_information(&info), original);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_retained_noreplace_has_no_empty_claim_and_rejects_competing_writers() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::DELETE;
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                drop(REPLACE_BEFORE_RENAME.with(|h| h.borrow_mut().take()));
+            }
+        }
+        let _reset = Reset;
+        let dir = TempDir::new().unwrap();
+        let tmp = dir.path().join("tmp");
+        let target = dir.path().join("target");
+        let writer = write_new_private_retained(&tmp, b"complete").unwrap();
+        let source = tmp.clone();
+        let destination = target.clone();
+        let called = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = called.clone();
+        REPLACE_BEFORE_RENAME.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |plain| {
+                assert!(plain, "no-replace uses FileRenameInformation");
+                assert_eq!(
+                    fs::symlink_metadata(&destination).unwrap_err().kind(),
+                    std::io::ErrorKind::NotFound
+                );
+                assert!(fs::OpenOptions::new()
+                    .write(true)
+                    .share_mode(7)
+                    .open(&source)
+                    .is_err());
+                assert!(fs::OpenOptions::new()
+                    .access_mode(DELETE)
+                    .share_mode(7)
+                    .open(&source)
+                    .is_err());
+                assert!(fs::rename(&source, source.with_extension("moved")).is_err());
+                seen.set(true);
+            }))
+        });
+        assert_eq!(
+            writer.publish_noreplace(&target).unwrap(),
+            PublishOutcome::Published
+        );
+        assert!(called.get());
+        assert_eq!(fs::read(&target).unwrap(), b"complete");
+        assert!(!tmp.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_retained_noreplace_maps_a_racing_collision_without_overwrite() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                drop(REPLACE_BEFORE_RENAME.with(|h| h.borrow_mut().take()));
+            }
+        }
+        let _reset = Reset;
+        let dir = TempDir::new().unwrap();
+        let tmp = dir.path().join("tmp");
+        let target = dir.path().join("target");
+        let writer = write_new_private_retained(&tmp, b"secret").unwrap();
+        let destination = target.clone();
+        REPLACE_BEFORE_RENAME.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |plain| {
+                assert!(plain);
+                assert!(!destination.exists());
+                fs::write(&destination, b"racer").unwrap();
+            }))
+        });
+        assert_eq!(
+            writer.publish_noreplace(&target).unwrap(),
+            PublishOutcome::AlreadyExists
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"racer");
+        assert!(!tmp.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_retained_replace_keeps_original_writer_through_both_classes() {
+        use std::os::windows::fs::OpenOptionsExt;
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                REPLACE_FORCE_LEGACY.with(|f| f.set(false));
+                drop(REPLACE_BEFORE_RENAME.with(|h| h.borrow_mut().take()));
+            }
+        }
+        let _reset = Reset;
+        let dir = TempDir::new().unwrap();
+        let tmp = dir.path().join("tmp");
+        let target = dir.path().join("target");
+        fs::write(&target, b"old").unwrap();
+        let writer = write_new_private_synced_retained(&tmp, b"new").unwrap();
+        let identity = written_file_identity(writer.file.as_ref().unwrap()).unwrap();
+        let source = tmp.clone();
+        let trace = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = trace.clone();
+        REPLACE_FORCE_LEGACY.with(|f| f.set(true));
+        REPLACE_BEFORE_RENAME.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |plain| {
+                seen.borrow_mut().push(plain);
+                assert!(fs::OpenOptions::new()
+                    .write(true)
+                    .share_mode(7)
+                    .open(&source)
+                    .is_err());
+                assert!(fs::rename(&source, source.with_extension("moved")).is_err());
+            }))
+        });
+        writer.replace(&target).unwrap();
+        assert_eq!(*trace.borrow(), [false, true]);
+        let published = super::super::fs_windows_acl::open_private_readable(&target).unwrap();
+        super::super::fs_windows_acl::check_private_handle(&published).unwrap();
+        assert_eq!(written_file_identity(&published).unwrap(), identity);
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert!(!tmp.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_retained_writer_rejects_a_different_parent_leaf_and_cleans_own_handle() {
+        let dir = TempDir::new().unwrap();
+        let tmp = dir.path().join("tmp");
+        let foreign = dir.path().join("foreign");
+        let target = dir.path().join("target");
+        let mut writer = write_new_private_retained(&tmp, b"secret").unwrap();
+        write_new_private(&foreign, b"foreign").unwrap();
+        writer.path = foreign.clone();
+        assert!(writer.replace(&target).is_err());
+        assert_eq!(fs::read(&foreign).unwrap(), b"foreign");
+        assert!(!tmp.exists(), "cleanup follows the writer handle");
+        assert!(!target.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_replace_failure_display_exposes_leaves_without_parent_paths() {
+        let source = Path::new(r"C:\PRIVATE_USER_ROOT\SOURCE_ONLY\token.tmp");
+        let target = Path::new(r"C:\PRIVATE_USER_ROOT\DESTINATION_ONLY\token.json");
+        for attempt in [0, 4] {
+            let error = WindowsReplaceFailure::io(
+                WindowsReplaceStage::Open,
+                "NtCreateFile(source)",
+                std::io::Error::from_raw_os_error(32),
+            )
+            .into_platform(source, target, attempt);
+            let message = error.to_string();
+            assert!(message.contains("atomic_replace"), "{message}");
+            for leaf in ["token.tmp", "token.json"] {
+                assert!(message.contains(leaf), "missing leaf: {message}");
+            }
+            for parent in ["PRIVATE_USER_ROOT", "SOURCE_ONLY", "DESTINATION_ONLY"] {
+                assert!(!message.contains(parent), "parent path leaked: {message}");
+            }
+            assert_eq!(message.contains("after 5 attempts"), attempt == 4);
+        }
+    }
+
+    #[test]
+    fn windows_atomic_replace_parent_mismatch_display_exposes_leaves_without_ancestors() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source-parent");
+        let target = dir.path().join("target-parent");
+        let error = dispatch_windows_replace_parent(&source, &target, || ()).unwrap_err();
+        let message = error.to_string();
+        for expected in ["atomic_replace", "source-parent", "target-parent"] {
+            assert!(message.contains(expected), "missing context: {message}");
+        }
+        assert!(
+            !message.contains(dir.path().to_string_lossy().as_ref()),
+            "{message}"
+        );
+        match error {
+            PlatformError::AtomicReplaceParentMismatch {
+                source_parent,
+                target_parent,
+            } => {
+                assert_eq!(source_parent, source);
+                assert_eq!(target_parent, target);
+            }
+            other => panic!("typed mismatch was lost: {other:?}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_atomic_replace_refuses_junction_before_both_rename_paths() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                REPLACE_FORCE_LEGACY.with(|f| f.set(false));
+                let _ = REPLACE_BEFORE_RENAME.with(|h| h.borrow_mut().take());
+            }
+        }
+        let _reset = Reset;
+        for legacy in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let real = dir.path().join("real-directory");
+            fs::create_dir(&real).unwrap();
+            fs::write(real.join("resident"), b"unchanged").unwrap();
+            let target = dir.path().join("token.json");
+            crate::platform::fs_symlink_windows::symlink_exclusive(&real, &target).unwrap();
+            let tmp = dir.path().join("token.tmp");
+            let identity = write_new_private_with_identity(&tmp, b"new").unwrap();
+            let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let seen = calls.clone();
+            REPLACE_FORCE_LEGACY.with(|f| f.set(legacy));
+            REPLACE_BEFORE_RENAME.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |_| seen.set(seen.get() + 1)));
+            });
+            for result in [
+                atomic_replace(&tmp, &target),
+                atomic_replace_written(&tmp, &target, identity),
+            ] {
+                let error = result.expect_err("junction destination must be refused before rename");
+                assert!(matches!(error, PlatformError::Win32 { code: 5, .. }));
+            }
+            assert_eq!(
+                calls.get(),
+                0,
+                "destination refusal must precede rename dispatch"
+            );
+            use std::os::windows::fs::MetadataExt;
+            assert_eq!(
+                fs::symlink_metadata(&target).unwrap().file_attributes() & 0x410,
+                0x410
+            );
+            assert_eq!(fs::read(&tmp).unwrap(), b"new");
+            assert_eq!(fs::read(real.join("resident")).unwrap(), b"unchanged");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_replace_failure_keeps_posix_primary_and_plain_secondary() {
+        use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+        let posix = 0xC000_0003_u32 as i32;
+        let plain = 0xC000_0022_u32 as i32;
+        // SAFETY: pure NTSTATUS translations with no pointer arguments.
+        let code = unsafe { RtlNtStatusToDosError(posix) };
+        let failure = WindowsReplaceFailure {
+            stage: WindowsReplaceStage::Rename,
+            code,
+            api: "rename",
+            nt: Some((posix, Some(plain))),
+        };
+        assert_eq!(failure.retry_code(), 5);
+        match failure.into_platform(Path::new("tmp"), Path::new("target"), 0) {
+            PlatformError::Win32 {
+                code: reported,
+                message,
+            } => {
+                assert_eq!(reported, code);
+                assert!(message.contains("posix_nt_status=0xc0000003"));
+                assert!(message.contains("plain_nt_status=0xc0000022"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_atomic_replace_rejects_cross_parent_with_typed_paths() {
+        let dir = TempDir::new().unwrap();
+        let from = dir.path().join("from");
+        let to = dir.path().join("to");
+        fs::create_dir(&from).unwrap();
+        fs::create_dir(&to).unwrap();
+        let tmp = from.join("tmp");
+        let target = to.join("target");
+        let identity = write_new_private_with_identity(&tmp, b"source").unwrap();
+        fs::write(&target, b"old").unwrap();
+        for result in [
+            atomic_replace(&tmp, &target),
+            atomic_replace_written(&tmp, &target, identity),
+        ] {
+            match result.unwrap_err() {
+                PlatformError::AtomicReplaceParentMismatch {
+                    source_parent,
+                    target_parent,
+                } => {
+                    assert_eq!(source_parent, from);
+                    assert_eq!(target_parent, to);
+                }
+                other => panic!("expected typed parent refusal, got {other:?}"),
+            }
+        }
+        assert_eq!(fs::read(&tmp).unwrap(), b"source");
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_atomic_replace_refuses_alias_leaves_before_lookup() {
+        let dir = TempDir::new().unwrap();
+        let tmp = dir.path().join("tmp");
+        fs::write(&tmp, b"source").unwrap();
+        for bad in ["bad.", "bad ", "bad:stream", ".", ".."] {
+            for result in [
+                atomic_replace(&tmp, &dir.path().join(bad)),
+                atomic_replace(&dir.path().join(bad), &dir.path().join("target")),
+            ] {
+                assert!(matches!(result, Err(PlatformError::Win32 { code: 87, .. })));
+            }
+        }
+        assert_eq!(fs::read(&tmp).unwrap(), b"source");
+        assert!(!dir.path().join("target").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_atomic_replace_written_refuses_changed_identity_and_broad_dacl() {
+        let dir = TempDir::new().unwrap();
+        let tmp = dir.path().join("tmp");
+        let target = dir.path().join("target");
+        fs::write(&target, b"old").unwrap();
+        let original = write_new_private_with_identity(&tmp, b"original").unwrap();
+        let parked = dir.path().join("parked");
+        fs::rename(&tmp, &parked).unwrap();
+        write_new_private(&tmp, b"substituted").unwrap();
+        assert!(atomic_replace_written(&tmp, &target, original).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+        assert_eq!(fs::read(&parked).unwrap(), b"original");
+        fs::remove_file(&tmp).unwrap();
+        fs::write(&tmp, b"broad").unwrap();
+        let file = fs::File::open(&tmp).unwrap();
+        let broad = written_file_identity(&file).unwrap();
+        drop(file);
+        assert!(atomic_replace_written(&tmp, &target, broad).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+        atomic_replace(&tmp, &target).expect("plain publication has no private-DACL policy");
+        assert_eq!(fs::read(&target).unwrap(), b"broad");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_atomic_replace_accepts_delete_sharing_lingering_writer() {
+        use std::io::Write;
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = TempDir::new().unwrap();
+        let tmp = dir.path().join("tmp");
+        let target = dir.path().join("target");
+        let mut writer = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .share_mode(7)
+            .open(&tmp)
+            .unwrap();
+        writer.write_all(b"written").unwrap();
+        atomic_replace(&tmp, &target).expect("READ|WRITE sharing accepts the open writer");
+        drop(writer);
+        assert_eq!(fs::read(&target).unwrap(), b"written");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_atomic_replace_pins_parent_before_relative_source_lookup() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::DELETE;
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                REPLACE_AFTER_PARENT_PIN.with(|h| h.borrow_mut().take());
+            }
+        }
+        let _reset = Reset;
+        let dir = TempDir::new().unwrap();
+        let original = dir.path().join("original");
+        let alternate = dir.path().join("alternate");
+        fs::create_dir(&original).unwrap();
+        fs::create_dir(&alternate).unwrap();
+        let alias = dir.path().join("alias");
+        crate::platform::fs_symlink_windows::symlink_exclusive(&original, &alias).unwrap();
+        let tmp = alias.join("tmp");
+        let target = alias.join("target");
+        let identity = write_new_private_with_identity(&tmp, b"original").unwrap();
+        write_new_private(&alternate.join("tmp"), b"alternate").unwrap();
+        let parked = dir.path().join("parked-alias");
+        let moved_alias = alias.clone();
+        let alternate_path = alternate.clone();
+        let original_source = original.join("tmp");
+        REPLACE_AFTER_PARENT_PIN.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let probe = fs::OpenOptions::new()
+                    .access_mode(DELETE)
+                    .share_mode(7)
+                    .open(&original_source)
+                    .expect("source must not be held before parent pinning");
+                drop(probe);
+                fs::rename(&moved_alias, &parked).unwrap();
+                crate::platform::fs_symlink_windows::symlink_exclusive(
+                    &alternate_path,
+                    &moved_alias,
+                )
+                .unwrap();
+            }))
+        });
+        atomic_replace_written(&tmp, &target, identity).unwrap();
+        assert_eq!(fs::read(original.join("target")).unwrap(), b"original");
+        assert!(!original.join("tmp").exists());
+        assert_eq!(fs::read(alternate.join("tmp")).unwrap(), b"alternate");
+        assert!(!alternate.join("target").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_atomic_replace_publishes_past_delete_sharing_reader() {
+        use std::io::Read;
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        let tmp = dir.path().join("tmp");
+        fs::write(&target, b"old").unwrap();
+        fs::write(&tmp, b"new").unwrap();
+        let mut reader = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(7)
+            .open(&target)
+            .unwrap();
+        atomic_replace(&tmp, &target).expect("POSIX replacement must unlink a held target");
+        let mut old = Vec::new();
+        reader.read_to_end(&mut old).unwrap();
+        assert_eq!(old, b"old");
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert!(!tmp.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_atomic_replace_retries_source_open_sharing() {
+        use std::os::windows::fs::OpenOptionsExt;
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                REPLACE_AFTER_FAILURE.with(|h| h.borrow_mut().take());
+            }
+        }
+        let _reset = Reset;
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        let tmp = dir.path().join("tmp");
+        fs::write(&target, b"old").unwrap();
+        fs::write(&tmp, b"new").unwrap();
+        let mut held = Some(
+            fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&tmp)
+                .unwrap(),
+        );
+        let seen = std::rc::Rc::new(std::cell::Cell::new(0));
+        let failures = seen.clone();
+        REPLACE_AFTER_FAILURE.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |stage, code| {
+                assert_eq!(stage, WindowsReplaceStage::Open);
+                assert_eq!(code, 32);
+                failures.set(failures.get() + 1);
+                drop(held.take());
+            }))
+        });
+        atomic_replace(&tmp, &target)
+            .expect("source open32 must retry after the deterministic release");
+        assert_eq!(seen.get(), 1);
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert!(!tmp.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_atomic_replace_parent_and_source_share_five_attempts() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                REPLACE_AFTER_FAILURE.with(|h| h.borrow_mut().take());
+                REPLACE_AFTER_PARENT_PIN.with(|h| h.borrow_mut().take());
+            }
+        }
+        let _reset = Reset;
+        let dir = TempDir::new().unwrap();
+        let tmp = dir.path().join("tmp");
+        let target = dir.path().join("target");
+        fs::write(&tmp, b"new").unwrap();
+        fs::write(&target, b"old").unwrap();
+        let source = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&tmp)
+            .unwrap();
+        let mut parent = Some(
+            fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(dir.path())
+                .unwrap(),
+        );
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let failures = seen.clone();
+        REPLACE_AFTER_FAILURE.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |stage, code| {
+                failures.borrow_mut().push((stage, code));
+                drop(parent.take());
+            }))
+        });
+        let pins = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = pins.clone();
+        REPLACE_AFTER_PARENT_PIN
+            .with(|h| *h.borrow_mut() = Some(Box::new(move || count.set(count.get() + 1))));
+        let error = atomic_replace(&tmp, &target).unwrap_err();
+        drop(source);
+        assert_eq!(
+            &*seen.borrow(),
+            &[
+                (WindowsReplaceStage::Rename, 32),
+                (WindowsReplaceStage::Open, 32),
+                (WindowsReplaceStage::Open, 32),
+                (WindowsReplaceStage::Open, 32),
+                (WindowsReplaceStage::Open, 32)
+            ]
+        );
+        assert_eq!(pins.get(), 1);
+        assert!(
+            matches!(error, PlatformError::Win32 { code: 32, ref message }
+            if message.contains("after 5 attempts"))
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+        assert_eq!(fs::read(&tmp).unwrap(), b"new");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_atomic_replace_refuses_post_validation_source_swap_in_both_rename_paths() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                REPLACE_FORCE_LEGACY.with(|f| f.set(false));
+                let _ = REPLACE_BEFORE_RENAME.with(|h| h.borrow_mut().take());
+            }
+        }
+        let _reset = Reset;
+        let dir = TempDir::new().unwrap();
+        let tmp = dir.path().join("tmp");
+        let target = dir.path().join("target");
+        fs::write(&tmp, b"checked-source").unwrap();
+        fs::write(&target, b"old").unwrap();
+        let phases = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = phases.clone();
+        let source = tmp.clone();
+        let parked = dir.path().join("parked");
+        REPLACE_FORCE_LEGACY.with(|f| f.set(true));
+        REPLACE_BEFORE_RENAME.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |legacy| {
+                seen.borrow_mut().push(legacy);
+                assert!(
+                    fs::rename(&source, &parked).is_err(),
+                    "checked source must deny competing rename"
+                );
+                use std::os::windows::fs::OpenOptionsExt;
+                use windows_sys::Win32::Storage::FileSystem::DELETE;
+                assert!(
+                    fs::OpenOptions::new()
+                        .access_mode(DELETE)
+                        .share_mode(7)
+                        .open(&source)
+                        .is_err(),
+                    "checked source must deny competing delete opens"
+                );
+                assert!(
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .share_mode(7)
+                        .open(&source)
+                        .is_ok(),
+                    "READ|WRITE sharing intentionally permits content writers"
+                );
+            }))
+        });
+        atomic_replace(&tmp, &target).expect("plain handle fallback must replace the target");
+        assert_eq!(*phases.borrow(), [false, true]);
+        assert_eq!(fs::read(&target).unwrap(), b"checked-source");
+        assert!(!tmp.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_atomic_replace_refuses_unsafe_source_entries() {
+        let dir = TempDir::new().unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"unchanged").unwrap();
+        let hardlink = dir.path().join("hardlink");
+        fs::hard_link(&victim, &hardlink).unwrap();
+        let directory = dir.path().join("directory");
+        fs::create_dir(&directory).unwrap();
+        let junction = dir.path().join("junction");
+        crate::platform::fs_symlink_windows::symlink_exclusive(&directory, &junction).unwrap();
+        for source in [&hardlink, &directory, &junction] {
+            let target = dir.path().join("absent-target");
+            let err = atomic_replace(source, &target).expect_err("unsafe source must be refused");
+            assert!(matches!(err, PlatformError::Win32 { code: 87, .. }));
+            assert!(!target.exists());
+            assert!(
+                fs::symlink_metadata(source).is_ok(),
+                "source entry must survive refusal"
+            );
+        }
+        assert_eq!(fs::read(&victim).unwrap(), b"unchanged");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_atomic_replace_follows_parent_junction_and_preserves_private_dacl() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let parent = dir.path().join("parent");
+        crate::platform::fs_symlink_windows::symlink_exclusive(&real, &parent).unwrap();
+        let tmp = parent.join("tmp");
+        let target = parent.join("target");
+        let identity = write_new_private_with_identity(&tmp, b"private").unwrap();
+        // The destination starts broad; the protected source DACL must travel
+        // with its inode instead of inheriting this destination's descriptor.
+        fs::write(&target, b"old").unwrap();
+        atomic_replace_written(&tmp, &target, identity)
+            .expect("parent junction must retain legacy traversal");
+        assert_eq!(fs::read(real.join("target")).unwrap(), b"private");
+        let file = crate::platform::fs_windows_acl::open_private_readable(&target).unwrap();
+        crate::platform::fs_windows_acl::check_private_handle(&file).unwrap();
+        assert!(!real.join("tmp").exists());
+        assert!(fs::symlink_metadata(&parent)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
     /// Native: a JUNCTION target (directory reparse point) is a permanent
     /// access-denied and must fail on the first attempt. RED under the old
     /// `Metadata::is_dir()` test, which reports a junction as a symlink, so
@@ -3620,6 +5860,10 @@ pub(crate) mod tests {
             Err(PlatformError::Win32 { code, message }) => {
                 assert_eq!(code, 5, "junction target must be access-denied");
                 assert!(
+                    message.contains("destination directory validation"),
+                    "destination refusal must name its validation operation: {message}"
+                );
+                assert!(
                     !message.contains("attempts"),
                     "junction target must not take the retry path: {message}"
                 );
@@ -3634,7 +5878,7 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(&tmp).unwrap(), b"new", "tmp must survive");
     }
 
-    /// Native: a target held open with `share_mode(0)` makes `MoveFileExW`
+    /// Native: a target held open with `share_mode(0)` makes rename
     /// fail transiently; once the holder releases it (~150ms, inside the
     /// 5x100ms budget) `atomic_replace` must succeed and publish the new
     /// bytes. RED if access-denied/sharing were not retried.

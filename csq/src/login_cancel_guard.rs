@@ -25,6 +25,8 @@ pub(crate) use piped::{
     PipedLoginTestHooks,
 };
 
+pub(crate) use crate::login_child_custody::VendorExit;
+
 use crate::login_child_custody::{
     DeliveryPhase, LoginChildRefusal, LoginWatchdog, OwnedLoginChild, RefusalReason,
     TimeoutDisposition, TimeoutNotice,
@@ -463,55 +465,6 @@ impl CliLoginReceipt {
     }
 }
 
-/// How a vendor login ended, worded for the operator. Fixed vocabulary only:
-/// a numeric exit code or a signal name, never paths, arguments or output.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct VendorExit(std::process::ExitStatus);
-
-impl VendorExit {
-    pub(crate) fn success(&self) -> bool {
-        self.0.success()
-    }
-}
-
-impl std::fmt::Display for VendorExit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            if let Some(signal) = self.0.signal() {
-                return write!(f, "was terminated by signal {}", signal_name(signal));
-            }
-            if let Some(signal) = self.0.stopped_signal() {
-                return write!(f, "was stopped by signal {}", signal_name(signal));
-            }
-        }
-        match self.0.code() {
-            Some(code) => write!(f, "exited with status {code}"),
-            None => f.write_str("ended without an exit status"),
-        }
-    }
-}
-
-#[cfg(unix)]
-fn signal_name(signal: i32) -> String {
-    let name = match signal {
-        libc::SIGHUP => "SIGHUP",
-        libc::SIGINT => "SIGINT",
-        libc::SIGQUIT => "SIGQUIT",
-        libc::SIGABRT => "SIGABRT",
-        libc::SIGKILL => "SIGKILL",
-        libc::SIGSEGV => "SIGSEGV",
-        libc::SIGPIPE => "SIGPIPE",
-        libc::SIGTERM => "SIGTERM",
-        libc::SIGTSTP => "SIGTSTP",
-        libc::SIGTTIN => "SIGTTIN",
-        libc::SIGTTOU => "SIGTTOU",
-        other => return other.to_string(),
-    };
-    name.to_owned()
-}
-
 /// Shared production seam: Command is fully built before entry. K can retain an
 /// actual account lock; the caller's enclosing account lock also spans this call.
 #[cfg(test)]
@@ -523,6 +476,7 @@ pub(crate) fn spawn_cli_login<K>(
 ) -> anyhow::Result<bool> {
     spawn_cli_inherited_login_inner(
         command,
+        crate::login_child_custody::group::StdinPolicy::Caller,
         timeout,
         keepalive,
         "Claude",
@@ -544,6 +498,7 @@ pub(crate) fn spawn_cli_login_receipt<K>(
 ) -> anyhow::Result<CliLoginReceipt> {
     spawn_cli_inherited_login_inner(
         command,
+        crate::login_child_custody::group::StdinPolicy::Caller,
         timeout,
         keepalive,
         "Claude",
@@ -565,6 +520,7 @@ pub(crate) fn spawn_cli_inherited_login<K>(
 ) -> anyhow::Result<std::process::ExitStatus> {
     spawn_cli_inherited_login_inner(
         command,
+        crate::login_child_custody::group::StdinPolicy::Caller,
         timeout,
         keepalive,
         vendor,
@@ -586,6 +542,7 @@ pub(crate) fn spawn_cli_inherited_login_receipt<K>(
 ) -> anyhow::Result<CliLoginReceipt> {
     spawn_cli_inherited_login_inner(
         command,
+        crate::login_child_custody::group::StdinPolicy::Caller,
         timeout,
         keepalive,
         vendor,
@@ -610,6 +567,7 @@ pub(crate) fn spawn_cli_login_scoped<K>(
 ) -> anyhow::Result<VendorExit> {
     spawn_cli_inherited_login_inner(
         command,
+        crate::login_child_custody::group::StdinPolicy::Inherit,
         timeout,
         keepalive,
         "Claude",
@@ -618,7 +576,7 @@ pub(crate) fn spawn_cli_login_scoped<K>(
         DeadlineStop::TerminateGroup,
         deadline_stopped,
     )
-    .map(|receipt| VendorExit(receipt.status))
+    .map(|receipt| VendorExit::from(receipt.status))
 }
 
 pub(crate) fn spawn_cli_inherited_login_scoped<K>(
@@ -631,6 +589,7 @@ pub(crate) fn spawn_cli_inherited_login_scoped<K>(
 ) -> anyhow::Result<std::process::ExitStatus> {
     spawn_cli_inherited_login_inner(
         command,
+        crate::login_child_custody::group::StdinPolicy::Inherit,
         timeout,
         keepalive,
         vendor,
@@ -658,6 +617,7 @@ pub(crate) enum DeadlineStop {
 #[allow(clippy::too_many_arguments)]
 fn spawn_cli_inherited_login_inner<K>(
     command: &mut Command,
+    stdin_policy: crate::login_child_custody::group::StdinPolicy,
     timeout: Duration,
     keepalive: K,
     vendor: &str,
@@ -688,16 +648,17 @@ fn spawn_cli_inherited_login_inner<K>(
         eprintln!("Cancelling — waiting for {vendor} login to exit");
         return Err(cancelled_before_spawn().context(CliLoginCustodyFinalized));
     }
-    let (child, group) = match crate::login_child_custody::group::spawn_attended(command) {
-        Ok(child) => child,
-        Err(error) => {
-            if cancellation.cancelled() {
-                eprintln!("Cancelling — waiting for {vendor} login to exit");
-                return Err(cancelled_before_spawn());
+    let (child, group) =
+        match crate::login_child_custody::group::spawn_attended(command, stdin_policy) {
+            Ok(child) => child,
+            Err(error) => {
+                if cancellation.cancelled() {
+                    eprintln!("Cancelling — waiting for {vendor} login to exit");
+                    return Err(cancelled_before_spawn());
+                }
+                return Err(error).context("failed to spawn sign-in program");
             }
-            return Err(error).context("failed to spawn sign-in program");
-        }
-    };
+        };
     #[cfg(test)]
     let child_id = child.id();
     let mut owned = OwnedLoginChild::adopt_group(child, group.clone(), watchdog.clone(), keepalive);
@@ -1561,7 +1522,7 @@ mod vendor_exit_tests {
 
     #[test]
     fn exit_wording_names_code_or_signal() {
-        let say = |raw| VendorExit(ExitStatus::from_raw(raw)).to_string();
+        let say = |raw| VendorExit::from(ExitStatus::from_raw(raw)).to_string();
         assert_eq!(say(1 << 8), "exited with status 1");
         assert_eq!(say(libc::SIGTTOU), "was terminated by signal SIGTTOU");
         assert_eq!(say(libc::SIGKILL), "was terminated by signal SIGKILL");
@@ -1571,6 +1532,6 @@ mod vendor_exit_tests {
             say((libc::SIGTTOU << 8) | 0x7f),
             "was stopped by signal SIGTTOU"
         );
-        assert!(VendorExit(ExitStatus::from_raw(0)).success());
+        assert!(VendorExit::from(ExitStatus::from_raw(0)).success());
     }
 }

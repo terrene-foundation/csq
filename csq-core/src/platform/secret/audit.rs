@@ -183,17 +183,19 @@ pub fn prune_older_than(base_dir: &Path, retention_days: u64) -> std::io::Result
     }
 
     // Atomic rewrite via existing platform helper conventions.
-    let tmp = crate::platform::fs::unique_tmp_path(&path);
-    if let Err(e) = std::fs::write(&tmp, kept.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    if let Err(e) = secure_file(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
+    let writer = match crate::platform::fs::write_private_tmp_retained(&path, kept.as_bytes()) {
+        Ok(writer) => writer,
+        Err(e) => {
+            return Err(match e {
+                crate::error::PlatformError::Io(source) => source,
+                other => std::io::Error::other(other.to_string()),
+            });
+        }
+    };
+    if let Err(e) = secure_file(writer.path()) {
         return Err(std::io::Error::other(format!("secure_file: {e}")));
     }
-    if let Err(e) = crate::platform::fs::atomic_replace(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = writer.replace(&path) {
         return Err(std::io::Error::other(format!("atomic replace: {e}")));
     }
     Ok(pruned)
@@ -288,6 +290,50 @@ mod tests {
     use super::*;
     use crate::providers::catalog::Surface;
     use tempfile::TempDir;
+
+    #[test]
+    fn prune_retries_actual_stage_collision() {
+        let _env = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let raw = b"{\"retained_extension\":\"operator@example.invalid\"}\n";
+        std::fs::write(audit_log_path(dir.path()), raw).unwrap();
+        let foreign = std::rc::Rc::new(std::cell::RefCell::new(None::<PathBuf>));
+        let observed = std::rc::Rc::clone(&foreign);
+        let result = crate::platform::fs::with_private_create_observer_for_test(
+            move |path| {
+                if observed.borrow().is_none() {
+                    std::fs::write(path, b"foreign-stage").unwrap();
+                    *observed.borrow_mut() = Some(path.to_path_buf());
+                    eprintln!("F4_PRIVATE_CREATE_COLLISION_PLANTED");
+                }
+            },
+            || prune_older_than(dir.path(), 30),
+        );
+        let path = foreign
+            .borrow()
+            .clone()
+            .expect("production create observer must be hit");
+        assert_eq!(std::fs::read(path).unwrap(), b"foreign-stage");
+        assert_eq!(
+            result.ok(),
+            Some(0),
+            "prune must retry a planted create collision"
+        );
+        assert_eq!(std::fs::read(audit_log_path(dir.path())).unwrap(), raw);
+    }
+
+    #[test]
+    fn prune_preserves_untyped_retained_bytes() {
+        let dir = TempDir::new().unwrap();
+        let raw = "{\"retained_extension\":\"operator@example.invalid\"}\n";
+        std::fs::write(audit_log_path(dir.path()), raw).unwrap();
+        assert_eq!(prune_older_than(dir.path(), 30).unwrap(), 0);
+        assert_eq!(
+            std::fs::read_to_string(audit_log_path(dir.path())).unwrap(),
+            raw
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     /// Surface tag for the only vault-using surface today. Resolved
     /// from [`Surface::Gemini::as_str()`] so the audit-log fixtures

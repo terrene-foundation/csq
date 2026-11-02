@@ -7,7 +7,7 @@
 //!
 //! - [`redact_tokens`] (+ [`redact_excerpt`], [`redact_pem_blocks`]) — the
 //!   fixed-vocabulary secret scrubber specified in
-//!   `csq-core`'s `specs/19-direct-api-security-prerequisites.md`. Pure `std`;
+//!   `csq-core`'s `specs/19-direct-api-security-prerequisites.md`. Bounded Unicode marker folding;
 //!   no csq-core dependency.
 //! - [`RedactedString`] — the newtype whose only untrusted constructor routes
 //!   through [`redact_tokens`], so an error variant carrying an operator-facing
@@ -19,6 +19,9 @@
 //! unchanged. New code — notably `csq-sdk` — depends on this crate directly.
 
 mod chat;
+mod context;
+#[cfg(test)]
+mod context_work_tests;
 pub use chat::redact_chat;
 
 use std::fmt;
@@ -99,7 +102,11 @@ const JWT_SEGMENT_MIN_BODY: usize = 17;
 ///    `api-key`, `apikey`, `authorization`) in HTTP-header or JSON
 ///    value position. Catches generic 3P keys that carry no known prefix
 ///    and are not hex/JWT (e.g. a Z.AI `<id>.<secret>` key in a 4xx
-///    body). The marker + separator text is preserved.
+///    body). Bounded Unicode marker folding also covers the supported confusable
+///    spelling. Explicit assignments with credential suffixes/camelCase names,
+///    password/client-secret flags, Cookie headers and quoted continuations use
+///    the shared context grammar. Bare generic prose remains excluded from the
+///    diagnostic profile. Marker + separator bytes are preserved.
 ///
 /// 1. **Known OAuth prefixes** (`sk-ant-oat01-`, `sk-ant-ort01-`): always
 ///    redacted, regardless of body length.  These are Anthropic OAuth
@@ -270,101 +277,18 @@ fn redact_tokens_inner(s: &str) -> String {
         // `signature_part_long_enough_to_match`).
         let word_boundary = i == 0 || !is_key_char(chars[i - 1]);
 
-        // --- Pattern 0: credential-context redaction (M1-PRE / spec 19) ---
-        // Generic catch-all for opaque credentials that carry no known
-        // shape prefix (`sk-`, `sess-`, `rt_`, `AIza`), are not pure hex,
-        // and are not JWTs — e.g. a Z.AI `<id>.<secret>` key echoed in an
-        // upstream 4xx body. Keyed on a credential CONTEXT marker so the
-        // false-positive surface stays narrow. Two marker forms:
-        //   - scheme form  — `Bearer <token>` (RFC 6750 §2.1); the token
-        //     starts immediately after the trailing space.
-        //   - field form   — `x-api-key: <tok>`, `"api_key":"<tok>"`,
-        //     `authorization: <tok>` (HTTP-header OR JSON value position);
-        //     the token starts after a run of separators (`:="' \t`).
-        // A token of more than `CRED_CONTEXT_MIN_BODY` chars immediately
-        // following a marker is redacted; the marker + separator text is
-        // preserved verbatim, only the credential is replaced. Match is
-        // case-insensitive on the marker. Runs BEFORE the shape patterns
-        // so it backstops keys whose shape no prefix/hex/JWT pattern
-        // recognizes. Bare generic words (`key`, `token`, `secret`,
-        // `password`) are deliberately EXCLUDED — too high a
-        // false-positive rate in prose; only the high-confidence
-        // API-key/authorization markers are matched. Added by M1-PRE per
-        // security-reviewer R1 (Pattern-0 generic-key false-negative for
-        // keys echoed without a `Bearer ` scheme).
-        let mut matched_cred_ctx = false;
+        // Pattern 0 shares credential context only; diagnostic shape policies stay local.
         if word_boundary {
-            const CRED_CONTEXT_MIN_BODY: usize = 8;
-            // Separators between a field marker and its value.
-            #[inline]
-            fn is_cred_sep(c: char) -> bool {
-                matches!(c, ':' | '=' | '"' | '\'' | ' ' | '\t')
+            if let Some((start, end)) =
+                context::context(s, byte_i, context::ContextProfile::Diagnostic)
+            {
+                out.push_str(&s[byte_i..start]);
+                out.push_str("[REDACTED]");
+                while i < len && char_byte_offsets[i] < end {
+                    i += 1;
+                }
+                continue;
             }
-            // Lowercase markers (all ASCII → byte len == char len). A
-            // trailing space marks a scheme form (token starts
-            // immediately); otherwise it is a field form (a separator run
-            // must follow before the token).
-            const CRED_MARKERS: &[&str] = &[
-                "bearer ",        // scheme (RFC 6750)
-                "x-goog-api-key", // google header (distinct prefix; order not load-bearing)
-                "x-api-key",      // anthropic / 3p header
-                "api_key",        // json field
-                "api-key",        // json / header field
-                "apikey",         // json field
-                "authorization",  // header / json field
-            ];
-            for marker in CRED_MARKERS {
-                let mlen = marker.len();
-                if s.get(byte_i..byte_i + mlen)
-                    .map(|w| w.eq_ignore_ascii_case(marker))
-                    != Some(true)
-                {
-                    continue;
-                }
-                let after_marker = i + marker.chars().count();
-                let tok_start = if marker.ends_with(' ') {
-                    after_marker // scheme: token starts right after the space
-                } else {
-                    // Field form: a separator MUST follow the marker word
-                    // (else `api_keyX` / `authorization_id` is not a field).
-                    if after_marker >= len || !is_cred_sep(chars[after_marker]) {
-                        continue;
-                    }
-                    let mut sp = after_marker;
-                    while sp < len && is_cred_sep(chars[sp]) {
-                        sp += 1;
-                    }
-                    sp
-                };
-                let mut j = tok_start;
-                // Consume the credential up to the first whitespace or
-                // quote (covers base64url `+/=`, dotted JWT/`ya29.` bodies,
-                // `-`/`_`); trailing prose survives.
-                while j < len && !chars[j].is_whitespace() && !matches!(chars[j], '"' | '\'' | '`')
-                {
-                    j += 1;
-                }
-                // A SHORT credential (4..=CRED_CONTEXT_MIN_BODY chars) is
-                // redacted only when it carries a digit: `Bearer none` /
-                // `Bearer null` / a scheme word (`Basic`, `Bearer` after an
-                // `authorization:` field) stay readable, `Bearer a1b2c3` does
-                // not. Lowercase-letters-only short secrets remain a
-                // documented false negative of this heuristic.
-                let tok_len = j - tok_start;
-                let short_credential = (4..=CRED_CONTEXT_MIN_BODY).contains(&tok_len)
-                    && (tok_start..j).any(|k| chars[k].is_ascii_digit());
-                if tok_len > CRED_CONTEXT_MIN_BODY || short_credential {
-                    // Preserve the marker + separator bytes verbatim.
-                    out.push_str(&s[byte_i..char_byte_offsets[tok_start]]);
-                    out.push_str("[REDACTED]");
-                    i = j;
-                    matched_cred_ctx = true;
-                }
-                break; // this marker owns the position
-            }
-        }
-        if matched_cred_ctx {
-            continue;
         }
 
         // --- Pattern 1: known OAuth token prefixes (always redact) ---

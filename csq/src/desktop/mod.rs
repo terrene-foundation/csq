@@ -167,7 +167,7 @@ pub struct AppState {
     /// shape. PR-C9a an internal journal entry finding 6: the desktop Codex
     /// UI's modal-close must kill the subprocess so it does not
     /// orphan for the minutes-long codex-cli device-auth window.
-    pub codex_login_child: Arc<Mutex<Option<Arc<Mutex<std::process::Child>>>>>,
+    pub codex_login_child: commands::CodexChildSlot,
     /// Running native-CLI (Kimi/Grok) login children, keyed by native
     /// [`csq_core::providers::catalog::Surface`]. Mirrors
     /// `codex_login_child`'s `Arc<Mutex<Option<...>>>` shape but is a
@@ -1514,7 +1514,7 @@ pub fn run() {
             // shells out to `claude auth login` via
             // `start_claude_login_subprocess`. The legacy paste-code
             // flow (`begin_claude_login` / `submit_oauth_code` /
-            // `cancel_login` / `start_claude_login`) AND the
+            // `cancel_login`) AND the
             // parallel-race flow (`start_claude_login_race` /
             // `submit_paste_code` / `cancel_race_login`) are no
             // longer registered — they have ZERO renderer callers as

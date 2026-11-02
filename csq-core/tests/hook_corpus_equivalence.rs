@@ -48,7 +48,12 @@ fn instrument_corpus(left: &str, right: &str, decision: Decision) -> Corpus {
         cases: vec![Case {
             id: "control-1".into(),
             stdin: "payload\n".into(),
-            timeout_ms: 500,
+            // Generous on purpose: positive controls must finish, and a 500 ms
+            // budget timed out a `/bin/sh` spawn on a loaded sign-off host, which
+            // reported a correct control as not equivalent. Tests that exercise
+            // the timeout itself set their own short budget (100 / 300 ms).
+            // 5000 is the model's validated ceiling (`(1..=5000)`).
+            timeout_ms: 5_000,
             initial_files: BTreeMap::from([("seed.txt".into(), "frozen\n".into())]),
             standalone: arm(left),
             dispatched: arm(right),
@@ -197,7 +202,8 @@ fn executable_tamper_and_missing_process_never_pass() {
 fn nested_rewrite_and_fixture_duplicate_keys_cannot_be_normalized_into_pass() {
     let mut corpus = instrument_corpus("rewrite", "rewrite", Decision::Allow);
     corpus.cases[0].expected.observation.rewrite = Some(serde_json::json!({"a":2}));
-    assert!(measure(&corpus).protocol_equivalent);
+    let report = measure(&corpus);
+    assert!(report.protocol_equivalent, "{report:?}");
     corpus.cases[0].standalone.args[1] = "duplicate-rewrite".into();
     corpus.cases[0].dispatched.args[1] = "duplicate-rewrite".into();
     let report = measure(&corpus);

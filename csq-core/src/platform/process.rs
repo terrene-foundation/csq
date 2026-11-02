@@ -148,7 +148,7 @@ pub fn spawn_foreign_test_process() -> std::process::Child {
 /// path — and does not return until [`is_pid_foreign`]'s underlying
 /// identification positively resolves the child's command as csq.
 ///
-/// Windows counterpart to [`spawn_foreign_test_process`], with the polarity
+/// Windows counterpart to `spawn_foreign_test_process`, with the polarity
 /// reversed. `is_pid_foreign` identifies "ours" by the spawned process's
 /// reported executable NAME (`csq_program_matches`, read via a
 /// `CreateToolhelp32Snapshot` walk — see `imp::process_command`). An

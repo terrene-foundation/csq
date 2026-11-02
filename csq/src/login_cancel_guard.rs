@@ -6,12 +6,13 @@
 use std::cell::Cell;
 use std::fmt;
 use std::io;
-use std::process::Command;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use anyhow::Context;
+
+use crate::login_child_custody::process::Command;
 
 #[path = "login_cancel_guard/piped.rs"]
 mod piped;
@@ -875,7 +876,7 @@ mod platform {
 #[cfg(test)]
 mod receipt_tests {
     use super::*;
-    use std::process::Stdio;
+    use crate::login_child_custody::process::Stdio;
 
     fn inert_command(root: &std::path::Path, executable: impl AsRef<std::ffi::OsStr>) -> Command {
         let mut command = Command::new(executable);

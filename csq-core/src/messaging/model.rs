@@ -142,6 +142,63 @@ impl Sender {
     }
 }
 
+/// Provenance of a stored message (design §3).
+///
+/// Only [`Origin::Peer`] is reachable from a peer-facing surface: the CLI, the MCP
+/// server, the hooks and [`super::store::send`]/[`super::store::reply`] have no
+/// parameter that carries an origin. [`Origin::OwnerTelegram`] is written only by the
+/// daemon's bridge ingress through `store::send_owner` (crate-internal), and its `mac`
+/// is the HMAC the daemon holds the key for. A render MAY show the owner header only
+/// after the daemon re-verified that mac for that exact body
+/// ([`frame::OriginAuthority`]); the origin field alone never earns it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Origin {
+    /// An ordinary cross-CLI peer message. Also what every record written before this
+    /// field existed deserialises as.
+    #[default]
+    Peer,
+    /// A message the pinned Telegram owner sent, attested by the daemon.
+    OwnerTelegram {
+        /// Telegram update the message arrived in (replay key).
+        update_id: u64,
+        /// Telegram's id of the owner's message (the phone-reply routing key).
+        tg_message_id: i64,
+        /// HMAC-SHA256 over the attested fields, lowercase hex.
+        mac: String,
+    },
+}
+
+impl Origin {
+    /// Whether this record's provenance is an ordinary peer.
+    #[must_use]
+    pub fn is_peer(&self) -> bool {
+        matches!(self, Self::Peer)
+    }
+
+    /// Whether the record claims owner provenance (verified or not: the claim itself
+    /// is data, and only the daemon's verification may promote it).
+    #[must_use]
+    pub fn claims_owner(&self) -> bool {
+        matches!(self, Self::OwnerTelegram { .. })
+    }
+
+    /// A stored record's origin must be structurally sane: the attestation mac is
+    /// ASCII alphanumerics of bounded length. Content is never checked against the key
+    /// here (this runs on every load, including lock-free reads); the daemon verifies at
+    /// render time.
+    #[must_use]
+    pub fn is_well_formed(&self) -> bool {
+        match self {
+            Self::Peer => true,
+            Self::OwnerTelegram { mac, .. } => {
+                !mac.is_empty()
+                    && mac.chars().count() <= super::limits::MAX_HASH_CHARS
+                    && mac.chars().all(|c| c.is_ascii_alphanumeric())
+            }
+        }
+    }
+}
+
 /// Lifecycle position of a message (spec 32 §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -173,6 +230,27 @@ impl Status {
     }
 }
 
+/// The synthetic sender block every owner-origin record carries (design §3).
+///
+/// The owner is not a csq session, so the v1 record schema's required sender block has no
+/// real value to hold: pid `0` cannot be a live session, the handle dir is empty, and the
+/// hash is a fixed non-secret marker. Provenance lives in [`Message::origin`], and every
+/// render of an owner record keys off that field — never off this block. It exists so the
+/// record stays schema-valid and so nothing else in the store has to special-case a
+/// missing sender.
+#[must_use]
+pub fn owner_sender() -> Sender {
+    Sender {
+        pid: 0,
+        started_at: 0,
+        surface: Surface::ClaudeCode,
+        handle_dir_hash: "owner".to_string(),
+        handle_dir: String::new(),
+        name: None,
+        started_exact: None,
+    }
+}
+
 /// One stored message, one file `<id>.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
@@ -184,6 +262,11 @@ pub struct Message {
     pub from: Sender,
     /// The addressed session.
     pub to: Recipient,
+    /// Provenance (design §3). Absent on every record written before this field: those
+    /// deserialise as [`Origin::Peer`], and a peer record still serialises without the
+    /// field, so the on-disk shape of ordinary mail is unchanged.
+    #[serde(default, skip_serializing_if = "Origin::is_peer")]
+    pub origin: Origin,
     /// Id of the message this answers; it was addressed to the sender.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<String>,
@@ -285,8 +368,25 @@ impl Message {
     }
 
     /// The view of this record for its recipient: no handle dir, no raw body or note.
+    ///
+    /// Fail-closed and channel-conservative: owner provenance renders the tool-result
+    /// string. The store's inbox/notice paths call [`Message::view_with`] after asking the
+    /// daemon; only the hook-injection path passes [`frame::RenderChannel::Hook`].
     #[must_use]
     pub fn view(&self) -> MessageView {
+        self.view_with(
+            frame::OriginAuthority::unverified(&self.origin),
+            frame::RenderChannel::ToolResult,
+        )
+    }
+
+    /// [`Message::view`] with an explicit, store-proven origin authority and channel.
+    #[must_use]
+    pub fn view_with(
+        &self,
+        authority: frame::OriginAuthority,
+        channel: frame::RenderChannel,
+    ) -> MessageView {
         MessageView {
             id: self.id.clone(),
             thread: self.thread.clone(),
@@ -299,10 +399,12 @@ impl Message {
             surfaced_at: self.surfaced_at,
             read_at: self.read_at,
             acked_at: self.acked_at,
-            framed_body: frame::render(self),
+            framed_body: frame::render_with(self, authority, channel),
             already_shown: false,
             ack_note_framed: frame::render_note(self),
-            notice: Some(super::store::PendingNotice::from_message(self, 1)),
+            notice: Some(super::store::PendingNotice::from_message_with(
+                self, 1, authority, channel,
+            )),
         }
     }
 }
@@ -396,10 +498,56 @@ mod tests {
         }
     }
 
+    /// Whether `line` is a `#[cfg(…)]` whose predicate names `test` as a term —
+    /// `#[cfg(test)]`, `#[cfg(all(test, unix, …))]`, `#[cfg(any(…, test))]` alike.
+    ///
+    /// ONLY cfg predicates count. A bare top-level `#[test]` fn is deliberately NOT a marker:
+    /// the attribute removes that one item from a normal build, so a production item BELOW it
+    /// still compiles — cutting there would hide it from the walk. What gates a whole region
+    /// of source out of the normal build is the cfg predicate.
+    ///
+    /// String literals are stripped before the term scan, so a feature gate such as
+    /// `#[cfg(feature = "test-utils")]` is NOT treated as a test marker: production code
+    /// may legitimately sit behind a test-utils feature.
+    fn is_test_only_marker(line: &str) -> bool {
+        let l = line.trim_start();
+        let Some(rest) = l.strip_prefix("#[cfg(") else {
+            return false;
+        };
+        let mut predicate = String::with_capacity(rest.len());
+        let mut in_string = false;
+        for c in rest.chars() {
+            match c {
+                '"' => in_string = !in_string,
+                _ if in_string => {}
+                _ => predicate.push(c),
+            }
+        }
+        predicate
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|term| term == "test")
+    }
+
+    /// The part of `text` that compiles in a normal (non-test) build: everything before the
+    /// first test-only marker.
+    ///
+    /// Residual: a production item placed BELOW the first test-only marker would be invisible
+    /// here. The caller's non-vacuity assert catches a walk that read the wrong tree, not this
+    /// ordering assumption.
+    fn production_source(text: &str) -> String {
+        text.lines()
+            .take_while(|line| !is_test_only_marker(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// `from_resolved` is the only way to mint a `VerifiedSession`; its production callers
     /// must be the resolver alone. Production source = the text before a file's first
-    /// `#[cfg(test)]`. Non-vacuity: the resolver file MUST be found calling it, else the walk
-    /// read the wrong tree.
+    /// test-only marker (see [`is_test_only_marker`]). A literal `#[cfg(test)]` split is NOT
+    /// enough: `session/swap_session.rs` gates its whole test module
+    /// `#[cfg(all(test, unix, feature = "secret-in-memory"))]`, so the literal form counted
+    /// 14 test functions as production. Non-vacuity: the resolver file MUST be found calling
+    /// it, else the walk read the wrong tree.
     #[test]
     fn from_resolved_has_no_production_caller_outside_the_resolver() {
         let core = crate::testing::manifest_dir(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -412,7 +560,7 @@ mod tests {
         let mut callers = Vec::new();
         for f in &files {
             let text = std::fs::read_to_string(f).unwrap();
-            let prod = text.split("#[cfg(test)]").next().unwrap_or("");
+            let prod = production_source(&text);
             let hit = prod
                 .lines()
                 .any(|l| l.contains("from_resolved(") && !l.trim_start().starts_with("//"));
@@ -430,6 +578,58 @@ mod tests {
         assert!(
             stray.is_empty(),
             "from_resolved outside the resolver: {stray:?}"
+        );
+    }
+
+    /// Pins the classifier the resolver guard runs over every file, at its boundaries.
+    ///
+    /// Without this, loosening `is_test_only_marker` would silently widen what counts as
+    /// production and the guard above would pass for the wrong reason. The last case is the
+    /// positive control required by `instrument-discipline`: a REAL production call must still
+    /// be kept, or the guard has been defanged rather than corrected.
+    #[test]
+    fn production_source_stops_at_every_test_only_marker_form() {
+        // The shape that produced the false positive: a compound predicate.
+        let compound = concat!(
+            "fn prod() {}\n",
+            "#[cfg(all(test, unix, feature = \"secret-in-memory\"))]\n",
+            "mod tests {\n    fn t() { VerifiedSession::from_resolved(s); }\n}\n",
+        );
+        assert!(
+            !production_source(compound).contains("from_resolved"),
+            "a cfg(all(test, …)) module must be excluded from production source"
+        );
+
+        // A plain `#[cfg(test)]` module.
+        let plain = "fn prod() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n";
+        assert!(!production_source(plain).contains("mod tests"));
+
+        // A bare top-level `#[test]` fn is deliberately NOT a cut. The attribute removes only
+        // that item from a normal build, so production BELOW it still compiles and must still
+        // be scanned — otherwise a real leak could hide behind a test.
+        let bare = concat!(
+            "fn prod() {}\n",
+            "#[test]\nfn t() {}\n",
+            "fn later() { let v = VerifiedSession::from_resolved(s); }\n",
+        );
+        assert!(
+            production_source(bare).contains("from_resolved("),
+            "a production call below a bare #[test] fn must still be caught"
+        );
+
+        // NOT a test marker: a feature gate whose NAME contains "test". Code behind it is
+        // production and must be scanned.
+        let feature = "#[cfg(feature = \"test-utils\")]\nfn prod() {}\n";
+        assert!(
+            production_source(feature).contains("fn prod"),
+            "a test-utils FEATURE gate is not a test marker"
+        );
+
+        // Positive control: a real production call outside the resolver is KEPT.
+        let real = "fn prod() { let v = VerifiedSession::from_resolved(s); }\n";
+        assert!(
+            production_source(real).contains("from_resolved("),
+            "the walk must still see a real production call"
         );
     }
 

@@ -1,11 +1,16 @@
 // Source-only preparation. Controlled native test process, no vendor/login preamble.
 use super::login_custody::{self, ChildKey, Drain, LoginProvider};
+use crate::login_child_custody::process::{
+    Child as LoginChild, Command as LoginCommand, Stdio as LoginStdio,
+};
 use csq_core::accounts::login_lock::{AccountLoginLock, AcquireOutcome};
 use csq_core::types::AccountNum;
 use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+#[cfg(unix)]
+use std::process::Stdio;
+use std::process::{Command, ExitStatus};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -162,7 +167,7 @@ fn diagnostic_json<T>(result: Option<&Result<T, serde_json::Error>>) -> &'static
 
 struct DesktopFixture {
     sandbox: Option<tempfile::TempDir>,
-    original: Option<Arc<Mutex<std::process::Child>>>,
+    original: Option<Arc<Mutex<LoginChild>>>,
     pid: Option<u32>,
     reaped: bool,
     sequence: u64,
@@ -200,8 +205,8 @@ impl DesktopFixture {
         self.sandbox.as_ref().expect("private fixture").path()
     }
 
-    fn command(&self, role: &str) -> std::io::Result<Command> {
-        let mut command = Command::new(std::env::current_exe()?);
+    fn command(&self, role: &str) -> std::io::Result<LoginCommand> {
+        let mut command = LoginCommand::new(std::env::current_exe()?);
         command
             .env_clear()
             .args([
@@ -228,15 +233,30 @@ impl DesktopFixture {
             .env("PATH", self.root().join("bin"))
             .env("LANG", "C")
             .env("LC_ALL", "C")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdin(LoginStdio::null())
+            .stdout(LoginStdio::piped())
+            .stderr(LoginStdio::piped());
         for key in ["SYSTEMROOT", "SystemRoot", "WINDIR"] {
             if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);
             }
         }
         Ok(command)
+    }
+
+    // Outer case drivers are ordinary owned test subprocesses. Their launch
+    // configuration comes from our explicit fixture builder, never from an
+    // opaque std Command reconstructed into a governed Windows plan.
+    fn standard_command(&self, role: &str) -> std::io::Result<Command> {
+        let command = self.command(role)?;
+        #[cfg(windows)]
+        {
+            command.into_std_command()
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(command)
+        }
     }
 
     fn entry_pid(&self) -> Option<u32> {
@@ -246,7 +266,7 @@ impl DesktopFixture {
             .ok()
     }
 
-    fn bind_original(&mut self, child: Arc<Mutex<std::process::Child>>) -> bool {
+    fn bind_original(&mut self, child: Arc<Mutex<LoginChild>>) -> bool {
         let Ok(guard) = child.try_lock() else {
             return false;
         };
@@ -1381,6 +1401,17 @@ struct CaseWait {
     timed_out: bool,
     detail: Option<String>,
 }
+fn standard_case_child(child: std::process::Child) -> LoginChild {
+    #[cfg(windows)]
+    {
+        child.into()
+    }
+    #[cfg(not(windows))]
+    {
+        child
+    }
+}
+
 fn spawn_owned_case(command: &mut Command) -> std::io::Result<std::process::Child> {
     #[cfg(unix)]
     {
@@ -1457,7 +1488,9 @@ fn wait_owned_case(fixture: &mut DesktopFixture, budget: Duration) -> CaseWait {
 fn case_process(role: &str) {
     let _env_guard = csq_core::platform::test_env::lock();
     let mut fixture = DesktopFixture::new().expect("private case sandbox");
-    let mut command = fixture.command(role).expect("private case command");
+    let mut command = fixture
+        .standard_command(role)
+        .expect("private case command");
     command
         .stdout(std::fs::File::create(fixture.root().join("case.out")).expect("case stdout"))
         .stderr(std::fs::File::create(fixture.root().join("case.err")).expect("case stderr"));
@@ -1473,7 +1506,7 @@ fn case_process(role: &str) {
     let child = spawn_owned_case(&mut command).expect("owned exact case entry");
     let pid = child.id();
     fixture.pid = Some(pid);
-    fixture.original = Some(Arc::new(Mutex::new(child)));
+    fixture.original = Some(Arc::new(Mutex::new(standard_case_child(child))));
     let waited = wait_owned_case(&mut fixture, Duration::from_secs(40));
     let last_recorded_stage = std::fs::File::open(fixture.root().join("case-stage.json"))
         .ok()
@@ -1688,13 +1721,13 @@ fn instrument_empty_private_release_reaches_actual_parser_panic() {
     std::fs::File::create(fixture.root().join("release"))
         .expect("intentional empty old-protocol release");
     let child = fixture
-        .command("hold")
+        .standard_command("hold")
         .expect("private instrument command")
         .spawn()
         .expect("private instrument actual entry");
     let pid = child.id();
     fixture.pid = Some(pid);
-    fixture.original = Some(Arc::new(Mutex::new(child)));
+    fixture.original = Some(Arc::new(Mutex::new(standard_case_child(child))));
     if !bounded(Duration::from_secs(10), || {
         fixture.live_original() == Some(false)
     }) {
@@ -3457,7 +3490,7 @@ async fn handler_und_case_with_setup(fail_holder_spawn: bool) -> Result<String, 
         observation_phase="receive-writer";
         let descriptor=receive_captured_writer_raw(receiver).map_err(|e|desktop_setup_verdict("receive-writer",e.raw_os_error()))?;
         observation_phase="spawn-holder";
-        let mut command=holder.command("hold").map_err(|e|desktop_setup_verdict("spawn-holder",e.raw_os_error()))?;
+        let mut command=holder.standard_command("hold").map_err(|e|desktop_setup_verdict("spawn-holder",e.raw_os_error()))?;
         if fail_holder_spawn {
             // Real ENOENT from actual Command::spawn, after actual vendor entry
             // and descriptor receipt. No auth command/binary or synthetic errno.
@@ -3688,7 +3721,9 @@ fn codex_full_handler_missing_captured_eof_retains_shared_grant_and_prior_slot()
 fn stalled_owned_case_is_actually_reaped_after_case_bound() {
     let _env_guard = csq_core::platform::test_env::lock();
     let mut fixture = DesktopFixture::new().expect("private stalled case root");
-    let mut command = fixture.command("hold").expect("exact inert stalled actor");
+    let mut command = fixture
+        .standard_command("hold")
+        .expect("exact inert stalled actor");
     // The actor has no descendants and performs only private file control.
     let child = spawn_owned_case(&mut command).expect("actual case spawn seam");
     drop(command);
@@ -3794,7 +3829,7 @@ fn actual_holder_spawn_failure_surfaces_setup_phase_errno_after_cleanup() {
     let _env_guard = csq_core::platform::test_env::lock();
     let mut fixture = DesktopFixture::new().expect("private setup-error case root");
     let mut command = fixture
-        .command("case-handler-codex-setup-error")
+        .standard_command("case-handler-codex-setup-error")
         .expect("isolated setup-error driver");
     command
         .stdout(std::fs::File::create(fixture.root().join("case.out")).unwrap())

@@ -245,7 +245,8 @@ enum Command {
         rest: Vec<String>,
     },
 
-    /// Swap the active account in the current config dir
+    /// Swap the active account in the current config dir, or another live
+    /// session's account with --session
     Swap {
         /// Account number to swap to
         account: u16,
@@ -255,6 +256,13 @@ enum Command {
         /// would not transfer.
         #[arg(long)]
         yes: bool,
+        /// Swap ANOTHER live session's account. `<NAME>` is the session's
+        /// `csq sessions` name: it only SELECTS the target (pid, started_at);
+        /// identity is never derived from the name. Cross-surface and
+        /// 3P/env-pinned slots are refused — they need a restart INSIDE that
+        /// session.
+        #[arg(long, value_name = "NAME")]
+        session: Option<String>,
     },
 
     /// Show status of all accounts
@@ -2331,11 +2339,25 @@ pub fn run() -> Result<()> {
                 &rest,
             )
         }
-        Command::Swap { account, yes } => {
-            let account_num = AccountNum::try_from(account)
-                .map_err(|e| anyhow::anyhow!("invalid account: {e}"))?;
-            commands::swap::handle(&base_dir, account_num, yes)
-        }
+        Command::Swap {
+            account,
+            yes,
+            session,
+        } => match session {
+            // The named form refuses an out-of-range slot with its own named
+            // line (`slot_from_wire`); the own-directory form keeps today's
+            // `invalid account:` text byte-for-byte.
+            Some(name) => {
+                let account_num = csq_core::session::swap_session::slot_from_wire(account)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                commands::swap::handle_named(&base_dir, account_num, &name)
+            }
+            None => {
+                let account_num = AccountNum::try_from(account)
+                    .map_err(|e| anyhow::anyhow!("invalid account: {e}"))?;
+                commands::swap::handle(&base_dir, account_num, yes)
+            }
+        },
         Command::Status => commands::status::handle(&base_dir, json),
         Command::Suggest => commands::suggest::handle(&base_dir),
         Command::Statusline => commands::statusline::handle(&base_dir),

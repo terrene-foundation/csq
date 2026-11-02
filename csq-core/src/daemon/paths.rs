@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 /// `LOCALAPPDATA` is unset.
 ///
 /// With feature `test-utils` (Unix), a base registered through
-/// [`test_socket`] resolves to its registered runtime directory instead.
+/// `test_socket` resolves to its registered runtime directory instead.
 pub fn pid_file_path(base_dir: &Path) -> PathBuf {
     #[cfg(all(feature = "test-utils", unix))]
     if let Some(pid) = test_socket::lookup_pid(base_dir) {

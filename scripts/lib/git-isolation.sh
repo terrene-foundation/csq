@@ -148,11 +148,17 @@
 #
 # # Idempotent re-source
 #
-# Sourcing twice is a no-op. That is load-bearing beyond hygiene: callers
-# deliberately REPLACE these values later (dev-preflight.test.sh's SIGN_PROBE
-# re-exports GIT_CONFIG_GLOBAL pointing at a hostile fixture config to prove the
-# fixture ignores it), and a second source must not clobber the caller's
-# deliberate override.
+# A second source IN THE SAME PROCESS is a no-op. That is load-bearing beyond
+# hygiene: callers deliberately REPLACE these values later
+# (dev-preflight.test.sh's SIGN_PROBE re-exports GIT_CONFIG_GLOBAL pointing at a
+# hostile fixture config to prove the fixture ignores it), and a second source
+# must not clobber the caller's deliberate override.
+#
+# The marker is honoured ONLY when this process set it unexported and it names
+# this process's pid. A marker that arrives through the environment is exported
+# by construction, so it is untrusted whatever its value; the pid is a
+# per-process key, never a secret (a parent can predict the child's pid — R2-1).
+# The full reasoning and the measured prediction are in the code note below.
 #
 # Usage:
 #   . "$HERE/../lib/git-isolation.sh"
@@ -169,12 +175,74 @@
 # script rather than returning — fail closed, so a test runs with no isolation
 # only if someone deliberately ignores a FATAL line, never by default.
 #
-# Idempotent: a second source is a no-op (see the header — a re-source must not
-# clobber a caller's later deliberate override).
-if [ -n "${_CSQ_GIT_ISOLATION_SOURCED:-}" ]; then
+# Idempotent WITHIN ONE PROCESS. A second source in the same shell is a no-op,
+# because a re-source must not clobber a caller's later deliberate override.
+#
+# THE TRUST BOUNDARY IS THE EXPORT ATTRIBUTE, NOT THE PID (R2-1). Keying the
+# marker on the pid alone was forgeable, twice over:
+#   - the pid is PREDICTED, not secret. A parent can export
+#     `_CSQ_GIT_ISOLATION_SOURCED=<its own pid + 1>` and the forked child very
+#     often receives exactly that id (MEASURED on bash 3.2.57: 61948 -> 61949,
+#     61950 -> 61951), across the BASHPID and the child-sh PPID routes alike.
+#   - the value can be pre-set from the environment, whether or not it matches.
+# What an inherited value CANNOT avoid is its export attribute: anything that
+# arrives through the environment is exported (`declare -x NAME="…"`), while the
+# marker this file sets is unexported (`declare -- NAME="…"`). So an exported
+# marker is untrusted — unset, and rebuilt by this process — and a marker is
+# honoured only when THIS process set it unexported AND it names this process's
+# pid (the pid remains as a per-process key, not as a secret).
+#
+# `command builtin declare -p` is used deliberately: an exported `declare`
+# FUNCTION shadows the builtin (MEASURED — a shadowing declare printed a forged
+# line while `command builtin declare -p` printed the truth). A hostile exported
+# function named `command` shadows even this, and a shell environment that can
+# export arbitrary functions is not a boundary this helper can police completely
+# — but no VALUE the environment can carry forges the marker any more, and an
+# unparsable declaration is treated as untrusted rather than trusted.
+#
+# The id is the pid of the sourcing shell (this one, subshell or not), taken as
+# the parent of a child `sh`. That is the ONE form that works on every bash:
+# `$$` is wrong inside a subshell, and `$BASHPID`, while a shell-maintained
+# dynamic variable on bash 4+, is an ORDINARY environment-importable variable on
+# bash 3.2 (macOS /bin/bash). Assigned UNCONDITIONALLY, so an inherited
+# `_CSQ_GI_PID` can never decide anything.
+#
+# The `$$` fallback is reached only if `sh` cannot be executed at all; in that
+# pathological case it is the least-bad id (and it is the same value the process
+# reports to its children).
+_CSQ_GI_PID="$(exec sh -c 'echo $PPID')"
+case "$_CSQ_GI_PID" in
+    ''|*[!0-9]*) _CSQ_GI_PID="$$" ;;
+esac
+
+# Untrust any marker that arrived EXPORTED. The helper never exports it, so an
+# exported marker cannot have been set by the helper — it came from the
+# environment, whatever its value. An unparsable declaration (no `declare -`
+# prefix: shadowed, empty, or some shape this code does not know) is untrusted
+# too; only a well-formed declaration whose flags lack `x` is honoured.
+if [ "${_CSQ_GIT_ISOLATION_SOURCED+set}" = "set" ]; then
+    _csq_gi_decl="$(command builtin declare -p _CSQ_GIT_ISOLATION_SOURCED 2>/dev/null || true)"
+    _csq_gi_trust=0
+    case "$_csq_gi_decl" in
+        'declare -'*)
+            # `declare -- NAME=…` (this process) or `declare -x NAME=…`
+            # (inherited). The flags are the field between "declare " and the
+            # first space; `--` means none, and any `x` means exported.
+            _csq_gi_flags="${_csq_gi_decl#declare }"
+            _csq_gi_flags="${_csq_gi_flags%% *}"
+            case "$_csq_gi_flags" in
+                --) _csq_gi_trust=1 ;;
+                -*) case "$_csq_gi_flags" in *x*) ;; *) _csq_gi_trust=1 ;; esac ;;
+            esac ;;
+    esac
+    [ "$_csq_gi_trust" -eq 1 ] || unset _CSQ_GIT_ISOLATION_SOURCED
+    unset _csq_gi_decl _csq_gi_flags _csq_gi_trust
+fi
+
+if [ "${_CSQ_GIT_ISOLATION_SOURCED:-}" = "$_CSQ_GI_PID" ]; then
     return 0
 fi
-_CSQ_GIT_ISOLATION_SOURCED=1
+_CSQ_GIT_ISOLATION_SOURCED="$_CSQ_GI_PID"
 
 # ── internal helpers ────────────────────────────────────────────────────────
 
@@ -328,19 +396,6 @@ _csq_git_isolation_on_exit() {
 }
 
 # ── the body ────────────────────────────────────────────────────────────────
-
-# The PID of THIS process. `$BASHPID` where bash has it (4+); bash 3.2 does not,
-# and `$$` is wrong inside a subshell, so ask a child `sh` for its parent: in
-# `$(exec sh -c …)` the forked subshell becomes `sh`, whose PPID is the process
-# that forked it — this one, subshell or not.
-if [ -n "${BASHPID:-}" ]; then
-    _CSQ_GI_PID="$BASHPID"
-else
-    _CSQ_GI_PID="$(exec sh -c 'echo $PPID')"
-fi
-case "$_CSQ_GI_PID" in
-    ''|*[!0-9]*) _CSQ_GI_PID="$$" ;;
-esac
 
 _CSQ_GI_TMP="${TMPDIR:-/tmp}"
 _CSQ_GI_TMP="${_CSQ_GI_TMP%/}"

@@ -532,6 +532,30 @@ fn same_tty(a: RawFd, b: RawFd) -> io::Result<()> {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[path = "pty_grant.rs"]
+mod pty_grant;
+
+// Keep the exact typed lock-timeout tag at the launch boundary. An unrelated
+// io::Error (even ETIMEDOUT or the same display text) stays an openpty error.
+fn pty_open_error(error: io::Error) -> RelayError {
+    #[cfg(target_os = "macos")]
+    if pty_grant::is_timeout(&error) {
+        return RelayError::NotStarted {
+            op: pty_grant::TIMEOUT_OP,
+            errno: libc::ETIMEDOUT,
+        };
+    }
+    not_started("openpty")(error)
+}
+
+fn open_relay_pty(
+    termios: Option<&libc::termios>,
+    ws: Option<&libc::winsize>,
+) -> Result<Pty, RelayError> {
+    Pty::open(termios, ws).map_err(pty_open_error)
+}
+
 impl Pty {
     /// `posix_openpt` with `O_CLOEXEC` at creation (so no concurrent
     /// `fork`+`exec` can inherit either end), then the slave opened with
@@ -551,12 +575,13 @@ impl Pty {
         })?;
         // SAFETY: posix_openpt returned a fresh descriptor we now own.
         let master = unsafe { OwnedFd::from_raw_fd(m) };
-        // grantpt/unlockpt are NOT serialized. A macOS kernel spin in the
-        // grantpt/unlockpt ioctl was reproduced IN-PROCESS at 16 concurrent
-        // threads (scratchpad F-grantpt-repro.c; sampled at ~90% CPU in the
-        // ioctl, hangs ~1 run in 4). The CROSS-PROCESS case (several relays
-        // launching at once) is UNMEASURED. This MUST be resolved before the
-        // relay is wired into any launch path (spec 34).
+        // an internal ticket: a process-wide macOS guard covers the grant/unlock pair.
+        // Its acquisition wait has a finite deadline and a fixed error tag;
+        // the native ioctl itself remains synchronous and untimed. Other
+        // platforms retain the original direct pair below.
+        #[cfg(target_os = "macos")]
+        pty_grant::grant_unlock(m)?;
+        #[cfg(not(target_os = "macos"))]
         // SAFETY: plain syscalls on the master we own.
         if unsafe { libc::grantpt(m) } == -1 || unsafe { libc::unlockpt(m) } == -1 {
             return Err(io::Error::last_os_error());
@@ -2768,7 +2793,7 @@ impl Relay {
         let signals = SignalGuard::install(self.cfg.forward_usr1, &outer)?;
         let guard = RawGuard::enter(STDIN).map_err(not_started("tcsetattr"))?;
         let ws = term::get_winsize(STDIN).map_err(not_started("tiocgwinsz"))?;
-        let pty = Pty::open(Some(guard.saved()), Some(&ws)).map_err(not_started("openpty"))?;
+        let pty = open_relay_pty(Some(guard.saved()), Some(&ws))?;
         set_nonblock(pty.master.as_raw_fd()).map_err(not_started("fcntl"))?;
         let Pty { master, slave } = pty;
         let Spawned { pid, ctl, up } =

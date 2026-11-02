@@ -1,17 +1,29 @@
 //! Binary-private vendor ownership. A timeout refuses publication, not custody.
 
+use self::process::Child;
 use std::fmt;
 use std::io;
-use std::process::{Child, ExitStatus};
+use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[path = "login_child_custody/group.rs"]
 pub(crate) mod group;
+#[path = "login_child_custody/process.rs"]
+pub(crate) mod process;
 #[cfg(all(test, unix))]
 #[path = "login_child_custody/tty_tests.rs"]
 mod tty_tests;
+#[cfg(windows)]
+#[path = "login_child_custody/windows_process.rs"]
+pub(crate) mod windows_process;
 use group::{ErrorAction, ErrorBudget, GroupControl, GroupSignal};
+
+/// Called only after installer admission, before normal process startup.
+#[cfg(windows)]
+pub(crate) fn dispatch_windows_helper(argv: &[std::ffi::OsString]) -> io::Result<Option<u32>> {
+    windows_process::dispatch_helper(argv)
+}
 
 /// How a vendor login ended, worded for the operator. Fixed vocabulary only:
 /// a numeric exit code or a signal name, never paths, arguments or output.
@@ -167,8 +179,7 @@ pub(crate) enum RefusalReason {
     SetupFailed,
     DeadlineOverflow,
     Cancelled,
-    /// The vendor's group was not proven empty within the census budget.
-    #[cfg(unix)]
+    /// The vendor's process group or Job was not proven empty within the census budget.
     GroupCensus,
 }
 
@@ -189,7 +200,6 @@ impl LoginChildRefusal {
             RefusalReason::ObservationFailed => "login_child_observation_refused",
             RefusalReason::SetupFailed => "login_child_setup_refused",
             RefusalReason::DeadlineOverflow => "login_deadline_overflow_refused",
-            #[cfg(unix)]
             RefusalReason::GroupCensus => "login_group_census_refused",
         }
     }
@@ -511,8 +521,12 @@ pub(crate) struct OwnedLoginChild<K> {
     errors: ErrorBudget,
     stop_deadline: Option<Instant>,
     /// First census refusal of this custody; the census budget runs from it.
-    #[cfg(unix)]
     census_refused_since: Option<Instant>,
+    /// A Job census can recover while the retained native owner keeps polling.
+    /// Its budget reports refusal; it never discards observation/cancel authority.
+    /// Positive leftover-member observations also start GroupControl's separate
+    /// completion grace period, after which that exact Job is terminated.
+    job_census_recovering: bool,
     terminal: bool,
     /// True once the caller's deadline stop actually SUCCEEDED. Carried out of
     /// the wait loop to the caller: the CLI's operator paragraph and the
@@ -560,8 +574,8 @@ impl<K> OwnedLoginChild<K> {
             reaped: None,
             errors: ErrorBudget::default(),
             stop_deadline: None,
-            #[cfg(unix)]
             census_refused_since: None,
+            job_census_recovering: false,
             terminal: false,
             deadline_stopped: false,
             auxiliary_errors: ErrorBudget::default(),
@@ -655,15 +669,43 @@ impl<K> OwnedLoginChild<K> {
     }
     /// Actual child reap and every captured reader join authorize grant cleanup.
     pub(crate) fn custody_finalized(&self) -> bool {
-        self.reaped.is_some() && self.group.readers_joined() && !self.watchdog.custody_unresolved()
+        #[cfg(test)]
+        let unresolved = self.hard_unresolved_for_test();
+        #[cfg(not(test))]
+        let unresolved = self.watchdog.custody_unresolved();
+        self.reaped.is_some() && self.group.readers_joined() && !unresolved
     }
     #[cfg(test)]
     pub(crate) fn reaped_status(&self) -> Option<ExitStatus> {
         self.reaped
     }
 
+    #[cfg(test)]
+    pub(crate) fn recovery_pending_for_test(&self) -> bool {
+        !self.terminal && self.reaped.is_none()
+    }
+    #[cfg(test)]
+    pub(crate) fn hard_unresolved_for_test(&self) -> bool {
+        self.watchdog.custody_unresolved()
+    }
+    #[cfg(test)]
+    pub(crate) fn account_completed_fixture_for_test(&mut self) -> io::Result<()> {
+        if !self.group.readers_joined() {
+            return Err(io::Error::other("fixture captured reader not joined"));
+        }
+        let status = self
+            .child
+            .lock()
+            .map_err(|_| io::Error::other("fixture child poisoned"))?
+            .try_wait()?
+            .ok_or_else(|| io::Error::other("fixture original child not reaped"))?;
+        self.reaped = Some(status);
+        self.watchdog.state().custody_pgid = None;
+        Ok(())
+    }
+
     #[cfg(all(test, unix))]
-    fn set_wait_observer(
+    pub(crate) fn set_wait_observer(
         &mut self,
         observer: impl FnMut(&GroupControl, &mut Child, bool) -> io::Result<Option<ExitStatus>>
             + Send
@@ -687,7 +729,15 @@ impl<K> OwnedLoginChild<K> {
             );
         }
     }
+    #[cfg(not(test))]
     fn observe_kill_intent(&mut self) {
+        self.observe_kill_intent_body();
+    }
+    #[cfg(test)]
+    pub(crate) fn observe_kill_intent(&mut self) {
+        self.observe_kill_intent_body();
+    }
+    fn observe_kill_intent_body(&mut self) {
         if self.stop_deadline.is_none() {
             if let Some(at) = self.group.kill_requested_at() {
                 self.watchdog.refuse_cancelled_unconditional();
@@ -698,22 +748,54 @@ impl<K> OwnedLoginChild<K> {
             }
         }
     }
+    #[cfg(not(test))]
     fn observe_result(&mut self, result: io::Result<Option<ExitStatus>>) {
+        self.observe_result_body(result);
+    }
+    #[cfg(test)]
+    pub(crate) fn observe_result(&mut self, result: io::Result<Option<ExitStatus>>) {
+        self.observe_result_body(result);
+    }
+    fn observe_result_body(&mut self, result: io::Result<Option<ExitStatus>>) {
         match result {
             Ok(Some(status)) => {
                 self.errors.reset();
                 self.reaped = Some(status);
+                self.job_census_recovering = false;
                 #[cfg(test)]
                 self.watchdog.record_reaped(status);
             }
             Ok(None) => self.errors.reset(),
-            // The group was not proven empty before the reap (try_reap froze it
-            // with SIGKILL first, so a Survivor is a member still dying). An
+            #[cfg(any(windows, test))]
+            Err(error)
+                if error.get_ref().is_some_and(|error| {
+                    matches!(
+                        error.downcast_ref::<group::CensusRefusal>(),
+                        Some(
+                            group::CensusRefusal::Nonempty
+                                | group::CensusRefusal::Unavailable
+                                | group::CensusRefusal::ExitUnavailable
+                        )
+                    )
+                }) =>
+            {
+                self.job_census_recovering = true;
+                let now = Instant::now();
+                let since = *self.census_refused_since.get_or_insert(now);
+                if now.duration_since(since) >= group::STOP_DRAIN_BUDGET {
+                    // Report a retained refusal while this owner continues to
+                    // observe its original Child/Job and accept explicit stops.
+                    // No unresolved latch or leaked keepalive: later native
+                    // empty census + original reap + reader join can retire it.
+                    self.watchdog.refuse(RefusalReason::GroupCensus);
+                }
+            }
+            // The Unix group was not proven empty before the reap. try_reap
+            // froze it first, so a Survivor is a member still dying. An
             // ELAPSED budget, STOP_DRAIN_BUDGET from the first refusal, bounds
             // the wait for it to die; never a poll count, whose wall time
             // depends on the poll interval. At the deadline: a terminal refusal
             // that retains custody (never a reap-as-complete), cause named.
-            #[cfg(unix)]
             Err(error) if group::is_census_refusal(&error) => {
                 let now = Instant::now();
                 let since = *self.census_refused_since.get_or_insert(now);
@@ -722,6 +804,9 @@ impl<K> OwnedLoginChild<K> {
                 }
             }
             Err(error) => {
+                // An unrelated hard observation failure still follows the
+                // original error/lease policy; Job recovery cannot mask it.
+                self.job_census_recovering = false;
                 self.watchdog.refuse(RefusalReason::ObservationFailed);
                 match self.errors.record(&error) {
                     ErrorAction::Continue => {}
@@ -747,13 +832,26 @@ impl<K> OwnedLoginChild<K> {
             }
         }
         if self.stop_deadline.is_some_and(|at| Instant::now() >= at)
+            && !self.job_census_recovering
             && (self.reaped.is_none() || !self.group.readers_joined())
         {
             self.terminal_refusal();
         }
     }
+    #[cfg(not(test))]
     fn poll_child(&mut self, joined: bool) {
-        if self.reaped.is_some() || self.terminal {
+        self.poll_child_body(joined);
+    }
+    #[cfg(test)]
+    pub(crate) fn poll_child(&mut self, joined: bool) {
+        self.poll_child_body(joined);
+    }
+    fn poll_child_body(&mut self, joined: bool) {
+        #[cfg(test)]
+        let pending = self.recovery_pending_for_test();
+        #[cfg(not(test))]
+        let pending = self.reaped.is_none() && !self.terminal;
+        if !pending {
             return;
         }
         let result = match self.child.lock() {
@@ -807,7 +905,7 @@ impl<K> OwnedLoginChild<K> {
     }
     /// Whether the caller's deadline stop actually succeeded; callers carry
     /// this out of the wait (the CLI operator paragraph keys on it).
-    #[cfg(any(feature = "cli", test))]
+    #[cfg(any(feature = "cli", all(test, unix)))]
     pub(crate) fn deadline_stopped(&self) -> bool {
         self.deadline_stopped
     }
@@ -922,6 +1020,18 @@ impl LoginWatchdog {
 }
 impl<K> Drop for OwnedLoginChild<K> {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if self.reaped.is_some()
+            && self.group.readers_joined()
+            && !self.watchdog.custody_unresolved()
+        {
+            // Tests may retire a completed fixture only with the same actual
+            // original-child and joined-reader receipt used by the fixture.
+            if self.account_completed_fixture_for_test().is_err() {
+                self.watchdog.mark_custody_unresolved(self.group.id());
+                self.terminal = true;
+            }
+        }
         while self.reaped.is_none() && !self.terminal {
             match self.group.pump_signals() {
                 Ok(()) => self.auxiliary_errors.reset(),

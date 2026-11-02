@@ -86,6 +86,25 @@ fn main() {
         }
     };
 
+    // The creator helper shares this binary and must hold installer admission
+    // throughout its lifetime. Dispatch before any CLI/Tauri initialization can
+    // create another thread or process in the helper's private stdio window.
+    #[cfg(windows)]
+    {
+        let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        match login_child_custody::dispatch_windows_helper(&argv) {
+            Ok(Some(code)) => std::process::exit(code as i32),
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!(
+                    "csq: creator helper refused; error_kind=windows_creator_helper; win32={}",
+                    error.raw_os_error().unwrap_or(0)
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+
     // an internal ticket R3 N-2: `csq --build-info` prints the compiled feature set and
     // exits, before mode detection, so release and install scripts can verify
     // the BUILT binary (scripts/verify/built-binary-features.sh) before signing.

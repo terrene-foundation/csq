@@ -1,12 +1,16 @@
 //! Piped CLI login custody. Only this thread invokes the output callback.
 
 use std::io::{self, BufRead, BufReader, Write};
-use std::process::{ChildStdout, Command, ExitStatus};
+use std::process::ExitStatus;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::Context;
+
+#[cfg(test)]
+use crate::login_child_custody::process::Child;
+use crate::login_child_custody::process::{ChildStdout, Command};
 
 use super::{cancelled_before_spawn, CliLoginCancelled, CliLoginReceipt, ScopedLoginCancellation};
 use crate::login_child_custody::{
@@ -40,7 +44,7 @@ pub(crate) enum PipedLoginSpawnOutcome {
 }
 
 #[cfg(test)]
-type AdoptedChildCallback = Box<dyn FnOnce(Arc<Mutex<std::process::Child>>)>;
+type AdoptedChildCallback = Box<dyn FnOnce(Arc<Mutex<Child>>)>;
 
 #[cfg(test)]
 #[derive(Default)]
@@ -57,7 +61,7 @@ impl PipedCustodyHooks {
         }
     }
 
-    fn adopted_child(&mut self, child: Arc<Mutex<std::process::Child>>) {
+    fn adopted_child(&mut self, child: Arc<Mutex<Child>>) {
         if let Some(callback) = self.adopted_child.take() {
             callback(child);
         }
@@ -115,7 +119,7 @@ where
     /// before performing any fallible fixture logging or other work.
     pub(crate) fn with_adopted_child(
         mut self,
-        callback: impl FnOnce(Arc<Mutex<std::process::Child>>) + 'static,
+        callback: impl FnOnce(Arc<Mutex<Child>>) + 'static,
     ) -> Self {
         self.custody.adopted_child = Some(Box::new(callback));
         self
@@ -350,7 +354,7 @@ impl PipedReader {
 /// still-owned fd to the existing worker before ordinary reader cleanup runs.
 #[cfg(test)]
 struct AdoptedHookUnwindHandoff<'a> {
-    child: Arc<Mutex<std::process::Child>>,
+    child: Arc<Mutex<Child>>,
     reader: &'a mut PipedReader,
     armed: bool,
 }

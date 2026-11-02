@@ -7,6 +7,11 @@ mod ascii_probe;
 // crate::all_enum::declare_all_enum;`.
 mod all_enum;
 pub mod audit;
+/// Owner bridge over Telegram: config, vault-backed secrets, the pure
+/// inbound-update validator and owner attestation. The daemon ingest that
+/// consumes these lives in `daemon::telegram_bridge`; nothing here makes a
+/// network call, so the whole module is unit-testable without a bot token.
+pub mod bridge;
 pub mod capability_layer;
 pub mod chat_sessions;
 pub mod cli_deps;

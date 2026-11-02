@@ -11,6 +11,8 @@
 //! - `refresher` — per-identity OAuth token refresher (Anthropic + Codex).
 //! - `usage_poller` — per-surface quota pollers (Anthropic, Codex, Gemini,
 //!   3P bearers) writing to `quota.json`.
+//! - `telegram_bridge` — outbound Telegram long-poll ingest for the owner
+//!   bridge (validates, routes, stores, wakes; no listener).
 //! - `auto_rotate` — auto-rotation loop.
 //! - `cache` — in-memory TTL cache shared across pollers.
 //! - `startup_reconciler` — multi-pass on-disk reconciliation at boot.
@@ -99,6 +101,9 @@ pub mod startup_reconciler;
 /// set by `csq daemon stop`; cleared by every daemon-start entry point.
 pub mod stop_sentinel;
 pub mod supervise;
+/// S3 Telegram bridge ingest — outbound long polling only, no listener
+/// (`security.md` MUST-7). Absent or disabled config is the kill switch.
+pub mod telegram_bridge;
 pub mod usage_ledger_writer;
 pub mod usage_poller;
 
@@ -134,6 +139,9 @@ pub use startup_reconciler::{
     reconciler_join_failure, run_reconciler, ReconcileSummary, RECONCILER_TASK_FAILED,
 };
 pub use stop_sentinel::{clear_stop_requested, is_stop_requested, set_stop_requested};
+pub use telegram_bridge::{
+    spawn as spawn_telegram_bridge, ReqwestTelegramPost, TelegramBridgeHandle, TelegramPost,
+};
 pub use usage_ledger_writer::{
     spawn as spawn_usage_ledger_writer, WriterHandle as UsageLedgerWriterHandle,
 };

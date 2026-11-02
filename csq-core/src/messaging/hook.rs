@@ -399,6 +399,7 @@ mod tests {
             id: "3f2b8c1a-5d4e-4a7b-8c9d-0e1f2a3b4c5d".into(),
             from: snd(77, Surface::Codex),
             to: ses(9, Surface::ClaudeCode).as_recipient(),
+            origin: crate::messaging::model::Origin::Peer,
             in_reply_to: None,
             thread: "3f2b8c1a-5d4e-4a7b-8c9d-0e1f2a3b4c5d".into(),
             body: body.into(),

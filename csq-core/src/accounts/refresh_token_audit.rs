@@ -212,7 +212,10 @@ pub fn audit(base: &Path) -> AuditReport {
         let path = identity_store::credentials_path_for(base, identity);
         match std::fs::symlink_metadata(&path) {
             // No canonical: nothing to refresh, nothing to share.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && crate::platform::fs::confirm_absent(&path).is_ok() =>
+            {
                 for s in slots {
                     report.slots.insert(s, SlotState::Clear);
                 }
@@ -522,7 +525,12 @@ fn file_fingerprint(path: &Path) -> Option<String> {
     use std::io::Read;
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some("absent".to_string()),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && crate::platform::fs::confirm_absent(path).is_ok() =>
+        {
+            return Some("absent".to_string())
+        }
         Err(_) => return None,
     };
     let kind = meta.file_type();

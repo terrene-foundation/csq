@@ -209,6 +209,10 @@ thread_local! {
     /// returned ERROR_INVALID_PARAMETER, forcing the legacy-class fallback.
     pub(super) static FORCE_LEGACY_RENAME: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// Test seam: make the `FileRenameInfoEx` attempt report STATUS_ACCESS_DENIED
+    /// (an internal ticket's measured extended-class-only refusal), forcing the class fallback.
+    pub(super) static DENY_POSIX_RENAME: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     /// Test seam: runs once immediately before the first rename attempt, with
     /// the verified handle still held. The test probes the temp from outside.
     pub(super) static BEFORE_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
@@ -250,9 +254,15 @@ pub(super) fn create_private_temp(path: &Path) -> Result<File, StoreError> {
 }
 
 // Keep transcript publication and the general atomic writer on the same
-// unsupported-class policy; access/sharing failures must not select fallback.
+// extended-class policy: the plain class is the fallback when the extended one
+// is unsupported OR returns the measured extended-class-only ACCESS_DENIED
+// (an internal ticket). A refusal the two classes share (DACL, mandatory label, read-only
+// attribute, sharing) is re-asserted by the plain class, so this selects a
+// CLASS, never a permission.
 #[cfg(windows)]
 use crate::platform::fs::windows_rename_class_unsupported as rename_class_unsupported;
+#[cfg(windows)]
+use crate::platform::fs::windows_rename_should_fall_back as rename_should_fall_back;
 
 /// Publish `source` (the open handle the caller created through
 /// `create_private_temp`) as `leaf` inside `directory`, REPLACING any existing
@@ -269,10 +279,12 @@ use crate::platform::fs::windows_rename_class_unsupported as rename_class_unsupp
 /// `SetFileInformationByHandle(FileRenameInfoEx)` wrapper is NOT used: Windows CI
 /// (run 39014859238) showed it returns ERROR_INVALID_PARAMETER (87) for a
 /// handle-relative `RootDirectory` rename of a file as well as of a directory. ONLY
-/// when the NT call reports the class unsupported (`rename_class_unsupported`) does
-/// it retry, logged, with the legacy `FileRenameInformation` class through the SAME
-/// handle, root and leaf; that class cannot replace a target another handle holds
-/// open (ACCESS_DENIED), so it is a compatibility floor, not the expected path.
+/// when the class is unsupported or the extended class returns the measured
+/// extended-class-only ACCESS_DENIED (the shared `windows_rename_should_fall_back`
+/// policy) does it retry, logged, with the legacy `FileRenameInformation` class
+/// through the SAME handle, root and leaf; that class cannot replace a target
+/// another handle holds open (ACCESS_DENIED), so it is a compatibility floor, not
+/// the expected path, and a refusal the two classes share is re-asserted by it.
 /// Never a full-path rename. A failed fallback reports both calls' statuses
 /// (`ex_nt_status`, `ex_os_error` are the first attempt). Any failure AFTER the rename
 /// succeeded is `DurabilityUnknown` (published). The file is flushed; the directory
@@ -383,10 +395,16 @@ pub(super) fn publish_handle(
         }
     };
     #[cfg(test)]
+    let deny_ex = { DENY_POSIX_RENAME.with(|f| f.get()) };
+    #[cfg(not(test))]
+    let deny_ex = false;
+    #[cfg(test)]
     if let Some(hook) = BEFORE_RENAME.with(|c| c.borrow_mut().take()) {
         hook();
     }
-    let ex_status = if skip_ex {
+    let ex_status = if deny_ex {
+        0xC000_0022_u32 as i32 // an internal ticket's measured extended-class-only refusal
+    } else if skip_ex {
         0xC000_0003_u32 as i32 // as if the class were unknown to this OS
     } else {
         nt(
@@ -395,17 +413,30 @@ pub(super) fn publish_handle(
         )
     };
     if ex_status < 0 {
-        if !rename_class_unsupported(ex_status) {
+        if !rename_should_fall_back(ex_status) {
             return Err(failed("rename_nt_ex", ex_status, None));
         }
-        // Once per process: every publish on such a volume would otherwise log.
-        static LOGGED: std::sync::Once = std::sync::Once::new();
-        LOGGED.call_once(|| {
-            tracing::warn!(
-                error_kind = "chat_posix_rename_unsupported",
-                "POSIX-semantics rename is unsupported here; using the legacy rename class"
-            );
-        });
+        // Once per PROCESS, PER CAUSE: every publish on such a volume would
+        // otherwise log, but a denied extended class (an internal ticket, transient) must
+        // not silence the warning for a genuinely unsupported volume (or the
+        // reverse) later in the same process.
+        static UNSUPPORTED_LOGGED: std::sync::Once = std::sync::Once::new();
+        static DENIED_LOGGED: std::sync::Once = std::sync::Once::new();
+        if rename_class_unsupported(ex_status) {
+            UNSUPPORTED_LOGGED.call_once(|| {
+                tracing::warn!(
+                    error_kind = "chat_posix_rename_unsupported",
+                    "POSIX-semantics rename is unsupported here; using the legacy rename class"
+                );
+            });
+        } else {
+            DENIED_LOGGED.call_once(|| {
+                tracing::warn!(
+                    error_kind = "chat_posix_rename_denied",
+                    "the extended rename class was denied; retrying with the legacy rename class"
+                );
+            });
+        }
         #[cfg(test)]
         {
             LEGACY_RENAMES.with(|c| c.set(c.get() + 1));

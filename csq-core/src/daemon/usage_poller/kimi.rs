@@ -492,7 +492,13 @@ pub(crate) fn read_native_access_token(
         // tri-state exists to surface; mapping them to NotFound would
         // re-open the silent-skip class the R1 MED fix closed.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return NativeTokenRead::NotFound;
+            // Windows reports a file-shaped ancestor as NotFound: that is present-but-
+            // unusable drift, not a never-launched skip.
+            return if crate::platform::fs::confirm_absent(&path).is_ok() {
+                NativeTokenRead::NotFound
+            } else {
+                NativeTokenRead::Unusable
+            };
         }
         Err(_) => return NativeTokenRead::Unusable,
     };

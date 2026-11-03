@@ -1137,6 +1137,18 @@ pub enum EventKind {
     /// The message body, the bot token and any body hash are NEVER recorded
     /// (HIGH-1: no untrusted free-text into the chain).
     TelegramBridgeDelivery,
+    /// S5 outbound owner ping — `csq notify-owner` sends the pinned owner a
+    /// short Telegram message. An INTENT record precedes the transport call and
+    /// an OUTCOME follows it, correlated by `RecordId`, exactly like
+    /// [`EventKind::TelegramBridgeDelivery`].
+    ///
+    /// Metadata only: the scrubbed body's byte length, whether the scrub
+    /// changed the text, how many `[REDACTED]` markers it added, and a fixed
+    /// outcome tag (`intent` on the INTENT record; `sent`, `sent_redacted`,
+    /// `send_failed`, or one of the `refused_*` tags on the OUTCOME record).
+    /// The message text, the chat id, the bot token and the URL are NEVER
+    /// recorded (HIGH-1: no untrusted free-text into the chain).
+    TelegramOwnerPing,
 }
 }
 
@@ -1202,6 +1214,8 @@ pub enum EventPayload {
     SeatKeyReanchor(SeatKeyReanchorPayload),
     /// See [`EventKind::TelegramBridgeDelivery`].
     TelegramBridgeDelivery(TelegramBridgeDeliveryPayload),
+    /// See [`EventKind::TelegramOwnerPing`].
+    TelegramOwnerPing(TelegramOwnerPingPayload),
 }
 
 impl EventPayload {
@@ -1238,6 +1252,7 @@ impl EventPayload {
             Self::OrgRootCeremony(_) => EventKind::OrgRootCeremony,
             Self::SeatKeyReanchor(_) => EventKind::SeatKeyReanchor,
             Self::TelegramBridgeDelivery(_) => EventKind::TelegramBridgeDelivery,
+            Self::TelegramOwnerPing(_) => EventKind::TelegramOwnerPing,
         }
     }
 }
@@ -2046,6 +2061,36 @@ pub struct TelegramBridgeDeliveryPayload {
     /// UTF-8 byte length of the delivered text (never the body itself).
     pub byte_len: u64,
     /// Fixed-vocabulary outcome tag.
+    pub outcome: String,
+}
+
+/// Payload for [`EventKind::TelegramOwnerPing`] (S5 outbound owner ping).
+///
+/// Metadata only. The message text, the chat id (always the pinned owner's),
+/// the bot token and the request URL are NEVER recorded; `byte_len` describes
+/// the SCRUBBED text, and the two redaction fields let an operator see that the
+/// disclosure scrubbing ran without seeing what it removed.
+///
+/// **Field evolution is a schema change, not an additive tweak.** The chain's
+/// canonical hash covers this exact field set, so an older reader that ignored
+/// a new field would recompute different canonical bytes and report the record
+/// tampered. The opaque path covers unknown KINDS; it never covers unknown
+/// fields on a known kind. Adding a field here requires a chain-schema bump.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TelegramOwnerPingPayload {
+    /// UTF-8 byte length of the scrubbed text actually handed to the transport.
+    pub byte_len: u64,
+    /// Whether the scrub changed the caller's text.
+    pub redacted: bool,
+    /// How many `[REDACTED]` markers the scrub added.
+    pub redaction_count: u64,
+    /// Fixed-vocabulary outcome tag: `intent` on the INTENT record; on the
+    /// OUTCOME record `sent`, `sent_redacted`, `send_failed`,
+    /// `refused_killed`, `refused_kill_switch_unreadable`, `refused_disabled`,
+    /// `refused_unpinned`, `refused_not_configured`, or
+    /// `refused_config_unreadable` (the last four record a stop or a config
+    /// failure that landed between the INTENT and the wire).
     pub outcome: String,
 }
 
@@ -2895,6 +2940,7 @@ mod tests {
                 EventKind::OrgRootCeremony => "org_root_ceremony",
                 EventKind::SeatKeyReanchor => "seat_key_reanchor",
                 EventKind::TelegramBridgeDelivery => "telegram_bridge_delivery",
+                EventKind::TelegramOwnerPing => "telegram_owner_ping",
             };
         }
     }
@@ -2908,10 +2954,10 @@ mod tests {
     // a variant added with an arm elsewhere but never pushed into `ALL`
     // left both sides of this comparison unchanged — the assert stayed
     // green while the exact property it read as certifying was false. Its
-    // only real job now: catch the literal `26` going stale (harmless —
+    // only real job now: catch the literal `28` going stale (harmless —
     // `EventKind::ALL.len()` is authoritative) as a nudge to update this
     // constant, nothing more.
-    const _EVENT_KIND_VARIANT_COUNT_CHECK: () = assert!(EventKind::ALL.len() == 27);
+    const _EVENT_KIND_VARIANT_COUNT_CHECK: () = assert!(EventKind::ALL.len() == 28);
 
     #[test]
     fn event_payload_kind_matches_variant() {
@@ -3103,6 +3149,14 @@ mod tests {
                         target_surface: "claude-code".to_string(),
                         byte_len: 7,
                         outcome: "claude_woken".to_string(),
+                    })
+                }
+                EventKind::TelegramOwnerPing => {
+                    EventPayload::TelegramOwnerPing(TelegramOwnerPingPayload {
+                        byte_len: 7,
+                        redacted: true,
+                        redaction_count: 1,
+                        outcome: "sent_redacted".to_string(),
                     })
                 }
             };

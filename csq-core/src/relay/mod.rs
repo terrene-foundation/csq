@@ -43,6 +43,14 @@ pub mod state;
 #[cfg(unix)]
 pub mod term;
 
+#[cfg(unix)]
+pub mod control;
+#[path = "loop.rs"]
+#[cfg(unix)]
+pub mod loop_adapter;
+#[cfg(unix)]
+pub(crate) mod owner;
+
 /// Whether this platform can host the relay (spec 34 §34.2, §34.9).
 ///
 /// `Ok(())` on unix. On every other platform the `unsupported_platform`

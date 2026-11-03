@@ -255,9 +255,15 @@ fn legacy_config_cursor(base_dir: &Path) -> Result<Option<u64>, BridgeConfigErro
 /// `/csq off` and refuses to poll while it exists. A metadata error is `Err`
 /// (fail closed), never "not engaged".
 pub fn kill_switch_engaged(base_dir: &Path) -> Result<bool, BridgeConfigError> {
-    match std::fs::symlink_metadata(base_dir.join(KILLED_FILE)) {
+    let marker = base_dir.join(KILLED_FILE);
+    match std::fs::symlink_metadata(&marker) {
         Ok(_) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && crate::platform::fs::confirm_absent(&marker).is_ok() =>
+        {
+            Ok(false)
+        }
         Err(_) => Err(BridgeConfigError::ConfigUnreadable),
     }
 }

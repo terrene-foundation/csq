@@ -1588,7 +1588,9 @@ exit 17"#,
         // Seed a stale sentinel as if a prior refresh tick had set one.
         crate::refresh::sentinel::set_broker_failed(base, account, "codex_token_invalidated")
             .unwrap();
-        assert!(crate::refresh::sentinel::is_broker_failed(base, account));
+        assert!(crate::refresh::sentinel::login_needed_marker_present(
+            base, account
+        ));
 
         let mut reader = Cursor::new(Vec::<u8>::new());
         let mut writer = Vec::<u8>::new();
@@ -1609,7 +1611,7 @@ exit 17"#,
 
         assert_eq!(outcome.label, "codex-8/id");
         assert!(
-            !crate::refresh::sentinel::is_broker_failed(base, account),
+            !crate::refresh::sentinel::login_needed_marker_present(base, account),
             "successful login MUST clear the stale broker_failed sentinel"
         );
     }

@@ -1128,6 +1128,10 @@ fn classify_oauth_error_kind(e: &OAuthError) -> &'static str {
         OAuthError::PkceVerification => "pkce_verification",
         OAuthError::Http { .. } => "http_error",
         OAuthError::Exchange(_) => "race_failed",
+        // Only the credential-refresh path constructs this; the race path
+        // never sees it. Names the allowlisted category so a future widening
+        // cannot leak a free-form string through this fixed-vocabulary sink.
+        OAuthError::RefreshRejected { category, .. } => category,
         OAuthError::Cancelled => "cancelled",
         OAuthError::StoreAtCapacity { .. } => "store_at_capacity",
         OAuthError::ExchangeTimeout { .. } => "exchange_timeout",

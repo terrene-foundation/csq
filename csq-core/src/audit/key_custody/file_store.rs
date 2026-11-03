@@ -217,7 +217,11 @@ pub fn load_payload(
     let path = seed_file_path(base_dir, chain_id, slot);
     match std::fs::read_to_string(&path) {
         Ok(s) => Ok(Some(Zeroizing::new(s))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            crate::platform::fs::confirm_absent(&path)
+                .map_err(|e| KeyCustodyError::ChainIo(format!("seed file read: {e}")))?;
+            Ok(None)
+        }
         Err(e) => Err(KeyCustodyError::ChainIo(format!("seed file read: {e}"))),
     }
 }

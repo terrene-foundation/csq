@@ -121,14 +121,22 @@ pub struct AccountView {
     pub token_status: String,
     /// Seconds until token expires. Negative = expired N seconds ago.
     pub expires_in_secs: Option<i64>,
-    /// Fixed-vocabulary tag for the most recent refresh failure,
-    /// or null if the last refresh succeeded / there's no flag.
-    /// Possible values: "broker_token_invalid" (needs re-login),
-    /// "broker_refresh_failed" (refresh + sibling recovery both
-    /// failed), "credential" / "config" / "platform" / "other".
-    /// The dashboard joins this to the status to render e.g.
-    /// "Expired — invalid token" so users know WHY a slot is
-    /// stuck, not just that it is.
+    /// Operator-facing refresh line for this slot, or `None` when healthy.
+    ///
+    /// Fixed vocabulary only — never free-form upstream text, never a token:
+    /// - the shared login demand `login needed — run csq login N` for a
+    ///   classified permanent OAuth rejection (`invalid_grant`,
+    ///   `unauthorized_client`, `codex_token_expired`,
+    ///   `codex_refresh_reused`, `codex_token_invalidated`) or for the
+    ///   duplicate-grant suppression tag;
+    /// - `refresh failing, cause not recorded` when a marker exists but its
+    ///   cause cannot be classified (a legacy generic tag from the
+    ///   pre-classification writer, a pre-v2.1 zero-byte marker, an
+    ///   unreadable/oversized/symlinked marker);
+    /// - the duplicate-grant audit's own fixed tag when it suppressed the
+    ///   refresh.
+    ///
+    /// The dashboard renders this as the card's WHY line.
     pub last_refresh_error: Option<String>,
     /// Pending post-commit rescue state for this slot's identity:
     /// `"adoptable"` (a blocked refresh tick is transient — the next tick
@@ -243,6 +251,69 @@ pub struct DaemonStatusView {
 #[tauri::command]
 pub fn get_build_edition() -> Result<&'static str, String> {
     Ok(crate::BUILD_EDITION)
+}
+
+/// The card's refresh-state line, from the three-state sentinel accessor.
+///
+/// - `LoginNeeded` → [`login_needed_line`](csq_core::refresh::sentinel::login_needed_line):
+///   the SAME shared operator message `csq status`, `csq doctor` and the
+///   statusline print. The raw category tag is NOT a UI string — the Svelte
+///   `formatRefreshError` switch has no case for `invalid_grant` &
+///   co, so returning the tag would render `⚠ invalid_grant` on the card.
+/// - `Unknown` → [`csq_core::refresh::sentinel::REFRESH_FAILING_CAUSE_NOT_RECORDED`]; the card must NOT
+///   claim a login is needed for a marker whose cause was never recorded
+///   (the pre-classification writer marked every failure with a generic tag).
+/// - `Healthy` → no line.
+fn card_refresh_state(base: &Path, account: AccountNum) -> Option<String> {
+    match csq_core::refresh::sentinel::login_needed_state(base, account) {
+        csq_core::refresh::sentinel::LoginNeededState::Healthy => None,
+        csq_core::refresh::sentinel::LoginNeededState::LoginNeeded { .. } => {
+            Some(csq_core::refresh::sentinel::login_needed_line(account))
+        }
+        csq_core::refresh::sentinel::LoginNeededState::Unknown => {
+            Some(csq_core::refresh::sentinel::REFRESH_FAILING_CAUSE_NOT_RECORDED.to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod card_refresh_state_tests {
+    use super::card_refresh_state;
+    use csq_core::types::AccountNum;
+    use tempfile::TempDir;
+
+    /// The account card surfaces the SHARED login-needed message for a
+    /// classified slot (never the raw category tag: the Svelte
+    /// `formatRefreshError` switch has no case for `invalid_grant`), and the
+    /// not-recorded phrase — never a login claim — for a marker whose cause
+    /// this build cannot classify. Removing the `Unknown` arm REDs the
+    /// `oauth`/zero-byte/future-tag assertions; returning the tag REDs the
+    /// classified assertion.
+    #[test]
+    fn card_state_never_claims_login_needed_for_an_unrecorded_cause() {
+        let dir = TempDir::new().unwrap();
+        let creds = dir.path().join("credentials");
+        std::fs::create_dir_all(&creds).unwrap();
+        let slot = |n: u16| AccountNum::try_from(n).unwrap();
+
+        assert_eq!(card_refresh_state(dir.path(), slot(1)), None);
+
+        std::fs::write(creds.join("2.broker-failed"), "invalid_grant").unwrap();
+        assert_eq!(
+            card_refresh_state(dir.path(), slot(2)).as_deref(),
+            Some("login needed — run csq login 2"),
+            "the card must carry the shared operator message, not the raw tag"
+        );
+
+        for (n, content) in [(3u16, &b"oauth"[..]), (4, b""), (5, b"some_future_tag")] {
+            std::fs::write(creds.join(format!("{n}.broker-failed")), content).unwrap();
+            assert_eq!(
+                card_refresh_state(dir.path(), slot(n)).as_deref(),
+                Some("refresh failing, cause not recorded"),
+                "slot {n}: a card must not surface a login claim for an unrecorded cause"
+            );
+        }
+    }
 }
 
 /// Returns all configured accounts with current quota data.
@@ -419,10 +490,7 @@ fn get_accounts_blocking(base_dir: String) -> Result<Vec<AccountView>, String> {
                 // (account-terminal-separation.md MUST Rule 4).
                 let reason = AccountNum::try_from(a.id)
                     .ok()
-                    .and_then(|num| {
-                        csq_core::refresh::sentinel::read_broker_failed_reason(&base, num)
-                    })
-                    .filter(|s| !s.is_empty());
+                    .and_then(|num| card_refresh_state(&base, num));
                 let codex_path =
                     match csq_core::accounts::profiles::resolve_slot_to_uuid(&base, a.id) {
                         Some(uuid) => {
@@ -488,9 +556,7 @@ fn get_accounts_blocking(base_dir: String) -> Result<Vec<AccountView>, String> {
                             ),
                             None => cred_file::canonical_path(&base, num),
                         };
-                        let reason =
-                            csq_core::refresh::sentinel::read_broker_failed_reason(&base, num)
-                                .filter(|s| !s.is_empty());
+                        let reason = card_refresh_state(&base, num);
                         match credentials::load(&canonical) {
                             Ok(creds) => {
                                 let exp_ms = creds.expect_anthropic().claude_ai_oauth.expires_at;
@@ -2052,7 +2118,11 @@ where
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             forget(cache);
-            return LedgerOutcome::Absent;
+            // Windows reports a file-shaped ancestor as NotFound: unreadable, not absent.
+            return match csq_core::platform::fs::confirm_absent(&path) {
+                Ok(()) => LedgerOutcome::Absent,
+                Err(e) => LedgerOutcome::Unreadable(format!("open: {e}")),
+            };
         }
         Err(e) => {
             forget(cache);
@@ -2815,9 +2885,8 @@ pub struct StartNativeLoginView {
     /// Echoes the resolved native id back (`"kimi-cli"` / `"grok"`).
     pub native_id: String,
     pub display_name: String,
-    /// Whether `binary` resolves via [`provider_cli_installed`]'s same
-    /// resolution chain (`find_cli_binary` OR
-    /// `cli_deps::install_path::find_in_path`). `false` surfaces an
+    /// Whether the shared native-login selector finds a supported binary.
+    /// Unsupported Windows wrappers return an actionable error; `false` surfaces an
     /// install hint — it does NOT block [`complete_native_login`], which
     /// re-resolves the binary at spawn time and errors cleanly if it is
     /// still missing (mirrors the pre-0135 `native-cli-confirm` posture:
@@ -2904,8 +2973,8 @@ pub fn start_native_login(
     slot: u16,
 ) -> Result<StartNativeLoginView, String> {
     let (descriptor, _base, _slot_num) = resolve_native_login_request(&base_dir, &native_id, slot)?;
-    let cli_installed = csq_core::accounts::login::find_cli_binary(descriptor.binary)
-        .or_else(|| csq_core::cli_deps::install_path::find_in_path(descriptor.binary))
+    let cli_installed = csq_core::providers::native_login::resolve_native_login_binary(descriptor)
+        .map_err(|error| error.to_string())?
         .is_some();
     Ok(StartNativeLoginView {
         native_id: descriptor.id.to_string(),
@@ -3106,58 +3175,33 @@ pub async fn complete_native_login(
     )?;
 
     let children = state.native_login_children.clone();
-    let children_for_cleanup = children.clone();
     let app_for_task = app.clone();
 
     let worker = tokio::task::spawn_blocking(move || {
         let _signin = signin;
         let _account_lock = account_lock;
         let _ticket = ticket;
-        let spawned = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let _cleanup = NativeLoginReservationCleanup {
-            children: children_for_cleanup,
-            surface,
-            spawned: spawned.clone(),
-        };
-
-        csq_core::providers::native_login::login_native_with_seal(
-            &base,
-            slot_num,
-            surface,
-            |home, binary, args, home_env| {
-                spawn_native_device_auth_piped(
-                    home,
-                    binary,
-                    args,
-                    home_env,
-                    surface,
-                    &children,
-                    &spawned,
-                    worker_watchdog.clone(),
-                    (Arc::clone(&_account_lock), Arc::clone(&_ticket)),
-                    key,
-                    Arc::clone(&operation),
-                )
-            },
-            |code| {
-                let _ = app_for_task.emit_to(
-                    "main",
-                    "native-device-code",
-                    &NativeDeviceCodeView {
-                        surface: surface.as_str().to_string(),
-                        user_code: code.user_code,
-                        verification_url: code.verification_url,
-                    },
-                );
-            },
-            || operation.seal_publication(),
-        )
-        .map_err(|e| {
-            csq_core::error::redact_tokens(&csq_core::cli_deps::sanitize::redact_home_anywhere(
-                &format!("{e:#}"),
-            ))
+        NativeLoginWorker {
+            descriptor,
+            base,
+            slot: slot_num,
+            children,
+            watchdog: worker_watchdog,
+            key,
+            operation,
+        }
+        .run((Arc::clone(&_account_lock), Arc::clone(&_ticket)), |code| {
+            let _ = app_for_task.emit_to(
+                "main",
+                "native-device-code",
+                &NativeDeviceCodeView {
+                    surface: surface.as_str().to_string(),
+                    user_code: code.user_code,
+                    verification_url: code.verification_url,
+                },
+            );
         })?;
-        operation.mark_committed()
+        Ok(())
     });
     observe_desktop_login(worker, watchdog).await?;
 
@@ -3168,6 +3212,78 @@ pub async fn complete_native_login(
     notify_daemon_blocking(move || notify_daemon_cache_invalidated(&base)).await;
 
     Ok(())
+}
+
+/// The native completion worker owns the full blocking login pipeline. Keeping
+/// its event sink outside the pipeline allows native tests without a webview;
+/// admission and signin registration stay in the command above.
+struct NativeLoginWorker {
+    descriptor: &'static csq_core::providers::native::NativeCli,
+    base: PathBuf,
+    slot: AccountNum,
+    children: NativeLoginChildren,
+    watchdog: crate::login_child_custody::LoginWatchdog,
+    key: crate::desktop::login_custody::ChildKey,
+    operation: Arc<crate::desktop::login_custody::ChildRegistration>,
+}
+
+impl NativeLoginWorker {
+    fn run<K: Clone + Send + Sync + 'static>(
+        self,
+        keepalive: K,
+        on_device_code: impl FnMut(csq_core::providers::native_login::NativeDeviceCode),
+    ) -> Result<(), String> {
+        let Self {
+            descriptor,
+            base,
+            slot,
+            children,
+            watchdog,
+            key,
+            operation,
+        } = self;
+        let surface = descriptor.surface;
+        let spawned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _cleanup = NativeLoginReservationCleanup {
+            children: children.clone(),
+            surface,
+            spawned: spawned.clone(),
+        };
+
+        // A direct completion can bypass the modal precheck. Reject an
+        // unsupported selection before DI creates the vendor home; actual
+        // command construction independently revalidates again below.
+        let _selected = csq_core::providers::native_login::resolve_native_login_binary(descriptor)
+            .map_err(|error| error.to_string())?;
+        csq_core::providers::native_login::login_native_with_seal(
+            &base,
+            slot,
+            surface,
+            |home, binary, args, home_env| {
+                spawn_native_device_auth_piped(
+                    home,
+                    binary,
+                    args,
+                    home_env,
+                    surface,
+                    &children,
+                    &spawned,
+                    watchdog.clone(),
+                    keepalive.clone(),
+                    key,
+                    Arc::clone(&operation),
+                )
+            },
+            on_device_code,
+            || operation.seal_publication(),
+        )
+        .map_err(|error| {
+            csq_core::error::redact_tokens(&csq_core::cli_deps::sanitize::redact_home_anywhere(
+                &format!("{error:#}"),
+            ))
+        })?;
+        operation.mark_committed()
+    }
 }
 
 /// Cancels an in-flight native (Kimi/Grok) login by killing the child
@@ -3234,10 +3350,9 @@ fn cancel_native_login_from(children: &NativeLoginChildren, native_id: &str) -> 
 /// this function never inspects the piped stdout's content, only wires
 /// the raw reader through (0135 C8 primary methodological directive).
 ///
-/// Resolves the binary via
-/// [`csq_core::cli_deps::install_path::find_in_path`] (kimi/grok
-/// known-install-dir aware) rather than the OS's own PATH search inside
-/// `Command::new`, mirroring [`spawn_codex_device_auth_piped`].
+/// Revalidates the binary through the shared native-login selector before
+/// constructing a command. It keeps the existing known-install-dir search and
+/// refuses a selected unsupported Windows wrapper without creating a child.
 ///
 /// `spawned` is set `true` the instant a real child is registered in
 /// `children` (redteam R2 LOW-1 + LOW-2) — [`complete_native_login`]'s
@@ -3259,15 +3374,24 @@ fn spawn_native_device_auth_piped<K: Send + Sync + 'static>(
     key: crate::desktop::login_custody::ChildKey,
     operation: Arc<crate::desktop::login_custody::ChildRegistration>,
 ) -> std::io::Result<csq_core::providers::native_login::SpawnedNativeLogin> {
-    let bin_path = csq_core::cli_deps::install_path::find_in_path(binary).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!(
-                "could not locate the `{binary}` binary in $PATH or any standard install \
-                 location — install it and try again"
-            ),
-        )
-    })?;
+    let descriptor = csq_core::providers::native::descriptor(surface)
+        .filter(|descriptor| descriptor.binary == binary)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "native login descriptor mismatch",
+            )
+        })?;
+    let bin_path = csq_core::providers::native_login::resolve_native_login_binary(descriptor)?
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "could not locate the `{binary}` binary in $PATH or any standard install \
+                     location — install it and try again"
+                ),
+            )
+        })?;
 
     let mut command = LoginCommand::new(&bin_path);
     command
@@ -4195,6 +4319,12 @@ pub fn cancel_login(state: State<'_, AppState>, state_token: String) -> Result<(
         }
         Err(csq_core::error::OAuthError::Exchange(_)) => {
             Err("cancel failed: exchange_failed".into())
+        }
+        // Constructed only by the credential-refresh path; `consume` cannot
+        // return it. Listed for exhaustiveness with the allowlisted category
+        // as the fixed-vocabulary tag — never a free-form string.
+        Err(csq_core::error::OAuthError::RefreshRejected { category, .. }) => {
+            Err(format!("cancel failed: {category}"))
         }
         // The race-only error variants cannot be returned from
         // `consume` (they're set by the orchestrator/exchange paths),
@@ -11532,12 +11662,19 @@ mod tests {
         .unwrap();
 
         // test-hermeticity.md MUST-1b: `start_native_login` transitively reads
-        // process-global PATH (via `find_cli_binary`/`find_in_path` to derive
+        // process-global PATH (via the shared native-login selector to derive
         // `cli_installed`, unasserted here but still evaluated on every call).
         // This test doesn't care what PATH resolves to, but it must not race
         // a concurrent PATH-mutating sibling — hold the shared lock for the
         // read even though this test never sets PATH itself.
         let _shared_env_guard = csq_core::platform::test_env::lock();
+        // The binding decision is independent of an operator's real vendor
+        // installation. Keep discovery inside this fixture on every platform.
+        let _restore = DesktopFixtureEnv::set(&[
+            ("PATH", std::ffi::OsStr::new("")),
+            ("HOME", dir.path().as_os_str()),
+            ("CSQ_HOME", dir.path().as_os_str()),
+        ]);
         let _base_env = test_base_dir_env::BaseDirEnvGuard::set_locked(
             &_shared_env_guard,
             std::path::Path::new(&base),
@@ -11594,6 +11731,368 @@ mod tests {
         drop(_shared_env_guard);
 
         assert!(view.unwrap().cli_installed);
+    }
+
+    /// Process-lifetime directory the Windows native-login fixtures redirect
+    /// `TEMP`/`TMP` to. It is never deleted by any test, so a sibling test that
+    /// runs `TempDir::new()` while the override is active (most fixtures create
+    /// theirs BEFORE taking the shared env lock) lands in a directory that
+    /// outlives the override. Pointing `TEMP`/`TMP` at the per-test `private`
+    /// dir instead made `private`'s drop delete that sibling's fixture subtree
+    /// mid-test (`remove_account_non_gemini_slot_does_not_open_vault`:
+    /// `NOT_CONFIGURED`, os error 3). The first call reads the genuine `TEMP`
+    /// because this directory is initialised before the override is applied and
+    /// this helper is the only in-process `TEMP`/`TMP` setter in the test suite;
+    /// the shared env lock serialises callers but is not what makes the read safe.
+    /// The directory is left behind for the process lifetime (normally empty):
+    /// statics are never dropped and libtest has no process-end hook.
+    #[cfg(windows)]
+    fn native_windows_redirected_temp() -> &'static std::path::Path {
+        static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        ROOT.get_or_init(|| {
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("csq-desktop-native-temp-{}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            root
+        })
+    }
+
+    #[cfg(windows)]
+    fn native_windows_selection_environment(
+        bin: &std::path::Path,
+        home: &std::path::Path,
+        base: &std::path::Path,
+    ) -> DesktopFixtureEnv {
+        let temp = native_windows_redirected_temp();
+        DesktopFixtureEnv::set(&[
+            ("PATH", bin.as_os_str()),
+            ("HOME", home.as_os_str()),
+            ("CSQ_HOME", home.as_os_str()),
+            ("USERPROFILE", home.as_os_str()),
+            ("APPDATA", home.as_os_str()),
+            ("LOCALAPPDATA", home.as_os_str()),
+            ("CLAUDE_HOME", home.as_os_str()),
+            ("CSQ_BASE_DIR", base.as_os_str()),
+            ("TEMP", temp.as_os_str()),
+            ("TMP", temp.as_os_str()),
+        ])
+    }
+
+    /// Regression (Windows only — `TEMP`/`TMP` drive `temp_dir()` there): a
+    /// fixture another test creates under the redirected temp dir must survive
+    /// the drop of this test's `private` dir.
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_temp_override_does_not_delete_sibling_tempdirs() {
+        let _environment = csq_core::platform::test_env::lock();
+        let private = desktop_fixture_dir();
+        let bin = private.path().join("bin");
+        let home = private.path().join("home");
+        let base = private.path().join("base");
+        for directory in [&bin, &home, &base] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let restore = native_windows_selection_environment(&bin, &home, &base);
+        let sibling = tempfile::TempDir::new().unwrap();
+        drop(restore);
+        drop(private);
+        assert!(
+            sibling.path().is_dir(),
+            "a TempDir created while the native-login TEMP override was active must \
+             outlive the override's private fixture dir: {:?}",
+            sibling.path()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_wrapper_precheck_and_spawn_share_typed_refusal_without_registration() {
+        use csq_core::providers::{native, native_login};
+        let _environment = csq_core::platform::test_env::lock();
+        let mut precheck_refused = true;
+        let mut spawn_refused_without_effects = true;
+        for descriptor in native::NATIVE_CLIS {
+            for extension in ["cmd", "bat"] {
+                let private = desktop_fixture_dir();
+                let bin = private.path().join("bin");
+                let home = private.path().join("home");
+                let base = private.path().join("base");
+                for directory in [&bin, &home, &base] {
+                    std::fs::create_dir(directory).unwrap();
+                }
+                std::fs::write(
+                    bin.join(format!("{}.{extension}", descriptor.binary)),
+                    b"@exit /b 0\r\n",
+                )
+                .unwrap();
+                let _restore = native_windows_selection_environment(&bin, &home, &base);
+                let selection = native_login::resolve_native_login_binary(descriptor).unwrap_err();
+                assert_eq!(selection.kind(), std::io::ErrorKind::Unsupported);
+                assert!(selection.get_ref().is_some_and(|error| error
+                    .downcast_ref::<native_login::UnsupportedWindowsLoginWrapper>()
+                    .is_some()));
+                let precheck = start_native_login(
+                    base.to_string_lossy().into_owned(),
+                    descriptor.id.into(),
+                    51,
+                );
+                precheck_refused &=
+                    matches!(precheck, Err(ref error) if error == &selection.to_string());
+
+                let slot = AccountNum::try_from(51_u16).unwrap();
+                let vendor_home = native::native_home_path(&base, slot, descriptor.surface);
+                let children: NativeLoginChildren = Arc::new(Mutex::new(HashMap::new()));
+                let spawned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let watchdog = crate::login_child_custody::LoginWatchdog::new(
+                    std::time::Duration::from_secs(5),
+                    crate::login_child_custody::DeliveryPhase::Unknown,
+                );
+                let key = crate::desktop::login_custody::ChildKey::new(
+                    match descriptor.surface {
+                        csq_core::providers::catalog::Surface::Kimi => {
+                            crate::desktop::login_custody::LoginProvider::Kimi
+                        }
+                        csq_core::providers::catalog::Surface::Grok => {
+                            crate::desktop::login_custody::LoginProvider::Grok
+                        }
+                        _ => unreachable!("native fixture descriptors are closed"),
+                    },
+                    slot,
+                );
+                let writes = crate::desktop::login_custody::CredentialWrites::default();
+                let operation = writes.reserve_child(key, watchdog.clone()).unwrap();
+                let result = spawn_native_device_auth_piped(
+                    &vendor_home,
+                    descriptor.binary,
+                    descriptor.login_args,
+                    descriptor.home_env,
+                    descriptor.surface,
+                    &children,
+                    &spawned,
+                    watchdog,
+                    (),
+                    key,
+                    operation,
+                );
+                let error = match result {
+                    Ok(_) => panic!("unsupported wrapper unexpectedly spawned"),
+                    Err(error) => error,
+                };
+                spawn_refused_without_effects &= error.kind() == std::io::ErrorKind::Unsupported
+                    && error.get_ref().is_some_and(|error| {
+                        error
+                            .downcast_ref::<native_login::UnsupportedWindowsLoginWrapper>()
+                            .is_some()
+                    })
+                    && children.lock().unwrap().is_empty()
+                    && !spawned.load(std::sync::atomic::Ordering::Acquire)
+                    && !vendor_home.exists()
+                    && !native::marker_path(&base, slot, descriptor.surface).exists();
+                drop(_restore);
+                private.close().unwrap();
+            }
+        }
+        eprintln!("NATIVE_DESKTOP_SELECTION_PRIVATE_CLEANUP_CONFIRMED");
+        if !precheck_refused {
+            eprintln!("NATIVE_DESKTOP_PRECHECK_MUST_REFUSE_SELECTED_WRAPPER");
+        }
+        assert!(
+            precheck_refused,
+            "desktop precheck accepted a selected wrapper"
+        );
+        if !spawn_refused_without_effects {
+            eprintln!("NATIVE_DESKTOP_SPAWN_MUST_REVALIDATE_WRAPPER_BEFORE_REGISTRATION");
+        }
+        assert!(
+            spawn_refused_without_effects,
+            "desktop spawn selection lost typed refusal or produced effects"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_precheck_reports_missing_then_supported_exe() {
+        let _environment = csq_core::platform::test_env::lock();
+        let private = desktop_fixture_dir();
+        let bin = private.path().join("bin");
+        let home = private.path().join("home");
+        let base = private.path().join("base");
+        for directory in [&bin, &home, &base] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let _restore = native_windows_selection_environment(&bin, &home, &base);
+        let missing = start_native_login(base.to_string_lossy().into_owned(), "grok".into(), 52)
+            .expect("missing vendor remains an informational precheck");
+        assert!(!missing.cli_installed);
+        let slot = AccountNum::try_from(52_u16).unwrap();
+        let descriptor = &csq_core::providers::native::GROK;
+        let vendor_home =
+            csq_core::providers::native::native_home_path(&base, slot, descriptor.surface);
+        let children: NativeLoginChildren = Arc::new(Mutex::new(HashMap::new()));
+        let spawned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog = crate::login_child_custody::LoginWatchdog::new(
+            std::time::Duration::from_secs(5),
+            crate::login_child_custody::DeliveryPhase::Unknown,
+        );
+        let key = crate::desktop::login_custody::ChildKey::new(
+            crate::desktop::login_custody::LoginProvider::Grok,
+            slot,
+        );
+        let writes = crate::desktop::login_custody::CredentialWrites::default();
+        let operation = writes.reserve_child(key, watchdog.clone()).unwrap();
+        let result = spawn_native_device_auth_piped(
+            &vendor_home,
+            descriptor.binary,
+            descriptor.login_args,
+            descriptor.home_env,
+            descriptor.surface,
+            &children,
+            &spawned,
+            watchdog,
+            (),
+            key,
+            operation,
+        );
+        let error = match result {
+            Ok(_) => panic!("missing executable unexpectedly spawned"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            error.to_string(),
+            "could not locate the `grok` binary in $PATH or any standard install location — install it and try again"
+        );
+        assert!(children.lock().unwrap().is_empty());
+        assert!(!spawned.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!vendor_home.exists());
+        // The bytes are a real inert workspace test image. Selection must not
+        // run it or probe a version; actual Windows login I/O is separate.
+        std::fs::copy(std::env::current_exe().unwrap(), bin.join("grok.exe")).unwrap();
+        let present = start_native_login(base.to_string_lossy().into_owned(), "grok".into(), 52)
+            .expect("native executable remains selectable");
+        assert!(present.cli_installed);
+        assert!(!csq_core::providers::native::native_home_path(
+            &base,
+            slot,
+            csq_core::providers::catalog::Surface::Grok
+        )
+        .exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_direct_completion_refuses_wrapper_before_home_without_precheck() {
+        use csq_core::providers::{native, native_login};
+        let _environment = csq_core::platform::test_env::lock();
+        let mut observations = Vec::new();
+        for descriptor in native::NATIVE_CLIS {
+            for extension in ["cmd", "bat"] {
+                let private = desktop_fixture_dir();
+                let bin = private.path().join("bin");
+                let home = private.path().join("home");
+                let base = private.path().join("base");
+                for directory in [&bin, &home, &base] {
+                    std::fs::create_dir(directory).unwrap();
+                }
+                let probe = private.path().join("unexpected-vendor-child");
+                std::fs::write(
+                    bin.join(format!("{}.{extension}", descriptor.binary)),
+                    b"@echo child>\"%CSQ_PRIVATE_NATIVE_PROBE%\"\r\n@exit /b 0\r\n",
+                )
+                .unwrap();
+                let environment = native_windows_selection_environment(&bin, &home, &base);
+                let probe_environment =
+                    DesktopFixtureEnv::set(&[("CSQ_PRIVATE_NATIVE_PROBE", probe.as_os_str())]);
+                let expected = native_login::resolve_native_login_binary(descriptor).unwrap_err();
+                assert_eq!(expected.kind(), std::io::ErrorKind::Unsupported);
+                assert!(expected.get_ref().is_some_and(|error| error
+                    .downcast_ref::<native_login::UnsupportedWindowsLoginWrapper>()
+                    .is_some()));
+                let slot = AccountNum::try_from(61_u16).unwrap();
+                let key = crate::desktop::login_custody::ChildKey::new(
+                    match descriptor.surface {
+                        csq_core::providers::catalog::Surface::Kimi => {
+                            crate::desktop::login_custody::LoginProvider::Kimi
+                        }
+                        csq_core::providers::catalog::Surface::Grok => {
+                            crate::desktop::login_custody::LoginProvider::Grok
+                        }
+                        _ => unreachable!("native fixture descriptors are closed"),
+                    },
+                    slot,
+                );
+                let writes = crate::desktop::login_custody::CredentialWrites::default();
+                let ticket = Arc::new(writes.admit().unwrap());
+                let watchdog = crate::login_child_custody::LoginWatchdog::new(
+                    std::time::Duration::from_secs(5),
+                    crate::login_child_custody::DeliveryPhase::Unknown,
+                );
+                let operation = writes.reserve_child(key, watchdog.clone()).unwrap();
+                let account_lock =
+                    Arc::new(match AccountLoginLock::acquire(&base, slot).unwrap() {
+                        AcquireOutcome::Acquired(lock) => lock,
+                        AcquireOutcome::Held { .. } => panic!("private fixture lock must be free"),
+                    });
+                let children: NativeLoginChildren = Arc::new(Mutex::new(HashMap::new()));
+                reserve_native_login_slot(&children, descriptor.surface, descriptor.display_name)
+                    .unwrap();
+                assert!(children.lock().unwrap().contains_key(&descriptor.surface));
+                let emitted = std::cell::Cell::new(false);
+
+                // This is the exact full pipeline the Tauri command dispatches,
+                // without start_native_login or a mock webview. An omitted
+                // pre-home guard reaches real DI home creation, then the
+                // independently retained spawn selector refuses the wrapper.
+                let result = NativeLoginWorker {
+                    descriptor,
+                    base: base.clone(),
+                    slot,
+                    children: children.clone(),
+                    watchdog,
+                    key,
+                    operation,
+                }
+                .run((account_lock, ticket), |_code| emitted.set(true));
+                let observation = (
+                    descriptor.id,
+                    extension,
+                    matches!(result, Err(ref error) if error == &expected.to_string()),
+                    !native::native_home_path(&base, slot, descriptor.surface).exists(),
+                    !native::marker_path(&base, slot, descriptor.surface).exists(),
+                    !probe.exists(),
+                    children.lock().unwrap().is_empty(),
+                    !emitted.get(),
+                );
+                // Capture the actual side effects before private cleanup. The
+                // guard tuple must also have released the original account
+                // lock for this Windows directory removal to succeed.
+                drop(probe_environment);
+                drop(environment);
+                private.close().expect("private completion fixture cleanup");
+                observations.push(observation);
+            }
+        }
+        eprintln!("NATIVE_DESKTOP_DIRECT_COMPLETION_PRIVATE_CLEANUP_CONFIRMED");
+        let refused_before_home = !observations.is_empty()
+            && observations.iter().all(
+                |(_, _, actionable, no_home, no_marker, no_child, no_registration, no_event)| {
+                    *actionable
+                        && *no_home
+                        && *no_marker
+                        && *no_child
+                        && *no_registration
+                        && *no_event
+                },
+            );
+        if !refused_before_home {
+            eprintln!("NATIVE_DESKTOP_DIRECT_COMPLETION_MUST_REFUSE_BEFORE_HOME");
+        }
+        assert!(
+            refused_before_home,
+            "NATIVE_DESKTOP_DIRECT_COMPLETION_MUST_REFUSE_BEFORE_HOME: {observations:?}"
+        );
     }
 
     // ── cancel_native_login_from (an internal journal entry C8) ──────────────
@@ -12220,9 +12719,17 @@ mod tests {
             &base.to_string_lossy().into_owned(),
         ));
         let result = remove_account_blocking(base.to_string_lossy().into_owned(), 1);
+        // The fixture state is part of the failure message: `NOT_CONFIGURED` means the
+        // pre-check in `logout_account` saw neither a canonical file nor `config-1/`, so
+        // a recurrence must say whether the fixture really was absent at assert time or
+        // the pre-check disagreed with a fixture that is there.
         assert!(
             result.is_ok(),
-            "remove_account for ClaudeCode slot must succeed: {result:?}"
+            "remove_account for ClaudeCode slot must succeed: {result:?}; fixture at assert \
+             time: credentials/1.json={:?} config-1={:?} .credentials.json={:?}",
+            std::fs::symlink_metadata(creds_dir.join("1.json")).map(|_| ()),
+            std::fs::symlink_metadata(&config_dir).map(|_| ()),
+            std::fs::symlink_metadata(config_dir.join(".credentials.json")).map(|_| ()),
         );
     }
 

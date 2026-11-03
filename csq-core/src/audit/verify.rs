@@ -92,7 +92,7 @@ use crate::audit::multi_sig::verify_record_multi_sig;
 use crate::audit::persist::{canonical_bytes_for, sha256_hex, ChainKind};
 use crate::audit::traits::SigningKey;
 use crate::audit::types::{
-    Ed25519PublicKey, EventKind, KeyId, LedgerError, RedactedString, Sha256Hex, SignedRecord,
+    Ed25519PublicKey, KeyId, LedgerError, RedactedString, Sha256Hex, SignedRecord,
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 use std::path::Path;
@@ -1083,26 +1083,20 @@ pub fn verify_chain_in(
         // accessors; only an opaque record's typed payload SEMANTICS are deferred.
         let record: RecordView = match serde_json::from_str::<SignedRecord>(raw_line) {
             Ok(r) => RecordView::Typed(Box::new(r)),
-            Err(_) => match serde_json::from_str::<crate::audit::opaque::OpaqueRecord>(raw_line) {
-                Ok(o) => {
-                    // an internal ticket: only a genuinely unknown taxonomy tag may defer
-                    // typed semantics. A recognized kind retains strict fields
-                    // and known guarded-operation policy after a parse failure.
-                    if serde_json::from_value::<EventKind>(serde_json::Value::String(
-                        o.kind.clone(),
-                    ))
-                    .is_ok()
-                    {
-                        return Err(LedgerError::IntegrityBroken {
-                            seq: o.seq,
-                            reason: RedactedString::from_trusted(
-                                "known record kind has invalid typed fields",
-                            ),
-                        });
-                    }
-                    RecordView::Opaque(Box::new(o))
+            Err(_) => match crate::audit::opaque::admit_opaque(raw_line) {
+                crate::audit::opaque::OpaqueAdmission::Opaque(o) => RecordView::Opaque(o),
+                // an internal ticket: only a genuinely unknown taxonomy tag may defer
+                // typed semantics. A recognized kind retains strict fields
+                // and known guarded-operation policy after a parse failure.
+                crate::audit::opaque::OpaqueAdmission::KnownKindInvalid { seq } => {
+                    return Err(LedgerError::IntegrityBroken {
+                        seq,
+                        reason: RedactedString::from_trusted(
+                            "known record kind has invalid typed fields",
+                        ),
+                    });
                 }
-                Err(_) => {
+                crate::audit::opaque::OpaqueAdmission::Unrecognised => {
                     // Unrecognised format — treat as IntegrityBroken.
                     return Err(LedgerError::IntegrityBroken {
                         seq: prev_seq.map(|s| s + 1).unwrap_or(0),

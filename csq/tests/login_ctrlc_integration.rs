@@ -240,10 +240,12 @@ fn run_driver(root: &Path, role: &str) -> ! {
         lock,
         |_| {},
     );
-    if let Some(ms) = std::env::var(RECEIPT_STALL)
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-    {
+    if let Some(raw) = std::env::var_os(RECEIPT_STALL) {
+        // A stall that silently did not happen would leave the row proving nothing.
+        let ms: u64 = raw
+            .to_str()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or_else(|| panic!("{RECEIPT_STALL} must be a u64 of milliseconds"));
         std::thread::sleep(Duration::from_millis(ms));
     }
     let vendor_pid: u32 = std::fs::read_to_string(root.join("vendor-ready"))
@@ -812,14 +814,20 @@ fn second_interrupt_kills_vendor(receipt_stall_ms: Option<u64>) {
     // the lock was released before the reap. Free then reaped proves nothing,
     // and is not counted.
     let mut released_early = false;
+    let mut window_exercised = false;
     if killed {
         // `killed` implies `ready()` ran, which recorded the vendor PID.
         let vendor = libc::pid_t::try_from(driver.vendor_pid.expect("ready vendor PID")).unwrap();
+        // Latched: once the reap is seen it is never re-probed, so a reused PID
+        // cannot turn a reaped vendor back into a live one.
+        let mut reaped = false;
         poll(|| {
             let free = !held(driver.root());
-            let reaped = pid_gone(vendor);
+            reaped = reaped || pid_gone(vendor);
+            let receipt = driver.root().join("reaped-receipt").exists();
             released_early |= free && !reaped;
-            driver.root().join("reaped-receipt").exists() || released_early
+            window_exercised |= free && reaped && !receipt;
+            receipt || released_early
         });
     }
     let receipt = driver.receipt();
@@ -837,6 +845,12 @@ fn second_interrupt_kills_vendor(receipt_stall_ms: Option<u64>) {
     assert!(
         !released_early,
         "{LATE_ASSERTION}: lock released before reap"
+    );
+    // A stalled row must have actually sampled lock-free, vendor-reaped and no
+    // receipt yet, or it proved nothing about that window.
+    assert!(
+        receipt_stall_ms.is_none() || window_exercised,
+        "{LATE_ASSERTION}: stalled window never sampled"
     );
     assert!(
         reaped

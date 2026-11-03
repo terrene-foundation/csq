@@ -109,7 +109,11 @@ impl SurfaceRegistry {
                 Ok(Self { surfaces })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Absent = use defaults; do NOT write the file (per spec).
+                // Absent = use defaults; do NOT write the file (per spec) — once
+                // `confirm_absent` agrees (Windows reports a file-shaped `audit` as
+                // NotFound, which must read as an unreadable registry, not defaults).
+                crate::platform::fs::confirm_absent(&path)
+                    .map_err(|_| crate::audit::seam::error::SeamError::RegistryLoad)?;
                 Ok(Self::default())
             }
             Err(_) => Err(crate::audit::seam::error::SeamError::RegistryLoad),
@@ -229,6 +233,18 @@ pub const TEST_VERSION: &str = "test-v0";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A registry path under a regular file is `RegistryLoad`, never the defaults. Unix
+    /// reports ENOTDIR; Windows reports NotFound, which `confirm_absent` refuses.
+    /// DISCRIMINATES ONLY ON WINDOWS; a clean base still yields the defaults.
+    #[test]
+    fn registry_under_a_regular_file_is_a_load_error_not_defaults() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("audit"), b"not a directory").unwrap();
+        assert!(SurfaceRegistry::load(dir.path()).is_err());
+        let clean = tempfile::TempDir::new().unwrap();
+        assert!(SurfaceRegistry::load(clean.path()).is_ok());
+    }
     use crate::audit::seam::error::SeamError;
     use tempfile::TempDir;
 

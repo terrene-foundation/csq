@@ -767,10 +767,25 @@ fn read_last_canonical_bytes(
     match last_line {
         None => Ok(None),
         Some(line) => {
-            let record: SignedRecord =
-                serde_json::from_str(line).map_err(|e| AuditV2Error::ChainCorrupt {
-                    reason: format!("last JSONL line is not a valid SignedRecord: {e}"),
-                })?;
+            // A newer binary may have appended a record whose EventKind this
+            // build does not know. `verify_chain` admits such a record as
+            // opaque-but-intact; the writer's link read MUST do the same, or an
+            // older daemon's next append fails `ChainCorrupt` and aborts the
+            // audited operation the append belongs to (op_emit.rs).
+            let record: SignedRecord = match serde_json::from_str::<SignedRecord>(line) {
+                Ok(record) => record,
+                Err(e) => {
+                    return match crate::audit::opaque::admit_opaque(line) {
+                        crate::audit::opaque::OpaqueAdmission::Opaque(opaque) => Ok(Some((
+                            crate::audit::opaque::canonical_bytes_for_opaque_link(&opaque),
+                            opaque.seq,
+                        ))),
+                        _ => Err(AuditV2Error::ChainCorrupt {
+                            reason: format!("last JSONL line is not a valid SignedRecord: {e}"),
+                        }),
+                    };
+                }
+            };
             let seq = record.seq;
             Ok(Some((canonical_bytes_for(&record), seq)))
         }
@@ -2367,6 +2382,46 @@ mod tests {
             op_phase: None,
             verification_level: None,
         }
+    }
+
+    /// A HEAD written by a newer binary (an `EventKind` this build does not
+    /// know) must leave the chain APPENDABLE. Without the opaque admission in
+    /// `read_last_canonical_bytes`, the writer returns `ChainCorrupt` and
+    /// every caller that must abort its side effect on an audit failure —
+    /// including audited credential operations — refuses on a benign version
+    /// skew.
+    #[test]
+    fn append_after_an_unknown_kind_head_succeeds() {
+        use std::io::Write as _;
+
+        let dir = TempDir::new().unwrap();
+        write_record_v2(sample_v2_record(), Some(dir.path())).unwrap();
+        write_record_v2(sample_v2_record(), Some(dir.path())).unwrap();
+
+        let chain_dir = dir.path().join("csq-runs");
+        let genesis: ChainGenesis =
+            serde_json::from_str(&std::fs::read_to_string(chain_dir.join("chain.json")).unwrap())
+                .unwrap();
+        let chain_jsonl = chain_dir.join(format!("{}.jsonl", genesis.chain_id));
+
+        // Rewrite a known record's kind tag in BOTH the envelope and the
+        // adjacently-tagged payload, and give it the next sequence number, so
+        // it is a well-formed record with a genuinely unknown kind.
+        let known = serde_json::to_string(&sample_v2_record()).unwrap();
+        let unknown = known
+            .replace("\"csq_run\"", "\"future_owner_ping\"")
+            .replace("\"seq\":0", "\"seq\":2");
+        assert!(unknown.contains("future_owner_ping"));
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&chain_jsonl)
+            .unwrap();
+        writeln!(file, "{unknown}").unwrap();
+        drop(file);
+
+        // The next append links from the opaque head instead of refusing.
+        write_record_v2(sample_v2_record(), Some(dir.path()))
+            .expect("append after an unknown-kind head must succeed");
     }
 
     // ── W1: chain-id parameterization — op-chain / EATP-chain isolation ──────

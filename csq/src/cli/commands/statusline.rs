@@ -20,13 +20,16 @@ use anyhow::Result;
 use csq_core::accounts::snapshot;
 use csq_core::messaging::store::PendingCount;
 use csq_core::quota::format::{
-    account_label, parse_cc_stdin, parse_workspace_dir, rich_statusline,
-    should_report_broker_failed, statusline_str, GitStatus, StatuslineContext,
+    account_label, parse_cc_stdin, parse_workspace_dir, rich_statusline, statusline_str, GitStatus,
+    StatuslineContext,
 };
 use csq_core::quota::state;
-use csq_core::refresh::sentinel::is_broker_failed;
+use csq_core::refresh::sentinel::{
+    login_needed_line, login_needed_state, sentinel_scan, LoginNeededState,
+    REFRESH_FAILING_CAUSE_NOT_RECORDED, SENTINEL_SCAN_UNDETERMINED,
+};
 use csq_core::types::AccountNum;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -92,8 +95,13 @@ pub fn handle(base_dir: &Path) -> Result<()> {
     // longer renders a `!` glyph for divergence between live mirror and
     // canonical — handle dir symlinks resolve to a single inode written
     // by the daemon refresher.
-    let broker_failed =
-        should_report_broker_failed(base_dir, account) || is_broker_failed(base_dir, account);
+    //
+    // Login-needed is a SEPARATE line below, never a prefix on the quota
+    // line: the two states must stay explicitly distinct, and rendering must
+    // not mutate anything (`account-terminal-separation.md` MUST-2). The
+    // former `should_report_broker_failed` helper auto-DELETED the flag
+    // after 24h — a render-time write that also made a permanent login
+    // demand evaporate; it is gone.
 
     // ── Compose rich line from CC stdin + git probe ──
     //
@@ -106,10 +114,9 @@ pub fn handle(base_dir: &Path) -> Result<()> {
         account,
         &label,
         account_quota,
-        broker_failed,
     ) {
         Some(s) => s,
-        None => statusline_str(account, &label, account_quota, broker_failed),
+        None => statusline_str(account, &label, account_quota),
     };
 
     // Directives queued for this session by an external issuer (spec 31 §5).
@@ -144,8 +151,64 @@ pub fn handle(base_dir: &Path) -> Result<()> {
         .flatten()
         .collect::<Vec<_>>()
         .join(" ");
-    println!("{line}");
+    // Sticky login-needed state gets its OWN line, explicitly distinct from
+    // the quota line above (`diagnostic-surface-parity.md` MUST NOT 4). The
+    // check is a sentinel-file probe: no credential read, no keychain read,
+    // no network — and no write (the render never clears it).
+    write_output_lines(base_dir, account, &line, &mut std::io::stdout())?;
     Ok(())
+}
+
+/// The `handle` stdout step: the main statusline line, then — when present —
+/// the sticky login-needed/undetermined line as its OWN line.
+///
+/// Extracted so a test can assert the EXACT output bytes and line order;
+/// production passes stdout. Read-only: the login probe only classifies the
+/// sentinel and never deletes it (`account-terminal-separation.md` MUST-2).
+fn write_output_lines(
+    base_dir: &Path,
+    account: AccountNum,
+    main_line: &str,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
+    writeln!(out, "{main_line}")?;
+    if let Some(line) = login_needed_segment(base_dir, account) {
+        writeln!(out, "{line}")?;
+    }
+    Ok(())
+}
+
+/// The login-needed line this terminal must print, from the three-state
+/// sentinel accessor.
+///
+/// - `LoginNeeded` → the shared login-demand line.
+/// - `Unknown` → the not-recorded phrase: a marker written by the
+///   pre-classification writer (or an unreadable marker) is NOT a login
+///   demand and NOT healthy. If the WHOLE `credentials/` directory cannot be
+///   enumerated, the same state is the undetermined phrase instead — the
+///   statusline must not call a directory it could not read merely
+///   "refresh failing".
+/// - `Healthy` → nothing.
+///
+/// Extracted from [`handle`] so the decision is testable without capturing
+/// stdout, and so the read-only contract is explicit: this function only
+/// classifies the sentinel; it never deletes or rewrites the marker
+/// (`account-terminal-separation.md` MUST-2 — rendering is read-only).
+fn login_needed_segment(base_dir: &Path, account: AccountNum) -> Option<String> {
+    match login_needed_state(base_dir, account) {
+        LoginNeededState::Healthy => None,
+        LoginNeededState::LoginNeeded { .. } => Some(login_needed_line(account)),
+        LoginNeededState::Unknown => {
+            // Distinguish an unenumerable directory from an unclassified
+            // marker. The scan runs only on the UNKNOWN path, so a healthy
+            // or classified slot pays no directory walk per render.
+            if sentinel_scan(base_dir).readable {
+                Some(REFRESH_FAILING_CAUSE_NOT_RECORDED.to_string())
+            } else {
+                Some(SENTINEL_SCAN_UNDETERMINED.to_string())
+            }
+        }
+    }
 }
 
 /// The line `handle` prints on both early-exit branches (no config dir, no active
@@ -281,7 +344,6 @@ fn build_rich_line(
     account: AccountNum,
     label: &str,
     account_quota: Option<&csq_core::quota::AccountQuota>,
-    broker_failed: bool,
 ) -> Option<String> {
     if stdin_buf.trim().is_empty() {
         return None;
@@ -358,13 +420,7 @@ fn build_rich_line(
         .as_deref()
         .and_then(git_status);
 
-    Some(rich_statusline(
-        account,
-        label,
-        account_quota,
-        broker_failed,
-        &ctx,
-    ))
+    Some(rich_statusline(account, label, account_quota, &ctx))
 }
 
 /// Returns true when `CLAUDE_CONFIG_DIR` is set AND points inside
@@ -1373,6 +1429,126 @@ mod git_cache_tests;
 
 #[cfg(test)]
 mod tests {
+    /// The statusline's login-needed line comes from the shared sentinel
+    /// reader and the shared message, is produced only for the terminal's
+    /// own slot, and is a SEPARATE line from the quota line. Rendering is
+    /// read-only: the marker must survive the call.
+    #[test]
+    fn login_needed_segment_is_its_own_line_and_never_clears_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let account = csq_core::types::AccountNum::try_from(3u16).unwrap();
+        let other = csq_core::types::AccountNum::try_from(4u16).unwrap();
+        csq_core::refresh::sentinel::set_broker_failed(base, account, "invalid_grant").unwrap();
+        csq_core::refresh::sentinel::set_broker_failed(base, other, "codex_token_expired").unwrap();
+
+        assert_eq!(
+            login_needed_segment(base, account).as_deref(),
+            Some("login needed — run csq login 3"),
+            "the terminal's own slot prints the shared operator message"
+        );
+        // Another slot's marker is not this terminal's login demand.
+        assert_eq!(
+            login_needed_segment(base, other).as_deref(),
+            Some("login needed — run csq login 4")
+        );
+        let clean = csq_core::types::AccountNum::try_from(5u16).unwrap();
+        assert_eq!(login_needed_segment(base, clean), None);
+
+        // Rendering must not mutate the state it reports.
+        assert!(
+            csq_core::refresh::sentinel::login_needed_marker_present(base, account),
+            "the statusline must never clear the login-needed marker"
+        );
+    }
+
+    /// The UNKNOWN branch: every marker whose cause this build cannot
+    /// classify renders `refresh failing, cause not recorded` — never the
+    /// login-demand line and never nothing. One fixture per legacy form
+    /// (`oauth` canonical generic tag, an unrecognised future tag, the
+    /// pre-v2.1 zero-byte marker), plus the unreadable-marker case.
+    /// Removing the `Unknown` arm of `login_needed_segment` REDs this test.
+    #[test]
+    fn unknown_sentinel_forms_render_the_not_recorded_line_on_their_own() {
+        for (slot, name, content) in [
+            (20u16, "legacy_generic_oauth", Some(&b"oauth"[..])),
+            (21, "future_tag", Some(&b"some_future_tag"[..])),
+            (22, "zero_byte", Some(&b""[..])),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path();
+            let account = csq_core::types::AccountNum::try_from(slot).unwrap();
+            let creds = base.join("credentials");
+            std::fs::create_dir_all(&creds).unwrap();
+            let marker = creds.join(format!("{slot}.broker-failed"));
+            std::fs::write(&marker, content.unwrap()).unwrap();
+
+            assert_eq!(
+                login_needed_segment(base, account).as_deref(),
+                Some("refresh failing, cause not recorded"),
+                "{name}: a marker with an unrecorded cause is UNKNOWN, never login-needed"
+            );
+            assert!(
+                marker.exists(),
+                "{name}: rendering must never delete the marker"
+            );
+        }
+    }
+
+    /// The raw output contract: `handle`'s stdout step writes EXACTLY two
+    /// lines when the bound slot is login-needed, and the login line is
+    /// second. Whether Claude Code renders a second stdout line in the real
+    /// statusline is a live question outside this test (UNVERIFIED); here we
+    /// pin csq's own bytes and order.
+    #[test]
+    fn raw_output_is_exactly_two_lines_with_login_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let account = csq_core::types::AccountNum::try_from(3u16).unwrap();
+        csq_core::refresh::sentinel::set_broker_failed(base, account, "invalid_grant").unwrap();
+
+        let mut out = Vec::new();
+        write_output_lines(base, account, "main statusline line", &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text, "main statusline line\nlogin needed — run csq login 3\n",
+            "the login line must be the SECOND line and the only extra line"
+        );
+        assert_eq!(text.lines().count(), 2);
+
+        let clean = csq_core::types::AccountNum::try_from(4u16).unwrap();
+        let mut out = Vec::new();
+        write_output_lines(base, clean, "main statusline line", &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "main statusline line\n",
+            "a healthy slot adds no second line"
+        );
+    }
+
+    /// An unenumerable `credentials/` directory is UNDETERMINED, not "refresh
+    /// failing": the statusline's own slot cannot be read, so it prints the
+    /// scan-undetermined phrase rather than claiming a recorded failure.
+    #[test]
+    fn unenumerable_credentials_directory_renders_undetermined() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::write(base.join("credentials"), b"not a directory").unwrap();
+        let account = csq_core::types::AccountNum::try_from(3u16).unwrap();
+
+        assert_eq!(
+            login_needed_segment(base, account).as_deref(),
+            Some(SENTINEL_SCAN_UNDETERMINED),
+            "an unreadable directory is not evidence of a recorded refresh failure"
+        );
+        assert!(
+            !login_needed_segment(base, account)
+                .unwrap()
+                .contains("login needed"),
+            "and it is never a login demand"
+        );
+    }
+
     #[test]
     fn early_exit_lines_carry_the_archive_badge_only_when_configured_and_failing() {
         // `handle` prints `early_exit_line` on both early-exit branches.
@@ -2033,7 +2209,6 @@ mod tests {
             AccountNum::try_from(7u16).unwrap(),
             "x",
             None,
-            false,
         );
         if let Some(p) = prev {
             unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", p) };

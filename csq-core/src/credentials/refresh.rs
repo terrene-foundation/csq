@@ -10,7 +10,24 @@ use std::fmt;
 /// Anthropic OAuth token endpoint.
 pub const TOKEN_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token";
 
-/// Extracts a human-readable error from a token endpoint error response.
+/// A structured error document returned by the token endpoint.
+///
+/// The split is what makes the refresh path's login-needed classification
+/// possible: only an ALLOWLISTED category is evidence the grant is dead.
+/// Everything else (API-style messages whose `type` is outside the
+/// allowlist, schema drift, free-form strings) is redacted the same way but
+/// stays unclassified — and therefore retryable.
+enum OAuthErrorBody {
+    /// Category matched [`extract_oauth_error_type`]'s allowlist.
+    Classified {
+        category: &'static str,
+        detail: String,
+    },
+    /// Structured, redacted, but not classifiable.
+    Unclassified { detail: String },
+}
+
+/// Extracts an error from a token endpoint error response.
 ///
 /// Two JSON shapes are handled:
 ///
@@ -21,12 +38,18 @@ pub const TOKEN_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token";
 ///   `redact_tokens` because it is free-form and may contain echoed token
 ///   fragments (an internal journal entry, 0010).
 ///
-/// - **API-style** (`{"error": {"type": "rate_limit_error", "message": "..."}}`)
-///   The `type` and `message` strings are both redacted before inclusion.
-fn extract_oauth_error(body: &[u8]) -> Option<String> {
+/// - **API-style** (`{"error": {"type": "invalid_grant", "message": "..."}}`)
+///   Both observed shapes are classified through the same allowlist; a
+///   `type` such as `rate_limit_error` is not allowlisted and stays
+///   unclassified. The `type` and `message` strings are both redacted before
+///   inclusion.
+fn extract_oauth_error(body: &[u8]) -> Option<OAuthErrorBody> {
     let body_str = std::str::from_utf8(body).ok()?;
     let json: serde_json::Value = serde_json::from_str(body_str).ok()?;
     let error_val = json.get("error")?;
+    // ONE classification lookup, shared by the detail builder and the
+    // classified/unclassified split below.
+    let category = extract_oauth_error_type(body_str);
 
     let detail = if let Some(obj) = error_val.as_object() {
         // API-style error object: {"error": {"type": "...", "message": "..."}}
@@ -46,14 +69,18 @@ fn extract_oauth_error(body: &[u8]) -> Option<String> {
         // categories. This means the category name in the returned detail is
         // always from the compile-time constant — an attacker who controls
         // the response body cannot inject arbitrary text through this path.
-        let category: &str = extract_oauth_error_type(body_str).unwrap_or(err_str);
+        let label: &str = category.unwrap_or(err_str);
         match json.get("error_description").and_then(|v| v.as_str()) {
-            Some(desc) => format!("{category}: {desc}"),
-            None => category.to_string(),
+            Some(desc) => format!("{label}: {desc}"),
+            None => label.to_string(),
         }
     };
 
-    Some(redact_tokens(&detail))
+    let detail = redact_tokens(&detail);
+    Some(match category {
+        Some(category) => OAuthErrorBody::Classified { category, detail },
+        None => OAuthErrorBody::Unclassified { detail },
+    })
 }
 
 /// Response from the Anthropic OAuth token endpoint.
@@ -177,8 +204,20 @@ where
     // deserialize the success shape. This lets the broker tag the
     // failure correctly (rate-limit → long cooldown, skip sibling
     // recovery) without losing the actual reason.
-    if let Some(detail) = extract_oauth_error(&response_bytes) {
-        return Err(OAuthError::Exchange(detail));
+    match extract_oauth_error(&response_bytes) {
+        // Classified: the category is an allowlisted &'static str, so the
+        // refresh path can tell a dead grant (invalid_grant /
+        // unauthorized_client → sticky login-needed) from a retryable
+        // rejection. `detail` is already redacted.
+        Some(OAuthErrorBody::Classified { category, detail }) => {
+            return Err(OAuthError::RefreshRejected { category, detail });
+        }
+        // Unclassified: an opaque, redacted detail. NOT evidence the grant
+        // is dead — the caller keeps it retryable.
+        Some(OAuthErrorBody::Unclassified { detail }) => {
+            return Err(OAuthError::Exchange(detail));
+        }
+        None => {}
     }
 
     // Try to deserialize as a success response.
@@ -380,18 +419,22 @@ mod tests {
             Ok(br#"{"error":"invalid_grant","error_description":"The refresh token has been revoked"}"#.to_vec())
         });
         match result {
-            Err(OAuthError::Exchange(msg)) => {
-                assert!(msg.contains("invalid_grant"), "should surface: {msg}");
+            Err(OAuthError::RefreshRejected { category, detail }) => {
+                assert_eq!(
+                    category, "invalid_grant",
+                    "the allowlisted category is classified, not string-matched downstream"
+                );
+                assert!(detail.contains("invalid_grant"), "should surface: {detail}");
                 assert!(
-                    msg.contains("refresh token has been revoked"),
-                    "should surface: {msg}"
+                    detail.contains("refresh token has been revoked"),
+                    "should surface: {detail}"
                 );
                 assert!(
-                    !msg.contains("missing field"),
-                    "should NOT show serde error: {msg}"
+                    !detail.contains("missing field"),
+                    "should NOT show serde error: {detail}"
                 );
             }
-            other => panic!("expected Exchange error, got {other:?}"),
+            other => panic!("expected RefreshRejected error, got {other:?}"),
         }
     }
 
@@ -405,14 +448,65 @@ mod tests {
             )
         });
         match result {
-            Err(OAuthError::Exchange(msg)) => {
-                assert!(msg.contains("invalid_grant"), "should surface: {msg}");
+            Err(OAuthError::RefreshRejected { category, detail }) => {
+                assert_eq!(
+                    category, "invalid_grant",
+                    "the observed API-style shape must classify too"
+                );
+                assert!(detail.contains("invalid_grant"), "should surface: {detail}");
                 assert!(
-                    msg.contains("Token has been revoked"),
-                    "should surface: {msg}"
+                    detail.contains("Token has been revoked"),
+                    "should surface: {detail}"
                 );
             }
-            other => panic!("expected Exchange error, got {other:?}"),
+            other => panic!("expected RefreshRejected error, got {other:?}"),
+        }
+    }
+
+    /// An ALLOWLISTED category is classified even when it is retryable —
+    /// `invalid_scope` (an internal journal entry) and `invalid_request` (an internal journal entry)
+    /// reach the log and the sentinel reason as their own tags, while the
+    /// login-needed gate (`error::login_needed_category`) still refuses to
+    /// turn them into a re-login demand. A body outside the allowlist stays
+    /// an opaque `Exchange`.
+    #[test]
+    fn refresh_token_classifies_allowlisted_categories_and_leaves_unlisted_opaque() {
+        let existing = sample_creds();
+        for (body, expected) in [
+            (
+                &br#"{"error":"invalid_scope","error_description":"scope not permitted"}"#[..],
+                "invalid_scope",
+            ),
+            (
+                &br#"{"error":"invalid_request","error_description":"malformed body"}"#[..],
+                "invalid_request",
+            ),
+            (
+                &br#"{"error":{"type":"unsupported_grant_type"}}"#[..],
+                "unsupported_grant_type",
+            ),
+        ] {
+            let result = refresh_token(&existing, |_url, _body| Ok(body.to_vec()));
+            match result {
+                Err(OAuthError::RefreshRejected { category, .. }) => assert_eq!(
+                    category,
+                    expected,
+                    "an allowlisted category keeps its own tag: {}",
+                    String::from_utf8_lossy(body)
+                ),
+                other => panic!("allowlisted {expected} must classify, got {other:?}"),
+            }
+        }
+        for body in [
+            &br#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#[..],
+            &b"<html>502 bad gateway</html>"[..],
+        ] {
+            let result = refresh_token(&existing, |_url, _body| Ok(body.to_vec()));
+            assert!(
+                matches!(result, Err(OAuthError::Exchange(_))),
+                "a body outside the allowlist stays opaque, got {result:?} for {}",
+                String::from_utf8_lossy(body)
+            );
         }
     }
 
@@ -423,11 +517,15 @@ mod tests {
             Ok(br#"{"error":"invalid_grant","error_description":"bad token sk-ant-ort01-FAKETESTECRET"}"#.to_vec())
         });
         match result {
-            Err(OAuthError::Exchange(msg)) => {
-                assert!(!msg.contains("LEAKED-SECRET"), "must be redacted: {msg}");
-                assert!(msg.contains("invalid_grant"));
+            Err(OAuthError::RefreshRejected { category, detail }) => {
+                assert_eq!(category, "invalid_grant");
+                assert!(
+                    !detail.contains("sk-ant-ort01-FAKETESTECRET"),
+                    "must be redacted: {detail}"
+                );
+                assert!(detail.contains("invalid_grant"));
             }
-            other => panic!("expected Exchange error, got {other:?}"),
+            other => panic!("expected RefreshRejected error, got {other:?}"),
         }
     }
 

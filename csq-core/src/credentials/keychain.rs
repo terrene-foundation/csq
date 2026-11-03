@@ -15583,12 +15583,155 @@ mod tests {
         let ok = save_mirror_sync_status_with(base.path(), &status, &|| {
             pauses.set(pauses.get() + 1);
             held.borrow_mut().take();
+            // A parallel test's fork can keep a duplicate of this description
+            // alive past the drop; wait until the lock is really free.
+            wait_until_status_lock_free(base.path());
         });
         assert!(
             ok,
             "a transiently held writer lock must not fail persistence"
         );
         assert_eq!(pauses.get(), 1);
+        assert_eq!(read_mirror_sync_observation(base.path()), Some(status));
+    }
+
+    /// A child forked but not yet exec'd: it holds a duplicate of every open fd
+    /// (the lock's `CLOEXEC` only closes it at exec). Parked in `pre_exec` on a
+    /// pipe, so the fork-to-exec window is held open deterministically, no clock.
+    #[cfg(unix)]
+    struct ParkedFork {
+        go_w: libc::c_int,
+        spawner: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(unix)]
+    fn park_fork_child() -> ParkedFork {
+        use std::os::unix::process::CommandExt;
+        fn pipe_pair() -> [libc::c_int; 2] {
+            let mut fds = [0; 2];
+            // SAFETY: `fds` is a valid 2-element out array for pipe(2).
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            for fd in fds {
+                // SAFETY: `fd` was just returned by pipe(2).
+                assert_eq!(
+                    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                    0
+                );
+            }
+            fds
+        }
+        let [ready_r, ready_w] = pipe_pair();
+        let [go_r, go_w] = pipe_pair();
+        let spawner = std::thread::spawn(move || {
+            let mut cmd = std::process::Command::new("true");
+            // SAFETY: the closure runs between fork and exec and calls only
+            // async-signal-safe write(2)/read(2) on plain integer fds.
+            unsafe {
+                cmd.pre_exec(move || {
+                    let byte = 1u8;
+                    libc::write(ready_w, std::ptr::addr_of!(byte).cast(), 1);
+                    let mut sink = 0u8;
+                    libc::read(go_r, std::ptr::addr_of_mut!(sink).cast(), 1);
+                    Ok(())
+                });
+            }
+            assert!(cmd.status().unwrap().success());
+        });
+        let mut byte = 0u8;
+        // SAFETY: valid 1-byte buffer; blocks until the forked child signals.
+        assert_eq!(
+            unsafe { libc::read(ready_r, std::ptr::addr_of_mut!(byte).cast(), 1) },
+            1
+        );
+        // SAFETY: closing this process's own copies of fds created above.
+        unsafe {
+            libc::close(ready_r);
+            libc::close(ready_w);
+            libc::close(go_r);
+        }
+        ParkedFork {
+            go_w,
+            spawner: Some(spawner),
+        }
+    }
+
+    #[cfg(unix)]
+    impl ParkedFork {
+        /// Lets the child proceed to exec; does not wait for it.
+        fn signal(&self) {
+            let byte = 1u8;
+            // SAFETY: valid 1-byte buffer; `go_w` is owned by this value and
+            // closed only in `Drop`.
+            unsafe { libc::write(self.go_w, std::ptr::addr_of!(byte).cast(), 1) };
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ParkedFork {
+        fn drop(&mut self) {
+            self.signal();
+            // SAFETY: closing the owned write end exactly once.
+            unsafe { libc::close(self.go_w) };
+            if let Some(spawner) = self.spawner.take() {
+                let _ = spawner.join();
+            }
+        }
+    }
+
+    fn open_status_lock(base: &Path) -> std::fs::File {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(base.join(".keychain-mirror-status.lock"))
+            .unwrap()
+    }
+
+    /// Waits until a FRESH open file description can take the status lock, i.e.
+    /// every duplicate of the held description (a concurrently forked child's
+    /// copy, alive until its exec) is gone. The condition, not a clock, ends the
+    /// wait; the deadline only turns a hang into a failure.
+    fn wait_until_status_lock_free(base: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            match open_status_lock(base).try_lock() {
+                Ok(()) => return,
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(err) => panic!("probing the status lock failed: {err}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "status lock never became free"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_persist_rides_out_a_lock_description_held_by_a_forked_child() {
+        let base = tempfile::tempdir().unwrap();
+        let held = open_status_lock(base.path());
+        held.try_lock().unwrap();
+        let parked = park_fork_child();
+        // The parent's drop does NOT release: the parked child owns a duplicate
+        // of the open file description, which is what flock(2) locks.
+        drop(held);
+        assert!(matches!(
+            open_status_lock(base.path()).try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        let status = MirrorSyncStatus {
+            updated_at_unix_ms: now_ms(),
+            ..Default::default()
+        };
+        let ok = save_mirror_sync_status_with(base.path(), &status, &|| {
+            parked.signal();
+            wait_until_status_lock_free(base.path());
+        });
+        drop(parked);
+        assert!(ok, "a lock held by a forked child must be ridden out");
         assert_eq!(read_mirror_sync_observation(base.path()), Some(status));
     }
 

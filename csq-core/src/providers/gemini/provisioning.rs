@@ -720,7 +720,8 @@ pub fn delete_api_key_from_vault(
     let binding = match read_binding(base_dir, slot) {
         Ok(b) => b,
         Err(ProvisionError::Io { ref source, .. })
-            if source.kind() == std::io::ErrorKind::NotFound =>
+            if source.kind() == std::io::ErrorKind::NotFound
+                && crate::platform::fs::confirm_absent(&binding_path(base_dir, slot)).is_ok() =>
         {
             return Ok(());
         }

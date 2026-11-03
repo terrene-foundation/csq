@@ -3955,7 +3955,7 @@ mod tests {
                     Some("new_identity_failure")
                 );
             } else {
-                assert!(!sentinel::is_broker_failed(dir.path(), slot));
+                assert!(!sentinel::login_needed_marker_present(dir.path(), slot));
             }
         }
     }
@@ -3988,7 +3988,7 @@ mod tests {
         );
         drop(lock);
         clear_adopted_broker_failure(dir.path(), slot, &binding, &proof);
-        assert!(!sentinel::is_broker_failed(dir.path(), slot));
+        assert!(!sentinel::login_needed_marker_present(dir.path(), slot));
     }
 
     #[test]
@@ -4169,7 +4169,7 @@ mod tests {
                         .expose_secret(),
                     "fake-candidate-refresh"
                 );
-                assert!(!sentinel::is_broker_failed(dir.path(), slot));
+                assert!(!sentinel::login_needed_marker_present(dir.path(), slot));
             } else {
                 assert_eq!(
                     outcome,
@@ -4180,7 +4180,7 @@ mod tests {
                     }
                 );
                 assert_eq!(std::fs::read(&source).unwrap(), source_before);
-                assert!(sentinel::is_broker_failed(dir.path(), slot));
+                assert!(sentinel::login_needed_marker_present(dir.path(), slot));
             }
             assert_eq!(std::fs::read(sibling_path).unwrap(), sibling_before);
             assert_eq!(std::fs::read(metadata).unwrap(), metadata_before);

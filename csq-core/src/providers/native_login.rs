@@ -31,12 +31,68 @@ use crate::providers::catalog::Surface;
 use crate::providers::native;
 use crate::types::AccountNum;
 use anyhow::{anyhow, Context, Result};
-use std::io::{BufRead, Read};
-use std::path::Path;
+use std::io::{self, BufRead, Read};
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 /// Transferable launch configuration for callers with an owned native spawner.
 pub use crate::platform::launch_plan::LaunchPlan as NativeCliLoginLaunch;
+
+/// A selected Windows batch wrapper cannot enter the owned native login path.
+/// Identity and advice are static descriptor data; the selected/account path is
+/// deliberately absent from this error and its formatted representation.
+#[derive(Debug)]
+pub struct UnsupportedWindowsLoginWrapper {
+    /// Native surface whose selected wrapper was refused.
+    pub surface: Surface,
+    /// Descriptor binary name; never the resolved/account filesystem path.
+    pub binary: &'static str,
+    display_name: &'static str,
+    install_url: &'static str,
+}
+impl std::fmt::Display for UnsupportedWindowsLoginWrapper {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(out,
+            "{} login cannot use a Windows .cmd/.bat wrapper. Open the official installation guide at {} and follow its Windows instructions; ensure the vendor's native .exe is selected on PATH, then retry.",
+            self.display_name, self.install_url)
+    }
+}
+impl std::error::Error for UnsupportedWindowsLoginWrapper {}
+
+/// Resolve exactly the same first PATH/known-directory match as before, then
+/// reject a selected Windows batch wrapper before login side effects. Missing
+/// remains informational for prechecks. No alternate finder, skipping, cache or
+/// canonicalization is introduced; Unix executable suffixes remain unrestricted.
+pub fn resolve_native_login_binary(
+    descriptor: &'static native::NativeCli,
+) -> io::Result<Option<PathBuf>> {
+    crate::cli_deps::install_path::find_in_path(descriptor.binary)
+        .map(|path| validate_native_login_binary(descriptor, path, cfg!(windows)))
+        .transpose()
+}
+
+fn validate_native_login_binary(
+    descriptor: &'static native::NativeCli,
+    path: PathBuf,
+    windows: bool,
+) -> io::Result<PathBuf> {
+    if windows
+        && path.extension().is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            UnsupportedWindowsLoginWrapper {
+                surface: descriptor.surface,
+                binary: descriptor.binary,
+                display_name: descriptor.display_name,
+                install_url: crate::cli_deps::minimum::manual_install_url(descriptor.surface_cli),
+            },
+        ));
+    }
+    Ok(path)
+}
 
 /// A parsed device-code line from a native vendor CLI's login stdout.
 ///
@@ -399,14 +455,13 @@ where
     let descriptor = native::descriptor(surface)
         .ok_or_else(|| anyhow!("surface {surface} is not a native-CLI surface"))?;
 
-    let binary_path =
-        crate::cli_deps::install_path::find_in_path(descriptor.binary).ok_or_else(|| {
-            anyhow!(
-                "{} binary not found — install {} and ensure it is on PATH, then retry",
-                descriptor.binary,
-                descriptor.display_name,
-            )
-        })?;
+    let binary_path = resolve_native_login_binary(descriptor)?.ok_or_else(|| {
+        anyhow!(
+            "{} binary not found — install {} and ensure it is on PATH, then retry",
+            descriptor.binary,
+            descriptor.display_name,
+        )
+    })?;
 
     refuse_existing_binding(base_dir, slot, surface)?;
     let home = ensure_vendor_home(base_dir, slot, surface)?;
@@ -613,8 +668,14 @@ fn ensure_vendor_home(
 /// credential file landed under `home` before writing the binding
 /// marker; on either check failing, error out with no marker written.
 fn refuse_existing_binding(base: &Path, slot: AccountNum, surface: Surface) -> Result<()> {
-    match std::fs::symlink_metadata(native::marker_path(base, slot, surface)) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+    let marker = native::marker_path(base, slot, surface);
+    match std::fs::symlink_metadata(&marker) {
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && crate::platform::fs::confirm_absent(&marker).is_ok() =>
+        {
+            Ok(())
+        }
         Ok(_) => Err(anyhow!(
             "native slot already bound; logout before signing in again"
         )),
@@ -668,8 +729,273 @@ fn finish_native_login_with_seal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A binding marker under a regular file cannot be checked: the login REFUSES
+    /// instead of reading it as "not bound". Unix reports ENOTDIR; Windows reports
+    /// NotFound, which `confirm_absent` refuses. DISCRIMINATES ONLY ON WINDOWS.
+    #[test]
+    fn refuse_existing_binding_refuses_when_the_base_is_a_regular_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base_file = dir.path().join("base-is-a-file");
+        std::fs::write(&base_file, b"not a directory").unwrap();
+        let slot = AccountNum::try_from(1u16).unwrap();
+        assert!(refuse_existing_binding(&base_file, slot, Surface::Kimi).is_err());
+        assert!(refuse_existing_binding(dir.path(), slot, Surface::Kimi).is_ok());
+    }
     use std::io::Cursor;
     use std::process::ExitStatus;
+
+    #[test]
+    fn selected_windows_wrapper_has_typed_static_actionable_error() {
+        for descriptor in native::NATIVE_CLIS {
+            for extension in ["cmd", "CMD", "bAt", "BAT"] {
+                let private_path = PathBuf::from("private-account-home")
+                    .join(format!("{}.{}", descriptor.binary, extension));
+                let error = validate_native_login_binary(descriptor, private_path, true)
+                    .expect_err("Windows batch wrapper must be refused");
+                assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+                let typed = error
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<UnsupportedWindowsLoginWrapper>())
+                    .unwrap();
+                assert_eq!(typed.surface, descriptor.surface);
+                assert_eq!(typed.binary, descriptor.binary);
+                let advice = error.to_string();
+                assert!(
+                    advice.contains(".cmd/.bat")
+                        && advice.contains("native .exe")
+                        && advice.contains("Windows")
+                        && advice.contains("PATH")
+                        && advice.contains(crate::cli_deps::minimum::manual_install_url(
+                            descriptor.surface_cli
+                        ))
+                );
+                assert!(!advice.contains("private-account-home"));
+            }
+        }
+    }
+
+    #[test]
+    fn native_login_selection_preserves_supported_paths_and_unix_suffixes() {
+        for descriptor in native::NATIVE_CLIS {
+            for (name, windows) in [
+                ("vendor.exe", true),
+                ("vendor.cmd", false),
+                ("vendor.BAT", false),
+            ] {
+                let path = PathBuf::from("private-bin").join(name);
+                assert_eq!(
+                    validate_native_login_binary(descriptor, path.clone(), windows).unwrap(),
+                    path
+                );
+            }
+        }
+    }
+
+    // Every user holds the workspace's shared test_env lock before constructing
+    // this guard. Restore both the resolver PATH and known-directory HOME even
+    // when a test assertion unwinds; no live HOME or vendor files are consulted.
+    struct SelectorEnvironment(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl SelectorEnvironment {
+        fn new(path: &std::ffi::OsStr, home: &Path) -> Self {
+            let guard = Self(
+                ["PATH", "HOME"]
+                    .into_iter()
+                    .map(|key| (key, std::env::var_os(key)))
+                    .collect(),
+            );
+            // SAFETY: every caller holds the workspace-wide test_env lock;
+            // the saved owned values are restored before that guard is released.
+            unsafe {
+                std::env::set_var("PATH", path);
+                std::env::set_var("HOME", home);
+            }
+            guard
+        }
+    }
+    impl Drop for SelectorEnvironment {
+        fn drop(&mut self) {
+            for (key, previous) in self.0.iter().rev() {
+                // SAFETY: this RAII owner drops while its caller still holds
+                // the same workspace-wide test_env lock used for installation.
+                unsafe {
+                    match previous {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_selection_measures_wrapper_case_exe_missing_and_path_order() {
+        let _env = crate::platform::test_env::lock();
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first bin with spaces & ^");
+        let later = root.path().join("later");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&later).unwrap();
+        let path = std::env::join_paths([&first, &later]).unwrap();
+        let env = SelectorEnvironment::new(&path, &root.path().join("home"));
+        let mut refused = true;
+        let mut supported = true;
+        let mut missing = true;
+        for descriptor in native::NATIVE_CLIS {
+            for suffix in ["CMD", "bAt"] {
+                let wrapper = first.join(format!("{}.{}", descriptor.binary, suffix));
+                let executable = later.join(format!("{}.exe", descriptor.binary));
+                std::fs::write(&wrapper, []).unwrap();
+                std::fs::write(&executable, []).unwrap();
+                let result = resolve_native_login_binary(descriptor);
+                refused &= result.err().is_some_and(|error| {
+                    error.kind() == io::ErrorKind::Unsupported
+                        && error
+                            .get_ref()
+                            .is_some_and(|inner| inner.is::<UnsupportedWindowsLoginWrapper>())
+                });
+                // The existing within-directory extension order still prefers
+                // .exe over .cmd/.bat. Never skip a selected earlier wrapper.
+                let first_exe = first.join(format!("{}.exe", descriptor.binary));
+                std::fs::write(&first_exe, []).unwrap();
+                supported &=
+                    resolve_native_login_binary(descriptor).unwrap() == Some(first_exe.clone());
+                std::fs::remove_file(&first_exe).unwrap();
+                std::fs::remove_file(&wrapper).unwrap();
+                supported &=
+                    resolve_native_login_binary(descriptor).unwrap() == Some(executable.clone());
+                std::fs::remove_file(&executable).unwrap();
+                missing &= resolve_native_login_binary(descriptor).unwrap().is_none();
+            }
+        }
+        drop(env);
+        root.close().unwrap();
+        eprintln!("NATIVE_SELECTION_FILE_FIXTURE_CLEANUP_CONFIRMED");
+        if !refused {
+            eprintln!("WINDOWS_SELECTED_WRAPPER_MUST_BE_REFUSED");
+        }
+        assert!(
+            refused,
+            "selected Windows batch wrapper was accepted or bypassed"
+        );
+        assert!(
+            supported && missing,
+            "supported or missing native selection changed"
+        );
+    }
+
+    #[test]
+    fn native_selection_excludes_a_real_relative_candidate_with_empty_path_entries() {
+        let _env = crate::platform::test_env::lock();
+        // This private runtime tempdir is beside the test cwd, making its
+        // basename a REAL relative PATH candidate without changing global cwd.
+        let shadow = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let accepted_dir = root.path().join("absolute-bin");
+        std::fs::create_dir(&accepted_dir).unwrap();
+        let descriptor = &native::KIMI;
+        let name = if cfg!(windows) { "kimi.exe" } else { "kimi" };
+        let shadow_file = shadow.path().join(name);
+        let accepted = accepted_dir.join(name);
+        std::fs::write(&shadow_file, []).unwrap();
+        std::fs::write(&accepted, []).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [&shadow_file, &accepted] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        let relative = PathBuf::from(shadow.path().file_name().unwrap());
+        let path = std::env::join_paths([Path::new(""), &relative, &accepted_dir]).unwrap();
+        let env = SelectorEnvironment::new(&path, &root.path().join("home"));
+        assert_eq!(
+            resolve_native_login_binary(descriptor).unwrap(),
+            Some(accepted)
+        );
+        drop(env);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_native_selection_keeps_an_executable_cmd_suffix() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::platform::test_env::lock();
+        static CMD_DESCRIPTOR: native::NativeCli = native::NativeCli {
+            binary: "kimi.cmd",
+            ..native::KIMI
+        };
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("kimi.cmd");
+        std::fs::write(&path, []).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let env = SelectorEnvironment::new(root.path().as_os_str(), &root.path().join("home"));
+        assert_eq!(
+            resolve_native_login_binary(&CMD_DESCRIPTOR).unwrap(),
+            Some(path)
+        );
+        drop(env);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_wrapper_refusal_precedes_runner_home_and_binding() {
+        let _env = crate::platform::test_env::lock();
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        let base = root.path().join("base");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::create_dir(&base).unwrap();
+        let mut refused_before_effects = true;
+        for descriptor in native::NATIVE_CLIS {
+            let wrapper = bin.join(format!("{}.CMD", descriptor.binary));
+            std::fs::write(&wrapper, []).unwrap();
+            let env = SelectorEnvironment::new(bin.as_os_str(), &root.path().join("home"));
+            let mut ran = false;
+            let mut sealed = false;
+            let result = login_native_cli_with_launch_seal(
+                &base,
+                slot(2),
+                descriptor.surface,
+                |_| {
+                    ran = true;
+                    Err(anyhow!(
+                        "private fixture runner intentionally does not spawn"
+                    ))
+                },
+                || {
+                    sealed = true;
+                    Ok(())
+                },
+            );
+            let typed_refusal = result
+                .err()
+                .and_then(|error| error.downcast::<io::Error>().ok())
+                .is_some_and(|error| {
+                    error.kind() == io::ErrorKind::Unsupported
+                        && error
+                            .get_ref()
+                            .is_some_and(|inner| inner.is::<UnsupportedWindowsLoginWrapper>())
+                });
+            refused_before_effects &= typed_refusal
+                && !ran
+                && !sealed
+                && !base.join("native-homes").exists()
+                && !native::marker_exists(&base, slot(2), descriptor.surface);
+            drop(env);
+            std::fs::remove_file(&wrapper).unwrap();
+        }
+        root.close().unwrap();
+        eprintln!("NATIVE_LOGIN_NO_PROCESS_FIXTURE_CLEANUP_CONFIRMED");
+        if !refused_before_effects {
+            eprintln!("WINDOWS_WRAPPER_REFUSAL_MUST_PRECEDE_LOGIN_EFFECTS");
+        }
+        assert!(
+            refused_before_effects,
+            "unsupported wrapper reached login runner or filesystem effects"
+        );
+    }
 
     #[test]
     fn typed_cli_plan_and_legacy_conversion_preserve_native_slot_policy() {

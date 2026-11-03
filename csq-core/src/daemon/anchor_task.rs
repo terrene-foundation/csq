@@ -297,7 +297,7 @@ async fn check_and_anchor_high_impact(
     // H2: detect impossible last_anchored_seq.
     // Read HEAD once to validate the state file's seq claim.
     let head_seq_opt = match read_chain_head(base_dir) {
-        Ok(Some(h)) => Some(h.seq),
+        Ok(Some(h)) => Some(h.seq()),
         Ok(None) => return false,
         Err(e) => {
             debug!(sink = sink_name, error = %e, "anchor_task: chain head read error");
@@ -353,7 +353,9 @@ async fn check_and_anchor_high_impact(
             // For buried high-impact at seq=0 specifically, the HEAD check suffices
             // because seq=0 is always the first record (nothing buries it until anchored).
             match read_chain_head(base_dir) {
-                Ok(Some(h)) if is_high_impact_kind(&h.kind) => Some(h),
+                Ok(Some(h)) if h.kind().is_some_and(|kind| is_high_impact_kind(&kind)) => {
+                    h.typed().cloned()
+                }
                 Ok(Some(_)) => {
                     // HEAD is low-impact; check if there's a buried high-impact
                     // anywhere in the chain via scan starting from 0 (seq > 0).
@@ -452,9 +454,21 @@ async fn do_anchor(sink: &dyn LedgerSink, base_dir: &Path, sink_name: &str) {
         AnchorOutcome::EmptyChain => {
             debug!(sink = sink_name, "anchor_task: chain empty, skip");
         }
+        AnchorOutcome::HeadUnsupported { seq } => {
+            // A newer build wrote the HEAD. Nothing to do, and nothing to
+            // count as drift: this binary cannot submit that record, and the
+            // next binary can.
+            debug!(
+                sink = sink_name,
+                seq, "anchor_task: HEAD kind unknown to this build, skip"
+            );
+        }
     }
 
-    if !matches!(outcome, AnchorOutcome::EmptyChain) {
+    if !matches!(
+        outcome,
+        AnchorOutcome::EmptyChain | AnchorOutcome::HeadUnsupported { .. }
+    ) {
         if let Err(e) = write_anchor_state(base_dir, sink_name, &state) {
             // State write failure is logged but not fatal. csq continues.
             // This means `csq doctor` may show stale data until the next

@@ -804,7 +804,14 @@ pub fn read_status(base_dir: &Path) -> Result<Option<OrphanSweepStatus>, StatusR
     let path = base_dir.join(ORPHAN_STATUS_FILENAME);
     let meta = match std::fs::symlink_metadata(&path) {
         Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Windows reports a file-shaped parent as NotFound; that is unreadable,
+            // not "never published".
+            return match crate::platform::fs::confirm_absent(&path) {
+                Ok(()) => Ok(None),
+                Err(_) => Err(StatusReadError::Unreadable),
+            };
+        }
         Err(_) => return Err(StatusReadError::Unreadable),
     };
     if !meta.is_file() {
@@ -2124,6 +2131,22 @@ fn count_non_delete(state: &mut OrphanSweepState, verdict: OrphanVerdict) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A status path under a regular file is `Unreadable`, never "never published".
+    /// Unix gets ENOTDIR; Windows reports NotFound, which `confirm_absent` refuses.
+    /// DISCRIMINATES ONLY ON WINDOWS; a genuinely missing base stays `Ok(None)` everywhere.
+    #[test]
+    fn read_status_refuses_a_base_that_is_a_regular_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("base-is-a-file");
+        std::fs::write(&file, b"not a directory").unwrap();
+        assert!(matches!(
+            read_status(&file),
+            Err(StatusReadError::Unreadable)
+        ));
+        let missing = dir.path().join("gone");
+        assert!(matches!(read_status(&missing), Ok(None)));
+    }
 
     fn login(access: &str, refresh: &str, expires_at: u64) -> String {
         serde_json::json!({"claudeAiOauth": {

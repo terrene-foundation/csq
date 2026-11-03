@@ -19,6 +19,14 @@
 //! * [`attestation`](crate::bridge::attestation) — the HMAC-SHA256 owner-origin
 //!   proof. `mint` is `pub(crate)` so the separate `csq` CLI crate has no path
 //!   to forge an origin.
+//! * [`enroll`](crate::bridge::enroll) — the owner-enrolment handshake
+//!   (`csq telegram pair`). The pairing code exists only in process memory.
+//! * [`telegram_api`](crate::bridge::telegram_api) — the minimal Bot API
+//!   transport (`getUpdates`, `sendMessage`) behind an injectable trait.
+//! * [`notify`](crate::bridge::notify) — the outbound owner ping
+//!   (`csq notify-owner`): the pinned destination, the kill switch, the
+//!   persisted rate limit, the disclosure scrub and the signed-chain audit
+//!   pair.
 //!
 //! Neither the bot token nor the origin key may appear in a log, an error
 //! message, `Debug` output or argv (`security.md` MUST-2). Every error that can
@@ -26,7 +34,10 @@
 
 pub mod attestation;
 pub mod config;
+pub mod enroll;
+pub mod notify;
 pub mod secrets;
+pub mod telegram_api;
 pub mod validator;
 
 pub use attestation::OwnerAttestation;

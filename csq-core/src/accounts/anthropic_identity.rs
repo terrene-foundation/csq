@@ -528,6 +528,10 @@ fn known_unindexed_identity_collides(
         if matches!(std::fs::symlink_metadata(&metadata),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound)
         {
+            if crate::platform::fs::confirm_absent(&metadata).is_err() {
+                warn_sibling_unreadable(sibling_slot, "anthropic_sibling_metadata_unreadable");
+                return true;
+            }
             continue;
         }
         if identity_store::read_identity_provider(base, other).is_some_and(|p| p != "anthropic") {
@@ -618,6 +622,12 @@ pub(crate) fn known_sibling_block(
         if matches!(std::fs::symlink_metadata(&metadata),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound)
         {
+            if crate::platform::fs::confirm_absent(&metadata).is_err() {
+                warn_sibling_unreadable(sibling_slot, "anthropic_sibling_metadata_unreadable");
+                return Some(KnownSiblingBlock::Unreadable(SlotKey::from_key(
+                    sibling_slot,
+                )));
+            }
             continue;
         }
         if identity_store::read_identity_provider(base, other).is_some_and(|p| p != "anthropic") {
@@ -745,7 +755,12 @@ fn candidate_pair_scan(
         // still be compared. A non-Anthropic credential file is skipped below by shape.
         let path = identity_store::credentials_path_for(base, other);
         match std::fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && crate::platform::fs::confirm_absent(&path).is_ok() =>
+            {
+                continue
+            }
             Err(_) => {
                 warn_sibling_unreadable(sibling_slot, "anthropic_sibling_canonical_unreadable");
                 return Err(IdentityError::SiblingCustodyUnreadable {
@@ -1017,7 +1032,10 @@ pub(crate) fn read_profiles_file_at(
     blank_body_is_empty: bool,
 ) -> Result<ProfilesFile, IdentityError> {
     match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && crate::platform::fs::confirm_absent(path).is_ok() =>
+        {
             return Ok(ProfilesFile::empty())
         }
         Err(_) => return Err(IdentityError::Io),
@@ -1344,7 +1362,12 @@ pub(crate) fn legacy_verification_source(
     recorded_legacy_email(base, identity)?;
     let credentials_path = identity_store::credentials_path_for(base, identity);
     match std::fs::symlink_metadata(&credentials_path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && crate::platform::fs::confirm_absent(&credentials_path).is_ok() =>
+        {
+            return Ok(None)
+        }
         Err(_) => return Err(IdentityError::Io),
         Ok(_) => (),
     }
@@ -1803,7 +1826,12 @@ fn optional_login_json(
     private: bool,
 ) -> Result<Option<serde_json::Value>, IdentityError> {
     match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && crate::platform::fs::confirm_absent(path).is_ok() =>
+        {
+            Ok(None)
+        }
         Err(_) => Err(IdentityError::Io),
         Ok(_) => read_json(path, private).map(Some),
     }
@@ -1850,13 +1878,17 @@ fn capture_independent_login_prior(
         Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
             return Err(IdentityError::InvalidMetadata);
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && crate::platform::fs::confirm_absent(&config).is_ok() => {}
         Err(_) => return Err(IdentityError::Io),
         _ => (),
     }
     let settings_path = config.join("settings.json");
     match std::fs::symlink_metadata(&settings_path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && crate::platform::fs::confirm_absent(&settings_path).is_ok() => {}
         Err(_) => return Err(IdentityError::Io),
         Ok(_) => {
             let digest = read_json_with(&settings_path, false, |bytes| {
@@ -1973,7 +2005,12 @@ fn capture_prior_binding(
         PriorProvider::Codex => identity_store::credentials_codex_path_for(base, identity),
     };
     let canonical_version = match std::fs::symlink_metadata(&canonical_path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && crate::platform::fs::confirm_absent(&canonical_path).is_ok() =>
+        {
+            None
+        }
         Err(_) => return Err(IdentityError::Io),
         Ok(_) => {
             let loaded = match load_anthropic_canonical(&canonical_path) {
@@ -3020,9 +3057,17 @@ fn rescue_store_schema_permits(base: &Path) -> Result<(), IdentityError> {
 /// Whether the store schema refuses a login rescue install (see
 /// `rescue_store_schema_permits`).
 pub(crate) fn rescue_store_schema_refused(base: &Path) -> bool {
-    let present = match std::fs::symlink_metadata(identity_store::store_version_path(base)) {
+    let version_path = identity_store::store_version_path(base);
+    let present = match std::fs::symlink_metadata(&version_path) {
         Ok(_) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        // An unreachable store-version path (Windows reports a file-shaped parent as
+        // NotFound) counts as present, so the schema check stays closed.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && crate::platform::fs::confirm_absent(&version_path).is_ok() =>
+        {
+            false
+        }
         Err(_) => true,
     };
     let schema = crate::daemon::identity_mint::read_store_version_schema(base);
@@ -3196,6 +3241,23 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    /// A login file or profiles file under a regular file is an error, never an absent
+    /// prior or an empty profile set. Unix gets ENOTDIR; Windows reports NotFound,
+    /// which `confirm_absent` refuses. DISCRIMINATES ONLY ON WINDOWS; a genuinely
+    /// missing file stays absent on every platform.
+    #[test]
+    fn identity_readers_refuse_a_path_under_a_regular_file() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("parent-is-a-file");
+        std::fs::write(&file, b"not a directory").unwrap();
+        let under = file.join("login.json");
+        assert!(optional_login_json(&under, true).is_err());
+        assert!(read_profiles_file_at(&under, false).is_err());
+        let missing = dir.path().join("gone").join("login.json");
+        assert!(matches!(optional_login_json(&missing, true), Ok(None)));
+        assert!(read_profiles_file_at(&missing, false).is_ok());
+    }
 
     fn slot(n: u16) -> AccountNum {
         AccountNum::try_from(n).unwrap()

@@ -1792,10 +1792,11 @@ pub(crate) fn note_handle_status(
         return;
     };
     let gone = |name: &str| {
+        let path = base_dir.join(name);
         matches!(
-            std::fs::symlink_metadata(base_dir.join(name)),
+            std::fs::symlink_metadata(&path),
             Err(e) if e.kind() == io::ErrorKind::NotFound
-        )
+        ) && crate::platform::fs::confirm_absent(&path).is_ok()
     };
     update_lines(&dir, |lines| {
         if set {
@@ -2068,7 +2069,14 @@ fn classify_marker(path: &Path) -> Marker {
 fn read_markers(slot_dir: &Path) -> Vec<SlotWriteStatus> {
     let dir = slot_dir.join(SLOT_MARKER_DIR);
     match std::fs::symlink_metadata(&dir) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Vec::new(),
+        // Absent only once `confirm_absent` agrees (Windows reports a file-shaped
+        // ancestor as NotFound): an unreachable marker dir fails CLOSED, never "no marker".
+        Err(e)
+            if e.kind() == io::ErrorKind::NotFound
+                && crate::platform::fs::confirm_absent(&dir).is_ok() =>
+        {
+            return Vec::new()
+        }
         Ok(m) if m.is_dir() => {}
         _ => return vec![SlotWriteStatus::UnrecognisedMarker],
     }

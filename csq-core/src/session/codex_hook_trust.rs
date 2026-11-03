@@ -303,7 +303,10 @@ fn read_global_hooks(global: Option<&Path>) -> Option<Vec<GlobalHook>> {
         return Some(Vec::new());
     };
     if matches!(std::fs::metadata(g), Err(e) if e.kind() == io::ErrorKind::NotFound) {
-        return Some(Vec::new());
+        // Absent only once `confirm_absent` agrees; unreachable is UNKNOWN (`None`).
+        return crate::platform::fs::confirm_absent(g)
+            .ok()
+            .map(|()| Vec::new());
     }
     global_hooks(&read_regular_bounded(g, false)?)
 }
@@ -651,7 +654,9 @@ fn rewrite_slot(base_dir: &Path, account: AccountNum, plan: &Plan<'_>) -> io::Re
         report: CarryReport::default(),
         own: BTreeMap::new(),
     };
-    if matches!(std::fs::symlink_metadata(&path), Err(e) if e.kind() == io::ErrorKind::NotFound) {
+    if matches!(std::fs::symlink_metadata(&path), Err(e) if e.kind() == io::ErrorKind::NotFound)
+        && crate::platform::fs::confirm_absent(&path).is_ok()
+    {
         return Ok(nothing());
     }
     let _lock = lock_slot_config(base_dir, account)?;
@@ -659,7 +664,12 @@ fn rewrite_slot(base_dir: &Path, account: AccountNum, plan: &Plan<'_>) -> io::Re
     for _ in 0..MAX_ATTEMPTS {
         let Some(original) = read_regular_bounded(&path, false) else {
             return match std::fs::metadata(&path) {
-                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(nothing()),
+                Err(e)
+                    if e.kind() == io::ErrorKind::NotFound
+                        && crate::platform::fs::confirm_absent(&path).is_ok() =>
+                {
+                    Ok(nothing())
+                }
                 Ok(m) if m.len() > MAX_CONFIG_BYTES => Err(unusable(SlotConfigFault::Oversize)),
                 _ => Err(unusable(SlotConfigFault::Unreadable)),
             };
@@ -730,7 +740,9 @@ fn read_own_keys(
     handle_dir: &Path,
 ) -> io::Result<BTreeMap<String, toml::Value>> {
     let path = config_toml_path(base_dir, account);
-    if matches!(std::fs::symlink_metadata(&path), Err(e) if e.kind() == io::ErrorKind::NotFound) {
+    if matches!(std::fs::symlink_metadata(&path), Err(e) if e.kind() == io::ErrorKind::NotFound)
+        && crate::platform::fs::confirm_absent(&path).is_ok()
+    {
         return Ok(BTreeMap::new());
     }
     let fault = |f: SlotConfigFault| io::Error::new(io::ErrorKind::InvalidData, f);
@@ -1103,7 +1115,12 @@ pub fn hook_trust_counts(handle_dir: &Path, global: Option<&Path>) -> HookTrustC
     let state = match cfg {
         None => None,
         Some(p) => match std::fs::symlink_metadata(&p) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e)
+                if e.kind() == io::ErrorKind::NotFound
+                    && crate::platform::fs::confirm_absent(&p).is_ok() =>
+            {
+                None
+            }
             _ => {
                 let parsed = read_regular_bounded(&p, false)
                     .and_then(|b| String::from_utf8(b).ok())

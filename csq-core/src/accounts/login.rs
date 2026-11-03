@@ -2659,6 +2659,65 @@ mod tests {
         );
     }
 
+    /// `csq login N` is the PRIMARY resolution boundary for the sticky
+    /// login-needed state: minting a fresh grant makes the old failure
+    /// obsolete, so `finalize_verified_login` must clear the sentinel
+    /// (`sentinel-clearing-parity.md` MUST-1).
+    ///
+    /// Non-vacuity: drop the `clear_broker_failed` call from
+    /// `finalize_verified_login` and the post-login assertion fails with the
+    /// marker still on disk.
+    #[test]
+    fn finalize_verified_login_clears_the_login_needed_sentinel() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let account = AccountNum::try_from(1u16).unwrap();
+        let config_dir = base.join("config-1");
+        fs::create_dir_all(&config_dir).unwrap();
+
+        fs::write(
+            config_dir.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"fixture-slot-1@test.invalid"}}"#,
+        )
+        .unwrap();
+        let anthropic_creds = crate::credentials::CredentialFile::Anthropic(
+            crate::credentials::AnthropicCredentialFile {
+                claude_ai_oauth: crate::credentials::OAuthPayload {
+                    access_token: crate::types::AccessToken::new("sk-ant-oat01-fh1-test".into()),
+                    refresh_token: crate::types::RefreshToken::new("sk-ant-ort01-fh1-test".into()),
+                    expires_at: 4102444800000,
+                    scopes: vec!["user:inference".into()],
+                    subscription_type: Some("max".into()),
+                    rate_limit_tier: None,
+                    extra: std::collections::HashMap::new(),
+                },
+                extra: std::collections::HashMap::new(),
+            },
+        );
+        credentials::save(&config_dir.join(".credentials.json"), &anthropic_creds).unwrap();
+
+        // Production ordering: the identity is minted before finalization, so
+        // the fixture arms the sentinel against a slot that already has one.
+        let committed = fixture_verified_commit(base, account).expect("exact grant verified");
+        crate::refresh::sentinel::set_broker_failed(base, account, "invalid_grant")
+            .expect("sentinel must arm before the login");
+        assert!(
+            crate::refresh::sentinel::login_needed_marker_present(base, account),
+            "precondition: the marker must be set before login, or this proves nothing"
+        );
+
+        let result =
+            with_in_memory_secret_backend(|| finalize_verified_login(base, account, committed));
+        assert!(
+            result.is_ok(),
+            "login finalization must succeed: {result:?}"
+        );
+        assert!(
+            !crate::refresh::sentinel::login_needed_marker_present(base, account),
+            "a successful `csq login` must clear the sticky login-needed marker"
+        );
+    }
+
     /// Security review regression (GH an internal ticket): a `finalize_login` that
     /// FAILS after the stale-marker DETECTION point must NOT have deleted the
     /// prior Gemini binding. Before the capture/act split, cleanup ran

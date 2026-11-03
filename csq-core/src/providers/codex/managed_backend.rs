@@ -270,10 +270,15 @@ fn deadline(timeout: Duration) -> io::Result<Instant> {
 /// Presence includes malformed or unreadable markers: callers must refuse a
 /// configured backend failure instead of silently launching a second server.
 pub fn is_configured(handle_dir: &Path) -> bool {
-    !matches!(
-        std::fs::symlink_metadata(handle_dir.join(BINDING)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound
-    )
+    let binding = handle_dir.join(BINDING);
+    match std::fs::symlink_metadata(&binding) {
+        // Absent only once `confirm_absent` agrees: Windows reports a file-shaped
+        // ancestor as NotFound, and that must count as configured-but-unreachable.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            crate::platform::fs::confirm_absent(&binding).is_err()
+        }
+        _ => true,
+    }
 }
 
 /// Caller proof minted only by this module after authenticating the owning
@@ -2168,6 +2173,110 @@ mod tests {
         socket
     }
 
+    /// The fixture client closed its socket before the server finished talking
+    /// to it. Only a test that asserts the CLIENT gives up inside a short
+    /// deadline may tolerate this: on a slow runner the client's deadline can
+    /// expire before the server thread completes the handshake.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ClientGone;
+
+    /// Classifies a tungstenite error: a vanished peer is `ClientGone`, anything
+    /// else is a real fixture failure and panics (never swallowed).
+    fn client_gone_or_panic(error: tungstenite::Error) -> ClientGone {
+        use std::io::ErrorKind::{BrokenPipe, ConnectionReset, UnexpectedEof};
+        match &error {
+            tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => ClientGone,
+            tungstenite::Error::Io(io)
+                if matches!(io.kind(), BrokenPipe | ConnectionReset | UnexpectedEof) =>
+            {
+                ClientGone
+            }
+            tungstenite::Error::Protocol(
+                tungstenite::error::ProtocolError::HandshakeIncomplete
+                | tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+            ) => ClientGone,
+            other => {
+                panic!("fixture server failed for a reason other than a departed client: {other:?}")
+            }
+        }
+    }
+
+    fn try_receive(
+        socket: &mut tungstenite::WebSocket<UnixStream>,
+    ) -> Result<serde_json::Value, ClientGone> {
+        loop {
+            match socket.read().map_err(client_gone_or_panic)? {
+                tungstenite::Message::Text(text) => return Ok(serde_json::from_str(&text).unwrap()),
+                tungstenite::Message::Close(_) => return Err(ClientGone),
+                _ => {}
+            }
+        }
+    }
+
+    /// Like `initialized`, but a client that already closed (deadline expired
+    /// before or during the handshake) yields `Err(ClientGone)` instead of a
+    /// server-thread panic. Protocol assertions on what the client DID send are
+    /// kept.
+    fn try_initialized(
+        listener: &UnixListener,
+        home: &Path,
+        budget: Duration,
+    ) -> Result<tungstenite::WebSocket<UnixStream>, ClientGone> {
+        let stream = accept_bounded(listener, budget).expect("fixture accept timed out");
+        // macOS reports EINVAL (InvalidInput) from setsockopt on a socket whose
+        // peer already closed; that is a departed client, not a fixture bug.
+        let configure = |result: std::io::Result<()>| {
+            result.map_err(|io| match io.kind() {
+                std::io::ErrorKind::InvalidInput
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset => ClientGone,
+                _ => panic!("fixture socket setup failed: {io:?}"),
+            })
+        };
+        configure(stream.set_nonblocking(false))?;
+        configure(stream.set_read_timeout(Some(budget)))?;
+        configure(stream.set_write_timeout(Some(budget)))?;
+        let mut socket = tungstenite::accept(stream).map_err(|error| match error {
+            tungstenite::HandshakeError::Failure(error) => client_gone_or_panic(error),
+            tungstenite::HandshakeError::Interrupted(_) => {
+                panic!("blocking fixture handshake was interrupted")
+            }
+        })?;
+        let request = try_receive(&mut socket)?;
+        assert_eq!(request["method"], "initialize");
+        assert_eq!(request["params"]["capabilities"]["experimentalApi"], true);
+        socket
+            .send(tungstenite::Message::Text(
+                json!({"id":request["id"], "result":{"codexHome":home}})
+                    .to_string()
+                    .into(),
+            ))
+            .map_err(client_gone_or_panic)?;
+        assert_eq!(try_receive(&mut socket)?["method"], "initialized");
+        Ok(socket)
+    }
+
+    /// `next_request` for a test whose client may legitimately give up first:
+    /// `None` means the client departed before sending any request.
+    fn try_next_request(
+        listener: &UnixListener,
+        home: &Path,
+        budget: Duration,
+    ) -> Option<(tungstenite::WebSocket<UnixStream>, serde_json::Value)> {
+        loop {
+            let Ok(mut socket) = try_initialized(listener, home, budget) else {
+                return None;
+            };
+            match socket.read() {
+                Ok(tungstenite::Message::Text(text)) => {
+                    return Some((socket, serde_json::from_str(&text).unwrap()));
+                }
+                Ok(_) | Err(_) => continue,
+            }
+        }
+    }
+
     #[test]
     fn rpc_send_diagnostic_redacts_io_error_and_unknown_method() {
         const SENTINEL: &str = "PRIVATE_RPC_SENTINEL_nonce_payload_path";
@@ -2513,7 +2622,12 @@ mod tests {
         let home = plan.handle_dir.clone();
         let server = std::thread::spawn(move || {
             // Held open without a reply: the client must hit its own deadline.
-            let (_socket, request) = next_request(&listener, &home, HANG_GUARD);
+            // The client may give up (50 ms deadline) before this thread finishes the
+            // handshake on a slow runner; that is the behaviour under test, not a
+            // fixture failure. When a request does arrive it must be the list.
+            let Some((_socket, request)) = try_next_request(&listener, &home, HANG_GUARD) else {
+                return;
+            };
             assert_eq!(request["method"], "thread/loaded/list");
             std::thread::sleep(Duration::from_millis(200));
         });
@@ -2535,6 +2649,33 @@ mod tests {
             started.elapsed()
         );
         server.join().unwrap();
+    }
+
+    /// Deterministic reproducer: a client that connects and closes before the
+    /// handshake. The old fixture pattern (`initialized` unwrap) panics the
+    /// server thread; the tolerant pattern reports `ClientGone`.
+    fn fresh_plan() -> (tempfile::TempDir, ManagedBackendPlan) {
+        plan()
+    }
+
+    #[test]
+    fn departed_client_panics_old_fixture_pattern_but_not_tolerant_one() {
+        let (_temp, plan) = plan();
+        let listener = test_listener(&plan);
+        let home = plan.handle_dir.clone();
+        drop(UnixStream::connect(&plan.socket_path).unwrap());
+        let old = std::thread::spawn(move || drop(initialized(&listener, &home, HANG_GUARD)));
+        assert!(
+            old.join().is_err(),
+            "old pattern must panic on a departed client"
+        );
+
+        let (_temp2, plan2) = fresh_plan();
+        let listener2 = test_listener(&plan2);
+        let home2 = plan2.handle_dir.clone();
+        drop(UnixStream::connect(&plan2.socket_path).unwrap());
+        let new = std::thread::spawn(move || try_next_request(&listener2, &home2, HANG_GUARD));
+        assert!(new.join().unwrap().is_none());
     }
 
     #[test]

@@ -2598,6 +2598,12 @@ fn read_settings_layer(path: &Path, empty_usable: bool) -> (Value, bool, bool) {
             // a dangling symlink (or a read/lstat race) must not restore accept.
             // Global/slot layers retain their historical NotFound behavior. This
             // inspects only the entry; it never performs a second content read.
+            // Windows reports a file-shaped ancestor as NotFound too: a layer that
+            // carries env (3P base URLs) is unreachable then, never absent.
+            if let Err(refusal) = crate::platform::fs::confirm_absent(path) {
+                warn!(path = %path.display(), error_kind = ?refusal.kind(), "settings file unreadable, treating as empty");
+                return (empty(), false, false);
+            }
             let absent = empty_usable
                 || std::fs::symlink_metadata(path)
                     .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
@@ -3038,7 +3044,12 @@ pub(crate) fn read_native_swap_raw(handle: &Path) -> Result<Option<String>, Cred
             .open(&path)
         {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && crate::platform::fs::confirm_absent(&path).is_ok() =>
+            {
+                return Ok(None)
+            }
             Err(_) => return Err(ai::credential_refusal()),
         }
     };
@@ -3049,7 +3060,12 @@ pub(crate) fn read_native_swap_raw(handle: &Path) -> Result<Option<String>, Cred
     #[cfg(not(windows))]
     let before = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && crate::platform::fs::confirm_absent(&path).is_ok() =>
+        {
+            return Ok(None)
+        }
         Err(_) => return Err(ai::credential_refusal()),
     };
     if !before.is_file() || before.len() > MAX_NATIVE_BYTES {
@@ -3459,12 +3475,15 @@ pub fn repoint_handle_dir(
                         .is_some()
                     && crate::accounts::third_party::is_third_party_slot(base_dir, target)
                         .unwrap_or(false)
-                    && matches!(
-                        std::fs::symlink_metadata(
-                            base_dir.join(format!("config-{target}")).join(".credentials.json")
-                        ),
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound
-                    )
+                    && {
+                        let oauth_file = base_dir
+                            .join(format!("config-{target}"))
+                            .join(".credentials.json");
+                        matches!(
+                            std::fs::symlink_metadata(&oauth_file),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                        ) && crate::platform::fs::confirm_absent(&oauth_file).is_ok()
+                    }
             })
         };
         // Refuse without creating lock files for an unverified legacy target.
@@ -6596,6 +6615,26 @@ fn create_symlink(target: &Path, link: &Path) -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 mod tests {
+    /// A settings layer under a regular file is unreachable (unusable, not absent): the
+    /// layer carries env (3P base URLs), so absence-as-default is wrong there. Unix
+    /// reports ENOTDIR (already unusable); Windows reports NotFound, which
+    /// `confirm_absent` refuses. DISCRIMINATES ONLY ON WINDOWS; a genuinely missing
+    /// layer stays usable-and-absent (empty_usable) everywhere.
+    #[test]
+    fn settings_layer_under_a_regular_file_is_unusable_not_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("parent-is-a-file");
+        std::fs::write(&file, b"not a directory").unwrap();
+        let (_, usable, absent) = super::read_settings_layer(&file.join("settings.json"), true);
+        assert!(
+            !usable && !absent,
+            "unreachable layer: usable={usable} absent={absent}"
+        );
+        let (_, usable, absent) =
+            super::read_settings_layer(&dir.path().join("gone").join("settings.json"), true);
+        assert!(usable && absent);
+    }
+
     #[cfg(unix)]
     #[test]
     fn materializer_keeps_exact_native_root_trust_without_root_resume_state() {

@@ -33,9 +33,6 @@ pub fn sanitize_for_display(label: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Maximum age of a broker-failed flag before it's auto-cleared (24 hours).
-pub const BROKER_FLAG_STALE_SECS: u64 = 24 * 3600;
-
 /// Formats a duration in seconds as a compact string.
 ///
 /// Examples: "now", "5m", "2h", "1d"
@@ -109,15 +106,13 @@ pub fn fmt_tokens(n: u64) -> String {
 /// Formats the statusline string for an account.
 ///
 /// Format: `#N:label 5h:X% 7d:Y%`
-/// With `LOGIN-NEEDED` prefix when `broker_failed` is set.
-pub fn statusline_str(
-    account: AccountNum,
-    label: &str,
-    quota: Option<&AccountQuota>,
-    broker_failed: bool,
-) -> String {
-    let prefix = if broker_failed { "LOGIN-NEEDED " } else { "" };
-
+///
+/// The login-needed state is deliberately NOT rendered here: `csq statusline`
+/// prints it on its OWN line (`sentinel::login_needed_line`), so the quota
+/// line never carries a credential-state banner
+/// (`diagnostic-surface-parity.md` MUST NOT 4 — one state, one surface, and
+/// the message must be explicitly distinct from the quota line).
+pub fn statusline_str(account: AccountNum, label: &str, quota: Option<&AccountQuota>) -> String {
     match quota {
         // Balance-metered providers (DeepSeek) carry a $-balance, not 5h/7d
         // windows. Detect them by the record's own `kind` ("balance", written
@@ -151,12 +146,11 @@ pub fn statusline_str(
                 // marker rather than a fabricated 0% window.
                 None => "balance n/a".to_string(),
             };
-            format!("{}#{}:{} {}", prefix, account, label, body)
+            format!("#{}:{} {}", account, label, body)
         }
         Some(q) => {
             format!(
-                "{}#{}:{} 5h:{:.0}% 7d:{:.0}%",
-                prefix,
+                "#{}:{} 5h:{:.0}% 7d:{:.0}%",
                 account,
                 label,
                 q.five_hour_pct(),
@@ -164,7 +158,7 @@ pub fn statusline_str(
             )
         }
         None => {
-            format!("{}#{}:{} no data", prefix, account, label)
+            format!("#{}:{} no data", account, label)
         }
     }
 }
@@ -209,46 +203,6 @@ pub fn account_label(base_dir: &Path, account: AccountNum) -> String {
             .unwrap_or_else(|| format!("account-{}", account)),
         Err(_) => format!("account-{}", account),
     }
-}
-
-/// Checks if a broker-failed flag is stale (older than 24h) and should be ignored.
-///
-/// Returns true if the flag should be treated as cleared.
-pub fn is_broker_flag_stale(base_dir: &Path, account: AccountNum) -> bool {
-    let path = base_dir
-        .join("credentials")
-        .join(format!("{}.broker-failed", account));
-
-    match std::fs::metadata(&path) {
-        Ok(metadata) => {
-            if let Ok(modified) = metadata.modified() {
-                if let Ok(age) = modified.elapsed() {
-                    return age.as_secs() > BROKER_FLAG_STALE_SECS;
-                }
-            }
-            false
-        }
-        Err(_) => true, // No flag = treat as stale (cleared)
-    }
-}
-
-/// Self-healing check: returns true if broker-failed flag should be reported.
-/// Auto-clears stale flags (>24h old).
-pub fn should_report_broker_failed(base_dir: &Path, account: AccountNum) -> bool {
-    let path = base_dir
-        .join("credentials")
-        .join(format!("{}.broker-failed", account));
-
-    if !path.exists() {
-        return false;
-    }
-
-    if is_broker_flag_stale(base_dir, account) {
-        let _ = std::fs::remove_file(&path);
-        return false;
-    }
-
-    true
 }
 
 /// Context the CLI supplies to [`rich_statusline`] after parsing
@@ -335,12 +289,11 @@ pub fn rich_statusline(
     account: AccountNum,
     label: &str,
     quota: Option<&AccountQuota>,
-    broker_failed: bool,
     ctx: &StatuslineContext,
 ) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(6);
 
-    let core = statusline_str(account, label, quota, broker_failed);
+    let core = statusline_str(account, label, quota);
     if ctx.is_csq_terminal {
         parts.push(format!("⚡csq {core}"));
     } else {
@@ -618,7 +571,6 @@ mod tests {
             AccountNum::try_from(3u16).unwrap(),
             "user@test.com",
             Some(&quota),
-            false,
         );
         assert_eq!(s, "#3:user@test.com 5h:42% 7d:15%");
     }
@@ -627,40 +579,25 @@ mod tests {
     // with `is_swap_stuck` (no production "stuck" semantic under handle-dir
     // model; see comment near `is_swap_stuck`'s retirement marker above).
 
+    /// The quota line NEVER embeds the login-needed state: `csq statusline`
+    /// prints that message on its own line (`sentinel::login_needed_line`),
+    /// explicitly distinct from the quota display. Pins the pre-fix
+    /// `LOGIN-NEEDED ` prefix out of `statusline_str` — its return would
+    /// make this assertion fail.
     #[test]
-    fn statusline_broker_failed() {
-        let s = statusline_str(AccountNum::try_from(2u16).unwrap(), "user", None, true);
-        assert!(s.starts_with("LOGIN-NEEDED"));
-        assert!(s.contains("#2:user"));
+    fn statusline_quota_line_never_embeds_login_needed() {
+        let s = statusline_str(AccountNum::try_from(2u16).unwrap(), "user", None);
+        assert_eq!(s, "#2:user no data");
+        assert!(
+            !s.contains("LOGIN-NEEDED") && !s.contains("login needed"),
+            "the login-needed banner belongs to its own line, got {s:?}"
+        );
     }
 
     #[test]
     fn statusline_no_data() {
-        let s = statusline_str(AccountNum::try_from(5u16).unwrap(), "user", None, false);
+        let s = statusline_str(AccountNum::try_from(5u16).unwrap(), "user", None);
         assert_eq!(s, "#5:user no data");
-    }
-
-    #[test]
-    fn is_broker_flag_stale_missing_file() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let account = AccountNum::try_from(1u16).unwrap();
-        assert!(is_broker_flag_stale(dir.path(), account));
-    }
-
-    #[test]
-    fn should_report_broker_failed_no_flag() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let account = AccountNum::try_from(1u16).unwrap();
-        assert!(!should_report_broker_failed(dir.path(), account));
-    }
-
-    #[test]
-    fn should_report_broker_failed_fresh_flag() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let account = AccountNum::try_from(2u16).unwrap();
-        crate::refresh::sentinel::set_broker_failed(dir.path(), account, "test").unwrap();
-        // Fresh flag should be reported
-        assert!(should_report_broker_failed(dir.path(), account));
     }
 
     // ── rich_statusline + parse_cc_stdin ─────────────────────
@@ -702,7 +639,6 @@ mod tests {
             AccountNum::try_from(1u16).unwrap(),
             "user@test.com",
             Some(&quota),
-            false,
             &ctx,
         );
         assert_eq!(
@@ -730,7 +666,6 @@ mod tests {
             AccountNum::try_from(11u16).unwrap(),
             "DeepSeek",
             Some(&quota),
-            false,
             &ctx,
         );
         // 180000 / 1_000_000 = 18%, NOT 89%.
@@ -750,12 +685,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let s = statusline_str(
-            AccountNum::try_from(11u16).unwrap(),
-            "DeepSeek",
-            Some(&q),
-            false,
-        );
+        let s = statusline_str(AccountNum::try_from(11u16).unwrap(), "DeepSeek", Some(&q));
         assert_eq!(s, "#11:DeepSeek $196.42");
     }
 
@@ -769,12 +699,7 @@ mod tests {
             balance: None,
             ..Default::default()
         };
-        let s = statusline_str(
-            AccountNum::try_from(11u16).unwrap(),
-            "DeepSeek",
-            Some(&q),
-            false,
-        );
+        let s = statusline_str(AccountNum::try_from(11u16).unwrap(), "DeepSeek", Some(&q));
         assert_eq!(s, "#11:DeepSeek balance n/a");
         assert!(!s.contains("5h:"), "must not render a 5h/7d window: {s}");
     }
@@ -812,12 +737,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let s = statusline_str(
-            AccountNum::try_from(16u16).unwrap(),
-            "grok",
-            Some(&q),
-            false,
-        );
+        let s = statusline_str(AccountNum::try_from(16u16).unwrap(), "grok", Some(&q));
         assert_eq!(s, "#16:grok 5h:0% 7d:7%");
         assert!(
             !s.contains('$'),
@@ -839,12 +759,7 @@ mod tests {
             balance: None,
             ..Default::default()
         };
-        let s = statusline_str(
-            AccountNum::try_from(16u16).unwrap(),
-            "grok",
-            Some(&q),
-            false,
-        );
+        let s = statusline_str(AccountNum::try_from(16u16).unwrap(), "grok", Some(&q));
         assert_eq!(s, "#16:grok 5h:0% 7d:42%");
         assert!(
             !s.contains("balance n/a"),
@@ -902,7 +817,6 @@ mod tests {
             AccountNum::try_from(11u16).unwrap(),
             "DeepSeek",
             Some(&quota),
-            false,
             &ctx,
         );
         assert!(
@@ -921,7 +835,6 @@ mod tests {
             AccountNum::try_from(4u16).unwrap(),
             "u@e",
             Some(&quota),
-            false,
             &ctx,
         );
         assert_eq!(s, "#4:u@e 5h:10% 7d:15%");
@@ -943,13 +856,7 @@ mod tests {
             is_csq_terminal: true,
             ..Default::default()
         };
-        let s = rich_statusline(
-            AccountNum::try_from(1u16).unwrap(),
-            "u",
-            Some(&quota),
-            false,
-            &ctx,
-        );
+        let s = rich_statusline(AccountNum::try_from(1u16).unwrap(), "u", Some(&quota), &ctx);
         assert!(!s.contains("ctx:"), "got: {s}");
         assert!(!s.contains("$"), "got: {s}");
     }
@@ -964,13 +871,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let s = rich_statusline(
-            AccountNum::try_from(1u16).unwrap(),
-            "u",
-            Some(&quota),
-            false,
-            &ctx,
-        );
+        let s = rich_statusline(AccountNum::try_from(1u16).unwrap(), "u", Some(&quota), &ctx);
         assert!(s.contains("git:main"));
         assert!(!s.contains("git:main●"));
     }
@@ -986,7 +887,6 @@ mod tests {
             AccountNum::try_from(1u16).unwrap(),
             "u",
             Some(&quota),
-            false,
             &vanilla,
         );
         assert!(!s_vanilla.contains("⚡csq"));
@@ -995,13 +895,7 @@ mod tests {
             is_csq_terminal: true,
             ..Default::default()
         };
-        let s_csq = rich_statusline(
-            AccountNum::try_from(1u16).unwrap(),
-            "u",
-            Some(&quota),
-            false,
-            &csq,
-        );
+        let s_csq = rich_statusline(AccountNum::try_from(1u16).unwrap(), "u", Some(&quota), &csq);
         assert!(s_csq.starts_with("⚡csq "));
     }
 
@@ -1116,7 +1010,7 @@ mod tests {
         // Verify the sanitized label renders correctly through statusline_str
         // without any control bytes leaking to the output.
         let account = AccountNum::try_from(1u16).unwrap();
-        let rendered = statusline_str(account, &sanitized, None, false);
+        let rendered = statusline_str(account, &sanitized, None);
         assert!(
             !rendered.bytes().any(|b| b < 0x20),
             "statusline output must contain no control chars after sanitization"
@@ -1132,7 +1026,7 @@ mod tests {
             session_cost_unknown: true,
             ..Default::default()
         };
-        let out = rich_statusline(AccountNum::try_from(1u16).unwrap(), "a", None, false, &ctx);
+        let out = rich_statusline(AccountNum::try_from(1u16).unwrap(), "a", None, &ctx);
         assert!(out.contains("| $?"), "{out}");
         assert!(!out.contains("9.99"), "{out}");
     }

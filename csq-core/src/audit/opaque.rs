@@ -68,7 +68,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
-use crate::audit::types::{Ed25519Signature, KeyId, RecordId, Sha256Hex};
+use crate::audit::types::{Ed25519Signature, EventKind, KeyId, RecordId, Sha256Hex};
 
 /// A signed chain record whose `EventKind` is not recognized by this binary.
 ///
@@ -212,6 +212,40 @@ pub(crate) fn canonical_bytes_for_opaque_check4(r: &OpaqueRecord) -> Vec<u8> {
 /// `canonical_hash` — the pre-image for the NEXT record's `prev_hash` link.
 pub(crate) fn canonical_bytes_for_opaque_link(r: &OpaqueRecord) -> Vec<u8> {
     r.canonical_bytes(r.canonical_hash.as_str())
+}
+
+/// Outcome of admitting one JSONL line through the forward-compat path.
+pub(crate) enum OpaqueAdmission {
+    /// A well-formed record whose `kind` this build genuinely does not know.
+    ///
+    /// Boxed: `OpaqueRecord` is ~400 bytes and the other two variants are a
+    /// `u64` and a unit, so an unboxed variant would make every `Result` and
+    /// every match payload in the readers carry the largest record size.
+    Opaque(Box<OpaqueRecord>),
+    /// The kind IS known but its typed payload failed to parse. an internal ticket: this is
+    /// corruption, never version skew, and MUST NOT be downgraded to opaque.
+    KnownKindInvalid { seq: u64 },
+    /// Not even a well-formed v2 envelope.
+    Unrecognised,
+}
+
+/// Shared an internal ticket admission rule for consumers that parse chain lines outside
+/// [`verify_chain`](crate::audit::verify::verify_chain).
+///
+/// A line that fails the typed parse is admitted as opaque ONLY when its
+/// top-level `kind` is unknown to this build. Checking the taxonomy here (not
+/// merely "the opaque parse succeeded") is load-bearing: `OpaqueRecord` accepts
+/// any payload, so without this a recognized kind with invalid fields would be
+/// silently downgraded and its semantic checks skipped.
+pub(crate) fn admit_opaque(line: &str) -> OpaqueAdmission {
+    let Ok(record) = serde_json::from_str::<OpaqueRecord>(line) else {
+        return OpaqueAdmission::Unrecognised;
+    };
+    let seq = record.seq;
+    if serde_json::from_value::<EventKind>(serde_json::Value::String(record.kind.clone())).is_ok() {
+        return OpaqueAdmission::KnownKindInvalid { seq };
+    }
+    OpaqueAdmission::Opaque(Box::new(record))
 }
 
 #[cfg(test)]

@@ -2726,10 +2726,15 @@ impl BridgeIo for ProductionIo {
         slot: AccountNum,
         allow_classes: &[String],
     ) -> Result<SwapOutcome, SwapError> {
-        // Daemon-known verdict, never a probe: a slot whose credential refresh
-        // is broker-failed cannot authenticate, so binding a live session to it
-        // is refused BEFORE any handle-dir, credential or marker operation.
-        let target_login_dead = crate::refresh::sentinel::is_broker_failed(base_dir, slot);
+        // Daemon-known verdict, never a probe: only a slot in the classified
+        // LOGIN-NEEDED state is refused — it cannot authenticate, so binding a
+        // live session to it is refused BEFORE any handle-dir, credential or
+        // marker operation. An UNKNOWN marker (generic tag from the
+        // pre-classification writer, unreadable file) is NOT evidence the
+        // credential is dead: refusing on it would strand a healthy slot, so
+        // the swap proceeds (guard-reader-writer-parity.md MUST-2 fail-open).
+        let target_login_dead =
+            crate::refresh::sentinel::login_needed_state(base_dir, slot).is_login_needed();
         crate::session::swap_session::swap_session_from_bridge_for_recipient(
             base_dir,
             target,
@@ -2879,6 +2884,11 @@ mod tests {
         batches: Arc<Mutex<VecDeque<ScriptedBatch>>>,
         sent: Arc<Mutex<Vec<(i64, String)>>>,
         polls: Arc<AtomicUsize>,
+        /// Optional cap on `get_updates` calls, for a test that must fail
+        /// rather than hang if the bridge starts polling without yielding.
+        /// `tokio::time::timeout` cannot fire in that case: the runtime never
+        /// regains control to poll the timer.
+        poll_budget: Option<usize>,
         alert: Arc<tokio::sync::Notify>,
         /// Fired after every `getUpdates` call, so a test can wait for the
         /// loop to consume a scripted batch without sleeping.
@@ -2891,6 +2901,7 @@ mod tests {
                 batches: Arc::new(Mutex::new(VecDeque::new())),
                 sent: Arc::new(Mutex::new(Vec::new())),
                 polls: Arc::new(AtomicUsize::new(0)),
+                poll_budget: None,
                 alert: Arc::new(tokio::sync::Notify::new()),
                 batch_ready: Arc::new(tokio::sync::Notify::new()),
             }
@@ -2899,6 +2910,13 @@ mod tests {
         /// Queues one `getUpdates` reply.
         fn push_batch(&self, updates: Vec<TelegramUpdate>) {
             self.batches.lock().unwrap().push_back(Ok(updates));
+        }
+
+        /// Bounds `get_updates` calls so a spinning loop panics RED instead of
+        /// hanging the test (and its mutant run) indefinitely.
+        fn with_poll_budget(mut self, budget: usize) -> Self {
+            self.poll_budget = Some(budget);
+            self
         }
 
         fn always_conflict() -> Self {
@@ -2922,7 +2940,14 @@ mod tests {
             _token: &str,
             _offset: u64,
         ) -> Result<Vec<TelegramUpdate>, TelegramError> {
-            self.polls.fetch_add(1, Ordering::SeqCst);
+            let polls = self.polls.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some(budget) = self.poll_budget {
+                assert!(
+                    polls <= budget,
+                    "get_updates ran {polls} times, over the {budget}-poll budget: \
+                     the loop is spinning without yielding"
+                );
+            }
             let result = match self.batches.lock().unwrap().pop_front() {
                 Some(result) => result.map_err(TelegramError::new),
                 None => Err(TelegramError::new(TelegramErrorKind::Transport)),
@@ -3938,7 +3963,12 @@ mod tests {
             tag: "bridge_store_undetermined",
             permanent: false,
         });
-        let post = FakePost::new();
+        // Bound both loops. `tokio::time::timeout` alone cannot catch a
+        // mutant that spins without yielding: the runtime never regains
+        // control to poll the timer, so the test hangs instead of failing.
+        // The poll budget trips inside `get_updates`; the turn cap below trips
+        // in this test's own loop, which can also spin on stored permits.
+        let post = FakePost::new().with_poll_budget(16);
         // Batch 1: update 1 fails to store and must halt the batch, so update 2
         // is NOT attempted. Telegram re-delivers from the persisted offset, so
         // batch 2 carries both updates again.
@@ -3959,7 +3989,13 @@ mod tests {
             &io,
         ));
         let stored = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut turns = 0usize;
             loop {
+                turns += 1;
+                assert!(
+                    turns <= 64,
+                    "the retry loop spun {turns} turns without both updates being stored"
+                );
                 let ids = io.stored_ids();
                 if ids.len() >= 2 {
                     break ids;

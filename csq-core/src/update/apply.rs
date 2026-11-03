@@ -28,8 +28,10 @@
 //! On Windows, `platform::fs::atomic_replace` requires the temp and target to
 //! have the same parent path. It pins that parent, validates the source as a
 //! regular, non-reparse, single-link file, and renames through that source handle.
-//! It first requests POSIX replacement semantics; only an unsupported rename
-//! class/status selects the plain replacing rename through the same handle.
+//! It first requests POSIX replacement semantics; an unsupported rename class or
+//! the measured extended-class-only ACCESS_DENIED selects the plain replacing
+//! rename through the same handle (any refusal the two classes share is
+//! re-asserted by the plain class).
 //! Neither path deletes the target first or creates an empty target placeholder.
 //! The validated source handle pins its identity against rename/delete, but the
 //! path-based updater does not retain its original writer or freeze content.

@@ -36,10 +36,24 @@ pub(crate) static OAUTH_ERROR_TYPES: &[&str] = &[
 /// Extracts an RFC 6749 §5.2 OAuth error-type string from a JSON response
 /// body, returning a `&'static str` from `OAUTH_ERROR_TYPES` on match.
 ///
+/// Two shapes are recognised, both observed on Anthropic's token endpoint
+/// (`oauth::exchange`'s module docs record the API-style one as observed on
+/// `platform.claude.com`; `http::post_form`/`post_json` record the
+/// RFC 6749 string form as observed on refresh):
+///
+/// - **RFC 6749 §5.2** — `{"error": "invalid_grant", ...}`: the `error`
+///   field is the category string itself.
+/// - **API-style** — `{"error": {"type": "invalid_grant", ...}}`: the
+///   category is the inner `type` field. `type` values such as
+///   `invalid_request_error` or `rate_limit_error` are NOT in the
+///   allowlist and therefore classify as `None` (retryable), exactly like
+///   any other unrecognised string.
+///
 /// Returns `None` when:
 /// - The body is not valid JSON
-/// - The `error` field is absent or not a string
-/// - The `error` value does not exactly match an allowlisted string
+/// - The `error` field is absent, or is neither a string nor an object
+///   carrying a string `type`
+/// - The category value does not exactly match an allowlisted string
 ///   (prefix extensions like `"invalid_scope_extended"` are rejected)
 ///
 /// # Security
@@ -49,15 +63,20 @@ pub(crate) static OAUTH_ERROR_TYPES: &[&str] = &[
 /// injection: an attacker who controls the upstream response body cannot
 /// exfiltrate arbitrary content through this function even if they can
 /// reproduce an allowlisted string verbatim, because the returned bytes
-/// are always from the compile-time constant. Only the `error` field is
-/// consulted — `error_description` is free-form and attacker-controlled
-/// and is never examined here.
+/// are always from the compile-time constant. Only the category field is
+/// consulted — `error_description`/`message` are free-form and
+/// attacker-controlled and are never examined here.
 pub fn extract_oauth_error_type(body: &str) -> Option<&'static str> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    let error_str = value.get("error")?.as_str()?;
+    let error = value.get("error")?;
+    let category = match error {
+        serde_json::Value::String(category) => category.as_str(),
+        serde_json::Value::Object(fields) => fields.get("type")?.as_str()?,
+        _ => return None,
+    };
     OAUTH_ERROR_TYPES
         .iter()
-        .find(|&&allowlisted| error_str == allowlisted)
+        .find(|&&allowlisted| category == allowlisted)
         .copied()
 }
 
@@ -153,10 +172,18 @@ impl From<CsqError> for String {
             CsqError::Credential(CredentialError::InvalidAccount(_)) => {
                 format!("INVALID_INPUT: {e}")
             }
-            CsqError::Broker(BrokerError::RefreshTokenInvalid { .. })
-            | CsqError::Broker(BrokerError::CodexTokenExpired { .. })
+            CsqError::Broker(BrokerError::CodexTokenExpired { .. })
             | CsqError::Broker(BrokerError::CodexRefreshReused { .. })
             | CsqError::Broker(BrokerError::CodexTokenInvalidated { .. }) => {
+                format!("LOGIN_REQUIRED: {e}")
+            }
+            // Only the PERMANENT categories surface as LOGIN_REQUIRED; a
+            // retryable provider rejection stays INTERNAL_ERROR so an IPC
+            // consumer does not tell the operator to re-login for a slot
+            // whose credential is fine.
+            CsqError::OAuth(OAuthError::RefreshRejected { category, .. })
+                if login_needed_category(category) =>
+            {
                 format!("LOGIN_REQUIRED: {e}")
             }
             CsqError::OAuth(OAuthError::StateMismatch) => format!("CSRF_ERROR: {e}"),
@@ -175,34 +202,57 @@ impl From<CsqError> for String {
 /// so existing consumers never break.
 ///
 /// Returned values (sorted):
-/// - `"broker_refresh_failed"` — canonical refresh + sibling
-///   recovery both failed for a slot
-/// - `"broker_token_invalid"` — upstream rejected the refresh
-///   token (`invalid_grant`), needs re-login
-/// - `"broker_other"` — broker error that isn't the above
+/// - `"broker_refresh_failed"` — canonical refresh failed for a slot
 /// - `"codex_refresh_reused"` — OpenAI `refresh_token_reused`, needs re-login
 /// - `"codex_token_expired"` — OpenAI `token_expired`, needs re-login
 /// - `"codex_token_invalidated"` — OpenAI `token_invalidated`, needs re-login
 /// - `"config"` — local config file error
 /// - `"credential"` — reading/writing credential file on disk
 /// - `"daemon"` — daemon lifecycle error
-/// - `"oauth"` — OAuth flow error (typically re-login)
+/// - `"oauth"` — OAuth flow error whose body could not be classified
 /// - `"other"` — unclassified / anyhow-wrapped
 /// - `"platform"` — platform-specific syscall error
+/// - an allowlisted OAuth category (`"invalid_grant"`, `"invalid_scope"`, …)
+///   — a provider rejection the `credentials::refresh` extractor classified,
+///   returned verbatim from `OAUTH_ERROR_TYPES`
 pub fn error_kind_tag(e: &CsqError) -> &'static str {
     match e {
         CsqError::Credential(_) => "credential",
         CsqError::Platform(_) => "platform",
-        CsqError::Broker(BrokerError::RefreshTokenInvalid { .. }) => "broker_token_invalid",
-        CsqError::Broker(BrokerError::RefreshFailed { .. }) => "broker_refresh_failed",
-        CsqError::Broker(BrokerError::CodexTokenExpired { .. }) => "codex_token_expired",
-        CsqError::Broker(BrokerError::CodexRefreshReused { .. }) => "codex_refresh_reused",
-        CsqError::Broker(BrokerError::CodexTokenInvalidated { .. }) => "codex_token_invalidated",
+        // A classified provider rejection carries its allowlisted category
+        // (`invalid_grant`, `unauthorized_client`, …) so the sentinel reason
+        // and every log field name the REAL class instead of a generic tag.
+        CsqError::Broker(error) => error.kind_tag(),
+        CsqError::OAuth(OAuthError::RefreshRejected { category, .. }) => category,
         CsqError::OAuth(_) => "oauth",
         CsqError::Daemon(_) => "daemon",
         CsqError::Config(_) => "config",
         CsqError::Other(_) => "other",
     }
+}
+
+/// Whether an allowlisted OAuth error category means the refresh grant is
+/// DEAD and only a fresh interactive login can recover the slot.
+///
+/// - `invalid_grant` — RFC 6749 §5.2: the refresh token is invalid, expired
+///   or revoked. Re-presenting it cannot succeed.
+/// - `unauthorized_client` — RFC 6749 §5.2: this client is not authorized to
+///   use the refresh grant. Also terminal without a new authorization.
+///
+/// **`invalid_request` is deliberately RETRYABLE.** It means the request
+/// itself was malformed (a csq bug: wrong content type, a forbidden field,
+/// a body shape the endpoint stopped accepting — see an internal journal entry's
+/// JSON-only switch), never that the user's grant is dead. Marking a slot
+/// login-needed would tell the operator to re-authenticate an account whose
+/// credential is fine, which is the false-login-demand class this
+/// classification exists to end. Nothing in the tree or its fixtures shows
+/// Anthropic answering `invalid_request` for a dead token, so it is NOT
+/// promoted without evidence. The same holds for `invalid_scope`,
+/// `unsupported_grant_type` and the RFC 8628 device-auth codes
+/// (`authorization_pending`, `slow_down`, `access_denied`, `expired_token`):
+/// all stay retryable.
+pub fn login_needed_category(category: &str) -> bool {
+    matches!(category, "invalid_grant" | "unauthorized_client")
 }
 
 #[derive(Error, Debug)]
@@ -641,21 +691,27 @@ pub enum BrokerError {
     #[error("refresh failed for account {account}: {reason}")]
     RefreshFailed { account: u16, reason: String },
 
-    #[error("refresh token invalid for account {account} (re-login required)")]
-    RefreshTokenInvalid { account: u16 },
-
     // M3-7 fix-wave R1 H4: `AllSiblingsDead` and `RecoveryFailed` were sibling-
     // recovery error variants. Sibling recovery is retired (`refresh/check.rs`
     // post-M3-7 has no fanout path), so these variants have no production
     // construction sites. Deleted per zero-tolerance Rule 5.
+    //
+    // L-4 (2026-11-02): `RefreshTokenInvalid` was the third dead variant. Its
+    // `kind_tag` was documented retryable but `From<CsqError> for String`
+    // mapped it to LOGIN_REQUIRED and `reason_means_login_needed` did not
+    // accept `broker_token_invalid` — a latent semantic split with no
+    // production constructor. Deleted (repo-wide grep found only tests), so a
+    // future producer cannot demand a login over IPC while leaving the
+    // sentinel and the launch gate unarmed.
     /// Codex OAuth returned `code: "token_expired"`.
     ///
-    /// Distinguished from generic `RefreshTokenInvalid` because OpenAI's
-    /// `/oauth/token` endpoint emits this specific code when the submitted
-    /// refresh token's signature or expiry has lapsed, which differs
-    /// semantically from a reused-refresh-token scenario. Surfaces specific
-    /// UI text ("your Codex session has expired — run `codex login`")
-    /// instead of the generic re-login prompt. an internal journal entry / 0010.
+    /// Historically distinguished from the deleted generic
+    /// `RefreshTokenInvalid` because OpenAI's `/oauth/token` endpoint emits
+    /// this specific code when the submitted refresh token's signature or
+    /// expiry has lapsed, which differs semantically from a
+    /// reused-refresh-token scenario. Surfaces specific UI text ("your Codex
+    /// session has expired — run `codex login`") instead of the generic
+    /// re-login prompt. an internal journal entry / 0010.
     #[error("codex token expired for account {account} (re-login required)")]
     CodexTokenExpired { account: u16 },
 
@@ -681,6 +737,28 @@ pub enum BrokerError {
     CodexTokenInvalidated { account: u16 },
 }
 
+impl BrokerError {
+    /// Returns the fixed-vocabulary tag for this broker error.
+    ///
+    /// Single source of truth for the `error_kind` log field and the
+    /// login-needed sentinel reason: [`error_kind_tag`] delegates here for
+    /// the `CsqError::Broker` arm, and the daemon's refresh-failure log uses
+    /// it directly (it holds a `BrokerError`, not a `CsqError`, and must not
+    /// format `Display` — the `RefreshFailed.reason` string is redacted but
+    /// still richer than a log field needs).
+    ///
+    /// Only the three Codex variants mean "a fresh login is the only
+    /// recovery"; `RefreshFailed` stays retryable.
+    pub fn kind_tag(&self) -> &'static str {
+        match self {
+            BrokerError::RefreshFailed { .. } => "broker_refresh_failed",
+            BrokerError::CodexTokenExpired { .. } => "codex_token_expired",
+            BrokerError::CodexRefreshReused { .. } => "codex_refresh_reused",
+            BrokerError::CodexTokenInvalidated { .. } => "codex_token_invalidated",
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum OAuthError {
     #[error("http error: {status} {}", sanitize_body(body))]
@@ -697,6 +775,31 @@ pub enum OAuthError {
 
     #[error("token exchange failed: {0}")]
     Exchange(String),
+
+    /// The provider answered a refresh request with a structured OAuth error
+    /// document whose category matched `OAUTH_ERROR_TYPES`.
+    ///
+    /// Distinct from [`OAuthError::Exchange`] so the refresh path can
+    /// CLASSIFY the rejection instead of treating every provider answer as
+    /// an opaque string: a [`Self::RefreshRejected`] carries the allowlisted
+    /// `category` as a `&'static str` (never a slice of the upstream body),
+    /// which [`crate::refresh::sentinel`] uses to decide whether the slot is
+    /// permanently login-needed (`invalid_grant`, `unauthorized_client`) or
+    /// merely retrying. `Exchange` remains the variant for unclassifiable
+    /// bodies (schema drift, non-JSON, API-style `type`s outside the
+    /// allowlist), all of which stay retryable.
+    ///
+    /// `detail` is the redacted human-readable detail built by
+    /// `credentials::refresh` — already through `redact_tokens`, because an
+    /// OAuth error body can echo fragments of the submitted refresh token.
+    #[error("refresh rejected: {detail}")]
+    RefreshRejected {
+        /// A `&'static str` from `OAUTH_ERROR_TYPES` — compile-time
+        /// vocabulary, never a slice of the upstream response.
+        category: &'static str,
+        /// Redacted diagnostic detail. Display-safe; never a raw body.
+        detail: String,
+    },
 
     /// The race orchestrator's paste channel was closed without a
     /// value being sent — typically because the user closed the
@@ -939,13 +1042,6 @@ mod tests {
     }
 
     #[test]
-    fn broker_error_display() {
-        let err = BrokerError::RefreshTokenInvalid { account: 3 };
-        assert!(format!("{err}").contains("account 3"));
-        assert!(format!("{err}").contains("re-login"));
-    }
-
-    #[test]
     fn codex_token_expired_tag_and_ipc_mapping() {
         let e = CsqError::Broker(BrokerError::CodexTokenExpired { account: 7 });
         assert_eq!(error_kind_tag(&e), "codex_token_expired");
@@ -1085,8 +1181,93 @@ mod tests {
         }
     }
 
-    /// L3: `CredentialError::RepointFailed`'s `#[error("repoint failed on
-    /// {path}: {source}")]` Display bakes the raw absolute path in
+    /// The API-style shape (`{"error": {"type": "…"}}`) is observed on the
+    /// token endpoint too (`oauth::exchange`'s docs), so the same allowlist
+    /// must classify it. A `type` outside the allowlist (`rate_limit_error`,
+    /// the API-style convention) stays unclassified — retryable.
+    #[test]
+    fn extract_oauth_error_type_classifies_api_style_type_field() {
+        assert_eq!(
+            extract_oauth_error_type(r#"{"error":{"type":"invalid_grant","message":"x"}}"#),
+            Some("invalid_grant")
+        );
+        assert_eq!(
+            extract_oauth_error_type(r#"{"error":{"type":"invalid_scope","message":"x"}}"#),
+            Some("invalid_scope")
+        );
+        assert_eq!(
+            extract_oauth_error_type(r#"{"error":{"type":"rate_limit_error","message":"x"}}"#),
+            None,
+            "API-style `*_error` types are outside the OAuth allowlist"
+        );
+        assert_eq!(
+            extract_oauth_error_type(r#"{"error":{"type":"injected.invalid_grant"}}"#),
+            None,
+            "exact match only — no prefix/suffix extension"
+        );
+        assert_eq!(
+            extract_oauth_error_type(r#"{"error":{"message":"no type"}}"#),
+            None
+        );
+        assert_eq!(extract_oauth_error_type(r#"{"error": 5}"#), None);
+    }
+
+    /// The API-style category must also be pointer-into-the-constant, not a
+    /// slice of the attacker-controlled body.
+    #[test]
+    fn extract_oauth_error_type_api_style_returns_static_pointer() {
+        let body = r#"{"error" : { "type" : "invalid_grant" }}"#;
+        let result = extract_oauth_error_type(body).expect("should match");
+        let constant: &'static str = OAUTH_ERROR_TYPES
+            .iter()
+            .find(|&&entry| entry == "invalid_grant")
+            .copied()
+            .unwrap();
+        assert!(std::ptr::eq(result.as_ptr(), constant.as_ptr()));
+    }
+
+    /// The permanence split. `invalid_grant` / `unauthorized_client` are the
+    /// only OAuth categories that mean "a fresh login is the only recovery";
+    /// `invalid_request` and `invalid_scope` are explicitly retryable (see
+    /// `login_needed_category`'s doc for why).
+    #[test]
+    fn login_needed_category_is_the_two_terminal_categories_only() {
+        assert!(login_needed_category("invalid_grant"));
+        assert!(login_needed_category("unauthorized_client"));
+        for retryable in [
+            "invalid_request",
+            "invalid_scope",
+            "unsupported_grant_type",
+            "authorization_pending",
+            "slow_down",
+            "access_denied",
+            "expired_token",
+            "oauth",
+            "credential",
+        ] {
+            assert!(
+                !login_needed_category(retryable),
+                "{retryable} must stay retryable"
+            );
+        }
+    }
+
+    /// A classified rejection's `error_kind_tag` IS its allowlisted category
+    /// (fixed vocabulary, no free-form text). An unclassified `Exchange`
+    /// still tags as `"oauth"`.
+    #[test]
+    fn error_kind_tag_carries_the_classified_oauth_category() {
+        let rejected = CsqError::OAuth(OAuthError::RefreshRejected {
+            category: "invalid_grant",
+            detail: "invalid_grant: revoked".into(),
+        });
+        assert_eq!(error_kind_tag(&rejected), "invalid_grant");
+
+        let opaque = CsqError::OAuth(OAuthError::Exchange("schema drift".into()));
+        assert_eq!(error_kind_tag(&opaque), "oauth");
+    }
+
+    /// L3: `CredentialError::RepointFailed`'s `#[error("repoint failed on    /// {path}: {source}")]` Display bakes the raw absolute path in
     /// unconditionally — this is the exact shape `csq swap`'s error chain
     /// carries up through `anyhow::Error`'s `.context()` chain to
     /// `main.rs`'s `eprintln!("Error: {e:?}")`. Redacting the CLI's

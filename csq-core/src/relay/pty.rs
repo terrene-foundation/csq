@@ -60,6 +60,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use super::term::{self, Decline, RawGuard};
+use super::types::SessionIdentity;
 
 /// How long the relay keeps draining the master after the child exits
 /// (spec 34 §34.2.1 (g), CHOSEN). The bound covers reading AND writing the
@@ -198,6 +199,7 @@ struct SpawnFailure {
     /// The CLI had already been exec'ed (and has been told to end): the caller
     /// must treat the launch as started.
     started: bool,
+    op: &'static str,
 }
 
 impl SpawnFailure {
@@ -208,7 +210,7 @@ impl SpawnFailure {
     fn into_relay_error(self) -> RelayError {
         let errno = self.raw_os_error().unwrap_or(0);
         if self.started {
-            return RelayError::ChildStarted { op: "fcntl", errno };
+            return RelayError::ChildStarted { op: self.op, errno };
         }
         match self.drop_step {
             Some(step) => RelayError::PrivilegeDropFailed { step, errno },
@@ -223,6 +225,7 @@ impl From<io::Error> for SpawnFailure {
             err,
             drop_step: None,
             started: false,
+            op: "spawn",
         }
     }
 }
@@ -1751,6 +1754,16 @@ unsafe fn shim_main(plan: &ShimPlan) -> ! {
             shim_fail(st, e, 126);
         }
         SHIM_CLI.store(cli, Ordering::Release);
+        // This fixed-size frame precedes every stop report and gate release:
+        // the parent learns this actual fork's PID, never the shim's PID.
+        let mut identity = [b'I', 0, 0, 0, 0];
+        identity[1..].copy_from_slice(&cli.to_le_bytes());
+        if libc::write(SHIM_UP, identity.as_ptr().cast(), identity.len()) != identity.len() as isize
+        {
+            let e = *errno_location();
+            libc::kill(-cli, libc::SIGKILL);
+            shim_fail(st, e, 126);
+        }
         if libc::write(gate[1], b"g".as_ptr().cast(), 1) != 1 {
             let e = *errno_location();
             libc::kill(-cli, libc::SIGKILL);
@@ -2015,6 +2028,7 @@ fn set_cloexec_always(fd: RawFd) -> io::Result<()> {
 /// shim reports CLI stops on.
 pub struct Spawned {
     pid: libc::pid_t,
+    cli_pid: libc::pid_t,
     ctl: OwnedFd,
     up: OwnedFd,
 }
@@ -2077,9 +2091,27 @@ fn spawn_on_slave(spec: &LaunchSpec, slave: OwnedFd) -> Result<Spawned, SpawnFai
             err: io::Error::from_raw_os_error(errno),
             drop_step,
             started: false,
+            op: "spawn",
         });
     }
-    finish_spawn(pid, up_r, ctl_w, &set_nonblock)
+    let cli_pid = match read_cli_pid(
+        up_r.as_raw_fd(),
+        Duration::from_millis(SPAWN_STATUS_WAIT_MS),
+    ) {
+        Ok(cli) => cli,
+        Err(err) => {
+            terminate_child(pid, Duration::from_millis(TERMINATE_GRACE_MS));
+            return Err(SpawnFailure {
+                err,
+                drop_step: None,
+                started: true,
+                op: "cli_identity",
+            });
+        }
+    };
+    let mut spawned = finish_spawn(pid, up_r, ctl_w, &set_nonblock)?;
+    spawned.cli_pid = cli_pid;
+    Ok(spawned)
 }
 
 /// The last step of a spawn, AFTER the CLI has exec'ed: both pipe ends become
@@ -2098,13 +2130,26 @@ fn finish_spawn(
             err,
             drop_step: None,
             started: true,
+            op: "fcntl",
         });
     }
     Ok(Spawned {
         pid,
+        cli_pid: 0,
         ctl: ctl_w,
         up: up_r,
     })
+}
+
+/// A partial identity frame, timeout or unknown tag is uncertain, never
+/// permission to launch another CLI after the shim may have started it.
+fn read_cli_pid(fd: RawFd, bound: Duration) -> io::Result<libc::pid_t> {
+    let (frame, got) = read_startup_status(fd, bound)?;
+    let pid = i32::from_le_bytes([frame[1], frame[2], frame[3], frame[4]]);
+    if got != frame.len() || frame[0] != b'I' || pid <= 0 {
+        return Err(io::Error::from_raw_os_error(libc::EIO));
+    }
+    Ok(pid)
 }
 
 /// Read the startup status message (5 bytes: `E` and an errno) from `fd`,
@@ -2756,6 +2801,95 @@ fn reap(pid: libc::pid_t) -> Result<ChildState, io::Error> {
     }
 }
 
+/// Actual CLI identity, distinct from the relay's retained direct-child shim.
+/// Private fields are populated only after live kernel identity reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayChildIdentity {
+    cli: SessionIdentity,
+    shim_pid: u32,
+}
+
+impl RelayChildIdentity {
+    /// The actual CLI's PID and exact relay incarnation stamp: raw start ticks
+    /// on Linux, Unix start seconds on the other supported platforms.
+    pub const fn cli(self) -> SessionIdentity {
+        self.cli
+    }
+    /// The distinct direct child retained and waited by the byte pump.
+    pub const fn shim_pid(self) -> u32 {
+        self.shim_pid
+    }
+}
+
+/// Lifecycle integration without a master descriptor or terminal writer.
+/// Callbacks run on the byte-loop thread and must return promptly; socket
+/// reads and blocking work belong on separate bounded workers. An error ends
+/// the already-started child and never permits an unrelayed fallback.
+pub trait RelayObserver {
+    /// Observe a live CLI before the first loop tick.
+    fn child_started(&mut self, child: RelayChildIdentity) -> io::Result<()>;
+    /// Process only immediately available bounded work; never wait for input.
+    fn poll_tick(&mut self) -> io::Result<()>;
+    /// Called only for a known shim-mirrored CLI exit after terminal restore.
+    /// Errors/unwinds instead require the caller's own Drop-based cleanup.
+    fn child_exited(&mut self, exit: RelayExit);
+}
+
+/// An exact relay incarnation stamp, separate from wall-clock chronology.
+/// Linux raw start ticks avoid `btime` shifts and second-granularity collisions.
+/// Other platforms retain the relay's existing start-time representation.
+#[must_use]
+pub(crate) fn process_identity_start(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::sessions::ancestor_start(pid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        crate::sessions::process_start_time(pid)
+    }
+}
+
+fn read_cli_identity(
+    cli_pid: libc::pid_t,
+    shim_pid: libc::pid_t,
+) -> io::Result<RelayChildIdentity> {
+    read_cli_identity_with(
+        cli_pid,
+        shim_pid,
+        &process_identity_start,
+        &crate::sessions::parent_pid,
+    )
+}
+
+fn read_cli_identity_with(
+    cli_pid: libc::pid_t,
+    shim_pid: libc::pid_t,
+    start: &dyn Fn(u32) -> Option<u64>,
+    parent: &dyn Fn(u32) -> Option<u32>,
+) -> io::Result<RelayChildIdentity> {
+    let invalid = || io::Error::from_raw_os_error(libc::ESRCH);
+    if cli_pid <= 0 || shim_pid <= 0 || cli_pid == shim_pid {
+        return Err(invalid());
+    }
+    let cli_pid = cli_pid as u32;
+    let shim_pid = shim_pid as u32;
+    let before = start(cli_pid).filter(|v| *v != 0).ok_or_else(invalid)?;
+    if parent(cli_pid) != Some(shim_pid)
+        || start(cli_pid) != Some(before)
+        || parent(cli_pid) != Some(shim_pid)
+    {
+        return Err(invalid());
+    }
+    Ok(RelayChildIdentity {
+        cli: SessionIdentity {
+            pid: cli_pid,
+            started_at: before,
+        },
+        shim_pid,
+    })
+}
+
 /// The overlay-free relay.
 pub struct Relay {
     spec: LaunchSpec,
@@ -2784,6 +2918,19 @@ impl Relay {
     /// [`RelayExit::conclude`]. See the module's caller contract for which
     /// errors allow an unrelayed fallback.
     pub fn run(self) -> Result<RelayExit, RelayError> {
+        self.run_inner(None)
+    }
+
+    /// Run with an actual-CLI lifecycle observer. A CLI that exits before its
+    /// identity can be captured causes a post-start error, never a relaunch.
+    pub fn run_with_observer(
+        self,
+        observer: &mut dyn RelayObserver,
+    ) -> Result<RelayExit, RelayError> {
+        self.run_inner(Some(observer))
+    }
+
+    fn run_inner(self, observer: Option<&mut dyn RelayObserver>) -> Result<RelayExit, RelayError> {
         // The precondition first: a relay that declines hands back to an
         // unrelayed launch, which must not inherit the zeroed core limit.
         term::precondition(STDIN, STDOUT, STDERR).map_err(RelayError::Declined)?;
@@ -2796,8 +2943,12 @@ impl Relay {
         let pty = open_relay_pty(Some(guard.saved()), Some(&ws))?;
         set_nonblock(pty.master.as_raw_fd()).map_err(not_started("fcntl"))?;
         let Pty { master, slave } = pty;
-        let Spawned { pid, ctl, up } =
-            spawn_on_slave(&self.spec, slave).map_err(SpawnFailure::into_relay_error)?;
+        let Spawned {
+            pid,
+            cli_pid,
+            ctl,
+            up,
+        } = spawn_on_slave(&self.spec, slave).map_err(SpawnFailure::into_relay_error)?;
         let mut pump = Pump {
             master,
             pid,
@@ -2813,7 +2964,18 @@ impl Relay {
             resumes: 0,
             cfg: self.cfg,
         };
-        pump.run()
+        if let Some(observer) = observer {
+            let identity =
+                read_cli_identity(cli_pid, pid).map_err(|e| started("cli_identity", e))?;
+            observer
+                .child_started(identity)
+                .map_err(|e| started("observer_start", e))?;
+            let exit = pump.run_observed(Some(&mut *observer))?;
+            observer.child_exited(exit);
+            Ok(exit)
+        } else {
+            pump.run()
+        }
     }
 }
 
@@ -2858,10 +3020,22 @@ impl Drop for Pump {
 
 impl Pump {
     fn run(&mut self) -> Result<RelayExit, RelayError> {
+        self.run_observed(None)
+    }
+
+    fn run_observed(
+        &mut self,
+        mut observer: Option<&mut dyn RelayObserver>,
+    ) -> Result<RelayExit, RelayError> {
         let mut master_open = true;
         let mut stdin_open = true;
         let mut buf = vec![0u8; 8192];
         let exit = 'outer: loop {
+            if let Some(observer) = observer.as_deref_mut() {
+                observer
+                    .poll_tick()
+                    .map_err(|e| started("observer_tick", e))?;
+            }
             let mut fds = [
                 libc::pollfd {
                     fd: self.signals.wake_fd(),
@@ -4304,7 +4478,16 @@ mod tests {
             ..RelayConfig::default()
         };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Relay::new(child, cfg).and_then(Relay::run)
+            let relay = Relay::new(child, cfg)?;
+            if let Some(mode) = env("CSQ_S1A_OBSERVER") {
+                relay.run_with_observer(&mut TestObserver {
+                    mode,
+                    started: false,
+                    ticked: false,
+                })
+            } else {
+                relay.run()
+            }
         }));
         dbg(&format!("relay ended; tty_lost={}", term::tty_lost(STDIN)));
         if term::tty_lost(STDIN) {
@@ -4340,6 +4523,47 @@ mod tests {
                 println!("R-ERR {e}");
                 std::process::exit(50)
             }
+        }
+    }
+
+    struct TestObserver {
+        mode: String,
+        started: bool,
+        ticked: bool,
+    }
+
+    impl RelayObserver for TestObserver {
+        fn child_started(&mut self, child: RelayChildIdentity) -> io::Result<()> {
+            assert!(!self.started);
+            assert_eq!(
+                process_identity_start(child.cli().pid),
+                Some(child.cli().started_at)
+            );
+            assert_eq!(
+                crate::sessions::parent_pid(child.cli().pid),
+                Some(child.shim_pid())
+            );
+            self.started = true;
+            println!("OBSERVER-START {} {}", child.cli().pid, child.shim_pid());
+            if self.mode == "fail_start" {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+            Ok(())
+        }
+        fn poll_tick(&mut self) -> io::Result<()> {
+            assert!(self.started, "tick before actual CLI identity");
+            if !self.ticked {
+                println!("OBSERVER-TICK");
+            }
+            self.ticked = true;
+            if self.mode == "fail_tick" {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+            Ok(())
+        }
+        fn child_exited(&mut self, exit: RelayExit) {
+            assert!(self.started && self.ticked);
+            println!("OBSERVER-EXIT {exit:?}");
         }
     }
 
@@ -6491,7 +6715,7 @@ mod tests {
                 tick();
             }
         }
-        let Spawned { pid, ctl, up } = sp;
+        let Spawned { pid, ctl, up, .. } = sp;
         // The relay "dies": its control pipe closes, nothing else changes.
         drop(ctl);
         let gone = wait_gone(cli);
@@ -7376,6 +7600,154 @@ mod tests {
 
     // -- startup status, parent liveness ---------------------------------
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_relay_identity_reads_raw_start_ticks_without_wall_clock_conversion() {
+        let pid = std::process::id();
+        let raw_ticks = crate::sessions::ancestor_start(pid).expect("own raw start ticks");
+        assert_eq!(
+            process_identity_start(pid),
+            Some(raw_ticks),
+            "relay identities must use raw Linux start ticks"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_cli_identity_keeps_same_second_raw_tick_incarnations_distinct() {
+        // A synthetic 100 Hz clock puts both incarnations in the same second.
+        // The production bracket must compare the complete ticks, not seconds.
+        let before = 10_001_u64;
+        let reused = 10_002_u64;
+        assert_eq!(before / 100, reused / 100);
+        let stable = read_cli_identity_with(21, 20, &|_| Some(before), &|_| Some(20))
+            .expect("stable raw-tick identity");
+        assert_eq!(stable.cli().started_at, before);
+        let reads = std::cell::Cell::new(0);
+        assert!(
+            read_cli_identity_with(
+                21,
+                20,
+                &|_| {
+                    let value = if reads.get() == 0 { before } else { reused };
+                    reads.set(reads.get() + 1);
+                    Some(value)
+                },
+                &|_| Some(20),
+            )
+            .is_err(),
+            "same-second PID reuse must fail the exact raw-tick identity bracket"
+        );
+        assert_eq!(reads.get(), 2);
+    }
+
+    #[test]
+    fn cli_identity_rejects_the_shim_reuse_and_unreadable_starts() {
+        let identity =
+            read_cli_identity_with(21, 20, &|_| Some(100), &|_| Some(20)).expect("valid child");
+        assert_eq!(
+            identity.cli(),
+            SessionIdentity {
+                pid: 21,
+                started_at: 100
+            }
+        );
+        assert_eq!(identity.shim_pid(), 20);
+        assert!(read_cli_identity_with(20, 20, &|_| Some(100), &|_| Some(20)).is_err());
+        assert!(read_cli_identity_with(21, 20, &|_| None, &|_| Some(20)).is_err());
+        assert!(read_cli_identity_with(21, 20, &|_| Some(0), &|_| Some(20)).is_err());
+        assert!(read_cli_identity_with(21, 20, &|_| Some(100), &|_| Some(19)).is_err());
+        let reads = std::cell::Cell::new(0);
+        assert!(
+            read_cli_identity_with(
+                21,
+                20,
+                &|_| {
+                    reads.set(reads.get() + 1);
+                    Some(100 + reads.get())
+                },
+                &|_| Some(20)
+            )
+            .is_err(),
+            "changed start must refuse"
+        );
+    }
+
+    #[test]
+    fn shim_cli_identity_frame_is_complete_bounded_and_distinct_from_reports() {
+        for frame in [
+            vec![],
+            vec![b'I', 1],
+            vec![b'S', 21, 0, 0, 0],
+            vec![b'I', 0, 0, 0, 0],
+        ] {
+            let (r, w) = cloexec_pipe().expect("pipe");
+            write_fd(w.as_raw_fd(), &frame).expect("frame");
+            drop(w);
+            assert!(read_cli_pid(r.as_raw_fd(), Duration::from_millis(50)).is_err());
+        }
+        let (r, w) = cloexec_pipe().expect("pipe");
+        write_fd(w.as_raw_fd(), &[b'I', 21, 0, 0, 0, 0x80]).expect("frame and stop");
+        assert_eq!(
+            read_cli_pid(r.as_raw_fd(), Duration::from_millis(50)).unwrap(),
+            21
+        );
+        let mut stop = [0];
+        assert_eq!(read_fd(r.as_raw_fd(), &mut stop).unwrap(), 1);
+        assert_eq!(stop, [0x80], "identity reader consumed a stop report");
+        let (empty, _held_writer) = cloexec_pipe().expect("pipe");
+        assert!(read_cli_pid(empty.as_raw_fd(), Duration::from_millis(20)).is_err());
+    }
+
+    #[test]
+    fn observer_names_the_real_cli_before_ticks_and_reports_its_actual_exit() {
+        let _env_guard = crate::platform::test_env::lock();
+        let mut o = Outer::start(
+            "echo CLI=$$; read x; exit 7",
+            &[("CSQ_S1A_OBSERVER", "observe")],
+        );
+        let ids = o.wait_value("OBSERVER-START ");
+        let ids: Vec<u32> = ids.split_whitespace().map(|s| s.parse().unwrap()).collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1], "CLI identity must not name the shim");
+        o.wait_for("OBSERVER-TICK");
+        o.send(b"\n");
+        assert_eq!(o.wait_value("OBSERVER-EXIT "), "Exited(7)");
+        assert_eq!(o.wait_value("R-EXIT "), "7");
+        let seen = String::from_utf8_lossy(&o.acc);
+        let expected = format!("CLI={}", ids[0]);
+        assert!(
+            seen.lines().any(|line| line.trim() == expected),
+            "not the real CLI: {seen}"
+        );
+        o.assert_restored("observed CLI exit");
+    }
+
+    #[test]
+    fn observer_failures_end_the_started_cli_and_forbid_fallback() {
+        let _env_guard = crate::platform::test_env::lock();
+        for (mode, operation) in [
+            ("fail_start", "observer_start"),
+            ("fail_tick", "observer_tick"),
+        ] {
+            let mut o = Outer::start("read x", &[("CSQ_S1A_OBSERVER", mode)]);
+            let ids = o.wait_value("OBSERVER-START ");
+            let cli: libc::pid_t = ids.split_whitespace().next().unwrap().parse().unwrap();
+            let error = o.wait_value("R-ERR ");
+            assert!(
+                error.contains("after the child started") && error.contains(operation),
+                "{error}"
+            );
+            assert_eq!(o.wait_value("R-EXIT "), "50");
+            assert!(wait_gone(cli), "observer failure left the actual CLI alive");
+            assert!(!String::from_utf8_lossy(&o.acc).contains("OBSERVER-EXIT"));
+            o.assert_restored("observer failure");
+        }
+        let spec = LaunchSpec::new("/bin/true");
+        let failure = started("observer_start", io::Error::from_raw_os_error(libc::EIO));
+        assert!(!failure.may_launch_unrelayed(&spec));
+    }
+
     #[test]
     fn the_startup_status_wait_is_bounded_and_reads_a_failure() {
         let (r, w) = cloexec_pipe().expect("pipe");
@@ -8028,6 +8400,7 @@ mod tests {
             err: io::Error::from_raw_os_error(libc::EPERM),
             drop_step: Some("setuid"),
             started: false,
+            op: "spawn",
         }
         .into_relay_error();
         assert_eq!(

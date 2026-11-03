@@ -57,6 +57,56 @@ struct StatusPayload {
     /// paths, no credential material.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     rescue_pending: Vec<csq_core::credentials::rescue::PendingRescue>,
+    /// Slots in the classified LOGIN-NEEDED state — the JSON twin of the
+    /// text lines, and the SAME list `csq doctor` prints. Additive to
+    /// `csq.status.v2` (omitted when empty).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    login_needed: Vec<u16>,
+    /// Slots whose marker exists but whose cause cannot be classified (the
+    /// text lines use [`csq_core::refresh::sentinel::refresh_failing_line`]).
+    /// Never a login demand, never healthy. Additive; omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    refresh_failing: Vec<u16>,
+    /// True when `credentials/` could not be enumerated, so both lists are
+    /// UNDETERMINED rather than empty. Omitted from JSON when false.
+    #[serde(skip_serializing_if = "is_false")]
+    login_state_undetermined: bool,
+}
+
+/// `serde` helper: omit a `false` boolean from the JSON surface.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// The JSON twin of the two text lists, from the SAME scan the text surface
+/// uses: `(login_needed, refresh_failing, undetermined)`. Extracted so the
+/// JSON wiring is testable and cannot silently omit either list.
+fn sentinel_json_lists(
+    scan: &csq_core::refresh::sentinel::SentinelScan,
+) -> (Vec<u16>, Vec<u16>, bool) {
+    (
+        scan.login_needed_slots()
+            .iter()
+            .map(|account| account.get())
+            .collect(),
+        scan.refresh_failing_slots()
+            .iter()
+            .map(|account| account.get())
+            .collect(),
+        !scan.readable,
+    )
+}
+
+/// The text line for an unenumerable `credentials/` directory, or `None`
+/// when the scan was readable. Extracted so the text is testable without
+/// capturing stdout.
+fn login_state_undetermined_text(readable: bool) -> Option<String> {
+    (!readable).then(|| {
+        format!(
+            "  {}",
+            csq_core::refresh::sentinel::SENTINEL_SCAN_UNDETERMINED
+        )
+    })
 }
 
 /// The one text line `csq status` prints for the orphan sweep (the wording is
@@ -89,6 +139,16 @@ pub fn handle(base_dir: &Path, json: bool) -> Result<()> {
     let keychain_orphans =
         csq_core::credentials::keychain::orphans::read_diagnostic(base_dir).view();
     let rescue_pending = csq_core::credentials::rescue::pending_rescues(base_dir);
+    // The sentinel state, from the files the daemon's refresh path writes.
+    // TWO DISTINCT lists — a classified login demand and a marker whose
+    // cause was never recorded — plus the scan's own readability. Pure file
+    // reads: no credential read, no keychain read
+    // (`diagnostic-surface-parity.md` MUST NOT 4).
+    let sentinel_scan = csq_core::refresh::sentinel::sentinel_scan(base_dir);
+    let login_needed = sentinel_scan.login_needed_slots();
+    let refresh_failing = sentinel_scan.refresh_failing_slots();
+    let (login_needed_json, refresh_failing_json, login_state_undetermined) =
+        sentinel_json_lists(&sentinel_scan);
 
     if json {
         // R3: emit() is the only stdout writer for the enveloped surface.
@@ -103,6 +163,9 @@ pub fn handle(base_dir: &Path, json: bool) -> Result<()> {
                 keychain_mirror: login_diagnostics.keychain_mirror,
                 keychain_orphans,
                 rescue_pending,
+                login_needed: login_needed_json,
+                refresh_failing: refresh_failing_json,
+                login_state_undetermined,
             },
         ))?;
         return Ok(());
@@ -126,6 +189,22 @@ pub fn handle(base_dir: &Path, json: bool) -> Result<()> {
     }
     for rescue in &rescue_pending {
         println!("{}", render_rescue_line(rescue));
+    }
+    // Each login-needed slot gets its OWN line — never folded into a quota
+    // row — with the shared fixed-vocabulary message the statusline and
+    // `csq doctor` also print.
+    for line in login_needed_text_lines(&login_needed) {
+        println!("{line}");
+    }
+    // A marker whose cause was never recorded is its own, DIFFERENT line:
+    // never a login demand, never healthy.
+    for line in refresh_failing_text_lines(&refresh_failing) {
+        println!("{line}");
+    }
+    // The directory could not be enumerated: both lists above are
+    // UNDETERMINED, not empty. Never let silence read as all-clear.
+    if let Some(line) = login_state_undetermined_text(sentinel_scan.readable) {
+        println!("{line}");
     }
 
     if accounts.is_empty() {
@@ -153,6 +232,41 @@ fn render_rescue_line(rescue: &csq_core::credentials::rescue::PendingRescue) -> 
         RescuePendingState::Adoptable => "ℹ",
     };
     format!("  Rescue: {icon} {}", rescue.status_line())
+}
+
+/// One line per login-needed slot, in the order the sentinel scan returns
+/// them (ascending). Each slot gets its OWN line, and the text is the shared
+/// [`csq_core::refresh::sentinel::login_needed_line`] — never a quota row and
+/// never a second copy of the message that could drift from the statusline's.
+fn login_needed_text_lines(slots: &[AccountNum]) -> Vec<String> {
+    slots
+        .iter()
+        .map(|account| {
+            format!(
+                "  {}",
+                csq_core::refresh::sentinel::login_needed_line(*account)
+            )
+        })
+        .collect()
+}
+
+/// One line per slot whose marker exists but whose cause is unclassifiable.
+///
+/// The phrase is the shared
+/// [`csq_core::refresh::sentinel::REFRESH_FAILING_CAUSE_NOT_RECORDED`], prefixed
+/// with the slot so two unknown slots are distinguishable. Deliberately a
+/// different line from [`login_needed_text_lines`]: such a marker is not
+/// evidence the credential is dead.
+fn refresh_failing_text_lines(slots: &[AccountNum]) -> Vec<String> {
+    slots
+        .iter()
+        .map(|account| {
+            format!(
+                "  {}",
+                csq_core::refresh::sentinel::refresh_failing_line(*account)
+            )
+        })
+        .collect()
 }
 
 /// Returns the composed [`AccountStatus`] entries, trying the
@@ -276,6 +390,50 @@ mod tests {
     /// schema (verified by hand: renaming `StatusPayload.data` to `.rows` fails
     /// this test with "missing field `data`" / a null `data[0]` lookup).
     #[test]
+    fn login_needed_text_lines_are_one_own_line_per_slot() {
+        let slots = [
+            AccountNum::try_from(2u16).unwrap(),
+            AccountNum::try_from(7u16).unwrap(),
+        ];
+        let lines = login_needed_text_lines(&slots);
+        assert_eq!(
+            lines,
+            vec![
+                "  login needed — run csq login 2".to_string(),
+                "  login needed — run csq login 7".to_string(),
+            ],
+            "each login-needed slot gets its own line from the shared message"
+        );
+        assert_eq!(login_needed_text_lines(&[]), Vec::<String>::new());
+    }
+
+    /// A marker whose cause was never recorded prints the not-recorded line,
+    /// NOT a login demand — the pre-classification writer marked every
+    /// failure with a generic tag, so `csq status` must not tell the operator
+    /// to re-authenticate a healthy slot. Removing the refresh-failing loop
+    /// from `handle` (or the helper) REDs this.
+    #[test]
+    fn refresh_failing_text_lines_are_distinct_from_login_lines() {
+        let slots = [
+            AccountNum::try_from(4u16).unwrap(),
+            AccountNum::try_from(9u16).unwrap(),
+        ];
+        let lines = refresh_failing_text_lines(&slots);
+        assert_eq!(
+            lines,
+            vec![
+                "  slot 4: refresh failing, cause not recorded".to_string(),
+                "  slot 9: refresh failing, cause not recorded".to_string(),
+            ]
+        );
+        for line in &lines {
+            assert!(!line.contains("login needed"), "{line}");
+            assert!(!line.contains("LOGIN-NEEDED"), "{line}");
+        }
+        assert_eq!(refresh_failing_text_lines(&[]), Vec::<String>::new());
+    }
+
+    #[test]
     fn status_json_envelope_matches_golden_shape() {
         let payload = StatusPayload {
             data: vec![sample_row()],
@@ -285,6 +443,9 @@ mod tests {
             keychain_mirror: None,
             keychain_orphans: None,
             rescue_pending: Vec::new(),
+            login_needed: Vec::new(),
+            refresh_failing: Vec::new(),
+            login_state_undetermined: false,
         };
         let env = Envelope::success(SCHEMA_STATUS_V2, None, payload);
         let line = env.to_line().unwrap();
@@ -314,6 +475,53 @@ mod tests {
         // the pre-existing `AccountStatus` wire behavior, unchanged by the envelope.
         assert!(row.get("balance").is_none());
         assert!(row.get("stale_secs").is_none());
+    }
+
+    /// LOW-5: the JSON surface carries the same two lists the text surface
+    /// prints — a machine consumer must not read "all clear" while the text
+    /// says login needed. Both are additive v2 fields, omitted when empty.
+    /// The lists come from `sentinel_json_lists`, the helper `handle` uses.
+    #[test]
+    fn status_json_carries_both_sentinel_lists() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let creds = dir.path().join("credentials");
+        std::fs::create_dir_all(&creds).unwrap();
+        std::fs::write(creds.join("2.broker-failed"), "invalid_grant").unwrap();
+        std::fs::write(creds.join("7.broker-failed"), "unauthorized_client").unwrap();
+        std::fs::write(creds.join("4.broker-failed"), "oauth").unwrap();
+        std::fs::write(creds.join("9.broker-failed"), "").unwrap();
+        let scan = csq_core::refresh::sentinel::sentinel_scan(dir.path());
+        let (login_needed, refresh_failing, login_state_undetermined) = sentinel_json_lists(&scan);
+        assert_eq!(login_needed, vec![2, 7]);
+        assert_eq!(refresh_failing, vec![4, 9]);
+        assert!(!login_state_undetermined);
+
+        let payload = StatusPayload {
+            data: Vec::new(),
+            session_logins: Vec::new(),
+            sessions_undetermined: false,
+            keychain_mirror_age_secs: None,
+            keychain_mirror: None,
+            keychain_orphans: None,
+            rescue_pending: Vec::new(),
+            login_needed,
+            refresh_failing,
+            login_state_undetermined,
+        };
+        let env = Envelope::success(SCHEMA_STATUS_V2, None, payload);
+        let v: serde_json::Value = serde_json::from_str(&env.to_line().unwrap()).unwrap();
+        assert_eq!(v["login_needed"], serde_json::json!([2, 7]));
+        assert_eq!(v["refresh_failing"], serde_json::json!([4, 9]));
+        assert!(v.get("login_state_undetermined").is_none());
+    }
+
+    /// An unenumerable `credentials/` directory prints the undetermined line;
+    /// a readable scan prints nothing extra.
+    #[test]
+    fn unreadable_credentials_directory_prints_undetermined() {
+        let line = login_state_undetermined_text(false).expect("must print");
+        assert!(line.contains(csq_core::refresh::sentinel::SENTINEL_SCAN_UNDETERMINED));
+        assert!(login_state_undetermined_text(true).is_none());
     }
 
     /// Seeds a profiles binding plus an identity directory for `slot`, and
@@ -378,6 +586,9 @@ mod tests {
             keychain_mirror: None,
             keychain_orphans: None,
             rescue_pending: csq_core::credentials::rescue::pending_rescues(dir.path()),
+            login_needed: Vec::new(),
+            refresh_failing: Vec::new(),
+            login_state_undetermined: false,
         };
         let line = Envelope::success(SCHEMA_STATUS_V2, None, payload)
             .to_line()
@@ -475,6 +686,9 @@ mod tests {
                 keychain_mirror: None,
                 keychain_orphans: None,
                 rescue_pending: Vec::new(),
+                login_needed: Vec::new(),
+                refresh_failing: Vec::new(),
+                login_state_undetermined: false,
             },
         );
         let line = env.to_line().unwrap();

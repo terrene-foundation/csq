@@ -1578,10 +1578,16 @@ async fn tick_impl_with_shutdown(
                 Ok(Ok(broker_result)) => {
                     let status = RefreshStatus::from_result(account, expires_at_ms, &broker_result);
                     match &broker_result {
-                        BrokerResult::Failed(_) => {
+                        BrokerResult::Failed(error) => {
+                            // Classified tag from the typed BrokerError — never
+                            // its Display, whose RefreshFailed reason is a
+                            // redacted-but-richer string. A login-needed slot
+                            // already carries the sticky sentinel; this log is
+                            // the fixed-vocabulary trail for every failure.
                             warn!(
                                 account = info.id,
                                 surface = "codex",
+                                error_kind = error.kind_tag(),
                                 "codex refresh failed, entering cooldown"
                             );
                             set_cooldown(cooldowns, info.id);
@@ -1993,8 +1999,16 @@ async fn tick_impl_with_shutdown(
             Ok(Ok(broker_result)) => {
                 let status = RefreshStatus::from_result(account, expires_at_ms, &broker_result);
                 match &broker_result {
-                    BrokerResult::Failed(_) => {
-                        warn!(account = info.id, "refresh failed, entering cooldown");
+                    BrokerResult::Failed(error) => {
+                        // Fixed-vocabulary classification of the failure; a
+                        // permanent rejection (`invalid_grant`,
+                        // `unauthorized_client`) also wrote the sticky
+                        // login-needed sentinel inside broker_check.
+                        warn!(
+                            account = info.id,
+                            error_kind = error.kind_tag(),
+                            "refresh failed, entering cooldown"
+                        );
                         set_cooldown(cooldowns, info.id);
                         // Don't increase backoff for generic failures —
                         // the account might need re-auth, and aggressive
@@ -3736,6 +3750,84 @@ mod tests {
             codex_counter.load(Ordering::SeqCst),
             1,
             "second tick must not re-fire Codex refresh while inside 2h window"
+        );
+    }
+
+    /// The daemon's Codex failure log carries a CLASSIFIED `error_kind`, not
+    /// a bare "failed" message. The tag comes from the typed `BrokerError`, so
+    /// a login-needed failure is distinguishable from a retryable one in the
+    /// only trail the daemon leaves. RED before the fix: the warn had no
+    /// `error_kind` field at all.
+    #[test]
+    fn codex_refresh_failure_logs_a_classified_error_kind() {
+        struct V<'a>(&'a mut String);
+        impl tracing::field::Visit for V<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!("{}={value:?} ", field.name()));
+            }
+        }
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut line = String::new();
+                event.record(&mut V(&mut line));
+                self.0.lock().unwrap().push(line);
+            }
+        }
+
+        let _capture_guard = crate::testing::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = TempDir::new().unwrap();
+        // A Codex slot with no JWT exp claim always needs a refresh.
+        install_codex_account(dir.path(), 6);
+        let anth = counting_success(Arc::new(AtomicU32::new(0)));
+        let codex: HttpPostFnCodex = Arc::new(|_url: &str, _body: &str| {
+            Ok(crate::http::NodeHttpResponse {
+                status: 401,
+                body: br#"{"error":{"code":"token_expired"}}"#.to_vec(),
+                date: None,
+            })
+        });
+        let cache = Arc::new(TtlCache::with_default_age());
+        let cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let backoffs = Arc::new(Mutex::new(HashMap::new()));
+
+        let sink = Capture::default();
+        let guard = tracing::subscriber::set_default(sink.clone());
+        // Other refresher tests reach the same callsite without holding the
+        // capture lock; rebuild the interest cache from this thread so the
+        // event is not dropped (same flake guard as the suppression test).
+        crate::testing::settle_capture_interest(tracing::callsite::rebuild_interest_cache);
+        sink.0.lock().unwrap().clear();
+        // The capture lock is held for the whole body: run the async tick on a
+        // private current-thread runtime so no guard crosses an await point.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tick(dir.path(), &anth, &codex, &cache, &cooldowns, &backoffs).await;
+            });
+        drop(guard);
+        let lines = sink.0.lock().unwrap().clone();
+        assert!(
+            lines.iter().any(|line| {
+                line.contains("codex refresh failed, entering cooldown")
+                    && line.contains("error_kind=\"codex_token_expired\"")
+            }),
+            "the codex failure log must carry the classified error kind: {lines:?}"
         );
     }
 

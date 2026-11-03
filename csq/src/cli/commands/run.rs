@@ -12,7 +12,7 @@ use csq_core::credentials::{self, file};
 use csq_core::platform::env_check::{self, EnvIssue};
 use csq_core::providers::catalog::Surface;
 use csq_core::providers::codex::surface as codex_surface;
-use csq_core::refresh::sentinel::is_broker_failed;
+use csq_core::refresh::sentinel::LoginNeededState;
 use csq_core::session;
 use csq_core::types::AccountNum;
 
@@ -26,6 +26,35 @@ use csq_core::daemon::{self, DetectResult};
 
 #[path = "provider_session_policy.rs"]
 mod provider_session_policy;
+
+/// Why `csq run` refuses to launch on this slot, or `None` to proceed.
+///
+/// Three-state classification of the login-needed sentinel:
+///
+/// - `LoginNeeded` → the operator-facing refusal naming the slot's login.
+/// - `Healthy` → no refusal.
+/// - `Unknown` → NO refusal (`guard-reader-writer-parity.md` MUST-2
+///   fail-open, justified here): a marker whose cause this build cannot
+///   classify — a generic tag written by the pre-classification writer, a
+///   pre-v2.1 zero-byte marker, or an unreadable/symlinked/oversized file —
+///   is NOT evidence the grant is dead. Refusing would strand a healthy slot
+///   for as long as the marker survives. `csq run` performs NO refresh: it
+///   loads the canonical credential and only warns on expiry. The real
+///   clearers are the DAEMON's next `broker_check` tick (which reclassifies
+///   or clears the marker) and a successful `csq login N`. With the daemon
+///   off, the stale UNKNOWN marker persists, and the operator surfaces show
+///   it as "refresh failing, cause not recorded" — never as a login demand.
+///
+/// Extracted from [`handle`] so the gate is testable without spawning.
+fn login_needed_launch_refusal(base_dir: &Path, account: AccountNum) -> Option<String> {
+    match csq_core::refresh::sentinel::login_needed_state(base_dir, account) {
+        LoginNeededState::LoginNeeded { .. } => Some(format!(
+            "account {} is in LOGIN-NEEDED state — run `csq login {}` to re-authenticate",
+            account, account
+        )),
+        LoginNeededState::Healthy | LoginNeededState::Unknown => None,
+    }
+}
 
 /// Phase B' billing-ledger attribution (an internal journal entry D2). Best-effort append
 /// to `accounts/.csq-launch.log` so the daemon aggregator can attribute CC
@@ -414,12 +443,8 @@ pub fn handle(
     // 3P-discovered from `config-N/settings.json` already has `config-N/` on
     // disk by construction, so gating it here would be a no-op at best.
     if !is_third_party {
-        if is_broker_failed(base_dir, account) {
-            return Err(anyhow!(
-                "account {} is in LOGIN-NEEDED state — run `csq login {}` to re-authenticate",
-                account,
-                account
-            ));
+        if let Some(refusal) = login_needed_launch_refusal(base_dir, account) {
+            return Err(anyhow!(refusal));
         }
         if csq_core::accounts::profiles::resolve_slot_to_uuid(base_dir, account.get()).is_none() {
             return Err(anyhow!(
@@ -472,7 +497,7 @@ pub fn handle(
 
         launch_third_party(base_dir, &claude_home, account, rest, &mut audit_emitter)
     } else {
-        // Anthropic OAuth path. `is_broker_failed` + the identity-record
+        // Anthropic OAuth path. The login-needed gate + the identity-record
         // check already ran above, before any write — re-resolve here only
         // to build the credential path (a second `resolve_slot_to_uuid`
         // call, same pattern the pre-fix code already used across its two
@@ -7341,6 +7366,48 @@ mod tests {
     include!("ruletrim_override_tests.rs");
     use super::*;
     use tempfile::TempDir;
+
+    /// Three-state launch gate: only a CLASSIFIED login-needed marker
+    /// refuses. A legacy generic marker, an unrecognised tag and the pre-v2.1
+    /// zero-byte marker are UNKNOWN — the launch proceeds with the MUST-2
+    /// fail-open justification (a stale pre-classification marker would
+    /// otherwise strand a healthy slot; the DAEMON's next `broker_check` or a
+    /// successful `csq login N` clears it — `csq run` itself never refreshes).
+    /// A Healthy slot never refuses either.
+    #[test]
+    fn launch_refusal_only_for_classified_login_needed() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let creds = base.join("credentials");
+        std::fs::create_dir_all(&creds).unwrap();
+
+        let slot = |n: u16| AccountNum::try_from(n).unwrap();
+
+        // Healthy: no marker.
+        assert_eq!(login_needed_launch_refusal(base, slot(1)), None);
+
+        // Classified login-needed: refuses with the operator message.
+        std::fs::write(creds.join("2.broker-failed"), "invalid_grant").unwrap();
+        let refusal = login_needed_launch_refusal(base, slot(2)).expect("must refuse");
+        assert!(
+            refusal.contains("LOGIN-NEEDED") && refusal.contains("csq login 2"),
+            "{refusal}"
+        );
+
+        // UNKNOWN forms proceed, and the marker survives the decision.
+        for (n, content) in [(3u16, &b"oauth"[..]), (4, b"some_future_tag"), (5, b"")] {
+            std::fs::write(creds.join(format!("{n}.broker-failed")), content).unwrap();
+            assert_eq!(
+                login_needed_launch_refusal(base, slot(n)),
+                None,
+                "slot {n}: an unclassifiable marker must not refuse the launch"
+            );
+            assert!(
+                creds.join(format!("{n}.broker-failed")).exists(),
+                "slot {n}: the gate must never delete the marker"
+            );
+        }
+    }
 
     #[test]
     fn daemon_recovery_run_refuses_drift_and_missing_handshake_but_admits_matching_version() {

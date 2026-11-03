@@ -548,6 +548,21 @@ fn lifecycle_label(payload: &EventPayload) -> (String, String) {
                 p.update_id, p.target_surface, p.target_pid, p.outcome
             ),
         ),
+        // S5 outbound owner ping — metadata only: the scrubbed byte length and
+        // the fixed outcome tag. The text, chat id and token are never here.
+        P::TelegramOwnerPing(p) => (
+            "telegram owner ping".into(),
+            format!(
+                "{} bytes{} — {}",
+                p.byte_len,
+                if p.redacted {
+                    format!(" (redacted x{})", p.redaction_count)
+                } else {
+                    String::new()
+                },
+                p.outcome
+            ),
+        ),
         // Governance kinds never reach here (classified above); exhaustive
         // match keeps this a compile-time drift catch if a kind is added.
         P::GovernanceTurn(_) | P::EatpAttestation(_) | P::McpGateDecision(_) => {

@@ -535,10 +535,6 @@ pub(crate) struct SlashTable {
     compact: Option<SlashCell>,
 }
 
-#[cfg_attr(
-    all(unix, not(test)),
-    expect(dead_code, reason = "S3a/S10 build requests when they land")
-)]
 impl SlashTable {
     /// The table for `cli`. Nothing is measured yet, so every slash refuses
     /// `cli_unmeasured`; S3a replaces the body with the per-CLI measured cells.
@@ -554,6 +550,22 @@ impl SlashTable {
             SlashCmd::Clear => self.clear,
             SlashCmd::Compact => self.compact,
         }
+    }
+
+    /// Inspect the production cell without granting a writer or a transaction.
+    /// The control adapter still refuses delivery when a cell is measured: the
+    /// input classifier and transaction integration must land separately.
+    pub(in crate::relay) fn availability(
+        cli: super::types::CliKind,
+        cmd: SlashCmd,
+    ) -> Result<(), SdkErrorCode> {
+        let table = Self::for_cli(cli);
+        let cell = table.cell(cmd).ok_or(SdkErrorCode::CliUnmeasured)?;
+        cell.idle_return.ok_or(SdkErrorCode::ChainUnsupported)?;
+        if !alphabet_ok(cell.bytes) {
+            return Err(SdkErrorCode::InputRejected);
+        }
+        Ok(())
     }
 }
 

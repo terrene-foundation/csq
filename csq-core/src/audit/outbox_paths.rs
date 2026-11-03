@@ -81,7 +81,10 @@ pub fn inspect_mcp_gate_admission(base: &Path) -> Result<McpGateAdmissionUsage, 
     match std::fs::symlink_metadata(&dir) {
         Ok(meta) if meta.is_dir() => {}
         Ok(_) => return Err("mcp_gate_pending_unsafe_directory"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && crate::platform::fs::confirm_absent(&dir).is_ok() =>
+        {
             return Ok(McpGateAdmissionUsage::default())
         }
         Err(_) => return Err("mcp_gate_pending_stat"),

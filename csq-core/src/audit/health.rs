@@ -467,9 +467,15 @@ pub fn is_chain_broken_in(base_dir: &Path, runs_subdir: &str) -> Option<String> 
     let path = sentinel_path(base_dir, runs_subdir);
     match std::fs::read_to_string(&path) {
         Ok(s) => Some(s.trim().to_string()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && crate::platform::fs::confirm_absent(&path).is_ok() =>
+        {
+            None
+        }
         Err(_) => {
-            // Unreadable sentinel (permissions, I/O error) → treat as broken
+            // Unreadable sentinel (permissions, I/O error, or a NotFound that
+            // `confirm_absent` refuses because an ancestor is not a directory) → treat as broken
             // (fail-closed: if we cannot confirm the chain is sound, refuse to
             // extend it).
             Some("audit_sentinel_unreadable".to_string())

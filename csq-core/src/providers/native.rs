@@ -487,7 +487,12 @@ fn probe_node(p: &Path, want_dir: bool) -> Result<Option<()>, NativeAnomaly> {
         Ok(m) if m.file_type().is_symlink() => Err(NativeAnomaly::Symlink),
         Ok(m) if (want_dir && m.is_dir()) || (!want_dir && m.is_file()) => Ok(Some(())),
         Ok(_) => Err(NativeAnomaly::WrongType),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && crate::platform::fs::confirm_absent(p).is_ok() =>
+        {
+            Ok(None)
+        }
         Err(_) => Err(NativeAnomaly::Unreadable),
     }
 }

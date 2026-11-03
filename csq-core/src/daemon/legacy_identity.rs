@@ -41,9 +41,16 @@ impl LegacyVerifier {
         http: &HttpGetFn,
     ) -> LegacyVerificationSummary {
         let mut result = LegacyVerificationSummary::default();
-        let entries = match std::fs::read_dir(identity_store::identities_dir(base)) {
+        let identities = identity_store::identities_dir(base);
+        let entries = match std::fs::read_dir(&identities) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return result,
+            // A listing: probe a child so `identities` itself is an ancestor checked.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && crate::platform::fs::confirm_absent(&identities.join("entry")).is_ok() =>
+            {
+                return result
+            }
             Err(_) => {
                 result.refused += 1;
                 return result;

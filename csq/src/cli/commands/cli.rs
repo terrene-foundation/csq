@@ -561,17 +561,10 @@ fn handle_no_command(
 
 /// Returns the official manual-install URL for a surface CLI.
 ///
-/// Centralised here (alongside `npm_install_hint`) so all callsites
-/// stay in sync when upstream URLs change.
+/// Compatibility entry point; the core mapping also serves login selection
+/// errors so every surface presents the same official guide.
 pub fn manual_install_url(surface: SurfaceCli) -> &'static str {
-    match surface {
-        SurfaceCli::Claude => "https://www.anthropic.com/claude-code",
-        SurfaceCli::Codex => "https://www.npmjs.com/package/@openai/codex",
-        SurfaceCli::Gemini => "https://www.npmjs.com/package/@google/gemini-cli",
-        SurfaceCli::Kimi => "https://moonshotai.github.io/kimi-code/",
-        SurfaceCli::Grok => "https://x.ai/cli",
-        _ => "https://npmjs.com",
-    }
+    csq_core::cli_deps::minimum::manual_install_url(surface)
 }
 
 /// Returns the manual first-install command string for a surface CLI.

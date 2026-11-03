@@ -906,7 +906,7 @@ fn slot_serves_claude(base_dir: &Path, slot: AccountNum) -> bool {
     true
 }
 
-/// Pick the first healthy Anthropic slot: authenticated, not broker-failed.
+/// Pick the first healthy Anthropic slot: authenticated, not login-needed.
 fn resolve_healthy_claude_slot(base_dir: &Path) -> Result<AccountNum, SdkError> {
     // A slot the launch gate refuses is never auto-picked (orgident r7 item 9).
     let mut refused: Option<String> = None;
@@ -914,7 +914,18 @@ fn resolve_healthy_claude_slot(base_dir: &Path) -> Result<AccountNum, SdkError> 
         let Ok(slot) = AccountNum::try_from(acc.id) else {
             continue;
         };
-        if csq_core::refresh::sentinel::is_broker_failed(base_dir, slot) {
+        // `guard-reader-writer-parity.md` MUST-2 fail-open, justified: only
+        // the LOGIN-NEEDED classification excludes a slot. A marker whose
+        // cause is UNKNOWN (a generic tag written by the pre-classification
+        // writer, an unreadable marker) is not evidence the credential is
+        // dead, and excluding it here would strand a healthy slot for as
+        // long as the stale marker survives. Let it be picked: the DAEMON's
+        // next `broker_check` reclassifies the slot or clears the marker
+        // (a successful `csq login N` also clears it). This path performs no
+        // refresh itself; with the daemon off, the stale UNKNOWN marker
+        // persists and the operator surfaces show it as "refresh failing,
+        // cause not recorded" — never as a login demand.
+        if csq_core::refresh::sentinel::login_needed_state(base_dir, slot).is_login_needed() {
             continue;
         }
         if let Err(message) = csq_core::accounts::launch_block::check_launch(base_dir, slot.get()) {
@@ -958,7 +969,9 @@ fn resolve_healthy_third_party_slot(
         let Ok(slot) = AccountNum::try_from(acc.id) else {
             continue;
         };
-        if csq_core::refresh::sentinel::is_broker_failed(base_dir, slot) {
+        // Same MUST-2 fail-open as `resolve_healthy_claude_slot`: UNKNOWN is
+        // not a login demand, and excluding it would strand the slot.
+        if csq_core::refresh::sentinel::login_needed_state(base_dir, slot).is_login_needed() {
             continue;
         }
         return Ok(slot);
@@ -1026,10 +1039,11 @@ fn slot_serves_codex(base_dir: &Path, slot: AccountNum) -> bool {
 }
 
 /// Pick the first HEALTHY Codex slot — has codex credentials AND is not
-/// broker-failed. Mirrors `resolve_healthy_claude_slot`'s broker-failed skip
-/// (redteam R1 HIGH-1): a broker-failed codex slot's JWT is expired/revoked, so
-/// dispatching to it yields a `ProviderError` from a doomed spawn instead of the
-/// correct `NoHealthySlot` (re-login) signal.
+/// LOGIN-NEEDED. Mirrors `resolve_healthy_claude_slot`'s skip (redteam R1
+/// HIGH-1): a login-needed codex slot's JWT is expired/revoked, so dispatching
+/// to it yields a `ProviderError` from a doomed spawn instead of the correct
+/// `NoHealthySlot` (re-login) signal. An UNKNOWN marker does not exclude the
+/// slot (same MUST-2 fail-open as the Anthropic sibling).
 fn resolve_healthy_codex_slot(base_dir: &Path) -> Result<AccountNum, SdkError> {
     use csq_core::types::MAX_ACCOUNTS;
     for n in 1..=MAX_ACCOUNTS {
@@ -1037,14 +1051,14 @@ fn resolve_healthy_codex_slot(base_dir: &Path) -> Result<AccountNum, SdkError> {
             continue;
         };
         if slot_serves_codex(base_dir, slot)
-            && !csq_core::refresh::sentinel::is_broker_failed(base_dir, slot)
+            && !csq_core::refresh::sentinel::login_needed_state(base_dir, slot).is_login_needed()
         {
             return Ok(slot);
         }
     }
     Err(SdkError::trusted(
         SdkErrorCode::NoHealthySlot,
-        "no Codex slot available (none are logged in to codex, or all are broker-failed)",
+        "no Codex slot available (none are logged in to codex, or all are login-needed)",
     ))
 }
 

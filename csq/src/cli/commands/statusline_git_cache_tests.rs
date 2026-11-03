@@ -180,7 +180,6 @@ impl Fixture {
             AccountNum::try_from(7u16).unwrap(),
             "fixture",
             None,
-            false,
         )
         .unwrap()
     }

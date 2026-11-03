@@ -286,7 +286,14 @@ pub(crate) fn mirror_applicability(base: &Path, handle: &Path) -> MirrorApplicab
     }
     let present = |path: &Path| match std::fs::symlink_metadata(path) {
         Ok(_) => Some(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+        // Absent only once `confirm_absent` agrees (Windows reports a file-shaped
+        // ancestor as NotFound); unreachable is `None`, which every caller refuses.
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && crate::platform::fs::confirm_absent(path).is_ok() =>
+        {
+            Some(false)
+        }
         Err(_) => None,
     };
     if present(&root.join("credentials").join(format!("{account}.json"))).is_none() {

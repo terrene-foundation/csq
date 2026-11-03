@@ -25,6 +25,11 @@ const ENTRY: &str = "login_native_ctrlc_private_entry";
 const ROLE: &str = "CSQ_PRIVATE_NATIVE_CTRLC_ROLE";
 const ROOT: &str = "CSQ_PRIVATE_NATIVE_CTRLC_ROOT";
 const SURFACE: &str = "CSQ_PRIVATE_NATIVE_CTRLC_SURFACE";
+/// Fixture-only seam: the driver sleeps this many ms AFTER the guard returned
+/// (its lock is already dropped) and BEFORE it writes the receipt, so the
+/// "lock free, no receipt yet" window the fixture itself creates can be made
+/// wide enough to hit on every run.
+const RECEIPT_STALL: &str = "CSQ_PRIVATE_NATIVE_CTRLC_RECEIPT_STALL_MS";
 const CREDS: &[u8] = br#"{"fixture":"native-inert-credential"}"#;
 const DEFAULT_ASSERTION: &str = "LOGIN_NATIVE_CTRLC_DEFAULT_REAP_CANCEL130";
 const RETAIN_ASSERTION: &str = "LOGIN_NATIVE_CTRLC_RETAIN_LOCK_PING";
@@ -234,7 +239,7 @@ fn run_driver(root: &Path, role: &str, surface: Surface) -> ! {
         }
     });
     let lock = match AccountLoginLock::acquire(&root.join("base"), account()).unwrap() {
-        AcquireOutcome::Acquired(lock) => lock,
+        AcquireOutcome::Acquired(lock) => std::sync::Arc::new(lock),
         _ => panic!("private native account lock unexpectedly held"),
     };
     let descriptor = native::descriptor(surface).unwrap();
@@ -287,7 +292,7 @@ fn run_driver(root: &Path, role: &str, surface: Surface) -> ! {
             let completed = login_cancel_guard::spawn_cli_inherited_login_receipt(
                 &mut command,
                 Duration::from_secs(300),
-                &lock,
+                std::sync::Arc::clone(&lock),
                 descriptor.display_name,
                 |_| {},
             );
@@ -308,9 +313,18 @@ fn run_driver(root: &Path, role: &str, surface: Surface) -> ! {
             }
         },
     );
-    // The same enclosing lock spans the actual core finish/marker operation,
-    // matching handle_native. It can release only after owned child completion.
+    // When custody resolves, the guard's clone drops when the guard returns
+    // (after the reap), so this drop releases the lock; when custody is
+    // unresolved, the guard leaks its clone and the lock is never released.
     drop(lock);
+    if let Some(raw) = std::env::var_os(RECEIPT_STALL) {
+        // A stall that silently did not happen would leave the row proving nothing.
+        let ms: u64 = raw
+            .to_str()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or_else(|| panic!("{RECEIPT_STALL} must be a u64 of milliseconds"));
+        std::thread::sleep(Duration::from_millis(ms));
+    }
     let vendor_pid: u32 = std::fs::read_to_string(root.join("vendor-ready"))
         .expect("selected native vendor reached entry")
         .parse()
@@ -421,6 +435,12 @@ struct Driver {
 
 impl Driver {
     fn spawn(role: &'static str, surface: Surface) -> Self {
+        Self::spawn_stalled(role, surface, None)
+    }
+
+    /// [`Driver::spawn`] whose driver stalls `receipt_stall_ms` between the
+    /// guard's return and the receipt write (see [`RECEIPT_STALL`]).
+    fn spawn_stalled(role: &'static str, surface: Surface, receipt_stall_ms: Option<u64>) -> Self {
         let sandbox = tempfile::tempdir().unwrap();
         let life_path = sandbox.path().join("vendor-life");
         let life_c = std::ffi::CString::new(life_path.as_os_str().as_encoded_bytes()).unwrap();
@@ -433,6 +453,9 @@ impl Driver {
             .unwrap();
         let mut command = selected_command(sandbox.path(), role, surface).unwrap();
         command.process_group(0).stdin(Stdio::piped());
+        if let Some(ms) = receipt_stall_ms {
+            command.env(RECEIPT_STALL, ms.to_string());
+        }
         let mut child = command.spawn().unwrap();
         let input = child.stdin.take();
         let pid = libc::pid_t::try_from(child.id()).unwrap();
@@ -755,8 +778,8 @@ fn assert_ignored(surface: Surface) {
     );
 }
 
-fn assert_second_interrupt_kills(surface: Surface) {
-    let mut driver = Driver::spawn("driver-ignore", surface);
+fn assert_second_interrupt_kills(surface: Surface, receipt_stall_ms: Option<u64>) {
+    let mut driver = Driver::spawn_stalled("driver-ignore", surface, receipt_stall_ms);
     let ready = driver.ready();
     if ready {
         driver.signal_group();
@@ -772,14 +795,32 @@ fn assert_second_interrupt_kills(surface: Surface) {
         driver.signal_group();
         poll(|| driver.vendor_exited())
     };
-    // A sample that sees the lock free and then no receipt proves the lock was
-    // released before the reap.
+    // The lock must stay held until the vendor is REAPED. The receipt cannot
+    // witness that: the fixture drops the lock when the guard returns and
+    // writes the receipt after, so "lock free, no receipt yet" is the normal
+    // state between the two. The reap itself is observable: the vendor is the
+    // driver's child, a zombie answers kill(pid, 0) with success until the
+    // driver reaps it, then ESRCH (checked per platform by
+    // `pid_gone_distinguishes_unreaped_zombie_from_reaped_child`). Order is the
+    // proof: sample the lock FIRST, then the reap. A lock seen free at t1 with
+    // the vendor still unreaped at t2 > t1 means it was unreaped at t1 as well
+    // (a reap never un-happens), so
+    // the lock was released before the reap. Free then reaped proves nothing,
+    // and is not counted.
     let mut released_early = false;
+    let mut window_exercised = false;
     if killed {
+        // `killed` implies `ready()` ran, which recorded the vendor PID.
+        let vendor = libc::pid_t::try_from(driver.vendor_pid.expect("ready vendor PID")).unwrap();
+        // Latched: once the reap is seen it is never re-probed, so a reused PID
+        // cannot turn a reaped vendor back into a live one.
+        let mut reaped = false;
         poll(|| {
             let free = !held(driver.root());
+            reaped = reaped || pid_gone(vendor);
             let receipt = driver.root().join("reaped-receipt").exists();
-            released_early |= free && !receipt;
+            released_early |= free && !reaped;
+            window_exercised |= free && reaped && !receipt;
             receipt || released_early
         });
     }
@@ -799,6 +840,12 @@ fn assert_second_interrupt_kills(surface: Surface) {
         !released_early,
         "{LATE_ASSERTION}: lock released before reap"
     );
+    // A stalled row must have actually sampled lock-free, vendor-reaped and no
+    // receipt yet, or it proved nothing about that window.
+    assert!(
+        receipt_stall_ms.is_none() || window_exercised,
+        "{LATE_ASSERTION}: stalled window never sampled"
+    );
     assert!(
         reaped
             && !completed
@@ -810,6 +857,15 @@ fn assert_second_interrupt_kills(surface: Surface) {
             && status.is_some_and(|s| s.code() == Some(130)),
         "{LATE_ASSERTION}"
     );
+}
+
+fn pid_gone(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 delivers nothing; it only probes existence. The pid is the
+    // vendor, a child of the private DRIVER process (not of this test), so this
+    // process cannot reap it. If the pid were reused after the reap, the probe
+    // would see a live process and fail the row spuriously, never pass it falsely.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 fn assert_control(surface: Surface) {
@@ -892,11 +948,52 @@ fn login_native_grok_no_cancel_actual_zero_writes_binding() {
 #[test]
 fn login_native_kimi_ctrlc_second_interrupt_kills_vendor_130_no_binding() {
     let _env_guard = csq_core::platform::test_env::lock();
-    assert_second_interrupt_kills(Surface::Kimi);
+    assert_second_interrupt_kills(Surface::Kimi, None);
 }
 
 #[test]
 fn login_native_grok_ctrlc_second_interrupt_kills_vendor_130_no_binding() {
     let _env_guard = csq_core::platform::test_env::lock();
-    assert_second_interrupt_kills(Surface::Grok);
+    assert_second_interrupt_kills(Surface::Grok, None);
+}
+
+/// The receipt is the fixture's OWN file, written after the guard returned, and
+/// the lock is dropped on return: "lock free, receipt not yet written" is the
+/// normal state between those two points, never evidence of an early release.
+/// Stalling the driver 1.5s there makes that window certain; the rows must
+/// still pass because the vendor was already reaped when the lock freed.
+#[test]
+fn login_native_kimi_lock_free_between_reap_and_receipt_is_not_an_early_release() {
+    let _env_guard = csq_core::platform::test_env::lock();
+    assert_second_interrupt_kills(Surface::Kimi, Some(1500));
+}
+
+#[test]
+fn login_native_grok_lock_free_between_reap_and_receipt_is_not_an_early_release() {
+    let _env_guard = csq_core::platform::test_env::lock();
+    assert_second_interrupt_kills(Surface::Grok, Some(1500));
+}
+
+/// Calibrates `pid_gone`, which the early-release oracle relies on: a child that
+/// has exited but is not yet reaped is a zombie and must still answer
+/// `kill(pid, 0)`; after `waitpid` it must not.
+#[test]
+fn pid_gone_distinguishes_unreaped_zombie_from_reaped_child() {
+    let mut child = Command::new("true").spawn().unwrap();
+    let pid = libc::pid_t::try_from(child.id()).unwrap();
+    // WNOWAIT observes the exit without reaping, so the child stays a zombie.
+    // SAFETY: waitid only observes this test's own unreaped child.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT,
+        )
+    };
+    assert_eq!(rc, 0, "child exit observed without reaping");
+    assert!(!pid_gone(pid), "an exited, unreaped child must still exist");
+    child.wait().unwrap();
+    assert!(pid_gone(pid), "a reaped child must be gone");
 }

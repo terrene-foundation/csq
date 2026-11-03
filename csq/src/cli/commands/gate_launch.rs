@@ -72,6 +72,8 @@ fn directory(base: &Path, repo: &Path, create: bool) -> Result<Option<PathBuf>> 
     let meta = match fs::symlink_metadata(&dir) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            csq_core::platform::fs::confirm_absent(&dir)
+                .map_err(|_| anyhow!("gate state unavailable"))?;
             if !create {
                 return Ok(None);
             }
@@ -138,7 +140,11 @@ fn read_private(path: &Path) -> Result<Option<Vec<u8>>> {
         .open(path)
     {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            csq_core::platform::fs::confirm_absent(path)
+                .map_err(|_| anyhow!("gate configuration unreadable"))?;
+            return Ok(None);
+        }
         Err(_) => bail!("gate configuration unreadable"),
     };
     let meta = file
@@ -216,7 +222,11 @@ fn pin_present(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => Ok(true),
         Ok(_) => bail!("gate pin is not a regular file"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            csq_core::platform::fs::confirm_absent(path)
+                .map_err(|_| anyhow!("gate pin availability refused"))?;
+            Ok(false)
+        }
         Err(_) => bail!("gate pin availability refused"),
     }
 }

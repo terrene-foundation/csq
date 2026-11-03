@@ -1225,6 +1225,10 @@ fn handle_native(
         }
 
         // ── Pre-flight probe — same gate every surface's login uses ─────────────
+        // Refuse an unsupported selected Windows wrapper before the version
+        // probe can execute it. Missing still reaches the existing install gate;
+        // the actual login path revalidates selection before creating its home.
+        let _selected = native_login::resolve_native_login_binary(descriptor)?;
         super::cli_deps_gate::enforce(
             descriptor.surface_cli,
             ignore_cli_version,

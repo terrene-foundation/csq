@@ -508,7 +508,12 @@ where
                 crate::accounts::identity_store::identity_removed_marker_path(base_dir, existing);
             let removed = match stat(&marker) {
                 Ok(_) => true,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && crate::platform::fs::confirm_absent(&marker).is_ok() =>
+                {
+                    false
+                }
                 Err(_) => {
                     return Err(format!(
                         "identity_mint_failed: removed_marker_read_refused; \

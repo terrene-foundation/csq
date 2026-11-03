@@ -796,7 +796,10 @@ fn read_rescue_bytes(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
 
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::platform::fs::confirm_absent(path)?;
+            return Ok(None);
+        }
         Err(error) => return Err(error),
     };
     if !metadata.file_type().is_file() {
@@ -854,7 +857,10 @@ fn read_rescue_bytes(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
 
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::platform::fs::confirm_absent(path)?;
+            return Ok(None);
+        }
         Err(error) => return Err(error),
     };
     if !metadata.file_type().is_file() {
@@ -905,7 +911,11 @@ fn read_record_at(path: &Path) -> Option<RescueRecord> {
 fn rescue_record_paths_checked(identity_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let entries = match std::fs::read_dir(identity_dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A listing: probe a child so `identity_dir` itself is an ancestor checked.
+            crate::platform::fs::confirm_absent(&identity_dir.join(RESCUE_RECORD_FILE))?;
+            return Ok(Vec::new());
+        }
         Err(error) => return Err(error),
     };
     let mut paths: Vec<PathBuf> = Vec::new();
@@ -1522,7 +1532,12 @@ fn marker_present(marker: &Path) -> std::io::Result<bool> {
     }
     match std::fs::symlink_metadata(marker) {
         Ok(_) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        // Absent only once `confirm_absent` agrees: Windows reports a file-shaped
+        // ancestor as NotFound, and a tombstone that cannot be reached is UNKNOWN.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::platform::fs::confirm_absent(marker)?;
+            Ok(false)
+        }
         Err(error) => Err(error),
     }
 }
@@ -1592,6 +1607,7 @@ fn remove_refusal_artifact(path: &Path) {
 pub(crate) fn clear_rescue_artifacts_if_gone(record: &Path) {
     if matches!(std::fs::symlink_metadata(record),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        && crate::platform::fs::confirm_absent(record).is_ok()
     {
         remove_refusal_artifact(&record.with_extension(RESCUE_REFUSED_EXTENSION));
         remove_refusal_artifact(&record.with_extension(RESCUE_KEPT_EXTENSION));
@@ -1624,7 +1640,8 @@ fn sweep_orphan_rescue_artifacts(identity_dir: &Path) {
             continue;
         };
         let gone = matches!(std::fs::symlink_metadata(&record),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound);
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            && crate::platform::fs::confirm_absent(&record).is_ok();
         if !gone {
             continue;
         }
@@ -2425,6 +2442,45 @@ mod tests {
     use crate::accounts::anthropic_identity::{RescueKnownContext, RescueWitnessKind};
     use crate::credentials::{AnthropicCredentialFile, CredentialFile, OAuthPayload};
     use crate::types::{AccessToken, RefreshToken};
+
+    /// A rescue record path or identity directory standing under a regular file is an
+    /// error on every platform, never "no records". Unix gets ENOTDIR; Windows reports
+    /// NotFound, which `confirm_absent` refuses. DISCRIMINATES ONLY ON WINDOWS.
+    #[test]
+    fn rescue_readers_refuse_a_path_under_a_regular_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("identity-is-a-file");
+        std::fs::write(&file, b"not a directory").unwrap();
+        assert!(read_rescue_bytes(&file.join(RESCUE_RECORD_FILE)).is_err());
+        assert!(rescue_record_paths_checked(&file).is_err());
+        assert!(rescue_record_paths_checked(&file.join("nested")).is_err());
+    }
+
+    /// A tombstone path under a regular file is an UNREADABLE marker (the classifier maps
+    /// the error to `Unknown`), never "no marker". DISCRIMINATES ONLY ON WINDOWS.
+    #[test]
+    fn marker_present_refuses_a_path_under_a_regular_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("identity-is-a-file");
+        std::fs::write(&file, b"not a directory").unwrap();
+        assert!(marker_present(&file.join("rescue.json.refused")).is_err());
+        assert!(matches!(
+            marker_present(&dir.path().join("gone").join("rescue.json.refused")),
+            Ok(false)
+        ));
+    }
+
+    /// A genuinely missing identity directory is still an empty scan and an absent record.
+    #[test]
+    fn rescue_readers_treat_a_missing_identity_directory_as_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("gone");
+        assert!(matches!(
+            read_rescue_bytes(&missing.join(RESCUE_RECORD_FILE)),
+            Ok(None)
+        ));
+        assert!(rescue_record_paths_checked(&missing).unwrap().is_empty());
+    }
 
     fn assert_rescue_sync_before_publish(
         assertion_message: &'static str,

@@ -160,9 +160,14 @@ pub fn write_refresh_receipt(base_dir: &Path, receipt: &ShimRefreshReceipt) -> R
 /// Read the last attempt. Absence is distinct from an unreadable/corrupt receipt.
 pub fn read_refresh_receipt(base_dir: &Path) -> Result<Option<ShimRefreshReceipt>> {
     use std::io::Read;
-    let file = match std::fs::File::open(base_dir.join(RECEIPT_FILENAME)) {
+    let receipt_path = base_dir.join(RECEIPT_FILENAME);
+    let file = match std::fs::File::open(&receipt_path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            crate::platform::fs::confirm_absent(&receipt_path)
+                .context("inspect CLI-refresh receipt")?;
+            return Ok(None);
+        }
         Err(e) => return Err(e).context("open CLI-refresh receipt"),
     };
     let mut bytes = Vec::new();

@@ -357,6 +357,32 @@ fn native_windows_legacy_fallback_renames_through_the_same_handle() {
     assert_eq!(fs::read(&transcript).unwrap(), writer.serialized);
 }
 
+// an internal ticket: the measured extended-class-only STATUS_ACCESS_DENIED takes the SAME
+// fallback as an unsupported class — same handle, pinned RootDirectory, and the
+// published bytes are the writer's. Falsifier: treating the denial as fatal
+// leaves the append failed and `LEGACY_RENAMES` at 0.
+#[test]
+fn native_windows_denied_extended_class_falls_back_to_the_legacy_class() {
+    let (_temporary, base) = broad_base();
+    let store = SessionStore::open(&base, 4096).unwrap();
+    let mut writer = store.create(ID).unwrap();
+    writer.append(msg("first")).unwrap();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            super::DENY_POSIX_RENAME.with(|f| f.set(false));
+        }
+    }
+    let _reset = Reset;
+    super::LEGACY_RENAMES.with(|c| c.set(0));
+    super::DENY_POSIX_RENAME.with(|f| f.set(true));
+    let result = writer.append(msg("second"));
+    result.unwrap();
+    assert_eq!(super::LEGACY_RENAMES.with(|c| c.get()), 1);
+    let transcript = chat_dir(&base).join(format!("{ID}.jsonl"));
+    assert_eq!(fs::read(&transcript).unwrap(), writer.serialized);
+}
+
 // Creation never renames: the transcript is an exclusive `CREATE_NEW` at its final name
 // with the owner-only DACL applied at creation. Reds if a second create replaced or
 // truncated the file (it must be AlreadyExists, bytes unchanged), if the file were not

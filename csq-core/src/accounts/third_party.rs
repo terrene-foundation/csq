@@ -1004,11 +1004,16 @@ pub fn unbind_provider_from_slot(base_dir: &Path, slot: AccountNum) -> Result<bo
             // must REFUSE, not silently leave the credential bound.
             // Distinguish by the lock's parent; anything unverifiable fails
             // closed.
+            // `confirm_absent` makes that absence genuine: on Windows a file where a
+            // directory belongs above `parent` reads as NotFound too (unverifiable
+            // fails closed to the refusal below).
             let parent_missing = match settings_lock_path.parent() {
-                Some(parent) => matches!(
-                    std::fs::symlink_metadata(parent),
-                    Err(ref pe) if pe.kind() == std::io::ErrorKind::NotFound
-                ),
+                Some(parent) => {
+                    matches!(
+                        std::fs::symlink_metadata(parent),
+                        Err(ref pe) if pe.kind() == std::io::ErrorKind::NotFound
+                    ) && crate::platform::fs::confirm_absent(parent).is_ok()
+                }
                 None => false,
             };
             if parent_missing {
@@ -1192,12 +1197,22 @@ pub fn is_third_party_slot_with(
             })
         }
         // A missing config dir is a slot with no settings: not third-party.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && crate::platform::fs::confirm_absent(&config_dir).is_ok() =>
+        {
+            return Ok(false)
+        }
         _ => {}
     }
     let content = match read(&settings_path) {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && crate::platform::fs::confirm_absent(&settings_path).is_ok() =>
+        {
+            return Ok(false)
+        }
         Err(e) => {
             return Err(ConfigError::InvalidJson {
                 path: settings_path,

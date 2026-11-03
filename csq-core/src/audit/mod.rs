@@ -28,9 +28,9 @@
 //! [`RecordId`], [`KeyId`], [`Sha256Hex`], [`SinkName`], [`SinkId`],
 //! [`RedactedString`], [`Ed25519Signature`], [`Ed25519PublicKey`],
 //! [`SinkReceipt`], [`SinkError`] / [`LedgerError`] / [`SigningError`]
-//! / [`IdError`] (all `#[non_exhaustive]`), [`EventKind`] (24 variants —
+//! / [`IdError`] (all `#[non_exhaustive]`), [`EventKind`] (28 variants —
 //! the count is enforced by the `_EVENT_KIND_VARIANT_COUNT_CHECK` const-assert
-//! in `types.rs`), [`EventPayload`] (24 typed variants, includes `chain_id` for
+//! in `types.rs`), [`EventPayload`] (28 typed variants, includes `chain_id` for
 //! cross-record consistency per M05).
 //!
 //! [`CanonicalForm`]: traits::CanonicalForm

@@ -129,6 +129,17 @@ pub fn scan_orphan_intents(base_dir: &Path) -> Result<Vec<OrphanIntent>, OrphanS
                     if line.contains(r#""schema_version":"1""#) {
                         continue;
                     }
+                    // A newer binary may have appended a record whose EventKind
+                    // this build does not know. It cannot represent a
+                    // known-kind intent or outcome, so skipping it keeps the
+                    // scan honest; failing the whole scan would make `doctor`
+                    // and seat rotation refuse on a benign version skew.
+                    if matches!(
+                        crate::audit::opaque::admit_opaque(line),
+                        crate::audit::opaque::OpaqueAdmission::Opaque(_)
+                    ) {
+                        continue;
+                    }
                     return Err(OrphanScanError::Parse);
                 }
             };
@@ -626,6 +637,43 @@ mod tests {
             orphans.len(),
             1,
             "the v2 intent is still detected past the skipped v1 line"
+        );
+        assert_eq!(orphans[0].correlation_id, corr.as_str());
+    }
+
+    /// N5: a record from a newer build (an `EventKind` this build does not
+    /// know) is skipped, not a scan failure. It cannot resolve a known-kind
+    /// intent, and failing the scan would make `doctor` and seat rotation
+    /// refuse on a benign version skew.
+    #[test]
+    fn unknown_kind_record_is_skipped_not_scan_failure() {
+        let tmp = TempDir::new().unwrap();
+        let csq_runs = tmp.path().join("csq-runs");
+        std::fs::create_dir_all(&csq_runs).unwrap();
+        let corr = RecordId::try_new(crate::audit::persist::gen_chain_id()).unwrap();
+        let intent = base_record(
+            "i",
+            Some(OpPhase::Intent {
+                correlation_id: corr.clone(),
+            }),
+        );
+        // The same envelope with a kind this build does not know, in BOTH the
+        // top-level tag and the adjacently-tagged payload.
+        let future = serde_json::to_string(&intent)
+            .unwrap()
+            .replace("\"csq_run\"", "\"future_owner_ping\"");
+        assert!(future.contains("future_owner_ping"));
+        std::fs::write(
+            csq_runs.join("mixed.jsonl"),
+            format!("{future}\n{}\n", serde_json::to_string(&intent).unwrap()),
+        )
+        .unwrap();
+        let orphans = scan_orphan_intents(tmp.path())
+            .expect("an unknown-kind line must be skipped, not error the scan");
+        assert_eq!(
+            orphans.len(),
+            1,
+            "the known v2 intent is still detected past the skipped future-kind line"
         );
         assert_eq!(orphans[0].correlation_id, corr.as_str());
     }

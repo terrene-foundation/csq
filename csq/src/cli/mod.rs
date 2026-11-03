@@ -802,6 +802,34 @@ enum Command {
         #[arg(last = true, required = true, allow_hyphen_values = true)]
         server_cmd: Vec<String>,
     },
+
+    /// Administer the owner bridge over Telegram.
+    ///
+    /// Local, owner-only surface: reads the bot token from stdin, stores it in
+    /// the machine's vault, prints a one-time pairing code, and flips the
+    /// bridge on or off. No second factor: a message that passes the full
+    /// verification chain is the owner typing. No subcommand prints a
+    /// credential; `off` and `rotate` always succeed so the bridge can always
+    /// be switched off.
+    Telegram {
+        #[command(subcommand)]
+        command: commands::telegram::TelegramCommand,
+    },
+
+    /// Send a short Telegram message to the pinned owner.
+    ///
+    /// The destination is the owner pinned by `csq telegram pair`; this
+    /// command cannot address another chat and never prints a credential. The
+    /// text is read from stdin unless given here — argv is visible to other
+    /// local processes and lands in shell history, so the positional form is
+    /// for non-sensitive messages. Token-shaped content is scrubbed before the
+    /// message leaves the machine.
+    #[command(name = "notify-owner")]
+    NotifyOwner {
+        /// Message text; omit (or pass `-`) to read it from stdin.
+        #[arg(value_name = "TEXT", allow_hyphen_values = true)]
+        text: Option<String>,
+    },
 }
 
 /// Subcommands for `csq sdk` — SDK surface introspection.
@@ -2362,6 +2390,8 @@ pub fn run() -> Result<()> {
         Command::Suggest => commands::suggest::handle(&base_dir),
         Command::Statusline => commands::statusline::handle(&base_dir),
         Command::McpMessaging => commands::mcp_messaging::run(&base_dir),
+        Command::Telegram { command } => commands::telegram::handle(&base_dir, command),
+        Command::NotifyOwner { text } => commands::notify_owner::handle(text.as_deref()),
         Command::Exec {
             prompt,
             stdin,

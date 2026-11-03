@@ -174,9 +174,19 @@ pub fn load(base_dir: &Path) -> EffectivePosture {
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return EffectivePosture {
-                posture: DaemonPosture::Leader,
-                source: PostureSource::Default,
+            return match crate::platform::fs::confirm_absent(&path) {
+                Ok(()) => EffectivePosture {
+                    posture: DaemonPosture::Leader,
+                    source: PostureSource::Default,
+                },
+                // A file-shaped ancestor (Windows reports NotFound) is unreadable, not
+                // "no posture file": fail to Follower and say what refused.
+                Err(refusal) => EffectivePosture {
+                    posture: DaemonPosture::Follower,
+                    source: PostureSource::Unreadable(format!(
+                        "read {POSTURE_FILE_NAME}: {refusal}"
+                    )),
+                },
             };
         }
         Err(e) => {
@@ -353,6 +363,20 @@ pub fn expired_slots(base_dir: &Path, now_ms: u64) -> Vec<ExpiredSlot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A posture file under a regular file is UNREADABLE (Follower), never the Leader
+    /// default. Unix reports ENOTDIR; Windows reports NotFound, which `confirm_absent`
+    /// refuses and which the message names. DISCRIMINATES ONLY ON WINDOWS.
+    #[test]
+    fn posture_under_a_regular_file_is_follower_unreadable_not_leader_default() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base_file = dir.path().join("base-is-a-file");
+        std::fs::write(&base_file, b"not a directory").unwrap();
+        let posture = load(&base_file);
+        assert_eq!(posture.posture, DaemonPosture::Follower);
+        assert!(matches!(posture.source, PostureSource::Unreadable(_)));
+        assert_eq!(load(dir.path()).posture, DaemonPosture::Leader);
+    }
     use tempfile::TempDir;
 
     #[test]

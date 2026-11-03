@@ -6,6 +6,20 @@ use super::version::Version;
 use super::InstallManager;
 use crate::cli_deps::SurfaceCli;
 
+/// Official manual installation entry points, shared by CLI and desktop-only
+/// consumers. Preserve the five original concrete URLs. The former downstream
+/// CLI match needed a wildcard because SurfaceCli is non-exhaustive. Within its
+/// defining crate, this exhaustive match requires a guide for each new surface.
+pub fn manual_install_url(surface: SurfaceCli) -> &'static str {
+    match surface {
+        SurfaceCli::Claude => "https://www.anthropic.com/claude-code",
+        SurfaceCli::Codex => "https://www.npmjs.com/package/@openai/codex",
+        SurfaceCli::Gemini => "https://www.npmjs.com/package/@google/gemini-cli",
+        SurfaceCli::Kimi => "https://moonshotai.github.io/kimi-code/",
+        SurfaceCli::Grok => "https://x.ai/cli",
+    }
+}
+
 // ── Single-source-of-truth npm package names (IR-L3) ──────────────────────────
 // Referenced from `upgrade_command`, `install_command`, and `auto_update`
 // to avoid hardcoded literals that can drift independently.
@@ -256,6 +270,25 @@ mod tests {
     #[test]
     fn install_path_blocklist_gemini_is_empty() {
         assert!(install_path_blocklist(SurfaceCli::Gemini).is_empty());
+    }
+
+    #[test]
+    fn manual_install_url_preserves_each_concrete_surface_mapping() {
+        for (surface, expected) in [
+            (SurfaceCli::Claude, "https://www.anthropic.com/claude-code"),
+            (
+                SurfaceCli::Codex,
+                "https://www.npmjs.com/package/@openai/codex",
+            ),
+            (
+                SurfaceCli::Gemini,
+                "https://www.npmjs.com/package/@google/gemini-cli",
+            ),
+            (SurfaceCli::Kimi, "https://moonshotai.github.io/kimi-code/"),
+            (SurfaceCli::Grok, "https://x.ai/cli"),
+        ] {
+            assert_eq!(manual_install_url(surface), expected);
+        }
     }
 
     // ── install_command / upgrade_command ────────────────────────────

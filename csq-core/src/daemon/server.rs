@@ -1698,6 +1698,11 @@ impl OAuthErrorKind for OAuthError {
             OAuthError::StateMismatch => "state_mismatch",
             OAuthError::PkceVerification => "pkce_verification",
             OAuthError::Exchange(_) => "exchange",
+            // A classified refresh rejection names its allowlisted category;
+            // the server never sees one on the login-race path, but listing
+            // it keeps this match exhaustive so a future widening surfaces a
+            // typed kind instead of a compile error at an unrelated site.
+            OAuthError::RefreshRejected { category, .. } => category,
             OAuthError::Cancelled => "cancelled",
             OAuthError::StoreAtCapacity { .. } => "store_at_capacity",
             OAuthError::ExchangeTimeout { .. } => "exchange_timeout",

@@ -481,23 +481,27 @@ fn oauth_invalid_scope_error_is_diagnostic_in_error_message() {
     });
 
     match result {
-        Err(OAuthError::Exchange(msg)) => {
+        Err(OAuthError::RefreshRejected { category, detail }) => {
+            assert_eq!(
+                category, "invalid_scope",
+                "the RFC 6749 category is classified, not string-matched downstream"
+            );
             assert!(
-                msg.contains("invalid_scope"),
-                "error message must contain 'invalid_scope' for operator diagnosis: {msg}"
+                detail.contains("invalid_scope"),
+                "error detail must contain 'invalid_scope' for operator diagnosis: {detail}"
             );
             // The description text must also survive (it has no token patterns to redact)
             assert!(
-                msg.contains("invalid") || msg.contains("scope"),
-                "error message should be descriptive: {msg}"
+                detail.contains("invalid") || detail.contains("scope"),
+                "error detail should be descriptive: {detail}"
             );
             // Must NOT contain token patterns from the request body
             assert!(
-                !msg.contains("sk-ant-"),
-                "error message must not contain token prefixes: {msg}"
+                !detail.contains("sk-ant-"),
+                "error detail must not contain token prefixes: {detail}"
             );
         }
-        other => panic!("expected OAuthError::Exchange, got {other:?}"),
+        other => panic!("expected OAuthError::RefreshRejected, got {other:?}"),
     }
 }
 
@@ -514,10 +518,23 @@ fn csq_error_ipc_mapping_coverage() {
     let s: String = err.into();
     assert!(s.starts_with("NOT_FOUND:"), "got: {s}");
 
-    // RefreshTokenInvalid -> LOGIN_REQUIRED
-    let err = CsqError::Broker(BrokerError::RefreshTokenInvalid { account: 1 });
-    let s: String = err.into();
+    // A PERMANENT classified OAuth rejection -> LOGIN_REQUIRED; a retryable
+    // category stays INTERNAL_ERROR so an IPC consumer does not demand a
+    // re-login for a grant that is fine. `RefreshTokenInvalid` was deleted
+    // (L-4): it had no producer and split the classification.
+    let permanent = CsqError::OAuth(OAuthError::RefreshRejected {
+        category: "invalid_grant",
+        detail: "invalid_grant: revoked".into(),
+    });
+    let s: String = permanent.into();
     assert!(s.starts_with("LOGIN_REQUIRED:"), "got: {s}");
+
+    let retryable = CsqError::OAuth(OAuthError::RefreshRejected {
+        category: "invalid_request",
+        detail: "invalid_request".into(),
+    });
+    let s: String = retryable.into();
+    assert!(s.starts_with("INTERNAL_ERROR:"), "got: {s}");
 
     // StateMismatch -> CSRF_ERROR
     let err = CsqError::OAuth(OAuthError::StateMismatch);

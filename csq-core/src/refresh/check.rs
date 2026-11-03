@@ -309,8 +309,9 @@ where
             // Filesystem`, `StorageFull`, …) is NOT contention — it would
             // never clear on a later tick — and falls through to the terminal
             // arm, where the typed `credentials_canonical_lock_refused` tag
-            // (carrying the io_kind) reaches the broker-failed sentinel and
-            // therefore `csq status` / `csq doctor`.
+            // (carrying the io_kind) reaches the WARN log. It deliberately
+            // does NOT set the login-needed sentinel: no credential was ever
+            // presented to the provider.
             warn!(
                 account = %account,
                 error_kind = "refresh_pre_commit_lock_busy",
@@ -402,12 +403,12 @@ where
             // Post-M3-7 the mirror is gone — handle dirs read through
             // identity-keyed symlinks (M3-3/M3-4) and the daemon writes
             // canonical IS the only credential write path. A failed
-            // primary refresh is therefore terminal for this tick:
-            // surface broker_failed and let the user re-login.
+            // primary refresh is therefore terminal for this tick.
+            //
             // R3 corr L-1: the CsqError-level tag for a credential failure is
             // the generic "credential". A canonical-lock I/O fault must be
-            // identifiable on the sentinel / doctor surface, so it carries
-            // the TYPED tag (and its io kind rides the error's Display).
+            // identifiable in the log, so it carries the TYPED tag (and its io
+            // kind rides the error's Display).
             let reason_tag = match &primary_err {
                 CsqError::Credential(
                     error @ crate::error::CredentialError::CanonicalLockRefused { .. },
@@ -419,13 +420,25 @@ where
                 error_kind = reason_tag,
                 "primary refresh failed; sibling-recovery retired in Phase 3"
             );
-            #[cfg(test)]
-            BROKER_SENTINEL_TEST_HOOK.with(|hook| {
-                if let Some(hook) = hook.borrow_mut().take() {
-                    hook();
-                }
-            });
-            let _ = sentinel::set_broker_failed(base_dir, account, reason_tag);
+            // The sticky sentinel means LOGIN NEEDED, never merely "this
+            // attempt failed" (refresh::sentinel module docs). Only a
+            // provider-answered PERMANENT rejection of the grant — an
+            // allowlisted `invalid_grant` / `unauthorized_client`, classified
+            // by `credentials::refresh` — writes it. Everything else
+            // (`invalid_scope`, `invalid_request`, an unparseable body, a
+            // local lock/IO fault, a transport failure) leaves the daemon to
+            // apply its retryable cooldown with no operator-facing demand to
+            // re-authenticate. A stale sentinel from an earlier permanent
+            // failure is left in place: nothing here proved the slot healthy.
+            if sentinel::reason_means_login_needed(reason_tag) {
+                #[cfg(test)]
+                BROKER_SENTINEL_TEST_HOOK.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().take() {
+                        hook();
+                    }
+                });
+                let _ = sentinel::set_broker_failed(base_dir, account, reason_tag);
+            }
             drop(guard);
             // R1 M3-Sec fix-wave: `primary_err.to_string()` Display chain can
             // include `serde_json::Error` or upstream HTTP body bytes that
@@ -776,13 +789,15 @@ where
 /// 6. Calls `http_codex::refresh_with_http_meta` with the injected
 ///    transport. The transport returns body + Date header so we can
 ///    emit `clock_skew_detected` per INV-P01.
-/// 7. On `code: "token_expired"` / `"refresh_token_reused"` →
-///    [`BrokerResult::Failed`] with the typed
-///    [`BrokerError::CodexTokenExpired`] / [`BrokerError::CodexRefreshReused`]
-///    variant. Sets the broker_failed flag so subsequent reads (and
-///    the statusline LOGIN-NEEDED indicator) see it. Maps to
-///    `LOGIN_REQUIRED:` at the IPC boundary via the existing
-///    `From<CsqError> for String` impl in `error.rs`.
+/// 7. On `code: "token_expired"` / `"refresh_token_reused"` /
+///    `"token_invalidated"` → [`BrokerResult::Failed`] with the typed
+///    [`BrokerError`] variant. These are the ONLY Codex outcomes that set the
+///    sticky login-needed sentinel (reason = the typed tag), which
+///    `csq status`, `csq doctor` and the statusline print on its own line.
+///    Maps to `LOGIN_REQUIRED:` at the IPC boundary via the existing
+///    `From<CsqError> for String` impl in `error.rs`. An upstream code
+///    outside that vocabulary (or a malformed body) is a retryable failure:
+///    it applies the daemon's cooldown and writes no sentinel.
 /// 8. On HTTP 429 → [`BrokerResult::RateLimited`].
 /// 9. On success: builds a merged [`CredentialFile::Codex`]
 ///    (preserving `auth_mode`, `openai_api_key`, `extra`) and writes
@@ -1098,33 +1113,37 @@ where
                 let broker_err = other.into_broker(account.get());
                 // Compute the kind tag inline rather than wrapping into
                 // CsqError just to call `error_kind_tag` — avoids needing a
-                // Clone bound on BrokerError.
-                let kind: &'static str = match &broker_err {
-                    BrokerError::CodexTokenExpired { .. } => "codex_token_expired",
-                    BrokerError::CodexRefreshReused { .. } => "codex_refresh_reused",
-                    BrokerError::CodexTokenInvalidated { .. } => "codex_token_invalidated",
-                    BrokerError::RefreshTokenInvalid { .. } => "broker_token_invalid",
-                    BrokerError::RefreshFailed { .. } => "broker_refresh_failed",
-                };
+                // Clone bound on BrokerError. The tag comes from the typed
+                // BrokerError variant, never from the upstream body.
+                let kind: &'static str = broker_err.kind_tag();
                 warn!(
                     account = %account,
                     surface = "codex",
                     error_kind = kind,
                     "codex refresh failed"
                 );
-                log_codex_failure_sentinel_authority(
-                    account,
-                    with_current_codex_authority(
-                        base_dir,
+                // Same rule as the Anthropic arm: the sticky sentinel means
+                // LOGIN NEEDED. Only the provider's own re-login codes —
+                // `token_expired`, `refresh_token_reused`, `token_invalidated`
+                // (and the missing-refresh-token case handled above) — set
+                // it. An `Upstream` response outside that vocabulary or a
+                // schema-drift body is retryable: the daemon cooldowns and
+                // retries, and the operator is not told to re-authenticate.
+                if sentinel::reason_means_login_needed(kind) {
+                    log_codex_failure_sentinel_authority(
                         account,
-                        captured_uuid,
-                        captured_generation,
-                        &creds,
-                        || {
-                            let _ = sentinel::set_broker_failed(base_dir, account, kind);
-                        },
-                    ),
-                );
+                        with_current_codex_authority(
+                            base_dir,
+                            account,
+                            captured_uuid,
+                            captured_generation,
+                            &creds,
+                            || {
+                                let _ = sentinel::set_broker_failed(base_dir, account, kind);
+                            },
+                        ),
+                    );
+                }
                 drop(guard);
                 return Ok(BrokerResult::Failed(broker_err));
             }
@@ -1403,6 +1422,18 @@ fn now_secs() -> u64 {
 /// `{"error":{"type":"rate_limit_error", ...}}` for 429s, which
 /// `extract_oauth_error` stringifies as `rate_limit_error: ...`.
 fn is_rate_limited(e: &CsqError) -> bool {
+    // A CLASSIFIED provider rejection is never the heuristic's business: the
+    // category is authoritative, and a free-form `error_description` that
+    // happens to contain "rate limit" must not divert a dead-grant answer
+    // (`invalid_grant`) into the rate-limit arm — that arm returns early,
+    // applies a backoff and never sets the login-needed sentinel, turning a
+    // permanent credential failure into a silent retry loop.
+    if matches!(
+        e,
+        CsqError::OAuth(crate::error::OAuthError::RefreshRejected { .. })
+    ) {
+        return false;
+    }
     let msg = e.to_string().to_lowercase();
     msg.contains("rate_limit") || msg.contains("rate limit")
 }
@@ -1557,8 +1588,12 @@ mod tests {
         );
     }
 
+    /// A provider rejection of the GRANT (`invalid_grant`) is the sticky
+    /// login-needed state, and the sentinel records the CLASSIFIED category —
+    /// not the pre-fix generic `"oauth"` — so every operator surface can say
+    /// why the slot needs a login.
     #[test]
-    fn broker_check_failed_sets_flag() {
+    fn broker_check_invalid_grant_marks_login_needed_with_classified_reason() {
         let dir = TempDir::new().unwrap();
         let account = AccountNum::try_from(3u16).unwrap();
 
@@ -1569,7 +1604,109 @@ mod tests {
 
         let result = broker_check(dir.path(), account, mock_refresh_failure).unwrap();
         assert!(matches!(result, BrokerResult::Failed(_)));
-        assert!(sentinel::is_broker_failed(dir.path(), account));
+        assert!(sentinel::login_needed_marker_present(dir.path(), account));
+        assert_eq!(
+            sentinel::read_broker_failed_reason(dir.path(), account).as_deref(),
+            Some("invalid_grant"),
+            "the classified OAuth category must be the persisted reason"
+        );
+    }
+
+    /// A retryable provider rejection must NOT set the sentinel: the daemon
+    /// cooldowns and retries, and no surface tells the operator to
+    /// re-authenticate. `invalid_scope` is the an internal journal entry mass-failure
+    /// category; `invalid_request` is the JSON-only-switch class (journal
+    /// 0034) — both would have been false login demands under the old
+    /// every-failure-sets-the-flag behavior.
+    #[test]
+    fn broker_check_retryable_oauth_categories_are_not_login_needed() {
+        for body in [
+            &br#"{"error":"invalid_scope","error_description":"scope rejected"}"#[..],
+            &br#"{"error":"invalid_request","error_description":"malformed"}"#[..],
+            &br#"{"error":{"type":"api_error","message":"upstream boom"}}"#[..],
+            // Schema drift / truncated body: no classifiable category at all.
+            &b"<html>502 bad gateway</html>"[..],
+        ] {
+            let dir = TempDir::new().unwrap();
+            let account = AccountNum::try_from(6u16).unwrap();
+            let creds = make_creds("at-6", "rt-6", 0);
+            provision_uuid_for_account(dir.path(), account.get());
+            save_creds_uuid(dir.path(), account.get(), &creds);
+            credentials::save(&file::canonical_path(dir.path(), account), &creds).unwrap();
+
+            let result = broker_check(dir.path(), account, |_url, _body| Ok(body.to_vec()))
+                .expect("broker_check never errors on a provider rejection");
+            assert!(
+                matches!(result, BrokerResult::Failed(_)),
+                "a provider rejection is still a failed attempt: {result:?}"
+            );
+            assert!(
+                !sentinel::login_needed_marker_present(dir.path(), account),
+                "a retryable rejection must not demand a login for {}: the daemon \
+                 applies its cooldown instead",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    /// The rate-limit heuristic must never divert a CLASSIFIED rejection.
+    /// `is_rate_limited` lowercases the error's Display and matches "rate
+    /// limit"; a dead-grant answer whose free-form description happens to
+    /// carry that wording would otherwise return `RateLimited`, skip the
+    /// sentinel and retry a permanently dead credential forever.
+    #[test]
+    fn broker_check_invalid_grant_with_rate_limit_wording_still_marks_login_needed() {
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(14u16).unwrap();
+        let creds = make_creds("at-14", "rt-14", 0);
+        provision_uuid_for_account(dir.path(), account.get());
+        save_creds_uuid(dir.path(), account.get(), &creds);
+        credentials::save(&file::canonical_path(dir.path(), account), &creds).unwrap();
+
+        let result = broker_check(dir.path(), account, |_url, _body| {
+            Ok(
+                br#"{"error":"invalid_grant","error_description":"rate limit exceeded for this grant"}"#
+                    .to_vec(),
+            )
+        })
+        .unwrap();
+        assert!(
+            matches!(result, BrokerResult::Failed(_)),
+            "a classified rejection must not be diverted to RateLimited: {result:?}"
+        );
+        assert_eq!(
+            sentinel::read_broker_failed_reason(dir.path(), account).as_deref(),
+            Some("invalid_grant"),
+        );
+    }
+
+    /// Stickiness: a retryable failure that arrives AFTER a permanent one
+    /// must leave the login-needed marker in place. The slot still cannot
+    /// refresh; only a successful refresh or a login resolves the condition.
+    #[test]
+    fn broker_check_retryable_failure_does_not_clear_the_login_needed_marker() {
+        let dir = TempDir::new().unwrap();
+        let account = AccountNum::try_from(8u16).unwrap();
+        let creds = make_creds("at-8", "rt-8", 0);
+        provision_uuid_for_account(dir.path(), account.get());
+        save_creds_uuid(dir.path(), account.get(), &creds);
+        credentials::save(&file::canonical_path(dir.path(), account), &creds).unwrap();
+
+        // First tick: permanent rejection.
+        let _ = broker_check(dir.path(), account, mock_refresh_failure).unwrap();
+        assert!(sentinel::login_needed_marker_present(dir.path(), account));
+
+        // Second tick: a retryable rejection. The marker must survive.
+        let result = broker_check(dir.path(), account, |_url, _body| {
+            Ok(br#"{"error":"invalid_scope","error_description":"scope rejected"}"#.to_vec())
+        })
+        .unwrap();
+        assert!(matches!(result, BrokerResult::Failed(_)));
+        assert_eq!(
+            sentinel::read_broker_failed_reason(dir.path(), account).as_deref(),
+            Some("invalid_grant"),
+            "a retryable failure must neither clear nor overwrite the login-needed reason"
+        );
     }
 
     /// D237 ruling F: a LOCAL transport failure has an UNKNOWN provider
@@ -1596,7 +1733,7 @@ mod tests {
             "an unknown-outcome refresh must retry, not report failure: {result:?}"
         );
         assert!(
-            !sentinel::is_broker_failed(dir.path(), account),
+            !sentinel::login_needed_marker_present(dir.path(), account),
             "an unknown transport outcome is not a re-login condition"
         );
     }
@@ -1623,7 +1760,7 @@ mod tests {
         });
         assert!(matches!(result.unwrap(), BrokerResult::Skipped));
         assert!(
-            !sentinel::is_broker_failed(dir.path(), account),
+            !sentinel::login_needed_marker_present(dir.path(), account),
             "a missing runtime is not a re-login condition"
         );
         let kinds: Vec<String> = events
@@ -1803,7 +1940,7 @@ mod tests {
             matches!(result, BrokerResult::Skipped),
             "a pending rescue outranks a provider rejection for LOGIN-NEEDED: {result:?}"
         );
-        assert!(!sentinel::is_broker_failed(dir.path(), account));
+        assert!(!sentinel::login_needed_marker_present(dir.path(), account));
         assert!(
             crate::credentials::rescue::rescue_record_pending(&identity_dir).is_some(),
             "the in-flight record must be reported, never ignored or deleted"
@@ -1826,7 +1963,7 @@ mod tests {
             matches!(result, BrokerResult::Skipped),
             "an unknown-outcome codex refresh must retry: {result:?}"
         );
-        assert!(!sentinel::is_broker_failed(dir.path(), acc));
+        assert!(!sentinel::login_needed_marker_present(dir.path(), acc));
     }
 
     /// Reader parity for Codex: a missing refresh token in the canonical is
@@ -1860,7 +1997,7 @@ mod tests {
             matches!(result, BrokerResult::Skipped),
             "a pending rescue outranks the missing-token LOGIN-NEEDED: {result:?}"
         );
-        assert!(!sentinel::is_broker_failed(dir.path(), acc));
+        assert!(!sentinel::login_needed_marker_present(dir.path(), acc));
         assert!(crate::credentials::rescue::rescue_record_pending(&identity_dir).is_some());
     }
 
@@ -1905,7 +2042,7 @@ mod tests {
             matches!(result, BrokerResult::Skipped),
             "a pending rescue skips the tick: {result:?}"
         );
-        assert!(!sentinel::is_broker_failed(dir.path(), account));
+        assert!(!sentinel::login_needed_marker_present(dir.path(), account));
         assert!(
             record.exists(),
             "the provable record stays PENDING while its writer is live"
@@ -1970,7 +2107,7 @@ mod tests {
         );
         assert!(matches!(result, BrokerResult::Refreshed), "{result:?}");
         assert!(
-            !sentinel::is_broker_failed(dir.path(), account),
+            !sentinel::login_needed_marker_present(dir.path(), account),
             "quarantining a corrupt record is not a re-login condition"
         );
         assert!(
@@ -2062,7 +2199,7 @@ mod tests {
         );
         assert!(matches!(result, BrokerResult::Skipped), "{result:?}");
         assert!(
-            !sentinel::is_broker_failed(dir.path(), account),
+            !sentinel::login_needed_marker_present(dir.path(), account),
             "a pending rescue is never LOGIN-NEEDED"
         );
 
@@ -2126,7 +2263,7 @@ mod tests {
             "pre-commit lock contention skips the tick: {result:?}"
         );
         assert!(
-            !sentinel::is_broker_failed(dir.path(), account),
+            !sentinel::login_needed_marker_present(dir.path(), account),
             "lock contention is not a re-login condition"
         );
         assert!(
@@ -2137,13 +2274,17 @@ mod tests {
 
     /// R3 corr L-1: a NON-contention canonical-lock I/O fault (EACCES/EISDIR/
     /// EROFS/ENOSPC) is not contention. It must not report "busy; retried
-    /// next tick" — no later tick clears it — and must reach the sentinel
-    /// surface (`csq status` / `csq doctor`) with its typed tag; no provider
-    /// request may run.
+    /// next tick" — no later tick clears it — and must be visible with its
+    /// typed tag; no provider request may run.
+    ///
+    /// It is NOT a login condition: the credential was never presented to the
+    /// provider, so the sticky LOGIN-NEEDED sentinel stays unset (it would
+    /// tell the operator to re-authenticate a healthy account and make
+    /// `csq run` refuse the slot). The typed tag rides the WARN log instead.
     ///
     /// RED on the pre-fix classifier: every `CanonicalLockRefused` became
-    /// `PreCommitLockRefused`, so the sentinel stayed unset and the only tag
-    /// was `refresh_pre_commit_lock_busy`.
+    /// `PreCommitLockRefused`, so the only tag was
+    /// `refresh_pre_commit_lock_busy`.
     #[cfg(unix)]
     #[test]
     fn broker_check_non_contention_lock_error_is_visible_not_busy() {
@@ -2182,14 +2323,21 @@ mod tests {
             "a permanent local lock fault is a failure, not a silent busy skip: {result:?}"
         );
         assert_eq!(
-            sentinel::read_broker_failed_reason(dir.path(), account).as_deref(),
-            Some("credentials_canonical_lock_refused"),
-            "the typed lock-refusal reason must reach the sentinel / doctor surface"
+            sentinel::read_broker_failed_reason(dir.path(), account),
+            None,
+            "a local lock fault is never a login demand — the slot must not \
+             be marked LOGIN-NEEDED"
         );
         let kinds: Vec<String> = events
             .iter()
             .filter_map(|fields| fields.get("error_kind").cloned())
             .collect();
+        assert!(
+            kinds
+                .iter()
+                .any(|kind| kind == "credentials_canonical_lock_refused"),
+            "the typed lock-refusal tag must be visible in the log: {kinds:?}"
+        );
         assert!(
             !kinds
                 .iter()
@@ -2351,7 +2499,7 @@ mod tests {
             "a pending codex rescue must block the provider request entirely"
         );
         assert!(matches!(result, BrokerResult::Skipped));
-        assert!(!sentinel::is_broker_failed(dir.path(), acc));
+        assert!(!sentinel::login_needed_marker_present(dir.path(), acc));
         assert!(crate::credentials::rescue::rescue_record_pending(&identity_dir).is_some());
     }
 
@@ -2371,7 +2519,7 @@ mod tests {
 
         // Set flag first
         sentinel::set_broker_failed(dir.path(), account, "test_reason").unwrap();
-        assert!(sentinel::is_broker_failed(dir.path(), account));
+        assert!(sentinel::login_needed_marker_present(dir.path(), account));
         assert_eq!(
             sentinel::read_broker_failed_reason(dir.path(), account).as_deref(),
             Some("test_reason")
@@ -2380,7 +2528,7 @@ mod tests {
         // Successful refresh clears it
         let result = broker_check(dir.path(), account, mock_refresh_success).unwrap();
         assert!(matches!(result, BrokerResult::Refreshed));
-        assert!(!sentinel::is_broker_failed(dir.path(), account));
+        assert!(!sentinel::login_needed_marker_present(dir.path(), account));
     }
 
     /// M3-7 regression-pin: broker_check no longer fans out to
@@ -2700,7 +2848,7 @@ mod tests {
             matches!(result, BrokerResult::Valid),
             "healthy legacy numeric token must report Valid"
         );
-        assert!(!sentinel::is_broker_failed(base, account));
+        assert!(!sentinel::login_needed_marker_present(base, account));
         assert_eq!(std::fs::read(&numeric).unwrap(), before);
 
         let mut changed = expected.clone();
@@ -3031,7 +3179,7 @@ mod tests {
 
         // Seed a stale sentinel as if a prior failed refresh had set it.
         sentinel::set_broker_failed(dir.path(), acc, "codex_token_invalidated").unwrap();
-        assert!(sentinel::is_broker_failed(dir.path(), acc));
+        assert!(sentinel::login_needed_marker_present(dir.path(), acc));
 
         let mock = |_url: &str, _body: &str| -> Result<crate::http::NodeHttpResponse, String> {
             Ok(crate::http::NodeHttpResponse {
@@ -3044,7 +3192,7 @@ mod tests {
         let result = broker_codex_check(dir.path(), acc, mock).unwrap();
         assert!(matches!(result, BrokerResult::Valid));
         assert!(
-            !sentinel::is_broker_failed(dir.path(), acc),
+            !sentinel::login_needed_marker_present(dir.path(), acc),
             "stale broker_failed sentinel MUST be cleared when Codex creds are healthy"
         );
     }
@@ -3081,7 +3229,7 @@ mod tests {
             serde_json::to_value(credentials::load(&path).unwrap()).unwrap(),
             serde_json::to_value(winner).unwrap()
         );
-        assert!(sentinel::is_broker_failed(dir.path(), acc));
+        assert!(sentinel::login_needed_marker_present(dir.path(), acc));
     }
 
     #[test]
@@ -3181,7 +3329,7 @@ mod tests {
             crate::accounts::profiles::resolve_slot_to_uuid(dir.path(), acc.get()),
             Some(replacement)
         );
-        assert!(sentinel::is_broker_failed(dir.path(), acc));
+        assert!(sentinel::login_needed_marker_present(dir.path(), acc));
     }
 
     /// JWT exp within 2h pre-expiry window → refreshes via injected
@@ -3271,9 +3419,46 @@ mod tests {
         }
 
         // broker_failed flag MUST be set with the codex-specific reason.
-        assert!(sentinel::is_broker_failed(dir.path(), acc));
+        assert!(sentinel::login_needed_marker_present(dir.path(), acc));
         let reason = sentinel::read_broker_failed_reason(dir.path(), acc);
         assert_eq!(reason.as_deref(), Some("codex_token_expired"));
+    }
+
+    /// Same rule as Anthropic: only OpenAI's own re-login codes write the
+    /// sticky sentinel. An upstream error outside that vocabulary (a 5xx, a
+    /// new code, schema drift) is a retryable cooldown — the daemon backs off
+    /// and no operator surface demands a re-login.
+    #[test]
+    fn broker_codex_check_unknown_upstream_code_is_not_login_needed() {
+        for (status, body) in [
+            (
+                500u16,
+                &br#"{"error":{"code":"server_error","message":"try later"}}"#[..],
+            ),
+            (200, &b"<html>bad gateway</html>"[..]),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let exp = now_secs_test().saturating_sub(60);
+            let acc = install_codex_account(dir.path(), 21, exp, Some("rt_unknown"));
+            let mock =
+                move |_url: &str, _body: &str| -> Result<crate::http::NodeHttpResponse, String> {
+                    Ok(crate::http::NodeHttpResponse {
+                        status,
+                        body: body.to_vec(),
+                        date: None,
+                    })
+                };
+            let result = broker_codex_check(dir.path(), acc, mock).unwrap();
+            assert!(
+                matches!(result, BrokerResult::Failed(_)),
+                "a provider answer outside the re-login vocabulary is still a failed attempt: {result:?}"
+            );
+            assert!(
+                !sentinel::login_needed_marker_present(dir.path(), acc),
+                "status {status} / {} must not mark the slot login-needed",
+                String::from_utf8_lossy(body)
+            );
+        }
     }
 
     /// `code: "token_invalidated"` → Failed(CodexTokenInvalidated).
@@ -3957,7 +4142,7 @@ mod tests {
             SavedPairCustody::ConcurrentWrite
         );
         assert!(
-            sentinel::is_broker_failed(dir.path(), account),
+            sentinel::login_needed_marker_present(dir.path(), account),
             "a concurrent write must not clear the sentinel"
         );
         // Exactly current: the pair this call saved is what is there.
@@ -3971,7 +4156,7 @@ mod tests {
             ),
             SavedPairCustody::Current
         );
-        assert!(!sentinel::is_broker_failed(dir.path(), account));
+        assert!(!sentinel::login_needed_marker_present(dir.path(), account));
     }
 
     #[test]
@@ -4052,10 +4237,10 @@ mod tests {
                     assert!(held.load(Ordering::SeqCst));
                     if success {
                         assert!(matches!(result, BrokerResult::Refreshed));
-                        assert!(!sentinel::is_broker_failed(dir.path(), account));
+                        assert!(!sentinel::login_needed_marker_present(dir.path(), account));
                     } else {
                         assert!(matches!(result, BrokerResult::Failed(_)));
-                        assert!(sentinel::is_broker_failed(dir.path(), account));
+                        assert!(sentinel::login_needed_marker_present(dir.path(), account));
                     }
                 }
             }
@@ -4084,7 +4269,7 @@ mod tests {
         sentinel::set_broker_failed(dir.path(), account, "refresh_identity_org_unknown").unwrap();
         // The current Known binding may clear a genuinely healthy observation.
         clear_broker_failed_for_current(dir.path(), account, &captured, &source_path, &healthy);
-        assert!(!sentinel::is_broker_failed(dir.path(), account));
+        assert!(!sentinel::login_needed_marker_present(dir.path(), account));
         {
             let _lock =
                 crate::accounts::profiles_lock::ProfilesFileLock::acquire(dir.path()).unwrap();

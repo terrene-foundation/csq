@@ -104,7 +104,12 @@ impl OpClass {
             // the attestation MAC are its authority, so it is single-sig
             // chain-signed, not an M12 multi-sig-roster decision (same
             // rationale as GovernanceTurn).
-            | EventKind::TelegramBridgeDelivery => None,
+            | EventKind::TelegramBridgeDelivery
+            // S5 outbound owner ping: an owner notification to the already-pinned
+            // chat, not a governed credential/authority action. Its authority is
+            // the owner pin plus the single-sig chain signature, so it carries no
+            // M12 multi-sig roster class (same rationale as the inbound delivery).
+            | EventKind::TelegramOwnerPing => None,
         }
     }
 }

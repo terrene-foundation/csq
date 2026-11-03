@@ -31,7 +31,14 @@ fn read_json(path: &Path, limit: u64) -> Result<Option<serde_json::Value>> {
         Ok(metadata) if !metadata.is_file() => {
             bail!("provider-session fence: configuration is not a regular file; check {KEY}")
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Windows reports a file-shaped ancestor as NotFound: that is an
+            // unreadable fence configuration, not "no fence configured".
+            csq_core::platform::fs::confirm_absent(path).map_err(|_| {
+                anyhow!("provider-session fence: cannot inspect configuration; check {KEY}")
+            })?;
+            return Ok(None);
+        }
         Err(_) => bail!("provider-session fence: cannot inspect configuration; check {KEY}"),
         _ => {}
     }
@@ -52,7 +59,12 @@ fn read_json(path: &Path, limit: u64) -> Result<Option<serde_json::Value>> {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return match std::fs::symlink_metadata(path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && csq_core::platform::fs::confirm_absent(path).is_ok() =>
+                {
+                    Ok(None)
+                }
                 _ => Err(anyhow!(
                     "provider-session fence: unreadable present configuration; check {KEY}"
                 )),
@@ -522,7 +534,15 @@ pub(super) fn check_claude_launch(
                 &mut warnings,
                 "managed settings fragments are not a regular directory",
             )?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if csq_core::platform::fs::confirm_absent(&fragments).is_err() {
+                    add_unknown(
+                        &policy,
+                        &mut warnings,
+                        "managed settings cannot be inspected",
+                    )?;
+                }
+            }
             Err(_) => add_unknown(
                 &policy,
                 &mut warnings,
@@ -645,5 +665,24 @@ fn managed_settings_directory() -> Option<PathBuf> {
     ))]
     {
         None
+    }
+}
+
+#[cfg(test)]
+mod notdir_tests {
+    use super::*;
+
+    /// A fence configuration path under a regular file is unreadable, never "no fence
+    /// configured". Unix reports ENOTDIR from the stat; Windows reports NotFound, which
+    /// `confirm_absent` refuses. DISCRIMINATES ONLY ON WINDOWS; a genuinely missing
+    /// path stays `Ok(None)` everywhere.
+    #[test]
+    fn fence_configuration_under_a_regular_file_is_refused_not_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("parent-is-a-file");
+        std::fs::write(&file, b"not a directory").unwrap();
+        assert!(read_json(&file.join("fence.json"), 1024).is_err());
+        let missing = dir.path().join("gone").join("fence.json");
+        assert!(matches!(read_json(&missing, 1024), Ok(None)));
     }
 }

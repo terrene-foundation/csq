@@ -1682,7 +1682,7 @@ mod tests {
         crate::refresh::sentinel::set_broker_failed(dir.path(), account(7), "oauth")
             .expect("set_broker_failed must succeed to arm this test");
         assert!(
-            crate::refresh::sentinel::is_broker_failed(dir.path(), account(7)),
+            crate::refresh::sentinel::login_needed_marker_present(dir.path(), account(7)),
             "precondition: the sentinel must be set before logout, or this \
              test proves nothing"
         );
@@ -1690,7 +1690,7 @@ mod tests {
         logout_account(dir.path(), account(7)).unwrap();
 
         assert!(
-            !crate::refresh::sentinel::is_broker_failed(dir.path(), account(7)),
+            !crate::refresh::sentinel::login_needed_marker_present(dir.path(), account(7)),
             "a removed slot must not keep a broker-failed sentinel — it makes \
              `csq doctor` demand a login for an account that no longer exists"
         );

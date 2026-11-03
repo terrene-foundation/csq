@@ -79,6 +79,14 @@ pub enum AnchorOutcome {
     },
     /// The chain has no records yet — nothing to anchor.
     EmptyChain,
+    /// The chain HEAD was written by a newer csq build (an `EventKind` this
+    /// binary does not know). It cannot be submitted through the typed sink
+    /// interface, so this cycle does nothing: no failure record, no drift.
+    /// Anchoring resumes on the binary that knows the kind.
+    HeadUnsupported {
+        /// Sequence number of the unsubmittable HEAD.
+        seq: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -241,7 +249,55 @@ pub fn is_high_impact_kind(kind: &EventKind) -> bool {
 ///
 /// Exposed as `pub` so the daemon anchor task loop can read the head for
 /// high-impact-kind detection without going through `anchor_head`.
-pub fn read_chain_head(base_dir: &Path) -> Result<Option<SignedRecord>, String> {
+/// The chain HEAD as the anchor path needs it.
+///
+/// A newer binary may have appended an `EventKind` this build does not know.
+/// `verify_chain` admits such a record as opaque-but-intact; treating the HEAD
+/// as unreadable here would stall anchoring on a benign version skew. Only the
+/// sequence is needed to anchor past it.
+#[derive(Debug, Clone)]
+pub enum ChainHead {
+    /// A record whose kind this build knows.
+    Typed(Box<SignedRecord>),
+    /// A record written by a newer build; only its sequence is meaningful here.
+    Opaque {
+        /// The record's sequence number.
+        seq: u64,
+    },
+}
+
+impl ChainHead {
+    /// The HEAD record's sequence number.
+    #[must_use]
+    pub fn seq(&self) -> u64 {
+        match self {
+            Self::Typed(record) => record.seq,
+            Self::Opaque { seq } => *seq,
+        }
+    }
+
+    /// The typed kind, or `None` when this build does not know it.
+    #[must_use]
+    pub fn kind(&self) -> Option<EventKind> {
+        match self {
+            Self::Typed(record) => Some(record.kind),
+            Self::Opaque { .. } => None,
+        }
+    }
+
+    /// The full typed record, or `None` for an opaque HEAD.
+    #[must_use]
+    pub fn typed(&self) -> Option<&SignedRecord> {
+        match self {
+            Self::Typed(record) => Some(record),
+            Self::Opaque { .. } => None,
+        }
+    }
+}
+
+/// Reads the last record: typed when its kind is known, opaque-but-intact when
+/// a newer writer added the kind (an internal ticket / an internal ticket).
+pub fn read_chain_head(base_dir: &Path) -> Result<Option<ChainHead>, String> {
     let csq_runs = base_dir.join("csq-runs");
     let chain_jsonl = {
         let chain_json = csq_runs.join("chain.json");
@@ -268,11 +324,15 @@ pub fn read_chain_head(base_dir: &Path) -> Result<Option<SignedRecord>, String> 
     let last_line = content.lines().rev().find(|l| !l.trim().is_empty());
     match last_line {
         None => Ok(None),
-        Some(line) => {
-            let record: SignedRecord =
-                serde_json::from_str(line).map_err(|_| "chain HEAD parse error".to_string())?;
-            Ok(Some(record))
-        }
+        Some(line) => match serde_json::from_str::<SignedRecord>(line) {
+            Ok(record) => Ok(Some(ChainHead::Typed(Box::new(record)))),
+            Err(_) => match crate::audit::opaque::admit_opaque(line) {
+                crate::audit::opaque::OpaqueAdmission::Opaque(opaque) => {
+                    Ok(Some(ChainHead::Opaque { seq: opaque.seq }))
+                }
+                _ => Err("chain HEAD parse error".to_string()),
+            },
+        },
     }
 }
 
@@ -520,7 +580,19 @@ pub fn append_local_outcome_record(
 pub async fn anchor_head(sink: &dyn LedgerSink, now_ts: &str, base_dir: &Path) -> AnchorOutcome {
     // Step 1: read chain HEAD.
     let head = match read_chain_head(base_dir) {
-        Ok(Some(rec)) => rec,
+        Ok(Some(ChainHead::Typed(record))) => *record,
+        Ok(Some(ChainHead::Opaque { seq })) => {
+            // The HEAD was written by a newer build. It cannot be submitted
+            // through the typed sink interface, and treating it as a chain
+            // failure would anchor a ReplicationFailed record (and increment
+            // drift) on every cycle for a benign version skew. Do nothing this
+            // cycle; the binary that knows the kind anchors it.
+            info!(
+                event = "anchor_head_unsupported_kind",
+                seq, "anchor_head: HEAD carries an EventKind this build does not know; skipping"
+            );
+            return AnchorOutcome::HeadUnsupported { seq };
+        }
         Ok(None) => {
             info!(
                 event = "anchor_skip_empty_chain",
@@ -1372,6 +1444,44 @@ mod tests {
         let outcome = anchor_head(&sink, "2026-06-03T12:00:00Z", dir.path()).await;
         assert!(matches!(outcome, AnchorOutcome::EmptyChain));
         assert_eq!(sink.submitted_records().len(), 0);
+    }
+
+    /// N4: a HEAD written by a newer build carries an `EventKind` this binary
+    /// does not know. The anchor path must neither fail (which would append a
+    /// ReplicationFailed record and increment drift on every cycle) nor submit
+    /// a record it cannot decode — it reports `HeadUnsupported` and does
+    /// nothing. Anchoring resumes on the binary that knows the kind.
+    #[tokio::test]
+    async fn anchor_head_reports_an_unknown_kind_head_as_unsupported() {
+        let dir = TempDir::new().unwrap();
+        let runs = dir.path().join("csq-runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::write(
+            runs.join("chain.json"),
+            r#"{"chain_id":"01JZ00000000000000000000XY"}"#,
+        )
+        .unwrap();
+        let zeros64 = "0".repeat(64);
+        let zeros128 = "0".repeat(128);
+        let line = format!(
+            r#"{{"schema_version":"2","record_id":"01JZ00000000000000000000R0","chain_id":"01JZ00000000000000000000XY","seq":2,"prev_hash":"{zeros64}","kind":"future_owner_ping","payload":{{"kind":"future_owner_ping","data":{{}}}},"ts":"2026-11-02T00:00:00+00:00","key_id":"ed25519:{zeros64}","canonical_hash":"{zeros64}","signature":"{zeros128}"}}"#
+        );
+        std::fs::write(
+            runs.join("01JZ00000000000000000000XY.jsonl"),
+            format!("{line}\n"),
+        )
+        .unwrap();
+
+        let sink = TrackingSink::new();
+        let outcome = anchor_head(&sink, "2026-11-02T00:00:00Z", dir.path()).await;
+        match outcome {
+            AnchorOutcome::HeadUnsupported { seq } => assert_eq!(seq, 2),
+            other => panic!("expected HeadUnsupported, got {other:?}"),
+        }
+        assert!(
+            sink.submitted_records().is_empty(),
+            "an unknown-kind HEAD must not be submitted to a typed sink"
+        );
     }
 
     /// AC: drift counter increment.

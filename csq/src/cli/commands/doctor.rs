@@ -218,6 +218,18 @@ struct DoctorReport {
     #[serde(skip)]
     keychain_orphans_age_secs: Option<u64>,
     broker_failed: BrokerFailedInfo,
+    /// Slots whose refresh sentinel exists but whose cause is not
+    /// classifiable (legacy generic tag, zero-byte marker, unrecognised tag,
+    /// unreadable file). Never a login demand, never healthy. Omitted when
+    /// empty.
+    #[serde(skip_serializing_if = "RefreshFailingInfo::is_empty")]
+    refresh_failing: RefreshFailingInfo,
+    /// True when `credentials/` could not be enumerated: the two sentinel
+    /// lists above are UNDETERMINED, not empty. Printed as its own line and
+    /// omitted from JSON when false. A surface that stayed silent here would
+    /// read as "all clear" (`guard-reader-writer-parity.md` MUST-2).
+    #[serde(skip_serializing_if = "is_false")]
+    login_state_undetermined: bool,
     /// F5/L3 duplicate-refresh-token audit: one fixed-vocabulary line per finding, from the
     /// same core function the daemon's startup audit uses. Empty when nothing is shared.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1563,6 +1575,23 @@ struct BrokerFailedInfo {
     entries: Vec<BrokerFailedEntry>,
 }
 
+/// Slots whose refresh sentinel exists but whose cause is not classifiable.
+///
+/// Distinct from [`BrokerFailedInfo`] by construction: these are neither
+/// login demands nor healthy. The phrase rendered is
+/// `sentinel::REFRESH_FAILING_CAUSE_NOT_RECORDED`.
+#[derive(Serialize, Default)]
+struct RefreshFailingInfo {
+    count: usize,
+    slots: Vec<u16>,
+}
+
+impl RefreshFailingInfo {
+    fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+}
+
 #[derive(Serialize)]
 struct AccountsInfo {
     total: usize,
@@ -2153,6 +2182,11 @@ struct UnsharedHandleStateJson {
     total_bytes: u64,
 }
 
+/// `serde` helper: omit a `false` boolean from the JSON surface.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[cfg(feature = "enterprise")]
 const DOCTOR_SCHEMA_VERSION: u32 = 35;
 #[cfg(not(feature = "enterprise"))]
@@ -2367,6 +2401,12 @@ fn build_report(base_dir: &Path) -> DoctorReport {
     );
     let audit_verification_level_summary = audit_trust_plane_grade.and(audit_level_summary_raw);
 
+    // One `credentials/` enumeration feeds BOTH sentinel lists, and its
+    // `readable` flag distinguishes "no markers" from "could not read the
+    // directory". A second read here would also re-read unclassified bytes
+    // for `--json` (L-1).
+    let sentinel_scan = csq_core::refresh::sentinel::sentinel_scan(base_dir);
+
     DoctorReport {
         schema_version: DOCTOR_SCHEMA_VERSION,
         schema: doctor_schema_string(),
@@ -2439,7 +2479,9 @@ fn build_report(base_dir: &Path) -> DoctorReport {
         keychain_orphans_error,
         keychain_orphans_level,
         keychain_orphans_age_secs,
-        broker_failed: check_broker_failed(base_dir),
+        broker_failed: check_broker_failed(&sentinel_scan),
+        refresh_failing: check_refresh_failing(&sentinel_scan),
+        login_state_undetermined: !sentinel_scan.readable,
         refresh_audit: csq_core::accounts::refresh_token_audit::operator_lines(base_dir),
         mixed_state_slots: check_mixed_state_slots(base_dir),
         terminals: check_terminals(base_dir),
@@ -2590,21 +2632,29 @@ fn check_seam_registry_status(base_dir: &Path) -> String {
     }
 }
 
-/// True when `path` is NotFound because an EXISTING ancestor component is not
-/// a directory, rather than because the path is genuinely absent. Walks from
-/// `path`'s parent upward and classifies by the first ancestor that exists.
-///
-/// Needed because Windows' `ERROR_PATH_NOT_FOUND` (a non-directory component
-/// earlier in the path) maps to the same `std::io::ErrorKind::NotFound` as
-/// "no such entry" — see the call site in [`check_mcp_gate_outbox_backlog`].
-fn ancestor_is_not_a_directory(path: &Path) -> bool {
-    for ancestor in path.ancestors().skip(1) {
-        match std::fs::symlink_metadata(ancestor) {
-            Ok(meta) => return !meta.is_dir(),
-            Err(_) => continue,
-        }
-    }
-    false
+/// True when the nearest existing ancestor of `path` (found WITHOUT following links) is not
+/// a directory once resolved, which includes a symlink whose target is missing: that ancestor
+/// makes the outbox unreachable even though `stat` on `path` reports plain `NotFound`.
+/// Doctor-only, in addition to the shared `confirm_absent`, which follows links (as the
+/// open does) and so cannot see a dangling link. Restores the unix diagnostic the old
+/// private ancestor walk gave for a dangling `csq-runs` link.
+fn nearest_ancestor_is_not_a_real_directory(path: &Path) -> bool {
+    path.ancestors()
+        .skip(1)
+        .find_map(|ancestor| {
+            std::fs::symlink_metadata(ancestor)
+                .ok()
+                .map(|meta| (ancestor, meta))
+        })
+        .is_some_and(|(ancestor, meta)| {
+            if meta.file_type().is_symlink() {
+                // A symlink to a directory is a directory (a symlinked base dir is
+                // legitimate); only a link that does not resolve to one is a problem.
+                !std::fs::metadata(ancestor).is_ok_and(|target| target.is_dir())
+            } else {
+                !meta.is_dir()
+            }
+        })
 }
 
 /// M6 an internal ticket: inspect the MCP-gate attestation outbox for a stuck backlog.
@@ -2657,8 +2707,11 @@ fn check_mcp_gate_outbox_backlog(base_dir: &Path) -> Option<McpGateOutboxBacklog
             // absent". Unix instead returns ENOTDIR for that case, which lands
             // directly in the `Err(_)` arm below without ever reaching here — so
             // walking ancestors is required only to recover the distinction
-            // Windows' error-kind mapping collapses.
-            if ancestor_is_not_a_directory(&dir) {
+            // Windows' error-kind mapping collapses. `confirm_absent` is the one
+            // shared check (a no-op on unix, where ENOTDIR never reaches this arm).
+            if csq_core::platform::fs::confirm_absent(&dir).is_err()
+                || nearest_ancestor_is_not_a_real_directory(&dir)
+            {
                 admission_problem = Some("mcp_gate_pending_stat");
             }
             None
@@ -2842,7 +2895,13 @@ fn check_seam_capture_conformance(base_dir: &Path) -> SeamConformanceState {
     let required_path = base_dir.join("audit").join("required-hooks.json");
     let required_bytes = match std::fs::File::open(&required_path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Absent file = no policy configured (healthy default).
+            // Absent file = no policy configured (healthy default), once
+            // `confirm_absent` agrees (Windows reports a file-shaped `audit` as NotFound).
+            if csq_core::platform::fs::confirm_absent(&required_path).is_err() {
+                return SeamConformanceState::PolicyUnreadable {
+                    reason: "could not read required-hooks.json".to_string(),
+                };
+            }
             return SeamConformanceState::NotConfigured;
         }
         Err(e) => {
@@ -3956,7 +4015,12 @@ where
     use csq_core::providers::gemini::provisioning::is_gemini_bound_slot;
     let creds_dir_indeterminate = match std::fs::read_dir(base_dir.join("credentials")) {
         Ok(_) => false,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        // A listing: probe a child so `credentials` itself is an ancestor checked
+        // (Windows reports a file-shaped `credentials` as NotFound).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            csq_core::platform::fs::confirm_absent(&base_dir.join("credentials").join("entry"))
+                .is_err()
+        }
         Err(_) => true, // EACCES/EMFILE/EIO → cannot prove absence
     };
     let gemini_slots_present = creds_dir_indeterminate
@@ -5420,70 +5484,101 @@ fn check_custodian_identity_canary(base_dir: &Path) -> CustodianIdentityCanary {
     }
 }
 
-/// Scans `credentials/N.broker-failed` sentinel files and returns the list of
-/// accounts that require re-login.
+/// Scans the sticky login-needed sentinel files and returns the slots that
+/// require re-login.
 ///
-/// The scan uses two approaches combined:
-/// 1. Check every account discovered by `discovery::discover_anthropic` —
-///    covers accounts whose credential slot exists.
-/// 2. Glob `credentials/*.broker-failed` directly — catches sentinel files for
-///    accounts whose `credentials/N.json` is missing (total loss case).
-///
-/// Both sets are unioned and de-duplicated before building the report.
-fn check_broker_failed(base_dir: &Path) -> BrokerFailedInfo {
-    let mut failed_ids: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
-
-    // Pass 1: discovered accounts.
-    let accounts = discovery::discover_anthropic(base_dir);
-    for a in &accounts {
-        let Ok(num) = AccountNum::try_from(a.id) else {
-            continue;
-        };
-        if fanout::is_broker_failed(base_dir, num) {
-            failed_ids.insert(a.id);
-        }
-    }
-
-    // Pass 2: filesystem scan of credentials/*.broker-failed to catch
-    // accounts not in the discovery list.
-    let creds_dir = base_dir.join("credentials");
-    if let Ok(entries) = std::fs::read_dir(&creds_dir) {
-        for entry in entries.flatten() {
-            let name = match entry.file_name().into_string() {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-            let stem = match name.strip_suffix(".broker-failed") {
-                Some(s) => s,
-                None => continue,
-            };
-            if let Ok(id) = stem.parse::<u16>() {
-                failed_ids.insert(id);
-            }
-        }
-    }
-
-    let entries: Vec<BrokerFailedEntry> = failed_ids
-        .iter()
-        .filter_map(|&id| {
-            let Ok(num) = AccountNum::try_from(id) else {
-                return None;
-            };
-            let reason = fanout::read_broker_failed_reason(base_dir, num).unwrap_or_default();
-            let display_reason = if reason.is_empty() {
-                "unknown".to_string()
-            } else {
-                reason
-            };
-            Some(BrokerFailedEntry {
-                account: id,
-                reason: display_reason,
-            })
+/// Classifies ONCE, through [`csq_core::refresh::sentinel::SentinelScan`] —
+/// the SAME reader `csq status` uses — so a slot cannot be login-needed on
+/// one operator surface and not another. The reason is the classified
+/// `&'static str` the scan carries, never a second read of the file: a
+/// marker re-read could serialise unclassified bytes into
+/// `csq doctor --json` (`BrokerFailedEntry.reason`). The sentinel file is the
+/// only source; it is written by the daemon's refresh path for PERMANENT
+/// rejections only, so a classified tag IS the login demand.
+fn check_broker_failed(scan: &fanout::SentinelScan) -> BrokerFailedInfo {
+    let entries: Vec<BrokerFailedEntry> = scan
+        .login_needed()
+        .map(|(account, reason)| BrokerFailedEntry {
+            account: account.get(),
+            reason: reason.to_string(),
         })
         .collect();
 
     let count = entries.len();
     BrokerFailedInfo { count, entries }
+}
+
+/// Slots whose marker exists but whose cause is not classifiable.
+///
+/// Delegates the classification to
+/// [`csq_core::refresh::sentinel::SentinelScan::refresh_failing_slots`] — the
+/// SAME three-state reader `csq status` and the desktop use — so a legacy
+/// generic marker cannot be reported as a login demand on one surface and
+/// not another.
+fn check_refresh_failing(scan: &fanout::SentinelScan) -> RefreshFailingInfo {
+    let slots: Vec<u16> = scan
+        .refresh_failing_slots()
+        .into_iter()
+        .map(|account| account.get())
+        .collect();
+    RefreshFailingInfo {
+        count: slots.len(),
+        slots,
+    }
+}
+
+/// One printed line per slot whose refresh cause is not recorded: same
+/// phrase as the statusline's, prefixed with the slot and rendered in its own
+/// section so it can never be read as a login demand.
+fn refresh_failing_section(info: &RefreshFailingInfo) -> Vec<String> {
+    info.slots
+        .iter()
+        .filter_map(|slot| {
+            let account = AccountNum::try_from(*slot).ok()?;
+            Some(format!(
+                "  Refresh:     {} {}",
+                warn(),
+                fanout::refresh_failing_line(account),
+            ))
+        })
+        .collect()
+}
+
+/// One printed line when `credentials/` could not be enumerated: the two
+/// sentinel lists are UNDETERMINED, not empty. Extracted so the text is
+/// testable without capturing stdout.
+fn scan_undetermined_section(undetermined: bool) -> Option<String> {
+    undetermined.then(|| {
+        format!(
+            "  Scan:        {} {}",
+            warn(),
+            fanout::SENTINEL_SCAN_UNDETERMINED
+        )
+    })
+}
+
+/// One printed line per login-needed slot: the shared operator message plus
+/// the fixed-vocabulary reason tag.
+///
+/// Extracted from [`handle`] so the text is testable and the message cannot
+/// drift from `csq status` / the statusline (all three call
+/// `sentinel::login_needed_line`). Reasons are sanitized here because a
+/// foreign writer's marker contents are not trusted for display (spec/13
+/// §10, M-3).
+fn login_needed_section(info: &BrokerFailedInfo) -> Vec<String> {
+    info.entries
+        .iter()
+        .filter_map(|entry| {
+            let account = AccountNum::try_from(entry.account).ok()?;
+            let reason = sanitize_for_display(&entry.reason);
+            Some(format!(
+                "  Login:       {} {} ({})",
+                fail(),
+                fanout::login_needed_line(account),
+                reason,
+            ))
+        })
+        .collect()
 }
 
 /// Detects legacy and modern CC terminals by examining the `base_dir` layout.
@@ -6309,20 +6404,22 @@ fn print_report(r: &DoctorReport) {
         println!("  {line}");
     }
 
-    // Broker-failed sentinels
-    if r.broker_failed.count > 0 {
-        for entry in &r.broker_failed.entries {
-            // sanitize reason: broker failure reasons may include strings
-            // sourced from external services (spec/13 §10, M-3).
-            let reason = sanitize_for_display(&entry.reason);
-            println!(
-                "  Broker:      {} Account {}: LOGIN-NEEDED ({}) — run `csq login {}`",
-                fail(),
-                entry.account,
-                reason,
-                entry.account,
-            );
-        }
+    // Sticky login-needed state. Its OWN line, using the shared
+    // fixed-vocabulary message `csq status` and the statusline print — the
+    // reason tag (fixed vocabulary from the sentinel writer) is diagnostic
+    // detail appended after it.
+    for line in login_needed_section(&r.broker_failed) {
+        println!("{line}");
+    }
+    // A marker whose cause was never recorded: its own, DIFFERENT line —
+    // never a login demand, never healthy.
+    for line in refresh_failing_section(&r.refresh_failing) {
+        println!("{line}");
+    }
+    // The directory could not be enumerated: the two lists above are
+    // UNDETERMINED, not empty. Never let silence read as all-clear.
+    if let Some(line) = scan_undetermined_section(r.login_state_undetermined) {
+        println!("{line}");
     }
 
     for line in render_refresh_audit_lines(&r.refresh_audit) {
@@ -9399,6 +9496,8 @@ mod tests {
                 count: 0,
                 entries: Vec::new(),
             },
+            refresh_failing: RefreshFailingInfo::default(),
+            login_state_undetermined: false,
             refresh_audit: Vec::new(),
             mixed_state_slots: MixedStateInfo {
                 count: 0,
@@ -9609,6 +9708,65 @@ mod tests {
             status.status, "ok",
             "no Gemini slot must gate to ok regardless of env"
         );
+    }
+
+    /// A dangling symlink standing where `csq-runs` belongs makes the outbox unreachable:
+    /// `stat` reports plain NotFound (the link's target is missing), so only the
+    /// link-aware ancestor check can name it. Reds if that check is removed.
+    #[cfg(unix)]
+    #[test]
+    fn mcp_gate_dangling_csq_runs_symlink_reports_a_stat_problem() {
+        let dir = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("no-such-target"),
+            dir.path().join("csq-runs"),
+        )
+        .unwrap();
+        let report = check_mcp_gate_outbox_backlog(dir.path())
+            .expect("a dangling csq-runs link must be reported, not silent");
+        assert_eq!(report.admission_problem, Some("mcp_gate_pending_stat"));
+        assert!(report.warn);
+    }
+
+    /// A base directory that is itself a symlink to a real directory is legitimate: a
+    /// missing outbox under it is genuine absence, not a stat problem.
+    #[cfg(unix)]
+    #[test]
+    fn mcp_gate_symlinked_base_dir_with_no_outbox_stays_silent() {
+        let real = TempDir::new().unwrap();
+        let holder = TempDir::new().unwrap();
+        let link = holder.path().join("accounts-link");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        assert!(check_mcp_gate_outbox_backlog(&link).is_none());
+    }
+
+    /// A `credentials` regular file makes the directory unlistable, which is
+    /// INDETERMINATE (cannot prove no Gemini slot), never "absent". Unix reports ENOTDIR
+    /// from `read_dir`; Windows reports NotFound, which `confirm_absent` refuses.
+    /// DISCRIMINATES ONLY ON WINDOWS; a missing directory stays "no slots" everywhere.
+    #[test]
+    fn host_isolation_credentials_as_file_is_indeterminate_not_absent() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("credentials"), b"not a directory").unwrap();
+        let env = ["PATH", "HOME"];
+        let status = check_host_isolation_with_env(tmp.path(), env.iter().copied());
+        assert!(
+            status.gemini_slots_present,
+            "an unlistable dir must not prove absence"
+        );
+        // The `under a file` shape: the BASE is a regular file, so `read_dir` of
+        // `<base>/credentials` is NotFound on Windows (ERROR_PATH_NOT_FOUND), not the
+        // `ERROR_DIRECTORY` a direct `read_dir` of a file gives. Windows-discriminating.
+        let base_file = tmp.path().join("base-is-a-file");
+        std::fs::write(&base_file, b"not a directory").unwrap();
+        let status = check_host_isolation_with_env(&base_file, env.iter().copied());
+        assert!(
+            status.gemini_slots_present,
+            "a base that is a file must not prove the credentials dir absent"
+        );
+        let clean = TempDir::new().unwrap();
+        let status = check_host_isolation_with_env(clean.path(), env.iter().copied());
+        assert!(!status.gemini_slots_present);
     }
 
     /// PR-CA8b R1-H4: clean env with a Gemini slot → `ok`.
@@ -10365,7 +10523,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         // Act
-        let info = check_broker_failed(tmp.path());
+        let info = check_broker_failed(&fanout::sentinel_scan(tmp.path()));
 
         // Assert
         assert_eq!(info.count, 0);
@@ -10374,18 +10532,20 @@ mod tests {
 
     #[test]
     fn check_broker_failed_detects_sentinel_files() {
-        // Arrange: write two broker-failed sentinel files directly
+        // Arrange: two CLASSIFIED login-needed sentinels (the only kind that
+        // is a login demand — a generic legacy tag is UNKNOWN and is covered
+        // by `legacy_generic_marker_is_listed_as_refresh_failing_not_login_needed`).
         let tmp = TempDir::new().unwrap();
         let creds_dir = tmp.path().join("credentials");
         std::fs::create_dir_all(&creds_dir).unwrap();
         std::fs::write(creds_dir.join("2.broker-failed"), "invalid_grant").unwrap();
-        std::fs::write(creds_dir.join("5.broker-failed"), "network").unwrap();
+        std::fs::write(creds_dir.join("5.broker-failed"), "codex_refresh_reused").unwrap();
 
         // Act
-        let info = check_broker_failed(tmp.path());
+        let info = check_broker_failed(&fanout::sentinel_scan(tmp.path()));
 
         // Assert
-        assert_eq!(info.count, 2, "two sentinels should be detected");
+        assert_eq!(info.count, 2, "two classified sentinels should be detected");
         let ids: Vec<u16> = info.entries.iter().map(|e| e.account).collect();
         assert!(ids.contains(&2), "account 2 should be in entries");
         assert!(ids.contains(&5), "account 5 should be in entries");
@@ -10393,23 +10553,26 @@ mod tests {
 
     #[test]
     fn check_broker_failed_reads_reason_from_file() {
-        // Arrange
+        // Arrange: a classified tag, so the entry is a real login demand.
         let tmp = TempDir::new().unwrap();
         let creds_dir = tmp.path().join("credentials");
         std::fs::create_dir_all(&creds_dir).unwrap();
-        std::fs::write(creds_dir.join("3.broker-failed"), "rate_limit").unwrap();
+        std::fs::write(creds_dir.join("3.broker-failed"), "unauthorized_client").unwrap();
 
         // Act
-        let info = check_broker_failed(tmp.path());
+        let info = check_broker_failed(&fanout::sentinel_scan(tmp.path()));
 
         // Assert
         assert_eq!(info.count, 1);
         assert_eq!(info.entries[0].account, 3);
-        assert_eq!(info.entries[0].reason, "rate_limit");
+        assert_eq!(info.entries[0].reason, "unauthorized_client");
     }
 
+    /// A pre-v2.1 zero-byte marker records NO cause, so it is UNKNOWN: it
+    /// must not be reported as a login demand, and must be listed in the
+    /// refresh-failing section instead.
     #[test]
-    fn check_broker_failed_empty_sentinel_shows_unknown_reason() {
+    fn check_broker_failed_empty_sentinel_is_not_a_login_demand() {
         // Arrange: pre-v2.1 zero-byte sentinel file
         let tmp = TempDir::new().unwrap();
         let creds_dir = tmp.path().join("credentials");
@@ -10417,13 +10580,18 @@ mod tests {
         std::fs::write(creds_dir.join("1.broker-failed"), b"").unwrap();
 
         // Act
-        let info = check_broker_failed(tmp.path());
+        let login = check_broker_failed(&fanout::sentinel_scan(tmp.path()));
+        let failing = check_refresh_failing(&fanout::sentinel_scan(tmp.path()));
 
         // Assert
-        assert_eq!(info.count, 1);
         assert_eq!(
-            info.entries[0].reason, "unknown",
-            "empty file should show 'unknown'"
+            login.count, 0,
+            "a zero-byte marker is not a login demand — its cause was never recorded"
+        );
+        assert_eq!(
+            failing.slots,
+            vec![1],
+            "it IS a refresh failure, surfaced as UNKNOWN"
         );
     }
 
@@ -10437,7 +10605,7 @@ mod tests {
         std::fs::write(creds_dir.join("random.txt"), "data").unwrap();
 
         // Act
-        let info = check_broker_failed(tmp.path());
+        let info = check_broker_failed(&fanout::sentinel_scan(tmp.path()));
 
         // Assert
         assert_eq!(info.count, 0, "non-sentinel files should not be counted");
@@ -10445,22 +10613,130 @@ mod tests {
 
     #[test]
     fn check_broker_failed_entries_sorted_by_account_number() {
-        // Arrange: write sentinels in reverse order
+        // Arrange: write classified sentinels in reverse order
         let tmp = TempDir::new().unwrap();
         let creds_dir = tmp.path().join("credentials");
         std::fs::create_dir_all(&creds_dir).unwrap();
-        std::fs::write(creds_dir.join("7.broker-failed"), "network").unwrap();
+        std::fs::write(creds_dir.join("7.broker-failed"), "codex_token_invalidated").unwrap();
         std::fs::write(creds_dir.join("2.broker-failed"), "invalid_grant").unwrap();
-        std::fs::write(creds_dir.join("4.broker-failed"), "rate_limit").unwrap();
+        std::fs::write(creds_dir.join("4.broker-failed"), "codex_token_expired").unwrap();
 
         // Act
-        let info = check_broker_failed(tmp.path());
+        let info = check_broker_failed(&fanout::sentinel_scan(tmp.path()));
 
         // Assert: entries should be sorted ascending by account number
         assert_eq!(info.count, 3);
         assert_eq!(info.entries[0].account, 2);
         assert_eq!(info.entries[1].account, 4);
         assert_eq!(info.entries[2].account, 7);
+    }
+
+    /// Each login-needed slot prints its OWN line carrying the shared
+    /// operator message (`login needed — run csq login N`) — the same text
+    /// `csq status` and the statusline print — plus the diagnostic reason.
+    /// The pre-fix line read `Account N: LOGIN-NEEDED (…)`, which did NOT
+    /// carry that message.
+    #[test]
+    fn login_needed_section_prints_the_shared_own_line() {
+        let info = BrokerFailedInfo {
+            count: 2,
+            entries: vec![
+                BrokerFailedEntry {
+                    account: 7,
+                    reason: "invalid_grant".into(),
+                },
+                BrokerFailedEntry {
+                    account: 3,
+                    reason: "unknown".into(),
+                },
+            ],
+        };
+        let lines = login_needed_section(&info);
+        assert_eq!(lines.len(), 2, "one line per slot: {lines:?}");
+        assert!(
+            lines[0].contains("login needed — run csq login 7"),
+            "slot 7's line must carry the shared message: {}",
+            lines[0]
+        );
+        assert!(lines[0].contains("(invalid_grant)"));
+        assert!(lines[1].contains("login needed — run csq login 3"));
+        assert!(
+            lines.iter().all(|line| !line.contains('%')),
+            "a login-needed line is never a quota row: {lines:?}"
+        );
+    }
+
+    /// L-1: a `BrokerFailedEntry.reason` is the classified `&'static str`
+    /// carried by the scan, never a second read of marker bytes.
+    /// `check_broker_failed` takes ONLY the scan, so it has no filesystem
+    /// path at all; this test pins the field to the classified tag.
+    #[test]
+    fn broker_failed_entry_reason_is_the_classified_tag_from_the_scan() {
+        let tmp = TempDir::new().unwrap();
+        let creds = tmp.path().join("credentials");
+        std::fs::create_dir_all(&creds).unwrap();
+        std::fs::write(creds.join("6.broker-failed"), "codex_refresh_reused").unwrap();
+
+        let info = check_broker_failed(&fanout::sentinel_scan(tmp.path()));
+        assert_eq!(info.entries.len(), 1);
+        assert_eq!(
+            info.entries[0].reason, "codex_refresh_reused",
+            "the JSON reason must be the classified tag, not re-read bytes"
+        );
+    }
+
+    /// A legacy generic marker is UNKNOWN: doctor lists it in the refresh
+    /// section with the not-recorded phrase, NOT in the login section.
+    /// Removing `check_refresh_failing`'s call or the `Unknown` classification
+    /// REDs this.
+    #[test]
+    fn legacy_generic_marker_is_listed_as_refresh_failing_not_login_needed() {
+        let tmp = TempDir::new().unwrap();
+        let creds_dir = tmp.path().join("credentials");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(creds_dir.join("2.broker-failed"), "oauth").unwrap();
+        std::fs::write(creds_dir.join("3.broker-failed"), "").unwrap();
+        std::fs::write(creds_dir.join("4.broker-failed"), "invalid_grant").unwrap();
+
+        let failing = check_refresh_failing(&fanout::sentinel_scan(tmp.path()));
+        assert_eq!(
+            failing.slots,
+            vec![2, 3],
+            "the generic and zero-byte markers are UNKNOWN; the classified one is not"
+        );
+        let login = check_broker_failed(&fanout::sentinel_scan(tmp.path()));
+        assert_eq!(
+            login.entries.len(),
+            1,
+            "only the classified invalid_grant marker is a login demand"
+        );
+        assert_eq!(login.entries[0].account, 4);
+
+        let lines = refresh_failing_section(&failing);
+        assert_eq!(lines.len(), 2, "one line per unknown slot: {lines:?}");
+        assert!(lines[0].contains("slot 2: refresh failing, cause not recorded"));
+        assert!(lines[1].contains("slot 3: refresh failing, cause not recorded"));
+        assert!(
+            lines.iter().all(|line| !line.contains("login needed")),
+            "an unknown marker must never render as a login demand: {lines:?}"
+        );
+    }
+
+    /// An unreadable `credentials/` directory is UNDETERMINED, not empty:
+    /// both lists stay empty but the report and its printed section say so.
+    /// Collapsing to an empty report without the flag REDs this.
+    #[test]
+    fn unreadable_credentials_directory_is_surfaced_not_read_as_all_clear() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("credentials"), b"not a directory").unwrap();
+
+        let scan = fanout::sentinel_scan(tmp.path());
+        assert!(!scan.readable);
+        assert!(check_broker_failed(&scan).entries.is_empty());
+        assert!(check_refresh_failing(&scan).slots.is_empty());
+        let line = scan_undetermined_section(true).expect("an undetermined scan must print");
+        assert!(line.contains(fanout::SENTINEL_SCAN_UNDETERMINED));
+        assert!(scan_undetermined_section(false).is_none());
     }
 
     // ── custodian-identity canary tests (an internal ticket) ──────────────────────────
@@ -12307,21 +12583,42 @@ mod tests {
 
     /// Windows maps ERROR_PATH_NOT_FOUND (a path component exists but is not a
     /// directory) onto the same `ErrorKind::NotFound` used for a genuinely
-    /// absent path. This is the platform-neutral regression test for the
-    /// Windows-only symptom: `ancestor_is_not_a_directory` must distinguish the
-    /// two NotFound-shaped situations directly, without depending on which
-    /// `io::ErrorKind` this host's `stat` actually returns.
+    /// absent path. The shared `confirm_absent` must distinguish the two
+    /// NotFound-shaped situations directly: it refuses on Windows and is a
+    /// no-op on unix (ENOTDIR already surfaces there). The file-ancestor
+    /// assertion DISCRIMINATES ONLY ON WINDOWS.
     #[test]
-    fn ancestor_is_not_a_directory_distinguishes_notfound_shapes() {
+    fn confirm_absent_distinguishes_notfound_shapes() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("file"), b"not a directory").unwrap();
         // `<tmp>/file/child`: an existing ancestor ("file") is not a directory.
-        assert!(ancestor_is_not_a_directory(
-            &dir.path().join("file").join("child")
-        ));
+        assert_eq!(
+            csq_core::platform::fs::confirm_absent(&dir.path().join("file").join("child")).is_err(),
+            cfg!(windows)
+        );
         // `<tmp>/missing/child`: no ancestor below `dir` exists at all.
-        assert!(!ancestor_is_not_a_directory(
-            &dir.path().join("missing").join("child")
+        assert!(
+            csq_core::platform::fs::confirm_absent(&dir.path().join("missing").join("child"))
+                .is_ok()
+        );
+    }
+
+    /// The seam required-hooks policy sits under `audit/`; an `audit` regular file makes the
+    /// policy unreachable, never "no policy configured". Unix reports ENOTDIR on the open
+    /// (already `PolicyUnreadable`); Windows reports NotFound, which `confirm_absent`
+    /// refuses. DISCRIMINATES ONLY ON WINDOWS.
+    #[test]
+    fn seam_conformance_audit_dir_as_file_is_unreadable_not_unconfigured() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("audit"), b"not a directory").unwrap();
+        assert!(matches!(
+            check_seam_capture_conformance(dir.path()),
+            SeamConformanceState::PolicyUnreadable { .. }
+        ));
+        let clean = TempDir::new().unwrap();
+        assert!(matches!(
+            check_seam_capture_conformance(clean.path()),
+            SeamConformanceState::NotConfigured
         ));
     }
 

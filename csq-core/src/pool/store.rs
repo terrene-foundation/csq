@@ -1683,7 +1683,10 @@ impl Pool {
     /// remains durable for explicit recovery or the next launch.
     pub fn recover_after_restart(&self) -> Result<RestartRecovery> {
         match std::fs::symlink_metadata(&self.root) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && fs::confirm_absent(&self.root).is_ok() =>
+            {
                 return Ok(RestartRecovery::NotNeeded);
             }
             Err(_) => return Err(PoolError::ManifestUnavailable),

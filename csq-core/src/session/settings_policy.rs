@@ -106,8 +106,9 @@ pub fn slot_allows_provider_window(
         config_dir.join(".credentials.json"),
         base_dir.join("credentials").join(format!("{slot}.json")),
     ] {
-        if !matches!(std::fs::symlink_metadata(path),
+        if !matches!(std::fs::symlink_metadata(&path),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            || crate::platform::fs::confirm_absent(&path).is_err()
         {
             return false;
         }

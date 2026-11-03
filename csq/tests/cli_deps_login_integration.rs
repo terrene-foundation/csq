@@ -58,6 +58,127 @@ static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 mod common;
 use common::csq_bin;
 
+#[cfg(windows)]
+mod windows_native_login {
+    use super::csq_bin;
+    use csq_core::providers::native;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+
+    fn command(root: &Path, bin: &Path, home: &Path, base: &Path) -> Command {
+        let mut command = Command::new(csq_bin());
+        command
+            .env_clear()
+            .current_dir(root)
+            .env("HOME", home)
+            .env("CSQ_HOME", home)
+            .env("USERPROFILE", home)
+            .env("APPDATA", home)
+            .env("LOCALAPPDATA", home)
+            .env("CLAUDE_HOME", home)
+            .env("CSQ_BASE_DIR", base)
+            .env("PATH", bin)
+            .env("TEMP", root)
+            .env("TMP", root)
+            .env("CSQ_SECRET_BACKEND", "in-memory")
+            .env("CSQ_DISABLE_KEYCHAIN_MIRROR", "1")
+            .env("CSQ_NO_AUTO_UPDATE_CLI", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for name in [
+            "SystemRoot",
+            "SYSTEMROOT",
+            "SystemDrive",
+            "WINDIR",
+            "ComSpec",
+            "PATHEXT",
+        ] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        command
+    }
+
+    #[test]
+    fn native_cmd_and_bat_are_refused_before_version_probe_or_vendor_home() {
+        let mut refused_before_effects = true;
+        let mut actionable = true;
+        for descriptor in native::NATIVE_CLIS {
+            for extension in ["cmd", "bat"] {
+                let private = tempfile::tempdir().unwrap();
+                let bin = private.path().join("bin with spaces & ^");
+                let home = private.path().join("home");
+                let base = private.path().join("base");
+                for directory in [&bin, &home, &base] {
+                    std::fs::create_dir(directory).unwrap();
+                }
+                let probe = private.path().join("version-probe-ran");
+                std::fs::write(
+                    bin.join(format!("{}.{extension}", descriptor.binary)),
+                    b"@echo probe>\"%CSQ_PRIVATE_NATIVE_PROBE%\"\r\n@echo 0.0.1\r\n@exit /b 0\r\n",
+                )
+                .unwrap();
+                let output = command(private.path(), &bin, &home, &base)
+                    .env("CSQ_PRIVATE_NATIVE_PROBE", &probe)
+                    .args(["login", "41", "--provider", descriptor.id])
+                    .output()
+                    .expect("private csq login must execute");
+                let slot = csq_core::types::AccountNum::try_from(41_u16).unwrap();
+                refused_before_effects &= !output.status.success()
+                    && !probe.exists()
+                    && !native::native_home_path(&base, slot, descriptor.surface).exists()
+                    && !native::marker_path(&base, slot, descriptor.surface).exists();
+                // Display is an operator-facing contract; the absent sentinel
+                // and absent vendor artifacts above are the behavioral oracle.
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                actionable &= stderr.contains(csq_core::cli_deps::minimum::manual_install_url(
+                    descriptor.surface_cli,
+                ));
+                private.close().unwrap();
+            }
+        }
+        eprintln!("NATIVE_CLI_WRAPPER_PRIVATE_CLEANUP_CONFIRMED");
+        if !refused_before_effects {
+            eprintln!("NATIVE_WRAPPER_MUST_REFUSE_BEFORE_PROBE_OR_HOME");
+        }
+        assert!(
+            refused_before_effects,
+            "wrapper reached a probe, vendor home or binding"
+        );
+        assert!(
+            actionable,
+            "unsupported wrapper lacked its official installation guide"
+        );
+    }
+
+    #[test]
+    fn missing_native_binary_keeps_install_gate_before_drivability() {
+        for descriptor in native::NATIVE_CLIS {
+            let private = tempfile::tempdir().unwrap();
+            let bin = private.path().join("bin");
+            let home = private.path().join("home");
+            let base = private.path().join("base");
+            for directory in [&bin, &home, &base] {
+                std::fs::create_dir(directory).unwrap();
+            }
+            let output = command(private.path(), &bin, &home, &base)
+                .args(["login", "42", "--provider", descriptor.id])
+                .output()
+                .expect("private missing-binary csq login must execute");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success() && stderr.contains("is not installed"),
+                "NATIVE_MISSING_MUST_REACH_INSTALL_GATE: {stderr}"
+            );
+            let slot = csq_core::types::AccountNum::try_from(42_u16).unwrap();
+            assert!(!native::native_home_path(&base, slot, descriptor.surface).exists());
+            assert!(!native::marker_path(&base, slot, descriptor.surface).exists());
+        }
+    }
+}
+
 // ── Subprocess helper ────────────────────────────────────────────────────────
 
 /// Per-binary sandbox `$HOME` — a single empty tempdir for the whole test

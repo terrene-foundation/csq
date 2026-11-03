@@ -237,9 +237,15 @@ fn is_identity_removed_with<F>(base: &Path, id: IdentityId, stat: F) -> bool
 where
     F: FnOnce(&Path) -> std::io::Result<std::fs::Metadata>,
 {
-    match stat(&identity_removed_marker_path(base, id)) {
+    let marker = identity_removed_marker_path(base, id);
+    match stat(&marker) {
         Ok(_) => true,
-        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        // A definite NotFound is absence only once `confirm_absent` agrees: Windows
+        // reports a file-shaped ancestor as NotFound too.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::platform::fs::confirm_absent(&marker).is_err()
+        }
+        Err(_) => true,
     }
 }
 

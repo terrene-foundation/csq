@@ -37,6 +37,8 @@ pub mod mcp_messaging;
 mod mcp_messaging_reload;
 pub mod models;
 pub mod move_slot;
+/// Outbound owner ping (`csq notify-owner`).
+pub mod notify_owner;
 pub mod pool;
 pub mod probe;
 pub mod repair;
@@ -53,6 +55,9 @@ pub mod status;
 pub mod statusline;
 pub mod suggest;
 pub mod swap;
+/// `csq telegram …` — local owner-bridge administration (setup, status,
+/// pairing, on/off with `--allow`, token rotation).
+pub mod telegram;
 /// Shared `#[cfg(test)]` support: bounded hermetic re-exec for the three
 /// TMPDIR `*_outlives_*` regressions (child-process isolation of the
 /// TMPDIR mutation; see the module docs). `all(test, unix)`, not `test`:

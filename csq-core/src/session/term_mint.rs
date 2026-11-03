@@ -497,7 +497,12 @@ pub fn read_ledger(base: &Path) -> Result<MintLedger, LedgerUnreadable> {
     let path = ledger_path(base);
     let meta = match std::fs::symlink_metadata(&path) {
         Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(MintLedger::empty()),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && crate::platform::fs::confirm_absent(&path).is_ok() =>
+        {
+            return Ok(MintLedger::empty())
+        }
         Err(_) => return Err(LedgerUnreadable),
     };
     let most = (LEDGER_V1_LEN + 4 + LEDGER_MAX_RECORDS * RECORD_LEN_V2 + CHECKSUM_LEN) as u64;

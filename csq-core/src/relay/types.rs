@@ -277,8 +277,10 @@ pub enum InputClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionIdentity {
     pub pid: u32,
-    /// The process start time as read from the OS (same unit as
-    /// `sessions::SessionInfo::started_at`).
+    /// Kernel incarnation token. The authenticated relay control seam uses
+    /// raw start ticks on Linux and the existing Unix-second reader on macOS;
+    /// compare only tokens from the same reader and platform. Linux tokens
+    /// are not `sessions::SessionInfo::started_at` wall-clock seconds.
     pub started_at: u64,
 }
 

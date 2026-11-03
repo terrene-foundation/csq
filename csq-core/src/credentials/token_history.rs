@@ -1311,7 +1311,10 @@ fn read_owner_proof_v2(
             .open(&path)
         {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && crate::platform::fs::confirm_absent(&path).is_ok() =>
+            {
                 return OwnerProofRead::Absent
             }
             Err(_) => return OwnerProofRead::Incompatible,
@@ -1325,7 +1328,12 @@ fn read_owner_proof_v2(
     #[cfg(not(windows))]
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return OwnerProofRead::Absent,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && crate::platform::fs::confirm_absent(&path).is_ok() =>
+        {
+            return OwnerProofRead::Absent
+        }
         Err(_) => return OwnerProofRead::Incompatible,
     };
     // Sixteen version/fingerprint entries plus context fit this fixed ceiling.

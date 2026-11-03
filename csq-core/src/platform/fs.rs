@@ -1552,8 +1552,10 @@ fn discard_created(file: std::fs::File, path: &Path) {
 /// parent returns `PlatformError::AtomicReplaceParentMismatch` before opening
 /// either entry. The parent is pinned once and junctions in its path are followed.
 /// POSIX-semantics rename replaces a file even with a reader holding
-/// it open with delete sharing. An unsupported POSIX rename class tries the plain rename
-/// class through the same validated source handle. Sharing, lock, or selected
+/// it open with delete sharing. An unsupported POSIX rename class, and the measured
+/// extended-class-only ACCESS_DENIED (the shared `windows_rename_should_fall_back`
+/// policy), try the plain rename class through the same validated source handle; any
+/// refusal the two classes share is re-asserted by the plain class. Sharing, lock, or selected
 /// access-denied failures are retried up to 5 times with 100ms delay; access-denied
 /// on a directory target, and any other error, is returned on the first attempt. Other
 /// permanent access-denied causes (read-only file, denying DACL) are retried
@@ -1758,6 +1760,23 @@ fn windows_replace_retry(
         }
 }
 
+/// an internal ticket: the retry status for a dispatch that fell back to the plain class.
+/// Both codes are the Win32 (DOS) translations of the NTSTATUS pair, so the
+/// policy is exercisable on every platform; the Windows caller translates
+/// before calling. The attempted fallback governs retry; the extended-class
+/// DENIAL is the measured transient shape, so it keeps the attempt retryable
+/// even when the plain class reports a code the policy cannot treat as
+/// transient (the pre-fix eligibility, with the attempt budget unchanged);
+/// otherwise the plain class's status governs.
+#[cfg(any(windows, test))]
+fn windows_replace_retry_status(posix_nt: i32, posix_dos: u32, plain_dos: u32) -> u32 {
+    if windows_rename_class_denied(posix_nt) && !is_transient_move_error(plain_dos, false) {
+        posix_dos
+    } else {
+        plain_dos
+    }
+}
+
 #[cfg(any(windows, test))]
 fn windows_replace_source_safe(attributes: u32, links: u32) -> bool {
     attributes & (0x400 | 0x10) == 0 && links == 1
@@ -1775,6 +1794,43 @@ pub fn windows_rename_class_unsupported(status: i32) -> bool {
         status as u32,
         0xC000_0003 | 0xC000_000D | 0xC000_0010 | 0xC000_00BB
     )
+}
+
+/// `STATUS_ACCESS_DENIED` on the EXTENDED rename class alone is a class
+/// fallback, never a permission verdict (an internal ticket).
+///
+/// Evidence (native Windows run 41587031855, branch `fix/windows-profiles-rename-root-1806`):
+/// `FileRenameInformationEx` returned this status on 1 of 2000 iterations of the
+/// retained-writer replacement shape under full-suite load. That iteration's
+/// fixed-vocabulary diagnosis recorded `target_attrs=none`, `delete_blocked=no`
+/// and `holder=unknown` — i.e. the target was not read-only and no holder was
+/// ATTRIBUTABLE (the diagnosis does not claim no holder exists). A separate
+/// forced-legacy run over the same retained-writer SHAPE (a different temp and
+/// target) published through `FileRenameInformation` successfully, and the
+/// deterministic native test `windows_retained_replace_recovers_from_a_denied_extended_class`
+/// now injects exactly this status on the same handle and proves the recovery.
+/// WHY the extended class was denied without an attributable holder is not measured; filter
+/// or kernel interference is a hypothesis, not a finding.
+///
+/// The plain class re-evaluates every refusal class it SHARES with the
+/// extended class — the DACL and mandatory-label checks, the read-only
+/// attribute, and the sharing check (which is stricter for the plain class) —
+/// so a shared refusal still fails. The plain class grants no access the
+/// caller did not already hold. Both premises are named because the conclusion
+/// covers only them: an extended-class-only refusal is interference this code
+/// chooses to survive, not a permission it grants.
+#[cfg(any(windows, test))]
+pub(crate) fn windows_rename_class_denied(status: i32) -> bool {
+    status as u32 == 0xC000_0022
+}
+
+/// The ONE extended-class fallback policy shared by the general atomic writer
+/// and chat-transcript publication: an unsupported class or the measured
+/// extended-class-only denial selects the plain class. Both callers MUST use
+/// this predicate so their policies cannot drift apart.
+#[cfg(any(windows, test))]
+pub(crate) fn windows_rename_should_fall_back(status: i32) -> bool {
+    windows_rename_class_unsupported(status) || windows_rename_class_denied(status)
 }
 
 /// Budget for the an internal ticket publication diagnosis. All three probes (the attribute
@@ -2102,7 +2158,7 @@ fn dispatch_windows_rename<H>(
     if !windows_rename_failed(posix) {
         return Ok(());
     }
-    if !windows_rename_class_unsupported(posix) {
+    if !windows_rename_should_fall_back(posix) {
         return Err((posix, None));
     }
     let plain = rename(source, parent, 10);
@@ -2187,12 +2243,20 @@ struct WindowsReplaceFailure {
 impl WindowsReplaceFailure {
     fn retry_code(&self) -> u32 {
         use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
-        // SAFETY: pure status translation. The attempted fallback governs retry;
-        // the original POSIX refusal remains the final reported primary code.
-        self.nt
-            .and_then(|(_, plain)| plain)
-            .map(|status| unsafe { RtlNtStatusToDosError(status) })
-            .unwrap_or(self.code)
+        // SAFETY: pure status translation. The attempted fallback normally
+        // governs retry (the extended-class denial is the documented
+        // exception); the original POSIX refusal remains the final reported
+        // primary code.
+        match self.nt {
+            Some((posix, Some(plain))) => {
+                // SAFETY: pure NTSTATUS translation.
+                let plain_dos = unsafe { RtlNtStatusToDosError(plain) };
+                // SAFETY: pure NTSTATUS translation.
+                let posix_dos = unsafe { RtlNtStatusToDosError(posix) };
+                windows_replace_retry_status(posix, posix_dos, plain_dos)
+            }
+            _ => self.code,
+        }
     }
     fn io(stage: WindowsReplaceStage, api: &'static str, error: std::io::Error) -> Self {
         Self {
@@ -2357,6 +2421,9 @@ type AfterReplaceFailureHook = Box<dyn FnMut(WindowsReplaceStage, u32)>;
 #[cfg(all(windows, test))]
 thread_local! {
     static REPLACE_FORCE_LEGACY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // an internal ticket regression fixture: the measured intermittent denial of the
+    // EXTENDED rename class, reproduced deterministically.
+    static REPLACE_DENY_POSIX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static REPLACE_BEFORE_RENAME: std::cell::RefCell<Option<BeforeRenameHook>> =
         const { std::cell::RefCell::new(None) };
     static REPLACE_AFTER_PARENT_PIN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
@@ -2631,6 +2698,10 @@ fn windows_replace_attempt(
         if class == 65 && REPLACE_FORCE_LEGACY.with(|f| f.get()) {
             return 0xC000_0003_u32 as i32;
         }
+        #[cfg(test)]
+        if class == 65 && REPLACE_DENY_POSIX.with(|f| f.get()) {
+            return 0xC000_0022_u32 as i32;
+        }
         // SAFETY: same validated DELETE handle for both synchronous calls. The
         // union is fully overwritten (class10's BOOLEAN is 0 for no-replace).
         unsafe {
@@ -2882,7 +2953,13 @@ where
 ///
 /// On Windows the open uses `FILE_FLAG_OPEN_REPARSE_POINT`, so a symlink or junction is
 /// opened as the reparse point itself rather than followed, and the same handle-level
-/// `is_file()` check then rejects it. (Windows has no FIFO to block on.)
+/// `is_file()` check then rejects it. (Windows has no FIFO to block on.) Windows also
+/// reports a path component that is a regular file as `NotFound`
+/// (`ERROR_PATH_NOT_FOUND`) where unix reports `ENOTDIR`, so before returning `Ok(None)`
+/// the reader runs [`confirm_absent`]: it walks to the nearest existing ancestor and
+/// returns `Err(NotADirectory)` when that ancestor is not a directory (an ancestor that
+/// cannot be inspected returns its own error), and `Ok(None)` only when that ancestor is
+/// a directory. On unix the check is a no-op because `ENOTDIR` already surfaces.
 pub fn read_regular_nofollow_bounded(path: &Path, max: u64) -> std::io::Result<Option<Vec<u8>>> {
     read_regular_nofollow_bounded_inner(path, max, false)
 }
@@ -2922,7 +2999,10 @@ fn read_regular_nofollow_bounded_inner(
     }
     let file = match opts.open(path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            confirm_absent(path)?;
+            return Ok(None);
+        }
         Err(e) => return Err(e),
     };
     let meta = file.metadata()?;
@@ -2957,11 +3037,222 @@ fn read_regular_nofollow_bounded_inner(
     Ok(Some(buf))
 }
 
+/// The one cross-crate absence check (`csq-core` and `csq` both call it; do not write a
+/// second copy of this walk).
+///
+/// Confirms that a `NotFound` open/read/stat error on `path` really means "the target is
+/// absent", before a reader reports absence. Call it in the `NotFound` arm of every read
+/// that maps absence to a permissive state (healthy, empty, no marker).
+///
+/// Windows reports `ERROR_PATH_NOT_FOUND` (an `io::ErrorKind::NotFound`) when a path
+/// component is a regular file, where unix returns `ENOTDIR`. A reader that maps that
+/// `NotFound` to "absent" therefore reads a present-but-unreachable marker as absent on
+/// Windows only, and fails open.
+///
+/// * unix: always `Ok(())`. `ENOTDIR` already surfaces as its own error kind, and the
+///   check costs no extra syscall (the statusline render path calls readers built on it).
+/// * Windows: walks the ancestors of `path` with `std::fs::metadata` (followed, as the
+///   open follows them, so a symlinked directory still counts as a directory):
+///   - the nearest existing ancestor is a directory: `Ok(())`, the target is absent;
+///   - it is not a directory: `Err(NotADirectory)` with a fixed message that carries no
+///     path;
+///   - its metadata fails with anything other than `NotFound`: that original error is
+///     returned unchanged;
+///   - the ancestors run out on an absolute or prefixed path (a vanished drive or
+///     share): `Err` of kind `Other`, never `NotFound`, so a caller cannot map it back
+///     to absent;
+///   - the nearest remaining ancestor is the empty parent of a relative path: `Ok(())`.
+///
+/// Every `Err` returned is a refusal; a caller treats it exactly like any other
+/// unreadable-input error on that path.
+///
+/// For a directory LISTING (`read_dir(dir)` returned `NotFound`) pass a child of `dir`,
+/// not `dir` itself: the walk starts at the parent of the path it is given, so a child
+/// path puts `dir` among the ancestors checked, and a regular file standing where `dir`
+/// belongs is refused.
+pub fn confirm_absent(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        confirm_absent_walk(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// The ancestor walk behind [`confirm_absent`]. Compiled on unix for tests only, so the
+/// walk's decisions are exercised on every platform; on unix a missing component under a
+/// regular file surfaces as `ENOTDIR` (kind `NotADirectory`) from `metadata`, which the
+/// walk returns unchanged.
+#[cfg(any(windows, test))]
+fn confirm_absent_walk(path: &Path) -> std::io::Result<()> {
+    let mut cur = path.parent();
+    while let Some(dir) = cur {
+        if dir.as_os_str().is_empty() {
+            return Ok(());
+        }
+        match std::fs::metadata(dir) {
+            Ok(meta) if meta.is_dir() => return Ok(()),
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    "a path component is not a directory",
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => cur = dir.parent(),
+            Err(e) => return Err(e),
+        }
+    }
+    exhausted_ancestors_verdict(path)
+}
+
+/// The verdict when the ancestor walk ran out without finding an existing ancestor:
+/// an absolute or prefixed path (a vanished drive, share or root) is `Err` of kind
+/// `Other`, NEVER `NotFound` (a caller would map that back to absent); a relative path
+/// has nothing left to check and is `Ok`. Pure (no filesystem access) so every platform
+/// can unit-test the decision the Windows-only situation depends on.
+#[cfg(any(windows, test))]
+fn exhausted_ancestors_verdict(path: &Path) -> std::io::Result<()> {
+    use std::path::Component;
+    let rooted = path.has_root() || matches!(path.components().next(), Some(Component::Prefix(_)));
+    if rooted {
+        return Err(std::io::Error::other("no existing ancestor"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// A path whose parent (or a farther ancestor) is a regular file is an error on
+    /// every platform, never "absent". Unix gets this from `ENOTDIR`; Windows reports
+    /// `ERROR_PATH_NOT_FOUND`, which the reader must not map to `Ok(None)`.
+    #[test]
+    fn bounded_readers_refuse_a_path_under_a_regular_file() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("credentials");
+        fs::write(&file, b"not a directory").unwrap();
+        for path in [file.join("3.broker-failed"), file.join("x").join("y")] {
+            assert!(
+                read_regular_nofollow_bounded(&path, 64).is_err(),
+                "{path:?}: a non-directory ancestor must not read as absent"
+            );
+            assert!(
+                read_private_regular_nofollow_bounded(&path, 64).is_err(),
+                "{path:?}: a non-directory ancestor must not read as absent (private)"
+            );
+        }
+    }
+
+    /// A genuinely missing parent directory still reads as absent on every platform.
+    #[test]
+    fn bounded_readers_treat_a_missing_parent_as_absent() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("missing").join("3.broker-failed");
+        assert!(matches!(read_regular_nofollow_bounded(&path, 64), Ok(None)));
+        assert!(matches!(
+            read_private_regular_nofollow_bounded(&path, 64),
+            Ok(None)
+        ));
+    }
+
+    /// A missing parent (or missing ancestor chain) under a real directory is genuine
+    /// absence on every platform: `confirm_absent` and its walk both return `Ok`.
+    #[test]
+    fn confirm_absent_accepts_a_missing_parent_under_a_directory() {
+        let dir = TempDir::new().unwrap();
+        for path in [
+            dir.path().join("missing"),
+            dir.path().join("missing").join("3.broker-failed"),
+            dir.path().join("a").join("b").join("c"),
+        ] {
+            assert!(confirm_absent(&path).is_ok(), "{path:?}");
+            assert!(confirm_absent_walk(&path).is_ok(), "{path:?}");
+        }
+    }
+
+    /// The contract differs by platform on purpose: unix returns `Ok` (`ENOTDIR`
+    /// already surfaces from the open, so the check costs no syscall); Windows
+    /// returns `Err(NotADirectory)` because its open reports `NotFound` for the same
+    /// shape. DISCRIMINATES ONLY ON WINDOWS for the `confirm_absent` arm; the walk arm
+    /// runs everywhere.
+    #[test]
+    fn confirm_absent_refuses_a_path_under_a_regular_file_on_windows_only() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("credentials");
+        fs::write(&file, b"not a directory").unwrap();
+        for path in [file.join("3.broker-failed"), file.join("x").join("y")] {
+            let result = confirm_absent(&path);
+            if cfg!(windows) {
+                let error = result.expect_err("a file-shaped ancestor must refuse on Windows");
+                assert_ne!(error.kind(), std::io::ErrorKind::NotFound, "{path:?}");
+            } else {
+                assert!(result.is_ok(), "{path:?}: unix is a no-op by contract");
+            }
+            let walked = confirm_absent_walk(&path)
+                .expect_err("the walk itself refuses a file-shaped ancestor everywhere");
+            assert_ne!(
+                walked.kind(),
+                std::io::ErrorKind::NotFound,
+                "{path:?}: a refusal must never carry NotFound, or a caller maps it back to absent"
+            );
+        }
+    }
+
+    /// The refusal message names no path (it can be logged by callers that format it).
+    #[test]
+    fn confirm_absent_refusal_message_carries_no_path() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("secret-slot-marker");
+        fs::write(&file, b"x").unwrap();
+        let error = confirm_absent_walk(&file.join("child")).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+        let text = error.to_string();
+        assert!(!text.contains("secret-slot-marker"), "{text}");
+    }
+
+    /// Running out of ancestors on an absolute or prefixed path (a vanished drive or share)
+    /// is a refusal that is never `NotFound`; on a relative path it is `Ok`. Pure, so it
+    /// runs on every platform; reds if the rooted arm is changed to `Ok` or to `NotFound`.
+    #[test]
+    fn exhausted_ancestors_on_a_rooted_path_refuse_with_a_non_notfound_error() {
+        let rooted = if cfg!(windows) {
+            Path::new(r"Z:\vanished\share\leaf")
+        } else {
+            Path::new("/vanished/share/leaf")
+        };
+        let error = exhausted_ancestors_verdict(rooted).expect_err("a rooted path must refuse");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(exhausted_ancestors_verdict(Path::new("relative/leaf")).is_ok());
+        assert!(exhausted_ancestors_verdict(Path::new("leaf")).is_ok());
+    }
+
+    /// A relative single-component path has an empty parent: nothing to walk, `Ok`.
+    #[test]
+    fn confirm_absent_accepts_an_empty_parent_of_a_relative_path() {
+        let name = Path::new("csq-confirm-absent-no-such-entry");
+        assert!(confirm_absent(name).is_ok());
+        assert!(confirm_absent_walk(name).is_ok());
+    }
+
+    /// A symlinked directory ancestor counts as a directory (the open follows it), so a
+    /// missing leaf under it is genuine absence.
+    #[cfg(unix)]
+    #[test]
+    fn confirm_absent_follows_a_symlinked_directory_ancestor() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(confirm_absent_walk(&link.join("missing")).is_ok());
+    }
 
     /// Add an ACL entry with the system tool; the entries are what a user can set with
     /// `chmod +a` on a directory they own.
@@ -4963,7 +5254,17 @@ pub(crate) mod tests {
 
     #[test]
     fn windows_replace_dispatch_uses_actual_fallback_and_retains_both_statuses() {
-        for first in [0xC000_0003_u32, 0xC000_000D, 0xC000_0010, 0xC000_00BB].map(|s| s as i32) {
+        // The four unsupported statuses AND the measured extended-class denial
+        // (an internal ticket) fall back to the plain class within the SAME attempt.
+        for first in [
+            0xC000_0003_u32,
+            0xC000_000D,
+            0xC000_0010,
+            0xC000_00BB,
+            0xC000_0022,
+        ]
+        .map(|s| s as i32)
+        {
             let mut trace = Vec::new();
             let result = dispatch_windows_rename(&17, &29, |source, parent, class| {
                 trace.push((*source, *parent, class));
@@ -4984,7 +5285,9 @@ pub(crate) mod tests {
             })
             .is_ok());
         }
-        for first in [i32::MIN, -1, 0xC000_0022_u32 as i32, 0xC000_0043_u32 as i32] {
+        // A status that is neither "class unsupported" nor the measured
+        // extended-class denial stays fatal on the first call.
+        for first in [i32::MIN, -1, 0xC000_0043_u32 as i32] {
             let mut trace = Vec::new();
             let result = dispatch_windows_rename(&17, &29, |source, parent, class| {
                 trace.push((*source, *parent, class));
@@ -5002,6 +5305,59 @@ pub(crate) mod tests {
             })
             .is_ok());
             assert_eq!(calls, 1);
+        }
+    }
+
+    /// an internal ticket: a measured `STATUS_ACCESS_DENIED` on the EXTENDED rename class
+    /// falls back to the plain class within the SAME attempt. Falsifier:
+    /// without the class fallback the trace is `[65]` and the result is
+    /// `Err((denied, None))`.
+    #[test]
+    fn windows_replace_dispatch_recovers_from_a_denied_extended_class() {
+        let denied = 0xC000_0022_u32 as i32;
+        let mut trace = Vec::new();
+        let result = dispatch_windows_rename(&17, &29, |_, _, class| {
+            trace.push(class);
+            if class == 65 {
+                denied
+            } else {
+                -7
+            }
+        });
+        assert_eq!(trace, [65, 10]);
+        assert_eq!(result, Err((denied, Some(-7))));
+        assert!(dispatch_windows_rename(&17, &29, |_, _, class| {
+            if class == 65 {
+                denied
+            } else {
+                1
+            }
+        })
+        .is_ok());
+        // A denial BOTH classes share is not laundered into success.
+        assert_eq!(
+            dispatch_windows_rename(&17, &29, |_, _, _| denied),
+            Err((denied, Some(denied)))
+        );
+        // The ONE policy predicate both writers (general atomic writer +
+        // chat-transcript publication) call.
+        for status in [
+            0xC000_0003_u32,
+            0xC000_000D,
+            0xC000_0010,
+            0xC000_00BB,
+            0xC000_0022,
+        ] {
+            assert!(
+                windows_rename_should_fall_back(status as i32),
+                "{status:#x}"
+            );
+        }
+        for status in [0_u32, 1, 0xC000_0043, 0xC000_0035, 0x8000_0001] {
+            assert!(
+                !windows_rename_should_fall_back(status as i32),
+                "{status:#x}"
+            );
         }
     }
 
@@ -5799,6 +6155,29 @@ pub(crate) mod tests {
         }
     }
 
+    /// R2-M1 (an internal ticket): the retry policy keeps the attempt retryable on an
+    /// EXTENDED-class denial even when the plain class reports a status the
+    /// policy cannot treat as transient, and the arm is scoped to the denial
+    /// status. Falsifier: without the arm, the denied+303 pair returns 303
+    /// (not retryable) and the first assertion fails.
+    #[test]
+    fn denied_extended_class_governs_retry_over_a_non_transient_plain_status() {
+        let denied = 0xC000_0022_u32 as i32; // STATUS_ACCESS_DENIED, DOS 5
+        let unsupported = 0xC000_0003_u32 as i32; // STATUS_NOT_SUPPORTED
+        let delete_pending_dos = 303; // STATUS_DELETE_PENDING
+        assert!(!is_transient_move_error(delete_pending_dos, false));
+        assert_eq!(
+            windows_replace_retry_status(denied, 5, delete_pending_dos),
+            5,
+            "the extended denial keeps the attempt retryable"
+        );
+        assert_eq!(
+            windows_replace_retry_status(unsupported, 87, delete_pending_dos),
+            303,
+            "the arm is scoped to the denial status"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn native_windows_atomic_replace_rejects_cross_parent_with_typed_paths() {
@@ -6401,5 +6780,60 @@ pub(crate) mod tests {
             tmp.exists(),
             "an unpublished temp is preserved for its owner"
         );
+    }
+
+    /// an internal ticket regression, natively on Windows: the measured intermittent
+    /// `STATUS_ACCESS_DENIED` on the EXTENDED rename class is recovered by the
+    /// plain class within the same attempt. Falsifier: on the unfixed
+    /// dispatcher every attempt repeats the denied class, the retained publish
+    /// returns code 5, and the `expect` below fails.
+    #[cfg(all(windows, test))]
+    #[test]
+    fn windows_retained_replace_recovers_from_a_denied_extended_class() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                REPLACE_DENY_POSIX.with(|f| f.set(false));
+            }
+        }
+        let _reset = Reset;
+        REPLACE_DENY_POSIX.with(|f| f.set(true));
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("profiles.json");
+        let tmp = dir.path().join("profiles.tmp");
+        std::fs::write(&target, b"old profiles").unwrap();
+        let outcome = write_new_private_retained(&tmp, b"new profiles")
+            .unwrap()
+            .replace(&target);
+        outcome.expect("a denied extended class must fall back to the plain class");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new profiles");
+        assert!(!tmp.exists());
+
+        // The same denial with a READ-ONLY target still refuses: the plain
+        // class re-asserts the shared refusal, and the target is untouched.
+        let ro_target = dir.path().join("readonly.json");
+        let ro_tmp = dir.path().join("readonly.tmp");
+        std::fs::write(&ro_target, b"old").unwrap();
+        let mut perms = std::fs::metadata(&ro_target).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&ro_target, perms).unwrap();
+        let outcome = write_new_private_retained(&ro_tmp, b"new")
+            .unwrap()
+            .replace(&ro_target);
+        assert!(outcome.is_err(), "a read-only target must still refuse");
+        // The shared refusal is RE-ASSERTED: the extended denial is seam-
+        // injected while the plain denial is the real read-only attribute, so
+        // the plain class's status is retained and the reported code is the
+        // extended class's 5.
+        let PlatformError::Win32 { code, message } = outcome.unwrap_err() else {
+            panic!("expected a Windows error");
+        };
+        assert_eq!(code, 5, "{message}");
+        assert!(
+            message.contains("plain_code=5"),
+            "the plain class's refusal must be reported: {message}"
+        );
+        assert_eq!(std::fs::read(&ro_target).unwrap(), b"old");
     }
 }

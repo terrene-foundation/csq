@@ -1,10 +1,15 @@
 // Synthetic owned native children only: no vendor, auth, network or keychain.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[path = "parent_death_tests.rs"]
+mod parent_death_tests;
+
 use super::*;
+use crate::login_child_custody::process::{Child, ChildStdin, Command, Stdio};
 use csq_core::accounts::login_lock::{AccountLoginLock, AcquireOutcome};
 use csq_core::types::AccountNum;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
 const FIXTURE_ROLE: &str = "CSQ_PRIVATE_LOGIN_VENDOR_ROLE";
@@ -1884,6 +1889,14 @@ mod finalized_stop_receipt_tests {
         let stopped_group = stopped.group();
         let other_group = other.group();
         let original_pid = stopped.fixture.spawned_pid;
+        #[cfg(windows)]
+        let original_helper_identity = stopped
+            .fixture
+            .child
+            .as_ref()
+            .expect("original stopped Child")
+            .creator_identity_for_test()
+            .expect("original creator identity");
         let live_decision = stopped_group.request_stop_or_finalized(group::GroupSignal::Kill);
         // The stop must be OBSERVED (WNOWAIT: CLD_KILLED by SIGKILL) before any
         // stdin release or close, so EOF can never race the queued signal.
@@ -1932,6 +1945,16 @@ mod finalized_stop_receipt_tests {
         // Every semantic check is deferred until BOTH real actors/readers end.
         let stopped_status = stopped.finish().expect("actual stopped actor completion");
         let other_status = other.finish().expect("actual distinct actor completion");
+        #[cfg(windows)]
+        {
+            let matching_stop = stopped_group.job_stop_requested_for_test();
+            let unrelated_stop = other_group.job_stop_requested_for_test();
+            eprintln!("FINALIZED_API_WINDOWS_JOB_STOP_CONTEXT: original_vendor_pid={original_pid}; original_helper_pid_birth={original_helper_identity:?}; matching_successful_job_stop={matching_stop}; unrelated_successful_job_stop={unrelated_stop}; actual_both_children_reaped=true; actual_both_readers_joined=true");
+            assert!(
+                matching_stop && !unrelated_stop && original_helper_identity.is_some(),
+                "FINALIZED_API_JOB_STOP_CONTEXT_MUST_BIND_EXACT_GROUP"
+            );
+        }
         let receipt_identity =
             match stopped_group.request_stop_or_finalized(group::GroupSignal::Kill) {
                 Ok(group::GroupStopDecision::VendorFinalized(receipt)) => {
@@ -2745,6 +2768,13 @@ mod owned_group_causal {
         assert!(
             owner.deadline_stopped(),
             "DEADLINE_STOP_NOT_CARRIED_OUT_OF_THE_WAIT"
+        );
+        fixture
+            .record_helper_receipt(&owner, &result)
+            .expect("deadline fixture original child must actually be reaped");
+        assert!(
+            owner.custody_finalized(),
+            "deadline fixture must retain a verified child/reader completion receipt"
         );
         let refusal = result.expect_err("a refused login must not publish");
         assert_eq!(

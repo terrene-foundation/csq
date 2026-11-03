@@ -10,6 +10,9 @@ mod windows_update;
 pub use race::RaceLoginState;
 
 use crate::desktop::{AppState, CachedUpdateInfo};
+use crate::login_child_custody::process::{
+    Child as LoginChild, Command as LoginCommand, Stdio as LoginStdio,
+};
 use csq_core::accounts::discovery;
 use csq_core::accounts::login_lock::{AccountLoginLock, AcquireOutcome};
 use csq_core::accounts::AccountSource;
@@ -47,11 +50,10 @@ use tauri_plugin_autostart::ManagerExt;
 /// pass the check before either registered a real child) and is
 /// overwritten with `Some(child)` by [`spawn_native_device_auth_piped`]
 /// once the vendor binary actually spawns.
-pub(crate) type CodexChildSlot = Arc<Mutex<Option<Arc<Mutex<std::process::Child>>>>>;
+pub(crate) type CodexChildSlot = Arc<Mutex<Option<Arc<Mutex<LoginChild>>>>>;
 
-pub type NativeLoginChildren = Arc<
-    Mutex<HashMap<csq_core::providers::catalog::Surface, Option<Arc<Mutex<std::process::Child>>>>>,
->;
+pub type NativeLoginChildren =
+    Arc<Mutex<HashMap<csq_core::providers::catalog::Surface, Option<Arc<Mutex<LoginChild>>>>>>;
 
 /// Seconds-remaining threshold below which the token badge surfaces an
 /// "expiring" warning. Intentionally LOWER than the daemon's refresh
@@ -3257,8 +3259,6 @@ fn spawn_native_device_auth_piped<K: Send + Sync + 'static>(
     key: crate::desktop::login_custody::ChildKey,
     operation: Arc<crate::desktop::login_custody::ChildRegistration>,
 ) -> std::io::Result<csq_core::providers::native_login::SpawnedNativeLogin> {
-    use std::process::{Command, Stdio};
-
     let bin_path = csq_core::cli_deps::install_path::find_in_path(binary).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -3269,7 +3269,7 @@ fn spawn_native_device_auth_piped<K: Send + Sync + 'static>(
         )
     })?;
 
-    let mut command = Command::new(&bin_path);
+    let mut command = LoginCommand::new(&bin_path);
     command
         .args(login_args)
         // Strip BOTH known native home vars before setting this
@@ -3283,8 +3283,8 @@ fn spawn_native_device_auth_piped<K: Send + Sync + 'static>(
         .env_remove(csq_core::providers::native::KIMI.home_env)
         .env_remove(csq_core::providers::native::GROK.home_env)
         .env(home_env, home)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stdout(LoginStdio::piped())
+        .stderr(LoginStdio::null());
     native_vendor_with_operation(
         command, binary, surface, children, spawned, watchdog, keepalive, key, operation,
     )
@@ -3293,7 +3293,7 @@ fn spawn_native_device_auth_piped<K: Send + Sync + 'static>(
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 pub(crate) fn native_vendor_with_command<K: Send + Sync + 'static>(
-    command: std::process::Command,
+    command: LoginCommand,
     binary: &str,
     surface: csq_core::providers::catalog::Surface,
     children: &NativeLoginChildren,
@@ -3311,7 +3311,7 @@ pub(crate) fn native_vendor_with_command<K: Send + Sync + 'static>(
 }
 #[allow(clippy::too_many_arguments)]
 fn native_vendor_with_operation<K: Send + Sync + 'static>(
-    mut command: std::process::Command,
+    mut command: LoginCommand,
     binary: &str,
     surface: csq_core::providers::catalog::Surface,
     children: &NativeLoginChildren,
@@ -3538,7 +3538,7 @@ impl<K> LoginReaderCustody<K> {
     }
     fn attach(
         &self,
-        child: Arc<Mutex<std::process::Child>>,
+        child: Arc<Mutex<LoginChild>>,
         group: crate::login_child_custody::group::GroupControl,
     ) {
         *self.group.lock().unwrap_or_else(|e| e.into_inner()) = Some(group.clone());
@@ -3604,7 +3604,7 @@ impl<K> Drop for LoginReaderCustody<K> {
 /// Cleanup never removes a replacement operation's child slot.
 struct CodexSlotCustody<K> {
     slot: CodexChildSlot,
-    child: std::sync::OnceLock<Arc<Mutex<std::process::Child>>>,
+    child: std::sync::OnceLock<Arc<Mutex<LoginChild>>>,
     _keepalive: K,
 }
 impl<K> Drop for CodexSlotCustody<K> {
@@ -3625,7 +3625,7 @@ impl<K> Drop for CodexSlotCustody<K> {
 struct NativeLoginSlotCustody<K> {
     children: NativeLoginChildren,
     surface: csq_core::providers::catalog::Surface,
-    child: std::sync::OnceLock<Arc<Mutex<std::process::Child>>>,
+    child: std::sync::OnceLock<Arc<Mutex<LoginChild>>>,
     _keepalive: K,
 }
 impl<K> Drop for NativeLoginSlotCustody<K> {
@@ -3767,133 +3767,6 @@ fn begin_claude_login_for_base(
     csq_core::oauth::login::start_login_with_prior(store, account, base, prior)
         .map(ClaudeLoginView::from)
         .map_err(|e| e.to_string())
-}
-
-/// Runs `claude auth login` subprocess for the given account slot,
-/// using an absolute path to the `claude` binary so the call works
-/// in the Finder-launched desktop bundle (which doesn't inherit the
-/// user's shell `PATH`).
-///
-/// Returns `CLAUDE_NOT_FOUND` if no `claude` install can be located
-/// in `$PATH` or any of the well-known directories searched by
-/// [`csq_core::accounts::login::find_claude_binary`]. The frontend
-/// uses that tag to fall back to the in-process paste-code flow.
-///
-/// This is a BLOCKING command — runs on a Tokio blocking worker so
-/// it doesn't freeze the Tauri event loop. The OAuth handshake is
-/// owned entirely by the spawned `claude` process: it opens a
-/// browser, captures the callback, writes `.credentials.json` into
-/// the supplied `CLAUDE_CONFIG_DIR`. csq just reads the file after
-/// the subprocess exits and mirrors it to `credentials/N.json`.
-///
-/// On 3P import, the daemon's account-discovery cache is invalidated
-/// so the dashboard sees the new account on its next 5s poll.
-///
-/// # Legacy shell-out path
-///
-/// As of v2.4 the default Claude OAuth path is the in-process
-/// parallel-race flow (see [`race::start_claude_login_race`]). This
-/// shell-out command is preserved as an emergency-rollback knob,
-/// invocable via `force_legacy_shell: true` from a future Settings
-/// toggle if the in-process race regresses on a particular host /
-/// browser combination. The frontend does not reach this path
-/// during normal operation.
-#[tauri::command]
-#[allow(dead_code)]
-pub async fn start_claude_login(base_dir: String, account: u16) -> Result<u16, String> {
-    let account_num = AccountNum::try_from(account).map_err(|e| format!("invalid account: {e}"))?;
-    let base = resolve_csq_base_dir(&base_dir)?;
-
-    // GH an internal ticket: the reverse conflict guard that used to run here
-    // (redteam R3) is retired — a stale Gemini/native marker is now detected
-    // pre-mint and cleared on the SUCCESS path by `finalize_login`
-    // (`binding_guard::detect_stale_marker_binding` +
-    // `clear_detected_marker_binding`) rather than refused up-front. See
-    // those functions' doc comments.
-
-    let permit = crate::desktop::credential_writes::global().admit()?;
-    tokio::task::spawn_blocking(move || {
-        let _credential_write = permit;
-        // Resolve `claude` via the shared finder before we start
-        // creating state — there's no point provisioning a new
-        // config dir if the binary is missing.
-        let claude_bin = csq_core::accounts::login::find_claude_binary().ok_or_else(|| {
-            "CLAUDE_NOT_FOUND: could not locate the `claude` binary in $PATH or any standard install location".to_string()
-        })?;
-
-        // SEC-2.15 (unified, R1 M1): secure the accounts root (config-N's
-        // parent) fail-closed before creating the handle dir.
-        csq_core::platform::fs::ensure_private_dir_root(&base)
-            .map_err(|e| format!("accounts_root_refused: {e}"))?;
-        let config_dir = base.join(format!("config-{}", account_num));
-        std::fs::create_dir_all(&config_dir)
-            .map_err(|e| format!("failed to create config dir: {e}"))?;
-
-        // NOTE: the `.csq-account` marker is written LATER — only after the
-        // credential read + save succeed (see below). Writing it here, before
-        // the subprocess and `read_fresh_after_login` (which can now return
-        // Err(OnlyStale/NoCredentials)), would leave an orphan marker the
-        // daemon's discovery treats as a credential-less account — the M8 /
-        // REV-R1-02 bug the live CLI path (handle_direct_post_subprocess) fixed
-        // by ordering marker-after-save.
-
-        // Run claude auth login with isolated config dir, calling
-        // by absolute path so the Finder-default $PATH gap can't
-        // bite us.
-        let prior = csq_core::accounts::anthropic_identity::capture_login_prior(&base, account_num)
-            .map_err(|e| {
-                format!(
-                    "identity capture failed: {}",
-                    csq_core::accounts::login::LoginCommitOutcome::describe_prior_capture_error(&e)
-                )
-            })?;
-        let status = std::process::Command::new(&claude_bin)
-            .args(["auth", "login"])
-            .env("CLAUDE_CONFIG_DIR", &config_dir)
-            .status()
-            .map_err(|e| format!("failed to run `claude auth login`: {e}"))?;
-
-        if !status.success() {
-            return Err("claude auth login failed or was cancelled".to_string());
-        }
-
-        // CC's modern `claude auth login` commits the freshly minted token to
-        // the macOS Keychain, and that write can land a beat AFTER the
-        // subprocess exits. `read_fresh_after_login` reads both keychain and
-        // file, keeps whichever has the later `expiresAt`, retries to let CC
-        // commit, and errors rather than persisting a stale token — the same
-        // hardening as the live CLI + desktop-twin login paths
-        // (`csq_core::credentials::post_login`). This `start_claude_login`
-        // entry point is a dormant `#[allow(dead_code)]` rollback knob, but it
-        // is hardened identically so re-enabling it can never re-introduce the
-        // keychain-commit-race bug. Already inside `spawn_blocking`, so the
-        // synchronous retry helper is fine here.
-        let creds = csq_core::credentials::read_fresh_after_login(&config_dir)
-            .map_err(|e| e.to_string())?;
-
-        let expected = csq_core::accounts::anthropic_identity::read_native_expectation(&config_dir)
-            .map_err(|e| format!("identity metadata failed: {e}"))?;
-        let committed = csq_core::accounts::anthropic_identity::commit_anthropic_login(
-            &base, account_num, &creds, Some(&expected), prior,
-        ).map_err(|e| format!("identity verification failed: {}", csq_core::accounts::login::LoginCommitOutcome::describe_commit_failure_for_account(&e, account_num)))?;
-
-        // Only the receipt-consuming finalizer writes the authoritative marker.
-        csq_core::accounts::login::finalize_verified_login(&base, account_num, committed)
-            .map_err(|e| format!("post-login bookkeeping failed: {e}"))?;
-
-        // Tell the daemon its account-discovery cache is stale so
-        // get_accounts picks up the new slot on the dashboard's
-        // next 5s poll.
-        notify_daemon_cache_invalidated(&base);
-
-        // login-followup: wake the daemon's usage poller for an immediate
-        // quota tick (the commit + finalize above succeeded). Best-effort.
-        csq_core::daemon::notify::slot_rebind(&base, account_num.get());
-
-        Ok(account_num.get())
-    })
-    .await
-    .map_err(|e| format!("login task failed: {}", csq_core::error::join_cause(&e)))?
 }
 
 /// Submits a paste-code from Anthropic's OAuth callback page and
@@ -4397,7 +4270,7 @@ pub fn set_provider_key_blocking(
     match provider.auth_type {
         providers::catalog::AuthType::OAuth => {
             return Err(format!(
-                "provider {provider_id} uses OAuth, not API keys — use start_claude_login instead"
+                "provider {provider_id} uses OAuth, not API keys — use Add Account to sign in"
             ));
         }
         providers::catalog::AuthType::None => {
@@ -4474,7 +4347,7 @@ pub fn bind_keyed_provider(
     if provider.auth_type != providers::catalog::AuthType::Bearer {
         return Err(format!(
             "provider {provider_id} is not a Bearer provider — use \
-             bind_keyless_provider for keyless or start_claude_login for OAuth"
+             Add Account for keyless providers or OAuth sign-in"
         ));
     }
 
@@ -4684,7 +4557,7 @@ pub async fn set_slot_model(
 ///
 /// **Cancellation**: the running child is registered in
 /// `AppState.ollama_pull_child` so a later `cancel_ollama_pull`
-/// command can send SIGTERM and release the UI from a stuck
+/// command can terminate it and release the UI from a stuck
 /// (or unwanted) download. Normal completion clears the handle.
 ///
 /// **Pre-check**: if the `ollama` binary is not on PATH we fail
@@ -4694,7 +4567,7 @@ pub async fn set_slot_model(
 /// Failure modes:
 ///   - `ollama` binary not found → `"ollama not found: ..."`
 ///   - non-zero exit from the pull → `"ollama pull exited with N"`
-///     (if the exit was SIGTERM from cancel_ollama_pull the
+///     (if the child was killed by cancel_ollama_pull the
 ///     payload matches `"ollama pull exited with -1"` or a
 ///     signal code; the frontend treats any non-zero exit the
 ///     same — back to the picker screen).
@@ -4722,13 +4595,7 @@ pub async fn pull_ollama_model(
             );
         }
     };
-    if std::process::Command::new(&ollama_bin)
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_err()
-    {
+    if !ollama_version_available(&ollama_bin) {
         return Err("ollama not found — install via https://ollama.com or set OLLAMA_BIN".into());
     }
 
@@ -4743,18 +4610,35 @@ pub async fn pull_ollama_model(
     .map_err(|e| format!("pull task join error: {}", tauri_join_cause(&e)))?
 }
 
-/// Pure-Rust body of `pull_ollama_model` (no Tauri traits) so it
+/// The pull and its version precheck are noninteractive. Inherited stdin
+/// could consume or change the launching terminal.
+fn ollama_command(binary: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(binary);
+    command.stdin(std::process::Stdio::null());
+    command
+}
+
+fn ollama_version_available(binary: &Path) -> bool {
+    ollama_command(binary)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+}
+
+/// Pure-Rust body of `pull_ollama_model` (no Tauri state borrow) so it
 /// can be invoked from `spawn_blocking` without the caller
 /// holding a `State<AppState>` borrow.
-fn pull_ollama_model_blocking(
-    app: AppHandle,
+fn pull_ollama_model_blocking<R: tauri::Runtime>(
+    app: AppHandle<R>,
     child_slot: Arc<std::sync::Mutex<Option<Arc<std::sync::Mutex<std::process::Child>>>>>,
     ollama_bin: std::path::PathBuf,
     model: String,
 ) -> Result<(), String> {
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
-    let mut child = Command::new(&ollama_bin)
+    let mut child = ollama_command(&ollama_bin)
         .arg("pull")
         .arg(&model)
         .stdout(Stdio::piped())
@@ -4777,12 +4661,21 @@ fn pull_ollama_model_blocking(
     let stderr_t = spawn_progress_reader(stderr, "stderr", app.clone());
     let stdout_t = spawn_progress_reader(stdout, "stdout", app.clone());
 
-    // Wait for the child to exit (or be killed via cancel).
-    let status = {
-        let mut guard = child_arc.lock().map_err(|_| "child lock poisoned")?;
-        guard
-            .wait()
-            .map_err(|e| format!("wait on ollama pull: {e}"))?
+    // Cancel must acquire the same child mutex to call Child::kill. Never
+    // hold it while waiting for exit or sleeping: try_wait is nonblocking.
+    // Poll every 25ms to observe exit promptly without busy waiting. Cancel
+    // acquires the child directly and does not wait for this polling cadence.
+    let status = loop {
+        let status = {
+            let mut guard = child_arc.lock().map_err(|_| "child lock poisoned")?;
+            guard
+                .try_wait()
+                .map_err(|e| format!("wait on ollama pull: {e}"))?
+        };
+        if let Some(status) = status {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
     };
 
     if let Some(t) = stderr_t {
@@ -4794,7 +4687,14 @@ fn pull_ollama_model_blocking(
 
     {
         let mut slot = child_slot.lock().map_err(|_| "child slot poisoned")?;
-        *slot = None;
+        // A newer pull may have replaced this entry while the old readers
+        // drained. Only the worker owning the registered child may clear it.
+        if slot
+            .as_ref()
+            .is_some_and(|registered| Arc::ptr_eq(registered, &child_arc))
+        {
+            *slot = None;
+        }
     }
 
     if !status.success() {
@@ -4813,16 +4713,16 @@ fn pull_ollama_model_blocking(
 /// bytes and flushes on either `\r` or `\n` so the UI sees live
 /// progress. The 1 MiB buffer cap is a defence against a stream
 /// that never emits a delimiter.
-fn spawn_progress_reader(
+fn spawn_progress_reader<R: tauri::Runtime>(
     stream: Option<impl std::io::Read + Send + 'static>,
     tag: &'static str,
-    app: AppHandle,
+    app: AppHandle<R>,
 ) -> Option<std::thread::JoinHandle<()>> {
     let mut stream = stream?;
     Some(std::thread::spawn(move || {
         let mut buf = Vec::with_capacity(2048);
         let mut byte = [0u8; 1];
-        let flush = |buf: &mut Vec<u8>, app: &AppHandle| {
+        let flush = |buf: &mut Vec<u8>, app: &AppHandle<R>| {
             if buf.is_empty() {
                 return;
             }
@@ -4862,15 +4762,18 @@ fn spawn_progress_reader(
 /// Uses `Child::kill` (SIGKILL on Unix, TerminateProcess on
 /// Windows). The companion `pull_ollama_model` reader threads
 /// see EOF on their piped stdout/stderr and exit cleanly; the
-/// `wait()` call in the blocking task returns a non-success
+/// exit poll in the blocking task observes a non-success
 /// status which the frontend maps to the error banner.
 #[tauri::command]
 pub fn cancel_ollama_pull(state: State<'_, AppState>) -> Result<(), String> {
+    cancel_ollama_pull_from(&state.ollama_pull_child)
+}
+
+fn cancel_ollama_pull_from(
+    child_slot: &Arc<std::sync::Mutex<Option<Arc<std::sync::Mutex<std::process::Child>>>>>,
+) -> Result<(), String> {
     let handle_opt = {
-        let slot = state
-            .ollama_pull_child
-            .lock()
-            .map_err(|_| "child slot poisoned")?;
+        let slot = child_slot.lock().map_err(|_| "child slot poisoned")?;
         slot.clone()
     };
     let Some(handle) = handle_opt else {
@@ -4880,6 +4783,9 @@ pub fn cancel_ollama_pull(state: State<'_, AppState>) -> Result<(), String> {
     let _ = child.kill();
     Ok(())
 }
+
+#[cfg(all(test, unix))]
+mod ollama_pull_tests;
 
 // ── Launch-on-login (tauri-plugin-autostart) ──────────────────
 
@@ -5905,7 +5811,7 @@ pub(crate) struct CodexLoginIo {
     timeout: std::time::Duration,
     notify: bool,
     #[cfg(all(test, unix, feature = "test-utils"))]
-    command: Option<std::process::Command>,
+    command: Option<LoginCommand>,
     #[cfg(all(test, unix, feature = "test-utils"))]
     seal_observer: Option<Arc<dyn Fn(bool) + Send + Sync>>,
     #[cfg(all(test, unix, feature = "test-utils"))]
@@ -5926,7 +5832,7 @@ impl CodexLoginIo {
     }
     #[cfg(all(test, unix, feature = "test-utils"))]
     pub(crate) fn fixture(
-        command: std::process::Command,
+        command: LoginCommand,
         timeout: std::time::Duration,
         seal_observer: Option<Arc<dyn Fn(bool) + Send + Sync>>,
     ) -> Self {
@@ -6172,7 +6078,7 @@ fn spawn_codex_device_auth_piped<R: tauri::Runtime, K: Send + Sync + 'static>(
     config_dir: &std::path::Path,
     on_code: &mut dyn FnMut(csq_core::providers::codex::desktop_login::DeviceCodeInfo),
     app: &AppHandle<R>,
-    child_slot: &Arc<std::sync::Mutex<Option<Arc<std::sync::Mutex<std::process::Child>>>>>,
+    child_slot: &Arc<std::sync::Mutex<Option<Arc<std::sync::Mutex<LoginChild>>>>>,
     watchdog: crate::login_child_custody::LoginWatchdog,
     keepalive: K,
     custody: CodexSpawnCustody,
@@ -6182,7 +6088,6 @@ fn spawn_codex_device_auth_piped<R: tauri::Runtime, K: Send + Sync + 'static>(
         operation,
         grant,
     } = custody;
-    use std::process::{Command, Stdio};
 
     // Resolve `codex` via the same finder Claude uses so the Finder-
     // launched desktop bundle (which inherits a minimal PATH —
@@ -6200,7 +6105,7 @@ fn spawn_codex_device_auth_piped<R: tauri::Runtime, K: Send + Sync + 'static>(
                     csq_core::providers::codex::surface::CLI_BINARY
                 )
             })?;
-    let mut command = Command::new(&codex_bin);
+    let mut command = LoginCommand::new(&codex_bin);
     command
         .args(["login", "--device-auth"])
         .env(
@@ -6208,8 +6113,8 @@ fn spawn_codex_device_auth_piped<R: tauri::Runtime, K: Send + Sync + 'static>(
             config_dir,
         )
         .env_remove("CLAUDE_CONFIG_DIR")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(LoginStdio::piped())
+        .stderr(LoginStdio::piped());
     #[cfg(test)]
     {
         codex_vendor_with_command_impl(
@@ -6244,10 +6149,10 @@ fn spawn_codex_device_auth_piped<R: tauri::Runtime, K: Send + Sync + 'static>(
 #[allow(clippy::too_many_arguments)]
 #[cfg(all(test, unix))]
 pub(crate) fn codex_vendor_with_command<R: tauri::Runtime, K: Send + Sync + 'static>(
-    command: std::process::Command,
+    command: LoginCommand,
     on_code: &mut dyn FnMut(csq_core::providers::codex::desktop_login::DeviceCodeInfo),
     app: &tauri::AppHandle<R>,
-    child_slot: &Arc<Mutex<Option<Arc<Mutex<std::process::Child>>>>>,
+    child_slot: &Arc<Mutex<Option<Arc<Mutex<LoginChild>>>>>,
     watchdog: crate::login_child_custody::LoginWatchdog,
     keepalive: K,
     key: crate::desktop::login_custody::ChildKey,
@@ -6277,10 +6182,10 @@ pub(crate) fn codex_vendor_with_command_and_reader_completion<
     R: tauri::Runtime,
     K: Send + Sync + 'static,
 >(
-    command: std::process::Command,
+    command: LoginCommand,
     on_code: &mut dyn FnMut(csq_core::providers::codex::desktop_login::DeviceCodeInfo),
     app: &tauri::AppHandle<R>,
-    child_slot: &Arc<Mutex<Option<Arc<Mutex<std::process::Child>>>>>,
+    child_slot: &Arc<Mutex<Option<Arc<Mutex<LoginChild>>>>>,
     watchdog: crate::login_child_custody::LoginWatchdog,
     keepalive: K,
     key: crate::desktop::login_custody::ChildKey,
@@ -6305,10 +6210,10 @@ pub(crate) fn codex_vendor_with_command_and_reader_completion<
 
 #[allow(clippy::too_many_arguments)]
 fn codex_vendor_with_command_impl<R: tauri::Runtime, K: Send + Sync + 'static>(
-    mut command: std::process::Command,
+    mut command: LoginCommand,
     on_code: &mut dyn FnMut(csq_core::providers::codex::desktop_login::DeviceCodeInfo),
     app: &tauri::AppHandle<R>,
-    child_slot: &Arc<Mutex<Option<Arc<Mutex<std::process::Child>>>>>,
+    child_slot: &Arc<Mutex<Option<Arc<Mutex<LoginChild>>>>>,
     watchdog: crate::login_child_custody::LoginWatchdog,
     keepalive: K,
     _key: crate::desktop::login_custody::ChildKey,
@@ -8002,12 +7907,6 @@ mod tests {
             (
                 mod_src,
                 "complete_native_login",
-                "notify_daemon_cache_invalidated(",
-                1,
-            ),
-            (
-                mod_src,
-                "start_claude_login",
                 "notify_daemon_cache_invalidated(",
                 1,
             ),

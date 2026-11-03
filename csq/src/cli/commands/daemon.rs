@@ -266,7 +266,7 @@ fn build_daemon_runtime() -> Result<tokio::runtime::Runtime> {
         .context("failed to build tokio runtime for daemon")
 }
 
-/// Bounded attempt count for [`spawn_audit_verify_retry`]'s background
+/// Bounded attempt count for `spawn_audit_verify_retry`'s background
 /// retry after a startup `AuditHealth::Unknown` verdict.
 ///
 /// UNRESOLVED-pending-measurement: no representative-host-load timing data
@@ -1177,6 +1177,17 @@ async fn run_daemon_session_body(
 
                 #[cfg(windows)]
                 drop(custody.adopt_subsystem("refresher", refresher.join));
+                // S3 Telegram bridge ingest. Outbound long polling only (no
+                // listener, no webhook); absent or disabled config keeps the
+                // task idle on a local-config recheck, so `csq telegram on`
+                // activates it without a daemon restart.
+                let telegram_bridge = daemon::spawn_telegram_bridge(
+                    base_dir_for_runtime.clone(),
+                    shutdown.clone(),
+                    daemon::ReqwestTelegramPost::new(),
+                );
+                #[cfg(windows)]
+                drop(custody.adopt_subsystem("telegram_bridge", telegram_bridge.join));
                 // License CRL refresher (task #77 shard 2): keeps the signed
                 // revocation list fresh so the enterprise license gate can fail
                 // closed on a revoked/stale license without bricking a paying
@@ -1448,6 +1459,7 @@ async fn run_daemon_session_body(
                     ("usage_ledger_writer", usage_ledger_writer.join),
                     ("daemon_log_gc", log_gc),
                     ("ipc_server", server_join),
+                    ("telegram_bridge", telegram_bridge.join),
                 ];
                 #[cfg(all(not(windows), feature = "enterprise"))]
                 subsystems.push(("license_crl_refresher", crl_refresher.join));

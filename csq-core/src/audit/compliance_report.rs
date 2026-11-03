@@ -539,6 +539,15 @@ fn lifecycle_label(payload: &EventPayload) -> (String, String) {
                 p.rotation_reason
             ),
         ),
+        // S3 Telegram bridge delivery — metadata only: the update id, the
+        // target identity and a fixed outcome tag. No body, no token.
+        P::TelegramBridgeDelivery(p) => (
+            "telegram bridge delivery".into(),
+            format!(
+                "update {} → {} pid {} — {}",
+                p.update_id, p.target_surface, p.target_pid, p.outcome
+            ),
+        ),
         // Governance kinds never reach here (classified above); exhaustive
         // match keeps this a compile-time drift catch if a kind is added.
         P::GovernanceTurn(_) | P::EatpAttestation(_) | P::McpGateDecision(_) => {

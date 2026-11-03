@@ -181,6 +181,10 @@ windows-sys = { version = "0.52", features = [
     # directory handle (installer admission), so a reparse point set on the
     # directory's path after the pin cannot redirect a secret read or write.
     "Wdk_Foundation",
+    # Restart Manager: names the image holding a publication target when a
+    # rename is refused with ACCESS_DENIED. Diagnostic only; bounded
+    # and fail-silent. No new transitive crate.
+    "Win32_System_RestartManager",
 ] }
 
 [features]

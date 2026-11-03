@@ -47,6 +47,7 @@ impl Fixture {
                     ..recipient()
                 }),
                 to,
+                origin: crate::messaging::model::Origin::Peer,
                 in_reply_to: None,
                 body: format!("fixture {n}"),
                 created_at: NOW - 100,

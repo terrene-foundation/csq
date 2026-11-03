@@ -16,6 +16,7 @@ pub mod settings_policy;
 pub mod setup;
 pub mod share_audit;
 pub mod shared_state;
+pub mod swap_session;
 pub mod term_mint;
 pub mod workspace_trust;
 

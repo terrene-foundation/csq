@@ -1,7 +1,8 @@
 //! Owned vendor process groups. Timeout is never a stop request.
+use super::process::{Child, Command, Stdio};
 use std::{
     io,
-    process::{Child, Command, ExitStatus},
+    process::ExitStatus,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -11,7 +12,7 @@ use std::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GroupSignal {
-    #[cfg(any(feature = "cli", test))]
+    #[cfg(any(feature = "cli", all(test, unix)))]
     Interrupt,
     Kill,
     #[cfg(all(unix, any(feature = "cli", test)))]
@@ -24,6 +25,8 @@ pub(crate) enum GroupSignal {
 // Ten existing 200ms custody polls after an explicit stop intent. Expiration
 // is a terminal retained-custody refusal, never proof of EOF or permission to
 // clean credentials. This budget has no effect on ordinary login deadlines.
+// Windows also grants this elapsed grace to observed leftover Job members
+// after the original vendor/creator exited and captured readers joined.
 pub(crate) const STOP_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 type Pump = Box<dyn FnMut(&GroupControl) -> io::Result<()> + Send>;
 // Losing a wait lease is never positive completion authority.
@@ -34,6 +37,12 @@ enum WaitLease {
     Finalized,
     #[cfg(unix)]
     Lost,
+}
+#[derive(Clone, Copy)]
+enum StopIntent {
+    Explicit,
+    #[cfg(windows)]
+    Completion,
 }
 struct Inner {
     pid: u32,
@@ -46,13 +55,21 @@ struct Inner {
     foreground: Mutex<Option<TerminalCustody>>,
     #[cfg(windows)]
     job: win::Job,
+    // A successful native stop of THIS retained Job, not merely kill intent.
+    // The wait lease serializes publication with creator/vendor observation.
+    #[cfg(windows)]
+    job_stop_requested: AtomicBool,
+    // Only a positive census after original vendor/creator exit and reader
+    // joins starts the cooperative-descendant completion grace period.
+    #[cfg(windows)]
+    job_nonempty_since: Mutex<Option<Instant>>,
 }
 #[derive(Clone)]
 pub(crate) struct GroupControl(Arc<Inner>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StdinPolicy {
-    #[cfg(any(unix, feature = "cli", test))]
+    #[cfg(any(unix, feature = "cli"))]
     Inherit,
     #[cfg(any(unix, feature = "desktop", test))]
     Null,
@@ -212,6 +229,10 @@ impl GroupControl {
     pub(crate) fn id(&self) -> u32 {
         self.0.pid
     }
+    #[cfg(all(windows, test, feature = "desktop"))]
+    pub(crate) fn job_stop_requested_for_test(&self) -> bool {
+        self.0.job_stop_requested.load(Ordering::Acquire)
+    }
     #[cfg(any(feature = "cli", test))]
     pub(crate) fn set_signal_pump(
         &self,
@@ -254,7 +275,7 @@ impl GroupControl {
             }));
         }
         // Keep the retained lease locked across the decision and native signal.
-        self.signal_with_lease(signal, &mut lease)?;
+        self.signal_with_lease(signal, &mut lease, StopIntent::Explicit)?;
         Ok(GroupStopDecision::StopRequested)
     }
     pub(crate) fn signal(&self, signal: GroupSignal) -> io::Result<()> {
@@ -263,13 +284,18 @@ impl GroupControl {
             .lease
             .lock()
             .map_err(|_| io::Error::other("login group lease poisoned"))?;
-        self.signal_with_lease(signal, &mut lease)
+        self.signal_with_lease(signal, &mut lease, StopIntent::Explicit)
     }
-    fn signal_with_lease(&self, signal: GroupSignal, lease: &mut WaitLease) -> io::Result<()> {
+    fn signal_with_lease(
+        &self,
+        signal: GroupSignal,
+        lease: &mut WaitLease,
+        intent: StopIntent,
+    ) -> io::Result<()> {
         if *lease != WaitLease::Retained {
             return Err(io::Error::other("login group wait lease unavailable"));
         }
-        if matches!(signal, GroupSignal::Kill) {
+        if matches!(signal, GroupSignal::Kill) && matches!(intent, StopIntent::Explicit) {
             let mut killed = self
                 .0
                 .killed
@@ -329,7 +355,15 @@ impl GroupControl {
         }
         #[cfg(windows)]
         {
-            self.0.job.signal(self.id(), signal)
+            self.0.job.signal(self.id(), signal)?;
+            if matches!(signal, GroupSignal::Kill) {
+                // TerminateJobObject succeeded, but individual original process
+                // handles may become signaled in either order. Keep all exit,
+                // reader and empty-Job gates; record no success for failed calls.
+                // https://learn.microsoft.com/windows/win32/api/jobapi2/nf-jobapi2-terminatejobobject
+                self.0.job_stop_requested.store(true, Ordering::Release);
+            }
+            Ok(())
         }
     }
     pub(crate) fn try_reap(
@@ -342,6 +376,29 @@ impl GroupControl {
                 io::ErrorKind::InvalidInput,
                 "login group child identity mismatch",
             ));
+        }
+        #[cfg(windows)]
+        {
+            // signal_with_lease holds the same lock through the native call
+            // and successful-stop publication. An in-flight explicit stop can
+            // never look like an unexplained creator exit between these probes.
+            let mut lease = self
+                .0
+                .lease
+                .lock()
+                .map_err(|_| io::Error::other("login group lease poisoned"))?;
+            match child.poll_creator_lifecycle(self.0.job_stop_requested.load(Ordering::Acquire)) {
+                Ok(true) => {}
+                Ok(false) => return Ok(None),
+                Err(error) => {
+                    // Unexpected creator death remains an observation error.
+                    // Stop this exact Job through the already-held lease (no
+                    // recursive lock), consistently recording successful stop.
+                    let _stop =
+                        self.signal_with_lease(GroupSignal::Kill, &mut lease, StopIntent::Explicit);
+                    return Err(error);
+                }
+            }
         }
         #[cfg(unix)]
         {
@@ -407,22 +464,50 @@ impl GroupControl {
                     "login_group_census_refused pgid={} census={census:?}",
                     self.id()
                 );
-                return Err(io::Error::other(CensusRefusal));
+                return Err(io::Error::other(CensusRefusal::Unix));
             }
         }
         #[cfg(windows)]
-        let remaining = if win::exited(child).ok() == Some(true) {
-            // An exited leader is not active in the retained kernel Job. No
-            // numeric PID query is needed to count the remaining active members.
-            self.0.job.active_count().ok().map(|count| count as usize)
-        } else {
-            None
-        };
-        #[cfg(windows)]
-        if let Some(count) = remaining.filter(|count| *count > 0) {
-            eprintln!("login_group_members_remaining={count}");
+        {
+            let ready = job_completion_ready(win::exited(child), || self.0.job.active_count());
+            let ready = match ready {
+                Err(error) if is_nonempty_job_refusal(&error) => {
+                    let now = Instant::now();
+                    let mut since = self
+                        .0
+                        .job_nonempty_since
+                        .lock()
+                        .map_err(|_| io::Error::other("login Job census clock poisoned"))?;
+                    let first = *since.get_or_insert(now);
+                    if now.duration_since(first) < STOP_DRAIN_BUDGET {
+                        return Err(error);
+                    }
+                    // The original vendor and creator have exited, and all
+                    // captured readers joined. A leftover cooperative child is
+                    // cleanup custody, just as on Unix; it cannot hold login
+                    // completion forever. Do not turn this cleanup into an
+                    // operator cancellation or replace the vendor's exit code.
+                    self.signal_with_lease(GroupSignal::Kill, &mut lease, StopIntent::Completion)?;
+                    match job_completion_ready(win::exited(child), || self.0.job.active_count()) {
+                        // TerminateJobObject is asynchronous. A still-dying
+                        // member is pending, never permission to finalize.
+                        Err(error) if is_nonempty_job_refusal(&error) => return Ok(None),
+                        result => result,
+                    }
+                }
+                result => result,
+            }?;
+            if !ready {
+                return Ok(None);
+            }
         }
+        #[cfg(unix)]
         let result = child.try_wait();
+        // The retained process handle already proved exit and the Job census
+        // proved empty. Waiting now cannot block on a live vendor; it also
+        // closes any remaining parent stdin endpoint through the child owner.
+        #[cfg(windows)]
+        let result = child.wait().map(Some);
         if matches!(result, Ok(Some(_))) {
             #[cfg(unix)]
             self.release_foreground();
@@ -436,6 +521,63 @@ impl GroupControl {
         result
     }
 }
+
+// In normal operation the creator waits for the original vendor before exit.
+// Observe creator first, then freshly query vendor. A successful stop of this
+// exact Job can instead terminate creator before vendor: retain pending custody
+// until both original handles prove exit. Stop intent alone grants no exception.
+#[cfg(any(windows, test))]
+pub(super) fn creator_retirement_ready(
+    job_stop_requested: bool,
+    helper_exited: impl FnOnce() -> io::Result<bool>,
+    vendor_exited: impl FnOnce() -> io::Result<bool>,
+) -> io::Result<bool> {
+    if !helper_exited()? {
+        return Ok(false);
+    }
+    if !vendor_exited()? {
+        if job_stop_requested {
+            return Ok(false);
+        }
+        return Err(io::Error::other("login_creator_exited_before_vendor"));
+    }
+    Ok(true)
+}
+
+// An exited leader is no longer active in its retained kernel Job. Only a
+// successful empty-Job census may permit the original Child reap. Typed
+// refusals retain the wait lease and enter custody's elapsed census budget.
+#[cfg(any(windows, test))]
+fn job_completion_ready(
+    exited: io::Result<bool>,
+    active_count: impl FnOnce() -> io::Result<u32>,
+) -> io::Result<bool> {
+    match exited {
+        Ok(false) => return Ok(false),
+        Err(_) => return Err(io::Error::other(CensusRefusal::ExitUnavailable)),
+        Ok(true) => {}
+    }
+    match active_count() {
+        Ok(0) => Ok(true),
+        Ok(count) => {
+            eprintln!("login_group_members_remaining={count}");
+            Err(io::Error::other(CensusRefusal::Nonempty))
+        }
+        Err(_) => Err(io::Error::other(CensusRefusal::Unavailable)),
+    }
+}
+
+#[cfg(windows)]
+fn is_nonempty_job_refusal(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<CensusRefusal>())
+        .is_some_and(|refusal| matches!(refusal, CensusRefusal::Nonempty))
+}
+
+#[cfg(test)]
+#[path = "group_windows_tests.rs"]
+mod windows_tests;
 
 // Only the desktop login commands (and this module's tests) spawn an
 // unattended group; a `--no-default-features --features cli` build has no
@@ -456,7 +598,7 @@ pub(crate) fn spawn(
 /// custody (including a background job), the vendor instead starts a detached
 /// session. Inherit policy then becomes Null; Caller preserves configured
 /// input. Stdout/stderr configuration is preserved. Desktop callers use `spawn`.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(feature = "cli", all(test, unix)))]
 pub(crate) fn spawn_attended(
     command: &mut Command,
     stdin_policy: StdinPolicy,
@@ -514,13 +656,13 @@ fn spawn_with(
         stdin_policy
     };
     match stdin_policy {
-        #[cfg(any(unix, feature = "cli", test))]
+        #[cfg(any(unix, feature = "cli"))]
         StdinPolicy::Inherit => {
-            command.stdin(std::process::Stdio::inherit());
+            command.stdin(Stdio::inherit());
         }
         #[cfg(any(unix, feature = "desktop", test))]
         StdinPolicy::Null => {
-            command.stdin(std::process::Stdio::null());
+            command.stdin(Stdio::null());
         }
         #[cfg(test)]
         StdinPolicy::Caller => {}
@@ -859,19 +1001,33 @@ pub(crate) enum GroupCensus {
     Undetermined(&'static str),
 }
 
-/// try_reap's refusal marker: the group was not proven empty.
-#[cfg(unix)]
+/// try_reap's typed refusal: no original-child reap or finalized receipt.
 #[derive(Debug)]
-pub(crate) struct CensusRefusal;
-#[cfg(unix)]
+pub(crate) enum CensusRefusal {
+    #[cfg(unix)]
+    Unix,
+    #[cfg(any(windows, test))]
+    Nonempty,
+    #[cfg(any(windows, test))]
+    Unavailable,
+    #[cfg(any(windows, test))]
+    ExitUnavailable,
+}
 impl std::fmt::Display for CensusRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("login group not proven empty")
+        f.write_str(match self {
+            #[cfg(unix)]
+            Self::Unix => "login group not proven empty",
+            #[cfg(any(windows, test))]
+            Self::Nonempty => "login_job_census_nonempty",
+            #[cfg(any(windows, test))]
+            Self::Unavailable => "login_job_census_unavailable",
+            #[cfg(any(windows, test))]
+            Self::ExitUnavailable => "login_job_exit_observation_unavailable",
+        })
     }
 }
-#[cfg(unix)]
 impl std::error::Error for CensusRefusal {}
-#[cfg(unix)]
 pub(crate) fn is_census_refusal(error: &io::Error) -> bool {
     error.get_ref().is_some_and(|e| e.is::<CensusRefusal>())
 }
@@ -1248,12 +1404,70 @@ fn members(pgid: u32) -> io::Result<Vec<u32>> {
 #[cfg(windows)]
 mod win {
     use super::*;
-    use std::{
-        ffi::c_void,
-        os::windows::{io::AsRawHandle, process::CommandExt},
-        time::{Duration, Instant},
-    };
+    use std::{ffi::c_void, os::windows::io::AsRawHandle};
     type Handle = *mut c_void;
+    #[cfg(test)]
+    type PostCreateHook = Box<dyn FnOnce(u32, Handle) -> io::Result<()>>;
+    #[cfg(test)]
+    std::thread_local! {
+        static POST_CREATE_HOOK: std::cell::RefCell<Option<PostCreateHook>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+    #[cfg(test)]
+    pub(super) fn set_post_create_before_resume_hook_for_test(
+        hook: impl FnOnce(u32, Handle) -> io::Result<()> + 'static,
+    ) {
+        POST_CREATE_HOOK.with(|slot| {
+            assert!(slot.borrow_mut().replace(Box::new(hook)).is_none());
+        });
+    }
+    #[cfg(test)]
+    pub(super) fn post_create_before_resume_for_test(pid: u32, handle: Handle) -> io::Result<()> {
+        let hook = POST_CREATE_HOOK.with(|slot| slot.borrow_mut().take());
+        match hook {
+            Some(hook) => hook(pid, handle),
+            None => Ok(()),
+        }
+    }
+    const EXTENDED_LIMIT_INFORMATION: i32 = 9;
+    const KILL_ON_JOB_CLOSE: u32 = 0x2000;
+    // Win32 JOBOBJECT_BASIC_LIMIT_INFORMATION; usize matches SIZE_T/ULONG_PTR.
+    #[repr(C)]
+    #[derive(Default)]
+    struct BasicLimits {
+        process_time: i64,
+        job_time: i64,
+        flags: u32,
+        min_working_set: usize,
+        max_working_set: usize,
+        active_limit: u32,
+        affinity: usize,
+        priority: u32,
+        scheduling: u32,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct IoCounters {
+        read_ops: u64,
+        write_ops: u64,
+        other_ops: u64,
+        read_bytes: u64,
+        write_bytes: u64,
+        other_bytes: u64,
+    }
+    // Win32 JOBOBJECT_EXTENDED_LIMIT_INFORMATION, including its reserved IO
+    // counters and all four pointer-width memory fields (not a byte buffer).
+    #[repr(C)]
+    #[derive(Default)]
+    struct ExtendedLimits {
+        basic: BasicLimits,
+        io: IoCounters,
+        process_memory: usize,
+        job_memory: usize,
+        peak_process_memory: usize,
+        peak_job_memory: usize,
+    }
     #[repr(C)]
     struct Accounting {
         user: i64,
@@ -1268,8 +1482,8 @@ mod win {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> Handle;
-        fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
         fn TerminateJobObject(job: Handle, status: u32) -> i32;
+        fn SetInformationJobObject(job: Handle, class: i32, info: *mut c_void, size: u32) -> i32;
         fn QueryInformationJobObject(
             job: Handle,
             class: i32,
@@ -1278,13 +1492,9 @@ mod win {
             returned: *mut u32,
         ) -> i32;
         fn CloseHandle(handle: Handle) -> i32;
-        #[cfg(any(feature = "cli", test))]
+        #[cfg(feature = "cli")]
         fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> i32;
         fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
-    }
-    #[link(name = "ntdll")]
-    unsafe extern "system" {
-        fn NtResumeProcess(process: Handle) -> i32;
     }
     pub(super) struct Job(Handle);
     // SAFETY: the job is an owned kernel handle; operations are serialized by GroupControl.
@@ -1293,13 +1503,62 @@ mod win {
     unsafe impl Sync for Job {}
     impl Drop for Job {
         fn drop(&mut self) {
-            // SAFETY: sole handle ownership; no KILL_ON_JOB_CLOSE flag is ever set.
+            // SAFETY: sole non-inherited handle, closed once. Its last close
+            // terminates remaining members of a configured kill-on-close Job.
             unsafe {
                 CloseHandle(self.0);
             }
         }
     }
     impl Job {
+        fn configure_kill_on_close(&self) -> io::Result<()> {
+            let mut limits = ExtendedLimits::default();
+            // No BREAKAWAY_OK (0x800) or SILENT_BREAKAWAY_OK (0x1000): contains
+            // cooperative descendants; this is not a same-user isolation
+            // boundary. An equally privileged process may duplicate our handle
+            // or change the Job policy. Login does not exempt browser children:
+            // a fresh child stays contained, while a shell's IPC handoff to an
+            // already running process creates no member of this Job.
+            limits.basic.flags = KILL_ON_JOB_CLOSE;
+            // SAFETY: live owned empty Job, aligned class-9 input structure
+            // and exact byte size. Only the kill-on-close policy is enabled.
+            if unsafe {
+                SetInformationJobObject(
+                    self.0,
+                    EXTENDED_LIMIT_INFORMATION,
+                    std::ptr::addr_of_mut!(limits).cast(),
+                    std::mem::size_of::<ExtendedLimits>() as u32,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        #[cfg(test)]
+        pub(super) fn limit_flags_for_test(&self) -> io::Result<u32> {
+            let mut limits = ExtendedLimits::default();
+            let mut returned = 0;
+            // SAFETY: retained production Job and aligned class-9 output with
+            // exact writable capacity. The kernel, not a configured constant,
+            // supplies the flags read by the native qualification test.
+            if unsafe {
+                QueryInformationJobObject(
+                    self.0,
+                    EXTENDED_LIMIT_INFORMATION,
+                    std::ptr::addr_of_mut!(limits).cast(),
+                    std::mem::size_of::<ExtendedLimits>() as u32,
+                    &mut returned,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if returned as usize != std::mem::size_of::<ExtendedLimits>() {
+                return Err(io::Error::other("incomplete login Job limits"));
+            }
+            Ok(limits.basic.flags)
+        }
         pub(super) fn active_count(&self) -> io::Result<u32> {
             // SAFETY: initialized correctly aligned JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION.
             let mut info: Accounting = unsafe { std::mem::zeroed() };
@@ -1323,12 +1582,12 @@ mod win {
             Ok(info.active)
         }
         pub(super) fn signal(&self, pid: u32, signal: GroupSignal) -> io::Result<()> {
-            #[cfg(not(any(feature = "cli", test)))]
+            #[cfg(not(feature = "cli"))]
             let _ = pid;
             // SAFETY: retained job owns descendants; console event targets the own process group.
             let rc = unsafe {
                 match signal {
-                    #[cfg(any(feature = "cli", test))]
+                    #[cfg(feature = "cli")]
                     GroupSignal::Interrupt => GenerateConsoleCtrlEvent(1, pid),
                     GroupSignal::Kill => TerminateJobObject(self.0, 130),
                 }
@@ -1340,9 +1599,20 @@ mod win {
             }
         }
     }
+    #[cfg(all(test, target_pointer_width = "64"))]
+    #[test]
+    fn extended_limits_match_win64_layout() {
+        assert_eq!(std::mem::size_of::<BasicLimits>(), 64);
+        assert_eq!(std::mem::size_of::<IoCounters>(), 48);
+        assert_eq!(std::mem::size_of::<ExtendedLimits>(), 144);
+        assert_eq!(std::mem::align_of::<ExtendedLimits>(), 8);
+        assert_eq!(std::mem::offset_of!(BasicLimits, flags), 16);
+        assert_eq!(std::mem::offset_of!(ExtendedLimits, io), 64);
+        assert_eq!(std::mem::offset_of!(ExtendedLimits, process_memory), 112);
+    }
     pub(super) fn exited(child: &Child) -> io::Result<bool> {
         // SAFETY: actual Child owns this process handle; zero timeout never
-        // blocks or reaps it. Used only to qualify a best-effort Job snapshot.
+        // blocks or reaps it. Qualifies the fail-closed retained-Job census.
         match unsafe { WaitForSingleObject(child.as_raw_handle(), 0) } {
             0 => Ok(true),
             258 => Ok(false),
@@ -1351,41 +1621,30 @@ mod win {
         }
     }
     pub(super) fn spawn(command: &mut Command) -> io::Result<(Child, GroupControl)> {
-        // SAFETY: unnamed non-inherited job, initially empty, no kill-on-close policy.
+        // SAFETY: unnamed non-inherited Job, initially empty. Configuration
+        // must succeed before any vendor process is created.
         let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if raw.is_null() {
             return Err(io::Error::last_os_error());
         }
         let job = Job(raw);
-        command.creation_flags(0x0000_0004 | 0x0000_0200); // SUSPENDED | NEW_PROCESS_GROUP
-        let mut child = command.spawn()?;
-        // SAFETY: child's primary thread is still suspended, so no descendant can escape assignment.
-        let assigned = unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle()) } != 0;
-        // SAFETY: retained process handle names the suspended assigned process.
-        let resumed = assigned && unsafe { NtResumeProcess(child.as_raw_handle()) } >= 0;
-        if !resumed {
-            let failure = io::Error::other("login job assignment/resume refused");
-            // The vendor never ran; stop only this owned suspended child on setup failure.
-            let _ = child.kill();
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => return Err(failure),
-                    Err(_) => break,
-                    Ok(None) => {}
-                }
-                if Instant::now() >= deadline {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
+        job.configure_kill_on_close()?;
+        // Automatic stdio creates the vendor in this Job. Owned stdio creates
+        // a private creator in it; that creator's child inherits membership in
+        // the nonbreakaway Job. All Job handles stay in this main process. A
+        // setup error can retain quarantined custody; preserve its payload.
+        let child = super::super::windows_process::spawn(command, job.0, |pid, handle| {
+            #[cfg(test)]
+            {
+                post_create_before_resume_for_test(pid, handle)
             }
-            eprintln!(
-                "login_custody_UNDETERMINED pgid={} suspended setup cleanup not confirmed",
-                child.id()
-            );
-            std::mem::forget((child, job));
-            return Err(failure);
-        }
+            #[cfg(not(test))]
+            {
+                let _ = (pid, handle);
+                Ok(())
+            }
+        })
+        .map_err(super::super::windows_process::recover_setup_error)?;
         let group = GroupControl(Arc::new(Inner {
             pid: child.id(),
             lease: Mutex::new(WaitLease::Retained),
@@ -1393,6 +1652,8 @@ mod win {
             readers: AtomicBool::new(false),
             killed: Mutex::new(None),
             job,
+            job_stop_requested: AtomicBool::new(false),
+            job_nonempty_since: Mutex::new(None),
         }));
         Ok((child, group))
     }

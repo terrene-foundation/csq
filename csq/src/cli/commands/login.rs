@@ -24,6 +24,7 @@
 //! `profiles.json` with the email label, and clearing any
 //! `broker_failed` sentinel via [`csq_core::accounts::login::finalize_verified_login`].
 
+use crate::login_child_custody::process::Command as LoginCommand;
 use anyhow::{anyhow, Context, Result};
 #[cfg(all(test, unix))]
 use csq_core::accounts::anthropic_identity::LoginPrior;
@@ -845,9 +846,9 @@ fn handle_codex(
     json: bool,
 ) -> Result<()> {
     crate::login_cancel_guard::with_cli_login_session(account, |cancellation| {
+        use crate::login_child_custody::process::{Command, Stdio};
         use csq_core::providers::codex::desktop_login::parse_device_code_line;
         use std::io::Write;
-        use std::process::{Command, Stdio};
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
@@ -1264,11 +1265,15 @@ fn handle_native(
         // slot's isolated vendor home, then verifies + writes the marker.
         // `login_native_cli_with` owns the marker write — no separate
         // `native::write_binding` call here (unlike the retired 0133 flow).
-        native_login::login_native_cli_with_seal(
+        native_login::login_native_cli_with_launch_seal(
             base_dir,
             account,
             surface,
-            |mut command| {
+            |plan| {
+                #[cfg(unix)]
+                let mut command = plan.into_std_command()?;
+                #[cfg(windows)]
+                let mut command = plan;
                 crate::login_cancel_guard::spawn_cli_inherited_login_scoped(
                     &mut command,
                     login_subprocess_timeout(),
@@ -1800,7 +1805,7 @@ fn handle_direct_flow(
 
 /// Run `claude auth login` against `config_dir` and report whether it exited
 /// successfully. Enforces the watchdog timeout.
-fn claude_login_command(config_dir: &Path) -> Result<Command> {
+fn claude_login_command(config_dir: &Path) -> Result<LoginCommand> {
     let claude_bin = csq_core::accounts::login::find_claude_binary().ok_or_else(|| {
         anyhow!(
             "claude binary not found on PATH or well-known locations \
@@ -1810,7 +1815,7 @@ fn claude_login_command(config_dir: &Path) -> Result<Command> {
         )
     })?;
 
-    let mut command = Command::new(&claude_bin);
+    let mut command = LoginCommand::new(&claude_bin);
     command
         .args(["auth", "login"])
         .env("CLAUDE_CONFIG_DIR", config_dir);

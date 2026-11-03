@@ -152,7 +152,7 @@ enum Outcome {
 /// invocation — capability-layer intent, `toggles`, `debug`,
 /// `coc_cache_enabled` (item 3 of the governing task — cross-slot
 /// swap-resume shard S2 follow-up; F2, round 5) — and is forwarded to
-/// [`drive_child_inner`], which calls it on every `SIGUSR1` with a pending
+/// `drive_child_inner`, which calls it on every `SIGUSR1` with a pending
 /// request instead of re-deriving those values (a fresh
 /// `load_capability_layer_toggles(base_dir)` disk read plus hardcoded
 /// `debug=false, coc_cache_enabled=true`, the shape this replaced). So a
@@ -4456,6 +4456,13 @@ pub(crate) mod tests {
         // the full `GRACEFUL_STOP_MS` window, and then die from the
         // follow-up SIGKILL (which a `trap` cannot ignore) — never from its
         // own unrelated `sleep 120`.
+        //
+        // `exec sleep` so the wedged child has NO descendant. `graceful_stop`
+        // SIGKILLs descendants BEFORE the direct child (C-R4-6); with a
+        // non-exec `sleep`, a loaded host let `sh` reap its killed `sleep` and
+        // exit 137 on its own before its own SIGKILL landed, so the direct
+        // child reported an exit code, not the signal. An ignored disposition
+        // survives `exec` (POSIX), so `sleep` itself still ignores TERM.
         let receipt_dir = tempfile::tempdir().unwrap();
         let receipt = receipt_dir.path().join("trap.ready");
         let mut wedged_child = KillOnDrop(
@@ -4463,7 +4470,7 @@ pub(crate) mod tests {
                 .env("PATH", "/usr/bin:/bin")
                 .args([
                     "-c",
-                    "trap '' TERM; echo ready > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; sleep 120",
+                    "trap '' TERM; echo ready > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec sleep 120",
                     "sh",
                 ])
                 .arg(&receipt)

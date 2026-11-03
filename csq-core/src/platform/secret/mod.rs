@@ -285,29 +285,73 @@ impl SlotKey {
     }
 }
 
-/// Validated pool identity, independent of account slots.
+/// Validated named-secret identity, independent of account slots.
+///
+/// Two callers exist and they have different trust contracts, so the key
+/// carries both identities explicitly:
+///
+/// * [`NamedKey::pool`] — the API-key pool namespace, `csq.pool.*`.
+/// * [`NamedKey::bridge`] — the Telegram owner bridge, `csq.bridge.*`.
+///
+/// [`NamedKey::name`] is the storage identity (the file backend keys its
+/// entries on it); [`NamedKey::native_name`] is the OS keychain identity.
+/// Keeping them as separate fields lets the bridge live under its own native
+/// namespace without changing a single existing pool entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct NamedKey(String);
+pub struct NamedKey {
+    name: String,
+    native_name: String,
+}
 
 impl NamedKey {
-    pub fn pool(name: &str) -> Result<Self, SecretError> {
-        if name.is_empty()
-            || name.len() > 64
-            || !name
+    fn validated_stem(stem: &str, reason: &'static str) -> Result<(), SecretError> {
+        if stem.is_empty()
+            || stem.len() > 64
+            || !stem
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
         {
             return Err(SecretError::InvalidKey {
-                reason: "invalid pool key name".into(),
+                reason: reason.to_owned(),
             });
         }
-        Ok(Self(name.to_owned()))
+        Ok(())
     }
+
+    /// Named key in the API-key-pool namespace (`csq.pool.<name>`).
+    pub fn pool(name: &str) -> Result<Self, SecretError> {
+        Self::validated_stem(name, "invalid pool key name")?;
+        Ok(Self {
+            name: name.to_owned(),
+            native_name: format!("csq.pool.{name}"),
+        })
+    }
+
+    /// Named key in the owner-bridge namespace (`csq.bridge.<kind>`).
+    ///
+    /// The bridge MUST NOT use the `csq.pool.` namespace. `security.md` §6
+    /// places `csq.pool.*` under a separate native-backend contract that
+    /// carries a dated IPC-buffer exception (stop-dated 2027-01-11); naming a
+    /// bridge credential `csq.pool.bridge.*` would pull a brand-new trust
+    /// boundary inside that time-limited exception's scope and imply the
+    /// bridge inherits a contract written for the pool. `csq.bridge.*` sits
+    /// outside it.
+    ///
+    /// The storage identity carries a `bridge.` prefix so a named secret in
+    /// the file backend cannot collide with a pool entry of the same bare name.
+    pub fn bridge(kind: &str) -> Result<Self, SecretError> {
+        Self::validated_stem(kind, "invalid bridge key name")?;
+        Ok(Self {
+            name: format!("bridge.{kind}"),
+            native_name: format!("csq.bridge.{kind}"),
+        })
+    }
+
     pub fn native_name(&self) -> String {
-        format!("csq.pool.{}", self.0)
+        self.native_name.clone()
     }
     pub fn name(&self) -> &str {
-        &self.0
+        &self.name
     }
 }
 
@@ -714,6 +758,27 @@ mod tests {
         }
         assert!(NamedKey::pool(&"a".repeat(64)).is_ok());
         assert!(NamedKey::pool(&"a".repeat(65)).is_err());
+    }
+
+    /// The bridge lives in its own native namespace (`csq.bridge.*`), outside
+    /// the pool contract's dated exception. Its file-store identity is
+    /// prefixed so a same-named pool entry cannot collide with it.
+    #[test]
+    fn bridge_namespace_is_separate_from_the_pool_namespace() {
+        let bridge = NamedKey::bridge("telegram-bot").expect("valid bridge kind");
+        assert_eq!(bridge.native_name(), "csq.bridge.telegram-bot");
+        assert_eq!(bridge.name(), "bridge.telegram-bot");
+        let pool = NamedKey::pool("telegram-bot").expect("valid pool name");
+        assert_eq!(pool.native_name(), "csq.pool.telegram-bot");
+        assert_ne!(bridge, pool);
+        for invalid in ["", "a/b", "a b", "a\n", "é", "*"] {
+            assert!(
+                NamedKey::bridge(invalid).is_err(),
+                "must refuse {invalid:?}"
+            );
+        }
+        assert!(NamedKey::bridge(&"a".repeat(64)).is_ok());
+        assert!(NamedKey::bridge(&"a".repeat(65)).is_err());
     }
 
     #[test]

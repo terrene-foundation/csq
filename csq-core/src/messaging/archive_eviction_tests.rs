@@ -43,6 +43,7 @@ fn record(n: usize, read: bool) -> Message {
         id: id(n),
         from: sender(1),
         to: recipient(),
+        origin: crate::messaging::model::Origin::Peer,
         in_reply_to: None,
         thread: id(n),
         body: "fixture body".into(),

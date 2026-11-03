@@ -59,11 +59,24 @@
 //! `csq-core::rotation::swap` module — there is no longer any
 //! production code path that writes credentials directly into
 //! `config-<N>/.credentials.json` from a swap operation.
+//!
+//! # Remote form (`--session`)
+//!
+//! `csq swap N --session <name>` — and the daemon's Telegram bridge — swap
+//! ANOTHER live session's account. The name only SELECTS a `(pid, started_at)`
+//! through the same registry resolver `csq sessions send --name` uses; the
+//! handle dir is then resolved from that live process by
+//! `csq_core::session::swap_session`, never from this terminal's
+//! `CLAUDE_CONFIG_DIR`. Every route that would need an exec-replace INSIDE the
+//! target session (cross-surface, 3P/env-pinned slots, surfaces without a
+//! verified in-flight adoption) is refused with its own named reason. The
+//! same-surface ClaudeCode body is ONE implementation shared with the
+//! own-directory path above.
 
 use anyhow::{anyhow, Result};
 use csq_core::accounts::discovery;
 use csq_core::audit::op_emit;
-use csq_core::audit::types::{AccountSwapPayload, EventKind, EventPayload, OpOutcome, RecordId};
+use csq_core::audit::types::{EventKind, OpOutcome};
 use csq_core::cli_deps::sanitize::redact_path;
 use csq_core::providers::catalog::Surface;
 #[cfg(unix)]
@@ -72,6 +85,19 @@ use csq_core::providers::native;
 #[cfg(unix)]
 use csq_core::session::codex_supervisor as sup;
 use csq_core::session::handle_dir;
+// The swap core was lifted into csq-core so the CLI's own-directory path and
+// the remote session path share ONE implementation. These are the pieces the
+// CLI still drives directly (routing inputs, the Codex route, the audit pair).
+use csq_core::session::swap_session::{
+    begin_swap_audit, codex_canonical_auth_path, finish_swap_audit, is_term_handle_dir,
+    notify_daemon_cache_invalidation, read_codex_account_id, read_slot_from_handle_dir,
+    refresh_current_account_cache, resolve_source_env_transport, route, RouteKind,
+};
+// `SwapAuditContext` is used only by the two `#[cfg(unix)]` swap paths below; importing
+// it unconditionally is an unused import on Windows, which is a hard error under
+// `-D warnings` on the x86_64-pc-windows-gnu leg.
+#[cfg(unix)]
+use csq_core::session::swap_session::SwapAuditContext;
 use csq_core::types::AccountNum;
 use std::path::{Path, PathBuf};
 
@@ -140,444 +166,6 @@ pub(crate) fn admit_materialized_claude_swap(
     )
 }
 
-/// Whether a RUNNING process of a given surface can adopt a credential
-/// change made beneath it — a repointed symlink, a rewritten auth file —
-/// without being replaced.
-///
-/// This is the root-cause fix for a recurring failure shape: `route()`
-/// used to encode "can this surface adopt in-flight?" implicitly, per
-/// surface-pair cell, and got the DEFAULT backwards — every surface not
-/// given an explicit arm fell through a wildcard to `RouteKind::CrossSurface`
-/// (which happens to be safe — exec-replace — but by accident, and its own
-/// doc comment claimed "Source ≠ target surface", which was FALSE for a
-/// same-surface pair landing there). Twice now a surface has shipped with
-/// an assumed capability that broke in production before anyone added an
-/// explicit arm: ClaudeCode env-transport (an accepted-risk incident), then
-/// Codex account-id (this fix). Declaring the capability HERE, exhaustively
-/// (see [`in_flight_adoption`] — no wildcard arm), makes a THIRD silent
-/// instance impossible: a new [`Surface`] variant fails to compile until
-/// its adoption rule is declared.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InFlightAdoption {
-    /// Unconditionally re-reads/re-adopts the credential before every API
-    /// call — no vendor-side guard blocks a same-account in-flight change.
-    /// **ClaudeCode**: CC re-stats `.credentials.json` before each API call
-    /// path (`account-terminal-separation.md` Retracted Rule 7; spec 01
-    /// §1.4, `src/utils/auth.ts:1313-1336` / `:1453`). This does NOT cover
-    /// an env-transport (3P/Ollama) swap, which is a SEPARATE axis — the
-    /// process env vars (`ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`) are
-    /// frozen at launch regardless of credential-file re-read capability,
-    /// and `route()` checks that axis independently via
-    /// `source_env_transport` / `target_env_transport`.
-    Always,
-    /// Adopts an in-flight change ONLY when an additional per-swap
-    /// condition holds; otherwise the reload is REFUSED and the process
-    /// keeps serving the OLD state. **Codex**: codex-cli's own
-    /// auth-reload guard only accepts a reload when the new file's
-    /// `tokens.account_id` matches the in-memory session's. Measured at
-    /// RUNTIME on codex-cli 0.154.0 — the mismatch literal is quoted
-    /// from the runtime line, not from `strings`, because the binary's
-    /// string table truncates it at `(expected: `:
-    /// `codex_login::auth::manager: Skipping auth reload due to account
-    /// id mismatch (expected: …, found: …)`. (The sibling literal
-    /// "Skipping auth reload because no account id is available." ends at
-    /// its sentence-final period in the string table, so it is not
-    /// truncated the way the mismatch literal is.) Both account ids are
-    /// printed verbatim — opaque identifiers, a mild log disclosure, not
-    /// a credential leak.
-    ///
-    /// **Silent at the LOG layer, not silent to the user.** The guard's
-    /// own line is INFO and default `exec`-mode logging is ERROR-only
-    /// (measured: 0 guard lines without `RUST_LOG`, 19 with; no durable
-    /// capture either — no `$CODEX_HOME/log/` directory, 0 rows in
-    /// `logs_2.sqlite`). The CONSEQUENCE reaches the terminal at ERROR
-    /// on the next refresh attempt: "Your access token could not be
-    /// refreshed because you have since logged out or signed in to
-    /// another account. Please sign in again." That message
-    /// MISATTRIBUTES the cause — it describes user action for what is an
-    /// external credential repoint, and "sign in again" does not
-    /// resolve it.
-    ///
-    /// **UNDETERMINED — the healthy-token window.** Every synthetic
-    /// token 401s, forcing the refresh path, so whether a session whose
-    /// token stays VALID ever re-reads `auth.json` — and therefore
-    /// whether a repoint is silent until the first refresh need — is NOT
-    /// measured (it requires real credentials). The silent window is
-    /// bounded by token LIFETIME, not by the guard. Evidence:
-    /// `internal-design-docs`.
-    ///
-    /// **No override found**, within a BOUNDED search: CLI flags, ~40
-    /// `CODEX_*` env names, slash commands, and 7 candidate config keys
-    /// (all rejected by `--strict-config`, whose discriminating power was
-    /// validated by a positive control accepted in the same run). An
-    /// override under a name not guessed would not have been found.
-    WhenSameAccountId,
-    /// Freezes the relevant state at process launch; a running process can
-    /// never adopt a change without being replaced. Not currently declared
-    /// for any surface (ClaudeCode's env-transport freeze is a per-swap
-    /// axis, not a per-surface one — see `Always`'s doc), but kept as a
-    /// distinct variant from `Unknown` so a surface later PROVEN to never
-    /// adopt is a decision, not a guess.
-    #[allow(dead_code)]
-    // no surface declares this today; kept for the taxonomy (see doc above)
-    Never,
-    /// Not established for this surface — its reload behavior has not been
-    /// verified against the vendor CLI's source or observed behavior.
-    /// Treated identically to `Never`: exec-replace is the fail-closed
-    /// default for a capability nobody has characterised. Declaring a
-    /// surface `Always` or `WhenSameAccountId` without the verification
-    /// `Always`'s and `WhenSameAccountId`'s doc comments cite is BLOCKED —
-    /// an unverified "it probably re-reads" is exactly the bug this enum
-    /// exists to close.
-    Unknown,
-}
-
-/// Exhaustive per-surface [`InFlightAdoption`] declaration. **No wildcard
-/// arm** — adding a [`Surface`] variant fails this match at compile time
-/// until its adoption rule is declared here, which is the structural half
-/// of the fix (the taxonomy comment on [`InFlightAdoption`] is the
-/// narrative half).
-///
-/// Gemini/Kimi/Grok are `Unknown`, NOT `Always`: none of their reload
-/// behavior under an in-flight credential change has been verified against
-/// source or observed behavior. Do not upgrade one of these to `Always` or
-/// `WhenSameAccountId` without the same class of verification ClaudeCode
-/// and Codex cite in their own doc comments above.
-fn in_flight_adoption(surface: Surface) -> InFlightAdoption {
-    match surface {
-        Surface::ClaudeCode => InFlightAdoption::Always,
-        Surface::Codex => InFlightAdoption::WhenSameAccountId,
-        // gemini-cli memoizes its OAuth client PER PROCESS and reads the
-        // credential file exactly once, inside `initOauthClient`. Verified in
-        // the shipped bundle (`@google/gemini-cli/bundle/chunk-Z7C7OBI2.js`):
-        // the memo map is created at :245418, populated at :245615, and has
-        // exactly TWO `clear()` sites — :245810 and :245848. The only live
-        // caller is `clearCachedCredentialFile()`, gemini deleting its OWN
-        // creds during an in-process logout; the other is test-only. Neither
-        // is reachable from an external file change. Falsifying checks: zero
-        // reads of `oauth_creds.json` on any request path, and the bundle's
-        // only `watchFile` is a general utility ~96k lines away with no creds
-        // path near it. (The cached client DOES refresh its own token in
-        // memory — that is gemini refreshing ITS account, not adopting a
-        // different one.) Independent of, and agreeing with, the PR-G4b env
-        // finding above.
-        Surface::Gemini => InFlightAdoption::Never,
-        // No instrument discriminated. The binary is a Node single-executable,
-        // so reload/watcher vocabulary returns Node's OWN runtime surface
-        // (`internal/fs/watchers`, `FSWatcher`) whether or not kimi uses it,
-        // and the `getCredentials` family is vendored google-auth-library
-        // bundled for other providers. A window that read as proof of
-        // re-reading turned out, at statement boundary, to be about
-        // `globalMcpOAuth` (MCP server OAuth, not kimi's own credential) AND
-        // inverted in polarity. `Unknown` is the honest verdict; note this
-        // surface exec-replaces regardless via SlotBinding::LaunchEnv below.
-        Surface::Kimi => InFlightAdoption::Unknown,
-        // Grok's credential STORE genuinely hot-reloads, on the vendor's own
-        // compiled-in documentation (`~/.grok/downloads/grok-macos-aarch64`
-        // @10348164): "Grok picks up changes to ~/.grok/auth.json
-        // automatically … uses the new credentials on the next API call
-        // without a restart." Corroborated by runtime log strings (code, not
-        // prose): "Auth token hot-reloaded from config watcher",
-        // "auth hot-reload failed, keeping previous credentials",
-        // "auth: adopted sibling token after lock-loss revalidation" — grok
-        // expects OTHER processes to write auth.json. No codex-shape guard: a
-        // whole-binary search for an account-mismatch string returns nothing,
-        // against codex 0.154.0 which has exactly one.
-        //
-        // This is TRUE and, on its own, NOT SUFFICIENT: a Grok swap changes
-        // which HOME the process is bound to, not what is inside the home —
-        // see SlotBinding::LaunchEnv below, which is what actually forces
-        // exec-replace here.
-        //
-        // Residual: the mechanism is conditional on a watcher that can fail
-        // ("Config file watcher failed to start; hot-reload disabled") and the
-        // failure mode is silent-keep-old.
-        Surface::Grok => InFlightAdoption::Always,
-    }
-}
-
-/// Is the RUNNING process's binding to a SLOT repointable in flight, or frozen
-/// at launch?
-///
-/// The SECOND axis, and it is independent of [`InFlightAdoption`]. That one
-/// asks whether a process adopts a change to the credential store it is bound
-/// to; this asks whether csq can change WHICH store it is bound to at all.
-///
-/// Grok is why both are needed. Its store demonstrably hot-reloads, so the
-/// store axis is honestly `Always` — but a Grok swap does not rewrite
-/// `auth.json`, it points the vendor at a different per-slot home, and that
-/// pointer is an environment variable set on the child `Command` at spawn
-/// (`run.rs::set_native_home_env`) and frozen for the process lifetime. A
-/// running grok keeps hot-reloading slot N's credentials promptly and
-/// correctly, forever, while csq intended slot M. The vendor's reload
-/// capability is real and irrelevant.
-///
-/// NOTE this is NOT the same thing as `source_env_transport` /
-/// `target_env_transport`. Those resolve through
-/// `settings::slot_pins_anthropic_base_url`, which asks whether a slot's
-/// `config-<N>/settings.json` pins `env.ANTHROPIC_BASE_URL`. A native slot
-/// pins nothing of the sort, so both flags evaluate FALSE for it — reusing
-/// them here would drop a native surface through the `Always` arm into
-/// `RouteKind::SameSurfaceClaudeCode`, i.e. the ClaudeCode handle-dir symlink
-/// repoint, for a surface that HAS no handle-dir symlinks. Silent success,
-/// old account still live: the 2026-09-12 codex defect through a different
-/// door. Keep those two scoped to ClaudeCode exactly as documented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SlotBinding {
-    /// csq owns a symlink in the handle dir and repoints it. Changing the
-    /// slot is a filesystem operation the running process can observe.
-    HandleDirSymlink,
-    /// The slot is carried by an environment variable set at spawn
-    /// (`KIMI_CODE_HOME` / `GROK_HOME`, `providers/native.rs:113,133`) naming
-    /// a per-slot vendor home (`native-homes/<surface>-<N>/`,
-    /// `native::native_home_path`). Frozen for the process lifetime; csq never
-    /// reads or writes inside that home (`run.rs` § set_native_home_env).
-    LaunchEnv,
-}
-
-/// Exhaustive by construction, for the same reason [`in_flight_adoption`] is:
-/// adding a `Surface` MUST fail to compile until someone declares how its
-/// process binds to a slot, rather than inheriting a default nobody chose.
-fn slot_binding(surface: Surface) -> SlotBinding {
-    match surface {
-        Surface::ClaudeCode => SlotBinding::HandleDirSymlink,
-        Surface::Codex => SlotBinding::HandleDirSymlink,
-        Surface::Gemini => SlotBinding::HandleDirSymlink,
-        Surface::Kimi => SlotBinding::LaunchEnv,
-        Surface::Grok => SlotBinding::LaunchEnv,
-    }
-}
-
-/// Pure dispatch decision for `handle()`. Extracted as a free function
-/// (PR-C9b L-CDX-3) so the routing matrix is unit-testable without the
-/// env-var + filesystem setup that `handle()` requires. Any future
-/// refactor of the dispatcher MUST keep `route()` in lockstep — the
-/// `route_*` unit tests pin the matrix.
-#[derive(Debug, PartialEq, Eq)]
-enum RouteKind {
-    /// Source + target both ClaudeCode AND both OAuth/Anthropic (neither
-    /// pins `env.ANTHROPIC_BASE_URL`). In-flight symlink repoint; no exec,
-    /// no tombstone — CC re-stats `.credentials.json` and picks up the new
-    /// account on its next API call.
-    SameSurfaceClaudeCode,
-    /// Source + target both Codex, AND both sides' `tokens.account_id`
-    /// match. In-flight symlink repoint via the Codex-aware mirror (M10 /
-    /// an internal journal entry). No exec, no tombstone.
-    SameSurfaceCodex,
-    /// Source + target both Codex, but the codex `account_id` differs
-    /// between them — OR either side's `account_id` could not be
-    /// determined (fail-closed; an unknown id is treated as a mismatch,
-    /// never as a match). codex-cli's own auth-reload guard only accepts
-    /// a reload when the new file's `account_id` matches the in-memory
-    /// session's (measured at RUNTIME on codex-cli 0.154.0: "Skipping
-    /// auth reload due to account id mismatch (expected: …, found: …)" /
-    /// "Skipping auth reload because no account id is available."). An
-    /// in-flight repoint across accounts is therefore REFUSED by the
-    /// running codex process — it keeps serving the OLD account while
-    /// csq reports success. Not silent to the user: the guard's own line
-    /// is INFO and suppressed at default logging, but the next refresh
-    /// attempt surfaces an ERROR-level terminal message that
-    /// misattributes the cause (see
-    /// `InFlightAdoption::WhenSameAccountId` for the measured detail and
-    /// for the UNDETERMINED healthy-token window). No override was found
-    /// among CLI flags, `CODEX_*` env names, slash commands, or 7 probed
-    /// config keys — a bounded search, not a proof of universality. MUST
-    /// exec-replace
-    /// so a fresh codex process reads the new account from disk at
-    /// startup. Tombstone + exec; a resume is ATTEMPTED via
-    /// `codex resume --last`, and the store it reads IS the one holding
-    /// the source's thread: the fresh handle dir's `sessions` link
-    /// resolves to `config-<target>/codex-sessions`, which is a symlink
-    /// into the shared codex state (`CODEX_SHARED.shared`, linked before
-    /// vendor login by design — `providers/codex/login.rs`). The earlier
-    /// store-isolation suspect for this route is therefore REFUTED
-    /// (measured: every live `config-<N>/codex-sessions` resolves through
-    /// to one shared directory). The resume OUTCOME is still UNVERIFIED —
-    /// refuting a failure mechanism is not evidence the resume succeeds
-    /// (see `exec_replace_swap`).
-    CodexAccountMismatchExecReplace,
-    /// Both ClaudeCode, but at least ONE side is an env-transport slot
-    /// (3P / Ollama — `settings.json` pins `env.ANTHROPIC_BASE_URL` +
-    /// `env.ANTHROPIC_AUTH_TOKEN`). A running CC froze those env vars at
-    /// launch and never re-reads them, so an in-flight repoint cannot
-    /// switch the base URL / token — and a 3P→Anthropic repoint would leave
-    /// CC sending the freshly-repointed Anthropic OAuth token to the frozen
-    /// 3P endpoint (token exfiltration; see `daemon::auto_rotate` VP-F1).
-    /// MUST exec-replace so a fresh CC reads the new settings.json env at
-    /// startup. Tombstone + exec; no in-flight session state transfers —
-    /// a resume is ATTEMPTED on the fresh process (`claude --continue`),
-    /// outcome UNVERIFIED (see `exec_replace_swap`).
-    ClaudeCodeEnvTransportExecReplace,
-    /// Source + target are the SAME surface, but that surface's
-    /// [`InFlightAdoption`] is `Never` or `Unknown` (not yet characterised)
-    /// — Gemini/Kimi/Grok today. Exec-replace is the fail-closed default
-    /// for a capability nobody has verified. Tombstone + exec; the
-    /// conversation does NOT resume (none of these surfaces have a resume
-    /// flag csq drives today — `resume_conversation` in `exec_replace_swap`
-    /// is `false` for all three), so the notice MUST NOT promise otherwise.
-    SameSurfaceUnknownAdoptionExecReplace,
-    /// Source ≠ target surface. INV-P05 confirm + INV-P10 tombstone +
-    /// `exec` of the target binary. No in-flight session state transfers —
-    /// a resume is ATTEMPTED on the fresh process when the TARGET is
-    /// ClaudeCode/Codex (not for Gemini/Kimi/Grok); outcome UNVERIFIED
-    /// (see `exec_replace_swap`).
-    ///
-    /// This variant is returned ONLY when `source != target` (see `route()`
-    /// — the surface-equality check is the first, unconditional branch).
-    /// Before the `InFlightAdoption` reshape, a same-surface pair whose
-    /// capability fell through a wildcard ALSO landed here, making this
-    /// doc comment's "Source ≠ target surface" claim false for those pairs
-    /// (`doc-property-claims.md`) — `SameSurfaceUnknownAdoptionExecReplace`
-    /// now owns that case explicitly, so the claim holds unconditionally.
-    CrossSurface,
-}
-
-/// Pure routing decision.
-///
-/// The FIRST question is surface equality: `source != target` is always
-/// [`RouteKind::CrossSurface`], unconditionally — no capability, no flag,
-/// overrides a true surface change. For a same-surface pair, the decision
-/// is driven by [`in_flight_adoption`] (exhaustive over [`Surface`], no
-/// wildcard — see that function's doc comment for why this is the
-/// structural fix rather than a per-cell patch):
-///
-/// - `Always` (ClaudeCode): in-flight, UNLESS `source_env_transport` or
-///   `target_env_transport` is set — a SEPARATE, per-swap axis (frozen
-///   process env, not a credential-file-reload question; see
-///   [`InFlightAdoption::Always`]'s doc comment).
-/// - `WhenSameAccountId` (Codex): in-flight only when
-///   `source_codex_account_id == target_codex_account_id`, BOTH `Some`.
-///   Fail-closed: `(None, _)`, `(_, None)`, and a genuine mismatch are ALL
-///   treated as "cannot adopt", never as a match — mirroring
-///   `resolve_source_env_transport`'s discipline (an unresolved
-///   discriminator is the UNSAFE direction to report as safe-in-flight).
-/// - `Never` / `Unknown` (Gemini/Kimi/Grok today): always exec-replace.
-///
-/// `source_env_transport` / `target_env_transport` are `true` when the
-/// respective slot pins `env.ANTHROPIC_BASE_URL` in its
-/// `config-<N>/settings.json` (3P / Ollama); they are meaningful ONLY when
-/// `in_flight_adoption(source) == Always`. `source_codex_account_id` /
-/// `target_codex_account_id` are each slot's Codex `tokens.account_id`
-/// (`None` when unreadable/absent); they are meaningful ONLY when
-/// `in_flight_adoption(source) == WhenSameAccountId`. Callers compute both
-/// pairs unconditionally (cheap: booleans / cached reads) and `route()`
-/// consults only the pair its capability match needs.
-fn route(
-    source: Surface,
-    target: Surface,
-    source_env_transport: bool,
-    target_env_transport: bool,
-    source_codex_account_id: Option<&str>,
-    target_codex_account_id: Option<&str>,
-) -> RouteKind {
-    if source != target {
-        return RouteKind::CrossSurface;
-    }
-    // AXIS 2 FIRST, and before any arm that could return an in-flight kind.
-    // A frozen process->slot binding makes the store axis moot: it does not
-    // matter how eagerly the vendor re-reads its credential file if csq cannot
-    // change WHICH file it is bound to. Checked here rather than inside the
-    // `Always` arm so a future native surface carrying an account id cannot
-    // slip through `WhenSameAccountId` and repeat the class.
-    if slot_binding(source) == SlotBinding::LaunchEnv
-        || slot_binding(target) == SlotBinding::LaunchEnv
-    {
-        return RouteKind::SameSurfaceUnknownAdoptionExecReplace;
-    }
-
-    match in_flight_adoption(source) {
-        InFlightAdoption::Always => {
-            if source_env_transport || target_env_transport {
-                RouteKind::ClaudeCodeEnvTransportExecReplace
-            } else {
-                RouteKind::SameSurfaceClaudeCode
-            }
-        }
-        InFlightAdoption::WhenSameAccountId => {
-            match (source_codex_account_id, target_codex_account_id) {
-                (Some(s), Some(t)) if s == t => RouteKind::SameSurfaceCodex,
-                _ => RouteKind::CodexAccountMismatchExecReplace,
-            }
-        }
-        InFlightAdoption::Never | InFlightAdoption::Unknown => {
-            RouteKind::SameSurfaceUnknownAdoptionExecReplace
-        }
-    }
-}
-
-/// Read the slot number from a handle dir's `.csq-account` marker.
-///
-/// Returns `None` when the marker is absent or not resolvable to a slot.
-/// Used by the audit wiring to derive `from_slot` for the `AccountSwap`
-/// payload without modifying the `SourceHandle` API.
-///
-/// M4-7 (an internal ticket Phase 4): the marker's CONTENT is a UUID whenever a
-/// `by_slot` mapping exists (`markers::write_csq_account`, written by
-/// `csq run` / `finalize_login`), so this resolves through
-/// `resolve_marker_to_slot` (numeric-or-UUID) rather than the numeric-only
-/// `read_csq_account` — the latter returned `None` on every modern slot,
-/// which silently dropped the `AccountSwap` audit record AND defeated the
-/// `source_env_transport` exfiltration guard below
-/// (`guard-reader-writer-parity.md`).
-fn read_slot_from_handle_dir(base_dir: &Path, handle_dir_path: &Path) -> Option<AccountNum> {
-    csq_core::accounts::markers::resolve_marker_to_slot(base_dir, handle_dir_path)
-}
-
-/// Resolves the source-side env-transport discriminator for the
-/// `(ClaudeCode, ClaudeCode)` routing cell, FAIL-CLOSED.
-///
-/// A slot that pins `env.ANTHROPIC_BASE_URL` (3P: DeepSeek/Z.AI/MiniMax, or
-/// Ollama) injects its base URL + auth token into CC's process env at
-/// launch — FROZEN for the process lifetime. An in-flight symlink repoint
-/// cannot change them, so any swap touching such a slot on either side MUST
-/// exec-replace (a fresh CC reads the new settings.json env). The source
-/// flag is only knowable when the source marker resolved (`from_slot`).
-///
-/// `from_slot == None` means csq CANNOT determine whether the source is an
-/// env-transport slot — it does NOT mean the source is Anthropic. Reporting
-/// `false` in that case (the pre-fix behavior) is the UNSAFE direction: it
-/// lets `route()` choose `SameSurfaceClaudeCode` (in-flight repoint) for a
-/// source that might actually be 3P/Ollama, which is exactly the
-/// Anthropic-OAuth-token-to-frozen-3P-endpoint exfiltration path
-/// `RouteKind::ClaudeCodeEnvTransportExecReplace`'s doc comment describes.
-/// This function fails CLOSED instead: an unresolved marker reports `true`,
-/// forcing the safer exec-replace path. The target flag alone (computed
-/// separately by the caller) still forces exec-replace whenever the TARGET
-/// is env-transport, covering the Anthropic→3P direction independently.
-fn resolve_source_env_transport(base_dir: &Path, from_slot: Option<AccountNum>) -> bool {
-    from_slot
-        .map(|s| csq_core::providers::settings::slot_pins_anthropic_base_url(base_dir, s.get()))
-        .unwrap_or(true)
-}
-
-/// Reads slot `slot`'s Codex `tokens.account_id` for the `(Codex, Codex)`
-/// routing-cell discriminator, via the SAME channel daemon production paths
-/// read (`diagnostic-surface-parity.md` MUST NOT Rule 4 / `refresh::check`'s
-/// `broker_codex_check`): the identity-keyed path when a `by_slot` UUID
-/// mapping exists, falling back to the legacy `credentials/codex-<N>.json`
-/// mirror otherwise.
-///
-/// Returns `None` when the slot has no UUID mapping AND no legacy mirror,
-/// when the file cannot be parsed or is not Codex-shaped, or when
-/// `account_id` is absent/empty. `None` is NOT "this account has no id" —
-/// it means UNKNOWN, and `route()` MUST treat it as a mismatch (fail-closed),
-/// never as a match: codex-cli refuses to reload `auth.json` in-flight
-/// unless the account id it already holds matches the new file's, so
-/// proceeding with an in-flight repoint on an unreadable id risks leaving
-/// the running process bound to the OLD account — a binding the user
-/// learns of only through the refresh-error message, not from the refusal
-/// itself (see `InFlightAdoption::WhenSameAccountId`).
-fn read_codex_account_id(base_dir: &Path, slot: AccountNum) -> Option<String> {
-    let path = codex_canonical_auth_path(base_dir, slot);
-    let creds = csq_core::credentials::load(&path).ok()?;
-    let account_id = creds.codex()?.tokens.account_id.clone()?;
-    if account_id.is_empty() {
-        None
-    } else {
-        Some(account_id)
-    }
-}
-
 /// PR-C7 entry point. `yes` bypasses the cross-surface confirmation
 /// prompt (INV-P05 `--yes`).
 ///
@@ -590,6 +178,60 @@ pub fn handle(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
     csq_core::credentials::keychain::with_interactive_keychain(|| {
         handle_inner(base_dir, target, yes)
     })
+}
+
+/// `csq swap N --session <name>` — swap ANOTHER live session's account.
+///
+/// The name resolves through the SAME registry resolver `csq sessions send
+/// --name` uses (a name only SELECTS a `(pid, started_at)` — spec 32a §4.3);
+/// the selected recipient is re-verified against the live process table inside
+/// [`csq_core::session::swap_session::swap_session_for_recipient`], which acts
+/// on THAT process's handle dir. This terminal's own `CLAUDE_CONFIG_DIR` is
+/// never consulted, and no directory name is parsed for identity
+/// (`account-terminal-separation.md` MUST NOT Rule 3).
+///
+/// Runs inside `with_interactive_keychain` exactly like the own-directory path:
+/// an operator typed this command at their own terminal, so a macOS password
+/// dialog gets the interactive bound.
+pub fn handle_named(base_dir: &Path, target: AccountNum, session: &str) -> Result<()> {
+    csq_core::credentials::keychain::with_interactive_keychain(|| {
+        handle_named_inner(base_dir, target, session)
+    })
+}
+
+fn handle_named_inner(base_dir: &Path, target: AccountNum, session: &str) -> Result<()> {
+    use csq_core::messaging::registry;
+
+    let (live, complete) = super::sessions_messages::real_candidates(base_dir)
+        .map_err(|error| anyhow!("csq swap: {error}"))?;
+    let chosen = registry::resolve_recipient_by_name(&live, complete, session, None)
+        .map_err(|error| anyhow!("csq swap: {error}"))?;
+    let recipient = super::sessions_messages::resolve_target(
+        chosen.pid,
+        chosen.started_at,
+        &csq_core::sessions::session_info_for_pid_kind,
+    )
+    .map_err(|error| anyhow!("csq swap: {error}"))?;
+
+    // Phase B' billing-ledger attribution (an internal journal entry D2), exactly as the
+    // own-directory path records it. Best-effort; failures MUST NOT block the
+    // swap. The daemon-driven remote swap records its action in the AccountSwap
+    // audit chain instead (this helper attributes the launching CLI process).
+    super::run::append_launch_log(base_dir, "swap", target);
+
+    let outcome =
+        csq_core::session::swap_session::swap_session_for_recipient(base_dir, &recipient, target)
+            .map_err(|error| match error {
+            // The shared body's operator line and causal chain, unchanged —
+            // the same text the own-directory path prints.
+            csq_core::session::swap_session::SwapError::Failed(cause) => cause,
+            named => anyhow!(named),
+        })?;
+    println!(
+        "Swapped to account {} — session `{session}` will pick it up on its next API call",
+        outcome.account
+    );
+    Ok(())
 }
 
 fn handle_inner(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
@@ -613,9 +255,9 @@ fn handle_inner(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
     let from_slot = read_slot_from_handle_dir(base_dir, source.path());
 
     // Capture the handle-dir path before `source` is moved into the route arms.
-    // After a Claude-surface swap we mirror the new account's credential into
-    // the keychain item CC reads for this handle dir (current CC reads OAuth
-    // from the keychain, not the symlinked `.credentials.json`).
+    // The same-surface ClaudeCode swap (the shared core body in
+    // `csq_core::session::swap_session`) acts on THIS dir: for `csq swap` the
+    // caller's own terminal, for `csq swap --session` the verified target's.
     let handle_dir_path = source.path().to_path_buf();
 
     // Env-transport discriminator for the (ClaudeCode, ClaudeCode) cell — see
@@ -647,201 +289,24 @@ fn handle_inner(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
         source_codex_account_id.as_deref(),
         target_codex_account_id.as_deref(),
     );
-    // F2(d): captured before `route_kind` moves into `exec_replace_swap`
-    // below — only the same-surface ClaudeCode route repoints an EXISTING
-    // dir (the one F2's rollback/consistency check applies to).
-    let route_is_same_surface_claude_code = matches!(route_kind, RouteKind::SameSurfaceClaudeCode);
 
-    // A4a — close the daemon-custodian mid-swap race for a same-surface ClaudeCode
-    // swap (the only path that repoints an EXISTING dir whose keychain still holds
-    // the PREVIOUS account's token). Hold the per-dir swap lock so the daemon
-    // custodian's harvest (which try-locks the same file) SKIPS this dir until it
-    // settles. Cross-surface / Codex routes create a FRESH handle dir (keychain
-    // absent from birth), so they have no such race and need no lock here.
-    // v4 A1 ("switch now or say so"): for a same-surface ClaudeCode swap,
-    // read X and force-write the TARGET account's token BEFORE the repoint,
-    // under the lock — the daemon custodian's harvest must never observe
-    // this dir between the write and the repoint. Chosen order: write X,
-    // then repoint.
-    //
-    // K5 (doc fix — this comment previously claimed a write failure or an
-    // unreadable X always means nothing was mutated, which contradicts S4
-    // and F8 below): an UNREADABLE X, or a write failure over a
-    // CONFIRMED-absent X (F4/F8), does mean nothing was mutated, and the
-    // switch does NOT proceed (the `?` below returns before any repoint
-    // runs). But a write failure over KNOWN (`Content`) prior state (S4)
-    // leaves the resulting disk state UNKNOWN — `force_swap_write_before_repoint`
-    // passes that through as `Ok(WriteFailedUnknown)` rather than `Err`, and
-    // this function proceeds to the repoint exactly as for a confirmed
-    // write. v5 ("keychain follows the links", 2026-09-26 owner directive):
-    // there is no immediate restore-to-snapshot attempt here any more — the
-    // SOLE compensating action for ANY downstream failure is
-    // `reconcile_keychain_to_marker`, run once `result` (the repoint's own
-    // outcome) is known, below.
-    // KC4-2: the hint is recorded ONLY after a successful switch (see below,
-    // after `result` is known) and ONLY if absent — the running session that
-    // OWNS this handle dir had its keychain username fixed at ITS OWN launch;
-    // swap must never overwrite that recorded value, including on an abort
-    // path. `_swap_abs_for_hint` carries the canonicalized path forward so the
-    // post-result block below can still reach it.
-    let mut _swap_abs_for_hint: Option<std::path::PathBuf> = None;
-    // B2/PRIMARY DIRECTIVE: exactly what the pre-repoint force-write
-    // attempted, carried forward so the post-repoint reconcile below can
-    // classify X by IDENTITY against it (rule 4) rather than re-deriving a
-    // possibly-different value from a second read of the target's file.
-    let mut _swap_target_creds_for_reconcile: Option<
-        csq_core::accounts::identity_store::TargetToken,
-    > = None;
-    let swap_target_binding = if route_is_same_surface_claude_code {
-        // Capture the exact selected UUID and credential version. Legacy local
-        // custody permits its own canonical bytes, never organization trust.
-        let target_binding =
-            csq_core::accounts::anthropic_identity::capture_anthropic_binding(base_dir, target)
-                .map_err(|error| {
-                    if error == csq_core::accounts::anthropic_identity::IdentityError::BindingBusy {
-                        anyhow::anyhow!("csq swap: identity_binding_busy; nothing changed — retry the swap")
-                    } else {
-                        anyhow::anyhow!("csq swap: organization_identity_unconfirmed; run `csq login {target}` and retry the swap")
-                    }
-                })?;
-        if matches!(
-            target_binding.context(),
-            csq_core::accounts::anthropic_identity::StoredAnthropicContext::LegacyUnknown
-        ) {
-            tracing::info!(
-                error_kind = "swap_legacy_context_unconfirmed",
-                account = target.get(),
-                "swap uses only the selected legacy UUID's own canonical credentials; daemon organization verification remains pending"
-            );
+    match route_kind {
+        // The ONE implementation shared with the remote path: the two-lock
+        // acquisition, the keychain force-write + reconcile, the audit pair and
+        // the `.current-account` refresh all live in csq-core now. `claude_home`
+        // is a closure so it resolves at exactly the point in the sequence where
+        // this path always resolved it (inside the audited region).
+        RouteKind::SameSurfaceClaudeCode => {
+            let swapped = csq_core::session::swap_session::same_surface_claude_code_swap(
+                base_dir,
+                &handle_dir_path,
+                target,
+                from_slot,
+                &|| super::claude_home(),
+            )?;
+            println!("Swapped to account {swapped} — CC will pick up on next API call");
+            Ok(())
         }
-        Some(target_binding)
-    } else {
-        None
-    };
-    let mut swap_native_capture = None;
-    let _swap_guard = if matches!(route_kind, RouteKind::SameSurfaceClaudeCode) {
-        let (abs, keychain_write_allowed) =
-            csq_core::credentials::keychain::canonicalize_for_keychain_sync(&handle_dir_path);
-        if keychain_write_allowed {
-            // round 7c D5: opportunistically harvest the SOURCE account's
-            // own live keychain candidates via the D3 IPC route BEFORE
-            // taking the per-dir lock below — a separate process (unlike
-            // D4's in-daemon auto_rotate call, this asks the daemon, it does
-            // not run the custodian itself). Best-effort and its result is
-            // not branched on directly: if the daemon adopts a foreign token
-            // into the SOURCE account's store here, the post-lock
-            // `force_swap_write_before_repoint` call below will find X now
-            // matches a known token (rule 2, Write) instead of nothing
-            // (rule 3, `ForeignLoginUnharvested`) — that decide() call is
-            // what actually produces the refuse-vs-proceed disposition D5
-            // requires ("refuse after harvest still unmatched" / "unreachable
-            // daemon but nothing unmatched -> proceed" are both exactly what
-            // `decide_cc_keychain_write`'s rule 2/3 already implement; this
-            // call's only job is to give that decision a chance to see a
-            // freshly-adopted token first).
-            if let Some(source_account) = from_slot {
-                let sock = csq_core::daemon::socket_path(base_dir);
-                let _ = csq_core::daemon::harvest_account(&sock, source_account.get());
-            }
-            use csq_core::credentials::keychain::BoundedLockOutcome;
-            let guard =
-                match csq_core::credentials::keychain::lock_handle_dir_for_swap_bounded(&abs) {
-                    BoundedLockOutcome::Acquired(g) => Some(g),
-                    BoundedLockOutcome::NotNeeded => None,
-                    BoundedLockOutcome::TimedOut | BoundedLockOutcome::Failed => {
-                        anyhow::bail!(
-                            "csq swap: the keychain is busy; nothing changed — retry the swap"
-                        );
-                    }
-                };
-            // Preserve the complete source context under the existing swap lock
-            // before selecting canonical target bytes or mutating the keychain.
-            swap_native_capture = Some(handle_dir::capture_native_swap(base_dir, &abs).map_err(
-                |error| match profiles_busy_operator_line(Some(&error), "") {
-                    Some(_) => anyhow::anyhow!(
-                        "csq swap: profiles lock busy; nothing changed — retry the swap"
-                    ),
-                    None => anyhow::Error::from(error),
-                },
-            )?);
-            _swap_abs_for_hint = Some(abs.clone());
-            // M3-7/guard-reader-writer-parity.md MUST-1/F5: source the
-            // target's token via the shared `target_token_for_forced_write`
-            // helper, so this and `auto_rotate`'s tick can never drift apart
-            // on how the resolver is invoked — never a hardcoded config-N
-            // guess, which a UUID-keyed slot's config-N copy may be stale or
-            // absent for.
-            let target_creds =
-                csq_core::accounts::identity_store::target_token_for_forced_write(base_dir, target);
-            // round 7c D5: a target whose own canonical token is not Valid
-            // (unreadable/expired) is refused BEFORE any mutation — same
-            // rule `auto_rotate::find_target` enforces at selection time
-            // (D4). This route (`SameSurfaceClaudeCode`) only ever intends
-            // an Anthropic token (never a strip — see `route()`'s
-            // `target_env_transport` gate), so `None` here always means
-            // "nothing valid to switch to", never "positively non-Anthropic".
-            if target_creds.as_valid_str().is_none() {
-                anyhow::bail!(
-                    "csq swap: account {target} has no valid login; nothing changed — \
-                     run `csq login {target}` first"
-                );
-            }
-            // v5: every `Ok(_)` outcome (Applied, AbsentWriteFailed, or
-            // WriteFailedUnknown) proceeds to the repoint below identically
-            // — `reconcile_keychain_to_marker` is the single compensating
-            // action for whatever the repoint does next, so this call site
-            // no longer needs to branch on the write's own outcome. H1:
-            // `.as_valid_str()` reproduces the old "is there a token to
-            // write" behaviour; `target_creds` itself (the richer
-            // three-way classification) is carried forward below so the
-            // post-repoint reconcile can classify X by IDENTITY against
-            // exactly what THIS call attempted to write.
-            if let Err(msg) =
-                csq_core::credentials::keychain::force_swap_write_before_repoint_guarded(
-                    base_dir,
-                    &abs,
-                    target_creds.as_valid_str(),
-                    swap_target_binding
-                        .as_ref()
-                        .expect("same-surface target captured"),
-                    swap_native_capture
-                        .as_ref()
-                        .expect("same-surface native context captured"),
-                )
-            {
-                anyhow::bail!("csq swap: {msg}");
-            }
-            _swap_target_creds_for_reconcile = Some(target_creds);
-            guard
-        } else {
-            // F3/KC4-3: a canonicalize failure means we cannot even name the
-            // handle dir's absolute path, so the "CC falls back to the
-            // symlinked .credentials.json" claim below does not follow — CC's
-            // fallback is read through the SAME dir this canonicalize just
-            // failed on. Refuse rather than proceed with an unverified path,
-            // BEFORE any repoint runs (this arm is reached before `result` is
-            // computed below).
-            anyhow::bail!(
-                "csq swap: could not locate this terminal's keychain item; nothing changed — retry the swap"
-            );
-        }
-    } else {
-        None
-    };
-
-    let mut result = match route_kind {
-        RouteKind::SameSurfaceClaudeCode => same_surface_claude_code_audited(
-            base_dir,
-            source.path(),
-            target,
-            from_slot,
-            swap_target_binding
-                .as_ref()
-                .expect("same-surface target captured"),
-            swap_native_capture
-                .as_ref()
-                .expect("same-surface native context captured"),
-        ),
         RouteKind::SameSurfaceCodex => {
             same_surface_codex_audited(base_dir, source.path(), target, from_slot)
         }
@@ -864,265 +329,6 @@ fn handle_inner(base_dir: &Path, target: AccountNum, yes: bool) -> Result<()> {
             from_slot,
             route_kind,
         ),
-    };
-
-    // v5 ("keychain follows the links", 2026-09-26 owner directive): the
-    // keychain side of a same-surface ClaudeCode switch was already written
-    // BEFORE the repoint above (under `_swap_guard`'s lock). B2: the
-    // compensating action `reconcile_keychain_to_marker` is now run on
-    // BOTH outcomes, not only `Err` — an `Ok(())` repoint does not prove
-    // the earlier force-write's keychain mirror actually landed
-    // (`ForcedSyncResult::AbsentWriteFailed`/`WriteFailedUnknown` are both
-    // `Ok(_)` write outcomes at that earlier call site). It re-reads this
-    // handle dir's `.csq-account` marker AS IT IS NOW (never a pre-write
-    // snapshot) and makes X agree with whatever account that marker names.
-    // The marker read is the source of truth
-    // (`guard-reader-writer-parity.md`); this is what makes the operator
-    // line honest regardless of how (or whether) a repoint failed.
-    if route_is_same_surface_claude_code {
-        let forced_write = _swap_target_creds_for_reconcile.as_ref().map(|tt| {
-            csq_core::credentials::keychain::ForcedWriteAttempt {
-                account: target,
-                raw_json: tt.as_valid_str(),
-            }
-        });
-        let reconcile_outcome = csq_core::credentials::keychain::reconcile_keychain_to_marker(
-            base_dir,
-            &handle_dir_path,
-            forced_write,
-        );
-        // B4: the account the switch STARTED from — `from_slot` is exactly
-        // the same `resolve_marker_to_slot` read reconcile itself uses,
-        // taken before this switch attempted anything. Passed through as
-        // `Option`, NOT `.unwrap_or(target)` — falling back to `target`
-        // silently substituted the DESTINATION for "unknown start", which
-        // made "switched"/"not switched" a claim about whether the marker
-        // ended up on the target rather than an honest "we don't know
-        // where this started". `None` (the rare, pre-side-effect-unavailable
-        // case the source marker was already unreadable at swap start)
-        // now omits the switched/not-switched claim entirely (B4).
-        let reconcile_line = csq_core::credentials::keychain::reconcile_outcome_operator_line(
-            &reconcile_outcome,
-            from_slot,
-        );
-        let credential_error = result
-            .as_ref()
-            .err()
-            .and_then(|e| e.downcast_ref::<csq_core::error::CredentialError>());
-        // K3: `repoint_handle_dir`'s S7 pre-flight refusal fires BEFORE any
-        // symlink mutation — a real file blocks where an
-        // `ACCOUNT_BOUND_ITEMS` symlink belongs — but the keychain WAS
-        // already force-written above, so it can still disagree with the
-        // (unmoved) marker. D-F2: fold the reconcile outcome into this
-        // message rather than reporting the blocked item alone.
-        let refused_item = credential_error.and_then(|e| e.repoint_refused_item());
-        // B3: the handle dir's OWN symlinks may ALSO be left mixed across
-        // two accounts by a partially-rolled-back repoint — a signal
-        // independent of the keychain reconcile above. Only meaningful when
-        // the repoint actually failed.
-        let mixed_links = credential_error.is_some_and(|e| {
-            csq_core::credentials::keychain::repoint_left_mixed_links(e, base_dir, &handle_dir_path)
-        });
-        // S-H-A/D-F1: a repoint `Ok(())` is NOT the final word — reconcile
-        // ran unconditionally above (B2), and its outcome may say the
-        // keychain never actually followed the switch (`WriteFailed`,
-        // `KeychainUnknown`, `MarkerUnreadable`). Only `AlreadyCurrent`/
-        // `Reconciled` mean the keychain genuinely agrees with the marker
-        // now; every other outcome on an `Ok(())` repoint is converted to a
-        // non-zero exit carrying the reconcile line, so the operator is
-        // never told "Swapped" while the keychain disagrees.
-        if result.is_err() {
-            let operator_line = if let Some(line) =
-                profiles_busy_operator_line(credential_error, &reconcile_line)
-            {
-                line
-            } else if let Some(item) = refused_item {
-                csq_core::credentials::keychain::repoint_refused_real_file_operator_line(
-                    item,
-                    &reconcile_line,
-                )
-            } else if mixed_links {
-                // C-F8: the prior version REPLACED reconcile_line with the
-                // mixed-links line, silently discarding whatever
-                // reconcile_outcome itself said (a `WriteFailed`/
-                // `KeychainUnknown` detail is lost, and the operator sees
-                // only "links are mixed" with no explanation of the
-                // keychain's own disagreement). Two independently-checked
-                // things (`csq-core/src/credentials/keychain.rs`'s
-                // `mixed_links_operator_line` doc), so the message folds
-                // both in rather than picking one.
-                match reconcile_outcome.marker_account() {
-                    Some(m) => format!(
-                        "{} {reconcile_line}",
-                        csq_core::credentials::keychain::mixed_links_operator_line(m)
-                    ),
-                    None => reconcile_line,
-                }
-            } else {
-                reconcile_line
-            };
-            result = result.map_err(|e| e.context(operator_line));
-        } else {
-            match decide_ok_repoint_disposition(&reconcile_outcome, &reconcile_line) {
-                OkRepointDisposition::Success { marker_account } => {
-                    println!(
-                        "Swapped to account {} — CC will pick up on next API call",
-                        marker_account.get()
-                    );
-                }
-                OkRepointDisposition::Fail(message) => {
-                    result = Err(anyhow::anyhow!(message));
-                }
-            }
-        }
-    }
-    // KC4-2: record the hint ONLY now that the switch has actually
-    // succeeded, and ONLY if the file is still absent — never on an abort
-    // path (the `Err` arm above), and never overwriting a value some
-    // earlier launch of this SAME handle dir already recorded. See
-    // `record_keychain_account_hint_if_absent`'s doc.
-    if result.is_ok() {
-        if let Some(abs) = _swap_abs_for_hint.take() {
-            csq_core::credentials::keychain::record_keychain_account_hint_if_absent(&abs);
-        }
-    }
-    // `_swap_guard` drops here.
-
-    result
-}
-
-/// N5: a held profiles lock is contention, not an identity problem — the
-/// operator is told to retry, never to `csq login`. `None` for every other error.
-fn profiles_busy_operator_line(
-    error: Option<&csq_core::error::CredentialError>,
-    reconcile_line: &str,
-) -> Option<String> {
-    error.filter(|e| handle_dir::is_profiles_lock_busy(e)).map(|_| {
-        format!(
-            "csq swap: profiles lock busy; the repoint did not run — retry the swap. {reconcile_line}"
-        )
-    })
-}
-
-// ─── M13b audit helpers ──────────────────────────────────────────────
-
-/// The result of a successful `begin_swap_audit` call.
-#[derive(Debug)]
-struct SwapAuditContext {
-    chain_id: String,
-    correlation_id: RecordId,
-    payload: EventPayload,
-}
-
-/// Attempt to emit the INTENT record for a same-surface swap.
-///
-/// Returns:
-/// - `Ok(Some(ctx))` — INTENT persisted; caller MUST call `finish_swap_audit`
-///   after the side effect.
-/// - `Ok(None)` — marker absent; audit skipped (pre-side-effect detection
-///   failure is NOT fail-closed for same-surface swaps — swap proceeds).
-/// - `Err(..)` — INTENT could not be persisted; caller MUST abort the side
-///   effect (F-LEDGER-02 fail-closed contract).
-///
-/// FIX-3: typed return replaces the `contains("from_slot unavailable")`
-/// string discrimination that was brittle across refactors.
-///
-/// Round 7 (D-F3/S-M-1) added a `nonce: Option<&str>` parameter here, embedded
-/// on the INTENT payload so the codex supervisor could require it to match
-/// before writing the correlated OUTCOME. Round 8 (C-B1/C-B2) RETRACTED that:
-/// see `AccountSwapPayload`'s doc for why. The codex-supervisor handoff path
-/// (`handoff_to_supervisor_write_and_signal`) still mints and carries a
-/// request nonce (`SwapRequest::nonce`, `SwapHandoffArgs::nonce`) — it is
-/// simply never embedded in this function's payload.
-fn begin_swap_audit(
-    base_dir: &Path,
-    from_slot: Option<AccountNum>,
-    to_slot: AccountNum,
-) -> Result<Option<SwapAuditContext>> {
-    let from = match from_slot {
-        Some(f) => f,
-        None => {
-            // Marker absent — skip audit gracefully. No INTENT emitted.
-            return Ok(None);
-        }
-    };
-
-    let chain_id = op_emit::load_chain_id(base_dir);
-    let correlation_id =
-        op_emit::gen_correlation_id().map_err(|e| anyhow!("audit correlation_id: {e}"))?;
-    let payload = EventPayload::AccountSwap(AccountSwapPayload {
-        from_slot: from,
-        to_slot,
-    });
-
-    // FIX-7: reason uses RedactedString::from_untrusted; the audit framework
-    // does path-free string redaction. No filesystem paths reach the chain.
-    // FIX-1: Ok(true)=emitted → Ok(Some(ctx)); Ok(false)=chain-broken skip →
-    // Ok(None) (swap proceeds without audit); Err=fail-closed.
-    let intent_emitted = op_emit::emit_intent(
-        base_dir,
-        &chain_id,
-        EventKind::AccountSwap,
-        payload.clone(),
-        correlation_id.clone(),
-    )
-    .map_err(|e| anyhow!("audit intent persist failed — swap aborted: {e}"))?;
-
-    if !intent_emitted {
-        // Chain broken — proceed without audit trail (same pattern as marker-absent).
-        return Ok(None);
-    }
-
-    Ok(Some(SwapAuditContext {
-        chain_id,
-        correlation_id,
-        payload,
-    }))
-}
-
-/// Emit the OUTCOME record. Best-effort — if this fails the intent is a
-/// visible orphan detectable by `scan_orphan_intents`. The swap result is
-/// returned unchanged.
-///
-/// FIX-7: `e.to_string()` from `anyhow::Error` may contain paths from
-/// underlying IO errors. Route through `op_emit::redact_reason` (token scrub
-/// + `$HOME` strip).
-///
-/// D-F5/S-LOW-3 (round 7): this used to be a private copy of the same logic
-/// now shared as `op_emit::redact_reason` — moved to csq-core so every
-/// lifecycle-op outcome writer (this function, `exec_replace_swap`'s own
-/// OUTCOME write below, AND `codex_supervise.rs`'s supervisor-side writes)
-/// scrubs `$HOME` identically rather than each deciding independently. See
-/// that function's doc for the full rationale.
-fn finish_swap_audit(base_dir: &Path, ctx: SwapAuditContext, result: &Result<()>) {
-    let outcome = match result {
-        Ok(()) => OpOutcome::Ok,
-        Err(e) => OpOutcome::Failed {
-            reason: op_emit::redact_reason(e.to_string()),
-        },
-    };
-    if let Err(e) = op_emit::emit_outcome(
-        base_dir,
-        &ctx.chain_id,
-        EventKind::AccountSwap,
-        ctx.payload,
-        ctx.correlation_id,
-        outcome,
-    ) {
-        // S-LOW-C (round 8): the swap itself already completed (or failed)
-        // by this point — this OUTCOME write is best-effort audit trail,
-        // never a gate on the operation — so a WARN is correct, not a
-        // propagated error. `e.fixed_tag()` is itself a fixed vocabulary
-        // (`AuditV2Error::fixed_tag`), so this never echoes an upstream
-        // error body onto the log (`security.md` MUST-2).
-        tracing::warn!(
-            error_kind = "audit_outcome_emit_failed",
-            op = "swap",
-            audit_error_kind = e.fixed_tag(),
-            "finish_swap_audit: failed to emit AccountSwap OUTCOME record \
-             (op already completed; audit trail incomplete — the INTENT is \
-             left as an orphan for scan_orphan_intents)"
-        );
     }
 }
 
@@ -1237,13 +443,6 @@ fn validate_source_handle_path(base_dir: &Path, source: &Path) -> Result<PathBuf
     Ok(source)
 }
 
-fn is_term_handle_dir(p: &Path) -> bool {
-    p.file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| n.starts_with("term-"))
-        .unwrap_or(false)
-}
-
 fn is_legacy_config_dir(p: &Path) -> bool {
     p.file_name()
         .and_then(|n| n.to_str())
@@ -1265,151 +464,11 @@ fn resolve_target_surface(base_dir: &Path, target: AccountNum) -> Result<Surface
         })
 }
 
-// ─── Same-surface ClaudeCode (existing behavior) ────────────────────
-
-/// Wrapper that adds M13b INTENT/OUTCOME audit emit around the same-surface
-/// ClaudeCode symlink repoint.
-///
-/// FIX-3: uses typed `SwapAuditContext` — no string discrimination.
-fn same_surface_claude_code_audited(
-    base_dir: &Path,
-    source_dir: &Path,
-    target: AccountNum,
-    from_slot: Option<AccountNum>,
-    target_binding: &csq_core::accounts::anthropic_identity::CapturedBinding,
-    native_capture: &handle_dir::NativeSwapCapture,
-) -> Result<()> {
-    match begin_swap_audit(base_dir, from_slot, target)? {
-        Some(ctx) => {
-            // INTENT committed. Run side effect, then emit OUTCOME.
-            let result = same_surface_claude_code(
-                base_dir,
-                source_dir,
-                target,
-                target_binding,
-                native_capture,
-            );
-            finish_swap_audit(base_dir, ctx, &result);
-            result
-        }
-        None => {
-            // Marker absent → audit skipped, swap proceeds (not fail-closed).
-            same_surface_claude_code(base_dir, source_dir, target, target_binding, native_capture)
-        }
-    }
-}
-
-/// S-H-A/D-F1 decision seam: what a same-surface ClaudeCode swap's `Ok(())`
-/// repoint should report, given the [`csq_core::credentials::keychain::ReconcileOutcome`]
-/// that ran right after it — factored out as a PURE function of that
-/// outcome so it is directly unit-testable with a synthetic
-/// `ReconcileOutcome`, no `security` subprocess, no lock, no CLI harness.
-#[derive(Debug, PartialEq, Eq)]
-enum OkRepointDisposition {
-    /// The keychain genuinely agrees with the marker now — print the
-    /// success line naming the account the marker (not necessarily the
-    /// originally-intended target) resolved to.
-    Success { marker_account: AccountNum },
-    /// The repoint itself succeeded, but the keychain did not confirm
-    /// following it — report failure (non-zero exit) with the reconcile
-    /// line as the message, rather than announcing a clean "Swapped".
-    Fail(String),
-}
-
-fn decide_ok_repoint_disposition(
-    reconcile_outcome: &csq_core::credentials::keychain::ReconcileOutcome,
-    reconcile_line: &str,
-) -> OkRepointDisposition {
-    use csq_core::credentials::keychain::ReconcileOutcome;
-    match reconcile_outcome {
-        ReconcileOutcome::AlreadyCurrent { marker_account }
-        | ReconcileOutcome::Reconciled { marker_account } => OkRepointDisposition::Success {
-            marker_account: *marker_account,
-        },
-        ReconcileOutcome::MarkerUnreadable
-        | ReconcileOutcome::WriteFailed { .. }
-        | ReconcileOutcome::KeychainUnknown { .. } => {
-            OkRepointDisposition::Fail(reconcile_line.to_string())
-        }
-    }
-}
-
-fn same_surface_claude_code(
-    base_dir: &Path,
-    source_dir: &Path,
-    target: AccountNum,
-    target_binding: &csq_core::accounts::anthropic_identity::CapturedBinding,
-    native_capture: &handle_dir::NativeSwapCapture,
-) -> Result<()> {
-    // M4-8 (Phase 4 an internal ticket): the only valid same-surface ClaudeCode
-    // swap path is the handle-dir model. `detect_source_handle` already
-    // refuses legacy `config-N` sources with the spec 02 §2.6 message,
-    // so any source reaching this function MUST be a `term-<pid>` dir.
-    // The defensive check below preserves a clear error if the routing
-    // contract is ever broken from above.
-    let dir_name = source_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-
-    if !dir_name.starts_with("term-") {
-        return Err(anyhow!(
-            "source dir is not a csq-managed handle dir: {}. \
-             Relaunch with `csq run {target}` to use per-terminal swap.",
-            redact_path(source_dir)
-        ));
-    }
-
-    let claude_home = super::claude_home()?;
-    handle_dir::repoint_handle_dir_guarded(
-        base_dir,
-        &claude_home,
-        source_dir,
-        target_binding,
-        native_capture,
-    )?;
-    refresh_current_account_cache(base_dir, target);
-    notify_daemon_cache_invalidation(base_dir);
-    // S-H-A/D-F1: the success line is printed by the caller, AFTER
-    // `reconcile_keychain_to_marker` has run — printing it here means a
-    // repoint that succeeds but leaves the keychain desynced (reconcile
-    // outcome anything other than `AlreadyCurrent`/`Reconciled`) is
-    // announced as a clean success before that outcome is even known.
-    Ok(())
-}
-
-/// Refreshes the canonical `config-N/.current-account` cache after a swap
-/// repoints a handle dir to slot N.
-///
-/// `csq swap` repoints the handle dir's symlinks but does NOT touch the
-/// target `config-N`'s `.current-account`, which can hold a stale value (a
-/// pre-handle-dir-migration leftover, or a value left behind by `csq move`).
-/// Without this refresh the next statusline render on any sibling terminal
-/// bound to slot N would surface the stale slot until `snapshot_account`'s
-/// lazy self-heal runs — the exact `csq swap N → wrong slot` bug (workspace
-/// an internal workspace, C2/M4).
-///
-/// Writes the canonical `config-N` file directly (never the handle dir, whose
-/// `.current-account` is a symlink into config-N). Non-fatal: snapshot's
-/// authority-first self-heal is the structural backstop, so a failed write
-/// here only delays the heal by one render.
-fn refresh_current_account_cache(base_dir: &Path, target: AccountNum) {
-    let config_dir = base_dir.join(format!("config-{}", target.get()));
-    if config_dir.is_dir() {
-        if let Err(e) = csq_core::accounts::markers::write_current_account(&config_dir, target) {
-            tracing::debug!(
-                error = %e,
-                slot = target.get(),
-                "swap: failed to refresh config-N/.current-account cache"
-            );
-        }
-    }
-}
-
 // ─── Same-surface Codex (M10 / an internal journal entry) ────────────────────────
 
 /// Same-surface Codex→Codex symlink repoint. Mirrors
-/// `same_surface_claude_code` but uses the Codex-aware
+/// `csq_core::session::swap_session::same_surface_claude_code_swap` but uses
+/// the Codex-aware
 /// [`handle_dir::repoint_handle_dir_codex`] (spec 07 §7.2.2 symlink
 /// set). No exec-replace, no tombstone — the running codex process
 /// keeps its open fds and picks up the new auth.json on the next API
@@ -1683,15 +742,6 @@ fn find_cc_pid_for_refusal() -> Option<u32> {
 /// resolution order `read_codex_account_id` uses, factored out so
 /// `verify_codex_target_ready_for_handoff` (below) can reuse it rather than
 /// duplicating the `resolve_slot_to_uuid` match a second time.
-fn codex_canonical_auth_path(base_dir: &Path, slot: AccountNum) -> PathBuf {
-    match csq_core::accounts::profiles::resolve_slot_to_uuid(base_dir, slot.get()) {
-        Some(uuid) => {
-            csq_core::accounts::identity_store::credentials_codex_path_for(base_dir, uuid)
-        }
-        None => csq_core::credentials::file::canonical_path_for(base_dir, slot, Surface::Codex),
-    }
-}
-
 /// C-F2/S-F3: the same preconditions `super::run::launch_codex` enforces
 /// before a governed Codex spawn — `config-<N>/config.toml` exists, the
 /// canonical credential path is a regular file (never a symlink — same-user
@@ -2478,7 +1528,8 @@ fn handoff_to_supervisor_write_and_signal(
 
 /// Exec-replace swap. Handles true cross-surface swaps
 /// (`RouteKind::CrossSurface`, e.g. Codex→Claude) AND every same-surface
-/// pair whose [`InFlightAdoption`] forces exec-replace: ClaudeCode
+/// pair whose [`InFlightAdoption`](csq_core::session::swap_session::InFlightAdoption)
+/// forces exec-replace: ClaudeCode
 /// env-transport (`RouteKind::ClaudeCodeEnvTransportExecReplace`), Codex
 /// account mismatch (`RouteKind::CodexAccountMismatchExecReplace`), and
 /// Gemini/Kimi/Grok's not-yet-characterised adoption capability
@@ -3678,14 +2729,11 @@ fn exec_native_after_binding(
 
 // ─── Daemon cache invalidation ───────────────────────────────────────
 
-/// Best-effort cache invalidation: notify the daemon (Unix socket or
-/// Windows named pipe) that on-disk account state changed. Routes through
-/// the single cross-platform chokepoint — see `csq_core::daemon::notify`
-/// (an internal ticket).
-fn notify_daemon_cache_invalidation(base_dir: &Path) {
-    csq_core::daemon::notify::cache_invalidation(base_dir);
-}
-
+// Best-effort cache invalidation: notify the daemon (Unix socket or
+// Windows named pipe) that on-disk account state changed. Routes through
+// the single cross-platform chokepoint — see `csq_core::daemon::notify`
+// (an internal ticket). The wrapper itself now lives in `csq_core::session::swap_session`
+// and is imported above; this note stays where the CLI's calls used to be.
 // ─── Tests ──────────────────────────────────────────────────────────
 //
 // HERMETICITY NOTE: any test that calls `refuse_if_inside_live_cc_ancestor`
@@ -3704,6 +2752,13 @@ fn notify_daemon_cache_invalidation(base_dir: &Path) {
 #[allow(dead_code)] // ensure markers/Surface paths compile on all targets
 mod tests {
     use super::*;
+    // Lifted into csq-core with the swap body; the CLI exercises the taxonomy and
+    // the disposition seam directly, so they are imported for the tests only
+    // (a production import would be an unused-import warning).
+    use csq_core::session::swap_session::{
+        decide_ok_repoint_disposition, in_flight_adoption, profiles_busy_operator_line,
+        slot_binding, InFlightAdoption, OkRepointDisposition, SlotBinding,
+    };
 
     /// H1 (R3): a swap into a codex slot refuses while `csq sessions share`
     /// holds the share lock EXCLUSIVE, with NOTHING changed: no source
@@ -4717,8 +3772,9 @@ mod tests {
 
     /// The `SameSurfaceClaudeCode` in-flight repoint route never calls
     /// `refuse_if_inside_live_cc_ancestor` (or `exec_replace_swap` at all —
-    /// `route()` dispatches it straight to `same_surface_claude_code_audited`,
-    /// see the dispatch `match` above). Proven from INSIDE a live `claude`
+    /// `route()` dispatches it straight to the shared core body,
+    /// `csq_core::session::swap_session::same_surface_claude_code_swap`, see
+    /// the dispatch `match` above). Proven from INSIDE a live `claude`
     /// ancestor: the call fails for an entirely unrelated, pre-existing
     /// reason (a source dir that is not a csq-managed handle dir) rather
     /// than the CC-ancestor refusal wording — if the new check had been
@@ -4826,44 +3882,18 @@ mod tests {
         let bogus_source = base.path().join("not-a-handle-dir");
         std::fs::create_dir_all(&bogus_source).unwrap();
         let target = AccountNum::try_from(5u16).unwrap();
-        // A real synthetic witness preserves the original invalid-source oracle.
-        let binding = csq_core::platform::test_env::with_in_memory_secret_backend(|| {
-            use csq_core::accounts::anthropic_identity as ai;
-            let credential: csq_core::credentials::CredentialFile = serde_json::from_value(
-                serde_json::json!({"claudeAiOauth": {"accessToken": "fixture-swap-token",
-                    "refreshToken": "fixture-swap-refresh", "expiresAt": 4102444800000_u64,
-                    "scopes": ["user:profile", "user:inference"]}}),
-            )
-            .unwrap();
-            let profile: csq_core::daemon::usage_poller::HttpGetFn = std::sync::Arc::new(
-                |_, token, _| {
-                    assert_eq!(token, "fixture-swap-token");
-                    Ok((200, br#"{"account":{"uuid":"11111111-1111-4111-8111-111111111111","email":"swap-probe@test.invalid"},"organization":{"uuid":"22222222-2222-4222-8222-222222222222"}}"#.to_vec()))
-                },
-            );
-            ai::commit_anthropic_login_with(
-                base.path(),
-                target,
-                &credential,
-                &profile,
-                None,
-                ai::capture_login_prior(base.path(), target).unwrap(),
-            )
-            .unwrap();
-            ai::capture_anthropic_binding(base.path(), target).unwrap()
-        });
-        let _source_lock =
-            csq_core::platform::lock::lock_file(&bogus_source.join(".swap-lock")).unwrap();
-        let native_capture = handle_dir::capture_native_swap(base.path(), &bogus_source).unwrap();
-        let line = match same_surface_claude_code_audited(
+        // The shared core body refuses an invalid source dir as its FIRST check
+        // (before any binding, keychain or audit work), so the oracle holds
+        // without a credential fixture: a CC-ancestor check wrongly wired into
+        // this route would instead say "exit claude first".
+        let line = match csq_core::session::swap_session::same_surface_claude_code_swap(
             base.path(),
             &bogus_source,
             target,
             None,
-            &binding,
-            &native_capture,
+            &|| Ok(base.path().join("claude-home")),
         ) {
-            Ok(()) => "ok\n".to_string(),
+            Ok(_) => "ok\n".to_string(),
             Err(e) => format!("err:{e}\n"),
         };
         let mut f = std::fs::File::create(&out_path).expect("create result file");

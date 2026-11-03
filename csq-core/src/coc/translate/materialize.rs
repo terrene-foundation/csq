@@ -1092,42 +1092,72 @@ fn emit_kimi_native_inner(
     Ok(())
 }
 
+/// Fixed-vocabulary classification of a restore failure for logging: the
+/// `std::io::ErrorKind` name for I/O errors, otherwise `"other"`. Never
+/// carries the error's message (which can embed paths or payloads).
+fn platform_error_kind(e: &crate::error::PlatformError) -> &'static str {
+    match e {
+        crate::error::PlatformError::Io(io) => match io.kind() {
+            std::io::ErrorKind::NotFound => "not_found",
+            std::io::ErrorKind::PermissionDenied => "permission_denied",
+            std::io::ErrorKind::AlreadyExists => "already_exists",
+            std::io::ErrorKind::StorageFull => "storage_full",
+            _ => "io_other",
+        },
+        _ => "other",
+    }
+}
+
 /// Best-effort removal of every file recorded in `manifest` (RESTORING
 /// any it overwrote from `prior`), used by
 /// [`emit_kimi_native`]/[`emit_grok_native`] on failure. Their `dest` is a
 /// PERSISTENT, credential-bearing vendor home (see their doc comments), so
-/// a failed call MUST leave `dest` in exactly the state it found it —
-/// nothing outside `manifest.files` is touched, and `dest` itself is NEVER
-/// deleted. Errors during cleanup are swallowed (acceptable per
-/// `no-stubs.md`'s cleanup/teardown carve-out): the ORIGINAL
-/// [`MaterializeError`] is what the caller needs to see, and a cleanup
-/// failure here must not mask it or abort the unwind partway through.
+/// a failed call leaves `dest` in exactly the state it found it WHEN every
+/// restore succeeds — nothing outside `manifest.files` is touched, and
+/// `dest` itself is NEVER deleted. If restoring an overwritten prior
+/// artifact fails (an internal ticket), that guarantee does not hold for that file: it
+/// is NEVER deleted, it stays in place holding this call's complete
+/// (atomically published) bytes, and the failure is logged with a fixed
+/// `materialize_restore_failed` tag (stage and error kind only). Other
+/// cleanup errors (removing this call's new files and empty directories)
+/// are swallowed (acceptable per `no-stubs.md`'s cleanup/teardown
+/// carve-out): the ORIGINAL [`MaterializeError`] is what the caller needs
+/// to see, and a cleanup failure here must not mask it or abort the unwind
+/// partway through.
 fn cleanup_partial_write(dest: &Path, manifest: &MaterializedManifest, prior: &PriorContents) {
     for rel in manifest.files.keys() {
         if let Some(bytes) = prior.get(rel) {
             // Round-6 MED: this call OVERWROTE a prior artifact and then
             // failed — restore the prior content atomically so `dest` is
-            // left exactly as found (the contract this function's doc
-            // states), not minus the prior version.
+            // left as found, not minus the prior version. This holds only
+            // when the restore succeeds; on failure the file is kept (see
+            // the an internal ticket note below), holding this call's complete bytes.
             let abs = dest.join(rel);
             // Prior bytes are unrestricted. The private creator owns failure
             // cleanup; do not unlink an unowned create-new collision.
-            let restored = match write_private_tmp_retained(&abs, bytes) {
-                Ok(writer) => writer.replace(&abs).is_ok(),
-                Err(_) => false,
+            let failure = match write_private_tmp_retained(&abs, bytes) {
+                Ok(writer) => writer
+                    .replace(&abs)
+                    .err()
+                    .map(|e| ("replace", platform_error_kind(&e))),
+                Err(e) => Some(("stage", platform_error_kind(&e))),
             };
-            if !restored {
-                let _ = std::fs::remove_file(&abs);
-                // R9 LOW: the restore failed (e.g. ENOSPC, correlated with
-                // the emit's own failure) and the prior artifact is now
-                // GONE — say so, or the operator never learns a previously
-                // working artifact was lost (a csq-owned one regenerates
-                // on the next successful emit, but only if they know to
-                // retry). Fixed-vocabulary tag; no content interpolation.
+            if let Some((stage, kind)) = failure {
+                // an internal ticket: a failed restore (transient foreign handle, ENOSPC
+                // correlated with the emit's own failure) MUST NEVER remove
+                // the artifact. `abs` currently holds either the prior bytes
+                // or this call's complete replacement (`atomic_replace`
+                // publishes whole files, never torn ones); deleting it
+                // turned a transient failure into permanent loss of a
+                // previously working artifact. Leave it in place and make
+                // the failure observable. Fixed-vocabulary fields only: the
+                // stage and the OS error kind, never file contents.
                 tracing::warn!(
                     error_kind = "materialize_restore_failed",
+                    stage,
+                    io_kind = kind,
                     rel_path = rel.as_str(),
-                    "emit cleanup could not restore the prior artifact; it was removed — re-run the emit to regenerate it"
+                    "emit cleanup could not restore the prior artifact; the file was left in place (it may hold this call's content) — re-run the emit to regenerate it"
                 );
             }
             continue;
@@ -1372,7 +1402,9 @@ pub fn check_no_template_dsl(
 type PriorContents = BTreeMap<String, Vec<u8>>;
 
 /// [`write_file`] plus the snapshot the persistent-dest emitters need to
-/// honor their "leave `dest` exactly as found" contract: if a file
+/// honor their "leave `dest` as found" contract (which holds when the
+/// restore succeeds; a failed restore keeps the file, holding this call's
+/// complete bytes — see [`cleanup_partial_write`]): if a file
 /// already exists at `rel` (a PRIOR successful call's artifact), its
 /// content is recorded so [`cleanup_partial_write`] can RESTORE it when
 /// this call fails after overwriting. Without the snapshot the cleanup
@@ -1816,6 +1848,32 @@ mod tests {
             b"new-artifact-bytes"
         );
         assert!(manifest.files.contains_key("artifact.md"));
+    }
+
+    /// an internal ticket: a restore that fails (staging file cannot be created) must
+    /// leave the artifact on disk, never delete it.
+    #[test]
+    fn cleanup_partial_write_restore_failure_never_deletes_artifact() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut manifest = MaterializedManifest::default();
+        manifest
+            .files
+            .insert("artifact.md".into(), MaterializedKind::Agent);
+        let mut prior = PriorContents::new();
+        prior.insert("artifact.md".into(), b"prior-artifact-bytes".to_vec());
+        fs::write(dir.path().join("artifact.md"), b"complete-new-artifact").unwrap();
+        // Every staging candidate lives in a directory that does not exist,
+        // so the restore's create fails deterministically (NotFound).
+        let missing = dir.path().join("no-such-dir");
+        crate::platform::fs::with_private_tmp_candidates_for_test(
+            move |_, attempt| missing.join(format!("stage-{attempt}")),
+            || cleanup_partial_write(dir.path(), &manifest, &prior),
+        );
+        assert_eq!(
+            fs::read(dir.path().join("artifact.md")).ok().as_deref(),
+            Some(b"complete-new-artifact".as_slice()),
+            "a failed restore must leave the existing artifact, not delete it"
+        );
     }
 
     #[test]

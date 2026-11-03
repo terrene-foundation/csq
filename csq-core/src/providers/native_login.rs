@@ -35,6 +35,9 @@ use std::io::{BufRead, Read};
 use std::path::Path;
 use std::process::{Command, ExitStatus};
 
+/// Transferable launch configuration for callers with an owned native spawner.
+pub use crate::platform::launch_plan::LaunchPlan as NativeCliLoginLaunch;
+
 /// A parsed device-code line from a native vendor CLI's login stdout.
 ///
 /// Unlike codex's shape (URL and code as two separate tokens, sometimes on
@@ -370,6 +373,29 @@ where
     F: FnOnce() -> Result<()>,
     R: FnOnce(Command) -> Result<ExitStatus>,
 {
+    login_native_cli_with_launch_seal(
+        base_dir,
+        slot,
+        surface,
+        |plan| run(plan.into_std_command()?),
+        seal,
+    )
+}
+
+/// Typed-plan counterpart of [`login_native_cli_with_seal`]. The runner owns
+/// process creation and must retain actual child custody until completion.
+/// Unlike the compatibility API, no opaque `Command` is constructed first.
+pub fn login_native_cli_with_launch_seal<R, F>(
+    base_dir: &Path,
+    slot: AccountNum,
+    surface: Surface,
+    run: R,
+    seal: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+    R: FnOnce(NativeCliLoginLaunch) -> Result<ExitStatus>,
+{
     let descriptor = native::descriptor(surface)
         .ok_or_else(|| anyhow!("surface {surface} is not a native-CLI surface"))?;
 
@@ -385,7 +411,19 @@ where
     refuse_existing_binding(base_dir, slot, surface)?;
     let home = ensure_vendor_home(base_dir, slot, surface)?;
 
-    let mut cmd = Command::new(&binary_path);
+    let cmd = native_cli_launch_plan(&binary_path, &home, descriptor);
+    // Runner errors include cancellation and watchdog refusal, not just spawn.
+    // Preserve that classification; binary-resolution errors above carry install advice.
+    let status = run(cmd).context("native login subprocess did not complete")?;
+    finish_native_login_with_seal(base_dir, slot, surface, descriptor, &home, status, seal)
+}
+
+fn native_cli_launch_plan(
+    binary_path: &Path,
+    home: &Path,
+    descriptor: &native::NativeCli,
+) -> NativeCliLoginLaunch {
+    let mut cmd = NativeCliLoginLaunch::new(binary_path);
     cmd.args(descriptor.login_args);
     // Strip BOTH native home vars before setting this surface's own, so a
     // parent-shell `KIMI_CODE_HOME`/`GROK_HOME` cannot redirect the vendor to
@@ -393,11 +431,8 @@ where
     // (redteam R1 NIT: keep the invariant uniform across every native spawn).
     cmd.env_remove("KIMI_CODE_HOME");
     cmd.env_remove("GROK_HOME");
-    cmd.env(descriptor.home_env, &home);
-    // Runner errors include cancellation and watchdog refusal, not just spawn.
-    // Preserve that classification; binary-resolution errors above carry install advice.
-    let status = run(cmd).context("native login subprocess did not complete")?;
-    finish_native_login_with_seal(base_dir, slot, surface, descriptor, &home, status, seal)
+    cmd.env(descriptor.home_env, home);
+    cmd
 }
 
 /// True iff the error is a POSIX **mode-bits-only** failure from `fchmod`
@@ -635,6 +670,63 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::process::ExitStatus;
+
+    #[test]
+    fn typed_cli_plan_and_legacy_conversion_preserve_native_slot_policy() {
+        use crate::platform::launch_plan::LaunchStdio;
+        use std::ffi::OsStr;
+
+        for surface in [Surface::Kimi, Surface::Grok] {
+            let descriptor = native::descriptor(surface).unwrap();
+            let home = Path::new("isolated-slot-home");
+            let binary = Path::new("inert-vendor-executable");
+            let plan = native_cli_launch_plan(binary, home, descriptor);
+            assert_eq!(plan.get_program(), binary.as_os_str());
+            assert_eq!(
+                plan.get_args().collect::<Vec<_>>(),
+                descriptor
+                    .login_args
+                    .iter()
+                    .map(OsStr::new)
+                    .collect::<Vec<_>>()
+            );
+            assert!(plan.inherits_env());
+            let snapshot = plan.build_for_spawn().unwrap();
+            assert!(matches!(snapshot.stdin, LaunchStdio::Inherit));
+            assert!(matches!(snapshot.stdout, LaunchStdio::Inherit));
+            assert!(matches!(snapshot.stderr, LaunchStdio::Inherit));
+            assert!(snapshot
+                .env_changes
+                .iter()
+                .any(|(key, value)| { key == "KIMI_CODE_HOME" && value.is_none() }));
+            assert!(snapshot
+                .env_changes
+                .iter()
+                .any(|(key, value)| { key == "GROK_HOME" && value.is_none() }));
+            let legacy = plan.into_std_command().unwrap();
+            let effective = legacy.get_envs().collect::<Vec<_>>();
+            assert!(effective.contains(&(OsStr::new(descriptor.home_env), Some(home.as_os_str()))));
+            let other_home = if surface == Surface::Kimi {
+                "GROK_HOME"
+            } else {
+                "KIMI_CODE_HOME"
+            };
+            assert!(effective.contains(&(OsStr::new(other_home), None)));
+        }
+    }
+
+    #[test]
+    fn typed_cli_facade_rejects_unsupported_surface_before_runner_or_seal() {
+        let base = tempfile::tempdir().unwrap();
+        let result = login_native_cli_with_launch_seal(
+            base.path(),
+            slot(2),
+            Surface::Codex,
+            |_| -> Result<ExitStatus> { panic!("unsupported surface reached runner") },
+            || -> Result<()> { panic!("unsupported surface reached publication seal") },
+        );
+        assert!(result.is_err());
+    }
 
     #[test]
     fn invalid_utf8_refuses_even_after_successful_vendor_exit() {

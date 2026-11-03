@@ -191,7 +191,7 @@ fn r3_low_false_hits() {
         "password: string",
         "key: string",
         "primary_key = id",
-        "sort_key=42",
+        "sort_order=42",
         "TOKEN_URL=https://example.invalid",
         "PWD=/path",
         "Use the key: press enter",
@@ -203,6 +203,9 @@ fn r3_low_false_hits() {
     ] {
         assert_eq!(redact_chat(input), input);
     }
+    // The owner requires credential-bearing *_key names to retain redaction;
+    // readability is preserved by the non-key sort_order control above.
+    assert_eq!(redact_chat("sort_key=42"), "sort_key=[REDACTED]");
 }
 
 #[test]

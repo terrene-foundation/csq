@@ -22,7 +22,7 @@
 //! The socket file is created with `0o600` permissions. To close the
 //! microsecond window between `bind(2)` and `chmod(2)` during which
 //! the socket would otherwise inherit the process umask (typically
-//! 0o644 or 0o755), [`serve`] temporarily sets the thread's umask to
+//! 0o644 or 0o755), `serve` temporarily sets the thread's umask to
 //! `0o077` immediately before bind and restores it immediately after.
 //! The explicit `set_permissions(0o600)` call remains as
 //! defense-in-depth.
@@ -294,7 +294,16 @@ pub fn router(state: RouterState) -> Router {
         .route("/api/audit/record", post(audit_record_handler))
         .route("/api/audit/anchor", post(audit_anchor_handler))
         .route("/api/audit/health", get(audit_health_handler))
-        .route("/api/provenance/anchor", post(provenance_anchor_handler));
+        .route("/api/provenance/anchor", post(provenance_anchor_handler))
+        // Owner bridge (design §3): provenance verification for the message store's
+        // render path, and the single-use owner-approval record the PreToolUse gate
+        // consumes. Same socket + same-UID check as every sibling route; no new
+        // listener, never TCP (`security.md` MUST-7, MUST NOT 3).
+        .route(BRIDGE_VERIFY_ORIGIN_ROUTE, post(bridge_verify_origin_handler))
+        .route(
+            BRIDGE_VERIFY_AND_CONSUME_ROUTE,
+            post(bridge_verify_and_consume_handler),
+        );
 
     // an internal ticket/an internal ticket — interactive per-turn enforcement routes (enterprise-only,
     // spec 21 §21.7). Registered in the enterprise build; the seeded registry is
@@ -342,6 +351,443 @@ pub fn router(state: RouterState) -> Router {
 
     app.with_state(state)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+}
+
+// ── Owner bridge IPC (design §3 provenance) ──────────────────────────────
+//
+// One route, on the existing per-user Unix socket and therefore behind the accept-time
+// SO_PEERCRED / LOCAL_PEERCRED same-UID check that already guards every other route
+// (`rules/security.md` MUST-7). This adds NO listener and NO TCP route
+// (`rules/security.md` MUST NOT 3).
+//
+// The handler never formats the origin key, a request body or a stored body into a log
+// or an error: every answer is the fixed `{"valid":…}` shape (`security.md` §2).
+// (Outbound pings — `POST /api/bridge/notify` — are a separate, re-queued shard.)
+
+/// Re-verifies an owner attestation for one stored body (design §3).
+pub const BRIDGE_VERIFY_ORIGIN_ROUTE: &str = "/api/bridge/verify-origin";
+
+/// Body of `POST /api/bridge/verify-origin`.
+///
+/// The store sends the stored record's attested fields. The MAC binds `update_id`, the
+/// target `(to_pid, to_started_at)` and `SHA256(body)` (see
+/// `bridge::attestation::OwnerAttestation`); `tg_message_id` is carried for diagnostics
+/// and is not covered by the MAC, so nothing here is trusted on its own.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BridgeVerifyOriginRequest {
+    /// Telegram update the owner message arrived in.
+    pub update_id: u64,
+    /// Telegram's id of the owner's message.
+    pub tg_message_id: i64,
+    /// Target session pid the attestation was minted for.
+    pub to_pid: u32,
+    /// Target session start time the attestation was minted for.
+    pub to_started_at: u64,
+    /// Lowercase-hex HMAC.
+    pub mac: String,
+    /// The stored body whose SHA-256 the MAC covers.
+    pub body: String,
+}
+
+/// Answer of `POST /api/bridge/verify-origin`.
+#[derive(Debug, Clone, Serialize)]
+pub struct BridgeVerifyOriginResponse {
+    /// The attestation matched for this body and target.
+    pub valid: bool,
+}
+
+/// How long a failed origin-key load is remembered before the vault is asked again.
+///
+/// Long enough that a burst of verify calls cannot turn into a keychain prompt storm on
+/// macOS, short enough that a pairing completed while the daemon is running starts
+/// verifying without a restart.
+const ORIGIN_KEY_RETRY_SECS: u64 = 30;
+
+/// The origin key, loaded at most once per process after the first success.
+///
+/// A successful load is cached for the daemon's lifetime: the vault read is a keychain
+/// call on macOS, and a per-render keychain round trip would blow the store's 2 s verify
+/// bound. A FAILED load is remembered for [`ORIGIN_KEY_RETRY_SECS`] only, so the route
+/// fails closed without hammering the vault; rotating a loaded key needs a daemon restart.
+fn origin_key_cached() -> Option<[u8; crate::bridge::secrets::ORIGIN_KEY_BYTES]> {
+    use crate::bridge::secrets::ORIGIN_KEY_BYTES as KEY_BYTES;
+    struct Cache {
+        key: Option<[u8; KEY_BYTES]>,
+        retry_at: Option<std::time::Instant>,
+    }
+    static ORIGIN_KEY: std::sync::OnceLock<std::sync::Mutex<Cache>> = std::sync::OnceLock::new();
+    let cache = ORIGIN_KEY.get_or_init(|| {
+        std::sync::Mutex::new(Cache {
+            key: None,
+            retry_at: None,
+        })
+    });
+    let mut cache = cache.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(key) = cache.key {
+        return Some(key);
+    }
+    if cache
+        .retry_at
+        .is_some_and(|at| std::time::Instant::now() < at)
+    {
+        return None;
+    }
+    match crate::bridge::secrets::load_origin_key() {
+        Ok(key) => {
+            cache.key = Some(key);
+            cache.retry_at = None;
+            Some(key)
+        }
+        Err(_) => {
+            cache.retry_at = Some(
+                std::time::Instant::now() + std::time::Duration::from_secs(ORIGIN_KEY_RETRY_SECS),
+            );
+            None
+        }
+    }
+}
+
+/// Verifies a stored attestation against the update and target it claims.
+///
+/// Split from the handler so the decision is testable without a vault: `key` is the
+/// caller-supplied origin key, and a `None` key (unconfigured / unreadable) is
+/// fail-closed. A stored MAC that is not the canonical 64-lowercase-hex form is refused
+/// without a key comparison.
+fn verify_origin_with_key(
+    req: &BridgeVerifyOriginRequest,
+    key: Option<&[u8; crate::bridge::secrets::ORIGIN_KEY_BYTES]>,
+) -> bool {
+    use crate::bridge::attestation::OwnerAttestation;
+    use crate::bridge::validator::ValidatedUpdate;
+    let Some(key) = key else {
+        return false;
+    };
+    let Some(attestation) = OwnerAttestation::from_stored_mac(&req.mac) else {
+        return false;
+    };
+    // The MAC does not cover `date`; the validator only uses it for freshness, and the
+    // record's own `created_at` was written by the daemon at ingest.
+    let update = ValidatedUpdate {
+        update_id: req.update_id,
+        text: req.body.clone(),
+        date: 0,
+    };
+    attestation.verify(&update, req.to_pid, req.to_started_at, key)
+}
+
+async fn bridge_verify_origin_handler(
+    Json(req): Json<BridgeVerifyOriginRequest>,
+) -> Json<BridgeVerifyOriginResponse> {
+    // Bound the work a hostile same-UID caller can ask for before any crypto: the store
+    // caps a body at 4000 chars and a MAC at 128.
+    if req.body.len() > 4 * crate::messaging::limits::MAX_BODY_CHARS
+        || req.mac.len() > crate::messaging::limits::MAX_HASH_CHARS
+    {
+        return Json(BridgeVerifyOriginResponse { valid: false });
+    }
+    let valid = tokio::task::spawn_blocking(move || {
+        let key = origin_key_cached();
+        verify_origin_with_key(&req, key.as_ref())
+    })
+    .await
+    .unwrap_or(false);
+    Json(BridgeVerifyOriginResponse { valid })
+}
+
+// ── Owner approval records (design §3, owner amendment 2026-11-01) ────────
+//
+// An approval is a SINGLE-USE, 120 s, main-thread-bound grant that the daemon minted when
+// a validated OwnerTelegram update replied to the specific Telegram message that carried
+// an approval request. The gate asks for it here, on the same per-user Unix socket and
+// behind the same peer-UID check (`security.md` MUST-7; never TCP — MUST NOT 3).
+//
+// The authority is the PEER CREDENTIAL, never a request field: the connecting process's
+// pid must equal the record's pid, so a subagent or any other process fails closed.
+
+/// Consumes one owner approval record (design §3).
+pub const BRIDGE_VERIFY_AND_CONSUME_ROUTE: &str = "/api/bridge/verify-and-consume";
+
+/// Lifetime of an approval record, in seconds.
+pub const APPROVAL_TTL_SECS: u64 = 120;
+
+/// How long an expired record is remembered so `expired` can be reported distinctly
+/// instead of collapsing into `no_record`.
+const APPROVAL_TOMBSTONE_SECS: u64 = 2 * APPROVAL_TTL_SECS;
+
+/// One approval the owner granted by replying to a specific Telegram message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApprovalGrant {
+    /// The session the approval is addressed to.
+    pub pid: u32,
+    /// That session's start time (unix seconds).
+    pub started_at: u64,
+    /// The CLI session id the request named.
+    pub session_id: String,
+    /// Telegram's id of the message that carried the approval request.
+    pub msg_id: i64,
+    /// Digest of the exact action the owner approved.
+    pub action_digest: String,
+}
+
+/// Body of `POST /api/bridge/verify-and-consume`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BridgeApprovalRequest {
+    /// Claimed session pid; the peer credential must agree.
+    pub pid: u32,
+    /// Claimed session start time.
+    pub started_at: u64,
+    /// The CLI session id the gate is acting for.
+    pub session_id: String,
+    /// Digest of the action being approved.
+    pub action_digest: String,
+}
+
+/// Answer of `POST /api/bridge/verify-and-consume`.
+///
+/// `status` is `granted` or `refused`; a refusal always carries one of the fixed reason
+/// tags. Never a caller-supplied string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BridgeApprovalResponse {
+    /// `granted` or `refused`.
+    pub status: &'static str,
+    /// Fixed refusal tag, when refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+}
+
+impl BridgeApprovalResponse {
+    fn granted() -> Self {
+        Self {
+            status: "granted",
+            reason: None,
+        }
+    }
+
+    fn refused(reason: &'static str) -> Self {
+        Self {
+            status: "refused",
+            reason: Some(reason),
+        }
+    }
+}
+
+/// The fixed refusal vocabulary shared with the gate.
+pub const APPROVAL_REASONS: [&str; 9] = [
+    "no_record",
+    "expired",
+    "already_consumed",
+    "session_mismatch",
+    "digest_mismatch",
+    "not_main_thread",
+    "not_csq_launched",
+    "bridge_disabled",
+    "daemon_unreachable",
+];
+
+/// An approval record: the grant plus its lifecycle stamps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApprovalRecord {
+    grant: ApprovalGrant,
+    minted_at: u64,
+    consumed: bool,
+}
+
+/// In-memory approval records, keyed by `(pid, started_at, session_id)`.
+///
+/// In-memory on purpose: the record is minted by the same daemon process that consumes
+/// it (the ingest and this route share it), it carries no secret, and a daemon restart
+/// must lose every outstanding approval rather than persist an authorisation.
+#[derive(Debug, Default)]
+pub(crate) struct ApprovalStore {
+    records: std::collections::HashMap<(u32, u64, String), Vec<ApprovalRecord>>,
+}
+
+impl ApprovalStore {
+    /// Records one owner approval. Called by the daemon ingest when a validated owner
+    /// reply matches a pending approval request.
+    ///
+    /// `#[allow(dead_code)]`: the caller is the ingest's approval-reply path, which lands
+    /// with the outbound approval-request half (S5, re-queued behind S7). Remove the
+    /// allow when that caller lands; the route that consumes these records is live and
+    /// refuses `no_record` until then.
+    #[allow(dead_code)]
+    pub(crate) fn mint(&mut self, grant: ApprovalGrant, now: u64) {
+        self.prune(now);
+        let key = (grant.pid, grant.started_at, grant.session_id.clone());
+        self.records.entry(key).or_default().push(ApprovalRecord {
+            grant,
+            minted_at: now,
+            consumed: false,
+        });
+    }
+
+    fn prune(&mut self, now: u64) {
+        self.records.retain(|_, rows| {
+            rows.retain(|r| now.saturating_sub(r.minted_at) < APPROVAL_TOMBSTONE_SECS);
+            !rows.is_empty()
+        });
+    }
+
+    /// Consumes the approval for this exact action, if one is outstanding.
+    ///
+    /// Single use: the matching record is marked consumed under the same lock that
+    /// admitted it, so two concurrent callers cannot both be granted.
+    fn consume(
+        &mut self,
+        pid: u32,
+        started_at: u64,
+        session_id: &str,
+        action_digest: &str,
+        now: u64,
+    ) -> BridgeApprovalResponse {
+        self.prune(now);
+        let mut any_for_session_pair = false;
+        let mut any_for_session = false;
+        for ((r_pid, r_started, r_session), rows) in self.records.iter_mut() {
+            if *r_pid != pid || *r_started != started_at {
+                continue;
+            }
+            any_for_session_pair = true;
+            if r_session != session_id {
+                continue;
+            }
+            any_for_session = true;
+            if let Some(record) = rows
+                .iter_mut()
+                .find(|r| r.grant.action_digest == action_digest)
+            {
+                if record.consumed {
+                    return BridgeApprovalResponse::refused("already_consumed");
+                }
+                if now.saturating_sub(record.minted_at) >= APPROVAL_TTL_SECS {
+                    return BridgeApprovalResponse::refused("expired");
+                }
+                record.consumed = true;
+                return BridgeApprovalResponse::granted();
+            }
+        }
+        if any_for_session {
+            BridgeApprovalResponse::refused("digest_mismatch")
+        } else if any_for_session_pair {
+            BridgeApprovalResponse::refused("session_mismatch")
+        } else {
+            BridgeApprovalResponse::refused("no_record")
+        }
+    }
+}
+
+/// The daemon's process-wide approval store.
+static APPROVALS: std::sync::OnceLock<std::sync::Mutex<ApprovalStore>> = std::sync::OnceLock::new();
+
+fn approvals() -> &'static std::sync::Mutex<ApprovalStore> {
+    APPROVALS.get_or_init(|| std::sync::Mutex::new(ApprovalStore::default()))
+}
+
+// The peer pid of the current connection, captured by the accept loop.
+//
+// Set once per accepted Unix connection from the kernel's peer credential
+// (`SO_PEERCRED` / `LOCAL_PEERPID`), never from a request field.
+#[cfg(unix)]
+tokio::task_local! {
+    static PEER_PID: Option<u32>;
+}
+
+/// What the approval route can verify about the caller without touching the vault or the
+/// process table (injected so the decision is unit-testable).
+pub(crate) struct ApprovalDeps<'a> {
+    /// Whether `(pid, started_at)` is a session csq launched (its handle dir lives under
+    /// the accounts base).
+    pub launched_by_csq: &'a dyn Fn(u32, u64) -> bool,
+    /// Whether the bridge is configured, enabled and pinned.
+    pub bridge_enabled: &'a dyn Fn() -> bool,
+}
+
+/// The approval decision. Refuses before touching the store when the caller cannot be
+/// proven to be the addressed session's own process.
+fn verify_and_consume_with(
+    store: &std::sync::Mutex<ApprovalStore>,
+    deps: &ApprovalDeps<'_>,
+    peer_pid: Option<u32>,
+    now: u64,
+    req: &BridgeApprovalRequest,
+) -> BridgeApprovalResponse {
+    // The peer credential is the authority: a caller-supplied pid never is.
+    match peer_pid {
+        Some(peer) if peer == req.pid => {}
+        _ => return BridgeApprovalResponse::refused("not_main_thread"),
+    }
+    if !(deps.bridge_enabled)() {
+        return BridgeApprovalResponse::refused("bridge_disabled");
+    }
+    if !(deps.launched_by_csq)(req.pid, req.started_at) {
+        return BridgeApprovalResponse::refused("not_csq_launched");
+    }
+    let mut store = store.lock().unwrap_or_else(|poison| poison.into_inner());
+    store.consume(
+        req.pid,
+        req.started_at,
+        &req.session_id,
+        &req.action_digest,
+        now,
+    )
+}
+
+/// Production dependencies for the approval route.
+fn production_approval_deps(base_dir: &Path) -> impl Fn() -> bool + '_ {
+    move || {
+        let Ok(Some(config)) = crate::bridge::config::load(base_dir) else {
+            return false;
+        };
+        config.enabled && config.is_pinned()
+    }
+}
+
+/// Whether `(pid, started_at)` is a live session whose handle dir lives under the csq
+/// accounts base — the structural meaning of "launched by csq".
+fn session_launched_by_csq(base_dir: &Path, pid: u32, started_at: u64) -> bool {
+    let Some(home) = crate::platform::home::home_dir() else {
+        return false;
+    };
+    let Some(rows) = crate::sessions::list_rows(base_dir, &home) else {
+        return false;
+    };
+    rows.iter().any(|row| {
+        row.pid == pid
+            && crate::sessions::same_start(row.started_at, started_at)
+            && row.handle_dir.starts_with(base_dir)
+    })
+}
+
+async fn bridge_verify_and_consume_handler(
+    State(state): State<RouterState>,
+    Json(req): Json<BridgeApprovalRequest>,
+) -> Json<BridgeApprovalResponse> {
+    #[cfg(unix)]
+    let peer_pid = PEER_PID.try_with(|pid| *pid).ok().flatten();
+    // No Unix peer credential on this platform: every approval refuses not_main_thread.
+    #[cfg(not(unix))]
+    let peer_pid: Option<u32> = None;
+    let base_dir = Arc::clone(&state.base_dir);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let answer = tokio::task::spawn_blocking(move || {
+        let bridge_enabled = production_approval_deps(&base_dir);
+        let base = base_dir.as_path();
+        let launched = |pid: u32, started_at: u64| session_launched_by_csq(base, pid, started_at);
+        let deps = ApprovalDeps {
+            launched_by_csq: &launched,
+            bridge_enabled: &bridge_enabled,
+        };
+        verify_and_consume_with(approvals(), &deps, peer_pid, now, &req)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        // A join failure is the daemon failing to answer, never a grant.
+        BridgeApprovalResponse::refused("daemon_unreachable")
+    });
+    Json(answer)
 }
 
 async fn health_handler() -> Json<HealthResponse> {
@@ -3782,6 +4228,9 @@ async fn accept_loop(
                             drop(stream);
                             continue;
                         }
+                        // The kernel's peer credential is the ONLY source of the caller's
+                        // pid (the approval route refuses `not_main_thread` without it).
+                        let peer_pid = peer_process_id(&stream);
 
                         let app = Arc::clone(&app);
                         tokio::spawn(async move {
@@ -3793,10 +4242,10 @@ async fn accept_loop(
                                     router.oneshot(req).await
                                 }
                             });
-                            if let Err(e) = auto::Builder::new(TokioExecutor::new())
-                                .serve_connection(io, service)
-                                .await
-                            {
+                            // Bind the builder first: `serve_connection` borrows it.
+                            let builder = auto::Builder::new(TokioExecutor::new());
+                            let served = builder.serve_connection(io, service);
+                            if let Err(e) = PEER_PID.scope(peer_pid, served).await {
                                 tracing::debug!(error = %e, "connection service error");
                             }
                         });
@@ -3857,6 +4306,59 @@ fn verify_peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The connecting process's pid, from the kernel's peer credential.
+///
+/// Only the kernel can answer this: it is what makes the approval route's main-thread
+/// binding structural rather than a caller-supplied claim. `None` (unreadable, or an
+/// unsupported Unix) makes every approval refuse `not_main_thread`.
+#[cfg(all(unix, target_os = "linux"))]
+fn peer_process_id(stream: &tokio::net::UnixStream) -> Option<u32> {
+    let fd = stream.as_raw_fd();
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: fd is a valid Unix-domain socket fd; cred is a valid stack allocation of
+    // the right type; len matches its size.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return None;
+    }
+    u32::try_from(cred.pid).ok().filter(|pid| *pid != 0)
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+fn peer_process_id(stream: &tokio::net::UnixStream) -> Option<u32> {
+    let fd = stream.as_raw_fd();
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of_val(&pid) as libc::socklen_t;
+    // SAFETY: fd is a connected Unix socket; pid and len are valid output slots.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            &mut pid as *mut libc::pid_t as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (ret == 0 && len as usize == std::mem::size_of_val(&pid))
+        .then(|| u32::try_from(pid).ok())
+        .flatten()
+        .filter(|pid| *pid != 0)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn peer_process_id(_stream: &tokio::net::UnixStream) -> Option<u32> {
+    None
 }
 
 #[cfg(all(unix, target_os = "macos"))]
@@ -7216,6 +7718,237 @@ mod tests {
 
         handle.shutdown();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    // ── owner approval records (design §3 amendment) ─────────────────────
+
+    /// The record is single-use, expiring, and bound to BOTH the session id and the
+    /// action digest. Every refusal names one of the fixed tags.
+    #[test]
+    fn the_approval_record_is_single_use_and_bound_to_session_and_digest() {
+        let store = std::sync::Mutex::new(ApprovalStore::default());
+        let me = std::process::id();
+        let launched = |pid: u32, _: u64| pid == me;
+        let enabled = || true;
+        let deps = ApprovalDeps {
+            launched_by_csq: &launched,
+            bridge_enabled: &enabled,
+        };
+        let req = |pid: u32, session: &str, digest: &str| BridgeApprovalRequest {
+            pid,
+            started_at: 9,
+            session_id: session.to_string(),
+            action_digest: digest.to_string(),
+        };
+        store.lock().unwrap().mint(
+            ApprovalGrant {
+                pid: me,
+                started_at: 9,
+                session_id: "sess".into(),
+                msg_id: 5,
+                action_digest: "d1".into(),
+            },
+            1_000,
+        );
+
+        // The peer credential, not the request field, decides.
+        for peer in [None, Some(me.wrapping_add(1))] {
+            let out = verify_and_consume_with(&store, &deps, peer, 1_001, &req(me, "sess", "d1"));
+            assert_eq!(out.status, "refused");
+            assert_eq!(out.reason, Some("not_main_thread"), "peer {peer:?}");
+        }
+        // Wrong session, then wrong digest, then the one grant.
+        assert_eq!(
+            verify_and_consume_with(&store, &deps, Some(me), 1_001, &req(me, "other", "d1")).reason,
+            Some("session_mismatch")
+        );
+        assert_eq!(
+            verify_and_consume_with(&store, &deps, Some(me), 1_001, &req(me, "sess", "d2")).reason,
+            Some("digest_mismatch")
+        );
+        let granted =
+            verify_and_consume_with(&store, &deps, Some(me), 1_001, &req(me, "sess", "d1"));
+        assert_eq!(granted, BridgeApprovalResponse::granted());
+        let again = verify_and_consume_with(&store, &deps, Some(me), 1_002, &req(me, "sess", "d1"));
+        assert_eq!(again.reason, Some("already_consumed"));
+
+        // A stale record expires rather than granting.
+        store.lock().unwrap().mint(
+            ApprovalGrant {
+                pid: me,
+                started_at: 9,
+                session_id: "sess2".into(),
+                msg_id: 6,
+                action_digest: "d3".into(),
+            },
+            2_000,
+        );
+        let expired = verify_and_consume_with(
+            &store,
+            &deps,
+            Some(me),
+            2_000 + APPROVAL_TTL_SECS,
+            &req(me, "sess2", "d3"),
+        );
+        assert_eq!(expired.reason, Some("expired"));
+
+        // The two environment refusals.
+        let off = || false;
+        let deps_off = ApprovalDeps {
+            launched_by_csq: &launched,
+            bridge_enabled: &off,
+        };
+        assert_eq!(
+            verify_and_consume_with(&store, &deps_off, Some(me), 3_000, &req(me, "sess", "d1"))
+                .reason,
+            Some("bridge_disabled")
+        );
+        let not_launched = |_: u32, _: u64| false;
+        let deps_nl = ApprovalDeps {
+            launched_by_csq: &not_launched,
+            bridge_enabled: &enabled,
+        };
+        assert_eq!(
+            verify_and_consume_with(&store, &deps_nl, Some(me), 3_000, &req(me, "sess", "d1"))
+                .reason,
+            Some("not_csq_launched")
+        );
+
+        // Every reason this route can produce is in the published vocabulary.
+        for reason in [
+            "not_main_thread",
+            "session_mismatch",
+            "digest_mismatch",
+            "already_consumed",
+            "expired",
+            "bridge_disabled",
+            "not_csq_launched",
+            "no_record",
+        ] {
+            assert!(APPROVAL_REASONS.contains(&reason), "{reason}");
+        }
+        let missing =
+            verify_and_consume_with(&store, &deps, Some(me), 3_000, &req(me, "none", "d"));
+        assert_eq!(missing.reason, Some("no_record"));
+    }
+
+    /// The peer pid used by the approval route comes from the kernel credential, not from
+    /// anything the caller wrote. Same process on both ends of the socket here, so the
+    /// kernel reports this test process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_approval_peer_pid_comes_from_the_kernel_credential() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock = dir.path().join("peer.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let connect = tokio::net::UnixStream::connect(&sock);
+        let (accepted, connected) = tokio::join!(listener.accept(), connect);
+        // Keep the CLIENT end alive until after the assertion. macOS's
+        // `LOCAL_PEERPID` fails with ENOTCONN once the peer has closed, while
+        // Linux's `SO_PEERCRED` captured the credentials at connect time — so
+        // dropping `connected` on the next line made this test pass on Linux
+        // and fail on darwin with `left: None`. The product accept loop keeps
+        // the client connected while it serves the request; only this test was
+        // discarding the peer early. Measured on a real Mac: with the peer
+        // alive `ret=0 errno=0 len=4 pid=<self>`; after it closes
+        // `ret=-1 errno=57 len=4 pid=0`.
+        let _connected = connected.unwrap();
+        let (stream, _) = accepted.unwrap();
+        assert_eq!(peer_process_id(&stream), Some(std::process::id()));
+    }
+
+    /// End to end over the real router: reaching `bridge_disabled` (rather than
+    /// `not_main_thread`) proves the accept loop delivered the kernel peer pid to the
+    /// handler; after configuring the bridge, the same call advances to the launch check.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_approval_route_is_gated_after_the_peer_credential_check() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+        let body = format!(
+            r#"{{"pid":{},"started_at":9,"session_id":"s","action_digest":"d"}}"#,
+            std::process::id()
+        );
+
+        // Unconfigured bridge -> bridge_disabled, which is only reachable once the peer
+        // pid matched.
+        let (status, resp) = http_post_json(&sock, BRIDGE_VERIFY_AND_CONSUME_ROUTE, &body).await;
+        assert!(status.contains("200"), "{status}");
+        assert!(
+            resp.contains(r#""reason":"bridge_disabled""#),
+            "peer pid did not reach the handler: {resp}"
+        );
+
+        // Configured + pinned -> the launch check is next.
+        crate::bridge::config::save(
+            &crate::bridge::config::BridgeConfig {
+                enabled: true,
+                owner_user_id: 42,
+                owner_chat_id: 42,
+                allow_classes: vec![crate::bridge::config::SWAP_CLASS.to_string()],
+            },
+            dir.path(),
+        )
+        .unwrap();
+        let (status, resp) = http_post_json(&sock, BRIDGE_VERIFY_AND_CONSUME_ROUTE, &body).await;
+        assert!(status.contains("200"), "{status}");
+        assert!(
+            resp.contains(r#""reason":"not_csq_launched""#),
+            "expected the launch check after the config gate: {resp}"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+    }
+
+    /// The route's decision half: an attestation verifies only for the exact body, target
+    /// and key it was minted for. The key comes from the vault in production; here it is a
+    /// literal so the test is hermetic. Falsifier: a `verify_origin_with_key` that ignored
+    /// the body or the target would return true for the tampered cases below.
+    #[test]
+    fn verify_origin_matches_only_the_exact_body_target_and_key() {
+        use crate::bridge::attestation::OwnerAttestation;
+        use crate::bridge::validator::ValidatedUpdate;
+        const KEY: [u8; 32] = [0x5a; 32];
+        let update = ValidatedUpdate {
+            update_id: 77,
+            text: "owner says hi".to_string(),
+            date: 0,
+        };
+        let attestation = OwnerAttestation::mint(&update, 12, 34, &KEY);
+        let req = BridgeVerifyOriginRequest {
+            update_id: 77,
+            tg_message_id: 11,
+            to_pid: 12,
+            to_started_at: 34,
+            mac: attestation.mac_hex().to_string(),
+            body: "owner says hi".to_string(),
+        };
+        assert!(verify_origin_with_key(&req, Some(&KEY)));
+        // Tampered body.
+        let mut tampered = req.clone();
+        tampered.body = "owner says hi!".to_string();
+        assert!(!verify_origin_with_key(&tampered, Some(&KEY)));
+        // Redirected target.
+        let mut redirected = req.clone();
+        redirected.to_pid = 13;
+        assert!(!verify_origin_with_key(&redirected, Some(&KEY)));
+        let mut redirected = req.clone();
+        redirected.to_started_at = 35;
+        assert!(!verify_origin_with_key(&redirected, Some(&KEY)));
+        // Replayed under another update id.
+        let mut replayed = req.clone();
+        replayed.update_id = 78;
+        assert!(!verify_origin_with_key(&replayed, Some(&KEY)));
+        // Wrong key, and no key at all (bridge not configured / vault unreadable).
+        assert!(!verify_origin_with_key(&req, Some(&[0x5b; 32])));
+        assert!(!verify_origin_with_key(&req, None));
+        // A MAC that is not hex is refused rather than compared as text.
+        let mut junk = req.clone();
+        junk.mac = "not-a-mac".to_string();
+        assert!(!verify_origin_with_key(&junk, Some(&KEY)));
     }
 }
 

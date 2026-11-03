@@ -9,7 +9,7 @@ edition.workspace = true
 # the community extraction exclusions — it ships to the community
 # fork verbatim. This preserves the public SDK dependency boundary.
 license.workspace = true
-description = "csq token redaction — redact_tokens + the RedactedString newtype. Zero csq-core deps; serde-only. Shared by both editions and the public csq-sdk."
+description = "csq token redaction — redact_tokens + the RedactedString newtype. Zero csq-core deps; serde + bounded Unicode normalization. Shared by both editions and the public csq-sdk."
 repository.workspace = true
 # Publishable (W3): csq-redact is the crates.io redaction leaf that the public
 # csq-sdk depends on, so it must be published FIRST (dependency order) for csq-sdk
@@ -17,9 +17,10 @@ repository.workspace = true
 # appears in THIRD-PARTY-LICENSES.md: cargo-about keys first-party exclusion
 # (`[private] ignore`) on `publish = false`, so a publishable crate is attributed —
 # the correct redistribution attribution for a standalone crates.io crate
-# (over-inclusive attribution is safe — see about.toml). serde is its only dep.
+# (over-inclusive attribution is safe — see about.toml). Dependencies stay
+# independent of csq-core.
 
 [dependencies]
-# serde only — RedactedString is a wire type (Serialize/Deserialize that
-# re-redacts on the way in). redact_tokens itself is pure std.
+# RedactedString is a wire type; normalization applies only to bounded markers.
 serde.workspace = true
+unicode-normalization.workspace = true

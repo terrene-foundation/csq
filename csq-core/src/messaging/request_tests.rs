@@ -845,6 +845,7 @@ fn seed_authority(
         id: id.clone(),
         from: from.sender().clone(),
         to: who(2).as_recipient(),
+        origin: crate::messaging::model::Origin::Peer,
         in_reply_to: None,
         thread: id.clone(),
         body: "one".into(),

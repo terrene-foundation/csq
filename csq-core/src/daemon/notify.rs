@@ -71,7 +71,7 @@ pub fn slot_swap(base_dir: &Path, from: u16, to: u16) {
 /// failed login would be strictly worse. When no daemon wakes, the poller
 /// picks the new binding up at its next periodic tick, exactly as before.
 ///
-/// Unix arm delegates to [`super::client::notify_slot_rebind`] (same
+/// Unix arm delegates to `super::client::notify_slot_rebind` (same
 /// transport + error mapping as the `slot_swap` client fn it mirrors);
 /// the Windows arm reuses `windows_post`, so the an internal ticket cross-platform
 /// gap cannot reopen here. Both arms log `daemon_slot_rebind_notify_failed`

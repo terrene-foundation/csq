@@ -1125,6 +1125,18 @@ pub enum EventKind {
     /// a fixed-vocabulary reason tag — never free-text prose, never raw seed
     /// material.
     SeatKeyReanchor,
+    /// S3 Telegram bridge — one inbound owner message, command or swap,
+    /// emitted by `daemon::telegram_bridge` as an INTENT before the side effect
+    /// (store write, swap, kill-switch write, or a refusal that ends the
+    /// update) and an OUTCOME after it, correlated by `RecordId`. A `command`
+    /// record addresses no session, so its target identity is
+    /// `0` / `0` / `none`.
+    ///
+    /// Fields are metadata only: the Telegram update id, a fixed kind tag, the
+    /// target process identity, the body's byte length and a fixed outcome tag.
+    /// The message body, the bot token and any body hash are NEVER recorded
+    /// (HIGH-1: no untrusted free-text into the chain).
+    TelegramBridgeDelivery,
 }
 }
 
@@ -1188,6 +1200,8 @@ pub enum EventPayload {
     OrgRootCeremony(OrgRootCeremonyPayload),
     /// See [`EventKind::SeatKeyReanchor`].
     SeatKeyReanchor(SeatKeyReanchorPayload),
+    /// See [`EventKind::TelegramBridgeDelivery`].
+    TelegramBridgeDelivery(TelegramBridgeDeliveryPayload),
 }
 
 impl EventPayload {
@@ -1223,6 +1237,7 @@ impl EventPayload {
             Self::PolicyBundleInstall(_) => EventKind::PolicyBundleInstall,
             Self::OrgRootCeremony(_) => EventKind::OrgRootCeremony,
             Self::SeatKeyReanchor(_) => EventKind::SeatKeyReanchor,
+            Self::TelegramBridgeDelivery(_) => EventKind::TelegramBridgeDelivery,
         }
     }
 }
@@ -1991,6 +2006,49 @@ pub struct SeatKeyReanchorPayload {
     pub rotation_reason: RotationReason,
 }
 
+/// Payload for [`EventKind::TelegramBridgeDelivery`] (S3 bridge ingest).
+///
+/// Metadata only — the delivered text, the bot token and any hash of the body
+/// are deliberately absent (HIGH-1). Every string field is a fixed-vocabulary
+/// tag chosen by `daemon::telegram_bridge`, never message content:
+///
+/// - `kind` — one of `message`, `command`, `swap`; the closed set grows only
+///   with a reviewed inbound kind, never with owner-supplied text.
+/// - `target_surface` — `claude-code` or `codex` for a routed message or swap;
+///   `none` on a `command` record, which addresses no session.
+/// - `target_pid` / `target_started_at` — the routed session identity for a
+///   message or swap; `0` / `0` on a `command` record.
+/// - `outcome` — a fixed-vocabulary tag. Two members are DERIVED, so this doc
+///   names their origin rather than copying their variants (copying would go
+///   stale as the enums grow):
+///   - literal tags: `intent`, `off`, `refused_ledger`,
+///     `refused_attestation_key`, `refused_store`, `refused_store_permanent`,
+///     `refused_state_unreadable`, `stored_not_acted`, `swapped`,
+///     `swapped_replay`, `swapped_not_recorded`, `not_under_relay`;
+///   - `delivery_outcome_tag(delivery)` — one tag per `Delivery` variant
+///     (`claude_woken`, `queued_only`, …);
+///   - `SwapError::code()` — the named swap refusal (`class_not_allowed`,
+///     `swap_target_dead`, `target_slot_login_needed`, …).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TelegramBridgeDeliveryPayload {
+    /// Telegram's monotone update id (the replay key).
+    pub update_id: u64,
+    /// Fixed-vocabulary inbound kind tag: `message` / `command` / `swap`.
+    pub kind: String,
+    /// Target process id for a message or swap; `0` on a command record.
+    pub target_pid: u32,
+    /// Target process start, unix seconds; `0` on a command record.
+    pub target_started_at: u64,
+    /// Fixed-vocabulary target surface tag (`claude-code` / `codex`), or
+    /// `none` on a command record.
+    pub target_surface: String,
+    /// UTF-8 byte length of the delivered text (never the body itself).
+    pub byte_len: u64,
+    /// Fixed-vocabulary outcome tag.
+    pub outcome: String,
+}
+
 /// Payload for [`EventKind::EatpAttestation`] (M3 §10.5 W2b/W3 — born-canonical
 /// EATP genesis record and per-session-close attestations).
 ///
@@ -2170,7 +2228,13 @@ pub enum OpOutcome {
 /// describe the same logical op); only the `op_phase` envelope differs. The
 /// `correlation_id` is a per-op [`RecordId`] (ULID / UUIDv7 shape) generated
 /// once and embedded in both records, so orphan detection is a single
-/// linear scan keyed on `correlation_id`.
+/// linear scan keyed on `(correlation_id, kind)`.
+///
+/// Exception, documented rather than implied: [`EventKind::TelegramBridgeDelivery`]
+/// carries a phase-specific `outcome` field (`intent` on the INTENT record, the
+/// delivery status on the OUTCOME). Orphan detection keys on
+/// `(correlation_id, kind)` and never on payload equality, so the pair still
+/// resolves; the rest of the payload is identical.
 ///
 /// # Why a correlation id rather than the intent's `record_id`
 ///
@@ -2830,6 +2894,7 @@ mod tests {
                 EventKind::PolicyBundleInstall => "policy_bundle_install",
                 EventKind::OrgRootCeremony => "org_root_ceremony",
                 EventKind::SeatKeyReanchor => "seat_key_reanchor",
+                EventKind::TelegramBridgeDelivery => "telegram_bridge_delivery",
             };
         }
     }
@@ -2846,7 +2911,7 @@ mod tests {
     // only real job now: catch the literal `26` going stale (harmless —
     // `EventKind::ALL.len()` is authoritative) as a nudge to update this
     // constant, nothing more.
-    const _EVENT_KIND_VARIANT_COUNT_CHECK: () = assert!(EventKind::ALL.len() == 26);
+    const _EVENT_KIND_VARIANT_COUNT_CHECK: () = assert!(EventKind::ALL.len() == 27);
 
     #[test]
     fn event_payload_kind_matches_variant() {
@@ -3027,6 +3092,17 @@ mod tests {
                         new_seat_pubkey: Ed25519PublicKey([1u8; 32]),
                         seat_endorsement: Ed25519Signature::new([0u8; 64]),
                         rotation_reason: RotationReason::Operator,
+                    })
+                }
+                EventKind::TelegramBridgeDelivery => {
+                    EventPayload::TelegramBridgeDelivery(TelegramBridgeDeliveryPayload {
+                        update_id: 42,
+                        kind: "message".to_string(),
+                        target_pid: 123,
+                        target_started_at: 1_000,
+                        target_surface: "claude-code".to_string(),
+                        byte_len: 7,
+                        outcome: "claude_woken".to_string(),
                     })
                 }
             };

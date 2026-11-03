@@ -473,7 +473,7 @@ impl SpawnPlan {
 /// `gemini-cli` process replaces csq-cli; on Windows this spawns a
 /// child and waits.
 ///
-/// On Unix, [`pre_exec`] sets `RLIMIT_CORE=0` to prevent core dumps
+/// On Unix, `pre_exec` sets `RLIMIT_CORE=0` to prevent core dumps
 /// from writing the gemini-cli memory image (containing the
 /// cleartext key) to disk per security review §5 "subprocess crash
 /// core dump".
@@ -482,7 +482,7 @@ impl SpawnPlan {
 /// failure); returns the child's exit code via
 /// [`std::process::exit`] on Windows.
 ///
-/// [`pre_exec`]: std::os::unix::process::CommandExt::pre_exec
+/// Unix hook: `std::os::unix::process::CommandExt::pre_exec`.
 pub fn execute_plan(plan: SpawnPlan) -> std::io::Result<std::convert::Infallible> {
     use std::process::Command;
 
@@ -541,7 +541,7 @@ pub fn execute_plan(plan: SpawnPlan) -> std::io::Result<std::convert::Infallible
 /// Stdio: **inherited** (default). For the OneShot capture path
 /// (Gemini `--prompt` mode) use [`execute_plan_as_child_piped`].
 ///
-/// [`pre_exec`]: std::os::unix::process::CommandExt::pre_exec
+/// Unix hook: `std::os::unix::process::CommandExt::pre_exec`.
 pub fn execute_plan_as_child(plan: SpawnPlan) -> std::io::Result<std::process::Child> {
     use std::process::Command;
 
@@ -591,7 +591,7 @@ pub fn execute_plan_as_child(plan: SpawnPlan) -> std::io::Result<std::process::C
 /// - **Windows:** no core-dump equivalent; same posture.
 /// - Allowlisted env via `Command::env_clear()`.
 ///
-/// [`pre_exec`]: std::os::unix::process::CommandExt::pre_exec
+/// Unix hook: `std::os::unix::process::CommandExt::pre_exec`.
 pub fn execute_plan_as_child_piped(plan: SpawnPlan) -> std::io::Result<std::process::Child> {
     use std::process::{Command, Stdio};
 

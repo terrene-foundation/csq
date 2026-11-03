@@ -2325,7 +2325,7 @@ impl ClaudeWakeTarget {
     /// an exact start matching the stored resolve-time value; the record is a regular file (bounded, no-follow read) whose `pid` and
     /// `startedAt` bind to that process by the same rule `list_sessions` uses; and it carries an
     /// absolute `messagingSocketPath`. Whether that path is a socket of ours is checked at post
-    /// time by [`deliver_claude_coalesced`], not here. When optional JSON publication is absent,
+    /// time by `deliver_claude_coalesced`, not here. When optional JSON publication is absent,
     /// producer-derived candidate lookup selects exactly one permitted default socket;
     /// unreadable or invalid present metadata never authorizes that fallback.
     #[must_use]

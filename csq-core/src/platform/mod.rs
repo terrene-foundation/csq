@@ -23,6 +23,7 @@ mod fs_windows_upgrade;
 pub mod home;
 mod label_level;
 pub mod label_upgrade;
+pub mod launch_plan;
 pub mod lock;
 pub mod process;
 pub mod secret;

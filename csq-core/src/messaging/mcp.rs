@@ -1566,6 +1566,54 @@ mod tests {
         .is_empty());
     }
 
+    /// S4.1: no MCP send path can carry an origin. The tool schemas are closed and the
+    /// runtime `args` guard refuses any key outside the schema, so a model that passes an
+    /// `origin` (or any other framing field) gets `invalid_input` and NOTHING is stored.
+    /// Falsifier: an `args` guard that ignored unknown keys would store an owner-claimed
+    /// record built from a model's argument.
+    #[test]
+    fn mcp_send_and_reply_refuse_an_origin_argument_and_write_nothing() {
+        let h = H::new(Some(a()));
+        for (tool, args) in [
+            (
+                "send",
+                serde_json::json!({
+                    "to": {"pid": 200, "started_at": 5_000},
+                    "body": "hi",
+                    "origin": {"OwnerTelegram": {"update_id": 1, "tg_message_id": 2, "mac": "ab"}}
+                }),
+            ),
+            (
+                "reply",
+                serde_json::json!({
+                    "in_reply_to": uuid::Uuid::new_v4().to_string(),
+                    "body": "hi",
+                    "origin": "owner"
+                }),
+            ),
+        ] {
+            let (error, value) = payload(&h.call_as(Some(a()), &call(tool, args)).unwrap());
+            assert!(error, "{tool}: {value}");
+            let text = value.as_str().unwrap_or_default();
+            assert!(text.starts_with("invalid_input"), "{tool}: {text}");
+            assert!(text.contains("unknown argument"), "{tool}: {text}");
+        }
+        assert!(
+            store::inbox(
+                h.dir.path(),
+                NOW,
+                &real_fs(),
+                &|_| Liveness::Live,
+                &b(),
+                false,
+                None
+            )
+            .unwrap()
+            .is_empty(),
+            "a refused origin-carrying call must write nothing"
+        );
+    }
+
     #[test]
     fn tools_list_is_exactly_the_six_tools_with_closed_schemas() {
         let h = H::new(Some(a()));

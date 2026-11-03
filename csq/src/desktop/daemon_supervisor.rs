@@ -1388,6 +1388,17 @@ Run `csq audit verify --full` for diagnosis."
     );
     #[cfg(windows)]
     drop(custody.adopt_subsystem("refresher", refresher.join));
+    // S3 Telegram bridge ingest (twin of the CLI daemon spawn). Outbound long
+    // polling only; absent or disabled config keeps the task idle on a
+    // local-config recheck, so `csq telegram on` activates it without a
+    // daemon restart.
+    let telegram_bridge = daemon::spawn_telegram_bridge(
+        base_dir.to_path_buf(),
+        shutdown.clone(),
+        daemon::ReqwestTelegramPost::new(),
+    );
+    #[cfg(windows)]
+    drop(custody.adopt_subsystem("telegram_bridge", telegram_bridge.join));
     // License CRL refresher (task #77 shard 2) — twin of the CLI daemon spawn. Keeps the
     // signed revocation list fresh for the enterprise license gate. Enterprise-only; inert
     // while the placeholder key is baked.
@@ -1557,6 +1568,7 @@ Run `csq audit verify --full` for diagnosis."
         ("usage_ledger_writer", usage_ledger_writer.join),
         ("daemon_log_gc", log_gc),
         ("ipc_server", server_join),
+        ("telegram_bridge", telegram_bridge.join),
     ];
     #[cfg(all(not(windows), feature = "enterprise"))]
     subsystems.push(("license_crl_refresher", crl_refresher.join));

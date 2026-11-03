@@ -1095,7 +1095,7 @@ dependencies = [
 
 [[package]]
 name = "csq"
-version = "2.21.4"
+version = "2.21.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1134,12 +1134,13 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "url",
+ "windows-sys 0.52.0",
  "zeroize",
 ]
 
 [[package]]
 name = "csq-core"
-version = "2.21.4"
+version = "2.21.5"
 dependencies = [
  "aes 0.8.4",
  "aes 0.9.3",
@@ -1197,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "csq-ledger"
-version = "2.21.4"
+version = "2.21.5"
 dependencies = [
  "async-trait",
  "axum",
@@ -1224,7 +1225,7 @@ dependencies = [
 
 [[package]]
 name = "csq-merkle"
-version = "2.21.4"
+version = "2.21.5"
 dependencies = [
  "hex",
  "sha2 0.10.9",
@@ -1232,14 +1233,15 @@ dependencies = [
 
 [[package]]
 name = "csq-redact"
-version = "2.21.4"
+version = "2.21.5"
 dependencies = [
  "serde",
+ "unicode-normalization",
 ]
 
 [[package]]
 name = "csq-sdk"
-version = "2.21.4"
+version = "2.21.5"
 dependencies = [
  "csq-redact",
  "serde",

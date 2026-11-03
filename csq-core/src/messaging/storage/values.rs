@@ -126,6 +126,7 @@ pub(crate) mod fixtures {
                 surface: Surface::Codex,
                 started_exact: Some(2),
             },
+            origin: crate::messaging::model::Origin::Peer,
             in_reply_to: None,
             thread: ID.into(),
             body: "fixture body".into(),

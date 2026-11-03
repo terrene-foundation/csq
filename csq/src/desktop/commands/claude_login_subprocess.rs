@@ -33,6 +33,7 @@
 //! `csq-core/src/oauth/{race,loopback}.rs` and
 //! `csq/src/desktop/commands/race.rs`.
 
+use crate::login_child_custody::process::{Command as LoginCommand, Stdio as LoginStdio};
 use csq_core::accounts::login::{finalize_verified_login, find_claude_binary};
 use csq_core::accounts::login_lock::{AccountLoginLock, AcquireOutcome};
 use csq_core::error::redact_tokens;
@@ -115,7 +116,7 @@ pub async fn start_claude_login_subprocess(
 // Command/transport injection changes no admission, cleanup, seal or finalization
 // policy. The renderer can reach only the production constructor above.
 type ClaudeCommandFactory =
-    Box<dyn FnOnce(&std::path::Path) -> Result<std::process::Command, String> + Send>;
+    Box<dyn FnOnce(&std::path::Path) -> Result<LoginCommand, String> + Send>;
 #[cfg(all(test, unix, feature = "test-utils"))]
 type VendorGroupObserver =
     std::sync::Arc<dyn Fn(crate::login_child_custody::group::GroupControl) + Send + Sync>;
@@ -137,12 +138,12 @@ impl ClaudeLoginIo {
             command: Box::new(|config| {
                 let binary = find_claude_binary()
                     .ok_or_else(|| "CLAUDE_BIN_MISSING: claude binary not found".to_string())?;
-                let mut command = std::process::Command::new(binary);
+                let mut command = LoginCommand::new(binary);
                 command
                     .args(["auth", "login"])
                     .env("CLAUDE_CONFIG_DIR", config)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null());
+                    .stdout(LoginStdio::null())
+                    .stderr(LoginStdio::null());
                 Ok(command)
             }),
             timeout: crate::login_child_custody::login_timeout(),
@@ -157,7 +158,7 @@ impl ClaudeLoginIo {
     }
     #[cfg(all(test, unix, feature = "test-utils"))]
     pub(crate) fn fixture(
-        command: std::process::Command,
+        command: LoginCommand,
         timeout: std::time::Duration,
         profile: csq_core::daemon::usage_poller::HttpGetFn,
         seal_observer: Option<std::sync::Arc<dyn Fn(bool) + Send + Sync>>,
@@ -871,7 +872,7 @@ fn read_fresh_vendor_credentials(
 /// graceful stop or kill and never infers PRE from output or elapsed time.
 #[cfg(test)]
 pub(crate) async fn desktop_vendor_status_registered_with_timeout<K: Send + Sync + 'static>(
-    command: std::process::Command,
+    command: LoginCommand,
     keepalive: K,
     timeout: std::time::Duration,
     key: crate::desktop::login_custody::ChildKey,
@@ -885,7 +886,7 @@ pub(crate) async fn desktop_vendor_status_registered_with_timeout<K: Send + Sync
 }
 #[cfg(test)]
 pub(crate) async fn desktop_vendor_status_impl<K: Send + Sync + 'static>(
-    command: std::process::Command,
+    command: LoginCommand,
     keepalive: K,
     watchdog: crate::login_child_custody::LoginWatchdog,
     operation: std::sync::Arc<crate::desktop::login_custody::ChildRegistration>,
@@ -904,7 +905,7 @@ pub(crate) async fn desktop_vendor_status_impl<K: Send + Sync + 'static>(
     .await
 }
 async fn desktop_vendor_status_with_grant<K: Send + Sync + 'static>(
-    mut command: std::process::Command,
+    mut command: LoginCommand,
     keepalive: K,
     watchdog: crate::login_child_custody::LoginWatchdog,
     operation: std::sync::Arc<crate::desktop::login_custody::ChildRegistration>,
@@ -1151,7 +1152,7 @@ mod tests {
         }
         let profile: csq_core::daemon::usage_poller::HttpGetFn =
             std::sync::Arc::new(|_, _, _| panic!("a failed spawn must not reach the profile"));
-        let command = std::process::Command::new(home.path().join("missing-claude-1729"));
+        let command = LoginCommand::new(home.path().join("missing-claude-1729"));
         let error = start_claude_login_owned(
             base,
             AccountNum::try_from(47u16).unwrap(),
@@ -1209,7 +1210,7 @@ mod tests {
         }
         let profile: csq_core::daemon::usage_poller::HttpGetFn =
             std::sync::Arc::new(|_, _, _| panic!("a failed spawn must not reach the profile"));
-        let command = std::process::Command::new(home.path().join("missing-claude-1729"));
+        let command = LoginCommand::new(home.path().join("missing-claude-1729"));
         let error = start_claude_login_owned(
             base,
             AccountNum::try_from(48u16).unwrap(),

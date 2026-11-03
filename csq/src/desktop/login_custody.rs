@@ -2,6 +2,7 @@
 //! S1 credential_writes must re-export this module when the lanes reconcile.
 use crate::login_child_custody::{
     group::{GroupControl, GroupSignal, GroupStopDecision},
+    process::Child as LoginChild,
     LoginWatchdog,
 };
 use std::{
@@ -34,7 +35,7 @@ impl ChildKey {
         }
     }
 }
-type RegisteredChildSlot = Arc<Mutex<Option<(Arc<Mutex<std::process::Child>>, GroupControl)>>>;
+type RegisteredChildSlot = Arc<Mutex<Option<(Arc<Mutex<LoginChild>>, GroupControl)>>>;
 struct ChildEntry {
     operation_id: String,
     identity: Arc<()>,
@@ -235,7 +236,7 @@ impl ChildRegistration {
         Ok(())
     }
     /// Infallible attachment: reserve every fallible registry field BEFORE spawn.
-    pub(crate) fn attach(&self, child: Arc<Mutex<std::process::Child>>, group: GroupControl) {
+    pub(crate) fn attach(&self, child: Arc<Mutex<LoginChild>>, group: GroupControl) {
         *self.child.lock().unwrap_or_else(|e| e.into_inner()) = Some((child, group));
         self.inner.changed.notify_waiters();
     }
@@ -676,6 +677,11 @@ impl CredentialWrites {
             }
         }
         let mut stopped = !before_publication;
+        // This is only the caller's observation budget. Expiration must not
+        // remove the registration or retire the actual child/reader owner.
+        let observer_deadline = std::time::Instant::now()
+            .checked_add(crate::login_child_custody::group::STOP_DRAIN_BUDGET)
+            .ok_or_else(|| unresolved_cancel_message(&quarantine))?;
         loop {
             let changed = self.inner.changed.notified();
             tokio::pin!(changed);
@@ -724,7 +730,10 @@ impl CredentialWrites {
             }
             // Actual unresolved custody may be recorded after the initial stop.
             // Refuse this observer promptly while the owner retains K and index.
-            if watchdog.custody_unresolved() {
+            if watchdog.custody_unresolved() || std::time::Instant::now() >= observer_deadline {
+                // A slow/recoverable Job remains owned and can be observed or
+                // cancelled again. The bounded Quit observer reports refusal,
+                // never completion, while its exact registration is still live.
                 return Err(unresolved_cancel_message(&quarantine));
             }
             tokio::select! {
@@ -820,7 +829,7 @@ impl CredentialWrites {
     pub(crate) fn registered_child_for_test(
         &self,
         key: &ChildKey,
-    ) -> Option<Arc<Mutex<std::process::Child>>> {
+    ) -> Option<Arc<Mutex<LoginChild>>> {
         self.inner
             .state
             .lock()
@@ -859,7 +868,7 @@ impl<K> ChildCustody<K> {
             registration,
         }
     }
-    pub(crate) fn attach(&self, child: Arc<Mutex<std::process::Child>>, group: GroupControl) {
+    pub(crate) fn attach(&self, child: Arc<Mutex<LoginChild>>, group: GroupControl) {
         self.registration.attach(child, group);
     }
 }
@@ -1529,3 +1538,7 @@ mod windows_install_custody_tests {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "../login_child_custody/job_recovery_tests.rs"]
+mod job_recovery_tests;

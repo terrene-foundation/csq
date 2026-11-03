@@ -1777,6 +1777,312 @@ pub fn windows_rename_class_unsupported(status: i32) -> bool {
     )
 }
 
+/// Budget for the an internal ticket publication diagnosis. All three probes (the attribute
+/// read, the DELETE check and the Restart Manager session) run on one helper
+/// thread; the caller waits at most this long and otherwise reports `unknown`.
+/// A failure path must not be extended by more than this fixed, documented cap.
+#[cfg(windows)]
+const HOLDER_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Fixed-vocabulary diagnosis for a publication rename that exhausted its
+/// retries with ACCESS_DENIED (5) or SHARING_VIOLATION (32) — the two measured
+/// shapes (an internal ticket):
+///
+/// * `delete_blocked=yes|no|unknown` — whether the TARGET can be opened for
+///   DELETE right now. `yes` means that open was refused: a foreign handle
+///   opened without `FILE_SHARE_DELETE`, or an ACL that denies delete. It says
+///   nothing about the read-only attribute (that open may succeed and the
+///   failure surface later); `target_attrs` is the authoritative field for the
+///   attribute. A missing target entry is `no`.
+/// * `target_attrs=<list>|none|absent|directory|unknown` — the target ENTRY's
+///   Windows attributes (never a reparse-point destination), from a fixed
+///   vocabulary in a fixed order: `readonly`, `hidden`, `system`, `temporary`,
+///   `offline`; `none` when it has none of them; `absent` when the entry is
+///   missing; `directory` for a directory target (which suppresses the other
+///   names); `unknown` when the query itself failed — including when a
+///   non-sharing holder blocks even the attribute query. A read-only target is
+///   the ONLY measured source of a bare 5 on the rename, and csq sets no
+///   Windows attributes itself.
+/// * `hint=target_is_read_only` — present only on a 5 whose `target_attrs`
+///   contains `readonly`, so an operator reads THAT failure as an attribute,
+///   not a holder. Never emitted for 32, where the measured cause is a holder.
+/// * `holder=<image>(<app-type>)[,…]|unknown` — the process image basenames the
+///   Restart Manager attributes the TARGET to, each reduced to
+///   `[A-Za-z0-9._-]` and capped at 64 characters, with a fixed app-type
+///   label. Never a path (`\` and `/` cannot survive the reduction), never a
+///   pid, never file content.
+///   The SOURCE is deliberately not registered: on the retained-writer path
+///   the publisher itself holds it, so including it would name us in every
+///   report — and alone, whenever the target's holder is not attributable.
+///   A 32 caused by a holder on the staged SOURCE is therefore reported as
+///   `delete_blocked=no; target_attrs=<attrs>; holder=unknown`, where `<attrs>`
+///   is whatever the target's own probe yields: honest, and still more than the
+///   pre-an internal ticket code said.
+///
+/// Diagnostic only: the publication outcome is not consulted. Every failure —
+/// an unusable Restart Manager, or a helper thread that cannot be spawned —
+/// collapses to `unknown` with one WARN, and no failure propagates.
+#[cfg(windows)]
+fn windows_publication_diagnosis(target: &Path, retry_code: u32) -> String {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let target_path = target.to_path_buf();
+    let spawned = std::thread::Builder::new()
+        .name("csq-publish-holder".into())
+        .spawn(move || {
+            let blocked = windows_target_delete_blocked(&target_path);
+            let attrs = windows_target_attributes(&target_path);
+            let holders = restart_manager_images(&target_path);
+            let _ = sender.send((blocked, attrs, holders));
+        });
+    let facts = match spawned {
+        Ok(_) => receiver.recv_timeout(HOLDER_PROBE_BUDGET).ok(),
+        Err(_) => None,
+    };
+    match facts {
+        Some((blocked, attrs, holders)) => {
+            let hint = readonly_operator_hint(&attrs, retry_code);
+            let holder = holders
+                .filter(|images| !images.is_empty())
+                .map(|images| images.join(","))
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        tag = "publication_holder_unknown",
+                        "restart manager named no holder for the refused publication"
+                    );
+                    "unknown".to_string()
+                });
+            format!("; delete_blocked={blocked}; target_attrs={attrs}{hint}; holder={holder}")
+        }
+        None => {
+            tracing::warn!(
+                tag = "publication_holder_unknown",
+                "the publication diagnosis did not answer within its budget"
+            );
+            "; delete_blocked=unknown; target_attrs=unknown; holder=unknown".to_string()
+        }
+    }
+}
+
+/// The operator hint that follows `target_attrs` for an ACCESS_DENIED (5) whose
+/// target is READ-ONLY: the only measured source of a bare 5 on the publication
+/// rename, and never something csq set. Empty for every other code — a 32 is a
+/// holder, and its measured cause is named in `holder` — and empty when the
+/// target is not read-only.
+#[cfg(windows)]
+fn readonly_operator_hint(attributes: &str, retry_code: u32) -> &'static str {
+    if retry_code == 5 && attributes.split(',').any(|name| name == "readonly") {
+        "; hint=target_is_read_only"
+    } else {
+        ""
+    }
+}
+
+/// The target ENTRY's Windows attributes in a fixed vocabulary, in a fixed
+/// order. `symlink_metadata` inspects the entry itself, never a reparse-point
+/// destination — the same discipline as the DELETE probe. `absent` when the
+/// entry is missing; `unknown` when the query itself failed (a non-sharing
+/// holder blocks the attribute query too); `directory` suppresses the names.
+#[cfg(windows)]
+fn windows_target_attributes(target: &Path) -> String {
+    use std::os::windows::fs::MetadataExt;
+    const READONLY: u32 = 0x0000_0001;
+    const HIDDEN: u32 = 0x0000_0002;
+    const SYSTEM: u32 = 0x0000_0004;
+    const DIRECTORY: u32 = 0x0000_0010;
+    const TEMPORARY: u32 = 0x0000_0100;
+    const OFFLINE: u32 = 0x0000_1000;
+    match std::fs::symlink_metadata(target) {
+        Ok(meta) => {
+            let attributes = meta.file_attributes();
+            if attributes & DIRECTORY != 0 {
+                return "directory".to_string();
+            }
+            let mut names: Vec<&'static str> = Vec::new();
+            for (bit, name) in [
+                (READONLY, "readonly"),
+                (HIDDEN, "hidden"),
+                (SYSTEM, "system"),
+                (TEMPORARY, "temporary"),
+                (OFFLINE, "offline"),
+            ] {
+                if attributes & bit != 0 {
+                    names.push(name);
+                }
+            }
+            if names.is_empty() {
+                "none".to_string()
+            } else {
+                names.join(",")
+            }
+        }
+        Err(error) => match error.raw_os_error() {
+            Some(2) | Some(3) => "absent".to_string(),
+            _ => "unknown".to_string(),
+        },
+    }
+}
+
+/// The failure shapes that are ABOUT the target entry: the rename itself, the
+/// no-replace rename, and the destination-validation open. A destination-PARENT
+/// open failure is also staged as `Rename`, so blaming the target for it would
+/// be a false accusation in the one field this diagnosis exists to make
+/// trustworthy.
+#[cfg(windows)]
+fn diagnosis_names_target(failure: &WindowsReplaceFailure) -> bool {
+    matches!(
+        failure.api,
+        "NtSetInformationFile(FileRenameInformation)"
+            | "NtSetInformationFile(FileRenameInformation; no-replace)"
+            | "NtCreateFile(destination validation)"
+    )
+}
+
+/// Can this process open the TARGET for DELETE right now? `yes` means the open
+/// was refused: a competing handle holding it without `FILE_SHARE_DELETE`, or a
+/// DACL that denies delete. A read-only attribute does NOT refuse this open
+/// (the attribute may block the later delete instead), so `target_attrs` is the
+/// authoritative field for it. `no` means the entry is deletable or absent.
+#[cfg(windows)]
+fn windows_target_delete_blocked(target: &Path) -> &'static str {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    // Inspect the entry ITSELF (never a reparse-point destination), and allow a
+    // directory target to be opened so it is not misreported as delete-blocked.
+    match std::fs::OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(7)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(target)
+    {
+        Ok(_) => "no",
+        Err(error) => match error.raw_os_error() {
+            Some(2) | Some(3) => "no",
+            Some(5) | Some(32) => "yes",
+            _ => "unknown",
+        },
+    }
+}
+
+/// One Restart Manager session naming the images holding `target`.
+/// `None` when the API is unavailable or the session could not be started or
+/// registered; an empty `Some` when nothing is attributed.
+#[cfg(windows)]
+fn restart_manager_images(target: &Path) -> Option<Vec<String>> {
+    let paths = [target.to_path_buf()];
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::RestartManager::{
+        RmEndSession, RmGetList, RmRegisterResources, RmStartSession, CCH_RM_SESSION_KEY,
+        RM_PROCESS_INFO,
+    };
+    // ERROR_MORE_DATA: the fixed buffer was too small; the first entries are
+    // still valid and are all this diagnostic reports.
+    const ERROR_MORE_DATA: u32 = 234;
+    let wide: Vec<Vec<u16>> = paths
+        .iter()
+        .map(|path| path.as_os_str().encode_wide().chain(Some(0)).collect())
+        .collect();
+    let names: Vec<*const u16> = wide.iter().map(|name| name.as_ptr()).collect();
+    let mut session: u32 = 0;
+    let mut key = [0u16; (CCH_RM_SESSION_KEY + 1) as usize];
+    // SAFETY: live out-pointers; `key` is a CCH_RM_SESSION_KEY+1 UTF-16 buffer.
+    if unsafe { RmStartSession(&mut session, 0, key.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: the session handle came from RmStartSession; the name pointers
+    // stay alive for the call and no application/service arrays are passed.
+    let registered = unsafe {
+        RmRegisterResources(
+            session,
+            names.len() as u32,
+            names.as_ptr(),
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+        )
+    } == 0;
+    let mut images = Vec::new();
+    if registered {
+        let mut needed: u32 = 0;
+        // `pnProcInfo` is IN/OUT: on entry it is the capacity of the array, on
+        // return the number of entries written. A 0 capacity writes nothing.
+        let mut reasons: u32 = 0;
+        // SAFETY: RM_PROCESS_INFO is a plain C struct of integers and arrays.
+        let blank: RM_PROCESS_INFO = unsafe { std::mem::zeroed() };
+        let mut info = vec![blank; 8];
+        let mut count: u32 = info.len() as u32;
+        // SAFETY: an array of 8 writable entries, with its capacity passed as
+        // the in/out count; a larger set reports `needed` under ERROR_MORE_DATA.
+        let status = unsafe {
+            RmGetList(
+                session,
+                &mut needed,
+                &mut count,
+                info.as_mut_ptr(),
+                &mut reasons,
+            )
+        };
+        if status == 0 || status == ERROR_MORE_DATA {
+            for entry in info.iter().take((count as usize).min(info.len())) {
+                let application = String::from_utf16_lossy(&entry.strAppName);
+                let basename = Path::new(application.trim_end_matches('\0'))
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let image = sanitized_holder_image(&basename);
+                if image.is_empty() {
+                    continue;
+                }
+                images.push(format!(
+                    "{image}({})",
+                    restart_manager_app_type(entry.ApplicationType)
+                ));
+            }
+        }
+    }
+    // SAFETY: the session handle came from RmStartSession and is ended once.
+    unsafe { RmEndSession(session) };
+    if !registered {
+        return None;
+    }
+    images.sort();
+    images.dedup();
+    Some(images)
+}
+
+/// Reduce an OS-provided image name to the reported vocabulary:
+/// `[A-Za-z0-9._-]`, at most 64 characters. A path separator, a control
+/// character or an oversized token cannot reach an error message.
+#[cfg(windows)]
+fn sanitized_holder_image(name: &str) -> String {
+    name.chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Fixed labels for `RM_APP_TYPE`; the exact process identity is never reported.
+#[cfg(windows)]
+fn restart_manager_app_type(application_type: i32) -> &'static str {
+    match application_type {
+        1 => "main-window",
+        2 => "other-window",
+        3 => "service",
+        4 => "explorer",
+        5 => "console",
+        1000 => "critical",
+        _ => "unknown-app",
+    }
+}
+
 #[cfg(any(windows, test))]
 fn windows_replace_leaf_safe(name: &[u16]) -> bool {
     !name.is_empty()
@@ -1905,6 +2211,19 @@ impl WindowsReplaceFailure {
         }
     }
     fn into_platform(self, source: &Path, target: &Path, attempt: u32) -> PlatformError {
+        self.into_platform_diagnosed(source, target, attempt, "")
+    }
+
+    /// Like [`Self::into_platform`], appending a fixed-vocabulary diagnosis of a
+    /// final failure (an internal ticket). `diagnosis` is empty except on the retry-exhausted
+    /// ACCESS_DENIED rename path.
+    fn into_platform_diagnosed(
+        self,
+        source: &Path,
+        target: &Path,
+        attempt: u32,
+        diagnosis: &str,
+    ) -> PlatformError {
         use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
         let statuses = self
             .nt
@@ -1932,7 +2251,7 @@ impl WindowsReplaceFailure {
         PlatformError::Win32 {
             code: self.code,
             message: format!(
-                "atomic_replace: {} failed{exhausted}{statuses}: {} -> {}",
+                "atomic_replace: {} failed{exhausted}{statuses}{diagnosis}: {} -> {}",
                 self.api,
                 source.file_name().unwrap_or_default().to_string_lossy(),
                 target.file_name().unwrap_or_default().to_string_lossy()
@@ -2150,7 +2469,27 @@ fn windows_publish(
                 .map(|info| info.dwFileAttributes & 0x10 != 0)
                 .unwrap_or(false);
         if !windows_replace_retry(failure.stage, retry_code, target_is_dir, attempt) {
-            return Err(failure.into_platform(tmp_path, target, attempt));
+            // an internal ticket: two MEASURED refusal shapes reach here (native probe table:
+            // every blocking HOLDER yields 32; the only 5 is a read-only target
+            // with no holder at all).
+            //  * 32 (SHARING_VIOLATION) — a foreign handle on the target or on
+            //    the staged source opened without FILE_SHARE_DELETE.
+            //  * 5 (ACCESS_DENIED) on a READ-ONLY target — csq sets no Windows
+            //    attributes (secure_file/secure_file_readonly are Unix-only), so
+            //    the flag is external. The outcome is NOT changed here: a
+            //    read-only flag may be a deliberate lock, and this path also
+            //    publishes credentials, so the diagnosis names the attribute and
+            //    an operator decides. Repair policy is tracked separately.
+            // Both are diagnosed in a fixed vocabulary with no path and no pid.
+            let diagnosis = if failure.stage == WindowsReplaceStage::Rename
+                && matches!(retry_code, 5 | 32)
+                && diagnosis_names_target(&failure)
+            {
+                windows_publication_diagnosis(target, retry_code)
+            } else {
+                String::new()
+            };
+            return Err(failure.into_platform_diagnosed(tmp_path, target, attempt, &diagnosis));
         }
         tracing::warn!(
             attempt = attempt + 1,
@@ -5909,5 +6248,158 @@ pub(crate) mod tests {
         result.expect("atomic_replace must retry past a briefly held target");
         assert_eq!(std::fs::read(&target).unwrap(), b"new");
         assert!(!tmp.exists(), "tmp must be consumed on success");
+    }
+
+    /// an internal ticket, MEASURED by the native probe: a target held by a handle without
+    /// `FILE_SHARE_DELETE` refuses the publication rename with
+    /// SHARING_VIOLATION (32), NOT access-denied — every blocking holder mode
+    /// yields 32, and no holder mode yields 5. Held past the retry budget, the
+    /// refusal must name the cause: `delete_blocked=yes`, the target's
+    /// attributes, and the holding process image, in a fixed vocabulary with no
+    /// path, no pid and no content.
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_replace_sharing_violation_names_the_holder() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("token.json");
+        std::fs::write(&target, b"old").unwrap();
+        let tmp = dir.path().join("token.json.tmp");
+        std::fs::write(&tmp, b"new").unwrap();
+        let holder_path = target.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&holder_path)
+                .unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(3000));
+            drop(file);
+        });
+        held_rx.recv().unwrap();
+        let error = atomic_replace(&tmp, &target)
+            .expect_err("a target held past the budget must exhaust the retries");
+        holder.join().unwrap();
+        let PlatformError::Win32 { code, message } = error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert_eq!(
+            code, 32,
+            "a non-sharing holder is a sharing violation: {message}"
+        );
+        assert!(
+            message.contains("delete_blocked=yes"),
+            "the refusal must say the target is delete-blocked: {message}"
+        );
+        // A share-0 holder MAY also block the attribute query, so the fixture
+        // can legitimately produce `none` or `unknown` — that Win32 interaction
+        // is not measured. Accept exactly those two, so the row still REDs if
+        // the field is dropped, empty or any other token.
+        assert!(
+            message.contains("target_attrs=none") || message.contains("target_attrs=unknown"),
+            "the refusal must report the target's attributes (none or unknown): {message}"
+        );
+        let holders = message
+            .split("holder=")
+            .nth(1)
+            .expect("the refusal must carry a holder field");
+        assert!(
+            !holders.starts_with("unknown"),
+            "Restart Manager must name the holding image: {message}"
+        );
+        assert!(
+            !holders.contains('\\') && !holders.contains('/'),
+            "the holder report carries image names only, never paths: {message}"
+        );
+        let image = std::env::current_exe()
+            .unwrap()
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_lowercase();
+        assert!(
+            holders.to_lowercase().contains(&image),
+            "the holder must name this test image ({image}): {message}"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"old",
+            "a refused publication leaves the target untouched"
+        );
+        assert!(
+            tmp.exists(),
+            "an unpublished temp is preserved for its owner"
+        );
+        // The diagnosis must not leave any non-sharing handle behind: the owner
+        // unlinks its staged temp immediately after a failure.
+        std::fs::remove_file(&tmp).expect("the diagnosis must not block the owner's cleanup");
+    }
+
+    /// The read-only hint explains an ACCESS_DENIED (5) and nothing else: a 32
+    /// is a holder, and the hint must never point an operator at an attribute
+    /// when the measured cause is a holder. Pure function, no I/O.
+    #[cfg(windows)]
+    #[test]
+    fn readonly_hint_only_explains_access_denied() {
+        assert_eq!(
+            readonly_operator_hint("readonly", 5),
+            "; hint=target_is_read_only"
+        );
+        assert_eq!(readonly_operator_hint("readonly", 32), "");
+        assert_eq!(readonly_operator_hint("none", 5), "");
+        assert_eq!(readonly_operator_hint("unknown", 5), "");
+        assert_eq!(
+            readonly_operator_hint("readonly,hidden", 5),
+            "; hint=target_is_read_only"
+        );
+    }
+
+    /// an internal ticket, MEASURED by the native probe: a READ-ONLY target with no holder is
+    /// the ONLY shape that refuses the publication rename with ACCESS_DENIED
+    /// (5). csq sets no Windows attributes itself (the secure helpers are
+    /// Unix-only), so the flag is external — and a read-only flag may also be a
+    /// deliberate lock, so the publication is NOT repaired: it fails with the
+    /// attribute named and the operator hint, leaving the target, its attribute
+    /// and the staged temp untouched. Repair policy is a separate decision.
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_replace_readonly_target_fails_naming_the_attribute() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("token.json");
+        std::fs::write(&target, b"old").unwrap();
+        let mut permissions = std::fs::metadata(&target).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&target, permissions).unwrap();
+        let tmp = dir.path().join("token.json.tmp");
+        std::fs::write(&tmp, b"new").unwrap();
+        let error = atomic_replace(&tmp, &target)
+            .expect_err("a read-only target is refused, never silently repaired");
+        let PlatformError::Win32 { code, message } = error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert_eq!(code, 5, "a read-only target is access-denied: {message}");
+        assert!(
+            message.contains("target_attrs=readonly"),
+            "the refusal must name the read-only attribute: {message}"
+        );
+        assert!(
+            message.contains("hint=target_is_read_only"),
+            "the refusal must carry the operator hint: {message}"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"old",
+            "a refused publication leaves the target untouched"
+        );
+        assert!(
+            std::fs::metadata(&target).unwrap().permissions().readonly(),
+            "the target's READONLY attribute must be left untouched"
+        );
+        assert!(
+            tmp.exists(),
+            "an unpublished temp is preserved for its owner"
+        );
     }
 }

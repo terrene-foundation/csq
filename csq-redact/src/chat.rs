@@ -1,6 +1,6 @@
-//! Transcript-specific scanner. Legacy diagnostic redaction stays unchanged.
+//! Transcript-specific shape scanner over shared credential-context spans.
 
-const MASK: &str = "[REDACTED]";
+pub(super) const MASK: &str = "[REDACTED]";
 // Owner policy: saved chats mask every >=32-byte hex run, including git SHAs.
 // Retained switch enables a one-line isolated regression control.
 const KEEP_DELIMITED_GIT_SHA: bool = false;
@@ -74,10 +74,10 @@ fn safe_tail(b: &[u8], i: usize) -> &[u8] {
     &b[i.saturating_sub(6)..i]
 }
 
-fn key(b: u8) -> bool {
+pub(super) fn key(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')
 }
-fn run(b: &[u8], mut i: usize, predicate: fn(u8) -> bool) -> usize {
+pub(super) fn run(b: &[u8], mut i: usize, predicate: fn(u8) -> bool) -> usize {
     while i < b.len() && predicate(b[i]) {
         i += 1;
     }
@@ -181,7 +181,7 @@ fn jwt(s: &str, i: usize) -> Option<usize> {
     (third - second > super::JWT_SEGMENT_MIN_BODY).then_some(third)
 }
 
-fn private_pem(s: &str, i: usize) -> Option<usize> {
+pub(super) fn private_pem(s: &str, i: usize) -> Option<usize> {
     let tail = &s[i..];
     if !tail.starts_with("-----BEGIN ") {
         return None;

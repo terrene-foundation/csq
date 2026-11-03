@@ -98,7 +98,13 @@ impl OpClass {
             // enforcement layer with no seat-hierarchy integration yet. Unguarded
             // for op-class purposes today; a future milestone MAY promote this to
             // a guarded class once seat ids participate in the M12 roster.
-            | EventKind::SeatKeyReanchor => None,
+            | EventKind::SeatKeyReanchor
+            // S3 Telegram bridge delivery is a passive observation of an
+            // already-validated owner message: owner pinning, the validator and
+            // the attestation MAC are its authority, so it is single-sig
+            // chain-signed, not an M12 multi-sig-roster decision (same
+            // rationale as GovernanceTurn).
+            | EventKind::TelegramBridgeDelivery => None,
         }
     }
 }

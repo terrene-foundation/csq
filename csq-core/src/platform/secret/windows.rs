@@ -663,7 +663,7 @@ pub fn is_running_as_local_system() -> bool {
 
 // ── factory ───────────────────────────────────────────────────────────
 
-/// Windows backend selector called from [`super::open_native_default`].
+/// Windows backend selector called from `super::open_native_default`.
 ///
 /// - `CSQ_SECRET_BACKEND=file` → refuse: file backend is Linux-only
 ///   per an internal journal entry §1 (no silent fallback when DPAPI exists).

@@ -24,7 +24,7 @@
   const messages: Record<string, string> = {
     pool_invalid_name: 'Use 1–64 letters, numbers, dots, underscores or hyphens for the name.',
     pool_invalid_provider: 'Choose anthropic, openai or a supported API provider ID.',
-    pool_invalid_reset: 'Choose a reset day from 1 to 28 or a valid calendar date.',
+    pool_invalid_reset: 'Choose a reset day from 1 to 31 or a valid calendar date.',
     pool_invalid_cap: 'Enter a monthly cap greater than zero.',
     pool_invalid_key: 'Enter an API key without whitespace (up to 4096 bytes).',
     pool_manifest_invalid: 'Pool metadata is invalid. Repair it with your administrator before retrying.',
@@ -158,7 +158,7 @@
         <label>Monthly cap (USD, optional)<input bind:value={cap} type="number" min="0.01" step="any" /></label>
       {/if}
       <label>Reset<select bind:value={resetKind}><option value="none">None</option><option value="day">Day of month</option><option value="date">Calendar date</option></select></label>
-      {#if resetKind === 'day'}<label>Reset day<input bind:value={day} type="number" min="1" max="28" required /></label>{/if}
+      {#if resetKind === 'day'}<label>Reset day<input bind:value={day} type="number" min="1" max="31" required /></label>{/if}
       {#if resetKind === 'date'}<label>Reset date<input bind:value={date} type="date" required /></label>{/if}
       <div class="actions"><button type="submit">{editing ? 'Save reset' : 'Add key'}</button>{#if editing}<button type="button" onclick={() => { clearKey(); clearEditor(); }}>Cancel reset</button>{/if}</div>
     </fieldset>

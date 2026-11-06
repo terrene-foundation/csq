@@ -148,6 +148,10 @@ fn scan_env_content_for_shadow_auth(content: &str) -> Option<&'static str> {
 ///   today, but a defensive no-op)
 /// - `XDG_RUNTIME_DIR` — Linux-only; nullable
 /// - `GEMINI_CLI_HOME` — set to the handle dir
+/// - `TMPDIR` — the per-session temp dir, taken from `tmpdir` (the
+///   caller's [`ensure_session_tmpdir`](crate::session::tmpdir::ensure_session_tmpdir)
+///   result), never from `parent_env`: a user-set parent `TMPDIR` is
+///   deliberately NOT forwarded (an internal ticket)
 /// - `<secret_var>` → `<secret_value>` — `GEMINI_API_KEY` or
 ///   `GOOGLE_APPLICATION_CREDENTIALS`
 ///
@@ -155,12 +159,18 @@ fn scan_env_content_for_shadow_auth(content: &str) -> Option<&'static str> {
 /// caller has already pulled it from the vault; this function does
 /// NOT call the vault. Keeping vault access in the caller means the
 /// caller controls the audit log entry (one read, one audit line).
+///
+/// `tmpdir` is `Some` for EVERY caller that spawns a child — session launches
+/// and the daemon's bounded capture probes alike (an internal ticket). `None` is
+/// retained only as the "no per-session temp dir" value used by the module's
+/// own tests; no production caller passes it.
 pub fn prepare_env(
     parent_env: &HashMap<String, String>,
     handle_dir: &Path,
     secret: Option<(&str, &str)>,
+    tmpdir: Option<&Path>,
 ) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::with_capacity(8);
+    let mut out: Vec<(String, String)> = Vec::with_capacity(9);
     for key in ["HOME", "PATH", "XDG_RUNTIME_DIR"] {
         if let Some(v) = parent_env.get(key) {
             out.push((key.to_string(), v.clone()));
@@ -170,6 +180,12 @@ pub fn prepare_env(
         "GEMINI_CLI_HOME".to_string(),
         handle_dir.to_string_lossy().to_string(),
     ));
+    // Per-session TMPDIR (an internal ticket). Pushed AFTER the parent allowlist and
+    // BEFORE the secret, so a parent `TMPDIR` (never copied above) cannot win
+    // and the secret stays last for review-diff visibility.
+    if let Some(tmpdir) = tmpdir {
+        out.push(("TMPDIR".to_string(), tmpdir.to_string_lossy().to_string()));
+    }
     // Push the secret last so review diffs land on the leak-sensitive
     // line at a predictable cursor position. `None` skips secret
     // injection entirely — used by Code Assist OAuth slots where
@@ -265,6 +281,14 @@ pub enum SpawnError {
     /// remediation text.
     #[error(transparent)]
     Vault(#[from] SecretError),
+    /// The per-session `TMPDIR` could not be created under the handle dir
+    /// (an internal ticket). The fixed tag is the whole point: the launch is refused
+    /// and NEVER falls back to the shared system `$TMPDIR`.
+    #[error(
+        "{}: could not create the per-session TMPDIR under the terminal handle dir",
+        crate::session::tmpdir::SESSION_TMPDIR_TAG
+    )]
+    SessionTmpdirUnavailable,
 }
 
 impl SpawnError {
@@ -275,6 +299,7 @@ impl SpawnError {
             SpawnError::Probe(_) => "gemini_spawn_probe_failed",
             SpawnError::Provision(e) => e.error_kind_tag(),
             SpawnError::Vault(e) => e.error_kind_tag(),
+            SpawnError::SessionTmpdirUnavailable => crate::session::tmpdir::SESSION_TMPDIR_TAG,
         }
     }
 }
@@ -340,8 +365,15 @@ pub fn resolve_secret_for_binding(
 /// `cwd` is the user's shell CWD (where shadow auth lives). The
 /// resulting plan's `handle_dir` is the spawn-time working
 /// directory, NOT `cwd` — see [`SpawnPlan::handle_dir`].
+///
+/// **No production caller uses this variant.** Session launches MUST use
+/// [`build_spawn_plan_with_tmpdir`] and every capture probe passes its own
+/// `TMPDIR` too (an internal ticket); this no-`TMPDIR` form survives for the module's tests
+/// and the spec-referenced surface, and its `dead_code` allow keeps a future
+/// caller from reaching it silently.
 #[allow(clippy::too_many_arguments)]
-pub fn build_spawn_plan(
+#[allow(dead_code)] // No production caller: tests and the spec-referenced surface only; every spawn path passes a tmpdir.
+pub(crate) fn build_spawn_plan(
     base_dir: &Path,
     handle_dir: &Path,
     slot: AccountNum,
@@ -352,7 +384,39 @@ pub fn build_spawn_plan(
     args: Vec<String>,
 ) -> Result<SpawnPlan, SpawnError> {
     build_spawn_plan_inner(
-        base_dir, handle_dir, slot, parent_env, cwd, home, vault, args, None,
+        base_dir, handle_dir, slot, parent_env, cwd, home, vault, args, None, None,
+    )
+}
+
+/// Session-launch variant of [`build_spawn_plan`]: carries `tmpdir` as the
+/// child's `TMPDIR` (an internal ticket). `tmpdir` is the `<handle_dir>/tmp` path the
+/// CALLER created and validated with
+/// [`ensure_session_tmpdir`](crate::session::tmpdir::ensure_session_tmpdir), so
+/// a creation failure is refused by the caller with the fixed tag before any
+/// spawn — the environment never falls back to the shared `$TMPDIR`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_spawn_plan_with_tmpdir(
+    base_dir: &Path,
+    handle_dir: &Path,
+    slot: AccountNum,
+    parent_env: &HashMap<String, String>,
+    cwd: &Path,
+    home: Option<&Path>,
+    vault: &dyn Vault,
+    args: Vec<String>,
+    tmpdir: &Path,
+) -> Result<SpawnPlan, SpawnError> {
+    build_spawn_plan_inner(
+        base_dir,
+        handle_dir,
+        slot,
+        parent_env,
+        cwd,
+        home,
+        vault,
+        args,
+        None,
+        Some(tmpdir),
     )
 }
 
@@ -368,8 +432,16 @@ pub fn build_spawn_plan(
 /// [`build_spawn_plan`] (preserve semantics) — useful when the
 /// caller has already decided not to engage the layer for this
 /// spawn but still routes through this function.
+///
+/// **Session launches MUST use
+/// [`build_spawn_plan_with_system_instruction_and_tmpdir`].**
+///
+/// Not re-exported outside this crate: the only session path is the
+/// `_and_tmpdir` variant, so a future caller cannot silently reintroduce the
+/// shared-temp leak by picking this one.
 #[allow(clippy::too_many_arguments)]
-pub fn build_spawn_plan_with_system_instruction(
+#[allow(dead_code)] // Spec-referenced surface (specs 07 §7.5, 10); sessions use the _and_tmpdir variant.
+pub(crate) fn build_spawn_plan_with_system_instruction(
     base_dir: &Path,
     handle_dir: &Path,
     slot: AccountNum,
@@ -390,6 +462,37 @@ pub fn build_spawn_plan_with_system_instruction(
         vault,
         args,
         system_instruction,
+        None,
+    )
+}
+
+/// [`build_spawn_plan_with_system_instruction`] for a session launch: carries
+/// the caller's per-session `TMPDIR` (an internal ticket), exactly as
+/// [`build_spawn_plan_with_tmpdir`] does.
+#[allow(clippy::too_many_arguments)]
+pub fn build_spawn_plan_with_system_instruction_and_tmpdir(
+    base_dir: &Path,
+    handle_dir: &Path,
+    slot: AccountNum,
+    parent_env: &HashMap<String, String>,
+    cwd: &Path,
+    home: Option<&Path>,
+    vault: &dyn Vault,
+    args: Vec<String>,
+    system_instruction: Option<&str>,
+    tmpdir: &Path,
+) -> Result<SpawnPlan, SpawnError> {
+    build_spawn_plan_inner(
+        base_dir,
+        handle_dir,
+        slot,
+        parent_env,
+        cwd,
+        home,
+        vault,
+        args,
+        system_instruction,
+        Some(tmpdir),
     )
 }
 
@@ -404,6 +507,7 @@ fn build_spawn_plan_inner(
     vault: &dyn Vault,
     args: Vec<String>,
     system_instruction: Option<&str>,
+    tmpdir: Option<&Path>,
 ) -> Result<SpawnPlan, SpawnError> {
     // 1. Cross-account shadow-auth scan. Runs FIRST so a refusal
     //    aborts before any settings.json mutation — clean rollback.
@@ -442,7 +546,7 @@ fn build_spawn_plan_inner(
     //    env var injected; gemini-cli auto-discovers from its own
     //    config dir.
     let secret_ref = secret.as_ref().map(|(k, v)| (*k, v.as_str()));
-    let envs = prepare_env(parent_env, handle_dir, secret_ref);
+    let envs = prepare_env(parent_env, handle_dir, secret_ref, tmpdir);
 
     Ok(SpawnPlan {
         binary: GEMINI_CLI_BINARY,
@@ -465,6 +569,19 @@ impl SpawnPlan {
         self.envs.retain(|(k, _)| k != DECISION_ENV);
         self.envs
             .push((DECISION_ENV.to_string(), decision_env_value(on).to_string()));
+        self
+    }
+
+    /// Adds/replaces the Fact Guard X1 variables (`CSQ_LAUNCH_RECEIPT` and the
+    /// per-launch `GH_CONFIG_DIR`) in the fixed allowlist. Everything else in the
+    /// allowlist is untouched: the child still receives a closed environment,
+    /// never the parent's. A key already present is replaced, not duplicated.
+    #[must_use]
+    pub fn with_env_overlay(mut self, overlay: &[(String, String)]) -> Self {
+        for (key, value) in overlay {
+            self.envs.retain(|(existing, _)| existing != key);
+            self.envs.push((key.clone(), value.clone()));
+        }
         self
     }
 }
@@ -510,7 +627,9 @@ pub fn execute_plan(plan: SpawnPlan) -> std::io::Result<std::convert::Infallible
             });
         }
         // exec replaces the current process. Returns only on error.
-        Err(cmd.exec())
+        let err = cmd.exec();
+        crate::platform::process::restore_sigpipe_after_failed_exec();
+        Err(err)
     }
 
     #[cfg(not(unix))]
@@ -629,9 +748,10 @@ pub fn execute_plan_as_child_piped(plan: SpawnPlan) -> std::io::Result<std::proc
 }
 
 /// End-to-end spawn entry. Composes [`build_spawn_plan`] +
-/// [`execute_plan`]. The ONLY caller of this function is csq-cli's
-/// `run` command — desktop callers should also funnel through here
-/// rather than reimplementing.
+/// [`execute_plan`]. Session launches reach gemini-cli through csq-cli's
+/// gemini launch path (which wraps this entry in the layer dispatch);
+/// desktop callers should also funnel through here rather than
+/// reimplementing.
 ///
 /// # Side effects
 ///
@@ -653,13 +773,20 @@ pub fn spawn_gemini(
     vault: &dyn Vault,
     messaging_on: bool,
 ) -> Result<std::convert::Infallible, SpawnError> {
-    let parent_env: HashMap<String, String> = std::env::vars().collect();
+    let parent_env = inherited_env_utf8();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     // The shared home resolver (`HOME` is usually unset on Windows), the same one the
     // gemini OAuth writer, the usage poller and the headless check use.
     let home = crate::platform::home::home_dir();
 
-    let plan = build_spawn_plan(
+    // an internal ticket: every session launch gets its own 0700 TMPDIR under the
+    // terminal handle dir. Created BEFORE the plan so a failure refuses the
+    // launch (fixed tag) instead of letting gemini-cli fall back to the shared
+    // system temp dir.
+    let tmpdir = crate::session::tmpdir::ensure_session_tmpdir(handle_dir)
+        .map_err(|_tag| SpawnError::SessionTmpdirUnavailable)?;
+
+    let plan = build_spawn_plan_with_tmpdir(
         base_dir,
         handle_dir,
         slot,
@@ -668,14 +795,29 @@ pub fn spawn_gemini(
         home.as_deref(),
         vault,
         args,
+        &tmpdir,
     )?
     .with_messaging_decision(messaging_on);
 
-    // execute_plan returns Infallible on success path (exec or
-    // exit). Map io::Error to a synthesized Vault-shaped error so
-    // the caller has a typed return — but in practice the unix
-    // branch returns Err(io_error) only when exec failed (binary
-    // missing, etc.).
+    execute_spawn_plan(plan)
+}
+
+/// The inherited environment as UTF-8 pairs. `std::env::vars()` panics on a
+/// non-UTF-8 entry; the plan builder takes a `String` map, so an unrepresentable
+/// entry is dropped (it can never match the fixed allowlist's key set).
+fn inherited_env_utf8() -> HashMap<String, String> {
+    crate::env::utf8_env_map(std::env::vars_os())
+}
+
+/// [`execute_plan`] with the io failure mapped to the caller-actionable
+/// [`SpawnError`] shape every `csq run` gemini path already surfaces. Lets a
+/// caller build the plan, run a pre-exec step (Fact Guard X1's receipt and
+/// guard-manifest check), and only then hand the SAME plan to exec.
+pub fn execute_spawn_plan(plan: SpawnPlan) -> Result<std::convert::Infallible, SpawnError> {
+    // execute_plan returns Infallible on the success path (exec or exit). Map
+    // io::Error to a synthesized Provision error so the caller has a typed
+    // return — in practice the unix branch returns Err only when exec failed
+    // (binary missing, etc.).
     match execute_plan(plan) {
         // `never` is `Infallible`: no value of it exists, so this arm cannot run.
         // An empty `match` says so directly; rebuilding `Ok(never)` instead made
@@ -699,6 +841,26 @@ mod tests {
         let mut f = std::fs::File::create(&p).unwrap();
         f.write_all(content.as_bytes()).unwrap();
         p
+    }
+
+    /// R1 C7: `std::env::vars()` panics on a non-UTF-8 entry; the map the plan
+    /// builder consumes drops it instead. (`vars()` itself is never called, so
+    /// this instrument reddens only if the helper starts panicking/lossy-keeping.)
+    #[cfg(unix)]
+    #[test]
+    fn env_utf8_map_drops_a_non_utf8_entry() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad_name = std::ffi::OsString::from_vec(b"GEMINI_\xff".to_vec());
+        let bad_value = std::ffi::OsString::from_vec(b"\xff".to_vec());
+        let map = crate::env::utf8_env_map(vec![
+            (bad_name, bad_value),
+            (
+                std::ffi::OsString::from("GEMINI_OK"),
+                std::ffi::OsString::from("kept"),
+            ),
+        ]);
+        assert_eq!(map.get("GEMINI_OK").map(String::as_str), Some("kept"));
+        assert_eq!(map.len(), 1, "{map:?}");
     }
 
     #[test]
@@ -856,6 +1018,7 @@ mod tests {
             &parent,
             handle,
             Some(("GEMINI_API_KEY", "AIzaFAKETESTKEYDONOTUSE0000000000000000")),
+            None,
         );
 
         let map: HashMap<_, _> = env.iter().cloned().collect();
@@ -881,7 +1044,12 @@ mod tests {
         let mut parent = HashMap::new();
         parent.insert("HOME".into(), "/home/u".into());
 
-        let env = prepare_env(&parent, Path::new("/tmp/x"), Some(("GEMINI_API_KEY", "k")));
+        let env = prepare_env(
+            &parent,
+            Path::new("/tmp/x"),
+            Some(("GEMINI_API_KEY", "k")),
+            None,
+        );
         let map: HashMap<_, _> = env.iter().cloned().collect();
         assert!(!map.contains_key("PATH"));
         assert!(!map.contains_key("XDG_RUNTIME_DIR"));
@@ -899,7 +1067,7 @@ mod tests {
         parent.insert("HOME".into(), "/home/u".into());
         parent.insert("PATH".into(), "/usr/bin".into());
 
-        let env = prepare_env(&parent, Path::new("/tmp/term-1234"), None);
+        let env = prepare_env(&parent, Path::new("/tmp/term-1234"), None, None);
         let map: HashMap<_, _> = env.iter().cloned().collect();
         assert_eq!(map.get("HOME").unwrap(), "/home/u");
         assert_eq!(map.get("GEMINI_CLI_HOME").unwrap(), "/tmp/term-1234");
@@ -910,6 +1078,43 @@ mod tests {
         assert!(
             !map.contains_key("GOOGLE_APPLICATION_CREDENTIALS"),
             "OAuth mode must not inject GOOGLE_APPLICATION_CREDENTIALS"
+        );
+    }
+
+    /// an internal ticket AC4: the caller-supplied session TMPDIR wins over a
+    /// parent-shell `TMPDIR`, which the allowlist never forwards at all.
+    #[test]
+    fn prepare_env_carries_the_session_tmpdir_not_the_parent_one() {
+        let mut parent = HashMap::new();
+        parent.insert("HOME".into(), "/home/u".into());
+        parent.insert("TMPDIR".into(), "/shared/system/tmp".into());
+
+        let env = prepare_env(
+            &parent,
+            Path::new("/tmp/term-1234"),
+            None,
+            Some(Path::new("/tmp/term-1234/tmp")),
+        );
+        let map: HashMap<_, _> = env.iter().cloned().collect();
+        assert_eq!(map.get("TMPDIR").unwrap(), "/tmp/term-1234/tmp");
+        assert_eq!(
+            env.iter().filter(|(k, _)| k == "TMPDIR").count(),
+            1,
+            "one TMPDIR entry: a duplicate would make last-wins ambiguous"
+        );
+    }
+
+    /// No production caller passes `None`; when it is absent the parent's
+    /// `TMPDIR` still must not slip into the allowlist.
+    #[test]
+    fn prepare_env_without_a_session_tmpdir_drops_the_parent_one() {
+        let mut parent = HashMap::new();
+        parent.insert("TMPDIR".into(), "/shared/system/tmp".into());
+
+        let env = prepare_env(&parent, Path::new("/tmp/x"), None, None);
+        assert!(
+            env.iter().all(|(k, _)| k != "TMPDIR"),
+            "an allowlist without a session TMPDIR must not forward the parent's"
         );
     }
 
@@ -1005,6 +1210,121 @@ mod tests {
         assert_eq!(plan.binary, "gemini");
         assert_eq!(plan.args, vec!["-p".to_string(), "ping".to_string()]);
         assert_eq!(plan.handle_dir, handle);
+    }
+
+    /// an internal ticket AC1/AC4: a session-launch plan carries the CALLER's
+    /// `<handle_dir>/tmp` as `TMPDIR`, and a `TMPDIR` exported by the parent
+    /// shell never reaches the child. Falsifier: before the allowlist gained
+    /// `TMPDIR`, the child could only inherit the shared system temp dir (or
+    /// nothing, under `env_clear`).
+    #[test]
+    fn build_plan_with_tmpdir_carries_the_session_tmpdir_and_never_the_parent_one() {
+        let dir = TempDir::new().unwrap();
+        let handle = dir.path().join("term-1234");
+        std::fs::create_dir_all(&handle).unwrap();
+        let cwd = dir.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let vault = InMemoryVault::new();
+        provision_api_key(
+            dir.path(),
+            &vault,
+            3,
+            "gemini-2.5-pro",
+            "AIzaFAKETESTKEYDONOTUSE0000000000000000",
+        );
+        let mut parent = empty_parent_env();
+        parent.insert("TMPDIR".into(), "/shared/system/tmp".into());
+        let tmpdir = handle.join("tmp");
+        std::fs::create_dir(&tmpdir).unwrap();
+
+        let plan = build_spawn_plan_with_tmpdir(
+            dir.path(),
+            &handle,
+            slot(3),
+            &parent,
+            &cwd,
+            Some(dir.path()),
+            &vault,
+            vec![],
+            &tmpdir,
+        )
+        .unwrap();
+
+        let map: HashMap<_, _> = plan.envs.iter().cloned().collect();
+        assert_eq!(
+            map.get("TMPDIR").map(String::as_str),
+            Some(tmpdir.to_string_lossy().as_ref()),
+            "the caller-supplied session TMPDIR must be the child's"
+        );
+        assert_ne!(
+            map.get("TMPDIR").map(String::as_str),
+            Some("/shared/system/tmp"),
+            "a parent TMPDIR must never be forwarded"
+        );
+        assert_eq!(
+            plan.envs.iter().filter(|(k, _)| k == "TMPDIR").count(),
+            1,
+            "one TMPDIR entry: a duplicate would make last-wins ambiguous"
+        );
+    }
+
+    /// The layer-on builder carries the same session `TMPDIR` (an internal ticket):
+    /// the WithLayer launch path must not lose it.
+    #[test]
+    fn build_plan_with_system_instruction_and_tmpdir_carries_the_session_tmpdir() {
+        let dir = TempDir::new().unwrap();
+        let handle = dir.path().join("term-1234");
+        std::fs::create_dir_all(&handle).unwrap();
+        let cwd = dir.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let vault = InMemoryVault::new();
+        provision_api_key(dir.path(), &vault, 3, "gemini-2.5-pro", "k");
+        let tmpdir = handle.join("tmp");
+        std::fs::create_dir(&tmpdir).unwrap();
+
+        let plan = build_spawn_plan_with_system_instruction_and_tmpdir(
+            dir.path(),
+            &handle,
+            slot(3),
+            &empty_parent_env(),
+            &cwd,
+            Some(dir.path()),
+            &vault,
+            vec![],
+            None,
+            &tmpdir,
+        )
+        .unwrap();
+
+        let map: HashMap<_, _> = plan.envs.iter().cloned().collect();
+        assert_eq!(
+            map.get("TMPDIR").map(String::as_str),
+            Some(tmpdir.to_string_lossy().as_ref())
+        );
+    }
+
+    /// an internal ticket AC1: the end-to-end session entry refuses with the fixed
+    /// tag when the per-session TMPDIR cannot be created — and does so BEFORE
+    /// reading the binding or the vault, so the refusal is a pure launch
+    /// refusal with no fallback to the shared `$TMPDIR`.
+    #[test]
+    fn spawn_gemini_refuses_with_the_fixed_tag_on_a_tmpdir_creation_failure() {
+        let dir = TempDir::new().unwrap();
+        let handle = dir.path().join("term-1");
+        std::fs::create_dir(&handle).unwrap();
+        std::fs::write(handle.join("tmp"), b"not a directory").unwrap();
+        let vault = InMemoryVault::new();
+
+        let error = spawn_gemini(dir.path(), &handle, slot(3), vec![], &vault, false)
+            .expect_err("a TMPDIR creation failure must refuse the spawn");
+        assert!(
+            matches!(error, SpawnError::SessionTmpdirUnavailable),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.error_kind_tag(),
+            crate::session::tmpdir::SESSION_TMPDIR_TAG
+        );
     }
 
     #[test]
@@ -1326,6 +1646,7 @@ mod tests {
             })
             .error_kind_tag(),
             SpawnError::Vault(SecretError::Locked).error_kind_tag(),
+            SpawnError::SessionTmpdirUnavailable.error_kind_tag(),
         ];
         let unique: std::collections::HashSet<_> = tags.iter().collect();
         assert_eq!(unique.len(), tags.len(), "tag collision: {tags:?}");

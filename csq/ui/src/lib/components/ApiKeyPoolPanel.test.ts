@@ -4,7 +4,14 @@ import { tick } from 'svelte';
 import SettingsPopover from './SettingsPopover.svelte';
 
 const mockInvoke = vi.fn();
-vi.mock('@tauri-apps/api/core', () => ({ invoke: (...args: unknown[]) => mockInvoke(...args) }));
+// SettingsPopover also hosts AutoRotateSetting, which reads `get_rotation_config` on open. These tests drive
+// the pool panel with per-test `mockInvoke` handlers that know nothing about rotation, so that one command is
+// answered here with a well-formed config: otherwise the setting renders its own role="alert" read error and
+// every `getByRole('alert')` below finds two alerts.
+const rotationConfig = { enabled: false, threshold_percent: 95, cooldown_secs: 300, exclude_accounts: [] };
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: (cmd: string, ...rest: unknown[]) => (cmd === 'get_rotation_config' ? Promise.resolve(rotationConfig) : mockInvoke(cmd, ...rest)),
+}));
 vi.mock('@tauri-apps/api/path', () => ({ homeDir: async () => '/fixture', join: async (...parts: string[]) => parts.join('/') }));
 vi.mock('@tauri-apps/api/app', () => ({ getVersion: async () => 'fixture' }));
 const row = { name: 'pool.one', provider: 'anthropic', source: 'secret-store', reset: { day_of_month: 12 }, monthly_cap_usd: 20, added_at: '2026-10-11T00:00:00Z', present: true };
@@ -98,6 +105,13 @@ describe('API pool through closed settings → open settings', () => {
     expect((view.getByLabelText('API key') as HTMLInputElement).value).toBe('');
     expect(mockInvoke.mock.calls.filter(([cmd]) => cmd === 'pool_list')).toHaveLength(2);
     await waitFor(() => expect(view.queryByRole('status')).toBeNull());
+  });
+  it('offers reset days 1 through 31 (a shorter month resets on its last day)', async () => {
+    const view = await open();
+    await fireEvent.change(view.getByLabelText('Reset'), { target: { value: 'day' } });
+    const input = view.getByLabelText('Reset day') as HTMLInputElement;
+    expect(input.min).toBe('1');
+    expect(input.max).toBe('31');
   });
   it('clears keys on failures and dismissal and never renders or logs an arbitrary error body', async () => {
     const view = await open();

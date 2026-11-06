@@ -138,6 +138,22 @@ pub fn first_exemplar(detected: &BTreeSet<String>) -> Option<&str> {
     detected.iter().next().map(|s| s.as_str())
 }
 
+/// The inherited environment as UTF-8 pairs, dropping any entry whose NAME or
+/// VALUE is not UTF-8. The single implementation behind the launch paths'
+/// `vars_os` reads: `std::env::vars()` panics on a non-UTF-8 entry, and the
+/// plan builders take `String` pairs, so an unrepresentable entry is dropped
+/// (it can never match a `String` allowlist key set). Callers that must report
+/// what was dropped read [`crate::launch_isolation::scrub_os_env`]'s outcome,
+/// which classifies the raw `OsString` pairs.
+pub fn utf8_env_map<I>(vars: I) -> std::collections::HashMap<String, String>
+where
+    I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+{
+    vars.into_iter()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

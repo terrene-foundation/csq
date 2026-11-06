@@ -1393,6 +1393,13 @@ fn refuse_if_existing_handle_dir_live_with(
 /// A creator that cannot get the lock inside its bounded wait REFUSES, with a
 /// fixed message; it never creates a `term-<pid>` unlocked. Capture and exec
 /// dirs are not part of the sweep's contract and create unlocked, as before.
+///
+/// No directory MODE is set here, and none is needed (an internal ticket): the launch path
+/// secures the accounts root 0700 (`platform::fs::ensure_private_dir_root`)
+/// before any handle dir can exist, so another local user cannot traverse into
+/// a `term-<pid>` dir regardless of that dir's own umask-default mode. The
+/// per-session `tmp/` created inside it is separately 0700
+/// ([`super::tmpdir::ensure_session_tmpdir`]).
 fn create_term_dir_under_mint_lock(
     base_dir: &Path,
     dir_name: &str,
@@ -2995,9 +3002,35 @@ fn run_repoint_after_loop_hook_for_test(handle_dir: &Path) {
 /// `flock`s it, and on Unix/macOS `flock` is per-open-file-description, so
 /// re-`flock`-ing the SAME file from a second fd in one process blocks forever.
 /// The two lock files therefore MUST stay distinct (`.swap.lock` vs `.swap-lock`).
-fn repoint_lock_path(handle_dir: &Path) -> PathBuf {
+pub(crate) fn repoint_lock_path(handle_dir: &Path) -> PathBuf {
     let lock_dir = std::fs::canonicalize(handle_dir).unwrap_or_else(|_| handle_dir.to_path_buf());
     lock_dir.join(".swap.lock")
+}
+
+/// Attempts and delay of the BOUNDED repoint-lock wait taken by
+/// [`lock_repoint_bounded`]: 40 x 250 ms, an enforced ceiling of about 10 s
+/// (`try_lock_file_bounded`'s attempt count is the cap).
+const REPOINT_BOUND_ATTEMPTS: u32 = 40;
+const REPOINT_BOUND_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Takes the handle dir's repoint lock (`.swap.lock`) with a BOUND, on every
+/// platform. `Ok(None)` = still held when the bound ran out; the caller refuses
+/// and changes nothing. For a writer that must be ordered against the rotator's
+/// `lock_repoint_custody` (which takes the same file without a bound): callers
+/// MUST take the swap lock first and this one second, the rotator's own order,
+/// so no cycle is possible and every wait here is bounded.
+pub(crate) fn lock_repoint_bounded(
+    handle_dir: &Path,
+) -> Result<Option<crate::platform::lock::FileLockGuard>, crate::error::PlatformError> {
+    lock_repoint_bounded_with(handle_dir, REPOINT_BOUND_ATTEMPTS, REPOINT_BOUND_DELAY)
+}
+
+pub(crate) fn lock_repoint_bounded_with(
+    handle_dir: &Path,
+    attempts: u32,
+    delay: std::time::Duration,
+) -> Result<Option<crate::platform::lock::FileLockGuard>, crate::error::PlatformError> {
+    crate::platform::lock::try_lock_file_bounded(&repoint_lock_path(handle_dir), attempts, delay)
 }
 
 /// Atomically repoints the account-bound symlinks in a handle dir
@@ -9718,6 +9751,48 @@ mod tests {
         assert!(removed >= 1);
     }
 
+    /// The per-session auto-swap override (`rotation::session_override`) is a
+    /// REAL file inside the handle dir, deliberately NOT an `ACCOUNT_BOUND_ITEMS`
+    /// link: swap rewrites only those four names, so the override neither follows
+    /// an account nor is copied into `config-N/`.
+    #[test]
+    fn session_override_is_not_an_account_bound_item() {
+        let name = crate::rotation::session_override::OVERRIDE_FILE;
+        assert!(
+            !ACCOUNT_BOUND_ITEMS.contains(&name),
+            "{name} must never be repointed by a swap"
+        );
+    }
+
+    /// The override lives INSIDE the handle dir, so reaping a dead session
+    /// removes it with the dir; a later session reusing the number starts clean.
+    #[test]
+    fn sweep_removes_a_dead_handles_session_override_with_it() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+        let claude_home = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+
+        let dead = base.join("term-999999999");
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::write(dead.join(".live-pid"), "999999999").unwrap();
+        crate::rotation::session_override::write_override(
+            &dead,
+            crate::rotation::session_override::SessionRotationMode::On,
+        )
+        .unwrap();
+        assert!(dead
+            .join(crate::rotation::session_override::OVERRIDE_FILE)
+            .exists());
+
+        sweep_dead_handles(base, Some(&claude_home));
+
+        assert!(!dead.exists(), "the dead handle dir is reaped");
+        assert!(!dead
+            .join(crate::rotation::session_override::OVERRIDE_FILE)
+            .exists());
+    }
+
     // R1/KC4-9: a leftover pre-v4 `.keychain-account-change-pending` marker
     // in a LIVE (not dead) handle dir MUST be removed best-effort by the
     // sweep, even though the dir itself survives.
@@ -15331,6 +15406,85 @@ mod tests {
         let removed = sweep_dead_handles_inner(base.path(), None, |_| Ok(false));
         assert_eq!(removed, 1);
         assert!(!handle.exists());
+    }
+
+    // ── per-session `tmp/` reaped by containment (an internal ticket AC3) ────────────────
+    //
+    // A session's `TMPDIR` is `<handle dir>/tmp` (session::tmpdir). The reaper
+    // needs no `tmp`-specific code: it renames the whole handle dir to a
+    // tombstone and `remove_dir_all`s it, so `tmp/` and everything under it go
+    // with it. These tests pin that containment claim from the outside — the
+    // day the reaper learns to remove the handle dir piecemeal, they red.
+
+    /// A dead terminal with a populated `tmp/` is removed WHOLE: no temp file
+    /// survives the sweep and nothing is left behind under the accounts root.
+    #[test]
+    fn sweep_removes_a_dead_terminals_tmp_dir_with_its_handle_dir() {
+        let base = TempDir::new().unwrap();
+        // 999_999_9xx is above every supported platform's pid_max: dead by
+        // construction, exactly like the other pid literals in this module.
+        let handle = orphan_dir_with(base.path(), 999_999_041, "999999042", None);
+        let tmp = handle.join("tmp");
+        std::fs::create_dir_all(tmp.join("nested")).unwrap();
+        std::fs::write(tmp.join("scratch.txt"), "session temp").unwrap();
+        std::fs::write(tmp.join("nested").join("scratch.txt"), "session temp").unwrap();
+
+        let removed = sweep_dead_handles_inner(base.path(), None, |_| Ok(false));
+
+        assert_eq!(removed, 1, "the dead terminal must be reaped");
+        assert!(!tmp.exists(), "tmp/ must go with the handle dir");
+        assert!(
+            std::fs::read_dir(base.path()).unwrap().next().is_none(),
+            "handle dir and every temp file under tmp/ must be fully removed"
+        );
+    }
+
+    /// A LIVE terminal's `tmp/` is never touched: the liveness gate runs before
+    /// anything inside the handle dir is removed, so unsaved temp work survives.
+    #[test]
+    fn sweep_keeps_a_live_terminals_tmp_dir() {
+        let base = TempDir::new().unwrap();
+        let me = std::process::id();
+        let handle = orphan_dir_with(base.path(), 999_999_043, &me.to_string(), None);
+        let tmp = handle.join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("scratch.txt"), "unsaved").unwrap();
+
+        let removed = sweep_dead_handles_inner(base.path(), None, |_| Ok(false));
+
+        assert_eq!(removed, 0);
+        assert!(
+            tmp.join("scratch.txt").exists(),
+            "a live terminal's tmp/ contents must survive the sweep"
+        );
+    }
+
+    /// Fail-closed: an UNREADABLE liveness marker means "possibly live", so the
+    /// sweep keeps the handle dir AND its `tmp/` (the existing `continue`, now
+    /// covering the temp tree too).
+    #[test]
+    fn sweep_keeps_a_tmp_dir_when_the_liveness_state_is_unreadable() {
+        for marker in [".live-pid", ".live-cc-pid"] {
+            for kind in ["dir", "oversized"] {
+                let base = TempDir::new().unwrap();
+                let handle = orphan_dir_with(base.path(), 999_999_045, "999999046", None);
+                let tmp = handle.join("tmp");
+                std::fs::create_dir_all(&tmp).unwrap();
+                std::fs::write(tmp.join("scratch.txt"), "keep").unwrap();
+                if marker == ".live-pid" {
+                    std::fs::remove_file(handle.join(marker)).unwrap();
+                }
+                plant_unreadable(&handle.join(marker), kind);
+
+                let removed = sweep_dead_handles_inner(base.path(), None, |_| Ok(false));
+
+                assert_eq!(removed, 0, "{marker} {kind}");
+                assert!(
+                    tmp.join("scratch.txt").exists(),
+                    "{marker} {kind}: an unreadable liveness state must keep tmp/"
+                );
+            }
+        }
     }
 
     #[test]

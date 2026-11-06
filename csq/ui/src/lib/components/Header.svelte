@@ -3,11 +3,7 @@
   import { getVersion } from '@tauri-apps/api/app';
   import { homeDir, join } from '@tauri-apps/api/path';
   import SettingsPopover from './SettingsPopover.svelte';
-
-  interface KeychainOrphansView {
-    level: 'ok' | 'info' | 'warn' | 'needs_action';
-    summary: string;
-  }
+  import KeychainOrphansChip, { type KeychainOrphansView } from './KeychainOrphansChip.svelte';
 
   interface DaemonStatusView {
     running: boolean;
@@ -115,15 +111,7 @@
       <span class="status-label">{daemonRunning ? 'Running' : 'Stopped'}</span>
     </div>
     {#if orphans && (orphans.level === 'warn' || orphans.level === 'needs_action')}
-      <span
-        class="orphans"
-        class:needs-action={orphans.level === 'needs_action'}
-        title={orphans.summary}
-        aria-label={orphans.summary}
-        data-testid="keychain-orphans"
-      >
-        {orphans.level === 'needs_action' ? 'Keychain: action needed' : 'Keychain: orphans'}
-      </span>
+      <KeychainOrphansChip {orphans} />
     {/if}
     <SettingsPopover {daemonRunning} />
   </div>
@@ -216,14 +204,5 @@
   }
   .status-label {
     white-space: nowrap;
-  }
-  .orphans {
-    font-size: 0.72rem;
-    color: var(--text-secondary);
-    white-space: nowrap;
-  }
-  .orphans.needs-action {
-    color: var(--red);
-    font-weight: 600;
   }
 </style>

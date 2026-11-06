@@ -31,23 +31,81 @@ impl Surface {
     }
 }
 
+/// Which kind of identity sent a stored message (design an internal ticket §5).
+///
+/// This is the MESSAGING-local surface: it adds [`Self::Service`] to the two CLI surfaces.
+/// [`Surface`] stays the app-wide "which CLI" concept (accounts, providers, desktop); a
+/// service is not a CLI and never becomes one. The two session serde names are unchanged,
+/// so every stored session record and the inbox wire stay byte-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SenderSurface {
+    /// A Claude Code session.
+    #[serde(rename = "claude-code")]
+    ClaudeCode,
+    /// A Codex session.
+    #[serde(rename = "codex")]
+    Codex,
+    /// A registered service identity: not a session, no process, no inbox.
+    #[serde(rename = "service")]
+    Service,
+}
+
+impl SenderSurface {
+    /// The wire name, as in the frame header and inbox row.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code",
+            Self::Codex => "codex",
+            Self::Service => "service",
+        }
+    }
+}
+
+impl From<Surface> for SenderSurface {
+    fn from(surface: Surface) -> Self {
+        match surface {
+            Surface::ClaudeCode => Self::ClaudeCode,
+            Surface::Codex => Self::Codex,
+        }
+    }
+}
+
+/// The registered service a [`Sender`] stands for (design an internal ticket §5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceRef {
+    /// The registered name (grammar-checked at registration and re-checked on load).
+    pub name: String,
+    /// The registration this message was sent under. A re-registration mints a new one, so
+    /// idempotency and rate accounting never carry across identities.
+    pub registration_id: String,
+}
+
 /// The sending session. Built only from the identity the caller resolved (INV-32-01); the
 /// store never takes a sender from message text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sender {
     /// Process id of the CLI process.
     pub pid: u32,
-    /// OS process start time, unix seconds.
+    /// OS process start time, unix seconds. For a service this is the registration's
+    /// `created_at` (there is no process); the field exists so the record stays schema-valid.
     pub started_at: u64,
-    /// Which CLI.
-    pub surface: Surface,
+    /// Which kind of identity sent the message.
+    pub surface: SenderSurface,
     /// Hash of the canonical handle dir (the only form of it that may reach a wire).
+    /// Empty for a service (no handle dir).
     pub handle_dir_hash: String,
-    /// The handle dir itself: stored, never on a wire.
+    /// The handle dir itself: stored, never on a wire. Empty for a service.
     pub handle_dir: String,
     /// Optional session name; excluded from every limit key so a rename frees nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The registered service this sender stands for, present exactly when `surface` is
+    /// [`SenderSurface::Service`]. Absent from every session record, so their on-disk shape
+    /// is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<ServiceRef>,
     /// Full-precision start ([`crate::sessions::ancestor_start`]; units differ per
     /// platform) read at the moment the session was identified. Stored, never on a wire:
     /// the Codex wake requires it to equal the listed value, which tells apart two
@@ -65,6 +123,7 @@ pub struct Sender {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedSession {
     sender: Sender,
+    recipient: Recipient,
 }
 
 impl VerifiedSession {
@@ -73,8 +132,21 @@ impl VerifiedSession {
     /// test `from_resolved_has_no_production_caller_outside_the_resolver` greps the
     /// production source of both crates for it. Read-only paths take a plain [`Recipient`]
     /// (`store::pending_count`) and never build one of these.
+    ///
+    /// A `VerifiedSession` is a SESSION by construction: no production surface wraps a
+    /// service sender (the service send path passes its [`Sender`] to `do_send_core`
+    /// directly, never here). If a caller ever did, the stored address is the zero
+    /// pid/start with the Claude surface — an address no live session can occupy — so
+    /// nothing can be addressed to it. It is a fail-closed placeholder, never a guessed
+    /// surface for a service.
     pub(crate) fn from_resolved(sender: Sender) -> Self {
-        Self { sender }
+        let recipient = sender.as_recipient().unwrap_or(Recipient {
+            pid: 0,
+            started_at: 0,
+            surface: Surface::ClaudeCode,
+            started_exact: None,
+        });
+        Self { sender, recipient }
     }
 
     /// The handle dir this session was proved to run in: where its own name is stored.
@@ -98,7 +170,7 @@ impl VerifiedSession {
     /// This session as an addressable `(pid, started_at, surface)`.
     #[must_use]
     pub fn as_recipient(&self) -> Recipient {
-        self.sender.as_recipient()
+        self.recipient
     }
 }
 
@@ -130,14 +202,42 @@ impl Recipient {
 }
 
 impl Sender {
-    /// The sender as an addressable session.
+    /// The sender as an addressable session. `None` for a service: it has no process
+    /// identity and no inbox, so callers MUST refuse rather than fabricate an address
+    /// (design an internal ticket §5).
     #[must_use]
-    pub fn as_recipient(&self) -> Recipient {
-        Recipient {
+    pub fn as_recipient(&self) -> Option<Recipient> {
+        let surface = match self.surface {
+            SenderSurface::ClaudeCode => Surface::ClaudeCode,
+            SenderSurface::Codex => Surface::Codex,
+            SenderSurface::Service => return None,
+        };
+        if self.service.is_some() {
+            return None;
+        }
+        Some(Recipient {
             pid: self.pid,
             started_at: self.started_at,
-            surface: self.surface,
+            surface,
             started_exact: self.started_exact,
+        })
+    }
+
+    /// Whether `other` is this same logical sender for rate/pending accounting.
+    ///
+    /// Sessions compare as `(pid, started_at)` within the `same_start` tolerance (a pid is
+    /// reused). Services compare as `(name, registration_id)`: a re-registration is a NEW
+    /// identity with its own quota and its own idempotency space, exactly as its new
+    /// `registration_id` implies.
+    #[must_use]
+    pub fn same_identity(&self, other: &Sender) -> bool {
+        match (&self.service, &other.service) {
+            (Some(a), Some(b)) => a.name == b.name && a.registration_id == b.registration_id,
+            (None, None) => match (self.as_recipient(), other.as_recipient()) {
+                (Some(a), Some(b)) => a.same_session(&b),
+                _ => false,
+            },
+            (Some(_), None) | (None, Some(_)) => false,
         }
     }
 }
@@ -151,6 +251,11 @@ impl Sender {
 /// is the HMAC the daemon holds the key for. A render MAY show the owner header only
 /// after the daemon re-verified that mac for that exact body
 /// ([`frame::OriginAuthority`]); the origin field alone never earns it.
+///
+/// [`Origin::Service`] is written only by the daemon's service-send route through
+/// `store::send_service` (crate-internal) after the registry record was validated. A
+/// render always shows it as `service:<name>` — never as a session, never as an approval,
+/// and never with the owner header.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Origin {
     /// An ordinary cross-CLI peer message. Also what every record written before this
@@ -165,6 +270,16 @@ pub enum Origin {
         tg_message_id: i64,
         /// HMAC-SHA256 over the attested fields, lowercase hex.
         mac: String,
+    },
+    /// A registered service identity sent the message (design an internal ticket). Written ONLY by the
+    /// daemon's `/api/message/send-service` route from the registry record: no CLI or MCP
+    /// parameter carries an origin, so a session-facing surface cannot produce this
+    /// variant. A service is not a session and never an approval.
+    Service {
+        /// The registered name (grammar-checked).
+        name: String,
+        /// The registration this message was sent under.
+        registration_id: String,
     },
 }
 
@@ -183,9 +298,10 @@ impl Origin {
     }
 
     /// A stored record's origin must be structurally sane: the attestation mac is
-    /// ASCII alphanumerics of bounded length. Content is never checked against the key
-    /// here (this runs on every load, including lock-free reads); the daemon verifies at
-    /// render time.
+    /// ASCII alphanumerics of bounded length, and a service origin names a grammar-valid
+    /// service with a canonical UUIDv4 registration. Content is never checked against the
+    /// key here (this runs on every load, including lock-free reads); the daemon verifies
+    /// at render time.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
         match self {
@@ -194,6 +310,13 @@ impl Origin {
                 !mac.is_empty()
                     && mac.chars().count() <= super::limits::MAX_HASH_CHARS
                     && mac.chars().all(|c| c.is_ascii_alphanumeric())
+            }
+            Self::Service {
+                name,
+                registration_id,
+            } => {
+                super::service::validate_service_name(name).is_ok()
+                    && super::service::is_registration_id(registration_id)
             }
         }
     }
@@ -243,11 +366,37 @@ pub fn owner_sender() -> Sender {
     Sender {
         pid: 0,
         started_at: 0,
-        surface: Surface::ClaudeCode,
+        surface: SenderSurface::ClaudeCode,
         handle_dir_hash: "owner".to_string(),
         handle_dir: String::new(),
         name: None,
         started_exact: None,
+        service: None,
+    }
+}
+
+/// The synthetic sender block a service-origin record carries (design an internal ticket §5).
+///
+/// A service is not a process: pid `0` can never be a live session, `started_at` is the
+/// registration's `created_at`, the start is never "exact", and the handle fields are
+/// empty. Provenance lives in [`Message::origin`]; every render keys off that field (and
+/// cross-checks this block), never off the pid. `pub(crate)`: only the daemon's service
+/// send path builds one, from a record [`super::service::load`] already validated.
+#[cfg_attr(not(unix), allow(dead_code))] // the only production caller is the Unix-only service route
+#[must_use]
+pub(crate) fn service_sender(record: &super::service::ServiceRecord) -> Sender {
+    Sender {
+        pid: 0,
+        started_at: record.created_at,
+        surface: SenderSurface::Service,
+        handle_dir_hash: String::new(),
+        handle_dir: String::new(),
+        name: None,
+        started_exact: None,
+        service: Some(ServiceRef {
+            name: record.name.clone(),
+            registration_id: record.registration_id.clone(),
+        }),
     }
 }
 
@@ -393,7 +542,13 @@ impl Message {
             in_reply_to: self.in_reply_to.clone(),
             from_surface: self.from.surface,
             from_pid: self.from.pid,
-            from_name: self.from.name.as_deref().and_then(frame::safe_name),
+            service_origin: matches!(self.origin, Origin::Service { .. }),
+            from_name: match &self.from.service {
+                // The registered name is grammar-checked on load; `safe_name` is the
+                // belt-and-braces sanitiser for a hand-edited record.
+                Some(service) => frame::safe_name(&service.name),
+                None => self.from.name.as_deref().and_then(frame::safe_name),
+            },
             status: self.status(),
             created_at: self.created_at,
             surfaced_at: self.surfaced_at,
@@ -448,10 +603,16 @@ pub struct MessageView {
     /// The message this answers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<String>,
-    /// The sender's CLI.
-    pub from_surface: Surface,
+    /// The sender's identity kind (`claude-code`, `codex`, or `service`).
+    pub from_surface: SenderSurface,
     /// The sender's pid.
     pub from_pid: u32,
+    /// The record's ORIGIN says a registered service authored it. Readers that show or
+    /// address the sender MUST consult this flag (via [`MessageView::is_service_sender`])
+    /// as well as the surface: a malformed record can claim a session surface, and a
+    /// service has no process identity to print. Never a wire field.
+    #[serde(skip)]
+    pub service_origin: bool,
     /// The sender's name, sanitised and capped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from_name: Option<String>,
@@ -481,6 +642,20 @@ pub struct MessageView {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+impl MessageView {
+    /// True when this record must never be presented with a session's process shape.
+    ///
+    /// The ORIGIN flag is the authority: a record a registered service authored is a
+    /// service even when its sender block disagrees (the render path withholds such a
+    /// record rather than printing it as a peer). The surface arm keeps a record that
+    /// merely CLAIMS `service` from printing a session shape, matching the frame's
+    /// `service:<invalid>` treatment. Every sender-showing reader uses this one predicate.
+    #[must_use]
+    pub fn is_service_sender(&self) -> bool {
+        self.service_origin || self.from_surface == SenderSurface::Service
+    }
 }
 
 #[cfg(test)]
@@ -631,6 +806,55 @@ mod tests {
             production_source(real).contains("from_resolved("),
             "the walk must still see a real production call"
         );
+    }
+
+    /// Falsifiers: a service acquiring an address, a re-registration matching the old
+    /// identity, or a service comparing equal to a session would each flip an assertion.
+    #[test]
+    fn a_service_sender_has_no_address_and_is_keyed_by_its_registration() {
+        let record = crate::messaging::service::ServiceRecord {
+            v: 1,
+            name: "nightly".to_string(),
+            uid: 7,
+            registration_id: "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".to_string(),
+            created_at: 9,
+        };
+        let sender = service_sender(&record);
+        assert_eq!(sender.surface, SenderSurface::Service);
+        assert!(sender.as_recipient().is_none(), "a service has no address");
+        assert!(sender.same_identity(&sender));
+        let mut reregistered = sender.clone();
+        reregistered.service.as_mut().unwrap().registration_id =
+            "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4e".to_string();
+        assert!(
+            !sender.same_identity(&reregistered),
+            "a re-registration is a new identity"
+        );
+        assert!(!sender.same_identity(&owner_sender()));
+        assert!(owner_sender().as_recipient().is_some());
+    }
+
+    #[test]
+    fn a_service_origin_is_well_formed_only_with_the_registered_shapes() {
+        let well_formed = Origin::Service {
+            name: "nightly".to_string(),
+            registration_id: "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".to_string(),
+        };
+        assert!(well_formed.is_well_formed());
+        assert!(!well_formed.is_peer() && !well_formed.claims_owner());
+        for bad in [
+            // A reserved name can never have been registered.
+            Origin::Service {
+                name: "claude-code".to_string(),
+                registration_id: "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".to_string(),
+            },
+            Origin::Service {
+                name: "nightly".to_string(),
+                registration_id: "not-a-uuid".to_string(),
+            },
+        ] {
+            assert!(!bad.is_well_formed(), "{bad:?}");
+        }
     }
 
     #[test]

@@ -146,17 +146,36 @@ pub fn handle(base_dir: &Path) -> Result<()> {
     let shared_sign_in = csq_core::accounts::launch_block::status_segment(base_dir, account.get());
     // Archive badge: cheap file checks only (no launchctl spawn on the render path).
     let archive = archive_segment(base_dir, std::time::SystemTime::now());
-    let line = [Some(line), shared_sign_in, notice, messages, archive]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" ");
+    // Child-process memory warning (spec 36): one bounded read of the file the
+    // supervisor writes; absent/stale/unreadable renders nothing and never blocks.
+    let memory = memory_status(&config_dir);
+    let line = join_segments([
+        Some(line),
+        shared_sign_in,
+        notice,
+        messages,
+        archive,
+        memory,
+    ]);
     // Sticky login-needed state gets its OWN line, explicitly distinct from
     // the quota line above (`diagnostic-surface-parity.md` MUST NOT 4). The
     // check is a sentinel-file probe: no credential read, no keychain read,
     // no network — and no write (the render never clears it).
     write_output_lines(base_dir, account, &line, &mut std::io::stdout())?;
     Ok(())
+}
+
+/// The child-process memory warning for this terminal, `None` unless a fresh `warn` sample exists.
+fn memory_status(config_dir: &Path) -> Option<String> {
+    csq_core::session::recycle::statusline_segment(
+        config_dir,
+        &csq_core::session::recycle::now_rfc3339(),
+    )
+}
+
+/// Joins the present segments with single spaces, in display order.
+fn join_segments(parts: [Option<String>; 6]) -> String {
+    parts.into_iter().flatten().collect::<Vec<_>>().join(" ")
 }
 
 /// The `handle` stdout step: the main statusline line, then — when present —
@@ -2216,5 +2235,40 @@ mod tests {
         let line = line.expect("rich line");
         assert!(line.contains("| $?"), "{line}");
         assert!(!line.contains("9.99"), "{line}");
+    }
+}
+
+#[cfg(test)]
+mod memory_segment_tests {
+    use super::*;
+    use csq_core::session::recycle::{memory_record, now_rfc3339, write_memory};
+
+    /// The statusline reads the file the supervisor writes and composes it LAST (spec 36 §36.9).
+    #[test]
+    fn the_composed_line_carries_the_supervisor_written_warning() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(memory_status(d.path()), None);
+        write_memory(
+            d.path(),
+            &memory_record(Ok(3 << 30), 5 << 29, &now_rfc3339()),
+        )
+        .unwrap();
+        let mem = memory_status(d.path());
+        assert_eq!(mem.as_deref(), Some("[mem 3.0G: recycle]"));
+        let line = join_segments([
+            Some("acct 1".into()),
+            None,
+            Some("[directives: ?]".into()),
+            None,
+            None,
+            mem,
+        ]);
+        assert_eq!(line, "acct 1 [directives: ?] [mem 3.0G: recycle]");
+        write_memory(
+            d.path(),
+            &memory_record(Ok(1 << 30), 5 << 29, &now_rfc3339()),
+        )
+        .unwrap();
+        assert_eq!(memory_status(d.path()), None, "ok state shows nothing");
     }
 }

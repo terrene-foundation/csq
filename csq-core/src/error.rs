@@ -889,6 +889,15 @@ pub enum ConfigError {
     #[error("invalid JSON in {path}: {reason}")]
     InvalidJson { path: PathBuf, reason: String },
 
+    /// The writer lock of a settings file could not be taken: another writer
+    /// holds it, or the lock file is damaged (a symlink, foreign-owned, or with
+    /// group/other permission bits). Nothing was read or written.
+    #[error(
+        "settings are locked by another writer, or the lock file {path} is damaged; \
+         if no other csq command is running, remove that file and retry"
+    )]
+    Locked { path: PathBuf },
+
     #[error("settings merge conflict in {key}")]
     MergeConflict { key: String },
 
@@ -936,6 +945,11 @@ impl ConfigError {
         match self {
             ConfigError::InvalidJson { path, reason } => format!(
                 "invalid JSON in {}: {reason}",
+                crate::cli_deps::sanitize::redact_path(path)
+            ),
+            ConfigError::Locked { path } => format!(
+                "settings are locked by another writer, or the lock file {} is damaged; \
+                 if no other csq command is running, remove that file and retry",
                 crate::cli_deps::sanitize::redact_path(path)
             ),
             other => other.to_string(),

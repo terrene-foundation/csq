@@ -14,10 +14,11 @@ fn session(pid: u32) -> VerifiedSession {
         pid,
         started_at: NOW - 10,
         started_exact: Some(NOW - 10),
-        surface: MessageSurface::ClaudeCode,
+        surface: MessageSurface::ClaudeCode.into(),
         handle_dir_hash: format!("handle{pid}"),
         handle_dir: format!("/private/term-{pid}"),
         name: None,
+        service: None,
     })
 }
 

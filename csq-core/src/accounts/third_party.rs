@@ -3355,8 +3355,34 @@ mod tests {
             let t_unbind =
                 std::thread::spawn(move || unbind_provider_from_slot(&base_unbind, slot));
 
-            t_bind.join().unwrap().expect("bind must succeed");
-            t_unbind.join().unwrap().expect("unbind must succeed");
+            // The credential lock is bounded (`CREDENTIAL_LOCK_BUDGET`) and its
+            // expiry REFUSES rather than waits. On a loaded host the holder can
+            // outlast the budget, so the loser may be refused; that is the
+            // contract, not a failure. Only that exact refusal is accepted, at
+            // least one side must succeed, and the file must stay valid JSON.
+            let budget_refusal = |e: &ConfigError| {
+                matches!(e, ConfigError::InvalidJson { path, reason }
+                    if path.ends_with("config-9/settings.lock")
+                        && reason.starts_with("lock: timed out after"))
+            };
+            let bound = t_bind.join().unwrap();
+            let unbound = t_unbind.join().unwrap();
+            if let Err(e) = &bound {
+                assert!(
+                    budget_refusal(e),
+                    "bind failed other than by the lock budget: {e:?}"
+                );
+            }
+            if let Err(e) = &unbound {
+                assert!(
+                    budget_refusal(e),
+                    "unbind failed other than by the lock budget: {e:?}"
+                );
+            }
+            assert!(
+                bound.is_ok() || unbound.is_ok(),
+                "one side must hold the lock and succeed"
+            );
 
             let settings_path = base.join("config-9/settings.json");
 

@@ -29,6 +29,10 @@ pub mod gate_status;
 pub mod inspect_coc;
 pub mod install;
 pub mod keychain_sync;
+/// Fact Guard X1 launch wiring: receipt, environment scrub, guard manifest and
+/// `--sandbox` on every `csq run` CLI arm. See the module doc for the split
+/// between `plan` (facts, no receipt) and `commit` (receipt + refusal).
+pub(crate) mod launch_x1;
 pub mod listkeys;
 pub mod login;
 pub mod logout;
@@ -44,12 +48,17 @@ pub mod probe;
 pub mod repair;
 pub mod rmkey;
 pub mod roster;
+pub mod rotation;
 pub mod run;
+pub mod session_recycle;
 pub mod sessions;
 pub mod sessions_directives;
 pub mod sessions_disk;
 pub mod sessions_list;
 pub mod sessions_messages;
+/// Registered service identities: `csq sessions service add|remove|list` and the
+/// `csq sessions send --service` transport (an internal ticket, spec 32h §11).
+pub mod sessions_service;
 pub mod setkey;
 pub mod status;
 pub mod statusline;

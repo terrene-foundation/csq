@@ -10,6 +10,11 @@ pub mod handle_dir;
 pub mod isolation;
 pub mod kimi_migration;
 pub mod merge;
+pub mod recycle;
+pub mod recycle_consent;
+pub mod recycle_foreign;
+#[cfg(unix)]
+pub mod recycle_supervise;
 pub mod settings;
 pub mod settings_diagnostics;
 pub mod settings_policy;
@@ -18,6 +23,7 @@ pub mod share_audit;
 pub mod shared_state;
 pub mod swap_session;
 pub mod term_mint;
+pub mod tmpdir;
 pub mod workspace_trust;
 
 pub use handle_dir::{

@@ -45,6 +45,7 @@ use crate::accounts::AccountSource;
 use crate::providers::catalog::Surface;
 use crate::quota::state as quota_state;
 use crate::rotation::config as rotation_config;
+use crate::rotation::session_override;
 use crate::session::handle_dir::repoint_handle_dir_guarded_locked;
 use crate::types::AccountNum;
 use std::collections::HashMap;
@@ -348,8 +349,9 @@ fn same_surface_as_active(active_surface: Surface, candidate_surface: Surface) -
 /// tokens AND the 3P `env.ANTHROPIC_BASE_URL` from `config-<N>/settings.json` —
 /// sending Anthropic OAuth tokens to a 3P endpoint (live token exfiltration).
 ///
-/// Returns `false` on any I/O or parse error (fail-safe: a missing or unparseable
-/// settings.json means no 3P binding — allow the rotation check to proceed).
+/// Fail-closed: an unreadable or unparseable settings.json counts as 3P
+/// ([`crate::providers::settings::SlotBaseUrlPin::Unknown`]), so the rotator
+/// skips; only an absent file or one without the key is "not 3P".
 fn handle_dir_is_3p(base_dir: &Path, current_account: AccountNum) -> bool {
     // Single source of truth for the env-transport discriminator: shared with
     // `cli::commands::swap`'s routing guard so the daemon rotator and the manual
@@ -416,6 +418,52 @@ fn run_pre_lock_test_hook() {
 
 #[cfg(not(test))]
 fn run_pre_lock_test_hook() {}
+
+// cfg(test) seam between the swap lock and the repoint lock (S2): a test that
+// publishes an `off` here models a writer that completed in that window. Runs
+// on every platform (the swap lock is `NotNeeded` off macOS).
+#[cfg(test)]
+thread_local! {
+    static PRE_CUSTODY_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_pre_custody_test_hook_for_test(hook: Option<Box<dyn FnMut()>>) {
+    PRE_CUSTODY_TEST_HOOK.with(|c| *c.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn run_pre_custody_test_hook() {
+    PRE_CUSTODY_TEST_HOOK.with(|c| {
+        if let Some(hook) = c.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_pre_custody_test_hook() {}
+
+/// True the FIRST time `(kind, path)` is reported by this process, false after:
+/// lets a per-tick condition that persists (an unreadable override, a handle
+/// dir failing admission) WARN once per directory instead of every tick. The
+/// set is capped; at the cap it is cleared, so a long-lived daemon re-warns
+/// rather than growing without bound.
+fn first_report(kind: &'static str, path: &Path) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    const CAP: usize = 1024;
+    static SEEN: OnceLock<Mutex<HashSet<(&'static str, PathBuf)>>> = OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if seen.len() >= CAP {
+        seen.clear();
+    }
+    seen.insert((kind, path.to_path_buf()))
+}
 
 /// Runs a single auto-rotation tick.
 ///
@@ -533,15 +581,26 @@ fn tick_with_deps(
     // take effect within one tick interval without restarting the daemon.
     let cfg = match rotation_config::load(base_dir) {
         Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "auto-rotation: failed to load rotation config, skipping tick");
+        Err(_) => {
+            // Unreadable rotation.json (spec 02 §2.7): the file carries the
+            // `exclude_accounts` policy, so rotate NOTHING this tick — not even
+            // a session whose own override is `on`. Fixed tag only: the error
+            // text embeds the path.
+            warn!(
+                error_kind = "auto_rotate_config_unreadable",
+                "auto-rotation: rotation config unreadable; no session is rotated this tick"
+            );
             return;
         }
     };
 
+    // The machine setting is only the DEFAULT: a session's own override
+    // (`rotation::session_override`, spec 02 §2.7) can turn it on while the
+    // machine is off, or off while the machine is on. So a disabled machine no
+    // longer ends the tick here; every handle dir is admitted below and each
+    // decides for itself (`session_override::rotates`).
     if !cfg.enabled {
-        debug!("auto-rotation disabled, skipping tick");
-        return;
+        debug!("auto-rotation: machine setting off, only sessions with an explicit 'on' are considered");
     }
 
     let cooldown_duration = Duration::from_secs(cfg.cooldown_secs);
@@ -559,6 +618,10 @@ fn tick_with_deps(
 
     let mut rotated = 0usize;
     let mut skipped = 0usize;
+    // Sessions that do not participate (override `off`/`unreadable`, or no
+    // override with the machine off) are counted here, NOT in `skipped`, so a
+    // machine-off daemon with no opted-in session stays silent at INFO.
+    let mut not_participating = 0usize;
     // C-F6 (`keychain-fix-r8.md`): mirrors `refresher.rs`'s own
     // `rate_limited_this_tick` — once the custodian's validate call for ANY
     // handle dir this tick comes back 429, Anthropic is rate-limiting this
@@ -594,13 +657,57 @@ fn tick_with_deps(
             continue;
         }
         let Some(handle_dir) = contained_handle_dir(base_dir, &candidate) else {
-            warn!(
-                error_kind = "auto_rotate_invalid_handle",
-                "auto-rotation: handle admission failed; skipping before side effects"
-            );
-            skipped += 1;
+            if first_report("auto_rotate_invalid_handle", &candidate) {
+                warn!(
+                    error_kind = "auto_rotate_invalid_handle",
+                    "auto-rotation: handle admission failed; skipping before side effects"
+                );
+            } else {
+                debug!(
+                    error_kind = "auto_rotate_invalid_handle",
+                    "auto-rotation: handle admission still failing; skipping before side effects"
+                );
+            }
+            // Counted (so the tick INFO appears) only when the machine setting
+            // makes this daemon active; a machine-off daemon stays silent.
+            if cfg.enabled {
+                skipped += 1;
+            }
             continue;
         };
+
+        // Per-session override (spec 02 §2.7): rotate this handle dir iff its
+        // override is `on`, or it has none and the machine setting is on. An
+        // unreadable/corrupt override counts as `off` for THIS session only —
+        // ambiguity never moves a live session — and is reported with a fixed
+        // tag (no path, no parse detail). Decided before any marker, quota or
+        // keychain work so a non-participating session costs one bounded read.
+        let session_state = session_override::read_override(&handle_dir);
+        if session_state == session_override::SessionRotationState::Unreadable {
+            // First occurrence per handle dir is a WARN; a steady state repeats
+            // at debug so it does not write a WARN every tick.
+            if first_report("auto_rotate_session_override_unreadable", &handle_dir) {
+                warn!(
+                    error_kind = "auto_rotate_session_override_unreadable",
+                    "auto-rotation: per-session override unreadable; treating this session as off"
+                );
+            } else {
+                debug!(
+                    error_kind = "auto_rotate_session_override_unreadable",
+                    "auto-rotation: per-session override still unreadable; treating this session as off"
+                );
+            }
+        }
+        if !session_override::rotates(cfg.enabled, session_state) {
+            debug!(
+                dir = %crate::cli_deps::sanitize::redact_path(&handle_dir),
+                session = session_state.as_str(),
+                machine_enabled = cfg.enabled,
+                "auto-rotation: not enabled for this session, skipping"
+            );
+            not_participating += 1;
+            continue;
+        }
 
         // Read which account this handle dir is currently bound to.
         // The symlink `term-<pid>/.csq-account` → `config-<current>/.csq-account`
@@ -617,7 +724,7 @@ fn tick_with_deps(
         let current_account = match markers::resolve_marker_to_slot(base_dir, &handle_dir) {
             Some(a) => a,
             None => {
-                debug!(dir = %handle_dir.display(), "auto-rotation: no .csq-account marker in handle dir, skipping");
+                debug!(dir = %crate::cli_deps::sanitize::redact_path(&handle_dir), "auto-rotation: no .csq-account marker in handle dir, skipping");
                 skipped += 1;
                 continue;
             }
@@ -631,7 +738,7 @@ fn tick_with_deps(
         // from ever calling repoint_handle_dir when the CURRENT slot is already 3P.
         if handle_dir_is_3p(base_dir, current_account) {
             debug!(
-                dir = %handle_dir.display(),
+                dir = %crate::cli_deps::sanitize::redact_path(&handle_dir),
                 account = current_account.get(),
                 "auto-rotation: current account is a 3P slot — skipping (VP-F1)"
             );
@@ -643,7 +750,7 @@ fn tick_with_deps(
         if let Some(&last_rotated) = cooldowns.get(&handle_dir) {
             if last_rotated.elapsed() < cooldown_duration {
                 debug!(
-                    dir = %handle_dir.display(),
+                    dir = %crate::cli_deps::sanitize::redact_path(&handle_dir),
                     remaining_secs = (cooldown_duration - last_rotated.elapsed()).as_secs(),
                     "auto-rotation: in cooldown, skipping"
                 );
@@ -669,7 +776,7 @@ fn tick_with_deps(
 
         if five_hour_pct < cfg.threshold_percent {
             debug!(
-                dir = %handle_dir.display(),
+                dir = %crate::cli_deps::sanitize::redact_path(&handle_dir),
                 account = current_account.get(),
                 pct = five_hour_pct,
                 threshold = cfg.threshold_percent,
@@ -690,7 +797,7 @@ fn tick_with_deps(
             Some(t) => t,
             None => {
                 debug!(
-                    dir = %handle_dir.display(),
+                    dir = %crate::cli_deps::sanitize::redact_path(&handle_dir),
                     account = current_account.get(),
                     "auto-rotation: no better account available, skipping"
                 );
@@ -874,6 +981,8 @@ fn tick_with_deps(
             skipped += 1;
             continue;
         }
+        // Test seam: the window between the swap lock and the repoint lock.
+        run_pre_custody_test_hook();
         // Acquire both handle locks before profile custody. A busy profile
         // now refuses BEFORE any forced keychain write, and custody stays held
         // through the force-write, repoint and compensating reconcile.
@@ -899,6 +1008,34 @@ fn tick_with_deps(
                     continue;
                 }
             };
+        // S2: the per-session override and the machine setting were read BEFORE
+        // the reconcile HTTP call and the locks above (up to ~20s on macOS), and
+        // the repoint lock is taken without a bound. The re-read therefore sits
+        // AFTER `lock_repoint_custody`, on EVERY platform: a writer
+        // (`session_override::write_override`) takes the swap lock and then this
+        // same repoint lock, both bounded, in the rotator's own order, so an
+        // `off` it has returned for is already on disk here, and one still
+        // waiting cannot publish between this read and the repoint (we hold the
+        // lock it needs). An unreadable config or override refuses (fail
+        // closed), as does an exclusion added meanwhile. No write has happened.
+        let post_lock_state = session_override::read_override(&handle_dir);
+        let post_lock_cfg = rotation_config::load(base_dir);
+        let still_participating = match &post_lock_cfg {
+            Ok(fresh) => {
+                session_override::rotates(fresh.enabled, post_lock_state)
+                    && !fresh.exclude_accounts.contains(&target.get())
+            }
+            Err(_) => false,
+        };
+        if !still_participating {
+            debug!(
+                dir = %crate::cli_deps::sanitize::redact_path(&handle_dir),
+                session = post_lock_state.as_str(),
+                "auto-rotation: session no longer participating after the lock, skipping (S2)"
+            );
+            not_participating += 1;
+            continue;
+        }
         let native_capture = match crate::session::handle_dir::capture_native_swap_locked(
             &rotation_custody.profiles,
             base_dir,
@@ -1147,7 +1284,10 @@ fn tick_with_deps(
     if rotated > 0 || skipped > 0 {
         info!(rotated, skipped, "auto-rotation tick complete");
     } else {
-        debug!("auto-rotation tick: no handle dirs processed");
+        debug!(
+            not_participating,
+            "auto-rotation tick: no participating session was considered"
+        );
     }
 }
 
@@ -2297,6 +2437,279 @@ mod tests {
         );
     }
 
+    // ── per-session override (spec 02 §2.7) ──────────────────────────────
+
+    use crate::rotation::session_override::{
+        self, SessionRotationMode, SessionRotationState, OVERRIDE_FILE,
+    };
+
+    /// Two accounts, account 1 over threshold, account 2 free; the machine setting
+    /// is `machine_enabled`. Returns `(base, claude_home)`.
+    fn override_fixture(machine_enabled: bool) -> (TempDir, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let claude_home = TempDir::new().unwrap();
+        setup_account(dir.path(), 1);
+        setup_account(dir.path(), 2);
+        setup_quota(dir.path(), 1, 97.0);
+        setup_quota(dir.path(), 2, 10.0);
+        setup_config_dir(dir.path(), 1);
+        setup_config_dir(dir.path(), 2);
+        let cfg = RotationConfig {
+            enabled: machine_enabled,
+            threshold_percent: 95.0,
+            ..RotationConfig::default()
+        };
+        save_rotation_config(dir.path(), &cfg).unwrap();
+        (dir, claude_home)
+    }
+
+    fn bound_to_two(handle_dir: &Path) -> bool {
+        markers::read_csq_account(handle_dir) == Some(AccountNum::try_from(2u16).unwrap())
+    }
+
+    #[test]
+    fn session_override_precedence_machine_by_session() {
+        // (machine enabled, session override, the session is rotated)
+        let table: [(bool, Option<SessionRotationMode>, bool); 6] = [
+            (true, None, true),
+            (false, None, false),
+            (true, Some(SessionRotationMode::On), true),
+            (false, Some(SessionRotationMode::On), true),
+            (true, Some(SessionRotationMode::Off), false),
+            (false, Some(SessionRotationMode::Off), false),
+        ];
+        for (machine, session, expected) in table {
+            let (dir, claude_home) = override_fixture(machine);
+            let handle_dir = setup_handle_dir(dir.path(), claude_home.path(), 10100, 1);
+            if let Some(mode) = session {
+                session_override::write_override(&handle_dir, mode).unwrap();
+            }
+            let mut cooldowns = HashMap::new();
+            tick(dir.path(), Some(claude_home.path()), &mut cooldowns);
+            assert_eq!(
+                bound_to_two(&handle_dir),
+                expected,
+                "machine={machine} session={session:?}"
+            );
+            assert_eq!(
+                cooldowns.len(),
+                usize::from(expected),
+                "a cooldown is recorded iff the session was rotated: machine={machine} session={session:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_override_decides_per_handle_dir_in_one_tick() {
+        // Machine OFF: only the session that opted in moves.
+        let (dir, claude_home) = override_fixture(false);
+        let opted_in = setup_handle_dir(dir.path(), claude_home.path(), 10110, 1);
+        let following = setup_handle_dir(dir.path(), claude_home.path(), 10111, 1);
+        session_override::write_override(&opted_in, SessionRotationMode::On).unwrap();
+        tick(dir.path(), Some(claude_home.path()), &mut HashMap::new());
+        assert!(bound_to_two(&opted_in));
+        assert!(!bound_to_two(&following));
+
+        // Machine ON: only the session that opted out stays.
+        let (dir, claude_home) = override_fixture(true);
+        let opted_out = setup_handle_dir(dir.path(), claude_home.path(), 10112, 1);
+        let following = setup_handle_dir(dir.path(), claude_home.path(), 10113, 1);
+        session_override::write_override(&opted_out, SessionRotationMode::Off).unwrap();
+        tick(dir.path(), Some(claude_home.path()), &mut HashMap::new());
+        assert!(!bound_to_two(&opted_out));
+        assert!(bound_to_two(&following));
+    }
+
+    #[test]
+    fn corrupt_session_override_stops_only_that_session_even_with_machine_on() {
+        let (dir, claude_home) = override_fixture(true);
+        let corrupt = setup_handle_dir(dir.path(), claude_home.path(), 10120, 1);
+        let truncated = setup_handle_dir(dir.path(), claude_home.path(), 10121, 1);
+        let healthy = setup_handle_dir(dir.path(), claude_home.path(), 10122, 1);
+        std::fs::write(corrupt.join(OVERRIDE_FILE), b"{not json").unwrap();
+        std::fs::write(truncated.join(OVERRIDE_FILE), b"").unwrap();
+        assert_eq!(
+            session_override::read_override(&corrupt),
+            SessionRotationState::Unreadable
+        );
+
+        let mut cooldowns = HashMap::new();
+        tick(dir.path(), Some(claude_home.path()), &mut cooldowns);
+
+        assert!(
+            !bound_to_two(&corrupt),
+            "a corrupt override must not rotate"
+        );
+        assert!(
+            !bound_to_two(&truncated),
+            "an empty override must not rotate"
+        );
+        assert!(bound_to_two(&healthy), "a healthy neighbour still rotates");
+        assert_eq!(cooldowns.len(), 1);
+        // The tick reads, it never repairs or deletes what it cannot parse.
+        assert_eq!(
+            std::fs::read(corrupt.join(OVERRIDE_FILE)).unwrap(),
+            b"{not json"
+        );
+    }
+
+    #[test]
+    fn corrupt_session_override_beats_machine_off_too() {
+        // Machine off + unreadable file: still no rotation (ambiguity moves nothing).
+        let (dir, claude_home) = override_fixture(false);
+        let corrupt = setup_handle_dir(dir.path(), claude_home.path(), 10123, 1);
+        std::fs::write(corrupt.join(OVERRIDE_FILE), b"{\"auto_swap\":\"default\"}").unwrap();
+        tick(dir.path(), Some(claude_home.path()), &mut HashMap::new());
+        assert!(!bound_to_two(&corrupt));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_session_override_is_not_followed_by_the_rotator() {
+        let (dir, claude_home) = override_fixture(false);
+        let handle_dir = setup_handle_dir(dir.path(), claude_home.path(), 10124, 1);
+        let elsewhere = dir.path().join("elsewhere.json");
+        std::fs::write(&elsewhere, b"{\"auto_swap\":\"on\"}").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, handle_dir.join(OVERRIDE_FILE)).unwrap();
+        tick(dir.path(), Some(claude_home.path()), &mut HashMap::new());
+        assert!(!bound_to_two(&handle_dir));
+    }
+
+    /// S1: an unreadable `rotation.json` ends the tick — a session whose own
+    /// override is `on` must not be rotated with an empty exclusion list.
+    #[test]
+    fn unreadable_rotation_config_rotates_nothing_even_for_an_on_session() {
+        let (dir, claude_home) = override_fixture(false);
+        let handle_dir = setup_handle_dir(dir.path(), claude_home.path(), 10140, 1);
+        session_override::write_override(&handle_dir, SessionRotationMode::On).unwrap();
+        // Account 2 is excluded by policy, but the file that says so is damaged.
+        let damaged = [0xffu8, 0xfe, b'{'];
+        std::fs::write(crate::rotation::config::config_path(dir.path()), damaged).unwrap();
+
+        let mut cooldowns = HashMap::new();
+        tick(dir.path(), Some(claude_home.path()), &mut cooldowns);
+
+        assert!(
+            !bound_to_two(&handle_dir),
+            "an `on` session must not rotate"
+        );
+        assert!(cooldowns.is_empty());
+        assert_eq!(
+            std::fs::read(crate::rotation::config::config_path(dir.path())).unwrap(),
+            damaged,
+            "the tick never repairs the file"
+        );
+    }
+
+    /// S2: an `off` written between the pre-lock decision and the swap lock stops
+    /// the rotation (the post-lock re-read).
+    #[test]
+    fn override_turned_off_after_the_decision_stops_the_rotation() {
+        let (dir, claude_home) = override_fixture(true);
+        let handle_dir = setup_handle_dir(dir.path(), claude_home.path(), 10141, 1);
+        let writer_dir = handle_dir.clone();
+        set_pre_lock_test_hook_for_test(Some(Box::new(move || {
+            std::fs::write(writer_dir.join(OVERRIDE_FILE), b"{\"auto_swap\":\"off\"}\n").unwrap();
+        })));
+        let mut cooldowns = HashMap::new();
+        tick(dir.path(), Some(claude_home.path()), &mut cooldowns);
+        set_pre_lock_test_hook_for_test(None);
+
+        assert!(
+            !bound_to_two(&handle_dir),
+            "an `off` set before the lock must stop the rotation"
+        );
+        assert!(cooldowns.is_empty());
+    }
+
+    /// S2 (every platform): an `off` published after the swap lock but before the
+    /// repoint lock is honoured, because the re-read follows `lock_repoint_custody`.
+    #[test]
+    fn override_turned_off_before_the_repoint_lock_stops_the_rotation() {
+        let (dir, claude_home) = override_fixture(true);
+        let handle_dir = setup_handle_dir(dir.path(), claude_home.path(), 10146, 1);
+        let writer_dir = handle_dir.clone();
+        set_pre_custody_test_hook_for_test(Some(Box::new(move || {
+            std::fs::write(writer_dir.join(OVERRIDE_FILE), b"{\"auto_swap\":\"off\"}\n").unwrap();
+        })));
+        let mut cooldowns = HashMap::new();
+        tick(dir.path(), Some(claude_home.path()), &mut cooldowns);
+        set_pre_custody_test_hook_for_test(None);
+        assert!(
+            !bound_to_two(&handle_dir),
+            "an `off` published before the repoint lock must stop the rotation"
+        );
+        assert!(cooldowns.is_empty());
+    }
+
+    /// S2: an exclusion added after the decision also stops the rotation.
+    #[test]
+    fn exclusion_added_after_the_decision_stops_the_rotation() {
+        let (dir, claude_home) = override_fixture(true);
+        let handle_dir = setup_handle_dir(dir.path(), claude_home.path(), 10142, 1);
+        let base = dir.path().to_path_buf();
+        set_pre_lock_test_hook_for_test(Some(Box::new(move || {
+            let cfg = RotationConfig {
+                enabled: true,
+                exclude_accounts: vec![2],
+                ..RotationConfig::default()
+            };
+            save_rotation_config(&base, &cfg).unwrap();
+        })));
+        tick(dir.path(), Some(claude_home.path()), &mut HashMap::new());
+        set_pre_lock_test_hook_for_test(None);
+        assert!(!bound_to_two(&handle_dir));
+    }
+
+    #[test]
+    fn first_report_is_true_once_per_kind_and_path() {
+        let p = PathBuf::from("/nonexistent/first-report-test-a");
+        assert!(first_report("kind_x", &p));
+        assert!(!first_report("kind_x", &p));
+        assert!(first_report("kind_y", &p));
+        assert!(first_report(
+            "kind_x",
+            Path::new("/nonexistent/first-report-test-b")
+        ));
+    }
+
+    #[test]
+    fn session_override_is_not_account_bound_and_survives_the_rotators_repoint() {
+        // The file is a REAL file in the handle dir, never one of the links a swap
+        // rewrites, and the repoint leaves it (and the account dirs) as they were.
+        let (dir, claude_home) = override_fixture(false);
+        let handle_dir = setup_handle_dir(dir.path(), claude_home.path(), 10130, 1);
+        session_override::write_override(&handle_dir, SessionRotationMode::On).unwrap();
+        let before = std::fs::read(handle_dir.join(OVERRIDE_FILE)).unwrap();
+
+        tick(dir.path(), Some(claude_home.path()), &mut HashMap::new());
+
+        assert!(
+            bound_to_two(&handle_dir),
+            "the opted-in session was repointed"
+        );
+        let meta = std::fs::symlink_metadata(handle_dir.join(OVERRIDE_FILE)).unwrap();
+        assert!(meta.is_file() && !meta.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read(handle_dir.join(OVERRIDE_FILE)).unwrap(),
+            before
+        );
+        assert_eq!(
+            session_override::read_override(&handle_dir),
+            SessionRotationState::On,
+            "a swap does not reset the session's own setting"
+        );
+        for account in [1u16, 2] {
+            assert!(
+                !dir.path()
+                    .join(format!("config-{account}"))
+                    .join(OVERRIDE_FILE)
+                    .exists(),
+                "the override is never copied into config-{account}/"
+            );
+        }
+    }
+
     // ── VP-final F1: 3P slot exfiltration guard ───────────────────────────
 
     /// Regression guard: VP-final R1 CRITICAL.
@@ -2470,6 +2883,42 @@ mod tests {
             b"anthropic-slot-1-sentinel",
             "config-1 creds must not be touched when 3P handle dir is skipped"
         );
+    }
+
+    /// N3 (`guard-reader-writer-parity.md` MUST-2): a current slot whose
+    /// settings.json cannot be read or parsed is treated as third-party, so the
+    /// rotator skips the terminal instead of moving an OAuth token into a process
+    /// that may hold a frozen 3P base URL.
+    #[test]
+    fn tick_skips_handle_dir_when_current_slot_settings_are_unreadable() {
+        for bytes in [&[0xffu8, 0xfe][..], &b"{not json"[..]] {
+            let dir = TempDir::new().unwrap();
+            let claude_home = TempDir::new().unwrap();
+            setup_account(dir.path(), 1);
+            setup_config_dir(dir.path(), 1);
+            setup_quota(dir.path(), 1, 5.0);
+            let config_9 = setup_config_dir(dir.path(), 9);
+            std::fs::write(config_9.join("settings.json"), bytes).unwrap();
+            setup_account(dir.path(), 9);
+            setup_quota(dir.path(), 9, 97.0);
+            let handle_dir = setup_handle_dir(dir.path(), claude_home.path(), 30002, 9);
+            let cfg = RotationConfig {
+                enabled: true,
+                threshold_percent: 95.0,
+                ..RotationConfig::default()
+            };
+            save_rotation_config(dir.path(), &cfg).unwrap();
+
+            let mut cooldowns = HashMap::new();
+            tick(dir.path(), Some(claude_home.path()), &mut cooldowns);
+
+            assert_eq!(
+                markers::read_csq_account(&handle_dir),
+                Some(AccountNum::try_from(9u16).unwrap()),
+                "an unreadable settings.json must stop the rotation"
+            );
+            assert!(cooldowns.is_empty());
+        }
     }
 
     // ── C-F6 (`keychain-fix-r8.md`): rate-limit short-circuit ─────────────

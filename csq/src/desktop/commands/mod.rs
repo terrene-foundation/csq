@@ -2316,12 +2316,146 @@ pub fn get_rotation_config(base_dir: String) -> Result<RotationConfig, String> {
 }
 
 /// Enables or disables auto-rotation, writing the change to `rotation.json`.
+///
+/// Delegates to [`rotation_config::set_enabled`], the SAME function
+/// `csq rotation on|off` calls, so the desktop and the CLI cannot disagree
+/// about how the file is read-modified-written.
+///
+/// `async`: the write waits up to ~2 s on `.rotation.json.lock`, so it runs on
+/// the blocking pool, never Tauri's invoke thread (`tauri-commands.md` §3).
 #[tauri::command]
-pub fn set_rotation_enabled(base_dir: String, enabled: bool) -> Result<(), String> {
+pub async fn set_rotation_enabled(base_dir: String, enabled: bool) -> Result<(), String> {
+    run_desktop_read("set_rotation_enabled", move || {
+        set_rotation_enabled_blocking(base_dir, enabled)
+    })
+    .await
+}
+
+fn set_rotation_enabled_blocking(base_dir: String, enabled: bool) -> Result<(), String> {
     let base = resolve_csq_base_dir(&base_dir)?;
-    let mut config = rotation_config::load(&base).map_err(|e| e.redacted_message())?;
-    config.enabled = enabled;
-    rotation_config::save(&base, &config).map_err(|e| e.redacted_message())
+    rotation_config::set_enabled(&base, enabled)
+        .map(|_| ())
+        .map_err(|e| e.redacted_message())
+}
+
+/// A terminal session's own auto-rotate setting, as the Sessions view shows it.
+///
+/// No path and no secret: a terminal number, fixed-vocabulary strings and two
+/// booleans.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionRotationView {
+    /// The terminal number (`term-<pid>`).
+    pub pid: u32,
+    /// What is stored for this terminal: `"default"` (follow the machine
+    /// setting), `"on"`, `"off"`, or `"unreadable"` (a damaged setting file; the
+    /// daemon treats it as off).
+    pub mode: String,
+    /// The machine-wide auto-rotate setting the terminal falls back to.
+    pub machine_enabled: bool,
+    /// Whether the daemon may move this terminal now.
+    pub effective: bool,
+}
+
+fn session_rotation_view(
+    pid: u32,
+    machine_enabled: bool,
+    state: csq_core::rotation::session_override::SessionRotationState,
+) -> SessionRotationView {
+    SessionRotationView {
+        pid,
+        mode: state.as_str().to_string(),
+        machine_enabled,
+        effective: csq_core::rotation::session_override::rotates(machine_enabled, state),
+    }
+}
+
+/// Fixed refusal text for a terminal the rotator never moves (no path, no slot).
+const SESSION_ROTATION_INELIGIBLE: &str =
+    "auto-rotate applies to Claude Code sign-in sessions only; the daemon would never move this terminal";
+
+/// The machine-wide setting a terminal falls back to. An unreadable
+/// `rotation.json` is surfaced (path-redacted), never defaulted: the daemon skips
+/// every terminal while it is broken, so a defaulted "effective" would be a lie.
+fn machine_rotation_enabled(base: &std::path::Path) -> Result<bool, String> {
+    rotation_config::load(base)
+        .map(|cfg| cfg.enabled)
+        .map_err(|e| e.redacted_message())
+}
+
+/// Reads one terminal's own auto-rotate setting.
+///
+/// `pid` must name an existing `term-<pid>` handle dir directly under the csq
+/// base (a symlink or a nested path is refused). Read-only. Errors are fixed
+/// text — never a path.
+#[tauri::command]
+pub fn get_session_rotation(base_dir: String, pid: u32) -> Result<SessionRotationView, String> {
+    let base = resolve_csq_base_dir(&base_dir)?;
+    let state = csq_core::rotation::session_override::get(&base, pid).map_err(|e| e.to_string())?;
+    Ok(session_rotation_view(
+        pid,
+        machine_rotation_enabled(&base)?,
+        state,
+    ))
+}
+
+/// Sets one terminal's own auto-rotate setting: `mode` is exactly `"on"`,
+/// `"off"` or `"default"` (follow the machine setting again).
+///
+/// Delegates to [`csq_core::rotation::session_override::set`], the SAME
+/// function `csq rotation session` calls, so both surfaces admit the handle dir
+/// and write the owner-only file identically. Idempotent: setting the value
+/// already stored rewrites the same bytes. Returns the setting now on disk.
+///
+/// `async`: the write waits up to ~20 s on the handle dir's swap lock (and the
+/// repoint lock) and runs `discover_all`, so it runs on the blocking pool, never
+/// Tauri's invoke thread (`tauri-commands.md` §3).
+#[tauri::command]
+pub async fn set_session_rotation(
+    base_dir: String,
+    pid: u32,
+    mode: String,
+) -> Result<SessionRotationView, String> {
+    run_desktop_read("set_session_rotation", move || {
+        set_session_rotation_blocking(base_dir, pid, mode)
+    })
+    .await
+}
+
+fn set_session_rotation_blocking(
+    base_dir: String,
+    pid: u32,
+    mode: String,
+) -> Result<SessionRotationView, String> {
+    use csq_core::rotation::session_override::{self, SessionRotationMode, SessionRotationState};
+    // Validate every argument before any filesystem access.
+    let mode = SessionRotationMode::parse(&mode)
+        .ok_or_else(|| "mode must be on, off or default".to_string())?;
+    let base = resolve_csq_base_dir(&base_dir)?;
+    // Read the machine setting BEFORE writing, so a refusal leaves nothing changed.
+    // `default` only CLEARS a setting, so it never needs the machine config: while
+    // rotation.json is unreadable the daemon rotates nothing, so clearing is safe
+    // and must stay possible. The reported `machine_enabled: false` is then the
+    // truthful "nothing rotates" value, not a read of the file.
+    let machine_enabled = if mode == SessionRotationMode::Default {
+        machine_rotation_enabled(&base).unwrap_or(false)
+    } else {
+        machine_rotation_enabled(&base)?
+    };
+    // `on`/`off` only mean something where the rotator can move the terminal;
+    // `default` stays allowed so a stale setting can always be cleared.
+    if mode != SessionRotationMode::Default {
+        let dir = session_override::resolve_session_dir(&base, pid).map_err(|e| e.to_string())?;
+        let accounts = discovery::discover_all(&base);
+        if !csq_core::rotation::eligibility::session_rotation_eligible(&base, &accounts, &dir) {
+            return Err(SESSION_ROTATION_INELIGIBLE.to_string());
+        }
+    }
+    let state = session_override::set(&base, pid, mode).map_err(|e| e.to_string())?;
+    // The file we just wrote must read back as what we asked for.
+    if state == SessionRotationState::Unreadable {
+        return Err(session_override::SessionRotationError::Write.to_string());
+    }
+    Ok(session_rotation_view(pid, machine_enabled, state))
 }
 
 /// IPC view of [`CapabilityLayerToggles`] for the desktop tray
@@ -2512,6 +2646,19 @@ pub struct SessionView {
     /// Human-readable iTerm2 tab title resolved via osascript.
     /// Most specific identifier when available.
     pub terminal_title: Option<String>,
+    /// The csq terminal number (`term-<pid>`) of this session's handle dir,
+    /// parsed from the BASENAME of `config_dir`; `null` when the session is
+    /// not in a `term-<pid>` handle dir (a `config-N` launch). `pid` above is
+    /// the `claude` process and differs from this on Windows (spawn+wait) and
+    /// for child processes, so per-session rotation is keyed on THIS value
+    /// (spec 02 INV-02), never on `pid`.
+    pub handle_pid: Option<u32>,
+    /// Whether the daemon rotator can ever move this terminal: a Claude Code
+    /// sign-in session, not a third-party or native-CLI slot. Answered by
+    /// [`csq_core::rotation::eligibility::session_rotation_eligible`], the same
+    /// predicate the setter, `csq rotation session` and `csq run --auto-swap`
+    /// use. The per-session control is shown only when this is `true`.
+    pub rotation_eligible: bool,
 }
 
 /// Resolves the slot a session's config dir is CURRENTLY bound to.
@@ -2649,6 +2796,42 @@ fn session_quota_fields(row: Option<&AccountQuota>) -> (bool, Option<f64>, Optio
     (has_quota, five_hour_pct, seven_day_pct)
 }
 
+/// A session's `(handle_pid, rotation_eligible)`.
+///
+/// `handle_pid` is the number in the `term-<pid>` BASENAME of `config_dir`
+/// (never the `claude` process id). It is reported only when that directory is
+/// the admitted `<base>/term-<pid>` handle dir ([`csq_core::rotation::session_override::resolve_session_dir`]
+/// — a `term-<n>` dir under another base, or a symlink, yields `None`), so the
+/// control it keys never addresses a different terminal. `rotation_eligible`
+/// is the shared rotator predicate over that admitted dir; `false` whenever
+/// `handle_pid` is `None`.
+fn session_rotation_fields(
+    base: &Path,
+    accounts: &[csq_core::accounts::AccountInfo],
+    config_dir: &Path,
+) -> (Option<u32>, bool) {
+    use csq_core::rotation::session_override::{parse_session_id, resolve_session_dir};
+    let Some(name) = config_dir.file_name().and_then(|n| n.to_str()) else {
+        return (None, false);
+    };
+    if !csq_core::session::handle_dir::is_term_handle_dir_name(name) {
+        return (None, false);
+    }
+    let Ok(pid) = parse_session_id(name) else {
+        return (None, false);
+    };
+    let Ok(admitted) = resolve_session_dir(base, pid) else {
+        return (None, false);
+    };
+    match config_dir.canonicalize() {
+        Ok(actual) if actual == admitted => {}
+        _ => return (None, false),
+    }
+    let eligible =
+        csq_core::rotation::eligibility::session_rotation_eligible(base, accounts, &admitted);
+    (Some(pid), eligible)
+}
+
 /// Returns the list of live Claude Code sessions under the current
 /// user. Each entry is one terminal's `claude` process with the
 /// current account and 5-hour quota for its bound config dir.
@@ -2702,6 +2885,8 @@ fn list_sessions_blocking(base_dir: String) -> Result<Vec<SessionView>, String> 
         let session_row = live_account.and_then(|id| quota.get(id));
         let (has_quota, five_hour_pct, seven_day_pct) = session_quota_fields(session_row);
 
+        let (handle_pid, rotation_eligible) =
+            session_rotation_fields(&base, &accounts, &s.config_dir);
         out.push(SessionView {
             pid: s.pid,
             cwd: s.cwd.display().to_string(),
@@ -2718,6 +2903,8 @@ fn list_sessions_blocking(base_dir: String) -> Result<Vec<SessionView>, String> 
             term_pane: s.term_pane,
             iterm_profile: s.iterm_profile,
             terminal_title: s.terminal_title,
+            handle_pid,
+            rotation_eligible,
         });
     }
 
@@ -11038,6 +11225,405 @@ mod tests {
         let home_str = home.path().to_string_lossy().into_owned();
         assert!(!err.contains(&home_str), "path leaked to renderer: {err}");
         assert!(err.contains('~'), "expected a redacted ~/ path: {err}");
+    }
+
+    #[test]
+    fn set_rotation_enabled_round_trips_through_the_shared_core_and_keeps_other_fields() {
+        let _shared_env_guard = csq_core::platform::test_env::lock();
+        let home = desktop_fixture_dir();
+        let _restore = DesktopFixtureEnv::set(&[("HOME", home.path().as_os_str())]);
+        let base = home.path().join(".claude").join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        rotation_config::save(
+            &base,
+            &RotationConfig {
+                enabled: false,
+                threshold_percent: 80.0,
+                cooldown_secs: 120,
+                exclude_accounts: vec![4],
+            },
+        )
+        .unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set_locked(
+            &_shared_env_guard,
+            std::path::Path::new(&base.to_string_lossy().into_owned()),
+        );
+        let base_arg = base.to_string_lossy().into_owned();
+
+        set_rotation_enabled_blocking(base_arg.clone(), true).unwrap();
+        let on = get_rotation_config(base_arg.clone()).unwrap();
+        assert!(on.enabled);
+        assert_eq!(
+            (on.threshold_percent, on.cooldown_secs, on.exclude_accounts),
+            (80.0, 120, vec![4])
+        );
+        // The CLI's `csq rotation status` reads the same file through the
+        // same core accessor: what the desktop wrote is what the CLI sees.
+        assert!(rotation_config::summary_line(&base).starts_with("Auto-rotate: on"));
+
+        set_rotation_enabled_blocking(base_arg.clone(), false).unwrap();
+        assert!(!get_rotation_config(base_arg).unwrap().enabled);
+    }
+
+    #[test]
+    fn set_rotation_enabled_error_does_not_leak_home_path() {
+        let _shared_env_guard = csq_core::platform::test_env::lock();
+        let home = desktop_fixture_dir();
+        let _restore = DesktopFixtureEnv::set(&[("HOME", home.path().as_os_str())]);
+        let base = home.path().join(".claude").join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("rotation.json"), b"{not valid json").unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set_locked(
+            &_shared_env_guard,
+            std::path::Path::new(&base.to_string_lossy().into_owned()),
+        );
+
+        let err =
+            set_rotation_enabled_blocking(base.to_string_lossy().into_owned(), true).unwrap_err();
+
+        let home_str = home.path().to_string_lossy().into_owned();
+        assert!(!err.contains(&home_str), "path leaked to renderer: {err}");
+        assert_eq!(
+            std::fs::read(base.join("rotation.json")).unwrap(),
+            b"{not valid json",
+            "a corrupt file must not be overwritten with defaults"
+        );
+    }
+
+    /// Fixture for the per-session rotation commands: a fresh HOME whose
+    /// `~/.claude/accounts` is the resolved csq base, with the shared env lock
+    /// held for the whole call. `test` gets `(home, base)`.
+    fn with_session_rotation_base(test: impl FnOnce(&std::path::Path, &std::path::Path)) {
+        let home_dir = desktop_fixture_dir();
+        let home = home_dir.path();
+        let base = home.join(".claude").join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(&base);
+        let _restore = DesktopFixtureEnv::set(&[("HOME", home.as_os_str())]);
+        test(home, &base);
+    }
+
+    /// Binds `handle` to Claude Code OAuth slot 1 (decimal marker), the shape the
+    /// rotator and the eligibility predicate read.
+    fn bind_claude_slot(handle: &std::path::Path) {
+        csq_core::accounts::markers::write_csq_account_legacy(
+            handle,
+            csq_core::types::AccountNum::try_from(1u16).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn session_rotation_commands_round_trip_and_follow_the_machine_setting() {
+        with_session_rotation_base(|_home, base| {
+            let handle = base.join("term-4242");
+            std::fs::create_dir_all(&handle).unwrap();
+            bind_claude_slot(&handle);
+            let base_arg = base.to_string_lossy().into_owned();
+
+            let view = get_session_rotation(base_arg.clone(), 4242).unwrap();
+            assert_eq!(
+                (
+                    view.pid,
+                    view.mode.as_str(),
+                    view.machine_enabled,
+                    view.effective
+                ),
+                (4242, "default", false, false)
+            );
+
+            let view = set_session_rotation_blocking(base_arg.clone(), 4242, "on".into()).unwrap();
+            assert_eq!((view.mode.as_str(), view.effective), ("on", true));
+            // The CLI's reader sees what the desktop wrote: one shared core.
+            assert_eq!(
+                csq_core::rotation::session_override::read_override(&handle),
+                csq_core::rotation::session_override::SessionRotationState::On
+            );
+            assert_eq!(
+                get_session_rotation(base_arg.clone(), 4242).unwrap().mode,
+                "on"
+            );
+
+            rotation_config::set_enabled(base, true).unwrap();
+            let view = set_session_rotation_blocking(base_arg.clone(), 4242, "off".into()).unwrap();
+            assert_eq!(
+                (view.mode.as_str(), view.machine_enabled, view.effective),
+                ("off", true, false)
+            );
+            let view =
+                set_session_rotation_blocking(base_arg.clone(), 4242, "default".into()).unwrap();
+            assert_eq!(
+                (view.mode.as_str(), view.machine_enabled, view.effective),
+                ("default", true, true)
+            );
+            assert!(!handle
+                .join(csq_core::rotation::session_override::OVERRIDE_FILE)
+                .exists());
+            // The machine-wide file is not touched by a session change.
+            assert!(rotation_config::load(base).unwrap().enabled);
+        });
+    }
+
+    #[test]
+    fn session_rotation_commands_refuse_bad_pid_mode_and_paths_without_writing() {
+        with_session_rotation_base(|home, base| {
+            let handle = base.join("term-4242");
+            std::fs::create_dir_all(&handle).unwrap();
+            let base_arg = base.to_string_lossy().into_owned();
+            let override_path = |dir: &std::path::Path| {
+                dir.join(csq_core::rotation::session_override::OVERRIDE_FILE)
+            };
+
+            // pid 0 and a pid with no handle dir.
+            for pid in [0u32, 99] {
+                for result in [
+                    get_session_rotation(base_arg.clone(), pid).map(|_| ()),
+                    set_session_rotation_blocking(base_arg.clone(), pid, "on".into()).map(|_| ()),
+                ] {
+                    let err = result.unwrap_err();
+                    assert!(!err.contains(&home.to_string_lossy().into_owned()), "{err}");
+                }
+            }
+            // A mode that is not exactly on/off/default, checked before the base.
+            for mode in ["", "ON", "On", "yes", "true", "default ", "on\n"] {
+                let err =
+                    set_session_rotation_blocking(base_arg.clone(), 4242, mode.into()).unwrap_err();
+                assert_eq!(err, "mode must be on, off or default", "{mode:?}");
+            }
+            assert!(!override_path(&handle).exists());
+
+            // A base_dir other than the resolved csq base is refused before any access.
+            let other = home.join("elsewhere");
+            std::fs::create_dir_all(other.join("term-4242")).unwrap();
+            let err = set_session_rotation_blocking(
+                other.to_string_lossy().into_owned(),
+                4242,
+                "on".into(),
+            )
+            .unwrap_err();
+            assert!(!err.contains(&home.to_string_lossy().into_owned()), "{err}");
+            assert!(!override_path(&other.join("term-4242")).exists());
+
+            // A symlinked term dir (pointing outside, or at another term dir) is refused.
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&other, base.join("term-5")).unwrap();
+                std::os::unix::fs::symlink(&handle, base.join("term-6")).unwrap();
+                for pid in [5u32, 6] {
+                    let err = set_session_rotation_blocking(base_arg.clone(), pid, "on".into())
+                        .unwrap_err();
+                    assert!(!err.contains(&home.to_string_lossy().into_owned()), "{err}");
+                }
+                assert!(!override_path(&other).exists());
+                assert!(!override_path(&handle).exists());
+            }
+            // A regular file named like a handle dir is not a session.
+            std::fs::write(base.join("term-7"), b"x").unwrap();
+            assert!(set_session_rotation_blocking(base_arg, 7, "on".into()).is_err());
+        });
+    }
+
+    #[test]
+    fn session_rotation_commands_error_text_never_carries_a_path() {
+        with_session_rotation_base(|home, base| {
+            std::fs::create_dir_all(base.join("term-4242")).unwrap();
+            let base_arg = base.to_string_lossy().into_owned();
+            let home_str = home.to_string_lossy().into_owned();
+            // A broken rotation.json is reported with the redacted config message.
+            std::fs::write(base.join("rotation.json"), b"{not valid json").unwrap();
+            let err = get_session_rotation(base_arg.clone(), 4242).unwrap_err();
+            assert!(!err.contains(&home_str), "path leaked to renderer: {err}");
+            let err = set_session_rotation_blocking(base_arg, 4242, "on".into()).unwrap_err();
+            assert!(!err.contains(&home_str), "path leaked to renderer: {err}");
+            // The refusal happened before the write: nothing was stored.
+            assert!(!base
+                .join("term-4242")
+                .join(csq_core::rotation::session_override::OVERRIDE_FILE)
+                .exists());
+        });
+    }
+
+    /// C2: the setter refuses a terminal the rotator never moves, with fixed
+    /// text, and writes nothing; `default` can still clear a stale setting.
+    #[test]
+    fn set_session_rotation_refuses_an_ineligible_terminal_without_writing() {
+        with_session_rotation_base(|home, base| {
+            let base_arg = base.to_string_lossy().into_owned();
+            let override_file = csq_core::rotation::session_override::OVERRIDE_FILE;
+            // A 3P-bound terminal (slot 9 pins ANTHROPIC_BASE_URL).
+            let cfg = base.join("config-9");
+            std::fs::create_dir_all(&cfg).unwrap();
+            std::fs::write(
+                cfg.join("settings.json"),
+                r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.z.ai/api/anthropic","ANTHROPIC_AUTH_TOKEN":"x"}}"#,
+            )
+            .unwrap();
+            let third_party = base.join("term-4243");
+            std::fs::create_dir_all(&third_party).unwrap();
+            csq_core::accounts::markers::write_csq_account_legacy(
+                &third_party,
+                csq_core::types::AccountNum::try_from(9u16).unwrap(),
+            )
+            .unwrap();
+            // A terminal with no resolvable account marker.
+            let unbound = base.join("term-4244");
+            std::fs::create_dir_all(&unbound).unwrap();
+            for pid in [4243u32, 4244] {
+                for mode in ["on", "off"] {
+                    let err = set_session_rotation_blocking(base_arg.clone(), pid, mode.into())
+                        .unwrap_err();
+                    assert_eq!(err, SESSION_ROTATION_INELIGIBLE, "{pid} {mode}");
+                    assert!(!err.contains(&home.to_string_lossy().into_owned()));
+                }
+            }
+            assert!(!third_party.join(override_file).exists());
+            assert!(!unbound.join(override_file).exists());
+            // `default` clears, so a stale setting is never stuck.
+            std::fs::write(third_party.join(override_file), "{\"auto_swap\":\"on\"}\n").unwrap();
+            let view = set_session_rotation_blocking(base_arg, 4243, "default".into()).unwrap();
+            assert_eq!(view.mode, "default");
+            assert!(!third_party.join(override_file).exists());
+        });
+    }
+
+    /// Corr N1: a cloud-Claude (Vertex/Bedrock) slot is refused, on and off.
+    #[test]
+    fn set_session_rotation_refuses_a_cloud_claude_terminal() {
+        with_session_rotation_base(|_home, base| {
+            let base_arg = base.to_string_lossy().into_owned();
+            for (pid, flag) in [
+                (4250u32, "CLAUDE_CODE_USE_VERTEX"),
+                (4251, "CLAUDE_CODE_USE_BEDROCK"),
+            ] {
+                let slot = (pid - 4244) as u16;
+                let cfg = base.join(format!("config-{slot}"));
+                std::fs::create_dir_all(&cfg).unwrap();
+                std::fs::write(
+                    cfg.join("settings.json"),
+                    format!(r#"{{"env":{{"{flag}":"1"}}}}"#),
+                )
+                .unwrap();
+                let handle = base.join(format!("term-{pid}"));
+                std::fs::create_dir_all(&handle).unwrap();
+                csq_core::accounts::markers::write_csq_account_legacy(
+                    &handle,
+                    csq_core::types::AccountNum::try_from(slot).unwrap(),
+                )
+                .unwrap();
+                for mode in ["on", "off"] {
+                    let err = set_session_rotation_blocking(base_arg.clone(), pid, mode.into())
+                        .unwrap_err();
+                    assert_eq!(err, SESSION_ROTATION_INELIGIBLE, "{flag} {mode}");
+                }
+            }
+        });
+    }
+
+    /// Corr N4: `default` clears a stale setting while rotation.json is unreadable.
+    #[test]
+    fn set_session_rotation_default_clears_while_the_machine_config_is_unreadable() {
+        with_session_rotation_base(|_home, base| {
+            let handle = base.join("term-4242");
+            std::fs::create_dir_all(&handle).unwrap();
+            bind_claude_slot(&handle);
+            let base_arg = base.to_string_lossy().into_owned();
+            set_session_rotation_blocking(base_arg.clone(), 4242, "on".into()).unwrap();
+            std::fs::write(base.join("rotation.json"), b"{not valid json").unwrap();
+            assert!(set_session_rotation_blocking(base_arg.clone(), 4242, "on".into()).is_err());
+            let view = set_session_rotation_blocking(base_arg, 4242, "default".into()).unwrap();
+            assert_eq!(view.mode, "default");
+            assert!(!view.effective);
+            assert!(!handle
+                .join(csq_core::rotation::session_override::OVERRIDE_FILE)
+                .exists());
+        });
+    }
+
+    /// Corr N2 / sec N1: both setters are `async` Tauri commands that run on the
+    /// blocking pool; awaiting them gives the same result as the blocking body.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rotation_setters_are_async_commands() {
+        let home_dir = desktop_fixture_dir();
+        let home = home_dir.path();
+        let base = home.join(".claude").join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        let _base_env = test_base_dir_env::BaseDirEnvGuard::set(&base);
+        let _restore = DesktopFixtureEnv::set(&[("HOME", home.as_os_str())]);
+        let handle = base.join("term-4242");
+        std::fs::create_dir_all(&handle).unwrap();
+        bind_claude_slot(&handle);
+        let base_arg = base.to_string_lossy().into_owned();
+        set_rotation_enabled(base_arg.clone(), true).await.unwrap();
+        let view = set_session_rotation(base_arg, 4242, "off".into())
+            .await
+            .unwrap();
+        assert_eq!(view.mode, "off");
+        assert!(view.machine_enabled);
+        assert!(!view.effective);
+    }
+
+    /// C1: `handle_pid` is the `term-<pid>` basename of the config dir, never the
+    /// `claude` process id, and only for the admitted handle dir under THIS base.
+    #[test]
+    fn session_rotation_fields_key_on_the_handle_dir_basename() {
+        let base = tempfile::TempDir::new().unwrap();
+        let handle = base.path().join("term-4242");
+        std::fs::create_dir_all(&handle).unwrap();
+        bind_claude_slot(&handle);
+        let accounts: Vec<csq_core::accounts::AccountInfo> = Vec::new();
+        assert_eq!(
+            session_rotation_fields(base.path(), &accounts, &handle),
+            (Some(4242), true)
+        );
+        // A config-N launch has no handle pid and no control.
+        let legacy = base.path().join("config-3");
+        std::fs::create_dir_all(&legacy).unwrap();
+        assert_eq!(
+            session_rotation_fields(base.path(), &accounts, &legacy),
+            (None, false)
+        );
+        // Not exactly `term-<digits>`.
+        let odd = base.path().join("term-12x");
+        std::fs::create_dir_all(&odd).unwrap();
+        assert_eq!(
+            session_rotation_fields(base.path(), &accounts, &odd),
+            (None, false)
+        );
+        // A term dir under ANOTHER base is not this base's terminal.
+        let other = tempfile::TempDir::new().unwrap();
+        let foreign = other.path().join("term-4242");
+        std::fs::create_dir_all(&foreign).unwrap();
+        assert_eq!(
+            session_rotation_fields(base.path(), &accounts, &foreign),
+            (None, false)
+        );
+        // Handle dir present but unbound: pid reported, control gated off.
+        let unbound = base.path().join("term-4300");
+        std::fs::create_dir_all(&unbound).unwrap();
+        assert_eq!(
+            session_rotation_fields(base.path(), &accounts, &unbound),
+            (Some(4300), false)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_session_rotation_leaves_an_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        with_session_rotation_base(|_home, base| {
+            let handle = base.join("term-4242");
+            std::fs::create_dir_all(&handle).unwrap();
+            bind_claude_slot(&handle);
+            set_session_rotation_blocking(base.to_string_lossy().into_owned(), 4242, "on".into())
+                .unwrap();
+            let mode =
+                std::fs::metadata(handle.join(csq_core::rotation::session_override::OVERRIDE_FILE))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
+            assert_eq!(mode, 0o600);
+        });
     }
 
     // `gemini_switch_model` takes an `AppHandle`, which — per the

@@ -1,12 +1,16 @@
 //! Per-relay local control transport (spec 34 §34.3.1).
 //!
-//! This module authenticates socket endpoints, not command authority. The loop
-//! receives a bounded JSON line and a kernel-bound peer identity; it must apply
-//! the command verifier and every state gate before admitting a request. No
+//! Socket admission binds one bounded frame and kernel-bound peer to its
+//! original lease, then delegates owner provenance to the command verifier.
+//! That opaque admission grants neither Idle nor a state/writer bypass. No
 //! connection thread owns a PTY descriptor. Replies use a bounded channel, so
-//! the loop's `reply` operation performs no socket I/O.
+//! handing the worker a reply performs no socket I/O on the byte loop.
 
-use super::types::SessionIdentity;
+use super::owner::{AuthorizedOwnerCommand, OwnerAuthError, OwnerVerifier, WireOwnerCommand};
+use super::state::SlashCmd;
+use super::types::{CliKind, InjectOutcome, SessionIdentity};
+use crate::sdk::SdkErrorCode;
+use std::fmt;
 use std::fs::{self, Metadata};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -129,13 +133,83 @@ fn denied() -> io::Error {
     refusal(io::ErrorKind::PermissionDenied, "relay_control_peer")
 }
 
+/// A write window with permanent revocation. A clamp owns a child cancellation
+/// node: parent loss propagates downward, but a write cutoff never kills the
+/// original request's still-live reply channel.
+#[derive(Clone)]
+pub(in crate::relay) struct RequestLease {
+    node: Arc<LeaseNode>,
+}
+
+struct LeaseNode {
+    deadline: Instant,
+    cancelled: AtomicBool,
+    parent: Option<Arc<LeaseNode>>,
+}
+
+impl RequestLease {
+    fn new(deadline: Instant) -> Self {
+        Self {
+            node: Arc::new(LeaseNode {
+                deadline,
+                cancelled: AtomicBool::new(false),
+                parent: None,
+            }),
+        }
+    }
+
+    pub(in crate::relay) fn deadline(&self) -> Instant {
+        self.node.deadline
+    }
+
+    pub(in crate::relay) fn is_expired(&self) -> bool {
+        let now = Instant::now();
+        let mut node = Some(&self.node);
+        while let Some(current) = node {
+            if now >= current.deadline {
+                current.cancelled.store(true, Ordering::Release);
+            }
+            if current.cancelled.load(Ordering::Acquire) {
+                return true;
+            }
+            node = current.parent.as_ref();
+        }
+        false
+    }
+
+    pub(in crate::relay) fn clamp(&self, earlier: Instant) -> Self {
+        Self {
+            node: Arc::new(LeaseNode {
+                deadline: self.deadline().min(earlier),
+                cancelled: AtomicBool::new(false),
+                parent: Some(Arc::clone(&self.node)),
+            }),
+        }
+    }
+
+    pub(in crate::relay) fn revoke(&self) {
+        self.node.cancelled.store(true, Ordering::Release);
+    }
+}
+
+/// Revokes queued/in-flight authority on every worker exit, including unwind.
+struct CancelLease(RequestLease);
+
+impl Drop for CancelLease {
+    fn drop(&mut self) {
+        self.0.revoke();
+    }
+}
+
 /// One bounded frame. The peer identity is evidence for a later authorization
 /// check; same UID alone does not authorize a command.
 pub struct ControlRequest {
     peer: SessionIdentity,
     line: Vec<u8>,
     reply: mpsc::SyncSender<Vec<u8>>,
-    deadline: Instant,
+    lease: RequestLease,
+    /// Immutable identity of the lease received with this line. Never on wire.
+    origin: Arc<LeaseNode>,
 }
 
 impl ControlRequest {
@@ -152,39 +226,151 @@ impl ControlRequest {
     /// Re-read the incarnation after the caller's authorization chain walk.
     #[must_use]
     pub fn peer_is_live(&self) -> bool {
-        match super::pty::process_identity_start(self.peer.pid) {
-            Some(start) if start == self.peer.started_at => true,
-            Some(_) => {
-                diagnostic(FailureTag::PeerIdentityChanged);
-                false
-            }
-            None => {
-                diagnostic(FailureTag::PeerStartUnreadable);
-                false
-            }
-        }
+        peer_is_live(self.peer)
     }
 
     /// The full read, queue and answer lifetime shares the worker's deadline.
     #[must_use]
     pub fn is_expired(&self) -> bool {
-        Instant::now() >= self.deadline
+        self.lease.is_expired()
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "production owner command cells remain closed")
+    )]
+    pub(in crate::relay) fn lease(&self) -> RequestLease {
+        self.lease.clone()
     }
 
     #[cfg(test)]
     pub(crate) fn for_test(peer: SessionIdentity, line: Vec<u8>, deadline: Instant) -> Self {
+        Self::for_test_with_lease(peer, line, RequestLease::new(deadline))
+    }
+
+    #[cfg(test)]
+    pub(in crate::relay) fn for_test_with_lease(
+        peer: SessionIdentity,
+        line: Vec<u8>,
+        lease: RequestLease,
+    ) -> Self {
         let (reply, _receiver) = mpsc::sync_channel(1);
         Self {
             peer,
             line,
             reply,
-            deadline,
+            origin: Arc::clone(&lease.node),
+            lease,
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::relay) fn with_lease_from_for_test(mut self, donor: &Self) -> Self {
+        self.lease = donor.lease.clone();
+        self
+    }
+
+    /// Consume one received line and its original lease. Neither raw owner
+    /// provenance nor a separately cloned lease can construct an admission.
+    pub(in crate::relay) fn admit_owner(
+        self,
+        verifier: &mut OwnerVerifier,
+        cli: CliKind,
+        now_ms: Option<u64>,
+    ) -> Result<(OwnerAdmission, ReplyHandle), AdmissionRefusal> {
+        let admitted = (|| {
+            if !Arc::ptr_eq(&self.origin, &self.lease.node) {
+                return Err(InjectOutcome::Refused(SdkErrorCode::NotAuthorized));
+            }
+            if self.is_expired() {
+                return Err(InjectOutcome::Refused(SdkErrorCode::RequestExpired));
+            }
+            if !self.peer_is_live() {
+                return Err(InjectOutcome::Undetermined);
+            }
+            if self.is_expired() {
+                return Err(InjectOutcome::Refused(SdkErrorCode::RequestExpired));
+            }
+            if cli == CliKind::Codex {
+                return Err(InjectOutcome::Refused(SdkErrorCode::InputRejected));
+            }
+            let wire = serde_json::from_slice::<WireOwnerCommand>(&self.line)
+                .map_err(|_| InjectOutcome::Refused(SdkErrorCode::NotAuthorized))?;
+            let owner = verifier.verify(wire, now_ms).map_err(owner_refusal)?;
+            verifier.revalidate(&owner, now_ms).map_err(owner_refusal)?;
+            if !self.peer_is_live() {
+                return Err(InjectOutcome::Undetermined);
+            }
+            let lease = self.lease.clamp(owner.deadline());
+            if lease.is_expired() {
+                return Err(InjectOutcome::Refused(SdkErrorCode::RequestExpired));
+            }
+            Ok(OwnerAdmission { owner, lease })
+        })();
+        let reply = self.into_reply();
+        match admitted {
+            Ok(admission) => Ok((admission, reply)),
+            Err(outcome) => Err(AdmissionRefusal { outcome, reply }),
+        }
+    }
+
+    fn into_reply(self) -> ReplyHandle {
+        ReplyHandle {
+            peer: self.peer,
+            reply: self.reply,
+            lease: RequestLease { node: self.origin },
         }
     }
 
     /// Hand a JSON response to the connection worker without waiting for I/O.
     /// Consuming the request permits at most one response.
     pub fn reply(self, json: &[u8]) -> io::Result<()> {
+        self.into_reply().reply(json)
+    }
+}
+
+/// Opaque, single-use provenance and write lease from the same received frame.
+#[must_use = "consume the request admission or explicitly abandon it"]
+pub(in crate::relay) struct OwnerAdmission {
+    owner: AuthorizedOwnerCommand,
+    lease: RequestLease,
+}
+
+impl OwnerAdmission {
+    pub(in crate::relay) fn command(&self) -> SlashCmd {
+        self.owner.command()
+    }
+
+    pub(in crate::relay) fn into_parts(self) -> (AuthorizedOwnerCommand, RequestLease) {
+        (self.owner, self.lease)
+    }
+}
+
+impl fmt::Debug for OwnerAdmission {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OwnerAdmission(<bound>)")
+    }
+}
+
+/// Original reply ownership; a shorter child write cutoff cannot renew or
+/// revoke this root window. Dropping it grants no new writing authority.
+#[must_use = "retain the original reply handle until the request terminates"]
+pub(in crate::relay) struct ReplyHandle {
+    peer: SessionIdentity,
+    reply: mpsc::SyncSender<Vec<u8>>,
+    lease: RequestLease,
+}
+
+impl ReplyHandle {
+    pub(in crate::relay) fn peer_is_live(&self) -> bool {
+        peer_is_live(self.peer)
+    }
+
+    pub(in crate::relay) fn is_expired(&self) -> bool {
+        self.lease.is_expired()
+    }
+
+    pub(in crate::relay) fn reply(self, json: &[u8]) -> io::Result<()> {
         if self.is_expired() {
             diagnostic(FailureTag::Expired);
             return Err(refusal(
@@ -198,6 +384,55 @@ impl ControlRequest {
             .try_send(json.to_vec())
             .map_err(|_| refusal(io::ErrorKind::BrokenPipe, "relay_control_reply_unavailable"))
     }
+}
+
+impl fmt::Debug for ReplyHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ReplyHandle(<original-window>)")
+    }
+}
+
+#[must_use = "a refused admission retains its original reply handle"]
+pub(in crate::relay) struct AdmissionRefusal {
+    outcome: InjectOutcome,
+    reply: ReplyHandle,
+}
+
+impl AdmissionRefusal {
+    pub(in crate::relay) fn into_parts(self) -> (InjectOutcome, ReplyHandle) {
+        (self.outcome, self.reply)
+    }
+}
+
+impl fmt::Debug for AdmissionRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AdmissionRefusal(<closed-outcome>)")
+    }
+}
+
+fn peer_is_live(peer: SessionIdentity) -> bool {
+    match super::pty::process_identity_start(peer.pid) {
+        Some(start) if start == peer.started_at => true,
+        Some(_) => {
+            diagnostic(FailureTag::PeerIdentityChanged);
+            false
+        }
+        None => {
+            diagnostic(FailureTag::PeerStartUnreadable);
+            false
+        }
+    }
+}
+
+fn owner_refusal(error: OwnerAuthError) -> InjectOutcome {
+    InjectOutcome::Refused(match error {
+        OwnerAuthError::Disabled => SdkErrorCode::DisabledByOperator,
+        OwnerAuthError::Expired => SdkErrorCode::RequestExpired,
+        OwnerAuthError::ClockUnavailable
+        | OwnerAuthError::GenerationUnavailable
+        | OwnerAuthError::Invalid
+        | OwnerAuthError::Replay => SdkErrorCode::NotAuthorized,
+    })
 }
 
 /// Owns the socket and the accept thread. Drop wakes accept, cancels connection
@@ -541,16 +776,21 @@ fn serve_until(
     stop: &AtomicBool,
     end: Instant,
 ) -> io::Result<()> {
+    // Also covers direct socket-pair worker tests, which bypass accept setup.
+    no_sigpipe(&stream)?;
     let line = read_line(&mut stream, end, stop)?;
     // Re-read after transport work. The loop rechecks after its own chain walk.
     reauthenticate(&stream, peer, end, stop)?;
     remaining(end, stop)?;
     let (reply, answer) = mpsc::sync_channel(1);
+    let lease = RequestLease::new(end);
+    let _cancel_on_exit = CancelLease(lease.clone());
     send.try_send(ControlRequest {
         peer,
         line,
         reply,
-        deadline: end,
+        origin: Arc::clone(&lease.node),
+        lease,
     })
     .map_err(|_| {
         diagnostic(FailureTag::QueueFull);
@@ -558,11 +798,72 @@ fn serve_until(
     })?;
     loop {
         remaining(end, stop)?;
+        if peer_disconnected(&stream)? {
+            return Err(refusal(
+                io::ErrorKind::BrokenPipe,
+                "relay_control_peer_closed",
+            ));
+        }
         match answer.recv_timeout(CANCEL_TICK.min(end.saturating_duration_since(Instant::now()))) {
             Ok(json) => return send_frame(&stream, &json, end, stop),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
+    }
+}
+
+/// Check full close without consuming a byte or mistaking a write-half-close
+/// for loss of the reply receiver. Darwin can omit HUP for a zero event mask,
+/// so every tick probes whether the peer can receive. The empty send adds no
+/// wire bytes; the Linux HUP path remains separate.
+fn peer_disconnected(stream: &UnixStream) -> io::Result<bool> {
+    let mut poll = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    // SAFETY: one initialized writable pollfd; a zero timeout cannot block.
+    if unsafe { libc::poll(&mut poll, 1, 0) } < 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::Interrupted {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    if poll.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+        return Ok(true);
+    }
+    #[cfg(not(target_os = "macos"))]
+    if poll.revents & libc::POLLHUP == 0 {
+        return Ok(false);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: the socket is live and the empty slice is valid for length
+        // zero. SO_NOSIGPIPE was set before admission; MSG_DONTWAIT bounds this
+        // probe even if the direct caller has not made the socket nonblocking.
+        let sent = unsafe {
+            libc::send(
+                stream.as_raw_fd(),
+                b"".as_ptr().cast(),
+                0,
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if sent >= 0 {
+            return Ok(false);
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EPIPE | libc::ECONNRESET | libc::ENOTCONN) => Ok(true),
+            Some(libc::EINTR | libc::EAGAIN) => Ok(false),
+            _ => Err(error),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(true)
     }
 }
 
@@ -970,7 +1271,112 @@ fn connect(path: &Path, end: Instant, stop: &AtomicBool) -> io::Result<UnixStrea
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::relay::owner::{mint, OwnerCommand, OwnerCommandFields};
     use std::io::Write;
+
+    const OWNER_NOW: u64 = 1_000_000;
+    const OWNER_KEY: [u8; 32] = [0x53; 32];
+
+    fn owner_fixture() -> (OwnerVerifier, Vec<u8>) {
+        let relay = me();
+        let mut verifier = OwnerVerifier::new(
+            zeroize::Zeroizing::new(OWNER_KEY),
+            SessionIdentity {
+                pid: if relay.pid == 1 { 2 } else { 1 },
+                started_at: 1,
+            },
+            relay,
+        )
+        .unwrap();
+        verifier.set_clock_for_test(Arc::new(|| Some(OWNER_NOW)));
+        let target = verifier.target();
+        let wire = mint(
+            OwnerCommandFields {
+                version: 1,
+                target_pid: target.pid,
+                target_started_at: target.started_at,
+                relay_pid: relay.pid,
+                relay_started_at: relay.started_at,
+                generation: verifier.generation(),
+                update_id: 7,
+                issued_at_ms: OWNER_NOW,
+                expires_at_ms: OWNER_NOW + 30_000,
+                command: OwnerCommand::Clear,
+            },
+            &OWNER_KEY,
+        )
+        .unwrap();
+        (verifier, serde_json::to_vec(&wire).unwrap())
+    }
+
+    #[test]
+    fn admitted_child_revocation_preserves_original_reply_handle() {
+        let (mut verifier, line) = owner_fixture();
+        let (reply, answer) = mpsc::sync_channel(1);
+        let mut request =
+            ControlRequest::for_test(me(), line, Instant::now() + Duration::from_secs(30));
+        request.reply = reply;
+        let (admission, reply) = request
+            .admit_owner(&mut verifier, CliKind::Claude, Some(OWNER_NOW))
+            .unwrap();
+        assert_eq!(admission.command(), SlashCmd::Clear);
+        let (_owner, child) = admission.into_parts();
+        child.revoke();
+        assert!(child.is_expired());
+        assert!(reply.peer_is_live());
+        assert!(
+            !reply.is_expired(),
+            "ADMITTED_WRITE_REVOCATION_MUST_KEEP_ORIGINAL_REPLY_WINDOW"
+        );
+        let frame = br#"{"outcome":"refused","error":{"code":"request_expired"}}"#;
+        reply.reply(frame).unwrap();
+        assert_eq!(answer.recv_timeout(IO_BOUND).unwrap(), frame);
+    }
+
+    #[test]
+    fn swapped_admission_refusal_keeps_original_expired_reply_window() {
+        let (mut verifier, line) = owner_fixture();
+        let expired = ControlRequest::for_test(me(), line.clone(), Instant::now());
+        let donor = ControlRequest::for_test(me(), line, Instant::now() + Duration::from_secs(30));
+        let refused = expired
+            .with_lease_from_for_test(&donor)
+            .admit_owner(&mut verifier, CliKind::Claude, Some(OWNER_NOW))
+            .unwrap_err();
+        let (outcome, reply) = refused.into_parts();
+        assert_eq!(outcome, InjectOutcome::Refused(SdkErrorCode::NotAuthorized));
+        assert!(
+            reply.is_expired(),
+            "SWAPPED_REPLY_MUST_KEEP_ORIGINAL_FRAME_WINDOW"
+        );
+        assert!(!donor.is_expired());
+        assert_eq!(
+            reply.reply(b"{}").unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn admission_and_reply_debug_never_expose_owner_mac() {
+        let (mut verifier, line) = owner_fixture();
+        let value: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        let mac = value["mac"].as_str().unwrap();
+        let request =
+            ControlRequest::for_test(me(), line.clone(), Instant::now() + Duration::from_secs(30));
+        let (admission, reply) = request
+            .admit_owner(&mut verifier, CliKind::Claude, Some(OWNER_NOW))
+            .unwrap();
+        for rendered in [format!("{admission:?}"), format!("{reply:?}")] {
+            assert!(
+                !rendered.contains(mac),
+                "bound authority debug must omit bearer MAC"
+            );
+        }
+        let request = ControlRequest::for_test(me(), line, Instant::now());
+        let refused = request
+            .admit_owner(&mut verifier, CliKind::Claude, Some(OWNER_NOW))
+            .unwrap_err();
+        assert!(!format!("{refused:?}").contains(mac));
+    }
 
     fn fixture() -> tempfile::TempDir {
         let dir = tempfile::Builder::new()
@@ -1592,6 +1998,220 @@ mod tests {
     }
 
     #[test]
+    fn request_lease_clamp_never_extends_and_revokes_only_write_descendants() {
+        let now = Instant::now();
+        let end = now + Duration::from_secs(30);
+        let req = ControlRequest::for_test(me(), b"{}".to_vec(), end);
+        let original = req.lease();
+        let earlier = now + Duration::from_secs(10);
+        let shortened = original.clamp(earlier);
+        assert_eq!(shortened.deadline(), earlier);
+        assert_eq!(shortened.clamp(end).deadline(), earlier);
+        assert_eq!(original.clamp(end + IO_BOUND).deadline(), end);
+        assert!(!original.is_expired());
+        assert!(!shortened.is_expired());
+
+        let expired = shortened.clamp(now);
+        let sibling = expired.clone();
+        let descendant = sibling.clamp(end);
+        assert!(
+            expired.is_expired(),
+            "exclusive cutoff must revoke the lease"
+        );
+        assert!(
+            sibling.is_expired(),
+            "a sibling cannot resume after revocation"
+        );
+        assert!(
+            descendant.is_expired(),
+            "child leases cannot escape parent loss"
+        );
+        assert!(
+            !req.is_expired(),
+            "R1_M4: a write cutoff must leave the reply authority alive"
+        );
+        assert!(!original.clamp(end).is_expired());
+        shortened.revoke();
+        assert!(shortened.clamp(end).is_expired());
+        assert!(!req.is_expired());
+    }
+
+    #[test]
+    fn test_request_dropped_reply_receiver_does_not_cancel_lease() {
+        let end = Instant::now() + Duration::from_secs(30);
+        let req = ControlRequest::for_test(me(), b"{}".to_vec(), end);
+        assert_eq!(req.lease().deadline(), end);
+        assert!(!req.is_expired());
+        assert_eq!(
+            req.reply(b"{}").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe,
+            "test helper's dropped receiver is not a worker cancellation"
+        );
+    }
+
+    #[test]
+    fn worker_stop_revokes_queued_lease_before_original_deadline() {
+        let (worker, mut caller) = UnixStream::pair().unwrap();
+        worker.set_nonblocking(true).unwrap();
+        caller.write_all(b"{}\n").unwrap();
+        let (send, recv) = mpsc::sync_channel(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let end = Instant::now() + Duration::from_secs(30);
+        let worker = thread::spawn(move || serve_until(worker, me(), send, &worker_stop, end));
+        let req = recv.recv_timeout(IO_BOUND).unwrap();
+        let lease = req.lease();
+        assert!(!lease.is_expired());
+        stop.store(true, Ordering::Release);
+        assert!(worker.join().unwrap().is_err());
+        assert!(
+            Instant::now() < end,
+            "worker stop must not await the cutoff"
+        );
+        assert!(
+            lease.is_expired(),
+            "worker exit must revoke queued authority"
+        );
+        assert!(req.is_expired());
+    }
+
+    #[test]
+    fn clamped_write_expiry_still_allows_honest_reply_in_original_window() {
+        let (worker, mut caller) = UnixStream::pair().unwrap();
+        worker.set_nonblocking(true).unwrap();
+        caller.set_nonblocking(true).unwrap();
+        caller.write_all(b"{}\n").unwrap();
+        let (send, recv) = mpsc::sync_channel(1);
+        let end = Instant::now() + Duration::from_secs(30);
+        let worker =
+            thread::spawn(move || serve_until(worker, me(), send, &AtomicBool::new(false), end));
+        let req = recv.recv_timeout(IO_BOUND).unwrap();
+        let write_lease = req.lease().clamp(Instant::now());
+        assert!(write_lease.is_expired());
+        assert!(
+            !req.is_expired(),
+            "R1_M4: write expiry must not revoke the reply window"
+        );
+        let frame = br#"{"outcome":"refused","error":{"code":"request_expired"}}"#;
+        req.reply(frame).unwrap();
+        worker.join().unwrap().unwrap();
+        assert_eq!(
+            read_line(
+                &mut caller,
+                Instant::now() + IO_BOUND,
+                &AtomicBool::new(false)
+            )
+            .unwrap(),
+            frame,
+            "R1_M4: an honest expired-write refusal must reach the still-connected caller"
+        );
+    }
+
+    #[test]
+    fn queued_client_full_disconnect_revokes_lease_before_original_deadline() {
+        let (worker, mut caller) = UnixStream::pair().unwrap();
+        worker.set_nonblocking(true).unwrap();
+        caller.write_all(b"{}\n").unwrap();
+        let (send, recv) = mpsc::sync_channel(1);
+        let (done, finished) = mpsc::sync_channel(1);
+        let (release, keep_alive) = mpsc::sync_channel(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let end = Instant::now() + Duration::from_secs(30);
+        let worker = thread::spawn(move || {
+            let result = serve_until(worker, me(), send, &worker_stop, end);
+            let _ = done.send(());
+            // Keep the thread alive until the caller records revocation. Its
+            // eventual exit/join must not supply the observation under test.
+            // Dropping release during unwind also unblocks this receive.
+            let _ = keep_alive.recv();
+            result
+        });
+        let queued = recv.recv_timeout(IO_BOUND);
+        let lease = queued.as_ref().ok().map(ControlRequest::lease);
+        let initially_live = lease.as_ref().is_some_and(|lease| !lease.is_expired());
+        drop(caller);
+        let disconnected = finished.recv_timeout(IO_BOUND);
+        let revoked_before_cleanup = lease.as_ref().is_some_and(RequestLease::is_expired);
+        let before_original_deadline = Instant::now() < end;
+        // Capture above, then always release/reap before any assertion. Even a
+        // mutant that leaks the lease or ignores disconnect gets safe cleanup.
+        stop.store(true, Ordering::Release);
+        let _ = release.send(());
+        let terminal = worker.join();
+        assert!(
+            queued.is_ok(),
+            "the full-close fixture must admit one request"
+        );
+        assert!(initially_live, "the queued lease must initially be live");
+        assert!(disconnected.is_ok(), "R1_M3_FULL_DISCONNECT_REVOKES: worker must observe full close before the original deadline");
+        assert!(before_original_deadline);
+        assert!(
+            revoked_before_cleanup,
+            "R2_M3_REVOCATION_BEFORE_CLEANUP: full close must revoke the live queued lease before stop, thread exit or join"
+        );
+        assert!(
+            matches!(terminal, Ok(Err(_))),
+            "full close must end the worker with a transport refusal"
+        );
+    }
+
+    #[test]
+    fn queued_client_write_half_close_preserves_reply_receiver() {
+        let (worker, mut caller) = UnixStream::pair().unwrap();
+        worker.set_nonblocking(true).unwrap();
+        caller.set_nonblocking(true).unwrap();
+        let probe = worker.try_clone().unwrap();
+        caller.write_all(b"{}\n").unwrap();
+        let (send, recv) = mpsc::sync_channel(1);
+        let end = Instant::now() + IO_BOUND;
+        let worker =
+            thread::spawn(move || serve_until(worker, me(), send, &AtomicBool::new(false), end));
+        let req = recv.recv_timeout(IO_BOUND).unwrap();
+        caller.shutdown(std::net::Shutdown::Write).unwrap();
+        assert!(
+            !peer_disconnected(&probe).unwrap(),
+            "R1_M3_HALF_CLOSE: a peer still receiving replies must retain authority"
+        );
+        drop(probe);
+        req.reply(b"{}").unwrap();
+        worker.join().unwrap().unwrap();
+        assert_eq!(
+            read_line(
+                &mut caller,
+                Instant::now() + IO_BOUND,
+                &AtomicBool::new(false)
+            )
+            .unwrap(),
+            b"{}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_hangup_probe_distinguishes_full_and_half_close_without_wire_bytes() {
+        let (worker, mut caller) = UnixStream::pair().unwrap();
+        worker.set_nonblocking(true).unwrap();
+        caller.set_nonblocking(true).unwrap();
+        no_sigpipe(&worker).unwrap();
+        caller.shutdown(std::net::Shutdown::Write).unwrap();
+        assert!(
+            !peer_disconnected(&worker).unwrap(),
+            "R1_M3_DARWIN_HALF_CLOSE: a live reply receiver must survive the probe"
+        );
+        let mut byte = [0u8; 1];
+        assert!(
+            matches!(caller.read(&mut byte), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "R1_M3_ZERO_PROBE_NO_PAYLOAD: the disconnect probe must add no wire byte"
+        );
+        drop(caller);
+        assert!(
+            peer_disconnected(&worker).unwrap(),
+            "R1_M3_DARWIN_FULL_CLOSE: full close must be distinguished without a deadline wait"
+        );
+    }
+
+    #[test]
     fn serve_lifecycle_reuses_one_absolute_deadline() {
         let (worker, mut caller) = UnixStream::pair().unwrap();
         worker.set_nonblocking(true).unwrap();
@@ -1602,12 +2222,18 @@ mod tests {
             thread::spawn(move || serve_until(worker, me(), send, &AtomicBool::new(false), end));
         let req = recv.recv_timeout(IO_BOUND).unwrap();
         assert_eq!(
-            req.deadline, end,
+            req.lease().deadline(),
+            end,
             "queue must carry the original read deadline"
         );
         assert!(!req.is_expired());
+        let lease = req.lease();
         req.reply(b"{}").unwrap();
         worker.join().unwrap().unwrap();
+        assert!(
+            lease.is_expired(),
+            "successful worker exit also ends authority"
+        );
     }
 
     #[test]

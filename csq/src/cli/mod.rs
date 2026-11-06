@@ -220,6 +220,27 @@ enum Command {
         /// the gap visible).
         #[arg(long = "no-audit")]
         no_audit: bool,
+        /// Auto-rotate for THIS terminal only: `on` lets the daemon move it to a
+        /// lower-usage account near its quota even if auto-rotate is off
+        /// machine-wide; `off` keeps it where it is even if it is on. Without
+        /// the flag the terminal follows the machine setting
+        /// (`csq rotation on|off`). Claude Code sign-in sessions only; change it
+        /// later with `csq rotation session on|off|default`.
+        #[arg(long = "auto-swap", value_enum, value_name = "on|off")]
+        auto_swap: Option<commands::rotation::AutoSwapArg>,
+        /// Fact Guard sandbox request (opt-in, Claude Code launches only). Pins
+        /// the permission mode csq sets on the command line to `manual` and
+        /// REFUSES any bypass, settings, plugin, hook or approval-delegating flag
+        /// rather than silently dropping it. The launch receipt records
+        /// `sandbox: "permission-mode-only"` and `permission_mode: "manual"`.
+        #[arg(long = "sandbox")]
+        sandbox: bool,
+        /// Pass `NAME` through the admin-token environment scrub for this launch
+        /// (repeatable). The launch receipt records it in `allowed_env_keys`; a
+        /// scope-bearing name also appears in `unresolved_env_keys`, which a guard
+        /// reads as "a token csq could not classify".
+        #[arg(long = "allow-env", value_name = "NAME")]
+        allow_env: Vec<String>,
         /// Drive the native governed coding-agent loop (P0-B) against this
         /// slot's 3P provider instead of spawning a CLI. Enterprise-only.
         #[cfg(feature = "native-harness")]
@@ -531,6 +552,12 @@ enum Command {
         action: Option<ModelsCmd>,
     },
 
+    /// View or change auto-rotate (the daemon moving a terminal to a lower-usage account near its quota)
+    Rotation {
+        #[command(subcommand)]
+        action: commands::rotation::RotationCommand,
+    },
+
     /// Install csq into ~/.claude (creates dirs, patches settings.json)
     Install,
 
@@ -645,6 +672,13 @@ enum Command {
     Sessions {
         #[command(subcommand)]
         command: SessionsCommand,
+    },
+
+    /// This terminal's own session: queue an in-place recycle of the
+    /// csq-supervised Claude Code process, or read its memory sample.
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
     },
 
     /// Generate shell completions for bash, zsh, fish, or powershell
@@ -872,6 +906,58 @@ enum CliCommand {
     },
 }
 
+/// Subcommands for `csq session` — the CURRENT terminal's supervised session (spec 36).
+#[derive(Subcommand, Debug)]
+enum SessionCommand {
+    /// Queue a restart of this terminal's Claude Code process at the next quiet
+    /// point. The conversation resumes by `--resume <session-id>`; the account
+    /// and handle dir are unchanged. Only works inside a `csq run`-supervised
+    /// session.
+    Recycle {
+        /// The Claude Code session id this request names: THIS terminal's own for a
+        /// self recycle, the TARGET's when `--to` is given (REQUIRED; never
+        /// `--continue`).
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Why (at most 200 printable characters). Self recycle only.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Relaunch CLEAN instead of resuming: no `--resume`, one fixed positional
+        /// prompt. Needs the capability layer's terminal context (spec 36.10).
+        /// REQUIRED with `--to`: a third party may only ask for a fresh relaunch.
+        #[arg(long)]
+        fresh: bool,
+        /// Recycle ANOTHER session instead of this terminal: the absolute path of the
+        /// target's handle dir. Goes through the daemon socket and needs the target's
+        /// own consent (design §A/§B); there is no fallback when the daemon is down.
+        #[arg(long)]
+        to: Option<String>,
+    },
+    /// Print this terminal's latest child-memory sample (`--json` for the raw view).
+    Memory,
+    /// Opt THIS terminal in to a cross-session (`--to`) recycle by naming the requester, or
+    /// `--revoke` to withdraw it (design §A, A1). Run from the TARGET's own terminal: the
+    /// consent is bound to this terminal's CURRENT session and written into its own handle dir,
+    /// and the named requester record is verified against Claude Code's registry first.
+    Consent {
+        /// The requester's Claude Code session id (the verified record's session half).
+        #[arg(long)]
+        to: Option<String>,
+        /// The requester's handle dir (absolute; the record's other half).
+        #[arg(long)]
+        handle: Option<String>,
+        /// Consent lifetime in seconds (default 12 h, capped at 7 days).
+        #[arg(long = "ttl-secs")]
+        ttl_secs: Option<i64>,
+        /// Uses granted before the consent is spent (default 1).
+        #[arg(long = "max-uses")]
+        max_uses: Option<u32>,
+        /// Withdraw this terminal's consent.
+        #[arg(long)]
+        revoke: bool,
+    },
+}
+
 /// Subcommands for `csq sessions` — cross-slot session sharing
 /// (`csq-core::session::shared_state`).
 #[derive(Subcommand, Debug)]
@@ -987,6 +1073,10 @@ enum SessionsCommand {
     /// Send a message to a live Claude Code or Codex session. The sender is always the
     /// session this command runs inside; it cannot be chosen. Always emits
     /// `csq.message_receipt.v1`.
+    ///
+    /// With `--service <name>` the message is sent as a registered service instead:
+    /// "sent as a registered service; a service is not a session and never an approval."
+    /// That form works outside any session and needs the daemon.
     Send {
         /// The recipient: `<pid>:<started_at>` from `csq sessions list`, or the session's
         /// name. A name that matches two live sessions is refused, never guessed.
@@ -1006,6 +1096,12 @@ enum SessionsCommand {
         /// the receipt carries `wake_override: codex_no_turn_hook`.
         #[arg(long = "no-wake", action = clap::ArgAction::SetFalse)]
         wake: bool,
+        /// Send as this registered service (`csq sessions service add <name>`) instead of as
+        /// the session this command runs inside. Sent as a registered service; a service is
+        /// not a session and never an approval. Works outside any session and requires the
+        /// daemon: without one it fails `service_daemon_unavailable` and stores nothing.
+        #[arg(long)]
+        service: Option<String>,
     },
     /// Recover the calling session's receipt for a request token.
     LookupMessage {
@@ -1021,6 +1117,48 @@ enum SessionsCommand {
         #[arg(long)]
         note: Option<String>,
     },
+    /// Register, revoke and inspect the identities a NON-session process may send csq
+    /// messages as (`csq sessions send --service <name>`). Registration is NOT
+    /// exclusivity: any same-uid process can register a name. The protection is the
+    /// `service:<name>` framing, the audit trail of every admission and refusal, and
+    /// revocability — never exclusivity.
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
+}
+
+/// Subcommands for `csq sessions service` — registered service identities (an internal ticket, spec 32h
+/// §11). All three work without a daemon and outside any session.
+#[derive(Subcommand, Debug)]
+enum ServiceCommand {
+    /// Register (or, with `--force`, re-register) a service name for the current uid.
+    ///
+    /// Any same-uid process can register a name, including one you never created:
+    /// registration is NOT exclusivity. The protection is the `service:<name>` framing
+    /// (a service is never rendered as a session and never as an approval), the audit
+    /// trail of every admission and refusal, and revocability. `service list` prints each
+    /// registration's created_at and registration_id so you can spot one you did not
+    /// create.
+    Add {
+        /// The name: `^[a-z0-9][a-z0-9-]{0,31}$`. A shape that could pass for a session
+        /// label or a target (`term-<digits>`, a lowercase UUID, `claude-code`, `codex`,
+        /// `service`) is refused.
+        name: String,
+        /// Re-register an existing name with a FRESH registration_id (the old identity's
+        /// idempotency keys do not replay against the new one).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Revoke a service name (unlink its registry record). The daemon reads the registry
+    /// per send, so the next send refuses.
+    Remove {
+        /// The registered name.
+        name: String,
+    },
+    /// Print every registered service: name, created_at (readable and raw epoch) and
+    /// registration_id, plus the count of unreadable entries when there are any.
+    List,
 }
 
 /// Subcommands for `csq admin` — M-DEK org-root key-hierarchy operations
@@ -2176,6 +2314,9 @@ pub fn run() -> Result<()> {
         no_auto_update_cli: false,
         track_latest: false,
         no_audit: false,
+        auto_swap: None,
+        sandbox: false,
+        allow_env: Vec::new(),
         #[cfg(feature = "native-harness")]
         native: false,
         #[cfg(feature = "native-harness")]
@@ -2315,6 +2456,9 @@ pub fn run() -> Result<()> {
             no_auto_update_cli,
             track_latest,
             no_audit,
+            auto_swap,
+            sandbox,
+            allow_env,
             #[cfg(feature = "native-harness")]
             native,
             #[cfg(feature = "native-harness")]
@@ -2335,6 +2479,30 @@ pub fn run() -> Result<()> {
             // before the CLI-spawn surface logic.
             #[cfg(feature = "native-harness")]
             if native {
+                // `--native` runs the governed loop in-process: there is no
+                // child CLI to sandbox and no child environment to scrub, so
+                // silently ignoring these flags would be the exact "dropped
+                // flag" §35.5 refuses. Say so and stop.
+                if sandbox {
+                    return Err(anyhow::anyhow!(
+                        "csq_run_sandbox_unsupported: --native runs the governed loop \
+                         in-process; there is no Claude CLI to sandbox"
+                    ));
+                }
+                if !allow_env.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "{}: --allow-env applies to csq run CLI launches; --native reads \
+                         no child environment",
+                        commands::launch_x1::TAG_ALLOW_ENV_UNSUPPORTED
+                    ));
+                }
+                if auto_swap.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "csq_run_auto_swap_unsupported: --auto-swap applies to csq run CLI \
+                         launches; --native runs the governed loop in-process and the \
+                         session rotator never moves it"
+                    ));
+                }
                 return commands::run::handle_native(
                     &base_dir,
                     account_num,
@@ -2364,6 +2532,9 @@ pub fn run() -> Result<()> {
                 no_auto_update_cli,
                 track_latest,
                 no_audit,
+                auto_swap.map(commands::rotation::AutoSwapArg::mode),
+                sandbox,
+                &allow_env,
                 &rest,
             )
         }
@@ -2600,6 +2771,7 @@ pub fn run() -> Result<()> {
         Command::Listkeys => commands::listkeys::handle(&base_dir, json),
         Command::Rmkey { provider } => commands::rmkey::handle(&base_dir, &provider),
         Command::Pool { action } => commands::pool::handle(&base_dir, action, json),
+        Command::Rotation { action } => commands::rotation::handle(&base_dir, action, json),
         Command::Models { action } => {
             let action = action.unwrap_or(ModelsCmd::List {
                 provider: "all".to_string(),
@@ -2761,6 +2933,43 @@ pub fn run() -> Result<()> {
             CliCommand::Install { name } => commands::cli::handle_install(&name),
             CliCommand::Upgrade { name } => commands::cli::handle_upgrade(&name),
         },
+        Command::Session { command } => match command {
+            SessionCommand::Recycle {
+                session_id,
+                reason,
+                fresh,
+                to,
+            } => match to.as_deref() {
+                Some(target) => commands::session_recycle::recycle_foreign(
+                    &base_dir,
+                    target,
+                    session_id.as_deref(),
+                    reason.as_deref(),
+                    fresh,
+                ),
+                None => commands::session_recycle::recycle(
+                    &base_dir,
+                    session_id.as_deref(),
+                    reason.as_deref(),
+                    fresh,
+                ),
+            },
+            SessionCommand::Memory => commands::session_recycle::memory(json),
+            SessionCommand::Consent {
+                to,
+                handle,
+                ttl_secs,
+                max_uses,
+                revoke,
+            } => commands::session_recycle::consent(
+                &base_dir,
+                to.as_deref(),
+                handle.as_deref(),
+                ttl_secs,
+                max_uses,
+                revoke,
+            ),
+        },
         Command::Sessions { command } => match command {
             SessionsCommand::DiskReport => {
                 let code = commands::sessions_disk::handle(&base_dir, json)?;
@@ -2829,14 +3038,37 @@ pub fn run() -> Result<()> {
                 reply_to,
                 idempotency_key,
                 wake,
-            } => commands::sessions_messages::send(
-                &base_dir,
-                &target,
-                &message,
-                reply_to.as_deref(),
-                idempotency_key.as_deref(),
-                wake,
-            ),
+                service,
+            } => match service.as_deref() {
+                // The service form never resolves a caller session: it validates the name,
+                // resolves the target and POSTs the daemon's send-service route.
+                Some(name) => commands::sessions_service::send(
+                    &base_dir,
+                    name,
+                    &target,
+                    &message,
+                    reply_to.as_deref(),
+                    idempotency_key.as_deref(),
+                    wake,
+                ),
+                None => commands::sessions_messages::send(
+                    &base_dir,
+                    &target,
+                    &message,
+                    reply_to.as_deref(),
+                    idempotency_key.as_deref(),
+                    wake,
+                ),
+            },
+            SessionsCommand::Service { command } => match command {
+                ServiceCommand::Add { name, force } => {
+                    commands::sessions_service::add(&base_dir, &name, force)
+                }
+                ServiceCommand::Remove { name } => {
+                    commands::sessions_service::remove(&base_dir, &name)
+                }
+                ServiceCommand::List => commands::sessions_service::list(&base_dir),
+            },
             SessionsCommand::LookupMessage { idempotency_key } => {
                 commands::sessions_messages::lookup(&base_dir, &idempotency_key)
             }
@@ -3339,6 +3571,28 @@ mod tests {
         assert!(!wake_of(&["--no-wake"]), "--no-wake must not wake");
     }
 
+    /// `--service` binds to its own field and is absent unless passed: the session send path
+    /// is selected by its absence, byte for byte.
+    #[test]
+    fn sessions_send_service_flag_binds_only_when_passed() {
+        use clap::Parser;
+        let service_of = |extra: &[&str]| {
+            let mut args = vec!["csq", "sessions", "send", "12:34", "--message", "hi"];
+            args.extend_from_slice(extra);
+            match Cli::try_parse_from(args).unwrap().command {
+                Some(Command::Sessions {
+                    command: super::SessionsCommand::Send { service, .. },
+                }) => service,
+                other => panic!("not a sessions send: {}", other.is_some()),
+            }
+        };
+        assert_eq!(service_of(&[]), None);
+        assert_eq!(
+            service_of(&["--service", "nightly"]).as_deref(),
+            Some("nightly")
+        );
+    }
+
     /// The valid forms parse, and the hook flag is bound to `--messages`.
     #[test]
     fn messaging_arguments_cannot_name_a_sender() {
@@ -3392,6 +3646,38 @@ mod tests {
             "hi",
             "--no-wake"
         ]));
+        // The service sender forms: `--service` on send, and the registry commands.
+        assert!(ok(&[
+            "csq",
+            "sessions",
+            "send",
+            "12:34",
+            "--message",
+            "hi",
+            "--service",
+            "nightly",
+            "--no-wake"
+        ]));
+        assert!(ok(&[
+            "csq",
+            "sessions",
+            "send",
+            "name",
+            "--message",
+            "-",
+            "--service",
+            "nightly"
+        ]));
+        assert!(ok(&["csq", "sessions", "service", "add", "nightly"]));
+        assert!(ok(&[
+            "csq", "sessions", "service", "add", "nightly", "--force"
+        ]));
+        assert!(ok(&["csq", "sessions", "service", "remove", "nightly"]));
+        assert!(ok(&["csq", "sessions", "service", "list"]));
+        assert!(
+            !ok(&["csq", "sessions", "service", "add"]),
+            "name is required"
+        );
         for forged in [
             "--from",
             "--sender",
@@ -3698,6 +3984,62 @@ mod tests {
             Some(Command::Run { debug, .. }) => assert!(!debug, "debug must default to false"),
             other => panic!("expected Run subcommand, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn run_auto_swap_flag_parses_on_off_and_defaults_to_unset() {
+        use super::commands::rotation::AutoSwapArg;
+        for (value, expected) in [("on", AutoSwapArg::On), ("off", AutoSwapArg::Off)] {
+            let cli = Cli::try_parse_from(["csq", "run", "2", "--auto-swap", value])
+                .expect("parse run --auto-swap");
+            match cli.command {
+                Some(Command::Run { auto_swap, .. }) => assert_eq!(auto_swap, Some(expected)),
+                other => panic!("expected Run subcommand, got {other:?}"),
+            }
+        }
+        let cli = Cli::try_parse_from(["csq", "run", "2"]).expect("parse bare run");
+        match cli.command {
+            Some(Command::Run { auto_swap, .. }) => assert_eq!(auto_swap, None),
+            other => panic!("expected Run subcommand, got {other:?}"),
+        }
+        // `default` is for `csq rotation session`; a fresh handle dir has nothing to reset.
+        assert!(Cli::try_parse_from(["csq", "run", "2", "--auto-swap", "default"]).is_err());
+        assert!(Cli::try_parse_from(["csq", "run", "2", "--auto-swap", "maybe"]).is_err());
+    }
+
+    #[test]
+    fn rotation_session_subcommand_parses_mode_and_optional_session() {
+        use super::commands::rotation::{RotationCommand, SessionModeArg};
+        let cli = Cli::try_parse_from(["csq", "rotation", "session", "on"]).expect("parse");
+        match cli.command {
+            Some(Command::Rotation {
+                action: RotationCommand::Session { mode, session },
+            }) => {
+                assert_eq!(mode, SessionModeArg::On);
+                assert_eq!(session, None);
+            }
+            other => panic!("expected Rotation session, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "csq",
+            "rotation",
+            "session",
+            "default",
+            "--session",
+            "term-12",
+        ])
+        .expect("parse");
+        match cli.command {
+            Some(Command::Rotation {
+                action: RotationCommand::Session { mode, session },
+            }) => {
+                assert_eq!(mode, SessionModeArg::Default);
+                assert_eq!(session.as_deref(), Some("term-12"));
+            }
+            other => panic!("expected Rotation session, got {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["csq", "rotation", "session"]).is_err());
+        assert!(Cli::try_parse_from(["csq", "rotation", "session", "sometimes"]).is_err());
     }
 
     // M7: capability-layer default flipped opt-in → `.coc/`-gated

@@ -620,6 +620,15 @@ pub(crate) fn parse_ppid(stat: &str) -> Option<u32> {
     stat[close + 1..].split_whitespace().nth(1)?.parse().ok()
 }
 
+/// `(ppid, start unix seconds)` of `pid` from ONE read of `/proc/<pid>/stat`, so both belong to
+/// the same process incarnation.
+pub(crate) fn ppid_and_start(pid: u32) -> Option<(u32, u64)> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let ppid = parse_ppid(&stat)?;
+    let (_, ticks) = parse_tty_and_start(&stat)?;
+    Some((ppid, start_from_ticks(ticks)?))
+}
+
 /// The parent pid of `pid` from `/proc/<pid>/stat`, or `None` when unreadable.
 pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;

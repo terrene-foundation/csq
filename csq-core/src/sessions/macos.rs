@@ -1079,6 +1079,14 @@ pub(crate) fn probe_start_time(pid: u32) -> Probe<u64> {
     }
 }
 
+/// `(pbi_ppid, pbi_start_tvsec)` of `pid` from ONE `proc_pidinfo(PROC_PIDTBSDINFO)` read, so
+/// the parent and the start time describe the same process incarnation. `None` on any
+/// failure or an unpopulated (zero) start.
+pub(crate) fn ppid_and_start(pid: u32) -> Option<(u32, u64)> {
+    let i = read_bsd_info(pid)?;
+    (i.pbi_start_tvsec != 0).then_some((i.pbi_ppid, i.pbi_start_tvsec))
+}
+
 /// The parent pid of `pid` (`pbi_ppid`), or `None` when the process cannot be read.
 ///
 /// A process the full read refuses (setuid-root `/usr/bin/login` as a non-root caller) still
@@ -2841,17 +2849,30 @@ mod tests {
             .config_dirs
             .contains(&std::path::PathBuf::from(&orphan_dir));
         let by_lineage = scan.descent(creator.uniqueid) != holders::Descent::Not;
+        // A scan that stopped at its budget, could not read a process or contradicted itself
+        // omits processes by design and says so; the sweep reads that as Unknown and keeps
+        // (`orphans::unknown_reason`). Only a WHOLE scan is held to account for the orphan:
+        // there, a missing lineage entry or a "no descendant" verdict is a silent omission.
+        let whole = crate::credentials::keychain::orphans::unknown_reason(Some(&scan)).is_none();
+        eprintln!(
+            "scan: whole={whole} complete={} unreadable={} damaged={} listed={}",
+            scan.complete,
+            scan.unreadable,
+            scan.damaged,
+            scan.listed.contains(&grandchild)
+        );
         // The grandchild's own lineage entry, so the old code (which read a rewritten id
         // as "forked by launchd" and said Not) cannot pass on the env witness alone: the
         // entry is the creator's id, or launchd's with the process recorded as opaque (or, when macOS shows its environment, found by it).
         let g = scan.lineage.get(&after.uniqueid).copied();
         assert!(
-            g == Some(creator.uniqueid)
+            !whole
+                || g == Some(creator.uniqueid)
                 || (g == Some(1) && (scan.opaque.contains(&after.uniqueid) || by_env)),
-            "grandchild lineage entry {g:?}: neither its creator's id nor an opaque launchd-born one"
+            "whole scan, grandchild lineage entry {g:?}: neither its creator's id nor an opaque launchd-born one"
         );
         assert!(
-            by_env || by_lineage,
+            !whole || by_env || by_lineage,
             "the orphan is ruled out by both witnesses (env found: {by_env})"
         );
     }

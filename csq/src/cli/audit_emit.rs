@@ -145,6 +145,8 @@ pub struct AuditEmitter {
     /// (e.g. `"csq run account 3"`).  Set at construction; surfaced verbatim
     /// in [`AuditEmitError::PendingWriteFailed::operation`].
     operation: String,
+    /// Records whose flush failed and must be retried (spec 36: the OLD run of a recycle).
+    deferred: Vec<AuditRecord>,
 }
 
 impl AuditEmitter {
@@ -169,6 +171,7 @@ impl AuditEmitter {
             socket_path,
             pending_dir,
             operation,
+            deferred: Vec::new(),
         }
     }
 
@@ -185,6 +188,7 @@ impl AuditEmitter {
             socket_path: PathBuf::new(),
             pending_dir: PathBuf::new(),
             operation: String::new(),
+            deferred: Vec::new(),
         }
     }
 
@@ -199,6 +203,35 @@ impl AuditEmitter {
     #[cfg(test)]
     pub(crate) fn operation_for_test(&self) -> &str {
         &self.operation
+    }
+
+    /// A clone of the held record, for the corrective write after a pre-exec
+    /// flush. `None` once flushed, discarded, or for a disabled emitter.
+    pub fn retained_record(&self) -> Option<AuditRecord> {
+        self.record.clone()
+    }
+
+    /// P1: an `exec` that RETURNS means the launch never happened. Write a
+    /// corrective record with a fresh `run_id` and `Fail`/`Reject`, so the audit
+    /// chain does not carry the pre-spawn intent as the run's outcome.
+    /// `record` is the clone taken with [`retained_record`](Self::retained_record)
+    /// BEFORE the pre-exec flush.
+    pub fn write_corrective_failure(
+        &self,
+        mut record: AuditRecord,
+        now: &str,
+    ) -> Result<(), AuditEmitError> {
+        record.run_id = csq_core::audit::gen_run_id();
+        record.start_ts = now.to_string();
+        record.end_ts = now.to_string();
+        record.result_state = ResultState::Fail;
+        record.decision = Decision::Reject;
+        flush_record(
+            record,
+            &self.socket_path,
+            &self.pending_dir,
+            &self.operation,
+        )
     }
 
     /// Overwrite `start_ts` in the held record.
@@ -310,17 +343,88 @@ impl AuditEmitter {
     /// Marks the emitter as already-flushed so `Drop` is a no-op.  Safe to
     /// call once; a second call returns `Ok(())` (record already taken).
     pub fn try_flush_now(&mut self) -> Result<(), AuditEmitError> {
+        let deferred = self.flush_deferred();
         // Take the record so Drop is a no-op.
         let record = match self.record.take() {
             Some(r) => r,
-            None => return Ok(()), // already flushed
+            None => return deferred, // already flushed
         };
-        flush_record(
+        let current = flush_record(
             record,
             &self.socket_path,
             &self.pending_dir,
             &self.operation,
-        )
+        );
+        deferred.and(current)
+    }
+
+    /// Ends the current run's record as of `now` and starts a NEW run record
+    /// (fresh `run_id`, `start_ts == now`) carrying the same surface/identity
+    /// fields. Used by the supervised session recycle (spec 36): the old claude
+    /// process ended on purpose (`Pass`/`Accept`), the relaunched one is a new
+    /// run, so neither record claims the other's lifetime. A disabled or
+    /// already-flushed emitter stays so.
+    ///
+    /// On `Err` the new record is still installed (the old one is already past
+    /// recovery); the caller logs the fixed tag and continues the session.
+    #[cfg(unix)]
+    pub fn rotate_run(&mut self, now: &str) -> Result<(), AuditEmitError> {
+        let Some(mut old) = self.record.take() else {
+            return Ok(());
+        };
+        let mut next = old.clone();
+        old.end_ts = now.to_string();
+        old.result_state = ResultState::Pass;
+        old.decision = Decision::Accept;
+        next.run_id = csq_core::audit::gen_run_id();
+        next.start_ts = now.to_string();
+        next.end_ts = now.to_string();
+        next.result_state = ResultState::Degraded;
+        next.decision = Decision::Bypass;
+        self.record = Some(next);
+        let keep = old.clone();
+        flush_record(old, &self.socket_path, &self.pending_dir, &self.operation).inspect_err(|_| {
+            // Never lose the end record of a run that really executed: retry it at the
+            // next flush (`try_flush_now`) or on drop.
+            self.deferred.push(keep);
+        })
+    }
+
+    /// Number of end records still waiting for a successful flush.
+    #[cfg(all(test, unix))]
+    pub fn deferred_len(&self) -> usize {
+        self.deferred.len()
+    }
+
+    /// Retries the deferred end records of recycled runs NOW (a no-op when none are
+    /// waiting), leaving the current run's record held. The supervised arm calls this when
+    /// the session ends cleanly, so a recycled run's end record is never left to the
+    /// best-effort `Drop` path alone. The caller prints the remediation line on `Err`.
+    #[cfg(unix)]
+    pub fn flush_deferred_now(&mut self) -> Result<(), AuditEmitError> {
+        if self.deferred.is_empty() {
+            return Ok(());
+        }
+        self.flush_deferred()
+    }
+
+    /// Retries every deferred record; the ones that still fail stay queued.
+    fn flush_deferred(&mut self) -> Result<(), AuditEmitError> {
+        let mut first = Ok(());
+        for rec in std::mem::take(&mut self.deferred) {
+            if let Err(e) = flush_record(
+                rec.clone(),
+                &self.socket_path,
+                &self.pending_dir,
+                &self.operation,
+            ) {
+                self.deferred.push(rec);
+                if first.is_ok() {
+                    first = Err(e);
+                }
+            }
+        }
+        first
     }
 
     /// Discards the held record WITHOUT writing it anywhere — no live-IPC
@@ -381,6 +485,8 @@ impl AuditEmitter {
 
 impl Drop for AuditEmitter {
     fn drop(&mut self) {
+        // Best-effort like the record below; a failure was already WARNed inside `flush_record`.
+        let _ = self.flush_deferred();
         let record = match self.record.take() {
             Some(r) => r,
             None => return, // flush_now()/try_flush_now() already ran — nothing to do.
@@ -699,6 +805,111 @@ fn write_pending_at_tmp(target: &Path, tmp: &Path, bytes: &[u8]) -> Result<(), S
 
 #[cfg(test)]
 mod tests {
+
+    /// Spec 36 (M-D): a failed flush of the OLD run's record is kept and retried, never dropped.
+    #[cfg(unix)]
+    #[test]
+    fn rotate_run_keeps_the_old_record_when_its_flush_fails_and_retries_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = crate::cli::commands::run::build_audit_emitter(
+            dir.path(),
+            csq_core::audit::Surface::Cc,
+            "csq run account 1".to_string(),
+            "2026-11-03T00:00:00Z".to_string(),
+        );
+        let old_id = e.record_for_test().unwrap().run_id.clone();
+        // A FILE where the `.pending` directory must be: every fallback write fails.
+        let runs = dir.path().join("csq-runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::write(runs.join(".pending"), b"blocker").unwrap();
+        assert!(e.rotate_run("2026-11-03T01:00:00Z").is_err());
+        assert_eq!(e.deferred_len(), 1, "the old end record is retained");
+        std::fs::remove_file(runs.join(".pending")).unwrap();
+        e.try_flush_now().unwrap();
+        assert_eq!(e.deferred_len(), 0);
+        let files: Vec<_> = std::fs::read_dir(runs.join(".pending"))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(
+            files.len(),
+            2,
+            "old (retried) and new (final) records both landed"
+        );
+        let all: String = files
+            .iter()
+            .map(|f| std::fs::read_to_string(f.path()).unwrap())
+            .collect();
+        assert!(all.contains(&old_id));
+    }
+
+    /// Item 8: the clean-exit flush retries a deferred end record, surfaces a failure, and
+    /// leaves the current run's record untouched.
+    #[cfg(unix)]
+    #[test]
+    fn flush_deferred_now_retries_the_deferred_record_and_reports_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = crate::cli::commands::run::build_audit_emitter(
+            dir.path(),
+            csq_core::audit::Surface::Cc,
+            "csq run account 1".to_string(),
+            "2026-11-03T00:00:00Z".to_string(),
+        );
+        assert!(
+            e.flush_deferred_now().is_ok(),
+            "nothing deferred is a no-op"
+        );
+        let runs = dir.path().join("csq-runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::write(runs.join(".pending"), b"blocker").unwrap();
+        assert!(e.rotate_run("2026-11-03T01:00:00Z").is_err());
+        assert!(e.flush_deferred_now().is_err(), "still blocked: reported");
+        assert_eq!(e.deferred_len(), 1, "still queued");
+        std::fs::remove_file(runs.join(".pending")).unwrap();
+        e.flush_deferred_now().unwrap();
+        assert_eq!(e.deferred_len(), 0);
+        assert_eq!(
+            std::fs::read_dir(runs.join(".pending")).unwrap().count(),
+            1,
+            "the retried OLD record landed"
+        );
+        assert!(
+            e.record_for_test().is_some(),
+            "the current record is still held"
+        );
+        e.discard();
+    }
+
+    /// Spec 36: a recycle ends the old run record and starts a NEW one.
+    #[cfg(unix)]
+    #[test]
+    fn rotate_run_ends_old_record_and_starts_a_new_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = crate::cli::commands::run::build_audit_emitter(
+            dir.path(),
+            csq_core::audit::Surface::Cc,
+            "csq run account 1".to_string(),
+            "2026-11-03T00:00:00Z".to_string(),
+        );
+        let old_id = e.record_for_test().unwrap().run_id.clone();
+        e.rotate_run("2026-11-03T01:00:00Z").unwrap();
+        let new = e.record_for_test().unwrap();
+        assert_ne!(new.run_id, old_id);
+        assert_eq!(new.start_ts, "2026-11-03T01:00:00Z");
+        let pending = dir.path().join("csq-runs").join(".pending");
+        let files: Vec<_> = std::fs::read_dir(&pending).unwrap().flatten().collect();
+        assert_eq!(files.len(), 1, "exactly the OLD record was flushed");
+        let body = std::fs::read_to_string(files[0].path()).unwrap();
+        assert!(
+            body.contains(&old_id) && body.contains("2026-11-03T01:00:00Z"),
+            "{body}"
+        );
+        assert!(body.contains("pass"), "{body}");
+        e.discard();
+        let mut off = crate::cli::audit_emit::AuditEmitter::disabled();
+        off.rotate_run("t").unwrap();
+        assert!(off.record_for_test().is_none(), "disabled stays disabled");
+    }
     use super::*;
     #[cfg(unix)]
     use csq_core::audit::{Decision, ResultState, Surface};

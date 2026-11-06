@@ -139,10 +139,11 @@ fn caller(root: &Path, pid: u32) -> VerifiedSession {
         pid,
         started_at: START,
         started_exact: Some(START),
-        surface: Surface::Codex,
+        surface: Surface::Codex.into(),
         handle_dir_hash: format!("fixture{pid}"),
         handle_dir: root.join("caller").to_string_lossy().into_owned(),
         name: None,
+        service: None,
     })
 }
 

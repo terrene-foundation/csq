@@ -416,25 +416,56 @@ pub fn model_id_for_slot(base_dir: &Path, slot: u16) -> Option<String> {
 /// Anthropic OAuth token to a frozen 3P endpoint (token exfiltration — see
 /// `daemon::auto_rotate` VP-F1 and `cli::commands::swap`).
 ///
-/// Returns `false` on any I/O or parse error (fail-safe: a missing or
-/// unparseable settings.json means no detectable 3P binding). The check reads
-/// only the slot's on-disk settings, never the process environment.
+/// Fail-closed: returns `true` when the slot pins a base URL OR when its
+/// settings cannot be classified ([`SlotBaseUrlPin::Unknown`]: unreadable,
+/// non-UTF-8, malformed JSON). Only a genuinely absent `settings.json` or a
+/// readable one without the key answers `false`. A guard that read "cannot
+/// read" as "not third-party" would let an in-flight repoint send an OAuth
+/// token to a frozen 3P endpoint (`guard-reader-writer-parity.md` MUST-2).
+/// Callers that must tell "unknown" from "pinned" use
+/// [`slot_base_url_pin`]. The check reads only the slot's on-disk settings,
+/// never the process environment.
 pub fn slot_pins_anthropic_base_url(base_dir: &Path, slot: u16) -> bool {
+    slot_base_url_pin(base_dir, slot) != SlotBaseUrlPin::NotPinned
+}
+
+/// Three-state answer to "does this slot's settings pin a 3P base URL?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotBaseUrlPin {
+    /// `ANTHROPIC_BASE_URL` is present: env-transport (3P) slot.
+    Pinned,
+    /// `settings.json` is absent, or readable and without the key.
+    NotPinned,
+    /// `settings.json` exists but could not be read or parsed.
+    Unknown,
+}
+
+/// Reads `config-<slot>/settings.json` into a [`SlotBaseUrlPin`]. Only
+/// `ErrorKind::NotFound` counts as absence; every other read error, invalid
+/// UTF-8 or invalid JSON is [`SlotBaseUrlPin::Unknown`].
+pub fn slot_base_url_pin(base_dir: &Path, slot: u16) -> SlotBaseUrlPin {
     let path = base_dir
         .join(format!("config-{slot}"))
         .join("settings.json");
     let content = match std::fs::read_to_string(&path) {
         Ok(s) => s,
-        Err(_) => return false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SlotBaseUrlPin::NotPinned,
+        Err(_) => return SlotBaseUrlPin::Unknown,
     };
     let json: Value = match serde_json::from_str(&content) {
         Ok(v) => v,
-        Err(_) => return false,
+        Err(_) => return SlotBaseUrlPin::Unknown,
     };
-    json.get("env")
+    if json
+        .get("env")
         .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
         .or_else(|| json.get("ANTHROPIC_BASE_URL"))
         .is_some()
+    {
+        SlotBaseUrlPin::Pinned
+    } else {
+        SlotBaseUrlPin::NotPinned
+    }
 }
 
 /// Derives the cloud-Claude [`Backend`](crate::accounts::Backend) of a slot
@@ -874,11 +905,24 @@ mod tests {
         std::fs::create_dir_all(&cfg).unwrap();
         std::fs::write(cfg.join("settings.json"), r#"{"env":{}}"#).unwrap();
         assert!(!slot_pins_anthropic_base_url(dir.path(), 4));
-        // Malformed JSON → false (fail-safe).
-        let cfg5 = dir.path().join("config-5");
-        std::fs::create_dir_all(&cfg5).unwrap();
-        std::fs::write(cfg5.join("settings.json"), b"{not json").unwrap();
-        assert!(!slot_pins_anthropic_base_url(dir.path(), 5));
+        assert_eq!(slot_base_url_pin(dir.path(), 3), SlotBaseUrlPin::NotPinned);
+        assert_eq!(slot_base_url_pin(dir.path(), 4), SlotBaseUrlPin::NotPinned);
+    }
+
+    #[test]
+    fn slot_pins_anthropic_base_url_fails_closed_on_unreadable_settings() {
+        let dir = TempDir::new().unwrap();
+        for (slot, bytes) in [(5u16, &b"{not json"[..]), (6, &[0xffu8][..])] {
+            let cfg = dir.path().join(format!("config-{slot}"));
+            std::fs::create_dir_all(&cfg).unwrap();
+            std::fs::write(cfg.join("settings.json"), bytes).unwrap();
+            assert_eq!(slot_base_url_pin(dir.path(), slot), SlotBaseUrlPin::Unknown);
+            assert!(slot_pins_anthropic_base_url(dir.path(), slot));
+        }
+        // A directory where the file should be: read error that is not NotFound.
+        let cfg = dir.path().join("config-7");
+        std::fs::create_dir_all(cfg.join("settings.json")).unwrap();
+        assert_eq!(slot_base_url_pin(dir.path(), 7), SlotBaseUrlPin::Unknown);
     }
 
     /// M5: write an EU-only residency activation gate so the enterprise residency

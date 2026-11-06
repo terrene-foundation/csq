@@ -905,6 +905,146 @@ pub fn write_record_v2(record: SignedRecord, base_dir: Option<&Path>) -> Result<
     .map(|_| ())
 }
 
+/// Relay-only durable append. The caller must run this blocking operation outside
+/// the byte pump, then recheck its original lease before any side effect.
+#[cfg(unix)]
+pub(crate) fn write_session_inject_durable(
+    record: SignedRecord,
+    base_dir: &Path,
+    signing_key: Option<&dyn crate::audit::traits::SigningKey>,
+) -> Result<(), AuditV2Error> {
+    if record.kind != crate::audit::types::EventKind::SessionInject {
+        return Err(AuditV2Error::Internal {
+            reason: "relay_audit_kind_invalid".into(),
+        });
+    }
+    write_record_v2_impl(
+        record,
+        Some(base_dir),
+        ChainKind::Op,
+        signing_key,
+        None,
+        WriteV2Flags {
+            durable: true,
+            ..Default::default()
+        },
+    )
+    .map(|_| ())
+}
+
+#[cfg(unix)]
+fn relay_sync(
+    path: &Path,
+    operation: impl FnOnce() -> std::io::Result<()>,
+) -> Result<(), AuditV2Error> {
+    #[cfg(test)]
+    RELAY_SYNC_TEST.with(|state| {
+        let mut state = state.borrow_mut();
+        if let Some((paths, fail_at)) = state.as_mut() {
+            paths.push(path.to_path_buf());
+            if *fail_at == Some(paths.len()) {
+                return Err(std::io::Error::other("relay_sync_injected"));
+            }
+        }
+        Ok(())
+    })?;
+    let _ = path;
+    #[cfg(test)]
+    let started = std::time::Instant::now();
+    let result = operation();
+    #[cfg(test)]
+    APPEND_TIMING_CURRENT.with(|rows| {
+        if let Some(row) = rows.borrow_mut().last_mut() {
+            row.sync_ns.push(started.elapsed().as_nanos());
+        }
+    });
+    result.map_err(AuditV2Error::Io)
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static RELAY_SYNC_TEST: std::cell::RefCell<Option<(Vec<PathBuf>, Option<usize>)>> = const { std::cell::RefCell::new(None) };
+}
+
+// Test-only source-bracket probe, not a timing bound or production callback.
+#[cfg(all(test, unix))]
+#[derive(Clone, Serialize)]
+struct AppendTiming {
+    phase: &'static str,
+    relay: bool,
+    bytes: usize,
+    acquire_ns: u128,
+    acquire_attempted: bool,
+    acquired: bool,
+    lock_scope_ns: u128,
+    sync_ns: Vec<u128>,
+}
+#[cfg(all(test, unix))]
+thread_local! {
+    static APPEND_TIMINGS: std::cell::RefCell<Option<Vec<AppendTiming>>> = const { std::cell::RefCell::new(None) };
+    static APPEND_TIMING_CURRENT: std::cell::RefCell<Vec<AppendTiming>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(all(test, unix))]
+struct AppendProbe {
+    active: bool,
+    waiting: Option<std::time::Instant>,
+    locked: Option<std::time::Instant>,
+}
+#[cfg(all(test, unix))]
+impl AppendProbe {
+    fn begin(relay: bool) -> Self {
+        let active = APPEND_TIMINGS.with(|rows| rows.borrow().is_some());
+        if active {
+            APPEND_TIMING_CURRENT.with(|rows| {
+                rows.borrow_mut().push(AppendTiming {
+                    phase: if relay { "relay" } else { "ordinary" },
+                    relay,
+                    bytes: 0,
+                    acquire_ns: 0,
+                    acquire_attempted: false,
+                    acquired: false,
+                    lock_scope_ns: 0,
+                    sync_ns: Vec::new(),
+                })
+            });
+        }
+        Self {
+            active,
+            waiting: None,
+            locked: None,
+        }
+    }
+    fn acquired(&mut self, elapsed: std::time::Duration) {
+        if self.active {
+            self.locked = Some(std::time::Instant::now());
+            APPEND_TIMING_CURRENT
+                .with(|rows| rows.borrow_mut().last_mut().unwrap().acquire_ns = elapsed.as_nanos());
+        }
+    }
+    fn bytes(&self, bytes: usize) {
+        if self.active {
+            APPEND_TIMING_CURRENT.with(|rows| rows.borrow_mut().last_mut().unwrap().bytes = bytes);
+        }
+    }
+}
+#[cfg(all(test, unix))]
+impl Drop for AppendProbe {
+    fn drop(&mut self) {
+        if self.active {
+            let mut row = APPEND_TIMING_CURRENT.with(|rows| rows.borrow_mut().pop().unwrap());
+            row.acquire_attempted = self.waiting.is_some();
+            row.acquired = self.locked.is_some();
+            if !row.acquired {
+                row.acquire_ns = self.waiting.map_or(0, |t| t.elapsed().as_nanos());
+            }
+            // This bracket starts immediately after acquisition and ends after
+            // FileLockGuard drops, including test bookkeeping and unlock overhead.
+            row.lock_scope_ns = self.locked.map_or(0, |t| t.elapsed().as_nanos());
+            APPEND_TIMINGS.with(|rows| rows.borrow_mut().as_mut().unwrap().push(row));
+        }
+    }
+}
+
 /// Like [`write_record_v2`], but targets `chain`'s runs-directory. Used by the
 /// EATP attestation chain (`ChainKind::Eatp`); `ChainKind::Op` is identical to
 /// [`write_record_v2`].
@@ -942,6 +1082,8 @@ pub fn write_record_v2_unchecked(
     .map(|_| ())
 }
 
+const CHAIN_LOCK_DEADLINE_SECS: u64 = 5;
+
 /// Acquires the chain-wide `.chain-lock` sidecar with a bounded 5-second polled
 /// `try_lock_file` loop (100 ms interval).
 ///
@@ -966,8 +1108,7 @@ pub fn acquire_chain_lock(
 ) -> Result<crate::platform::lock::FileLockGuard, AuditV2Error> {
     use std::time::{Duration, Instant};
     let lock_path = csq_runs_dir.join(".chain-lock");
-    const DEADLINE_SECS: u64 = 5;
-    let deadline = Instant::now() + Duration::from_secs(DEADLINE_SECS);
+    let deadline = Instant::now() + Duration::from_secs(CHAIN_LOCK_DEADLINE_SECS);
     let poll_interval = Duration::from_millis(100);
     loop {
         match crate::platform::lock::try_lock_file(&lock_path) {
@@ -975,7 +1116,7 @@ pub fn acquire_chain_lock(
             Ok(None) => {
                 if Instant::now() >= deadline {
                     return Err(AuditV2Error::ChainLockTimeout {
-                        deadline_secs: DEADLINE_SECS,
+                        deadline_secs: CHAIN_LOCK_DEADLINE_SECS,
                     });
                 }
                 std::thread::sleep(poll_interval);
@@ -1199,6 +1340,8 @@ enum WriteV2Outcome {
 /// one-line `..Default::default()` for the flags it does not set.
 #[derive(Default)]
 struct WriteV2Flags<'a> {
+    /// Relay opt-in: fsync file/genesis/directory before returning success.
+    durable: bool,
     /// M19b M3: when `true`, skip the in-lock unsigned-after-cutoff guard. ONLY
     /// the test-only `write_record_v2_unchecked` passes `true` — it lets the
     /// verify-detection tests construct the malformed (unsigned-after-cutoff)
@@ -1235,10 +1378,13 @@ fn write_record_v2_impl(
     seam: Option<&SeamWriteSpec<'_>>,
     flags: WriteV2Flags<'_>,
 ) -> Result<WriteV2Outcome, AuditV2Error> {
+    #[cfg(all(test, unix))]
+    let mut append_probe = AppendProbe::begin(flags.durable);
     let WriteV2Flags {
         bypass_cutoff_guard,
         require_genesis_empty,
         precheck,
+        durable,
     } = flags;
     use crate::audit::types::{Ed25519Signature, RecordId, Sha256Hex};
 
@@ -1254,13 +1400,31 @@ fn write_record_v2_impl(
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&csq_runs)?;
+        if durable {
+            let base = csq_runs
+                .parent()
+                .ok_or_else(|| std::io::Error::other("relay_audit_base_missing"))?;
+            if !base.is_dir() {
+                return Err(std::io::Error::other("relay_audit_base_missing").into());
+            }
+            match std::fs::DirBuilder::new().mode(0o700).create(&csq_runs) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && csq_runs.is_dir() => {}
+                Err(e) => return Err(e.into()),
+            }
+            // Directory creation must persist, but need not extend the chain's
+            // critical section. Genesis/file publication remain serialized below.
+            relay_sync(base, || std::fs::File::open(base)?.sync_all())?;
+        } else {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&csq_runs)?;
+        }
     }
     #[cfg(not(unix))]
     {
+        let _ = durable;
         std::fs::create_dir_all(&csq_runs)?;
     }
 
@@ -1280,7 +1444,15 @@ fn write_record_v2_impl(
     // The polling loop is extracted into `acquire_chain_lock` so that
     // `csq audit roster-install` can reuse the same bounded acquire semantics
     // without duplicating the deadline/interval constants (an internal ticket).
+    #[cfg(all(test, unix))]
+    let lock_started = {
+        let now = std::time::Instant::now();
+        append_probe.waiting = Some(now);
+        now
+    };
     let _chain_lock = acquire_chain_lock(&csq_runs)?;
+    #[cfg(all(test, unix))]
+    append_probe.acquired(lock_started.elapsed());
 
     // Step 1.5 — fail-closed sentinel check (inside the `.chain-lock` critical
     // section so no concurrent writer can race between the check and the write).
@@ -1307,6 +1479,13 @@ fn write_record_v2_impl(
     // Step 2 — read or init chain genesis.
     let ts = current_iso8601_utc_persist();
     let genesis = read_or_init_chain_genesis(&csq_runs, &ts)?;
+    #[cfg(unix)]
+    if durable {
+        let genesis_path = csq_runs.join("chain.json");
+        relay_sync(&genesis_path, || {
+            std::fs::File::open(&genesis_path)?.sync_all()
+        })?;
+    }
 
     // Step 2.4 — S-LOW-B / C-N2 (round 8b): in-lock authorization precheck.
     // Evaluated with the exact (csq_runs, chain_id) this append targets, so
@@ -1499,6 +1678,8 @@ fn write_record_v2_impl(
         Vec::new()
     };
     existing.extend_from_slice(&line_bytes);
+    #[cfg(all(test, unix))]
+    append_probe.bytes(existing.len());
 
     let writer = match write_private_tmp_retained(&chain_jsonl, &existing) {
         Ok(writer) => writer,
@@ -1513,8 +1694,27 @@ fn write_record_v2_impl(
     if let Err(e) = secure_file(writer.path()) {
         return Err(AuditV2Error::Io(std::io::Error::other(e.to_string())));
     }
+    // Every op-chain rewrite includes previously durable relay records. Sync
+    // the complete retained temporary after permissions and before publication,
+    // so an ordinary append cannot replace that prefix with unsynced data.
+    if chain == ChainKind::Op {
+        #[cfg(unix)]
+        relay_sync(writer.path(), || {
+            writer
+                .sync_all()
+                .map_err(|_| std::io::Error::other("audit_op_file_sync_failed"))
+        })?;
+        #[cfg(not(unix))]
+        writer
+            .sync_all()
+            .map_err(|_| std::io::Error::other("audit_op_file_sync_failed"))?;
+    }
     if let Err(e) = writer.replace(&chain_jsonl) {
         return Err(AuditV2Error::Io(std::io::Error::other(e.to_string())));
+    }
+    #[cfg(unix)]
+    if durable {
+        relay_sync(&csq_runs, || std::fs::File::open(&csq_runs)?.sync_all())?;
     }
 
     // Step 9 — M20 seam-index maintenance (inside the same `.chain-lock`, after
@@ -1877,6 +2077,443 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    fn relay_record() -> SignedRecord {
+        let mut record = sample_v2_record();
+        record.kind = crate::audit::types::EventKind::SessionInject;
+        record.payload = serde_json::from_value(serde_json::json!({
+            "kind":"session_inject", "data": {
+                "inject_id":1, "caller_pid":2, "caller_started_at":3,
+                "target_pid":4, "target_started_at":5, "incarnation_unit":"linux_ticks",
+                "role":"operator", "primitive":"slash", "slash":"clear", "byte_len":6,
+                "when":"immediate", "outcome":"intent", "error_code":null
+            }
+        }))
+        .unwrap();
+        record
+    }
+
+    #[cfg(unix)]
+    fn observe_relay_sync<T>(
+        fail_at: Option<usize>,
+        operation: impl FnOnce() -> T,
+    ) -> (T, Vec<PathBuf>) {
+        struct Restore(Option<(Vec<PathBuf>, Option<usize>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                RELAY_SYNC_TEST.with(|s| *s.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore = Restore(RELAY_SYNC_TEST.with(|s| s.replace(Some((Vec::new(), fail_at)))));
+        let result = operation();
+        let paths = RELAY_SYNC_TEST.with(|s| s.borrow_mut().as_mut().unwrap().0.clone());
+        (result, paths)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_relay_append_syncs_genesis_private_file_and_directories() {
+        let _env = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let (result, paths) = observe_relay_sync(None, || {
+            write_session_inject_durable(relay_record(), dir.path(), None)
+        });
+        result.unwrap();
+        assert_eq!(paths.len(), 4, "relay_durable_sync_sequence");
+        assert_eq!(paths[0], dir.path());
+        assert_eq!(paths[1], dir.path().join("csq-runs/chain.json"));
+        assert!(paths[2]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(".tmp"));
+        assert_eq!(paths[3], dir.path().join("csq-runs"));
+        let genesis: ChainGenesis =
+            serde_json::from_slice(&std::fs::read(&paths[1]).unwrap()).unwrap();
+        assert!(dir
+            .path()
+            .join("csq-runs")
+            .join(format!("{}.jsonl", genesis.chain_id))
+            .is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_relay_each_sync_failure_returns_error_including_after_publication() {
+        let _env = crate::platform::test_env::lock();
+        for fail_at in 1..=4 {
+            let dir = TempDir::new().unwrap();
+            let (result, paths) = observe_relay_sync(Some(fail_at), || {
+                write_session_inject_durable(relay_record(), dir.path(), None)
+            });
+            assert!(
+                result.is_err(),
+                "relay_sync_failure_must_not_succeed at {fail_at}"
+            );
+            assert_eq!(paths.len(), fail_at);
+            if fail_at == 4 {
+                assert!(
+                    std::fs::read_dir(dir.path().join("csq-runs"))
+                        .unwrap()
+                        .any(|p| p.unwrap().path().extension().is_some_and(|e| e == "jsonl")),
+                    "published_record_retained_after_directory_sync_failure"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_relay_refuses_missing_base_without_creating_ancestors() {
+        let _env = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("missing");
+        assert!(write_session_inject_durable(relay_record(), &missing, None).is_err());
+        assert!(!missing.exists(), "relay_audit_must_not_create_base");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_relay_preserves_in_lock_unsigned_cutoff_refusal() {
+        use crate::audit::key_custody::ChainState;
+        let _env = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        write_session_inject_durable(relay_record(), dir.path(), None).unwrap();
+        let mut chain = ChainState::load(dir.path()).unwrap();
+        chain.signing_active_since_seq = Some(1);
+        chain.signing_key_id = Some(
+            crate::audit::types::KeyId::try_new(format!("ed25519:{}", "1".repeat(64))).unwrap(),
+        );
+        chain.save(dir.path()).unwrap();
+        assert!(
+            matches!(
+                write_session_inject_durable(relay_record(), dir.path(), None),
+                Err(AuditV2Error::Signing { .. })
+            ),
+            "relay_durable_unsigned_cutoff_must_refuse"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_op_append_syncs_data_without_relay_directory_contract() {
+        let _env = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let synced = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed = synced.clone();
+        let (result, paths) = observe_relay_sync(None, || {
+            crate::platform::fs::with_private_sync_observer_for_test(
+                move |path| observed.borrow_mut().push(path.to_path_buf()),
+                || write_record_v2(sample_v2_record(), Some(dir.path())),
+            )
+        });
+        result.unwrap();
+        assert_eq!(
+            paths.len(),
+            1,
+            "ordinary_append_must_sync_rewritten_op_chain"
+        );
+        assert_eq!(
+            *synced.borrow(),
+            paths,
+            "ordinary_sync_must_reach_retained_file_handle"
+        );
+        assert!(paths[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(".tmp"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_op_sync_failure_preserves_prior_durable_intent() {
+        let _env = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        write_session_inject_durable(relay_record(), dir.path(), None).unwrap();
+        let genesis: ChainGenesis =
+            serde_json::from_slice(&std::fs::read(dir.path().join("csq-runs/chain.json")).unwrap())
+                .unwrap();
+        let target = dir
+            .path()
+            .join("csq-runs")
+            .join(format!("{}.jsonl", genesis.chain_id));
+        let before = std::fs::read(&target).unwrap();
+        let (result, paths) = observe_relay_sync(Some(1), || {
+            write_record_v2(sample_v2_record(), Some(dir.path()))
+        });
+        assert!(
+            result.is_err(),
+            "ordinary_op_data_sync_failure_must_refuse_publication"
+        );
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            std::fs::read(target).unwrap(),
+            before,
+            "failed_ordinary_sync_must_preserve_durable_prefix"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_and_ordinary_append_latency_probe() {
+        let _env = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        struct Restore(Option<Vec<AppendTiming>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                APPEND_TIMINGS.with(|s| *s.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore = Restore(APPEND_TIMINGS.with(|s| s.replace(Some(Vec::new()))));
+        const SAMPLES_PER_PHASE: usize = 8;
+        let started = std::time::Instant::now();
+        for _ in 0..SAMPLES_PER_PHASE {
+            write_session_inject_durable(relay_record(), dir.path(), None).unwrap();
+            write_record_v2(sample_v2_record(), Some(dir.path())).unwrap();
+        }
+        let total_ns = started.elapsed().as_nanos();
+        let rows = APPEND_TIMINGS.with(|s| s.borrow().as_ref().unwrap().clone());
+        assert_eq!(
+            rows.len(),
+            SAMPLES_PER_PHASE * 2,
+            "audit_latency_probe_complete_sample_set"
+        );
+        assert_eq!(rows.iter().filter(|r| r.relay).count(), SAMPLES_PER_PHASE);
+        assert!(
+            rows.iter()
+                .all(|r| r.bytes > 0 && r.sync_ns.len() == if r.relay { 4 } else { 1 }),
+            "audit_latency_probe_functional_sync_coverage"
+        );
+        println!(
+            "CSQ_AUDIT_APPEND_PROBE {}",
+            serde_json::json!({
+                "schema":"csq.audit_append_probe.v1", "platform":std::env::consts::OS,
+                "samples_per_phase":SAMPLES_PER_PHASE, "total_samples":rows.len(),
+                "cold_start_first_relay_sample":true,
+                "total_ns":total_ns, "lock_timeout_ns":std::time::Duration::from_secs(CHAIN_LOCK_DEADLINE_SECS).as_nanos(),
+                "relay_sync_order":["base_directory_outside_lock","genesis_file","op_temp_file","runs_directory"],
+                "ordinary_sync_order":["op_temp_file"], "rows":rows,
+                "limit":"source-bracket sample; lock_scope_ns includes test bookkeeping/unlock overhead, not a worst-case timing or power-loss guarantee"
+            })
+        );
+    }
+
+    // Helpers for the explicitly invoked R2 N1 measurement probe below.
+    #[cfg(unix)]
+    fn large_chain_seed(base: &Path, minimum: u64) -> (PathBuf, String, u64) {
+        use crate::audit::types::Sha256Hex;
+        use std::io::Write as _;
+        let runs = base.join("csq-runs");
+        std::fs::create_dir(&runs).unwrap();
+        let genesis = read_or_init_chain_genesis(&runs, "2026-11-03T00:00:00+00:00").unwrap();
+        let path = runs.join(format!("{}.jsonl", genesis.chain_id));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let mut file = std::io::BufWriter::new(file);
+        let (mut bytes, mut count, mut prev) = (0u64, 0u64, Sha256Hex::genesis());
+        // One linear buffered pass; never seed via the full-file append writer.
+        while bytes < minimum {
+            let mut record = sample_v2_record();
+            record.record_id = RecordId::try_new(gen_chain_id()).unwrap();
+            record.chain_id = RecordId::try_new(genesis.chain_id.clone()).unwrap();
+            record.seq = count;
+            record.prev_hash = prev;
+            record.canonical_hash = Sha256Hex::genesis();
+            record.canonical_hash =
+                Sha256Hex::try_new(sha256_hex(&canonical_bytes_for(&record))).unwrap();
+            prev = Sha256Hex::try_new(sha256_hex(&canonical_bytes_for(&record))).unwrap();
+            let line = serde_json::to_vec(&record).unwrap();
+            file.write_all(&line).unwrap();
+            file.write_all(b"\n").unwrap();
+            bytes += line.len() as u64 + 1;
+            count += 1;
+        }
+        file.flush().unwrap();
+        file.get_ref().sync_all().unwrap();
+        std::fs::File::open(&runs).unwrap().sync_all().unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() >= minimum);
+        (path, genesis.chain_id, count)
+    }
+
+    #[cfg(unix)]
+    fn large_chain_check(path: &Path, chain: &str) -> u64 {
+        use crate::audit::types::Sha256Hex;
+        use std::io::BufRead as _;
+        let file = std::io::BufReader::new(std::fs::File::open(path).unwrap());
+        let (mut count, mut prev) = (0u64, Sha256Hex::GENESIS.to_string());
+        for line in file.lines() {
+            let mut record: SignedRecord = serde_json::from_str(&line.unwrap()).unwrap();
+            assert_eq!(record.seq, count, "large_probe_sequence");
+            assert_eq!(record.chain_id.as_str(), chain, "large_probe_chain");
+            assert_eq!(record.prev_hash.as_str(), prev, "large_probe_prev_hash");
+            prev = sha256_hex(&canonical_bytes_for(&record));
+            let hash = record.canonical_hash.clone();
+            record.canonical_hash = Sha256Hex::genesis();
+            assert_eq!(
+                hash.as_str(),
+                sha256_hex(&canonical_bytes_for(&record)),
+                "large_probe_canonical_hash"
+            );
+            count += 1;
+        }
+        count
+    }
+
+    #[cfg(unix)]
+    fn large_chain_quantiles(mut values: Vec<u128>) -> serde_json::Value {
+        values.sort_unstable();
+        let n = values.len();
+        if n == 0 {
+            return serde_json::json!({"n":0});
+        }
+        serde_json::json!({"n":n, "p50_ns":values[(n*50).div_ceil(100)-1],
+            "p99_ns":values[(n*99).div_ceil(100)-1], "max_ns":values[n-1]})
+    }
+
+    /// Opt-in contention measurement, outside the default regression suite.
+    /// Re-measure R2 N1 with this exact command:
+    /// ```text
+    /// cargo test --locked -p csq-core --lib --features test-utils audit::persist::tests::large_chain_four_writer_append_latency_probe -- --ignored --exact --show-output --test-threads=1
+    /// ```
+    /// Any observed lock hold >= 2.5 s requires the append-forward persistence policy.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "measurement instrument: run with --ignored --exact to re-measure R2 N1"]
+    fn large_chain_four_writer_append_latency_probe() {
+        let _env = crate::platform::test_env::lock();
+        const WRITERS: usize = 4;
+        const ROUNDS: usize = 25;
+        #[derive(Serialize)]
+        struct Sample {
+            writer: usize,
+            round: usize,
+            wall_ns: u128,
+            error: Option<&'static str>,
+            timing: Vec<AppendTiming>,
+        }
+        for minimum in [10_000_000u64, 50_000_000] {
+            let dir = TempDir::new().unwrap();
+            let (path, chain, seeded) = large_chain_seed(dir.path(), minimum);
+            assert_eq!(large_chain_check(&path, &chain), seeded);
+            let initial_bytes = std::fs::metadata(&path).unwrap().len();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+            let mut handles = Vec::new();
+            for writer in 0..WRITERS {
+                let (base, barrier) = (dir.path().to_path_buf(), barrier.clone());
+                handles.push(std::thread::spawn(move || {
+                    struct Restore(Option<Vec<AppendTiming>>);
+                    impl Drop for Restore {
+                        fn drop(&mut self) {
+                            APPEND_TIMINGS.with(|s| *s.borrow_mut() = self.0.take());
+                        }
+                    }
+                    let _restore = Restore(APPEND_TIMINGS.with(|s| s.replace(Some(Vec::new()))));
+                    let mut samples = Vec::new();
+                    for round in 0..ROUNDS {
+                        barrier.wait(); // Four live OS threads contend on the SAME real chain.
+                        let started = std::time::Instant::now();
+                        let result = if writer < WRITERS / 2 {
+                            write_session_inject_durable(relay_record(), &base, None)
+                        } else {
+                            write_record_v2(sample_v2_record(), Some(&base))
+                        };
+                        let wall_ns = started.elapsed().as_nanos();
+                        let timing = APPEND_TIMINGS
+                            .with(|s| std::mem::take(s.borrow_mut().as_mut().unwrap()));
+                        samples.push(Sample {
+                            writer,
+                            round,
+                            wall_ns,
+                            error: result.err().map(|e| e.fixed_tag()),
+                            timing,
+                        });
+                    }
+                    samples
+                }));
+            }
+            let rows: Vec<Sample> = handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect();
+            let known: Vec<&AppendTiming> = rows
+                .iter()
+                .filter_map(|r| {
+                    if r.timing.len() == 1 {
+                        r.timing.first()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let success = rows.iter().filter(|r| r.error.is_none()).count();
+            let mut errors = std::collections::BTreeMap::new();
+            for error in rows.iter().filter_map(|r| r.error) {
+                *errors.entry(error).or_insert(0usize) += 1;
+            }
+            let hold: Vec<u128> = known
+                .iter()
+                .filter(|r| r.acquired)
+                .map(|r| r.lock_scope_ns)
+                .collect();
+            let deadline_ns = std::time::Duration::from_secs(CHAIN_LOCK_DEADLINE_SECS).as_nanos();
+            let margin = hold.iter().copied().max().map(|max| max < deadline_ns / 2);
+            println!(
+                "CSQ_AUDIT_LARGE_CHAIN_PROBE {}",
+                serde_json::json!({
+                    "schema":"csq.audit_large_chain_probe.v1", "platform":std::env::consts::OS,
+                    "arch":std::env::consts::ARCH, "enterprise":cfg!(feature="enterprise"),
+                    "target_minimum_bytes":minimum, "initial_bytes":initial_bytes, "seed_records":seeded,
+                    "final_bytes":std::fs::metadata(&path).unwrap().len(),
+                    "writers":WRITERS, "rounds":ROUNDS, "attempts":rows.len(), "success":success,
+                    "error_counts":errors, "unknown_timing_rows":rows.len()-known.len(),
+                    "acquire_not_attempted":known.iter().filter(|r| !r.acquire_attempted).count(),
+                    "acquired":known.iter().filter(|r| r.acquired).count(),
+                    "hold_unobserved_rows":rows.len()-known.iter().filter(|r| r.acquired).count(),
+                    "acquisition_unobserved_rows":rows.len()-known.iter().filter(|r| r.acquire_attempted).count(),
+                    "quantile_method":"empirical nearest-rank ceil(p*n), no population confidence interval",
+                    "wall":large_chain_quantiles(rows.iter().map(|r| r.wall_ns).collect()),
+                    "acquisition":large_chain_quantiles(known.iter().filter(|r| r.acquire_attempted).map(|r| r.acquire_ns).collect()),
+                    "lock_scope":large_chain_quantiles(hold),
+                    "by_mode":([true,false].map(|relay| {
+                        let mode: Vec<_> = rows.iter().filter(|r| (r.writer < WRITERS / 2) == relay).collect();
+                        let timed: Vec<_> = known.iter().filter(|r| r.relay == relay).collect();
+                        serde_json::json!({"relay":relay,"attempts":mode.len(),
+                            "errors":mode.iter().filter(|r| r.error.is_some()).count(),"unknown_timing_rows":mode.len()-timed.len(),
+                            "wall":large_chain_quantiles(mode.iter().map(|r| r.wall_ns).collect()),
+                            "acquisition":large_chain_quantiles(timed.iter().filter(|r| r.acquire_attempted).map(|r| r.acquire_ns).collect()),
+                            "lock_scope":large_chain_quantiles(timed.iter().filter(|r| r.acquired).map(|r| r.lock_scope_ns).collect()),
+                            "sync_calls":large_chain_quantiles(timed.iter().flat_map(|r| r.sync_ns.iter().copied()).collect())})
+                    })),
+                    "sync_calls":large_chain_quantiles(known.iter().flat_map(|r| r.sync_ns.iter().copied()).collect()),
+                    "lock_acquisition_deadline_ns":deadline_ns,
+                    "complete_successful_sample_set":success == rows.len() && known.len() == rows.len(),
+                    "observed_max_hold_below_half_deadline":margin,
+                    "relay_sync_order":["base_directory_outside_lock","genesis_file","op_temp_file","runs_directory"],
+                    "ordinary_sync_order":["op_temp_file"], "sync":"real File::sync_all; no injected failure or mock",
+                    "signing":"unsigned pre-cutoff fixture; no registered key or credential reads",
+                    "cache_state":"seed linkage validation reads the full file before timing; warm-cache exploratory load",
+                    "schedule":"barrier each round; writers 0/1 relay durable, 2/3 ordinary; exploratory fixed load",
+                    "limits":"acquisition deadline is not an fsync/work-duration bound; lock_scope includes unlock/bookkeeping; sample margin is not a worst-case or population guarantee",
+                    "metric_brackets":"wall=append entry to return; acquire=lock call to acquired or failed probe Drop; hold=post-acquire through guard unlock plus probe bookkeeping; sync=individual real sync calls",
+                    "rows":rows
+                })
+            );
+            assert_eq!(
+                rows.len(),
+                WRITERS * ROUNDS,
+                "large_probe_attempt_denominator"
+            );
+            assert_eq!(known.len(), rows.len(), "large_probe_unknown_timings");
+            assert_eq!(
+                large_chain_check(&path, &chain),
+                seeded + success as u64,
+                "large_probe_retained_chain"
+            );
+        }
+    }
 
     fn with_one_stale_private_stage<T>(operation: impl FnOnce() -> T) -> (T, std::path::PathBuf) {
         let planted = std::rc::Rc::new(std::cell::RefCell::new(None));

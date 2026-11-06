@@ -114,11 +114,12 @@ pub(crate) mod fixtures {
             from: Sender {
                 pid: 1,
                 started_at: NOW,
-                surface: Surface::ClaudeCode,
+                surface: Surface::ClaudeCode.into(),
                 handle_dir_hash: "abc123".into(),
                 handle_dir: "/fixture/term-1".into(),
                 name: None,
                 started_exact: Some(1),
+                service: None,
             },
             to: Recipient {
                 pid: 2,

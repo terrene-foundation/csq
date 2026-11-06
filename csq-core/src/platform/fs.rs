@@ -1188,6 +1188,19 @@ impl WrittenPrivateFile {
             .ok_or_else(|| PlatformError::Io(std::io::Error::other("private writer is closed")))
     }
 
+    /// Sync the original retained file after any permission changes, before publication.
+    pub(crate) fn sync_all(&self) -> Result<(), PlatformError> {
+        self.file
+            .as_ref()
+            .ok_or_else(|| PlatformError::Io(std::io::Error::other("private writer is closed")))?
+            .sync_all()?;
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(observer) = PRIVATE_SYNC_OBSERVER.with(|slot| slot.borrow().clone()) {
+            observer(&self.path);
+        }
+        Ok(())
+    }
+
     /// Atomically replace the target, retaining the writer through Windows rename.
     pub fn replace(mut self, target: &Path) -> Result<(), PlatformError> {
         #[cfg(windows)]
@@ -1835,7 +1848,8 @@ pub(crate) fn windows_rename_should_fall_back(status: i32) -> bool {
 
 /// Budget for the an internal ticket publication diagnosis. All three probes (the attribute
 /// read, the DELETE check and the Restart Manager session) run on one helper
-/// thread; the caller waits at most this long and otherwise reports `unknown`.
+/// thread and report individually; the caller waits at most this long in total
+/// and reports every probe that did not answer as `unknown` in its own field.
 /// A failure path must not be extended by more than this fixed, documented cap.
 #[cfg(windows)]
 const HOLDER_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
@@ -1882,41 +1896,105 @@ const HOLDER_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_milli
 fn windows_publication_diagnosis(target: &Path, retry_code: u32) -> String {
     let (sender, receiver) = std::sync::mpsc::channel();
     let target_path = target.to_path_buf();
+    // Each probe reports the moment it finishes, so a slow Restart Manager
+    // session (cold on a loaded or hosted runner) costs only the `holder`
+    // field, never the two cheap probes that already answered.
     let spawned = std::thread::Builder::new()
         .name("csq-publish-holder".into())
         .spawn(move || {
-            let blocked = windows_target_delete_blocked(&target_path);
-            let attrs = windows_target_attributes(&target_path);
-            let holders = restart_manager_images(&target_path);
-            let _ = sender.send((blocked, attrs, holders));
+            let _ = sender.send(DiagnosisFact::Blocked(windows_target_delete_blocked(
+                &target_path,
+            )));
+            let _ = sender.send(DiagnosisFact::Attrs(windows_target_attributes(
+                &target_path,
+            )));
+            let _ = sender.send(DiagnosisFact::Holders(restart_manager_images(&target_path)));
         });
-    let facts = match spawned {
-        Ok(_) => receiver.recv_timeout(HOLDER_PROBE_BUDGET).ok(),
-        Err(_) => None,
+    let (facts, spawn_error) = match spawned {
+        Ok(_) => (
+            collect_diagnosis(&receiver, std::time::Instant::now() + HOLDER_PROBE_BUDGET),
+            None,
+        ),
+        // Keep the error KIND only: its Display text is never logged.
+        Err(error) => ((None, None, None), Some(error.kind())),
     };
-    match facts {
-        Some((blocked, attrs, holders)) => {
-            let hint = readonly_operator_hint(&attrs, retry_code);
-            let holder = holders
-                .filter(|images| !images.is_empty())
-                .map(|images| images.join(","))
-                .unwrap_or_else(|| {
-                    tracing::warn!(
-                        tag = "publication_holder_unknown",
-                        "restart manager named no holder for the refused publication"
-                    );
-                    "unknown".to_string()
-                });
-            format!("; delete_blocked={blocked}; target_attrs={attrs}{hint}; holder={holder}")
-        }
-        None => {
-            tracing::warn!(
-                tag = "publication_holder_unknown",
-                "the publication diagnosis did not answer within its budget"
-            );
-            "; delete_blocked=unknown; target_attrs=unknown; holder=unknown".to_string()
+    let (blocked, attrs, holders) = facts;
+    assemble_publication_diagnosis(blocked, attrs, holders, spawn_error, retry_code)
+}
+
+/// One answered probe of the publication diagnosis.
+#[cfg(any(windows, test))]
+enum DiagnosisFact {
+    Blocked(&'static str),
+    Attrs(String),
+    Holders(Option<Vec<String>>),
+}
+
+/// The answered probes, each `None` when it did not answer.
+#[cfg(any(windows, test))]
+type DiagnosisFacts = (
+    Option<&'static str>,
+    Option<String>,
+    Option<Option<Vec<String>>>,
+);
+
+/// Collect probe answers until all three arrived or `deadline` passed. Answers
+/// received before the deadline are KEPT: a late or hung probe, or a probe
+/// thread that died (disconnect), only leaves its own slot `None`.
+#[cfg(any(windows, test))]
+fn collect_diagnosis(
+    receiver: &std::sync::mpsc::Receiver<DiagnosisFact>,
+    deadline: std::time::Instant,
+) -> DiagnosisFacts {
+    let (mut blocked, mut attrs, mut holders) = (None, None, None);
+    while blocked.is_none() || attrs.is_none() || holders.is_none() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match receiver.recv_timeout(remaining) {
+            Ok(DiagnosisFact::Blocked(value)) => blocked = Some(value),
+            Ok(DiagnosisFact::Attrs(value)) => attrs = Some(value),
+            Ok(DiagnosisFact::Holders(value)) => holders = Some(value),
+            Err(_) => break,
         }
     }
+    (blocked, attrs, holders)
+}
+
+/// Format the diagnosis from whatever probes answered within the budget. A
+/// probe that did not answer is `unknown` in ITS field only; an answered probe
+/// is reported as measured. `holders` is `None` when the Restart Manager probe
+/// did not answer, `Some(None)` when it answered that it was unusable.
+/// `spawn_error` is the kind of a failed probe-thread spawn, logged as its own
+/// state rather than as a budget timeout.
+#[cfg(any(windows, test))]
+fn assemble_publication_diagnosis(
+    blocked: Option<&'static str>,
+    attrs: Option<String>,
+    holders: Option<Option<Vec<String>>>,
+    spawn_error: Option<std::io::ErrorKind>,
+    retry_code: u32,
+) -> String {
+    let blocked = blocked.unwrap_or("unknown");
+    let attrs = attrs.unwrap_or_else(|| "unknown".to_string());
+    let hint = readonly_operator_hint(&attrs, retry_code);
+    let holder = match holders {
+        Some(Some(images)) if !images.is_empty() => images.join(","),
+        other => {
+            let reason = match (&other, spawn_error) {
+                (_, Some(_)) => "the holder probe thread could not start",
+                (None, None) => "the holder probe did not answer within its budget",
+                (Some(None), None) => "restart manager was unusable",
+                (Some(Some(_)), None) => "restart manager answered with no holder",
+            };
+            tracing::warn!(
+                tag = "publication_holder_unknown",
+                reason,
+                error_kind = ?spawn_error,
+                "no holder is attributed to the refused publication"
+            );
+            "unknown".to_string()
+        }
+    };
+    format!("; delete_blocked={blocked}; target_attrs={attrs}{hint}; holder={holder}")
 }
 
 /// The operator hint that follows `target_attrs` for an ACCESS_DENIED (5) whose
@@ -1924,7 +2002,7 @@ fn windows_publication_diagnosis(target: &Path, retry_code: u32) -> String {
 /// rename, and never something csq set. Empty for every other code — a 32 is a
 /// holder, and its measured cause is named in `holder` — and empty when the
 /// target is not read-only.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn readonly_operator_hint(attributes: &str, retry_code: u32) -> &'static str {
     if retry_code == 5 && attributes.split(',').any(|name| name == "readonly") {
         "; hint=target_is_read_only"
@@ -6685,23 +6763,26 @@ pub(crate) mod tests {
             .nth(1)
             .expect("the refusal must carry a holder field");
         assert!(
-            !holders.starts_with("unknown"),
-            "Restart Manager must name the holding image: {message}"
-        );
-        assert!(
             !holders.contains('\\') && !holders.contains('/'),
             "the holder report carries image names only, never paths: {message}"
         );
-        let image = std::env::current_exe()
-            .unwrap()
-            .file_stem()
-            .unwrap()
-            .to_string_lossy()
-            .to_lowercase();
-        assert!(
-            holders.to_lowercase().contains(&image),
-            "the holder must name this test image ({image}): {message}"
-        );
+        // The Restart Manager probe is the one bounded by `HOLDER_PROBE_BUDGET`,
+        // and a cold session on a loaded runner may not answer in time (the
+        // hosted windows-latest image did not). The contract is that the field
+        // is correct or explicitly `unknown`, never wrong: when it names a
+        // holder, it must be this test image.
+        if !holders.starts_with("unknown") {
+            let image = std::env::current_exe()
+                .unwrap()
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .to_lowercase();
+            assert!(
+                holders.to_lowercase().contains(&image),
+                "a named holder must be this test image ({image}): {message}"
+            );
+        }
         assert_eq!(
             std::fs::read(&target).unwrap(),
             b"old",
@@ -6714,6 +6795,126 @@ pub(crate) mod tests {
         // The diagnosis must not leave any non-sharing handle behind: the owner
         // unlinks its staged temp immediately after a failure.
         std::fs::remove_file(&tmp).expect("the diagnosis must not block the owner's cleanup");
+    }
+
+    /// A probe that did not answer within the budget is `unknown` in ITS field
+    /// only; the probes that answered are reported as measured. Falsifier: the
+    /// pre-fix all-or-nothing diagnosis reported `delete_blocked=unknown` here.
+    #[test]
+    fn publication_diagnosis_keeps_answered_probes_when_one_is_late() {
+        let message =
+            assemble_publication_diagnosis(Some("yes"), Some("none".into()), None, None, 32);
+        assert_eq!(
+            message,
+            "; delete_blocked=yes; target_attrs=none; holder=unknown"
+        );
+        let message =
+            assemble_publication_diagnosis(Some("yes"), Some("none".into()), Some(None), None, 32);
+        assert_eq!(
+            message,
+            "; delete_blocked=yes; target_attrs=none; holder=unknown"
+        );
+        let message = assemble_publication_diagnosis(None, None, None, None, 32);
+        assert_eq!(
+            message,
+            "; delete_blocked=unknown; target_attrs=unknown; holder=unknown"
+        );
+        let message = assemble_publication_diagnosis(
+            Some("no"),
+            Some("readonly".into()),
+            Some(Some(vec!["csq.exe(1)".into()])),
+            None,
+            5,
+        );
+        assert_eq!(
+            message,
+            "; delete_blocked=no; target_attrs=readonly; hint=target_is_read_only; holder=csq.exe(1)"
+        );
+    }
+
+    /// The collection loop keeps the probes that answered when a later one
+    /// never does, and stays within its deadline. REDs if the loop becomes a
+    /// single `recv_timeout`, or if partial facts are dropped on timeout.
+    #[test]
+    fn collect_diagnosis_keeps_partial_facts_and_honours_the_deadline() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(DiagnosisFact::Blocked("yes")).unwrap();
+        sender.send(DiagnosisFact::Attrs("none".into())).unwrap();
+        // `sender` stays alive: the holder probe is "hung", not disconnected.
+        let started = std::time::Instant::now();
+        let (blocked, attrs, holders) =
+            collect_diagnosis(&receiver, started + std::time::Duration::from_millis(100));
+        let elapsed = started.elapsed();
+        assert_eq!(blocked, Some("yes"));
+        assert_eq!(attrs.as_deref(), Some("none"));
+        assert!(holders.is_none(), "the hung probe must stay unanswered");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(90),
+            "must wait for the deadline for the missing probe: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "must not wait past the deadline: {elapsed:?}"
+        );
+        drop(sender);
+    }
+
+    /// A probe thread that died (channel disconnected) ends collection at once,
+    /// keeping what already answered.
+    #[test]
+    fn collect_diagnosis_survives_a_dead_probe_thread() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(DiagnosisFact::Blocked("no")).unwrap();
+        sender
+            .send(DiagnosisFact::Holders(Some(vec!["csq.exe(1)".into()])))
+            .unwrap();
+        drop(sender);
+        let started = std::time::Instant::now();
+        let (blocked, attrs, holders) =
+            collect_diagnosis(&receiver, started + std::time::Duration::from_secs(30));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a disconnected channel must end collection at once: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(blocked, Some("no"));
+        assert!(attrs.is_none(), "the unanswered probe stays None");
+        assert_eq!(holders, Some(Some(vec!["csq.exe(1)".to_string()])));
+    }
+
+    /// The Restart Manager probe itself, UNBOUNDED by the publication budget,
+    /// under a share-0 hold: it must name this test image and no path. This is
+    /// the discriminating oracle for the probe; the budgeted diagnosis may
+    /// legitimately report `unknown` on a slow runner.
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_restart_manager_names_the_share_zero_holder() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("token.json");
+        std::fs::write(&target, b"old").unwrap();
+        let _holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&target)
+            .unwrap();
+        let images = restart_manager_images(&target)
+            .expect("the Restart Manager session must start and register the target");
+        let joined = images.join(",");
+        assert!(
+            !joined.contains('\\') && !joined.contains('/'),
+            "image names only, never paths: {joined}"
+        );
+        let image = std::env::current_exe()
+            .unwrap()
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_lowercase();
+        assert!(
+            joined.to_lowercase().contains(&image),
+            "the holder must name this test image ({image}): {joined}"
+        );
     }
 
     /// The read-only hint explains an ACCESS_DENIED (5) and nothing else: a 32

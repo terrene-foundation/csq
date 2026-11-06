@@ -548,6 +548,13 @@ fn lifecycle_label(payload: &EventPayload) -> (String, String) {
                 p.update_id, p.target_surface, p.target_pid, p.outcome
             ),
         ),
+        P::SessionInject(p) => (
+            "session inject".into(),
+            format!(
+                "inject {} → pid {} — {:?}",
+                p.inject_id, p.target_pid, p.outcome
+            ),
+        ),
         // S5 outbound owner ping — metadata only: the scrubbed byte length and
         // the fixed outcome tag. The text, chat id and token are never here.
         P::TelegramOwnerPing(p) => (
@@ -562,6 +569,39 @@ fn lifecycle_label(payload: &EventPayload) -> (String, String) {
                 },
                 p.outcome
             ),
+        ),
+        // Foreign-request audit observation — metadata only: the requester pid
+        // and the target handle (a machine path), plus the fixed outcome.
+        P::RecycleRequest(p) => (
+            "recycle request".into(),
+            format!(
+                "requester {} → {} — {}",
+                p.requester_pid,
+                p.target_handle,
+                match p.outcome {
+                    crate::audit::types::RecycleRequestOutcome::Issued => "issued",
+                    crate::audit::types::RecycleRequestOutcome::Refused => "refused",
+                }
+            ),
+        ),
+        // an internal ticket — a registered-service admission. Metadata only: the grammar-checked
+        // service name, the re-verified target identity and the fixed outcome tag. No
+        // body, no idempotency key.
+        P::ServiceMessage(p) => (
+            "service message".into(),
+            format!(
+                "service:{} → {} pid {} — {}",
+                p.service_display(),
+                p.target_surface.as_str(),
+                p.target_pid,
+                p.outcome.tag()
+            ),
+        ),
+        // an internal ticket — a registered-service REFUSAL. Same metadata discipline as the admission
+        // row; only what the refusal established is rendered (no target, no key digest).
+        P::ServiceMessageRefused(p) => (
+            "service message refused".into(),
+            format!("service:{} — {}", p.service_display(), p.refusal.tag()),
         ),
         // Governance kinds never reach here (classified above); exhaustive
         // match keeps this a compile-time drift catch if a kind is added.
@@ -848,19 +888,29 @@ impl ComplianceReport {
     }
 }
 
-/// Escapes a Markdown table cell: `|` would break the column and a newline
-/// would break the row, so both are neutralized.
+/// Escapes a Markdown table cell: `|` would break the column, a newline the row, and the
+/// link/image delimiters (`[`, `]`, `(`, `)`) plus autolink brackets and backticks would let a
+/// client-supplied string render as active markup.
 ///
-/// This neutralizes table STRUCTURE only, not Markdown link/image syntax
-/// (`[x](url)`, `![x](url)`). That is safe because every free-text field routed
-/// through this fn is either a fixed-vocabulary tag or a [`RedactedString`]
-/// (redacted at source AND re-redacted on deserialize) — an attacker cannot
-/// place attacker-controlled free-text that both survives redaction and renders
-/// as an active link. INVARIANT: if a future change ever routes a
-/// non-`RedactedString`, attacker-influenceable free-text field into a Markdown
-/// cell, that gating disappears and link/image neutralization must be added here.
+/// The structural escapes alone were justified by an invariant ("every free-text field routed
+/// here is a tag or a `RedactedString`"). The `RecycleRequest` audit payload broke that
+/// invariant: its handle/session fields are capped and control-stripped at capture
+/// (`daemon::server::audit_field`) but remain requester-chosen, so link neutralization is now
+/// part of this fn rather than a note about a future change.
 fn md_cell(s: &str) -> String {
-    s.replace('|', "\\|").replace(['\n', '\r'], " ")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '|' => out.push_str("\\|"),
+            '\n' | '\r' => out.push(' '),
+            '[' | ']' | '(' | ')' | '<' | '>' | '`' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Escapes the five HTML metacharacters so a redacted free-text field cannot
@@ -887,6 +937,17 @@ mod tests {
         Ed25519Signature, EventKind, EventPayload, GovernanceTurnPayload, KeyId, RecordId,
         Sha256Hex, SignedRecord,
     };
+
+    #[test]
+    fn md_cell_neutralizes_link_and_image_syntax() {
+        // Security R2 L6: a requester-chosen audit field must not render as active markup in
+        // the exported report. Escaping the delimiters is what the old invariant deferred.
+        let out = md_cell("[click](https://example.test)");
+        assert!(!out.contains("]("), "{out}");
+        assert!(out.contains("\\["), "{out}");
+        assert_eq!(md_cell("a|b"), "a\\|b");
+        assert_eq!(md_cell("line\nbreak"), "line break");
+    }
     use crate::types::AccountNum;
 
     /// A minimal signed record carrying `payload` at `seq`. The signature /
@@ -1234,9 +1295,14 @@ mod tests {
             report.governed.len() as u64,
             "the four verdict buckets partition the governed rows"
         );
-        // The failover detail renders its from → to (reason) shape.
+        // The failover detail renders its from → to (reason) shape. `md_cell` escapes
+        // the parentheses (markdown link/image neutralisation), so the rendered cell is
+        // the escaped form — the literal detail, not active markup.
         let md = report.render_markdown();
-        assert!(md.contains("claude → gemini (rate_limited)"));
+        assert!(
+            md.contains("claude → gemini \\(rate_limited\\)"),
+            "the failover detail renders through md_cell's escapes: {md}"
+        );
         assert!(
             md.contains("informational 2"),
             "summary shows the partition"
@@ -1337,5 +1403,73 @@ mod tests {
         let html = report.render_html();
         assert!(html.contains("PARTIAL verification"));
         assert!(!html.contains("Records covered:</strong> seq 0..="));
+    }
+
+    /// L2-7 — a signed record's service name is rendered through the §11.4 grammar check,
+    /// never echoed raw: a spelling the grammar rejects degrades to the fixed
+    /// `<unrecorded>` marker, while a valid one renders as itself. Only a same-uid holder
+    /// of the signing key could write a bad name, but the decode-time type does not
+    /// enforce the grammar, so the renderer must.
+    #[test]
+    fn a_service_name_outside_the_grammar_renders_as_unrecorded() {
+        use crate::audit::types::{
+            ServiceMessageOutcome, ServiceMessagePayload, ServiceMessageRefusalPayload,
+            ServiceRefusal, ServiceTargetSurface,
+        };
+        let bad = "bad name with spaces";
+        let records = vec![
+            rec(
+                1,
+                EventKind::ServiceMessage,
+                EventPayload::ServiceMessage(ServiceMessagePayload {
+                    service: bad.into(),
+                    registration_id: "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".into(),
+                    service_uid: 501,
+                    target_pid: 2,
+                    target_started_at: 3,
+                    target_surface: ServiceTargetSurface::ClaudeCode,
+                    key_sha256: None,
+                    outcome: ServiceMessageOutcome::Admitted,
+                }),
+            ),
+            rec(
+                2,
+                EventKind::ServiceMessageRefused,
+                EventPayload::ServiceMessageRefused(ServiceMessageRefusalPayload {
+                    service: Some(bad.into()),
+                    service_uid: Some(501),
+                    registration_id: None,
+                    refusal: ServiceRefusal::ServiceNameInvalid,
+                }),
+            ),
+            rec(
+                3,
+                EventKind::ServiceMessageRefused,
+                EventPayload::ServiceMessageRefused(ServiceMessageRefusalPayload {
+                    service: Some("nightly".into()),
+                    service_uid: Some(501),
+                    registration_id: None,
+                    refusal: ServiceRefusal::ServiceUnknown,
+                }),
+            ),
+        ];
+        let report = classify_records(&records);
+        let details: Vec<&str> = report
+            .lifecycle
+            .iter()
+            .map(|row| row.detail.as_str())
+            .collect();
+        assert!(
+            details.iter().any(|d| d.contains("service:<unrecorded>")),
+            "an out-of-grammar name is never echoed: {details:?}"
+        );
+        assert!(
+            !details.iter().any(|d| d.contains("bad name with spaces")),
+            "the raw spelling must not reach the report: {details:?}"
+        );
+        assert!(
+            details.iter().any(|d| d.contains("service:nightly")),
+            "a grammar-valid name still renders: {details:?}"
+        );
     }
 }

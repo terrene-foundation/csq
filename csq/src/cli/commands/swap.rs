@@ -99,6 +99,7 @@ use csq_core::session::swap_session::{
 #[cfg(unix)]
 use csq_core::session::swap_session::SwapAuditContext;
 use csq_core::types::AccountNum;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// One of the three env vars a csq-managed terminal sets pointing at
@@ -1580,6 +1581,10 @@ fn exec_replace_swap(
     route_kind: RouteKind,
 ) -> Result<()> {
     let source_surface = source.surface();
+    // R2 N6 (ROOT decision): a session launched with `--sandbox` must not be
+    // replaced by an exec the pinned permission mode does not cover. Refuses
+    // before the handoff, the tombstone and any target-handle write.
+    super::launch_x1::refuse_swap_from_sandbox_session(source.path())?;
     // Refuse before handoff, tombstoning or target-handle writes.
     super::run::admit_swap_provider_session(base_dir, target, target_surface, None, false)?;
 
@@ -1796,6 +1801,30 @@ fn exec_replace_swap(
     // marker write.
     let messaging_on = source_messaging_decision(source.path());
 
+    // ── Pre-teardown preparation: every fallible step that does not need the
+    // target handle dir runs HERE, while the user's session is still intact
+    // (R2 N5). The child environment is the big one: its private `gh` config
+    // dir is created in a staging directory now and moved into the target
+    // handle dir after the binding step; a failure here aborts with the source
+    // session untouched. Steps that must read or write the target handle dir
+    // (keychain sync, MCP rewrite, the Gemini settings materialization) still
+    // run after the binding and keep their rollback/recovery paths. ─────────
+    let prepared_env = super::launch_x1::PreparedSwapEnv::prepare(base_dir)?;
+    // The Gemini vault open is fallible and does not need the handle dir: do it
+    // before teardown too, instead of failing after the source is gone.
+    let gemini_vault = if target_surface == Surface::Gemini {
+        Some(
+            csq_core::platform::secret::open_default_vault().map_err(|e| {
+                anyhow!(
+                    "Gemini vault unavailable for swap target {target} ({}): {e}",
+                    e.error_kind_tag()
+                )
+            })?,
+        )
+    } else {
+        None
+    };
+
     // ── Step 1: emit INTENT (before any destructive operation) ──────────────
     //
     // FIX-2: INTENT now precedes the tombstone rename, not follows it.
@@ -1828,14 +1857,18 @@ fn exec_replace_swap(
     // (`run::launch_*` → `markers::write_current_account`) writes
     // `config-target/.current-account` as part of normal spawn.
     let source_path = source.path();
-    if is_term_handle_dir(source_path) {
-        rename_handle_dir_to_sweep_tombstone(source_path).map_err(|e| {
-            anyhow!(
-                "failed to tombstone source handle dir {} before cross-surface exec: {e}",
-                redact_path(source_path)
-            )
-        })?;
-    }
+    let tombstone = if is_term_handle_dir(source_path) {
+        Some(
+            rename_handle_dir_to_sweep_tombstone(source_path).map_err(|e| {
+                anyhow!(
+                    "failed to tombstone source handle dir {} before cross-surface exec: {e}",
+                    redact_path(source_path)
+                )
+            })?,
+        )
+    } else {
+        None
+    };
     // Legacy config-N source: do NOT remove the config dir (permanent
     // account home per spec 02 INV-01). Just exec; the config dir stays.
 
@@ -1847,6 +1880,15 @@ fn exec_replace_swap(
     // OUTCOME:ok = tombstone + target-binding committed. OUTCOME:Failed if
     // this step errors. exec(2) runs after OUTCOME.
     let binding_result = create_target_handle_dir(base_dir, target, target_surface, pid);
+
+    // R2 N5: a failed binding is rolled back when the source was tombstoned, so
+    // a swap that never reaches exec leaves the user's session intact instead
+    // of a tombstone plus a recovery hint. A legacy (non-`term-`) source dir
+    // was never moved, so it is intact either way.
+    let source_intact_after_failure = match (&binding_result, &tombstone) {
+        (Err(_), Some(tombstone)) => std::fs::rename(tombstone, source_path).is_ok(),
+        _ => true,
+    };
 
     // ── Step 4: emit OUTCOME (from real result of steps 2-3) BEFORE exec ─────
     //
@@ -1889,10 +1931,17 @@ fn exec_replace_swap(
     // R2-FIX-5: if binding failed after the source was already tombstoned,
     // surface a recovery hint. The OUTCOME:Failed was emitted in step 4.
     binding_result.map_err(|e| {
-        anyhow!(
-            "{e} — source handle dir was already tombstoned; \
-             re-run `csq run {target}` to start a new session"
-        )
+        if source_intact_after_failure {
+            anyhow!(
+                "{e} — the source handle dir was left in place; \
+                 the swap was not performed"
+            )
+        } else {
+            anyhow!(
+                "{e} — source handle dir was already tombstoned; \
+                 re-run `csq run {target}` to start a new session"
+            )
+        }
     })?;
 
     // Hand the source's decision to the target (every surface: a later swap out of a Gemini or
@@ -1950,6 +1999,11 @@ fn exec_replace_swap(
     #[cfg(not(feature = "enterprise"))]
     let codex_mcp_rewrite: Option<(String, PathBuf)> = None;
 
+    // R2 N5: the target handle dir now exists, so the prepared environment's
+    // private `gh` config dir moves into it. Every arm below receives the
+    // completed map; none builds its own environment after the tombstone.
+    let swap_child_env = prepared_env.adopt(&base_dir.join(format!("term-{pid}")));
+
     match target_surface {
         // T4 (S-F3 parity with the old exec path): every failure from here on
         // is reached with the source handle dir already tombstoned and the
@@ -1964,18 +2018,38 @@ fn exec_replace_swap(
             messaging_on,
             codex_share_lock,
             codex_session,
+            &swap_child_env,
         )
         .map_err(|e| swap_codex_post_tombstone_error(&e, target)),
-        Surface::ClaudeCode => {
-            exec_claude_code_after_binding(base_dir, target, pid, resume_conversation, messaging_on)
-        }
-        Surface::Gemini => exec_gemini_after_binding(base_dir, target, pid, messaging_on),
+        Surface::ClaudeCode => exec_claude_code_after_binding(
+            base_dir,
+            target,
+            pid,
+            resume_conversation,
+            messaging_on,
+            &swap_child_env,
+        ),
+        Surface::Gemini => exec_gemini_after_binding(
+            base_dir,
+            target,
+            pid,
+            messaging_on,
+            &swap_child_env,
+            gemini_vault
+                .as_deref()
+                .ok_or_else(|| anyhow!("Gemini vault was not opened before the swap"))?,
+        ),
         // W3-4 (an internal journal entry): native-CLI swap exec. Mirrors
         // exec_gemini_after_binding — no resume flag (native CLIs have no
         // resume concept csq drives).
-        Surface::Kimi | Surface::Grok => {
-            exec_native_after_binding(base_dir, target, target_surface, pid, messaging_on)
-        }
+        Surface::Kimi | Surface::Grok => exec_native_after_binding(
+            base_dir,
+            target,
+            target_surface,
+            pid,
+            messaging_on,
+            &swap_child_env,
+        ),
     }
 }
 
@@ -2047,7 +2121,7 @@ fn create_target_handle_dir(
 /// copy of this exact naming convention. Behavior is unchanged — the naming
 /// scheme, the parent-lookup failure mode, and the plain `std::fs::rename`
 /// call are identical to what codex_supervise's copy did.
-pub(crate) fn rename_handle_dir_to_sweep_tombstone(source_path: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_handle_dir_to_sweep_tombstone(source_path: &Path) -> std::io::Result<PathBuf> {
     let base = source_path
         .parent()
         .ok_or_else(|| std::io::Error::other("source handle dir has no parent"))?;
@@ -2057,7 +2131,8 @@ pub(crate) fn rename_handle_dir_to_sweep_tombstone(source_path: &Path) -> std::i
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let tombstone = base.join(format!(".sweep-tombstone-swap-{pid}-{nanos:x}"));
-    std::fs::rename(source_path, &tombstone)
+    std::fs::rename(source_path, &tombstone)?;
+    Ok(tombstone)
 }
 
 /// Confirmation for a true surface change (e.g. Claude↔Codex). The tombstone step
@@ -2112,16 +2187,19 @@ fn build_swap_codex_command(
     rest: &[String],
     mcp_wrap: Option<(&str, &Path)>,
     messaging_on: bool,
+    env: &BTreeMap<String, String>,
 ) -> Result<std::process::Command> {
-    // `None` (no envelope `mcp` policy) is the plain, unwrapped command. The messaging
-    // decision is the SOURCE terminal's, never the environment's (spec 32b section 6).
-    super::run::build_codex_exec_command_with(
+    // Fact Guard X1 (R1 S4, R2 N5): the FIRST swap child is a launch too. The
+    // scrub map was completed BEFORE the source was tombstoned; a swap writes
+    // no receipt, so the map carries no receipt pointer (spec §35.9).
+    super::run::build_codex_exec_command_with_x1(
         base_dir,
         target,
         handle_dir,
         rest,
         mcp_wrap,
         Some(messaging_on),
+        Some(env),
     )
 }
 
@@ -2134,16 +2212,36 @@ fn build_swap_claude_command(
     handle_dir_abs: &Path,
     resume: bool,
     messaging_on: bool,
-) -> std::process::Command {
+    env: &BTreeMap<String, String>,
+) -> Result<std::process::Command> {
+    // Fact Guard X1 (R1 S4, R2 N5): the first swap child is a launch too. The
+    // scrub map was completed BEFORE the source was tombstoned; a swap writes
+    // no receipt, so it inherits no receipt pointer (spec §35.9).
     let mut cmd = std::process::Command::new("claude");
+    cmd.env_clear();
+    cmd.envs(env);
+    // R2 N2: the scrub map preserves `ANTHROPIC_*`/`OPENAI_*`/`AWS_BEARER_TOKEN_BEDROCK`/
+    // `CLAUDE_API_KEY` (they are credentials of the PARENT session, not GitHub
+    // admin tokens). The swapped child must not inherit them — the same strip
+    // every `csq run` launch applies (`run::strip_sensitive_env`, the single
+    // source of truth for the spawn env allowlist).
+    super::run::strip_sensitive_env(&mut cmd);
     cmd.env("CLAUDE_CONFIG_DIR", handle_dir_abs);
     cmd.env_remove(codex_surface::HOME_ENV_VAR);
+    // an internal ticket: the swapped-into session gets its own TMPDIR under the
+    // target terminal's handle dir. Set AFTER `envs(env)` so a parent/scrub-map
+    // `TMPDIR` can never win; a creation failure refuses the exec with the
+    // fixed tag instead of falling back to the shared $TMPDIR.
+    cmd.env(
+        "TMPDIR",
+        super::run::session_tmpdir_or_refuse(handle_dir_abs)?,
+    );
     super::run::attach_messaging_claude_as(&mut cmd, handle_dir_abs, messaging_on);
     if resume {
         // `-c/--continue`: re-attach to the most recent conversation in the CWD.
         cmd.arg("--continue");
     }
-    cmd
+    Ok(cmd)
 }
 
 /// The audit emitter and capability-layer settings the codex session a
@@ -2211,6 +2309,7 @@ fn supervise_codex_after_binding(
         super::run::CodexLaunchSettings<'static>,
         super::run::PreSpawnCodexRun,
     )>,
+    env: &BTreeMap<String, String>,
 ) -> Result<()> {
     // `term-<pid>` is THIS process's handle dir: `exec_replace_swap` created it
     // under `std::process::id()`, and this process supervises codex in it.
@@ -2277,9 +2376,25 @@ fn supervise_codex_after_binding(
     let forced_cmd: Option<std::process::Command> = None;
     let mut cmd = match forced_cmd {
         Some(cmd) => cmd,
-        None => {
-            build_swap_codex_command(base_dir, target, &handle_dir, &rest, mcp_wrap, messaging_on)?
-        }
+        None => match build_swap_codex_command(
+            base_dir,
+            target,
+            &handle_dir,
+            &rest,
+            mcp_wrap,
+            messaging_on,
+            env,
+        ) {
+            Ok(cmd) => cmd,
+            Err(error) => {
+                // Includes the issue-an internal ticket per-session TMPDIR refusal. The
+                // source handle dir is already tombstoned, so remove the
+                // half-made target exactly as the Claude, Gemini and native
+                // swap arms do; the caller adds the recovery hint.
+                let _ = std::fs::remove_dir_all(&handle_dir);
+                return Err(error);
+            }
+        },
     };
 
     // M6 T6.4: inject the advisory path-scope env (empty unless the gate
@@ -2340,6 +2455,12 @@ fn supervise_codex_after_binding(
         &mut audit_emitter,
         messaging_on,
         embedded_native_fallback,
+        // A swap is not `csq run`: it carries no `--sandbox`/`--allow-env`
+        // options. The FIRST swap child is scrubbed by the map
+        // `PreparedSwapEnv` built before the tombstone; a supervised codex
+        // RELAUNCH goes through `launch_codex`, which writes its own receipt
+        // and scrubs again.
+        &super::launch_x1::X1Options::default(),
     )
 }
 
@@ -2359,6 +2480,7 @@ fn exec_claude_code_after_binding(
     pid: u32,
     resume: bool,
     messaging_on: bool,
+    env: &BTreeMap<String, String>,
 ) -> Result<()> {
     use std::os::unix::process::CommandExt;
     // Re-derive the handle dir path — do NOT call `create_handle_dir` again.
@@ -2403,10 +2525,24 @@ fn exec_claude_code_after_binding(
     // `--continue` re-attaches to the most recent conversation in the CWD. The transcript is
     // shared across handle dirs (SHARED_ITEMS `projects`), so the data stays reachable from the
     // fresh dir — but the actual re-attach is UNVERIFIED, and it resolves against the CWD.
-    let mut cmd = build_swap_claude_command(&handle_dir_abs, resume, messaging_on);
+    let mut cmd = match build_swap_claude_command(&handle_dir_abs, resume, messaging_on, env) {
+        Ok(cmd) => cmd,
+        Err(error) => {
+            // Includes the issue-an internal ticket per-session TMPDIR refusal. The source
+            // handle dir is already tombstoned here, so surface the same
+            // recovery hint every other post-tombstone failure carries.
+            let _ = std::fs::remove_dir_all(&handle_dir);
+            return Err(anyhow!(
+                "swap pre-exec setup failed after source handle dir was removed — \
+                 re-run `csq run {target}` to relaunch. Error: {}",
+                csq_core::error::redact_tokens(&error.to_string())
+            ));
+        }
+    };
 
     // S-F3 (this file's instance): see the codex exec arm's identical note.
     let err = cmd.exec();
+    csq_core::platform::process::restore_sigpipe_after_failed_exec();
     Err(anyhow!(
         "exec `claude` failed after source handle dir was removed — \
          re-run `csq run {target}` to relaunch. Error: {}",
@@ -2428,6 +2564,7 @@ fn supervise_codex_after_binding(
         super::run::CodexLaunchSettings<'static>,
         super::run::PreSpawnCodexRun,
     )>,
+    _env: &BTreeMap<String, String>,
 ) -> Result<()> {
     Err(anyhow!(
         "cross-surface csq swap is Unix-only today. \
@@ -2442,6 +2579,7 @@ fn exec_claude_code_after_binding(
     _pid: u32,
     _resume: bool,
     _messaging_on: bool,
+    _env: &BTreeMap<String, String>,
 ) -> Result<()> {
     Err(anyhow!(
         "cross-surface csq swap is Unix-only today. \
@@ -2503,45 +2641,123 @@ fn create_gemini_handle_dir(_base_dir: &Path, _target: AccountNum, _pid: u32) ->
 }
 
 /// Exec the Gemini binary after the target handle dir has already been created
-/// by `create_gemini_handle_dir` (step 3). Vault open + spawn_gemini are step 5.
+/// by `create_gemini_handle_dir` (step 3). The vault was opened BEFORE the
+/// source was tombstoned (R2 N5); plan build + exec are step 5.
 ///
 /// PR-G4b: mirrors `launch_gemini` in `commands/run.rs`.
 /// **Why a duplicate**: both call sites are inside csq-cli; factoring into
 /// csq-core requires a new `gemini::session` module + typed error enum;
 /// deferred until PR-G5 (desktop) becomes the third caller.
+/// Builds the Gemini swap child's plan: the fixed allowlist `csq run` Gemini
+/// uses, with the source terminal's messaging decision and the per-launch
+/// `GH_CONFIG_DIR` overlay (R2 item 3 — without it, `gh` inside the swapped
+/// session falls back to the parent's `hosts.yml`, exactly the isolation gap
+/// `csq run` Gemini already closes). The overlay is applied HERE, so a test can
+/// assert it without executing the binary.
+#[cfg(unix)]
+fn build_gemini_swap_plan(
+    base_dir: &Path,
+    handle_dir_abs: &Path,
+    target: AccountNum,
+    messaging_on: bool,
+    gh_config_dir: &str,
+    vault: &dyn csq_core::platform::secret::Vault,
+) -> Result<csq_core::providers::gemini::spawn::SpawnPlan> {
+    let parent_env = csq_core::env::utf8_env_map(std::env::vars_os());
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let home = csq_core::platform::home::home_dir();
+    build_gemini_swap_plan_with(
+        base_dir,
+        handle_dir_abs,
+        target,
+        messaging_on,
+        gh_config_dir,
+        vault,
+        &parent_env,
+        &cwd,
+        home.as_deref(),
+    )
+}
+
+/// [`build_gemini_swap_plan`] with the host-derived inputs injected, so the
+/// overlay and messaging decision are asserted by a test that never executes
+/// the binary (R2 item 3).
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn build_gemini_swap_plan_with(
+    base_dir: &Path,
+    handle_dir_abs: &Path,
+    target: AccountNum,
+    messaging_on: bool,
+    gh_config_dir: &str,
+    vault: &dyn csq_core::platform::secret::Vault,
+    parent_env: &std::collections::HashMap<String, String>,
+    cwd: &Path,
+    home: Option<&Path>,
+) -> Result<csq_core::providers::gemini::spawn::SpawnPlan> {
+    use csq_core::providers::gemini::spawn::build_spawn_plan_with_tmpdir;
+    // an internal ticket: the target terminal's per-session TMPDIR, created before the
+    // plan mutates settings.json (so a failure refuses before that write) and
+    // carried into the child through the Gemini allowlist. Never inherited from
+    // the parent: `parent_env`'s TMPDIR is not part of the allowlist.
+    let session_tmpdir = super::run::session_tmpdir_or_refuse(handle_dir_abs)?;
+    let plan = build_spawn_plan_with_tmpdir(
+        base_dir,
+        handle_dir_abs,
+        target,
+        parent_env,
+        cwd,
+        home,
+        vault,
+        Vec::new(),
+        &session_tmpdir,
+    )?;
+    let overlay = [("GH_CONFIG_DIR".to_owned(), gh_config_dir.to_owned())];
+    Ok(plan
+        .with_messaging_decision(messaging_on)
+        .with_env_overlay(&overlay))
+}
+
 #[cfg(unix)]
 fn exec_gemini_after_binding(
     base_dir: &Path,
     target: AccountNum,
     pid: u32,
     messaging_on: bool,
+    env: &BTreeMap<String, String>,
+    vault: &dyn csq_core::platform::secret::Vault,
 ) -> Result<()> {
-    use csq_core::platform::secret;
-    use csq_core::providers::gemini::spawn::spawn_gemini;
+    use csq_core::providers::gemini::spawn::execute_spawn_plan;
     super::run::admit_swap_provider_session(base_dir, target, Surface::Gemini, None, true)?;
 
     let handle_dir = base_dir.join(format!("term-{pid}"));
     let handle_dir_abs = std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
-
-    let vault = secret::open_default_vault().map_err(|e| {
-        let _ = std::fs::remove_dir_all(&handle_dir);
-        anyhow!(
-            "Gemini vault unavailable for swap target {target} ({}): {e}",
-            e.error_kind_tag()
-        )
-    })?;
+    let gh_config_dir = env
+        .get("GH_CONFIG_DIR")
+        .ok_or_else(|| anyhow!("Gemini swap environment carries no GH_CONFIG_DIR"))?;
 
     println!("Swapping to Gemini account {} (term-{})...", target, pid);
 
-    match spawn_gemini(
+    let plan = match build_gemini_swap_plan(
         base_dir,
         &handle_dir_abs,
         target,
-        Vec::new(),
-        vault.as_ref(),
         messaging_on,
+        gh_config_dir,
+        vault,
     ) {
-        Ok(_never) => unreachable!("spawn_gemini returns Infallible on success"),
+        Ok(plan) => plan,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&handle_dir);
+            return Err(anyhow!(
+                "Gemini swap plan failed after source handle dir was tombstoned — \
+                 re-run `csq run {target}` to relaunch. Error: {}",
+                csq_core::error::redact_tokens(&e.to_string())
+            ));
+        }
+    };
+    match execute_spawn_plan(plan) {
+        Ok(_never) => unreachable!("execute_spawn_plan returns Infallible on success"),
         Err(e) => {
             let _ = std::fs::remove_dir_all(&handle_dir);
             // S-F3 (this file's instance): see the codex exec arm's note.
@@ -2560,6 +2776,8 @@ fn exec_gemini_after_binding(
     _target: AccountNum,
     _pid: u32,
     _messaging_on: bool,
+    _env: &BTreeMap<String, String>,
+    _vault: &dyn csq_core::platform::secret::Vault,
 ) -> Result<()> {
     Err(anyhow!(
         "cross-surface csq swap is Unix-only today. \
@@ -2661,6 +2879,7 @@ fn exec_native_after_binding(
     target_surface: Surface,
     pid: u32,
     messaging_on: bool,
+    env: &BTreeMap<String, String>,
 ) -> Result<()> {
     use csq_core::providers::native;
     use std::os::unix::process::CommandExt;
@@ -2686,10 +2905,24 @@ fn exec_native_after_binding(
         descriptor.display_name, target, pid
     );
 
-    let mut cmd = build_swap_native_command(&binary_path, messaging_on);
+    let handle_dir = base_dir.join(format!("term-{pid}"));
+    let mut cmd = match build_swap_native_command(&binary_path, &handle_dir, messaging_on, env) {
+        Ok(cmd) => cmd,
+        Err(error) => {
+            // Includes the issue-an internal ticket per-session TMPDIR refusal (S-F3 shape:
+            // the source is already tombstoned, so carry the recovery hint).
+            let _ = std::fs::remove_dir_all(&handle_dir);
+            return Err(anyhow!(
+                "swap pre-exec setup failed after source handle dir was removed — \
+                 re-run `csq run {target}` to relaunch. Error: {}",
+                csq_core::error::redact_tokens(&error.to_string())
+            ));
+        }
+    };
 
     // S-F3 (this file's instance): see the codex exec arm's identical note.
     let err = cmd.exec();
+    csq_core::platform::process::restore_sigpipe_after_failed_exec();
     Err(anyhow!(
         "exec `{}` failed after source handle dir was removed — \
          re-run `csq run {target}` to relaunch. Error: {}",
@@ -2698,19 +2931,39 @@ fn exec_native_after_binding(
     ))
 }
 
-/// The Kimi/Grok swap-exec command: the vendor binary with the csq session-dir env scrubbed
-/// (so it never resolves a stale csq-managed config dir from the source surface, mirroring
-/// `supervise_codex_after_binding` / `exec_claude_code_after_binding`) and the source terminal's
-/// messaging decision in its environment (`run::set_decision_env`), so a later swap out of
-/// this terminal reads the decision even when no marker survived.
+/// The Kimi/Grok swap-exec command: the vendor binary with the X1 scrub map
+/// (R2 N1 — this arm used to inherit the full parent environment, including
+/// `GITHUB_TOKEN`/`GH_TOKEN`, a parent session's `CSQ_LAUNCH_RECEIPT` and
+/// `GH_CONFIG_DIR`), the csq session-dir env scrubbed so it never resolves a
+/// stale csq-managed config dir from the source surface (mirroring
+/// `supervise_codex_after_binding` / `exec_claude_code_after_binding`), the
+/// source terminal's messaging decision in its environment
+/// (`run::set_decision_env`), so a later swap out of this terminal reads the
+/// decision even when no marker survived, and the target terminal's
+/// per-session `TMPDIR` (an internal ticket).
+///
+/// `env_clear` + `envs` come FIRST: the `env_remove` calls below are name
+/// removals that must act on the completed map, and any variable the map does
+/// not carry must not exist in the child at all. `TMPDIR` is then SET from
+/// `handle_dir`: a `TMPDIR` in the map (it can survive the X1 deny-list scrub)
+/// is overridden, never trusted. A creation failure refuses the exec with the
+/// fixed `session_tmpdir_unavailable` tag.
 #[cfg(unix)]
-fn build_swap_native_command(binary: &Path, messaging_on: bool) -> std::process::Command {
+fn build_swap_native_command(
+    binary: &Path,
+    handle_dir: &Path,
+    messaging_on: bool,
+    env: &BTreeMap<String, String>,
+) -> Result<std::process::Command> {
     let mut cmd = std::process::Command::new(binary);
+    cmd.env_clear();
+    cmd.envs(env);
     cmd.env_remove("CLAUDE_CONFIG_DIR");
     cmd.env_remove("CLAUDE_HOME");
     cmd.env_remove(codex_surface::HOME_ENV_VAR);
+    cmd.env("TMPDIR", super::run::session_tmpdir_or_refuse(handle_dir)?);
     super::run::set_decision_env(&mut cmd, messaging_on);
-    cmd
+    Ok(cmd)
 }
 
 #[cfg(not(unix))]
@@ -2720,6 +2973,7 @@ fn exec_native_after_binding(
     _target_surface: Surface,
     _pid: u32,
     _messaging_on: bool,
+    _env: &BTreeMap<String, String>,
 ) -> Result<()> {
     Err(anyhow!(
         "cross-surface csq swap is Unix-only today. \
@@ -2987,6 +3241,7 @@ mod tests {
             /* messaging_on */ false,
             Some(lock),
             Some(codex_swap_session_inputs(base, target)),
+            &BTreeMap::new(),
         );
         let after = std::fs::OpenOptions::new()
             .read(true)
@@ -3297,22 +3552,30 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn native_swap_exec_carries_the_messaging_decision_in_its_env() {
+        let dir = tempfile::TempDir::new_in("/tmp").unwrap();
+        let handle = dir.path().join("term-77");
+        std::fs::create_dir(&handle).unwrap();
         let env_of = |on: bool| {
-            let cmd = build_swap_native_command(Path::new("/bin/true"), on);
+            // A canary in the prepared map proves `envs(&env)` was applied.
+            // The session-dir `env_remove` calls are not observable through
+            // `get_envs` after `env_clear` (their effect is implied absence),
+            // and the spawned canary test covers what the child actually sees.
+            let env = BTreeMap::from([("CSQ_SWAP_CANARY".to_owned(), "kept".to_owned())]);
+            let cmd = build_swap_native_command(Path::new("/bin/true"), &handle, on, &env).unwrap();
             let found: Vec<_> = cmd
                 .get_envs()
                 .filter(|(k, _)| *k == "CSQ_MESSAGING_DECISION")
                 .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
                 .collect();
-            let removed = cmd
+            let mapped = cmd
                 .get_envs()
-                .filter(|(k, v)| (*k == "CLAUDE_CONFIG_DIR") && v.is_none())
+                .filter(|(k, v)| (*k == "CSQ_SWAP_CANARY") && v.is_some())
                 .count();
-            (found, removed)
+            (found, mapped)
         };
-        let (on, scrub) = env_of(true);
+        let (on, mapped) = env_of(true);
         assert_eq!(on, vec![Some("on".to_string())]);
-        assert_eq!(scrub, 1, "the csq session-dir scrub is still there");
+        assert_eq!(mapped, 1, "the prepared scrub map reaches the command");
         assert_eq!(env_of(false).0, vec![Some("off".to_string())]);
     }
 
@@ -7402,6 +7665,7 @@ mod swap_codex_messaging_proxy_tests {
         std::fs::create_dir(&handle).unwrap();
         let envelope = handle.join(".pact-mcp-envelope.json");
 
+        let env = BTreeMap::new();
         let wrapped = build_swap_codex_command(
             dir.path(),
             acct,
@@ -7409,9 +7673,11 @@ mod swap_codex_messaging_proxy_tests {
             &[],
             Some(("/opt/csq", envelope.as_path())),
             true,
+            &env,
         )
         .unwrap();
-        let direct = build_swap_codex_command(dir.path(), acct, &handle, &[], None, true).unwrap();
+        let direct =
+            build_swap_codex_command(dir.path(), acct, &handle, &[], None, true, &env).unwrap();
 
         match prev {
             Some(v) => std::env::set_var("CSQ_MESSAGING", v),
@@ -7464,6 +7730,517 @@ mod swap_codex_messaging_proxy_tests {
         (dir, handle)
     }
 
+    /// Restores the process variables it sets, even on panic.
+    ///
+    /// Owns the workspace-wide `test_env` lock (R2 N7): the guard mutates
+    /// PATH/HOME/credential variables that every other spawn test reads, so it
+    /// must hold the lock for its whole lifetime. Taking the lock as a
+    /// constructor argument makes forgetting it a compile error, and removing
+    /// a second, nested `lock()` call prevents self-deadlock.
+    #[cfg(unix)]
+    struct SwapEnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _lock: csq_core::platform::test_env::EnvTestGuard,
+    }
+
+    #[cfg(unix)]
+    impl SwapEnvGuard {
+        fn apply(
+            lock: csq_core::platform::test_env::EnvTestGuard,
+            values: &[(&'static str, &std::ffi::OsStr)],
+        ) -> Self {
+            let saved = values
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect();
+            for (key, value) in values {
+                std::env::set_var(key, value);
+            }
+            Self { saved, _lock: lock }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for SwapEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn swap_fake_cli(dir: &Path, name: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = bin.join(name);
+        std::fs::write(&script, b"#!/bin/sh\n/usr/bin/env\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        bin
+    }
+
+    /// R1 S4/S5: the FIRST swap child is a launch too. Spawned against a
+    /// harness, it must see the X1 scrub, its OWN empty `GH_CONFIG_DIR`, and
+    /// never a parent session's receipt pointer.
+    #[cfg(unix)]
+    #[test]
+    fn swap_first_claude_child_is_scrubbed_and_drops_a_parent_receipt_pointer() {
+        let dir = tempfile::TempDir::new_in("/tmp").unwrap();
+        let bin = swap_fake_cli(dir.path(), "claude");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _guard = SwapEnvGuard::apply(
+            csq_core::platform::test_env::lock(),
+            &[
+                ("PATH", bin.as_os_str()),
+                ("HOME", home.as_os_str()),
+                (
+                    "GITHUB_TOKEN",
+                    std::ffi::OsStr::new("ghp_canary_never_reaches_child"),
+                ),
+                (
+                    "ANTHROPIC_API_KEY",
+                    std::ffi::OsStr::new("canary-value-anthropic-key-never-reaches-child"),
+                ),
+                (
+                    "CSQ_LAUNCH_RECEIPT",
+                    std::ffi::OsStr::new("/parent/session/receipt.json"),
+                ),
+                ("GH_CONFIG_DIR", std::ffi::OsStr::new("/parent/session/gh")),
+            ],
+        );
+        let (base, handle) = claude_handle();
+        let env = super::super::launch_x1::PreparedSwapEnv::prepare(base.path())
+            .unwrap()
+            .adopt(&handle);
+        let mut cmd = build_swap_claude_command(&handle, false, false, &env).unwrap();
+        let out = String::from_utf8_lossy(&cmd.output().unwrap().stdout).into_owned();
+        assert!(
+            !out.contains("ghp_canary_never_reaches_child"),
+            "swap child inherited GITHUB_TOKEN: {out}"
+        );
+        assert!(
+            !out.contains("canary-value-anthropic-key-never-reaches-child"),
+            "R2 N2: swap child inherited ANTHROPIC_API_KEY: {out}"
+        );
+        assert!(
+            !out.contains("CSQ_LAUNCH_RECEIPT"),
+            "swap child inherited a parent receipt pointer: {out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "GH_CONFIG_DIR={}/gh-config-empty-",
+                handle.display()
+            )),
+            "swap child must get its own empty gh config dir: {out}"
+        );
+    }
+
+    /// R1 S4/S5 for the Codex swap child: same scrub, same fresh gh dir.
+    #[cfg(unix)]
+    #[test]
+    fn swap_first_codex_child_is_scrubbed_and_drops_a_parent_receipt_pointer() {
+        let dir = tempfile::TempDir::new_in("/tmp").unwrap();
+        let bin = swap_fake_cli(dir.path(), "codex");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _guard = SwapEnvGuard::apply(
+            csq_core::platform::test_env::lock(),
+            &[
+                ("PATH", bin.as_os_str()),
+                ("HOME", home.as_os_str()),
+                (
+                    "GITHUB_TOKEN",
+                    std::ffi::OsStr::new("ghp_canary_never_reaches_child"),
+                ),
+                (
+                    "CSQ_LAUNCH_RECEIPT",
+                    std::ffi::OsStr::new("/parent/session/receipt.json"),
+                ),
+                ("GH_CONFIG_DIR", std::ffi::OsStr::new("/parent/session/gh")),
+            ],
+        );
+        let base = dir.path().join("accounts");
+        std::fs::create_dir_all(base.join("config-1")).unwrap();
+        std::fs::write(base.join("config-1").join("config.toml"), "model = \"x\"\n").unwrap(); // CI-ALLOW-fs-write-config-toml
+        let (d, handle) = claude_handle();
+        let env = super::super::launch_x1::PreparedSwapEnv::prepare(d.path())
+            .unwrap()
+            .adopt(&handle);
+        let account = AccountNum::try_from(1).unwrap();
+        let mut cmd =
+            build_swap_codex_command(&base, account, &handle, &[], None, false, &env).unwrap();
+        let out = String::from_utf8_lossy(&cmd.output().unwrap().stdout).into_owned();
+        assert!(
+            !out.contains("ghp_canary_never_reaches_child"),
+            "swap codex child inherited GITHUB_TOKEN: {out}"
+        );
+        assert!(
+            !out.contains("CSQ_LAUNCH_RECEIPT"),
+            "swap codex child inherited a parent receipt pointer: {out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "GH_CONFIG_DIR={}/gh-config-empty-",
+                handle.display()
+            )),
+            "swap codex child must get its own empty gh config dir: {out}"
+        );
+    }
+
+    /// R2 N1: the Kimi/Grok swap child is a launch too. Falsifier: the old
+    /// `build_swap_native_command` built a plain `Command` with only
+    /// `env_remove`s, so the parent's `GITHUB_TOKEN`, a parent session's
+    /// `CSQ_LAUNCH_RECEIPT` and its `GH_CONFIG_DIR` reached the child.
+    #[cfg(unix)]
+    #[test]
+    fn swap_first_native_child_is_scrubbed_and_drops_a_parent_receipt_pointer() {
+        let dir = tempfile::TempDir::new_in("/tmp").unwrap();
+        let bin = swap_fake_cli(dir.path(), "kimi");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _guard = SwapEnvGuard::apply(
+            csq_core::platform::test_env::lock(),
+            &[
+                ("PATH", bin.as_os_str()),
+                ("HOME", home.as_os_str()),
+                (
+                    "GITHUB_TOKEN",
+                    std::ffi::OsStr::new("ghp_canary_never_reaches_child"),
+                ),
+                (
+                    "CSQ_LAUNCH_RECEIPT",
+                    std::ffi::OsStr::new("/parent/session/receipt.json"),
+                ),
+                ("GH_CONFIG_DIR", std::ffi::OsStr::new("/parent/session/gh")),
+            ],
+        );
+        let (base, handle) = claude_handle();
+        let env = super::super::launch_x1::PreparedSwapEnv::prepare(base.path())
+            .unwrap()
+            .adopt(&handle);
+        let mut cmd = build_swap_native_command(&bin.join("kimi"), &handle, false, &env).unwrap();
+        let out = String::from_utf8_lossy(&cmd.output().unwrap().stdout).into_owned();
+        assert!(
+            !out.contains("ghp_canary_never_reaches_child"),
+            "native swap child inherited GITHUB_TOKEN: {out}"
+        );
+        assert!(
+            !out.contains("CSQ_LAUNCH_RECEIPT"),
+            "native swap child inherited a parent receipt pointer: {out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "GH_CONFIG_DIR={}/gh-config-empty-",
+                handle.display()
+            )),
+            "native swap child must get its own empty gh config dir: {out}"
+        );
+    }
+
+    /// R2 N5: the swap child environment is built BEFORE the source handle dir
+    /// is tombstoned, and its private `gh` dir moves into the target handle dir
+    /// once that exists. Falsifier: the old `swap_env(handle_dir)` ran after
+    /// the tombstone, so a failure there destroyed the session; a prepare
+    /// failure now happens with the source untouched.
+    #[cfg(unix)]
+    #[test]
+    fn prepared_swap_env_moves_the_gh_dir_and_prepare_failures_precede_any_teardown() {
+        let root = tempfile::TempDir::new_in("/tmp").unwrap();
+        let base = root.path().join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        let handle = base.join("term-77");
+        std::fs::create_dir(&handle).unwrap();
+        let _guard = SwapEnvGuard::apply(
+            csq_core::platform::test_env::lock(),
+            &[
+                (
+                    "GITHUB_TOKEN",
+                    std::ffi::OsStr::new("ghp_canary_never_reaches_child"),
+                ),
+                (
+                    "CSQ_LAUNCH_RECEIPT",
+                    std::ffi::OsStr::new("/parent/session/receipt.json"),
+                ),
+                ("GH_CONFIG_DIR", std::ffi::OsStr::new("/parent/session/gh")),
+            ],
+        );
+        let env = super::super::launch_x1::PreparedSwapEnv::prepare(&base)
+            .unwrap()
+            .adopt(&handle);
+        let gh = env.get("GH_CONFIG_DIR").expect("GH_CONFIG_DIR set");
+        assert!(gh.starts_with(&handle.display().to_string()), "{gh}");
+        assert!(Path::new(gh).is_dir(), "gh dir must exist: {gh}");
+        assert!(!env.contains_key("CSQ_LAUNCH_RECEIPT"));
+        assert!(!env.contains_key("GITHUB_TOKEN"));
+        assert!(
+            !base
+                .join(format!(".swap-env-{}", std::process::id()))
+                .exists(),
+            "the staging directory is removed once its gh dir is adopted"
+        );
+
+        // A staging path occupied by a file makes preparation fail. The source
+        // handle dir is untouched: preparation runs before the tombstone.
+        let root2 = tempfile::TempDir::new_in("/tmp").unwrap();
+        let base2 = root2.path().join("accounts");
+        std::fs::create_dir_all(&base2).unwrap();
+        let source = base2.join("term-88");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(
+            base2.join(format!(".swap-env-{}", std::process::id())),
+            b"occupied",
+        )
+        .unwrap();
+        let error = super::super::launch_x1::PreparedSwapEnv::prepare(&base2).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(super::super::launch_x1::TAG_ENV_ISOLATION),
+            "{error}"
+        );
+        assert!(
+            source.is_dir(),
+            "a preparation failure must leave the source session in place"
+        );
+        assert_eq!(
+            std::fs::read_dir(&source).unwrap().count(),
+            0,
+            "preparation never touches the source handle dir"
+        );
+    }
+
+    /// R2 N6 (ROOT decision): a session launched with `--sandbox` refuses an
+    /// exec-replace swap, because the replacement command is not built with the
+    /// pinned permission mode. No receipt (pre-X1 launch) proceeds; an
+    /// unreadable or unparseable receipt fails CLOSED.
+    #[cfg(unix)]
+    #[test]
+    fn swap_from_a_sandboxed_session_refuses_before_any_teardown() {
+        use super::super::launch_x1::{refuse_swap_from_sandbox_session, TAG_SWAP_SANDBOX_SESSION};
+        use csq_core::launch_isolation::RECEIPT_FILE;
+        let dir = tempfile::TempDir::new_in("/tmp").unwrap();
+        let handle = dir.path().join("term-9");
+        std::fs::create_dir(&handle).unwrap();
+        refuse_swap_from_sandbox_session(&handle).unwrap();
+        for state in ["enforced", "permission-mode-only"] {
+            std::fs::write(
+                handle.join(RECEIPT_FILE),
+                format!("{{\"sandbox\":\"{state}\"}}"),
+            )
+            .unwrap();
+            let error = refuse_swap_from_sandbox_session(&handle)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(TAG_SWAP_SANDBOX_SESSION), "{error}");
+            assert!(error.contains(state), "{error}");
+        }
+        std::fs::write(handle.join(RECEIPT_FILE), "{\"sandbox\":\"not-requested\"}").unwrap();
+        refuse_swap_from_sandbox_session(&handle).unwrap();
+        for unreadable in ["not json", "{\"sandbox\":\"future-state\"}"] {
+            std::fs::write(handle.join(RECEIPT_FILE), unreadable).unwrap();
+            let error = refuse_swap_from_sandbox_session(&handle)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(TAG_SWAP_SANDBOX_SESSION), "{error}");
+        }
+    }
+
+    /// R2 item 3: the Gemini swap plan carries the per-launch `GH_CONFIG_DIR`
+    /// overlay and no parent receipt pointer. Falsifier: without the overlay,
+    /// `gh` inside the swapped session falls back to the parent's `hosts.yml`
+    /// (the gap `csq run` Gemini already closes).
+    #[cfg(unix)]
+    #[test]
+    fn gemini_swap_plan_carries_the_private_gh_config_dir() {
+        use csq_core::platform::secret::in_memory::InMemoryVault;
+        use csq_core::platform::secret::{SlotKey, Vault};
+        use csq_core::providers::gemini::provisioning::{write_binding, AuthMode, GeminiBinding};
+        use secrecy::SecretString;
+        let dir = tempfile::TempDir::new_in("/tmp").unwrap();
+        let base = dir.path().join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        let handle = base.join("term-42");
+        std::fs::create_dir(&handle).unwrap();
+        let account = AccountNum::try_from(4).unwrap();
+        let vault = InMemoryVault::new();
+        write_binding(
+            &base,
+            account,
+            &GeminiBinding::new(AuthMode::ApiKey, "auto"),
+        )
+        .unwrap();
+        vault
+            .set(
+                SlotKey {
+                    surface: csq_core::providers::gemini::SURFACE_GEMINI,
+                    account,
+                },
+                &SecretString::from("AIzaSy_csq_test_key"),
+            )
+            .unwrap();
+        let mut parent = std::collections::HashMap::new();
+        parent.insert("HOME".to_owned(), dir.path().display().to_string());
+        parent.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+        let gh = handle.join("gh-config-empty-1");
+        std::fs::create_dir_all(&gh).unwrap();
+        let gh_text = gh.display().to_string();
+        let plan = build_gemini_swap_plan_with(
+            &base,
+            &handle,
+            account,
+            true,
+            &gh_text,
+            &vault,
+            &parent,
+            dir.path(),
+            Some(dir.path()),
+        )
+        .unwrap();
+        let value = |key: &str| -> Option<String> {
+            plan.envs
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(value("GH_CONFIG_DIR").as_deref(), Some(gh_text.as_str()));
+        assert_eq!(value("CSQ_MESSAGING_DECISION").as_deref(), Some("on"));
+        assert!(value("CSQ_LAUNCH_RECEIPT").is_none());
+    }
+
+    /// an internal ticket AC1/AC4/AC6: the Gemini swap plan carries the TARGET
+    /// terminal's `<handle>/tmp` as `TMPDIR`, overriding a parent-shell value.
+    /// Falsifier: the allowlist had no TMPDIR, so the child used the shared
+    /// system temp dir.
+    #[cfg(unix)]
+    #[test]
+    fn gemini_swap_plan_carries_the_session_tmpdir_and_overrides_a_parent_one() {
+        use csq_core::platform::secret::in_memory::InMemoryVault;
+        use csq_core::platform::secret::{SlotKey, Vault};
+        use csq_core::providers::gemini::provisioning::{write_binding, AuthMode, GeminiBinding};
+        use secrecy::SecretString;
+        let dir = tempfile::TempDir::new_in("/tmp").unwrap();
+        let base = dir.path().join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        let handle = base.join("term-42");
+        std::fs::create_dir(&handle).unwrap();
+        let account = AccountNum::try_from(4).unwrap();
+        let vault = InMemoryVault::new();
+        write_binding(
+            &base,
+            account,
+            &GeminiBinding::new(AuthMode::ApiKey, "auto"),
+        )
+        .unwrap();
+        vault
+            .set(
+                SlotKey {
+                    surface: csq_core::providers::gemini::SURFACE_GEMINI,
+                    account,
+                },
+                &SecretString::from("AIzaSy_csq_test_key"),
+            )
+            .unwrap();
+        let mut parent = std::collections::HashMap::new();
+        parent.insert("HOME".to_owned(), dir.path().display().to_string());
+        parent.insert("TMPDIR".to_owned(), "/parent/shared/tmp".to_owned());
+        let plan = build_gemini_swap_plan_with(
+            &base,
+            &handle,
+            account,
+            false,
+            "/unused-gh-config",
+            &vault,
+            &parent,
+            dir.path(),
+            Some(dir.path()),
+        )
+        .unwrap();
+        let expected = handle.join("tmp");
+        let tmpdir: Vec<_> = plan
+            .envs
+            .iter()
+            .filter(|(k, _)| k == "TMPDIR")
+            .map(|(_, v)| v.clone())
+            .collect();
+        assert_eq!(
+            tmpdir,
+            vec![expected.to_string_lossy().into_owned()],
+            "the swap plan must carry <handle>/tmp, never the parent's TMPDIR"
+        );
+        assert!(expected.is_dir());
+    }
+
+    /// an internal ticket AC1/AC4/AC6: the swap-exec Claude child exports the target
+    /// terminal's `<handle>/tmp` as `TMPDIR`, overriding a `TMPDIR` present in
+    /// the prepared (parent-derived) map. Falsifier: without the
+    /// `cmd.env("TMPDIR", …)` set, the map's parent value wins.
+    #[cfg(unix)]
+    #[test]
+    fn swap_claude_child_carries_the_session_tmpdir_and_overrides_a_parent_one() {
+        let (_d, handle) = claude_handle();
+        let env = BTreeMap::from([("TMPDIR".to_owned(), "/parent/shared/tmp".to_owned())]);
+        let cmd = build_swap_claude_command(&handle, false, false, &env).unwrap();
+        let expected = handle.join("tmp");
+        let tmpdir: Vec<_> = cmd
+            .get_envs()
+            .filter(|(k, _)| *k == "TMPDIR")
+            .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(
+            tmpdir,
+            vec![Some(expected.to_string_lossy().into_owned())],
+            "the swap child's TMPDIR must be <handle>/tmp, never the parent's"
+        );
+        assert!(expected.is_dir());
+    }
+
+    /// an internal ticket AC1/AC4/AC6: the swap-exec Kimi/Grok child exports the
+    /// target terminal's `<handle>/tmp` as `TMPDIR`, overriding a parent value.
+    #[cfg(unix)]
+    #[test]
+    fn swap_native_child_carries_the_session_tmpdir_and_overrides_a_parent_one() {
+        let (_d, handle) = claude_handle();
+        let env = BTreeMap::from([("TMPDIR".to_owned(), "/parent/shared/tmp".to_owned())]);
+        let cmd = build_swap_native_command(Path::new("/bin/true"), &handle, false, &env).unwrap();
+        let expected = handle.join("tmp");
+        let tmpdir: Vec<_> = cmd
+            .get_envs()
+            .filter(|(k, _)| *k == "TMPDIR")
+            .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(tmpdir, vec![Some(expected.to_string_lossy().into_owned())]);
+        assert!(expected.is_dir());
+    }
+
+    /// an internal ticket AC1/AC4/AC6: the swap-exec Codex child (same builder as
+    /// `csq run`) exports the target terminal's `<handle>/tmp` as `TMPDIR`,
+    /// overriding a `TMPDIR` carried by the prepared map.
+    #[cfg(unix)]
+    #[test]
+    fn swap_codex_child_carries_the_session_tmpdir_and_overrides_a_parent_one() {
+        let dir = tempfile::TempDir::new_in("/tmp").unwrap();
+        let account = AccountNum::try_from(7u16).unwrap();
+        std::fs::create_dir_all(dir.path().join("config-7")).unwrap();
+        let handle = dir.path().join("term-7");
+        std::fs::create_dir(&handle).unwrap();
+        let env = BTreeMap::from([("TMPDIR".to_owned(), "/parent/shared/tmp".to_owned())]);
+        let cmd =
+            build_swap_codex_command(dir.path(), account, &handle, &[], None, false, &env).unwrap();
+        let expected = handle.join("tmp");
+        let tmpdir: Vec<_> = cmd
+            .get_envs()
+            .filter(|(k, _)| *k == "TMPDIR")
+            .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(tmpdir, vec![Some(expected.to_string_lossy().into_owned())]);
+        assert!(expected.is_dir());
+    }
+
     /// The fixture must own a root independent of the ambient TMPDIR: the test
     /// transiently points TMPDIR at a directory it deletes. PARENT/CHILD
     /// dispatch (one test name; see
@@ -7512,7 +8289,11 @@ mod swap_codex_messaging_proxy_tests {
     #[test]
     fn swap_exec_claude_registers_messaging_before_the_resume_flag() {
         let (_d, handle) = claude_handle();
-        let cmd = with_env(None, || build_swap_claude_command(&handle, true, true));
+        let env = BTreeMap::new();
+        let cmd = with_env(None, || {
+            build_swap_claude_command(&handle, true, true, &env)
+        })
+        .unwrap();
         let a = args_of(&cmd);
         assert_eq!(a[0], "--mcp-config", "{a:?}");
         assert_eq!(a.last().map(String::as_str), Some("--continue"), "{a:?}");
@@ -7528,7 +8309,11 @@ mod swap_codex_messaging_proxy_tests {
     fn swap_exec_keeps_a_launch_time_off_decision_for_claude_and_codex() {
         use csq_core::messaging::register;
         let (_d, handle) = claude_handle();
-        let claude = with_env(None, || build_swap_claude_command(&handle, false, false));
+        let env = BTreeMap::new();
+        let claude = with_env(None, || {
+            build_swap_claude_command(&handle, false, false, &env)
+        })
+        .unwrap();
         assert!(args_of(&claude).is_empty(), "{:?}", args_of(&claude));
         let s: serde_json::Value =
             serde_json::from_slice(&std::fs::read(handle.join("settings.json")).unwrap()).unwrap();
@@ -7539,8 +8324,9 @@ mod swap_codex_messaging_proxy_tests {
         std::fs::create_dir_all(dir.path().join("config-12")).unwrap();
         let ch = dir.path().join("term-5");
         std::fs::create_dir(&ch).unwrap();
+        let codex_env = BTreeMap::new();
         let codex = with_env(None, || {
-            build_swap_codex_command(dir.path(), acct, &ch, &[], None, false).unwrap()
+            build_swap_codex_command(dir.path(), acct, &ch, &[], None, false, &codex_env).unwrap()
         });
         let c = args_of(&codex).join("\n");
         assert!(!c.contains("csq-messaging"), "{c}");

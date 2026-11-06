@@ -13,6 +13,8 @@ commands.allow = [
   "get_account_usage",
   "get_rotation_config",
   "set_rotation_enabled",
+  "get_session_rotation",
+  "set_session_rotation",
   "get_capability_layer_toggles",
   "set_capability_layer_toggles",
   "get_daemon_status",

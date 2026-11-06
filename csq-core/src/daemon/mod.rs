@@ -75,6 +75,9 @@ pub mod lifecycle;
 /// `csq` crate's `daemon_log` module. Mirrors `coc_cache_sweeper`'s
 /// spawn/tick idiom.
 pub mod log_gc;
+/// Owner Telegram ping when a slot newly becomes LOGIN-NEEDED (spec 04 §4.2.1
+/// step 8): fires once per transition, persisted so a restart does not resend.
+pub mod login_needed_alert;
 pub mod migrate_legacy_api_key_helper;
 /// Cross-platform daemon notify chokepoint (an internal ticket) — `POST
 /// /api/invalidate-cache` + the targeted `/api/slot-swap` per-slot

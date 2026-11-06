@@ -2399,7 +2399,8 @@ impl ClaudeWakeTarget {
             Ok(None) => {
                 // Optional registry JSON is not published in every Claude Code role.
                 // A producer candidate is admitted here; connected peer PID is authority at post.
-                let socket = socket_of(pid)?;
+                let socket =
+                    socket_of(pid).or_else(|| discovered_session_socket(pid, &info.config_dir))?;
                 let Ok(Some((fresh, fresh_exact))) = info_of(pid) else {
                     return None;
                 };
@@ -2546,6 +2547,48 @@ pub fn claude_socket_dirs() -> Vec<PathBuf> {
     }
 }
 
+/// an internal ticket: the RECIPIENT's own per-session temp dir may host its Claude inbox
+/// socket (`<handle dir>/tmp/cc-socks`).
+///
+/// Derived from the recipient's OWN `config_dir`, never from the sender's
+/// environment and never from `<base>/term-<current pid>`: a csq handle dir is
+/// named for the LAUNCH-time pid, which differs from the recipient's current
+/// pid whenever csq spawned rather than exec'd (layer-controlled sessions and
+/// every recycle relaunch), so a base-plus-current-pid path would miss exactly
+/// those sessions. A non-csq `config_dir` has no `term-` leaf and derives
+/// nothing; the shared roots remain the fallback, and `canonical_socket_in`
+/// still requires the parent to be this uid's, non-group/world-writable
+/// directory.
+#[must_use]
+pub fn recipient_session_socket_dir(config_dir: &Path) -> Option<PathBuf> {
+    let leaf = config_dir.file_name()?.to_str()?;
+    if !leaf.starts_with("term-") {
+        return None;
+    }
+    Some(
+        config_dir
+            .join(crate::session::tmpdir::SESSION_TMPDIR_DIR)
+            .join("cc-socks"),
+    )
+}
+
+/// The producer-derived lookup when Claude Code publishes no registry JSON:
+/// the sender-environment roots plus the recipient's own per-session dir.
+#[cfg(unix)]
+fn discovered_session_socket(pid: u32, config_dir: &Path) -> Option<PathBuf> {
+    let mut dirs = claude_socket_dirs();
+    if let Some(dir) = recipient_session_socket_dir(config_dir) {
+        dirs.push(dir);
+    }
+    let paths: Vec<_> = dirs.iter().map(|d| d.join(format!("{pid}.sock"))).collect();
+    select_claude_socket(pid, &paths, &dirs)
+}
+
+#[cfg(not(unix))]
+fn discovered_session_socket(_pid: u32, _config_dir: &Path) -> Option<PathBuf> {
+    None
+}
+
 /// The canonical path to post to, or `None`: `socket`'s parent canonicalizes to one of `allowed`
 /// (each canonicalized too, so `/tmp` -> `/private/tmp` on macOS compares equal) AND that
 /// directory is owned by this uid with no group or world write bit. The returned path is the
@@ -2656,9 +2699,14 @@ pub fn deliver_claude_coalesced(
     now: u64,
     pending_ids: &dyn Fn() -> Option<Vec<String>>,
 ) -> Delivery {
+    // an internal ticket: same recipient-aware admission as `deliver_claude_coalesced_with_notice`.
+    let mut allowed = allowed_dirs.to_vec();
+    if let Some(dir) = recipient_session_socket_dir(&target.config_dir) {
+        allowed.push(dir);
+    }
     deliver_claude_coalesced_text(
         target,
-        allowed_dirs,
+        &allowed,
         still_live,
         &notice(n),
         timeout,
@@ -2679,9 +2727,17 @@ pub fn deliver_claude_coalesced_with_notice(
     now: u64,
     pending_ids: &dyn Fn() -> Option<Vec<String>>,
 ) -> Delivery {
+    // an internal ticket: a recipient launched by csq may place its inbox socket under its
+    // OWN per-session temp dir. It is derived from the target's config dir
+    // (validated by `resolve`), so it is exact even when csq spawned rather
+    // than exec'd and the recipient's pid differs from its handle-dir name.
+    let mut allowed = allowed_dirs.to_vec();
+    if let Some(dir) = recipient_session_socket_dir(&target.config_dir) {
+        allowed.push(dir);
+    }
     deliver_claude_coalesced_text(
         target,
-        allowed_dirs,
+        &allowed,
         still_live,
         &super::frame::render_preview_notice(summary),
         timeout,
@@ -3746,14 +3802,30 @@ mod tests {
         let db = queue_db(dir.path());
         add_row_raw(&db, "ITEM1", TID, REAL_PAYLOAD);
         let calls = std::cell::Cell::new(0);
+        // The final liveness verification BLOCKS until the test has OBSERVED the
+        // overall budget expire. The ordering is enforced by the channel, not by
+        // racing a fixed sleep against a short wall deadline, so a loaded host
+        // cannot deliver fewer than three calls before the final check. The
+        // budget is ~5x the product's own bounded work per iteration (the
+        // reader open and the probe are each capped at 200 ms).
+        let (release, wait) = std::sync::mpsc::channel();
         let live = || {
             calls.set(calls.get() + 1);
             if calls.get() >= 3 {
-                std::thread::sleep(Duration::from_millis(350));
+                wait.recv()
+                    .expect("the test releases the final liveness verification");
             }
             true
         };
-        let overall = Instant::now() + Duration::from_millis(250);
+        let overall = Instant::now() + Duration::from_secs(2);
+        let releaser = std::thread::spawn(move || {
+            while Instant::now() < overall {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            release
+                .send(())
+                .expect("the final liveness verification is waiting");
+        });
         let result = watch_drain_reader(
             &dir.path().join(QUEUE_DB),
             &mut None,
@@ -3764,6 +3836,7 @@ mod tests {
             false,
             &live,
         );
+        releaser.join().unwrap();
         assert_eq!(
             calls.get(),
             3,
@@ -6609,6 +6682,48 @@ mod r8_tests {
         )
     }
 
+    /// an internal ticket R2 N1: the recipient's session socket dir comes from ITS OWN
+    /// config dir, so it still resolves when the handle dir is named for the
+    /// LAUNCH-time pid (csq spawned, so the recipient's current pid differs) —
+    /// a base-plus-current-pid derivation would miss exactly those sessions.
+    #[test]
+    fn the_recipients_session_socket_dir_comes_from_its_own_config_dir() {
+        let d = TempDir::new().unwrap();
+        let cfg = d.path().join("term-999999");
+        std::fs::create_dir(&cfg).unwrap();
+        assert_eq!(
+            recipient_session_socket_dir(&cfg),
+            Some(cfg.join("tmp").join("cc-socks"))
+        );
+        assert_eq!(
+            recipient_session_socket_dir(&d.path().join("config-3")),
+            None,
+            "a legacy config dir is not a per-session temp root"
+        );
+        assert_eq!(recipient_session_socket_dir(d.path()), None);
+    }
+
+    /// an internal ticket R2 C4: BOTH production delivery paths carry the recipient-aware
+    /// dir. A helper-only green would survive the call sites being dropped, so
+    /// the needles are split (`concat!`) to avoid matching this test's own
+    /// source and the counts are pinned.
+    #[test]
+    fn the_recipient_aware_socket_dir_is_wired_into_both_delivery_paths() {
+        let src = include_str!("wake.rs");
+        let with_notice = concat!("recipient_session_socket_dir(&target", ".config_dir)");
+        assert_eq!(
+            src.matches(with_notice).count(),
+            2,
+            "both deliver_claude_coalesced* fns must admit the recipient dir"
+        );
+        let discovery = concat!("discovered_session_socket(pid, &info", ".config_dir)");
+        assert_eq!(
+            src.matches(discovery).count(),
+            1,
+            "the registry-absent path must admit the recipient dir"
+        );
+    }
+
     /// A fresh `socks` directory standing in for `/tmp/cc-socks` (mode 0700, ours).
     fn socks(d: &TempDir) -> (PathBuf, Vec<PathBuf>) {
         let s = d.path().join("socks");
@@ -7024,20 +7139,22 @@ mod w2_tests {
             let receiver = VerifiedSession::from_resolved(Sender {
                 pid: std::process::id(),
                 started_at: 5_000,
-                surface: Surface::ClaudeCode,
+                surface: Surface::ClaudeCode.into(),
                 handle_dir_hash: "receiver".into(),
                 handle_dir: home.path().to_str().unwrap().into(),
                 name: None,
                 started_exact: Some(777),
+                service: None,
             });
             let sender = VerifiedSession::from_resolved(Sender {
                 pid: std::process::id().checked_add(1).unwrap(),
                 started_at: 5_000,
-                surface: Surface::Codex,
+                surface: Surface::Codex.into(),
                 handle_dir_hash: "sender".into(),
                 handle_dir: base.path().to_str().unwrap().into(),
                 name: None,
                 started_exact: Some(888),
+                service: None,
             });
             let to = receiver.as_recipient();
             let target = ClaudeWakeTarget {

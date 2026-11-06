@@ -644,6 +644,35 @@ pub fn emit_outcome(
     emit_record(base_dir, record, EmitPhase::Outcome, None).map(|_| ())
 }
 
+/// [`emit_outcome`] for an APPEND-FIRST admission, returning whether the record was
+/// actually appended.
+///
+/// [`emit_outcome`] treats a benign skip (`Ok(false)` — the `.chain-broken` sentinel, or a
+/// cutoff with the keychain unavailable) as success, because its callers' side effect has
+/// already committed. An append-first producer has not committed anything yet and MUST
+/// refuse the side effect unless the record is on the chain: this variant surfaces the
+/// skip (`Ok(false)`) so the caller can refuse (design an internal ticket §6, `service_audit_unavailable`).
+/// `Err` remains a hard I/O / chain-loader failure.
+pub fn emit_outcome_strict(
+    base_dir: &Path,
+    chain_id_str: &str,
+    kind: EventKind,
+    payload: EventPayload,
+    correlation_id: RecordId,
+    result: OpOutcome,
+) -> Result<bool, AuditV2Error> {
+    let record = build_lifecycle_record(
+        chain_id_str,
+        kind,
+        payload,
+        OpPhase::Outcome {
+            correlation_id,
+            result,
+        },
+    )?;
+    emit_record(base_dir, record, EmitPhase::Outcome, None)
+}
+
 /// Build and emit an OUTCOME record for a M13b lifecycle op, with an
 /// additional AUTHORIZATION precheck evaluated INSIDE the `.chain-lock`
 /// critical section, immediately before the append — the correlated
@@ -687,6 +716,70 @@ pub fn emit_outcome_with_precheck(
         },
     )?;
     emit_record(base_dir, record, EmitPhase::Outcome, Some(precheck))
+}
+
+/// Persist one relay phase with explicit durability and no benign-skip result.
+/// This blocking operation belongs on an audit worker, never inside the PTY pump.
+/// Success is persistence only: the payload's role is not an input capability.
+#[cfg(unix)]
+pub(crate) fn emit_session_inject(
+    base: &Path,
+    payload: crate::audit::types::SessionInjectPayload,
+    correlation: RecordId,
+    result: Option<OpOutcome>,
+) -> Result<(), AuditV2Error> {
+    use crate::audit::types::SessionInjectOutcome as O;
+    let valid_phase = matches!(
+        (&result, payload.outcome),
+        (None, O::Intent)
+            | (Some(OpOutcome::Ok), O::DeliveredToPty)
+            | (Some(OpOutcome::Failed { .. }), O::Refused | O::Undetermined)
+    );
+    if !valid_phase || (payload.outcome == O::Refused) != payload.error_code.is_some() {
+        return Err(AuditV2Error::Internal {
+            reason: "relay_audit_phase_invalid".into(),
+        });
+    }
+    let phase = match result {
+        None => OpPhase::Intent {
+            correlation_id: correlation,
+        },
+        Some(result) => OpPhase::Outcome {
+            correlation_id: correlation,
+            result: match result {
+                OpOutcome::Ok => OpOutcome::Ok,
+                OpOutcome::Failed { .. } => OpOutcome::Failed {
+                    reason: redact_reason(if payload.outcome == O::Refused {
+                        "relay_refused"
+                    } else {
+                        "relay_undetermined"
+                    }),
+                },
+            },
+        },
+    };
+    if let Some(error_kind) = crate::audit::health::is_chain_broken(base) {
+        return Err(AuditV2Error::ChainBrokenRefuseAppend { error_kind });
+    }
+    let mut record = build_lifecycle_record(
+        &load_chain_id(base),
+        EventKind::SessionInject,
+        EventPayload::SessionInject(payload),
+        phase,
+    )?;
+    // Existing cutoff-aware loading remains fail-closed; the in-lock writer
+    // guard also catches a cutoff activated after this signing decision.
+    let signing = load_signing_key_with_budget(base, Duration::from_millis(200))?;
+    if let Some(ctx) = signing.as_ref() {
+        record.key_id = ctx.key.key_id();
+    }
+    crate::audit::persist::write_session_inject_durable(
+        record,
+        base,
+        signing
+            .as_ref()
+            .map(|ctx| &ctx.key as &dyn crate::audit::traits::SigningKey),
+    )
 }
 
 /// Derive the chain_id string for use in lifecycle records.
@@ -823,6 +916,364 @@ mod tests {
     use crate::audit::types::{AccountLogoutPayload, AccountMovePayload};
     use crate::types::AccountNum;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    fn relay_payload() -> crate::audit::types::SessionInjectPayload {
+        serde_json::from_value(serde_json::json!({
+            "inject_id":1, "caller_pid":2, "caller_started_at":3,
+            "target_pid":4, "target_started_at":5, "incarnation_unit":"linux_ticks",
+            "role":"operator", "primitive":"slash", "slash":"clear", "byte_len":6,
+            "when":"immediate", "outcome":"intent", "error_code":null
+        }))
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn with_relay_verification_env<T>(home: &Path, operation: impl FnOnce() -> T) -> T {
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (name, value) in &self.0 {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(
+            ["HOME", "CSQ_AUDIT_EDITION", "CSQ_AUDIT_ROSTER_ROOT_PUBKEY"]
+                .into_iter()
+                .map(|name| (name, std::env::var_os(name)))
+                .collect(),
+        );
+        std::env::set_var("HOME", home);
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        // verify_chain's optional anchor read is confined to the process-only
+        // backend; signer custody below is exclusively the fixture's file store.
+        crate::audit::key_custody::init_mock_keyring();
+        operation()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_signed_active_cutoff_intent_outcome_chain_verifies() {
+        use crate::audit::key_custody::{file_store, ChainState};
+        use crate::audit::types::SessionInjectOutcome;
+        use std::os::unix::fs::DirBuilderExt as _;
+        let _env = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        with_relay_verification_env(home.path(), || {
+            let (seed, key_id, pubkey) = LocalSigningKey::generate_keypair().unwrap();
+            let chain_id = crate::audit::persist::gen_chain_id();
+            let mut chain = ChainState::new(chain_id.as_str());
+            chain.genesis_seq = Some(0);
+            chain.signing_key_id = Some(key_id.clone());
+            chain.pubkey = Some(pubkey);
+            chain.signing_active_since_seq = Some(0);
+            chain.save(dir.path()).unwrap();
+            let seed_hex = zeroize::Zeroizing::new(hex::encode(seed.as_slice()));
+            let payload =
+                zeroize::Zeroizing::new(format!(
+                "{{\"seed_hex\":\"{}\",\"signing_active_since_seq\":0,\"signing_key_id\":\"{}\"}}",
+                seed_hex.as_str(), key_id.as_str()));
+            let target = file_store::seed_file_path(dir.path(), &chain_id, KeySlot::Active);
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(target.parent().unwrap())
+                .unwrap();
+            let writer =
+                crate::platform::fs::write_private_tmp_retained(&target, payload.as_bytes())
+                    .unwrap();
+            writer.replace(&target).unwrap();
+            let correlation = gen_correlation_id().unwrap();
+            emit_session_inject(dir.path(), relay_payload(), correlation.clone(), None).unwrap();
+            let mut delivered = relay_payload();
+            delivered.outcome = SessionInjectOutcome::DeliveredToPty;
+            emit_session_inject(dir.path(), delivered, correlation, Some(OpOutcome::Ok)).unwrap();
+            let verified = crate::audit::verify::verify_chain(
+                dir.path(),
+                &crate::audit::verify::VerifyConfig::default(),
+                None,
+            );
+            assert!(
+                verified.is_ok(),
+                "relay_signed_active_cutoff_chain_must_verify: {verified:?}"
+            );
+            let summary = verified.unwrap();
+            assert_eq!(summary.verified_count, 2);
+            assert!(summary.historical_key_gaps.is_empty());
+            let raw = std::fs::read_to_string(
+                dir.path()
+                    .join("csq-runs")
+                    .join(format!("{chain_id}.jsonl")),
+            )
+            .unwrap();
+            let records: Vec<SignedRecord> = raw
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert!(
+                records.iter().all(|record| record.key_id == key_id),
+                "relay_records_use_actual_signing_key_identity"
+            );
+            assert!(!dir.path().join("csq-runs/.chain-broken").exists());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_durable_intent_prefix_survives_verified_ordinary_append() {
+        let _env = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        with_relay_verification_env(home.path(), || {
+            let synced = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let observed = synced.clone();
+            crate::platform::fs::with_private_sync_observer_for_test(
+                move |path| observed.borrow_mut().push(path.to_path_buf()),
+                || {
+                    emit_session_inject(
+                        dir.path(),
+                        relay_payload(),
+                        gen_correlation_id().unwrap(),
+                        None,
+                    )
+                    .unwrap();
+                    let chain_id = load_chain_id(dir.path());
+                    let target = dir
+                        .path()
+                        .join("csq-runs")
+                        .join(format!("{chain_id}.jsonl"));
+                    let prefix = std::fs::read(&target).unwrap();
+                    let ordinary = build_lifecycle_record(
+                        &chain_id,
+                        EventKind::AccountLogout,
+                        EventPayload::AccountLogout(AccountLogoutPayload {
+                            slot: acct(1),
+                            orphaned_uuid: None,
+                        }),
+                        OpPhase::Intent {
+                            correlation_id: gen_correlation_id().unwrap(),
+                        },
+                    )
+                    .unwrap();
+                    crate::audit::persist::write_record_v2(ordinary, Some(dir.path())).unwrap();
+                    assert!(
+                        std::fs::read(&target).unwrap().starts_with(&prefix),
+                        "relay_durable_prefix_must_be_preserved"
+                    );
+                },
+            );
+            assert_eq!(
+                synced.borrow().len(),
+                2,
+                "relay_prefix_ordinary_rewrite_must_sync"
+            );
+            let verified = crate::audit::verify::verify_chain(
+                dir.path(),
+                &crate::audit::verify::VerifyConfig::default(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(verified.verified_count, 2);
+            assert!(verified.historical_key_gaps.is_empty());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_intent_result_persist_exact_metadata_and_correlation() {
+        use crate::audit::types::SessionInjectOutcome;
+        let _env = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let correlation = gen_correlation_id().unwrap();
+        let intent = relay_payload();
+        emit_session_inject(dir.path(), intent.clone(), correlation.clone(), None).unwrap();
+        let mut delivered = intent.clone();
+        delivered.outcome = SessionInjectOutcome::DeliveredToPty;
+        emit_session_inject(
+            dir.path(),
+            delivered.clone(),
+            correlation.clone(),
+            Some(OpOutcome::Ok),
+        )
+        .unwrap();
+        let genesis: crate::audit::persist::ChainGenesis =
+            serde_json::from_slice(&std::fs::read(dir.path().join("csq-runs/chain.json")).unwrap())
+                .unwrap();
+        let text = std::fs::read_to_string(
+            dir.path()
+                .join("csq-runs")
+                .join(format!("{}.jsonl", genesis.chain_id)),
+        )
+        .unwrap();
+        let records: Vec<SignedRecord> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2, "relay_two_persisted_phases");
+        assert_eq!(records[0].payload, EventPayload::SessionInject(intent));
+        assert_eq!(records[1].payload, EventPayload::SessionInject(delivered));
+        assert_eq!(
+            records[0].op_phase,
+            Some(OpPhase::Intent {
+                correlation_id: correlation.clone()
+            })
+        );
+        assert_eq!(
+            records[1].op_phase,
+            Some(OpPhase::Outcome {
+                correlation_id: correlation,
+                result: OpOutcome::Ok
+            })
+        );
+        assert!(records[1].seq > records[0].seq);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_broken_chain_and_phase_mismatch_never_return_persistence_success() {
+        let _env = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        assert!(
+            emit_session_inject(
+                dir.path(),
+                relay_payload(),
+                gen_correlation_id().unwrap(),
+                Some(OpOutcome::Ok)
+            )
+            .is_err(),
+            "relay_invalid_phase_must_refuse"
+        );
+        assert!(!dir.path().join("csq-runs").exists());
+        std::fs::create_dir(dir.path().join("csq-runs")).unwrap();
+        // Any present sentinel is fail-closed; its contents are a fixed tag.
+        std::fs::write(
+            dir.path().join("csq-runs/.chain-broken"),
+            b"integrity_broken",
+        )
+        .unwrap();
+        assert!(
+            emit_session_inject(
+                dir.path(),
+                relay_payload(),
+                gen_correlation_id().unwrap(),
+                None
+            )
+            .is_err(),
+            "relay_broken_intent_must_not_skip_to_success"
+        );
+        let mut outcome = relay_payload();
+        outcome.outcome = crate::audit::types::SessionInjectOutcome::Undetermined;
+        assert!(
+            emit_session_inject(
+                dir.path(),
+                outcome,
+                gen_correlation_id().unwrap(),
+                Some(OpOutcome::Failed {
+                    reason: redact_reason("undetermined")
+                })
+            )
+            .is_err(),
+            "relay_broken_result_must_not_skip_to_success"
+        );
+        assert!(!dir.path().join("csq-runs/chain.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_audit_error_presence_must_match_closed_outcome() {
+        use crate::audit::types::{SessionInjectError, SessionInjectOutcome};
+        let _env = crate::platform::test_env::lock();
+        for (outcome, error_code, result) in [
+            (
+                SessionInjectOutcome::Intent,
+                Some(SessionInjectError::NotIdle),
+                None,
+            ),
+            (
+                SessionInjectOutcome::Refused,
+                None,
+                Some(OpOutcome::Failed {
+                    reason: redact_reason("relay_refused"),
+                }),
+            ),
+            (
+                SessionInjectOutcome::DeliveredToPty,
+                Some(SessionInjectError::NotIdle),
+                Some(OpOutcome::Ok),
+            ),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let mut payload = relay_payload();
+            payload.outcome = outcome;
+            payload.error_code = error_code;
+            assert!(
+                emit_session_inject(dir.path(), payload, gen_correlation_id().unwrap(), result)
+                    .is_err(),
+                "relay_audit_error_presence_must_refuse {outcome:?}"
+            );
+            assert!(!dir.path().join("csq-runs").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_failure_audit_never_stores_caller_reason_text() {
+        let _env = crate::platform::test_env::lock();
+        let dir = TempDir::new().unwrap();
+        let correlation = gen_correlation_id().unwrap();
+        emit_session_inject(dir.path(), relay_payload(), correlation.clone(), None).unwrap();
+        let mut payload = relay_payload();
+        payload.outcome = crate::audit::types::SessionInjectOutcome::Undetermined;
+        emit_session_inject(
+            dir.path(),
+            payload,
+            correlation,
+            Some(OpOutcome::Failed {
+                reason: redact_reason("caller_body_must_never_be_recorded"),
+            }),
+        )
+        .unwrap();
+        let genesis: crate::audit::persist::ChainGenesis =
+            serde_json::from_slice(&std::fs::read(dir.path().join("csq-runs/chain.json")).unwrap())
+                .unwrap();
+        let text = std::fs::read_to_string(
+            dir.path()
+                .join("csq-runs")
+                .join(format!("{}.jsonl", genesis.chain_id)),
+        )
+        .unwrap();
+        assert!(
+            !text.contains("caller_body_must_never_be_recorded"),
+            "relay_audit_reason_must_be_closed"
+        );
+        assert!(text.contains("relay_undetermined"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_metadata_rejects_body_unknown_fields_and_open_vocabulary() {
+        let value = serde_json::to_value(relay_payload()).unwrap();
+        for (field, replacement) in [
+            ("body", serde_json::json!("payload")),
+            ("slash", serde_json::json!("arbitrary")),
+            ("role", serde_json::json!("unverified")),
+            ("error_code", serde_json::json!("untrusted text")),
+        ] {
+            let mut forged = value.clone();
+            forged[field] = replacement;
+            assert!(
+                serde_json::from_value::<crate::audit::types::SessionInjectPayload>(forged)
+                    .is_err(),
+                "relay_metadata_closed_field_{field}"
+            );
+        }
+    }
 
     fn acct(n: u16) -> AccountNum {
         AccountNum::try_from(n).unwrap()

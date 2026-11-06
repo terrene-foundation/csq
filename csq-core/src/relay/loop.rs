@@ -5,8 +5,8 @@
 //! the production slash cells and input-loop integration remain unavailable.
 //! It does not register a launch arm or convert a peer message into input.
 
-use super::control::{ControlRequest, ControlServer};
-use super::owner::{OwnerAuthError, OwnerVerifier, WireOwnerCommand};
+use super::control::{ControlRequest, ControlServer, ReplyHandle};
+use super::owner::OwnerVerifier;
 use super::pty::{RelayChildIdentity, RelayExit, RelayObserver};
 use super::state::SlashTable;
 use super::types::{CliKind, InjectOutcome, SessionIdentity};
@@ -134,10 +134,10 @@ impl RelayObserver for ControlLoop {
                     return Err(io::Error::other("relay_control_disconnected"));
                 }
             };
-            let outcome = request_outcome(verifier, self.cli, &request, (self.now)());
+            let (outcome, reply) = request_outcome(verifier, self.cli, request, (self.now)());
             // A disconnected client cannot turn a completed refusal into a
             // relay failure. There were no master writes or queued commands.
-            let _ = request.reply(response(outcome));
+            let _ = reply.reply(response(outcome));
         }
         Ok(())
     }
@@ -157,71 +157,24 @@ impl Drop for ControlLoop {
 fn request_outcome(
     verifier: &mut OwnerVerifier,
     cli: CliKind,
-    request: &ControlRequest,
+    request: ControlRequest,
     now_ms: Option<u64>,
-) -> InjectOutcome {
-    // Queueing cannot renew the transport's original absolute deadline. Check
-    // before entering the verifier: even a refusal there can consume replay or
-    // clock high-water state while the waiting client already observed failure.
-    if request.is_expired() {
-        return InjectOutcome::Refused(SdkErrorCode::RequestExpired);
-    }
-    if !request.peer_is_live() {
-        return InjectOutcome::Undetermined;
-    }
-    if request.is_expired() {
-        return InjectOutcome::Refused(SdkErrorCode::RequestExpired);
-    }
-    let outcome = owner_request(verifier, cli, request.line(), now_ms);
-    if request.peer_is_live() {
+) -> (InjectOutcome, ReplyHandle) {
+    let (admission, reply) = match request.admit_owner(verifier, cli, now_ms) {
+        Ok(admitted) => admitted,
+        Err(refused) => return refused.into_parts(),
+    };
+    let outcome = match SlashTable::availability(cli, admission.command()) {
+        Err(code) => InjectOutcome::Refused(code),
+        // A measured cell cannot bypass the still-unavailable pump integration.
+        Ok(()) => InjectOutcome::Refused(SdkErrorCode::IdleSignalUnavailable),
+    };
+    let outcome = if reply.peer_is_live() {
         outcome
     } else {
         InjectOutcome::Undetermined
-    }
-}
-
-fn owner_request(
-    verifier: &mut OwnerVerifier,
-    cli: CliKind,
-    line: &[u8],
-    now_ms: Option<u64>,
-) -> InjectOutcome {
-    // CLI kind is supplied by trusted launch code until the launch seam is
-    // wired. Independently refuse Codex here, before consuming any authority.
-    if cli == CliKind::Codex {
-        return InjectOutcome::Refused(SdkErrorCode::InputRejected);
-    }
-    let wire = match serde_json::from_slice::<WireOwnerCommand>(line) {
-        Ok(wire) => wire,
-        Err(_) => return InjectOutcome::Refused(SdkErrorCode::NotAuthorized),
     };
-    let token = match verifier.verify(wire, now_ms) {
-        Ok(token) => token,
-        Err(error) => return auth_refusal(error),
-    };
-    let command = match verifier.authorize_delivery(token, now_ms) {
-        Ok(command) => command,
-        Err(error) => return auth_refusal(error),
-    };
-    match SlashTable::availability(cli, command) {
-        Err(code) => InjectOutcome::Refused(code),
-        // Even a future measured cell does not open a path around the
-        // classifier, permission latch, foreground and transaction gates.
-        Ok(()) => InjectOutcome::Refused(SdkErrorCode::IdleSignalUnavailable),
-    }
-}
-
-fn auth_refusal(error: OwnerAuthError) -> InjectOutcome {
-    match error {
-        OwnerAuthError::Disabled => InjectOutcome::Refused(SdkErrorCode::DisabledByOperator),
-        OwnerAuthError::Expired => InjectOutcome::Refused(SdkErrorCode::RequestExpired),
-        OwnerAuthError::ClockUnavailable | OwnerAuthError::GenerationUnavailable => {
-            InjectOutcome::Undetermined
-        }
-        OwnerAuthError::Invalid | OwnerAuthError::Replay => {
-            InjectOutcome::Refused(SdkErrorCode::NotAuthorized)
-        }
-    }
+    (outcome, reply)
 }
 
 fn response(outcome: InjectOutcome) -> &'static [u8] {
@@ -259,8 +212,17 @@ mod tests {
     const KEY: [u8; 32] = [0x39; 32];
     const NOW: u64 = 100_000;
 
+    #[test]
+    fn consuming_admission_keeps_control_loop_below_500_lines() {
+        let lines = include_str!("loop.rs").lines().count();
+        assert!(
+            lines <= 500,
+            "control loop grew to {lines} lines; admission belongs in control.rs"
+        );
+    }
+
     fn verifier() -> OwnerVerifier {
-        OwnerVerifier::new(
+        let mut verifier = OwnerVerifier::new(
             Zeroizing::new(KEY),
             SessionIdentity {
                 pid: 11,
@@ -271,7 +233,28 @@ mod tests {
                 started_at: 44,
             },
         )
-        .unwrap()
+        .unwrap();
+        verifier.set_clock_for_test(std::sync::Arc::new(|| Some(NOW)));
+        verifier
+    }
+
+    fn owner_request(
+        verifier: &mut OwnerVerifier,
+        cli: CliKind,
+        line: &[u8],
+        now_ms: Option<u64>,
+    ) -> InjectOutcome {
+        let pid = std::process::id();
+        let peer = SessionIdentity {
+            pid,
+            started_at: super::super::pty::process_identity_start(pid).unwrap(),
+        };
+        let request = ControlRequest::for_test(
+            peer,
+            line.to_vec(),
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
+        request_outcome(verifier, cli, request, now_ms).0
     }
 
     fn wire(verifier: &OwnerVerifier, command: OwnerCommand) -> serde_json::Value {
@@ -334,7 +317,7 @@ mod tests {
         let request = incoming.try_recv().unwrap();
         assert!(request.is_expired());
         assert_eq!(
-            request_outcome(&mut verifier, CliKind::Claude, &request, Some(NOW + 50)),
+            request_outcome(&mut verifier, CliKind::Claude, request, Some(NOW + 50)).0,
             InjectOutcome::Refused(SdkErrorCode::RequestExpired),
             "expired dequeued transport request must be refused before verification"
         );
@@ -444,7 +427,8 @@ mod tests {
         let line = serde_json::to_vec(&wire(&unknown, OwnerCommand::Clear)).unwrap();
         assert_eq!(
             owner_request(&mut unknown, CliKind::Claude, &line, None),
-            InjectOutcome::Undetermined
+            InjectOutcome::Refused(SdkErrorCode::NotAuthorized),
+            "R1_LA: a before-byte unknown-clock refusal cannot claim uncertain writes"
         );
     }
 

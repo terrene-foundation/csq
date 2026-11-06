@@ -25,7 +25,7 @@ use serde_json::{json, Map, Value};
 
 use super::frame;
 use super::limits::{Limits, Liveness};
-use super::model::{MessageView, Receipt, Recipient, Surface, VerifiedSession};
+use super::model::{MessageView, Receipt, Recipient, SenderSurface, Surface, VerifiedSession};
 use super::registry::{self, Candidate, NameSource};
 use super::request::{self, Intent};
 use super::store::{self, Mark};
@@ -356,17 +356,34 @@ fn safe_cwd(cwd: &str) -> Option<String> {
     (!s.is_empty() && !frame::contains_frame_phrase(&s)).then_some(s)
 }
 
-fn message_json(v: &MessageView) -> Value {
+/// The `from` object of an MCP inbox row (also used by `consume_shown`).
+///
+/// A service has no process identity: emitting `pid: 0` would present a session-shaped
+/// sender. `surface: "service"` is the whole address; the name rides inside
+/// `framed_body`'s service header, never as unframed text here.
+fn sender_json(surface: SenderSurface, pid: u32, service_origin: bool) -> Value {
     let mut from = Map::new();
-    from.insert("surface".into(), json!(v.from_surface.as_str()));
-    from.insert("pid".into(), json!(v.from_pid));
+    from.insert("surface".into(), json!(surface.as_str()));
+    // The record's ORIGIN decides service-ness as well as the surface: an origin-Service
+    // record has no process identity even if its sender block claims a session surface
+    // (the frame withholds such a record; printing `pid 0` would present a session shape).
+    if surface != SenderSurface::Service && !service_origin {
+        from.insert("pid".into(), json!(pid));
+    }
     // The sender's session NAME is deliberately absent: it is peer-chosen text, and this
     // object sits OUTSIDE `framed_body`, so it would reach the model unframed. pid + surface
     // identify the sender (and are csq-proved); the name is shown only by surfaces that
     // frame or escape it (the CLI table, the hook header via `frame::safe_name`).
+    Value::Object(from)
+}
+
+fn message_json(v: &MessageView) -> Value {
     let mut m = Map::new();
     m.insert("id".into(), json!(v.id));
-    m.insert("from".into(), Value::Object(from));
+    m.insert(
+        "from".into(),
+        sender_json(v.from_surface, v.from_pid, v.service_origin),
+    );
     m.insert("thread".into(), json!(v.thread));
     if let Some(r) = &v.in_reply_to {
         m.insert("in_reply_to".into(), json!(r));
@@ -941,7 +958,10 @@ fn call_tool_inner(
                 let consumed: Vec<Value> = done
                     .iter()
                     .map(|c| {
-                        json!({"id": c.id, "from": {"surface": c.from_surface.as_str(), "pid": c.from_pid}})
+                        json!({
+                            "id": c.id,
+                            "from": sender_json(c.from_surface, c.from_pid, c.service_origin)
+                        })
                     })
                     .collect();
                 return Ok(
@@ -980,7 +1000,13 @@ fn call_tool_inner(
 fn tool_result(r: Result<Value, DirectiveError>) -> Value {
     match r {
         Ok(v) => json!({"content": [{"type": "text", "text": v.to_string()}], "isError": false}),
-        Err(e) => json!({"content": [{"type": "text", "text": e.to_string()}], "isError": true}),
+        // `reply`/`send --reply-to` to a service must surface the fixed §11.6 tag, not the
+        // store's prose sentinel: a model reading `invalid_input: a service has no inbox`
+        // cannot match the documented vocabulary (spec 32h §11.4).
+        Err(e) => {
+            let e = store::caller_facing(e);
+            json!({"content": [{"type": "text", "text": e.to_string()}], "isError": true})
+        }
     }
 }
 
@@ -1316,11 +1342,12 @@ mod tests {
         VerifiedSession::from_resolved(Sender {
             pid,
             started_at: 5_000,
-            surface,
+            surface: surface.into(),
             handle_dir_hash: format!("h{pid}"),
             handle_dir: format!("/h/{pid}"),
             name: None,
             started_exact: Some(5_000),
+            service: None,
         })
     }
 
@@ -2701,6 +2728,42 @@ mod tests {
             assert!(err, "{extra}: {r}");
             assert!(p.as_str().unwrap().starts_with("invalid_input"), "{p}");
         }
+        // AC3 — no MCP parameter can select a SERVICE identity or an ORIGIN: a model
+        // trying to send as a registered service (or to set provenance directly) is
+        // refused at the argument allowlist, so `Origin::Service` stays unreachable
+        // from the six tools.
+        for extra in [
+            "service",
+            "service_name",
+            "registration_id",
+            "origin",
+            "surface",
+            "as",
+        ] {
+            let mut args = json!({"to":{"pid":200,"started_at":5000},"body":"x"});
+            args[extra] = json!("nightly");
+            let r = h.call_as(Some(a()), &call("send", args)).unwrap();
+            let (err, p) = payload(&r);
+            assert!(err, "a `{extra}` argument must be refused: {r}");
+            assert!(
+                p.as_str().unwrap().starts_with("invalid_input"),
+                "{extra}: {p}"
+            );
+        }
+        let r = h
+            .call_as(
+                Some(a()),
+                &call(
+                    "reply",
+                    json!({"in_reply_to":"x","body":"x","service":"nightly"}),
+                ),
+            )
+            .unwrap();
+        assert!(payload(&r).0, "reply must not accept a service argument");
+        let r = h
+            .call_as(Some(b()), &call("inbox", json!({"pending_only": false})))
+            .unwrap();
+        assert_eq!(payload(&r).1["messages"], json!([]));
         // Unknown key nested in `to` is refused as well.
         let r = h
             .call_as(
@@ -4333,6 +4396,107 @@ mod tests {
             );
         }
         assert_eq!(inbox_len(dir.path(), &b()), 0);
+    }
+
+    /// an internal ticket — the MCP inbox wire makes the service case explicit: `surface: "service"`,
+    /// no process pid (a service has none), and the name only inside `framed_body`.
+    /// Falsifier: a `pid` field appearing here would present a session-shaped sender.
+    #[test]
+    fn a_service_message_renders_as_a_service_without_a_process_pid() {
+        let id = "1a2b3c4d-abcd-4000-8000-000000000000";
+        let registration_id = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        let message: crate::messaging::model::Message = serde_json::from_value(json!({
+            "schema": "csq.message.v1",
+            "id": id,
+            "from": {"pid": 0, "started_at": 7, "surface": "service",
+                     "handle_dir_hash": "", "handle_dir": "",
+                     "service": {"name": "nightly", "registration_id": registration_id}},
+            "to": {"pid": 2, "started_at": 5, "surface": "codex"},
+            "origin": {"Service": {"name": "nightly", "registration_id": registration_id}},
+            "thread": id,
+            "body": "nightly backup failed",
+            "created_at": 1
+        }))
+        .unwrap();
+        let wire = message_json(&message.view());
+        assert_eq!(wire["from"]["surface"], json!("service"));
+        assert!(wire["from"].get("pid").is_none(), "{wire}");
+        let framed = wire["framed_body"].as_str().unwrap();
+        assert!(framed.contains("from service:nightly"), "{framed}");
+        assert!(!framed.contains("[peer msg"), "{framed}");
+    }
+
+    /// LOW-1 — the ORIGIN flag decides service-ness as well as the surface: an
+    /// origin-Service record whose sender block claims a session surface carries no `pid`
+    /// either (the frame withholds the body; `pid 0` would present a session shape).
+    /// Falsifier: a surface-only check emits `"pid":0` here.
+    #[test]
+    fn a_service_origin_with_a_session_sender_block_omits_the_pid() {
+        let id = "1a2b3c4d-abcd-4000-8000-000000000001";
+        let registration_id = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        let message: crate::messaging::model::Message = serde_json::from_value(json!({
+            "schema": "csq.message.v1",
+            "id": id,
+            "from": {"pid": 0, "started_at": 7, "surface": "claude-code",
+                     "handle_dir_hash": "", "handle_dir": ""},
+            "to": {"pid": 2, "started_at": 5, "surface": "codex"},
+            "origin": {"Service": {"name": "nightly", "registration_id": registration_id}},
+            "thread": id,
+            "body": "nightly backup failed",
+            "created_at": 1
+        }))
+        .unwrap();
+        let wire = message_json(&message.view());
+        assert_eq!(wire["from"]["surface"], json!("claude-code"));
+        assert!(wire["from"].get("pid").is_none(), "{wire}");
+        let framed = wire["framed_body"].as_str().unwrap();
+        assert!(framed.contains("from service:<invalid>"), "{framed}");
+        assert!(framed.contains("csq withheld this text"), "{framed}");
+    }
+
+    /// MEDIUM-1 (R1) — a session answering a service message through the MCP `reply` tool
+    /// gets the documented fixed tag `service_no_inbox`, not the store's prose sentinel
+    /// wrapped in a generic `invalid_input`.
+    #[test]
+    fn replying_to_a_service_message_reports_the_fixed_tag() {
+        let h = H::new(Some(a()));
+        let id = "1a2b3c4d-abcd-4000-8000-000000000000";
+        let registration_id = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        let to = a().as_recipient();
+        let message = json!({
+            "schema": "csq.message.v1",
+            "id": id,
+            "from": {"pid": 0, "started_at": 7, "surface": "service",
+                     "handle_dir_hash": "", "handle_dir": "",
+                     "service": {"name": "nightly", "registration_id": registration_id}},
+            "to": {"pid": to.pid, "started_at": to.started_at, "surface": "claude-code"},
+            "origin": {"Service": {"name": "nightly", "registration_id": registration_id}},
+            "thread": id,
+            "body": "nightly backup failed",
+            "created_at": h.now.get().saturating_sub(10)
+        });
+        let dir = store::store_dir(h.dir.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{id}.json")),
+            serde_json::to_vec(&message).unwrap(),
+        )
+        .unwrap();
+
+        let r = h
+            .call_as(
+                Some(a()),
+                &call("reply", json!({"in_reply_to": id, "body": "on it"})),
+            )
+            .unwrap();
+        let (err, p) = payload(&r);
+        assert!(err, "{r}");
+        assert!(
+            p.as_str()
+                .unwrap()
+                .starts_with("invalid_input: service_no_inbox"),
+            "the fixed tag must reach the model, not prose: {p}"
+        );
     }
 }
 

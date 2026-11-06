@@ -1149,6 +1149,44 @@ pub enum EventKind {
     /// The message text, the chat id, the bot token and the URL are NEVER
     /// recorded (HIGH-1: no untrusted free-text into the chain).
     TelegramOwnerPing,
+    /// Metadata-only relay delivery observation; never an input authorization.
+    SessionInject,
+    /// A daemon-issued cross-session (`--to`) recycle request (design slice 2).
+    ///
+    /// Observation only: who asked for which target and whether the daemon issued or refused.
+    /// The reason text and the relayed proof NEVER enter the chain; the request's single-use
+    /// nonce enters as a SHA-256 digest. Older csq versions verify this record's integrity and
+    /// count it as an unknown kind (they do not interpret it — the an internal ticket opaque policy).
+    RecycleRequest,
+    /// A registered-service message admission (design an internal ticket, `/api/message/send-service`).
+    ///
+    /// APPEND-FIRST: the daemon appends this record after the store has validated every
+    /// refusal condition and before the store write, and refuses the send when the append
+    /// fails (`service_audit_unavailable`). The record describes the ADMISSION decision,
+    /// never a later delivery outcome; the message's presence in the store is the outcome.
+    /// A keyed replay stores nothing and records no second admission. Metadata only: the
+    /// grammar-checked service name and registration, the creating uid, the re-verified
+    /// target, a digest of the idempotency key, and the fixed admission outcome. NO body,
+    /// NO key, NO free text (HIGH-1).
+    ServiceMessage,
+    /// A registered-service send REFUSED before the store committed a message (design
+    /// an internal ticket, `/api/message/send-service`).
+    ///
+    /// A SEPARATE kind from [`EventKind::ServiceMessage`], deliberately: a signed record
+    /// must never assert a fact it does not know. A pre-load refusal has no resolved
+    /// registration, no re-verified target and no key digest, so the admission payload's
+    /// required fields cannot be filled truthfully for it — zero/empty placeholders would
+    /// put a false statement on the chain. This payload carries only what the refusal
+    /// established: the requested name when (and only when) it passes the §11.4 grammar,
+    /// the caller's uid, the fixed refusal tag, and the registration id once the registry
+    /// record was resolved. Every refusal the route can both decide and record writes it
+    /// (pre-load and post-load). Two cases have no record: `service_audit_unavailable`,
+    /// where the chain that would hold the record is the thing that failed, and an UNKNOWN
+    /// outcome (the handler's blocking task died), where the send may have been committed —
+    /// a refusal record there could describe a send that happened. A failed refusal append
+    /// is logged and never changes the caller's tag. Metadata only — no body, no key, no
+    /// free text (HIGH-1).
+    ServiceMessageRefused,
 }
 }
 
@@ -1216,6 +1254,14 @@ pub enum EventPayload {
     TelegramBridgeDelivery(TelegramBridgeDeliveryPayload),
     /// See [`EventKind::TelegramOwnerPing`].
     TelegramOwnerPing(TelegramOwnerPingPayload),
+    /// See [`EventKind::SessionInject`].
+    SessionInject(SessionInjectPayload),
+    /// See [`EventKind::RecycleRequest`].
+    RecycleRequest(RecycleRequestPayload),
+    /// See [`EventKind::ServiceMessage`].
+    ServiceMessage(ServiceMessagePayload),
+    /// See [`EventKind::ServiceMessageRefused`].
+    ServiceMessageRefused(ServiceMessageRefusalPayload),
 }
 
 impl EventPayload {
@@ -1253,6 +1299,10 @@ impl EventPayload {
             Self::SeatKeyReanchor(_) => EventKind::SeatKeyReanchor,
             Self::TelegramBridgeDelivery(_) => EventKind::TelegramBridgeDelivery,
             Self::TelegramOwnerPing(_) => EventKind::TelegramOwnerPing,
+            Self::SessionInject(_) => EventKind::SessionInject,
+            Self::RecycleRequest(_) => EventKind::RecycleRequest,
+            Self::ServiceMessage(_) => EventKind::ServiceMessage,
+            Self::ServiceMessageRefused(_) => EventKind::ServiceMessageRefused,
         }
     }
 }
@@ -2064,6 +2114,360 @@ pub struct TelegramBridgeDeliveryPayload {
     pub outcome: String,
 }
 
+/// Metadata-only relay audit record. Incarnation units are explicit and never
+/// converted from registry listing timestamps. Recording a role grants no authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionInjectPayload {
+    pub inject_id: u64,
+    pub caller_pid: u32,
+    pub caller_started_at: u64,
+    pub target_pid: u32,
+    pub target_started_at: u64,
+    pub incarnation_unit: SessionInjectIncarnationUnit,
+    pub role: SessionInjectRole,
+    pub primitive: SessionInjectPrimitive,
+    pub slash: SessionInjectSlash,
+    pub byte_len: u64,
+    pub when: SessionInjectWhen,
+    pub outcome: SessionInjectOutcome,
+    pub error_code: Option<SessionInjectError>,
+}
+
+/// Payload for [`EventKind::RecycleRequest`].
+///
+/// Fixed vocabulary only: handle dirs (machine-generated paths), pids, ids, a nonce DIGEST and
+/// the outcome. A refusal carries no nonce and no TTL. No reason text, no proof.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecycleRequestPayload {
+    /// The requester's handle dir, capped and control-stripped at capture.
+    pub requester_handle: String,
+    /// The requester's claude pid at request time.
+    pub requester_pid: u32,
+    /// The requester's session id as the ask named it — the identifier a consent's
+    /// `RequesterRecord` binds and `verify_requester` checks. Without it the record cannot be
+    /// tied to the conversation the target authorised once the requester process has exited.
+    pub requester_session_id: String,
+    /// The target's handle dir.
+    pub target_handle: String,
+    /// The target session id the ask named.
+    pub session_id: String,
+    /// SHA-256 (lowercase hex) of the single-use nonce; the nonce itself never enters the chain.
+    pub nonce_sha256: Option<String>,
+    /// The issued request's lifetime in seconds.
+    pub ttl_secs: Option<i64>,
+    /// Whether the ask was issued or refused.
+    pub outcome: RecycleRequestOutcome,
+}
+
+/// Fixed-vocabulary outcome for [`RecycleRequestPayload`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecycleRequestOutcome {
+    /// The daemon wrote the request.
+    Issued,
+    /// The daemon refused the ask; the refusing tag stays on the socket reply, never in the chain.
+    Refused,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionInjectIncarnationUnit {
+    LinuxTicks,
+    MacosSeconds,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionInjectRole {
+    #[serde(rename = "self")]
+    SelfSession,
+    Controller,
+    Operator,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionInjectPrimitive {
+    Slash,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionInjectSlash {
+    Clear,
+    Compact,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionInjectWhen {
+    Immediate,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionInjectOutcome {
+    Intent,
+    DeliveredToPty,
+    Refused,
+    Undetermined,
+}
+/// Closed relay refusal vocabulary; unlike the SDK's Serialize-only code enum,
+/// this type also validates incoming persisted records without accepting free text.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionInjectError {
+    NotAuthorized,
+    NotIdle,
+    PasteModeUnknown,
+    CliUnmeasured,
+    InputRejected,
+    TooLarge,
+    QueueFull,
+    RateLimited,
+    ForegroundChanged,
+    BusyInput,
+    IdleSignalUnavailable,
+    ChainUnsupported,
+    DisabledByOperator,
+    OperatorDenied,
+    RequestExpired,
+    AuditUnavailable,
+    UnsupportedPlatform,
+    NoticeUnavailable,
+}
+
+/// The target CLI of a registered-service message (design an internal ticket §6). Closed set: the wire
+/// spellings match the messaging surfaces (`claude-code` / `codex`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ServiceTargetSurface {
+    /// A Claude Code session.
+    #[serde(rename = "claude-code")]
+    ClaudeCode,
+    /// A Codex session.
+    #[serde(rename = "codex")]
+    Codex,
+}
+
+impl ServiceTargetSurface {
+    /// The fixed wire tag.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code",
+            Self::Codex => "codex",
+        }
+    }
+}
+
+/// The ONE spelling of the §11.6 `service_no_inbox` tag. The audit vocabulary, the store's
+/// caller-facing normaliser and the daemon's route mapping all read this constant, so a
+/// drift cannot make the route return a tag the chain would record under another name
+/// (pinned by `the_service_no_inbox_tag_has_one_spelling`).
+pub const SERVICE_NO_INBOX_TAG: &str = "service_no_inbox";
+
+declare_all_enum! {
+/// The fixed refusal vocabulary a [`EventKind::ServiceMessageRefused`] record may carry
+/// (design an internal ticket §11). A closed enum, never free text: every variant is exactly one tag in
+/// the published §11.6 vocabulary, so the chain cannot record a tag a caller never saw and
+/// the route cannot return a tag the chain cannot record (both directions pinned by
+/// `service_refusal_tags_round_trip`).
+///
+/// `ServiceExists` is the CLI-side registration refusal and is never written by the daemon;
+/// `NotFound`, `NotAuthorized` and `Internal` are fixed codes the route's mapping can
+/// produce (the last two on a join failure / a missing peer credential). Every other variant
+/// is a route refusal with a driving test.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceRefusal {
+    /// The service name failed the grammar.
+    ServiceNameInvalid,
+    /// The service name is a reserved session/target shape.
+    ServiceNameReserved,
+    /// The name is already registered (without `force`) — CLI-side registration refusal.
+    ServiceExists,
+    /// The registry holds no such name.
+    ServiceUnknown,
+    /// The record was unreadable, malformed, or inconsistent.
+    ServiceRegistryUnreadable,
+    /// The record is bound to a different uid than the caller.
+    ServiceUidMismatch,
+    /// The admission record could not be appended.
+    ServiceAuditUnavailable,
+    /// The message would have to reach a service, which has no inbox.
+    ServiceNoInbox,
+    /// This build/platform has no peer-credentialed service-send surface.
+    ServiceSendSurfaceUnsupported,
+    /// The request body or target was malformed.
+    InvalidInput,
+    /// The supplied idempotency key was malformed or outside its window.
+    InvalidIdempotencyKey,
+    /// The target did not re-verify against the live session table.
+    TargetMismatch,
+    /// The store's rate or pending cap refused the send.
+    RateLimited,
+    /// The addressed name resolved to nothing.
+    NotFound,
+    /// The outcome could not be determined (clock, unreadable state, ambiguity).
+    Undetermined,
+    /// The request had no peer credential (the socket's accept loop captured none).
+    NotAuthorized,
+    /// An internal failure (a panicked blocking task, an unexpected response shape).
+    Internal,
+}
+}
+
+impl ServiceRefusal {
+    /// The fixed wire tag. One tag per variant; the route's error body and the chain
+    /// record both use this exact string.
+    #[must_use]
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::ServiceNameInvalid => "service_name_invalid",
+            Self::ServiceNameReserved => "service_name_reserved",
+            Self::ServiceExists => "service_exists",
+            Self::ServiceUnknown => "service_unknown",
+            Self::ServiceRegistryUnreadable => "service_registry_unreadable",
+            Self::ServiceUidMismatch => "service_uid_mismatch",
+            Self::ServiceAuditUnavailable => "service_audit_unavailable",
+            Self::ServiceNoInbox => SERVICE_NO_INBOX_TAG,
+            Self::ServiceSendSurfaceUnsupported => "service_send_surface_unsupported",
+            Self::InvalidInput => "invalid_input",
+            Self::InvalidIdempotencyKey => "invalid_idempotency_key",
+            Self::TargetMismatch => "target_mismatch",
+            Self::RateLimited => "rate_limited",
+            Self::NotFound => "not_found",
+            Self::Undetermined => "undetermined",
+            Self::NotAuthorized => "not_authorized",
+            Self::Internal => "internal",
+        }
+    }
+
+    /// The variant for a fixed route tag, or `None` for a tag outside the closed vocabulary.
+    #[must_use]
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|tagged| tagged.tag() == tag)
+    }
+}
+
+/// The admission decision recorded by a [`EventKind::ServiceMessage`] record.
+///
+/// NO writer constructs [`Self::Refused`] — a refusal is the separate
+/// [`EventKind::ServiceMessageRefused`] kind. The variant is retained only so the existing
+/// payload's variant set is not narrowed; no record carrying it was ever written. The
+/// field set is unchanged, so this is not a chain-schema change.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceMessageOutcome {
+    /// The daemon admitted the message to the store write.
+    Admitted,
+    /// Never produced by a writer (see the enum note); kept so the payload's variant set
+    /// is not narrowed.
+    Refused {
+        /// The fixed refusal.
+        tag: ServiceRefusal,
+    },
+}
+
+impl ServiceMessageOutcome {
+    /// The fixed tag used by the compliance report.
+    #[must_use]
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::Refused { tag } => tag.tag(),
+        }
+    }
+}
+
+/// Payload for [`EventKind::ServiceMessage`] (design an internal ticket §6).
+///
+/// Metadata only: the grammar-checked service name, its registration, the creating uid,
+/// the re-verified target identity, a SHA-256 of the caller's idempotency key (never the
+/// key) and the admission outcome. NO message body and NO free text ride this record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceMessagePayload {
+    /// The registered name (grammar-checked before it is written here).
+    pub service: String,
+    /// The registration the message was sent under.
+    pub registration_id: String,
+    /// The uid the registry record is bound to.
+    pub service_uid: u32,
+    /// The re-verified target process id.
+    pub target_pid: u32,
+    /// The re-verified target process start, unix seconds.
+    pub target_started_at: u64,
+    /// The re-verified target CLI.
+    pub target_surface: ServiceTargetSurface,
+    /// SHA-256 of the caller's idempotency token, lowercase hex; `None` without a key.
+    pub key_sha256: Option<String>,
+    /// The admission decision.
+    pub outcome: ServiceMessageOutcome,
+}
+
+impl ServiceMessagePayload {
+    /// The recorded service name for DISPLAY, or the fixed `<unrecorded>` marker.
+    ///
+    /// Same reasoning as [`ServiceMessageRefusalPayload::service_display`]: the writer
+    /// grammar-checks the name, the decode-time type does not, so the renderer runs the
+    /// check and never echoes an unvalidated spelling from a signed record.
+    #[must_use]
+    pub fn service_display(&self) -> &str {
+        if crate::messaging::service::grammar_ok(&self.service) {
+            &self.service
+        } else {
+            "<unrecorded>"
+        }
+    }
+}
+
+/// Payload for [`EventKind::ServiceMessageRefused`] (design an internal ticket §11.5).
+///
+/// The refusal record carries ONLY what a refusal actually established, because a signed
+/// record must never assert a fact it does not know:
+///
+/// - `service` is the requested name ONLY when it passes the §11.4 byte grammar
+///   (`^[a-z0-9][a-z0-9-]{0,31}$`: a reserved spelling that fits it, such as `term-<digits>`
+///   or one of the reserved literals, IS recorded; an invalid or over-length spelling is
+///   NOT echoed into the chain).
+/// - `service_uid` is the caller's uid ONLY where the platform HAS a uid (the
+///   listener-verified peer uid, or the daemon's effective uid); it is `None` on a platform
+///   with no uid, never a fabricated `0`.
+/// - `registration_id` is present ONLY when the registry record had been resolved and
+///   validated before the refusal; a pre-load refusal has no registration.
+/// - there is no target and no key digest: neither is known for most refusals, and a
+///   zero/empty placeholder would be a false statement.
+///
+/// Metadata only — no body, no key, no free text (HIGH-1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceMessageRefusalPayload {
+    /// The requested name, present only when it passes the §11.4 grammar.
+    pub service: Option<String>,
+    /// The caller's uid where the platform has one; `None` where it has no uid (never 0).
+    #[serde(default)]
+    pub service_uid: Option<u32>,
+    /// The registration the request resolved, present only when the registry load had
+    /// succeeded before the refusal.
+    pub registration_id: Option<String>,
+    /// The fixed refusal tag.
+    pub refusal: ServiceRefusal,
+}
+
+impl ServiceMessageRefusalPayload {
+    /// The recorded service name for DISPLAY, or the fixed `<unrecorded>` marker.
+    ///
+    /// The decode-time type does not enforce the §11.4 grammar (only the writer does), so
+    /// a renderer must not echo whatever spelling a signed record carries. Only a same-uid
+    /// holder of the signing key could have written a bad one, but the display path runs
+    /// the check anyway and degrades to a fixed marker.
+    #[must_use]
+    pub fn service_display(&self) -> &str {
+        self.service
+            .as_deref()
+            .filter(|name| crate::messaging::service::grammar_ok(name))
+            .unwrap_or("<unrecorded>")
+    }
+}
+
 /// Payload for [`EventKind::TelegramOwnerPing`] (S5 outbound owner ping).
 ///
 /// Metadata only. The message text, the chat id (always the pinned owner's),
@@ -2275,11 +2679,12 @@ pub enum OpOutcome {
 /// once and embedded in both records, so orphan detection is a single
 /// linear scan keyed on `(correlation_id, kind)`.
 ///
-/// Exception, documented rather than implied: [`EventKind::TelegramBridgeDelivery`]
-/// carries a phase-specific `outcome` field (`intent` on the INTENT record, the
-/// delivery status on the OUTCOME). Orphan detection keys on
-/// `(correlation_id, kind)` and never on payload equality, so the pair still
-/// resolves; the rest of the payload is identical.
+/// Exceptions: [`EventKind::TelegramBridgeDelivery`],
+/// [`EventKind::TelegramOwnerPing`] and [`EventKind::SessionInject`] carry
+/// phase-specific outcome metadata (`intent` on INTENT, terminal status on
+/// OUTCOME). SessionInject also records a closed refusal code on refusal.
+/// Orphan detection keys on `(correlation_id, kind)`, never payload equality;
+/// the remaining identifying metadata stays identical within each pair.
 ///
 /// # Why a correlation id rather than the intent's `record_id`
 ///
@@ -2941,6 +3346,10 @@ mod tests {
                 EventKind::SeatKeyReanchor => "seat_key_reanchor",
                 EventKind::TelegramBridgeDelivery => "telegram_bridge_delivery",
                 EventKind::TelegramOwnerPing => "telegram_owner_ping",
+                EventKind::SessionInject => "session_inject",
+                EventKind::RecycleRequest => "recycle_request",
+                EventKind::ServiceMessage => "service_message",
+                EventKind::ServiceMessageRefused => "service_message_refused",
             };
         }
     }
@@ -2954,10 +3363,10 @@ mod tests {
     // a variant added with an arm elsewhere but never pushed into `ALL`
     // left both sides of this comparison unchanged — the assert stayed
     // green while the exact property it read as certifying was false. Its
-    // only real job now: catch the literal `28` going stale (harmless —
+    // only real job now: catch the literal `32` going stale (harmless —
     // `EventKind::ALL.len()` is authoritative) as a nudge to update this
     // constant, nothing more.
-    const _EVENT_KIND_VARIANT_COUNT_CHECK: () = assert!(EventKind::ALL.len() == 28);
+    const _EVENT_KIND_VARIANT_COUNT_CHECK: () = assert!(EventKind::ALL.len() == 32);
 
     #[test]
     fn event_payload_kind_matches_variant() {
@@ -3159,8 +3568,123 @@ mod tests {
                         outcome: "sent_redacted".to_string(),
                     })
                 }
+                EventKind::SessionInject => EventPayload::SessionInject(SessionInjectPayload {
+                    inject_id: 1,
+                    caller_pid: 2,
+                    caller_started_at: 3,
+                    target_pid: 4,
+                    target_started_at: 5,
+                    incarnation_unit: SessionInjectIncarnationUnit::LinuxTicks,
+                    role: SessionInjectRole::Operator,
+                    primitive: SessionInjectPrimitive::Slash,
+                    slash: SessionInjectSlash::Clear,
+                    byte_len: 6,
+                    when: SessionInjectWhen::Immediate,
+                    outcome: SessionInjectOutcome::Intent,
+                    error_code: None,
+                }),
+                EventKind::RecycleRequest => EventPayload::RecycleRequest(RecycleRequestPayload {
+                    requester_handle: "/h/req".to_string(),
+                    requester_pid: 1,
+                    requester_session_id: "99999999-8888-7777-6666-555555555555".to_string(),
+                    target_handle: "/h/target".to_string(),
+                    session_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
+                    nonce_sha256: None,
+                    ttl_secs: None,
+                    outcome: RecycleRequestOutcome::Refused,
+                }),
+                EventKind::ServiceMessage => EventPayload::ServiceMessage(ServiceMessagePayload {
+                    service: "nightly".to_string(),
+                    registration_id: "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".to_string(),
+                    service_uid: 1,
+                    target_pid: 2,
+                    target_started_at: 3,
+                    target_surface: ServiceTargetSurface::ClaudeCode,
+                    key_sha256: None,
+                    outcome: ServiceMessageOutcome::Admitted,
+                }),
+                EventKind::ServiceMessageRefused => {
+                    EventPayload::ServiceMessageRefused(ServiceMessageRefusalPayload {
+                        service: Some("nightly".to_string()),
+                        service_uid: Some(501),
+                        registration_id: Some("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".to_string()),
+                        refusal: ServiceRefusal::ServiceNoInbox,
+                    })
+                }
             };
             assert_eq!(payload.kind(), *k);
         }
+    }
+
+    /// The refusal vocabulary is closed in BOTH directions: every variant maps to a tag,
+    /// and every tag maps back to its variant. Falsifier: a variant added without its
+    /// `tag()` arm fails to compile; a tag string changed on one side only reds here, so
+    /// the route cannot return a tag the chain records under a different name.
+    #[test]
+    fn service_refusal_tags_round_trip() {
+        assert_eq!(
+            ServiceRefusal::ALL.len(),
+            17,
+            "every refusal variant is part of the closed §11.6 vocabulary"
+        );
+        for refusal in ServiceRefusal::ALL {
+            let tag = refusal.tag();
+            assert_eq!(
+                ServiceRefusal::from_tag(tag),
+                Some(*refusal),
+                "tag {tag:?} must map back to its variant"
+            );
+            // The wire form is the tag, so a serialised variant is exactly its tag string.
+            assert_eq!(
+                serde_json::to_value(refusal).unwrap(),
+                serde_json::Value::String(tag.to_string()),
+                "{refusal:?}"
+            );
+        }
+        assert_eq!(ServiceRefusal::from_tag("service_attacker_text"), None);
+    }
+
+    /// L2-1 — the refusal payload's uid is OPTIONAL on the wire: `None` where the
+    /// platform has no uid (never a fabricated 0), an integer still decodes, and an
+    /// absent field decodes as `None` (the `#[serde(default)]` tolerance).
+    #[test]
+    fn a_refusal_uid_is_optional_on_the_wire() {
+        let payload = ServiceMessageRefusalPayload {
+            service: None,
+            service_uid: None,
+            registration_id: None,
+            refusal: ServiceRefusal::ServiceSendSurfaceUnsupported,
+        };
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["service_uid"], serde_json::Value::Null);
+        assert_eq!(
+            serde_json::from_value::<ServiceMessageRefusalPayload>(value).unwrap(),
+            payload
+        );
+
+        let with_uid = serde_json::json!({
+            "service": null,
+            "service_uid": 501,
+            "registration_id": null,
+            "refusal": "service_send_surface_unsupported",
+        });
+        assert_eq!(
+            serde_json::from_value::<ServiceMessageRefusalPayload>(with_uid)
+                .unwrap()
+                .service_uid,
+            Some(501)
+        );
+
+        let without_uid = serde_json::json!({
+            "service": null,
+            "registration_id": null,
+            "refusal": "service_send_surface_unsupported",
+        });
+        assert_eq!(
+            serde_json::from_value::<ServiceMessageRefusalPayload>(without_uid)
+                .unwrap()
+                .service_uid,
+            None
+        );
     }
 }

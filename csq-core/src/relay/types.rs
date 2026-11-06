@@ -1113,7 +1113,7 @@ mod tests {
     // name (no leading `.`) matches the method form, the path form
     // `RelayState::name(&mut g)` and the fn-pointer form alike. The first four
     // are also present in this file; the rest only name callers.
-    const OWNED: [(&str, &[&str]); 15] = [
+    const OWNED: [(&str, &[&str]); 23] = [
         ("ClassifiedKey::new", &["types.rs"]),
         ("Run::new", &["inparse.rs"]),
         ("EnterGate for ", &["state.rs"]),
@@ -1129,11 +1129,19 @@ mod tests {
         ("writer_lock", &["state.rs", "loop.rs", "writer.rs"]),
         ("Text::new", &["state.rs", "input.rs"]),
         ("for_cli", &["state.rs", "input.rs"]),
+        ("MasterWriter::new", &["pty.rs", "writer.rs"]),
+        ("injection", &["writer.rs"]),
+        ("master_raw_fd", &["writer.rs"]),
+        ("AsRawFd for MasterWriter", &[]),
+        ("AsFd for MasterWriter", &[]),
+        ("self.master.as_raw_fd", &["writer.rs"]),
+        ("write_fd(self.master", &["writer.rs"]),
+        ("write_fd(master", &["writer.rs"]),
     ];
     /// How many leading `OWNED` patterns this file's own source must contain.
     const SELF_VISIBLE: usize = 4;
     /// The guarded types, for the alias and `Self::new` checks.
-    const GUARDED: [&str; 8] = [
+    const GUARDED: [&str; 9] = [
         "ClassifiedKey",
         "Run",
         "WriterLock",
@@ -1142,6 +1150,7 @@ mod tests {
         "EnterCapableInputs",
         "Text",
         "SlashTable",
+        "MasterWriter",
     ];
     /// Where the production half of `types.rs` ends.
     const TYPES_TEST_MARKER: &str =
@@ -1267,7 +1276,7 @@ mod tests {
         let src = strip_comments_and_raw_idents(src);
         let collapsed = src.split_whitespace().collect::<Vec<_>>().join(" ");
         let chars: Vec<char> = collapsed.chars().collect();
-        let punct = |c: char| "<>(),:;={}&".contains(c);
+        let punct = |c: char| "<>(),:;={}&.".contains(c);
         let mut out = String::with_capacity(chars.len());
         for (i, &c) in chars.iter().enumerate() {
             let edge = i == 0 || i + 1 == chars.len();
@@ -1421,6 +1430,38 @@ mod tests {
             assert!(scan_violation("authz.rs", src).is_some(), "{src}");
             assert_eq!(scan_violation("state.rs", src), None, "{src} owner");
         }
+    }
+
+    #[test]
+    fn scan_blocks_master_fd_escape_and_direct_master_writes() {
+        for source in [
+            "let raw = self.master.as_raw_fd();",
+            "let raw = self . master . as_raw_fd ();",
+            "write_fd(self.master, bytes);",
+            "write_fd (self . master, bytes);",
+            "write_fd(master, bytes);",
+            "let raw = master.master_raw_fd();",
+        ] {
+            assert!(scan_violation("pty.rs", source).is_some(), "{source}");
+            assert_eq!(scan_violation("writer.rs", source), None);
+        }
+        for source in [
+            "impl AsRawFd for MasterWriter {}",
+            "impl AsFd for MasterWriter {}",
+        ] {
+            assert!(scan_violation("writer.rs", source).is_some(), "{source}");
+        }
+        let harness =
+            "fn read_master() {}\n#[cfg(test)]\nmod tests { let raw = self.master.as_raw_fd(); }";
+        assert!(
+            scan_violation("pty.rs", harness).is_some(),
+            "test syntax must not blind the tail scan"
+        );
+        assert_eq!(
+            scan_violation("pty.rs", "set_nonblock(pty.master.as_raw_fd());"),
+            None,
+            "raw setup precedes ownership transfer to MasterWriter"
+        );
     }
 
     /// Comments and raw identifiers cannot hide a construction: the forms the

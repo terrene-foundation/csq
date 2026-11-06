@@ -283,8 +283,8 @@ pub fn refresh_failing_line(account: AccountNum) -> String {
 
 /// The result of one `credentials/` enumeration.
 ///
-/// `readable = false` means the directory could not be read at all: the slot
-/// lists are UNDETERMINED, not empty, and every surface must print
+/// `readable = false` means the directory (or one of its entries) could not be
+/// read: the slot lists are UNDETERMINED, not empty, and every surface must print
 /// [`SENTINEL_SCAN_UNDETERMINED`] rather than reading as "all clear".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SentinelScan {
@@ -411,30 +411,6 @@ fn scan_entry_names(
     states.sort_unstable_by_key(|(account, _)| account.get());
     states.dedup_by_key(|(account, _)| *account);
     SentinelScan { readable, states }
-}
-
-/// Every slot with a sentinel and its classification, ascending.
-///
-/// Thin Vec-returning derivation over [`sentinel_scan`]; callers that must
-/// distinguish an unreadable directory from an empty one use the scan.
-pub fn sentinel_states(base_dir: &Path) -> Vec<(AccountNum, LoginNeededState)> {
-    sentinel_scan(base_dir).states
-}
-
-/// Slots in the LOGIN-NEEDED state only (case 1 of the three-state model).
-///
-/// Derived from [`sentinel_scan`]; a marker whose cause is unclassifiable is
-/// NOT included — that is [`refresh_failing_slots`].
-pub fn login_needed_slots(base_dir: &Path) -> Vec<AccountNum> {
-    sentinel_scan(base_dir).login_needed_slots()
-}
-
-/// Slots whose marker exists but whose cause is not classifiable (case 2).
-///
-/// Surfaced as [`REFRESH_FAILING_CAUSE_NOT_RECORDED`] by every operator
-/// surface. Never login-needed, never healthy.
-pub fn refresh_failing_slots(base_dir: &Path) -> Vec<AccountNum> {
-    sentinel_scan(base_dir).refresh_failing_slots()
 }
 
 /// Sets the login-needed flag for the given account with a fixed-vocabulary
@@ -615,6 +591,7 @@ pub fn clear_broker_failed(base_dir: &Path, account: AccountNum) {
 mod tests {
     use super::*;
     use crate::accounts::markers;
+
     use crate::credentials;
     use crate::credentials::{AnthropicCredentialFile, CredentialFile, OAuthPayload};
     use crate::types::{AccessToken, RefreshToken};
@@ -913,7 +890,8 @@ mod tests {
         )
         .unwrap();
 
-        let slots: Vec<u16> = login_needed_slots(dir.path())
+        let slots: Vec<u16> = sentinel_scan(dir.path())
+            .login_needed_slots()
             .into_iter()
             .map(|account| account.get())
             .collect();
@@ -937,7 +915,7 @@ mod tests {
             "a zero-byte legacy marker still reads back as an empty reason"
         );
         assert_eq!(
-            refresh_failing_slots(dir.path()),
+            sentinel_scan(dir.path()).refresh_failing_slots(),
             vec![AccountNum::try_from(5u16).unwrap()],
             "the zero-byte legacy marker is UNKNOWN, not login-needed"
         );
@@ -981,11 +959,15 @@ mod tests {
                 "{name}: a pre-classification marker is UNKNOWN"
             );
             assert!(
-                !login_needed_slots(dir.path()).contains(&account),
+                !sentinel_scan(dir.path())
+                    .login_needed_slots()
+                    .contains(&account),
                 "{name}: UNKNOWN must never be enumerated as login-needed"
             );
             assert!(
-                refresh_failing_slots(dir.path()).contains(&account),
+                sentinel_scan(dir.path())
+                    .refresh_failing_slots()
+                    .contains(&account),
                 "{name}: UNKNOWN must be enumerated as refresh-failing"
             );
         }
@@ -998,8 +980,12 @@ mod tests {
             login_needed_state(dir.path(), future),
             LoginNeededState::Unknown
         );
-        assert!(!login_needed_slots(dir.path()).contains(&future));
-        assert!(refresh_failing_slots(dir.path()).contains(&future));
+        assert!(!sentinel_scan(dir.path())
+            .login_needed_slots()
+            .contains(&future));
+        assert!(sentinel_scan(dir.path())
+            .refresh_failing_slots()
+            .contains(&future));
         assert!(
             read_broker_failed_reason(dir.path(), future).is_some(),
             "reading must not delete or hide the marker"
@@ -1029,7 +1015,9 @@ mod tests {
             "an unreadable marker is UNKNOWN, never Healthy"
         );
         assert!(!login_needed_state(dir.path(), account).is_login_needed());
-        assert!(refresh_failing_slots(dir.path()).contains(&account));
+        assert!(sentinel_scan(dir.path())
+            .refresh_failing_slots()
+            .contains(&account));
     }
 
     /// A login-needed slot is permanently unresolvable without a login, so
@@ -1052,7 +1040,7 @@ mod tests {
             "an aged marker is still login-needed"
         );
         assert_eq!(
-            login_needed_slots(dir.path()),
+            sentinel_scan(dir.path()).login_needed_slots(),
             vec![account],
             "the enumerator must not filter by age"
         );
@@ -1079,8 +1067,12 @@ mod tests {
             LoginNeededState::Unknown,
             "a symlink marker is UNKNOWN, never a login demand"
         );
-        assert!(!login_needed_slots(dir.path()).contains(&account));
-        assert!(refresh_failing_slots(dir.path()).contains(&account));
+        assert!(!sentinel_scan(dir.path())
+            .login_needed_slots()
+            .contains(&account));
+        assert!(sentinel_scan(dir.path())
+            .refresh_failing_slots()
+            .contains(&account));
         assert_eq!(
             read_broker_failed_reason(dir.path(), account),
             None,
@@ -1110,8 +1102,12 @@ mod tests {
             LoginNeededState::Unknown,
             "an oversized marker is UNKNOWN; the read cap wins over its leading tag"
         );
-        assert!(!login_needed_slots(dir.path()).contains(&account));
-        assert!(refresh_failing_slots(dir.path()).contains(&account));
+        assert!(!sentinel_scan(dir.path())
+            .login_needed_slots()
+            .contains(&account));
+        assert!(sentinel_scan(dir.path())
+            .refresh_failing_slots()
+            .contains(&account));
         assert!(creds.join("41.broker-failed").exists());
     }
 
@@ -1137,8 +1133,12 @@ mod tests {
             LoginNeededState::Unknown,
             "a FIFO marker is UNKNOWN and must not block the read"
         );
-        assert!(!login_needed_slots(dir.path()).contains(&account));
-        assert!(refresh_failing_slots(dir.path()).contains(&account));
+        assert!(!sentinel_scan(dir.path())
+            .login_needed_slots()
+            .contains(&account));
+        assert!(sentinel_scan(dir.path())
+            .refresh_failing_slots()
+            .contains(&account));
     }
 
     /// `/dev/zero` is the unbounded-symlink case: following it would read
@@ -1157,7 +1157,9 @@ mod tests {
             classify_with_timeout(dir.path(), account),
             LoginNeededState::Unknown
         );
-        assert!(!login_needed_slots(dir.path()).contains(&account));
+        assert!(!sentinel_scan(dir.path())
+            .login_needed_slots()
+            .contains(&account));
     }
 
     /// A directory that cannot be enumerated is an UNDETERMINED scan, not an

@@ -187,6 +187,10 @@ pub fn handle(base_dir: &Path, json: bool) -> Result<()> {
     if let Some(view) = &keychain_orphans {
         println!("{}", keychain_orphans_text(view));
     }
+    // Auto-rotate on/off, from the SAME core loader the daemon's rotator and
+    // `csq rotation status` use. Text-only: the machine-readable twin is
+    // `csq rotation status --json`, so `csq.status.v2` is unchanged.
+    println!("{}", super::rotation::summary_line_with_sessions(base_dir));
     for rescue in &rescue_pending {
         println!("{}", render_rescue_line(rescue));
     }

@@ -13,6 +13,8 @@ import { tick } from "svelte";
 //   invoke('set_dock_hidden', { baseDir, hidden }) — toggle
 //   invoke('get_dashboard_at_launch', { baseDir }) — on mount + on open
 //   invoke('set_dashboard_at_launch', { baseDir, enabled }) — toggle
+//   invoke('get_rotation_config', { baseDir })  — on open (AutoRotateSetting)
+//   invoke('set_rotation_enabled', { baseDir, enabled }) — toggle
 
 const mockInvoke = vi.fn();
 
@@ -43,6 +45,13 @@ function setupMocks(overrides: Record<string, unknown> = {}) {
     set_dock_hidden: false,
     get_dashboard_at_launch: true,
     set_dashboard_at_launch: true,
+    get_rotation_config: {
+      enabled: false,
+      threshold_percent: 95,
+      cooldown_secs: 300,
+      exclude_accounts: [],
+    },
+    set_rotation_enabled: undefined,
     ...overrides,
   };
   mockInvoke.mockImplementation((cmd: string) => {
@@ -313,6 +322,37 @@ describe("SettingsPopover", () => {
       baseDir: "/home/test/.claude/accounts",
       hidden: true,
     });
+  });
+
+  // ── Auto-swap (AutoRotateSetting) ─────────────────────────────
+
+  it("shows the auto-swap setting only after open, reading rotation config then", async () => {
+    setupMocks({
+      get_rotation_config: {
+        enabled: true,
+        threshold_percent: 90,
+        cooldown_secs: 300,
+        exclude_accounts: [],
+      },
+    });
+    const { container } = render(SettingsPopover);
+    await settle();
+    expect(
+      container.querySelector('[data-testid="setting-auto-rotate"]'),
+    ).toBeNull();
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "get_rotation_config",
+      expect.anything(),
+    );
+    await openPanel(container);
+    expect(mockInvoke).toHaveBeenCalledWith("get_rotation_config", {
+      baseDir: "/home/test/.claude/accounts",
+    });
+    const box = container.querySelector(
+      '[data-testid="setting-auto-rotate"]',
+    ) as HTMLInputElement;
+    expect(box).not.toBeNull();
+    expect(box.checked).toBe(true);
   });
 
   // ── About section ─────────────────────────────────────────────

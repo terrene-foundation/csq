@@ -298,7 +298,11 @@ fn pool_invalid_metadata_and_duplicate_name_leave_committed_custody_unchanged() 
     assert!(PoolName::new(&"x".repeat(65)).is_err());
     assert!(PoolName::new("a.b-C_9").is_ok());
     for reset in [
-        Reset::Day { day_of_month: 29 },
+        Reset::Day { day_of_month: 0 },
+        Reset::Day { day_of_month: 32 },
+        Reset::Day {
+            day_of_month: u8::MAX,
+        },
         Reset::Date {
             date: "2025-02-29".into(),
         },
@@ -1643,4 +1647,66 @@ fn pool_cleanup_cannot_delete_manifest_admitted_remove_backup() {
     );
     assert!(pool.root.join("cleanup.json").exists());
     TEST_BOOT.with(|slot| *slot.borrow_mut() = None);
+}
+
+#[test]
+fn pool_reset_day_accepts_one_through_thirty_one_and_nothing_else() {
+    for day in 1..=31u8 {
+        assert_eq!(
+            Reset::Day { day_of_month: day }.validate(),
+            Ok(()),
+            "day {day}"
+        );
+    }
+    for day in [0u8, 32, 33, 100, 255] {
+        assert_eq!(
+            Reset::Day { day_of_month: day }.validate(),
+            Err(PoolError::InvalidReset),
+            "day {day}"
+        );
+    }
+}
+
+#[test]
+fn pool_reset_day_29_to_31_round_trips_through_add_set_reset_and_the_manifest() {
+    let (dir, pool) = fixture();
+    pool.add(
+        "renews.29",
+        "anthropic",
+        SYNTHETIC.into(),
+        Some(Reset::Day { day_of_month: 29 }),
+        None,
+    )
+    .unwrap();
+    for day in [30u8, 31, 29] {
+        pool.set_reset("renews.29", Some(Reset::Day { day_of_month: day }))
+            .unwrap();
+        let listed = pool.list().unwrap();
+        assert_eq!(
+            listed[0].entry.reset,
+            Some(Reset::Day { day_of_month: day })
+        );
+        // A fresh handle re-reads the persisted manifest, not an in-memory copy.
+        let reread = Pool::new(dir.path()).load().unwrap();
+        assert_eq!(
+            reread.entries[0].entry.reset,
+            Some(Reset::Day { day_of_month: day })
+        );
+    }
+    assert_eq!(
+        pool.set_reset("renews.29", Some(Reset::Day { day_of_month: 32 })),
+        Err(PoolError::InvalidReset)
+    );
+    assert_eq!(
+        pool.add(
+            "bad.day",
+            "anthropic",
+            SYNTHETIC.into(),
+            Some(Reset::Day { day_of_month: 0 }),
+            None
+        ),
+        Err(PoolError::InvalidReset)
+    );
+    let on_disk = std::fs::read_to_string(dir.path().join("pool/manifest.json")).unwrap();
+    assert!(on_disk.contains("\"day_of_month\":29") || on_disk.contains("\"day_of_month\": 29"));
 }

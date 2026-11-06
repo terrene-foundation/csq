@@ -44,12 +44,34 @@ pub mod state;
 pub mod term;
 
 #[cfg(unix)]
+pub(crate) mod catalog;
+#[cfg(unix)]
 pub mod control;
+#[cfg(unix)]
+pub(crate) mod evidence;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "owner command cells remain closed pending measurement and pump integration"
+    )
+)]
+#[cfg(unix)]
+pub(crate) mod inject_audit;
 #[path = "loop.rs"]
 #[cfg(unix)]
 pub mod loop_adapter;
 #[cfg(unix)]
 pub(crate) mod owner;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "owner command cells remain closed pending measurement and pump integration"
+    )
+)]
+#[cfg(unix)]
+pub(crate) mod writer;
 
 /// Whether this platform can host the relay (spec 34 §34.2, §34.9).
 ///

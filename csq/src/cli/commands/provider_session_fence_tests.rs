@@ -702,9 +702,16 @@ fn caller_admission_child() {
         return;
     }
     if mode == "warn-third-party" {
-        let error = launch_third_party(&base, &home, account, &[], &mut audit)
-            .unwrap_err()
-            .to_string();
+        let error = launch_third_party(
+            &base,
+            &home,
+            account,
+            &[],
+            &mut audit,
+            &X1Options::default(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             !error.starts_with("provider-session fence:"),
             "warn must admit the launch"
@@ -732,9 +739,19 @@ fn caller_admission_child() {
             true,
             false,
             true,
+            None,
+            false,
+            &[],
             &[],
         ),
-        "third-party" => launch_third_party(&base, &home, account, &[], &mut audit),
+        "third-party" => launch_third_party(
+            &base,
+            &home,
+            account,
+            &[],
+            &mut audit,
+            &X1Options::default(),
+        ),
         "checker-refuse" => {
             provider_session_policy::check_claude_launch(&base, &home, account, None, &[])
                 .map(|_| ())

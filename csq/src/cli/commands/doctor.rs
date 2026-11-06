@@ -23,7 +23,7 @@ use csq_core::platform::process::is_pid_alive;
 use csq_core::refresh::sentinel as fanout;
 use csq_core::types::AccountNum;
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize)]
 struct DoctorReport {
@@ -44,6 +44,27 @@ struct DoctorReport {
     message_archive_capacity: usize,
     message_archive_state: &'static str,
     platform: PlatformInfo,
+    /// Per-session `TMPDIR` of the terminal this `csq doctor` runs inside
+    /// (an internal ticket AC5).
+    ///
+    /// Every csq session launch path creates `<handle_dir>/tmp` owner-only
+    /// (0700) before starting the child and exports it as `TMPDIR`; a relaunch
+    /// replays that value (spec 02 §2.1), so a `TMPDIR` inherited from a parent
+    /// shell is never the session's. This row reports whether the CURRENT
+    /// terminal has that dir, where it is, and its mode — the operator-side
+    /// check that the session's temp files are attributable to the terminal and
+    /// removed with it.
+    ///
+    /// Read-only and non-fatal: it stats one path and never talks to the
+    /// daemon. A terminal that cannot be resolved (a bare shell, a legacy
+    /// launch, or a surface whose handle dir this resolver does not cover)
+    /// renders `state: "unknown"` rather than failing the rest of the report.
+    ///
+    /// JSON shape: `{ "path": "...", "state": "present"|"absent"|"invalid"|
+    /// "unknown", "mode": "0700" }` — `path` is omitted when the terminal is
+    /// unresolvable, `mode` when there is no directory to measure or on
+    /// non-Unix hosts.
+    session_tmpdir: SessionTmpdirInfo,
     /// Claude Code CLI status.  Populated when at least one Anthropic slot
     /// has authenticated credentials; **omitted entirely** (not null) when
     /// no such slot exists (spec/13 §9, R1-L2).
@@ -130,6 +151,10 @@ struct DoctorReport {
     /// and thread-history databases over 1 GiB (paths shown as `~/...`).
     #[serde(skip_serializing_if = "Option::is_none")]
     disk_footprint: Option<csq_core::archive_health::footprint::Footprint>,
+    /// Spec 36: terminals whose supervised claude child is at or above the memory
+    /// warn threshold (the `.csq-memory.json` the supervisor writes; absent when none).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    memory_warn_sessions: Vec<MemoryWarnRow>,
     /// Slots whose identity holds a pending post-commit rescue record.
     ///
     /// A pending record makes the refresher SKIP the provider request (the
@@ -230,6 +255,11 @@ struct DoctorReport {
     /// read as "all clear" (`guard-reader-writer-parity.md` MUST-2).
     #[serde(skip_serializing_if = "is_false")]
     login_state_undetermined: bool,
+    /// True when the daemon's login-needed alert state file cannot be read, so
+    /// no owner alert can ever be sent. Judged by the daemon's own reader
+    /// (`login_needed_alert::state_readable`); omitted from JSON when false.
+    #[serde(skip_serializing_if = "is_false")]
+    login_alerts_not_working: bool,
     /// F5/L3 duplicate-refresh-token audit: one fixed-vocabulary line per finding, from the
     /// same core function the daemon's startup audit uses. Empty when nothing is shared.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -642,6 +672,112 @@ struct DoctorReport {
     /// contract change) — mirrors `custodian_identity_canary` above.
     #[serde(skip)]
     daemon_posture: DaemonPostureReport,
+
+    /// The auto-rotate setting (`rotation.json`), read through the SAME core
+    /// loader the daemon's rotator and `csq rotation status` use. NOT
+    /// serialized in `--json` (drives only the printed row, so it adds no
+    /// `schema_version` bump / spec-13 §9 contract change); `csq rotation
+    /// status --json` is the machine-readable surface.
+    #[serde(skip)]
+    auto_rotate: AutoRotateReport,
+}
+
+/// `csq doctor`'s view of `rotation.json`. Built by [`check_auto_rotate`].
+#[derive(Debug, Clone, Default, PartialEq)]
+enum AutoRotateReport {
+    /// Disabled (the default when the file is absent).
+    #[default]
+    Off,
+    /// The machine setting is off, but `live_on` live terminals the rotator can
+    /// move carry their own `on` override, so the daemon DOES move them
+    /// (`rotation::session_override::rotates`).
+    OffSessionsOn { live_on: usize },
+    /// The machine setting is off and the per-terminal settings could not be
+    /// listed, so a live `on` terminal may still be moved: unknown, not "off".
+    OffSessionsUnknown,
+    On {
+        threshold_percent: f64,
+        cooldown_secs: u64,
+    },
+    /// The file exists but cannot be parsed — the rotator skips every tick.
+    Unreadable,
+}
+
+fn check_auto_rotate(base_dir: &Path) -> AutoRotateReport {
+    auto_rotate_report(csq_core::rotation::config::load(base_dir), || {
+        super::rotation::live_on_count_for(base_dir)
+    })
+}
+
+fn auto_rotate_report<E>(
+    config: Result<csq_core::rotation::config::RotationConfig, E>,
+    live_on: impl FnOnce() -> Option<usize>,
+) -> AutoRotateReport {
+    match config {
+        Ok(cfg) if cfg.enabled => AutoRotateReport::On {
+            threshold_percent: cfg.threshold_percent,
+            cooldown_secs: cfg.cooldown_secs,
+        },
+        Ok(_) => match live_on() {
+            Some(0) => AutoRotateReport::Off,
+            Some(live_on) => AutoRotateReport::OffSessionsOn { live_on },
+            None => AutoRotateReport::OffSessionsUnknown,
+        },
+        Err(_) => AutoRotateReport::Unreadable,
+    }
+}
+
+/// The doctor row for auto-rotate. `daemon_serving` is true when the daemon
+/// row above reports a live daemon: an enabled setting with no daemon is a
+/// warning because nothing will rotate.
+fn auto_rotate_operator_detail(
+    report: &AutoRotateReport,
+    daemon_serving: bool,
+) -> (&'static str, String) {
+    match report {
+        AutoRotateReport::Off => (ok(), "off (turn on with `csq rotation on`)".into()),
+        AutoRotateReport::OffSessionsOn { live_on } => {
+            let settings = format!(
+                "off machine-wide, but {live_on} terminal(s) are set to on and will still be moved"
+            );
+            if daemon_serving {
+                (ok(), settings)
+            } else {
+                (
+                    warn(),
+                    format!("{settings}; the daemon is not running, so no terminal will be moved"),
+                )
+            }
+        }
+        AutoRotateReport::On {
+            threshold_percent,
+            cooldown_secs,
+        } => {
+            let settings = format!(
+                "on (threshold {}%, cooldown {}s)",
+                csq_core::rotation::config::format_percent(*threshold_percent),
+                cooldown_secs
+            );
+            if daemon_serving {
+                (ok(), settings)
+            } else {
+                (
+                    warn(),
+                    format!(
+                        "{settings} but the daemon is not running, so no terminal will be moved"
+                    ),
+                )
+            }
+        }
+        AutoRotateReport::OffSessionsUnknown => (
+            warn(),
+            "off machine-wide; per-terminal settings could not be listed, so a terminal set to on may still be moved".into(),
+        ),
+        AutoRotateReport::Unreadable => (
+            warn(),
+            "rotation.json is unreadable, so nothing will rotate — fix or remove it".into(),
+        ),
+    }
 }
 
 /// `csq doctor`'s view of the daemon refresh posture. Built by
@@ -1254,6 +1390,209 @@ struct TerminalInfo {
     check_available: bool,
 }
 
+/// Per-session `TMPDIR` of the terminal this `csq doctor` runs inside
+/// (an internal ticket AC5). See [`DoctorReport::session_tmpdir`].
+#[derive(Debug, Serialize)]
+struct SessionTmpdirInfo {
+    /// `<handle_dir>/tmp`; omitted when the current terminal could not be
+    /// resolved, because no path is then known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    /// `present` | `absent` | `invalid` | `unknown`.
+    ///
+    /// `absent` is a missing path. `invalid` means the launch would refuse the
+    /// entry: the path is not a REAL directory OWNED BY THIS USER (a symlink, a
+    /// regular file, or a foreign-owned directory), or it sits on a read-only
+    /// filesystem where the launch's 0700 re-assert cannot run. Both refuse
+    /// with `session_tmpdir_unavailable`, so neither is a usable per-session
+    /// TMPDIR. `unknown` is an entry that could not be observed.
+    /// `present` means the launch's STATIC acceptance checks pass (a real
+    /// directory owned by this user). A launch can still refuse on a read-only
+    /// mount, where the mode re-assertion cannot run — a diagnostic does not
+    /// mutate to find that out, so the row reports what can be observed.
+    state: &'static str,
+    /// Octal permission bits of the directory (e.g. `0700`). Omitted on
+    /// non-Unix hosts and whenever there is no directory to measure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+}
+
+/// Probe `<handle_dir>/tmp` into a [`SessionTmpdirInfo`].
+///
+/// Pure over its input: the caller supplies the already-resolved handle dir
+/// (or `None`), so the env resolution stays one thin, separately-testable
+/// seam. Every unreadable case is `unknown`, never an error — the doctor
+/// report must complete even when this row cannot.
+///
+/// The reader mirrors `session::tmpdir::ensure_session_tmpdir`: the launch
+/// requires a REAL directory OWNED BY THIS USER and refuses a symlink or any
+/// other non-directory without following it. The probe uses `symlink_metadata`
+/// plus [`csq_core::session::tmpdir::session_tmpdir_is_usable`], so a foreign
+/// symlink target or a foreign-owned directory is never reported as if it were
+/// the session's TMPDIR (`guard-reader-writer-parity.md`). The rendered path is
+/// `redact_path`-reduced: this row is operator-facing text and JSON, and a
+/// `$HOME`-rooted path is shown as `~` like every sibling path on the report.
+fn probe_session_tmpdir(handle_dir: Option<&Path>) -> SessionTmpdirInfo {
+    let Some(handle_dir) = handle_dir else {
+        return SessionTmpdirInfo {
+            path: None,
+            state: "unknown",
+            mode: None,
+        };
+    };
+    let path = handle_dir.join(csq_core::session::tmpdir::SESSION_TMPDIR_DIR);
+    // Operator-facing text and JSON: a `$HOME`-rooted path is reduced to `~`
+    // exactly as every sibling path on this report (`CliShimInfo.path`), never
+    // printed in full.
+    let rendered = csq_core::cli_deps::sanitize::redact_path(&path);
+    match std::fs::symlink_metadata(&path) {
+        // `present` only when the launch would accept it: a real directory
+        // owned by this user. A foreign-owned directory is refused by
+        // `ensure_session_tmpdir`, so reporting it as `present, mode 0700`
+        // would show a healthy row for a terminal that cannot launch
+        // (`diagnostic-surface-parity.md`).
+        Ok(meta) if meta.is_dir() && csq_core::session::tmpdir::session_tmpdir_is_usable(&path) => {
+            SessionTmpdirInfo {
+                path: Some(rendered),
+                state: "present",
+                mode: session_tmpdir_mode(&meta),
+            }
+        }
+        // A symlink or a regular file squatting on the path: the launch
+        // refuses this entry, so it is not a per-session TMPDIR.
+        Ok(_) => SessionTmpdirInfo {
+            path: Some(rendered),
+            state: "invalid",
+            mode: None,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => SessionTmpdirInfo {
+            path: Some(rendered),
+            state: "absent",
+            mode: None,
+        },
+        // Permission or I/O failure: NOT "absent" — the dir may exist and we
+        // could not observe it. State stays undetermined.
+        Err(_) => SessionTmpdirInfo {
+            path: Some(rendered),
+            state: "unknown",
+            mode: None,
+        },
+    }
+}
+
+#[cfg(unix)]
+fn session_tmpdir_mode(meta: &std::fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    // Special bits are kept (`& 0o7777`): a setuid/setgid/sticky TMPDIR is a
+    // deviation the operator must see, not something to mask down to 0o777.
+    Some(format!("{:04o}", meta.permissions().mode() & 0o7777))
+}
+
+#[cfg(not(unix))]
+fn session_tmpdir_mode(_meta: &std::fs::Metadata) -> Option<String> {
+    None
+}
+
+/// Resolve the handle dir of the terminal this process runs inside.
+///
+/// Reuses the crate's existing handle-dir-from-env resolution
+/// (`handle_dir::resolve_handle_dir_from_env`): it reads `CLAUDE_CONFIG_DIR`,
+/// rejects a legacy `config-<N>` / non-`term-` name, and canonicalizes the
+/// candidate under `base_dir`. `None` (rendered `unknown`, never an error)
+/// when this process is not inside a csq-managed terminal or the dir no
+/// longer resolves.
+fn current_terminal_handle_dir(base_dir: &Path) -> Option<PathBuf> {
+    if let Ok(dir) = csq_core::session::handle_dir::resolve_handle_dir_from_env(base_dir) {
+        return Some(dir);
+    }
+    // Only the Claude Code builder exports CLAUDE_CONFIG_DIR. Codex and
+    // Gemini export their own home variables, and EVERY csq launch surface
+    // exports TMPDIR as `<handle>/tmp`, so the current terminal is still
+    // resolvable from any of them instead of reporting `unknown` on five of
+    // the six launch surfaces (an internal ticket R1 F1).
+    for var in ["CODEX_HOME", "GEMINI_CLI_HOME"] {
+        if let Some(dir) = std::env::var_os(var)
+            .and_then(|raw| handle_dir_candidate(base_dir, &PathBuf::from(raw)))
+        {
+            return Some(dir);
+        }
+    }
+    let tmp = std::env::var_os("TMPDIR").map(PathBuf::from)?;
+    if tmp.file_name()
+        != Some(std::ffi::OsStr::new(
+            csq_core::session::tmpdir::SESSION_TMPDIR_DIR,
+        ))
+    {
+        return None;
+    }
+    handle_dir_candidate(base_dir, tmp.parent()?)
+}
+
+/// A `term-<pid>` directory under `base_dir`, canonicalized.
+///
+/// The same shape [`csq_core::session::handle_dir::resolve_handle_dir_from_env`]
+/// enforces for `CLAUDE_CONFIG_DIR`: a `term-` leaf plus containment under the
+/// canonical accounts base. Anything else (a legacy `config-<N>` dir, another
+/// tool's home, a path outside the base) is `None`, never a guess.
+fn handle_dir_candidate(base_dir: &Path, candidate: &Path) -> Option<PathBuf> {
+    let leaf = candidate.file_name()?.to_str()?;
+    if !leaf.starts_with("term-") {
+        return None;
+    }
+    let canon_base = base_dir.canonicalize().ok()?;
+    let canon = candidate.canonicalize().ok()?;
+    canon.starts_with(&canon_base).then_some(canon)
+}
+
+/// One text row for the per-session TMPDIR. Pure so a test reads the exact
+/// bytes; the path is passed through `sanitize_for_display` because it is
+/// filesystem-derived and the text surface must not relay control bytes.
+fn session_tmpdir_line(row: &SessionTmpdirInfo) -> String {
+    let (icon, detail) = match (row.state, row.path.as_deref(), row.mode.as_deref()) {
+        ("present", Some(path), Some("0700")) => (
+            ok(),
+            format!("{} (present, mode 0700)", sanitize_for_display(path)),
+        ),
+        ("present", Some(path), Some(mode)) => (
+            warn(),
+            format!(
+                "{} (present, mode {mode} — expected 0700)",
+                sanitize_for_display(path)
+            ),
+        ),
+        ("present", Some(path), None) => {
+            (ok(), format!("{} (present)", sanitize_for_display(path)))
+        }
+        ("absent", Some(path), _) => (
+            warn(),
+            format!(
+                "{} (absent — session temp files are not isolated to this terminal; relaunch with `csq run`)",
+                sanitize_for_display(path)
+            ),
+        ),
+        ("invalid", Some(path), _) => (
+            warn(),
+            format!(
+                "{} (invalid — the launch would refuse this entry ({}) — not a real directory owned by this user, or a read-only filesystem)",
+                sanitize_for_display(path),
+                csq_core::session::tmpdir::SESSION_TMPDIR_TAG
+            ),
+        ),
+        ("unknown", Some(path), _) => (
+            info(),
+            format!(
+                "{} (unknown — the directory could not be read)",
+                sanitize_for_display(path)
+            ),
+        ),
+        _ => (
+            info(),
+            "unknown — the current terminal's handle dir could not be resolved".to_string(),
+        ),
+    };
+    format!("  Session TMPDIR: {icon} {detail}")
+}
+
 #[derive(Serialize)]
 struct PlatformInfo {
     os: String,
@@ -1649,7 +1988,8 @@ pub fn handle_with_gate(
         return Ok(0);
     }
 
-    let mut report = build_report(base_dir);
+    let session_tmpdir = probe_session_tmpdir(current_terminal_handle_dir(base_dir).as_deref());
+    let mut report = build_report(base_dir, session_tmpdir);
     report.gate_status = gate.map(|(repo, pin)| csq_core::gate::status::build_report(repo, pin));
     let exit_code = report
         .gate_status
@@ -2188,9 +2528,9 @@ fn is_false(value: &bool) -> bool {
 }
 
 #[cfg(feature = "enterprise")]
-const DOCTOR_SCHEMA_VERSION: u32 = 35;
+const DOCTOR_SCHEMA_VERSION: u32 = 36;
 #[cfg(not(feature = "enterprise"))]
-const DOCTOR_SCHEMA_VERSION: u32 = 35;
+const DOCTOR_SCHEMA_VERSION: u32 = 36;
 
 /// One text line for the daemon's keychain orphan sweep, or `None` when it has
 /// never published and nothing is wrong. The wording and the severity both come
@@ -2308,6 +2648,55 @@ fn doctor_bundle_floor_anchor(_base_dir: &Path) -> Option<String> {
     None
 }
 
+/// One terminal over the memory warn threshold.
+#[derive(Serialize, Debug, PartialEq)]
+struct MemoryWarnRow {
+    /// Handle dir name (`term-<pid>`), never a path.
+    handle: String,
+    rss_bytes: u64,
+    warn_bytes: u64,
+}
+
+/// The `Session memory:` doctor rows (one per terminal over the warn threshold).
+fn memory_warn_lines(rows: &[MemoryWarnRow]) -> Vec<String> {
+    rows.iter()
+        .map(|row| {
+            format!(
+                "Session memory: {} at {:.1} GiB (warn {:.1} GiB) - `csq session recycle --session-id <id>` restarts it in place",
+                row.handle,
+                row.rss_bytes as f64 / (1u64 << 30) as f64,
+                row.warn_bytes as f64 / (1u64 << 30) as f64
+            )
+        })
+        .collect()
+}
+
+/// Reads the SAME `.csq-memory.json` the supervisor writes (diagnostic-surface
+/// parity with the statusline): a fresh `warn` record per `term-*` handle dir.
+/// Read-only; an unreadable dir or file contributes no row.
+fn check_memory_warn_sessions(base_dir: &Path, now: &str) -> Vec<MemoryWarnRow> {
+    let Ok(entries) = std::fs::read_dir(base_dir) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<MemoryWarnRow> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.starts_with("term-").then_some((name, e.path()))
+        })
+        .filter_map(|(name, path)| {
+            let rec = csq_core::session::recycle::fresh_memory(&path, now)?;
+            (rec.state == csq_core::session::recycle::MemoryState::Warn).then_some(MemoryWarnRow {
+                handle: name,
+                rss_bytes: rec.rss_bytes?,
+                warn_bytes: rec.warn_bytes,
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| a.handle.cmp(&b.handle));
+    rows
+}
+
 fn message_archive_snapshot(base_dir: &Path) -> (Option<usize>, &'static str) {
     let records = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2320,7 +2709,7 @@ fn message_archive_snapshot(base_dir: &Path) -> (Option<usize>, &'static str) {
     };
     (records, state)
 }
-fn build_report(base_dir: &Path) -> DoctorReport {
+fn build_report(base_dir: &Path, session_tmpdir: SessionTmpdirInfo) -> DoctorReport {
     let (cli_shim, installed) = check_cli_shim(base_dir);
     let mcp_images =
         super::mcp_image::collect(&|| installed.as_ref().and_then(InstalledImageAdmission::stable));
@@ -2416,6 +2805,7 @@ fn build_report(base_dir: &Path) -> DoctorReport {
         message_archive_capacity: ARCHIVE_CAPACITY,
         message_archive_state,
         platform: check_platform(),
+        session_tmpdir,
         claude_code,
         codex_cli,
         gemini_cli,
@@ -2442,6 +2832,10 @@ fn build_report(base_dir: &Path) -> DoctorReport {
             .then_some("cannot locate home"),
         disk_footprint: home_of_base(base_dir)
             .map(|h| csq_core::archive_health::footprint::measure(&h)),
+        memory_warn_sessions: check_memory_warn_sessions(
+            base_dir,
+            &csq_core::session::recycle::now_rfc3339(),
+        ),
         rescue_pending_slots: csq_core::credentials::rescue::pending_rescues(base_dir),
         codex_shared_shape_mismatches: check_codex_shared_shapes(base_dir),
         codex_project_trust: check_codex_project_trust(base_dir),
@@ -2482,6 +2876,7 @@ fn build_report(base_dir: &Path) -> DoctorReport {
         broker_failed: check_broker_failed(&sentinel_scan),
         refresh_failing: check_refresh_failing(&sentinel_scan),
         login_state_undetermined: !sentinel_scan.readable,
+        login_alerts_not_working: check_login_alerts_not_working(base_dir),
         refresh_audit: csq_core::accounts::refresh_token_audit::operator_lines(base_dir),
         mixed_state_slots: check_mixed_state_slots(base_dir),
         terminals: check_terminals(base_dir),
@@ -2522,6 +2917,7 @@ fn build_report(base_dir: &Path) -> DoctorReport {
         mcp_gate_outbox_backlog: check_mcp_gate_outbox_backlog(base_dir),
         custodian_identity_canary: check_custodian_identity_canary(base_dir),
         daemon_posture: check_daemon_posture(base_dir),
+        auto_rotate: check_auto_rotate(base_dir),
     }
 }
 
@@ -5557,6 +5953,23 @@ fn scan_undetermined_section(undetermined: bool) -> Option<String> {
     })
 }
 
+/// Fixed text of the login-alert health line: no path, no error text.
+const LOGIN_ALERTS_NOT_WORKING: &str =
+    "login alerts: not working — state file unreadable/unwritable";
+
+/// Whether the daemon's login-needed alert state can be read. Uses the
+/// daemon's own reader and classifier
+/// ([`csq_core::daemon::login_needed_alert::state_readable`]); there is no
+/// second parser here.
+fn check_login_alerts_not_working(base_dir: &Path) -> bool {
+    !csq_core::daemon::login_needed_alert::state_readable(base_dir)
+}
+
+/// The printed line for a login-alert state the daemon cannot read.
+fn login_alerts_section(not_working: bool) -> Option<String> {
+    not_working.then(|| format!("  Alerts:      {} {}", warn(), LOGIN_ALERTS_NOT_WORKING))
+}
+
 /// One printed line per login-needed slot: the shared operator message plus
 /// the fixed-vocabulary reason tag.
 ///
@@ -6176,6 +6589,8 @@ fn print_report(r: &DoctorReport) {
     // community = csq, enterprise = csq-ee). The hardcoded label is
     // injection-safe (no user input). Distinct from the runtime audit dialect.
     println!("  Edition:     {}", crate::edition_label());
+    // an internal ticket AC5: the CURRENT terminal's per-session TMPDIR.
+    println!("{}", session_tmpdir_line(&r.session_tmpdir));
     println!();
 
     for warning in cli_shim_warnings(&r.cli_shim) {
@@ -6263,6 +6678,13 @@ fn print_report(r: &DoctorReport) {
     let (daemon_icon, daemon_detail) = daemon_operator_detail(&r.daemon);
     println!("  Daemon:      {daemon_icon} {daemon_detail}");
 
+    // Auto-rotate: the setting is only meaningful with a live daemon.
+    let (rotate_icon, rotate_detail) = auto_rotate_operator_detail(
+        &r.auto_rotate,
+        matches!(r.daemon.status.as_str(), "healthy" | "drifted"),
+    );
+    println!("  Auto-rotate: {rotate_icon} {rotate_detail}");
+
     // Accounts
     let acct_icon = if r.accounts.with_credentials > 0 && r.accounts.expired == 0 {
         ok()
@@ -6345,6 +6767,9 @@ fn print_report(r: &DoctorReport) {
     for line in render_footprint_lines(r.disk_footprint.as_ref()) {
         println!("{line}");
     }
+    for line in memory_warn_lines(&r.memory_warn_sessions) {
+        println!("{line}");
+    }
 
     for s in &r.stale_quota_slots {
         println!(
@@ -6419,6 +6844,9 @@ fn print_report(r: &DoctorReport) {
     // The directory could not be enumerated: the two lists above are
     // UNDETERMINED, not empty. Never let silence read as all-clear.
     if let Some(line) = scan_undetermined_section(r.login_state_undetermined) {
+        println!("{line}");
+    }
+    if let Some(line) = login_alerts_section(r.login_alerts_not_working) {
         println!("{line}");
     }
 
@@ -7336,7 +7764,7 @@ mod tests {
     fn doctor_reports_duplicate_refresh_grant_without_token_bytes() {
         const SENTINEL: &str = "SENTINEL-DOCTOR-RT-5e1b88";
         let dir = shared_grant_fixture(SENTINEL);
-        let report = build_report(dir.path());
+        let report = build_report(dir.path(), probe_session_tmpdir(None));
         let text = render_refresh_audit_lines(&report.refresh_audit).join("\n");
         assert!(text.contains("slots 1 and 2"), "{text}");
         assert!(text.contains("csq login 2"), "{text}");
@@ -7344,7 +7772,9 @@ mod tests {
         assert!(json.contains("refresh_audit"));
         assert!(!text.contains(SENTINEL) && !json.contains(SENTINEL));
         let clean = csq_core::testing::identity_fixtures::identity_only_fixture(2);
-        assert!(build_report(clean.path()).refresh_audit.is_empty());
+        assert!(build_report(clean.path(), probe_session_tmpdir(None))
+            .refresh_audit
+            .is_empty());
     }
 
     #[cfg(unix)]
@@ -9371,7 +9801,7 @@ mod tests {
         std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let dir = csq_core::testing::identity_fixtures::coexisting_fixture(1);
         // the fixture root is not <home>/.claude/accounts
-        let report = build_report(dir.path());
+        let report = build_report(dir.path(), probe_session_tmpdir(None));
         let v = serde_json::to_value(&report).unwrap();
         assert_eq!(v["archive_health_error"], "cannot locate home");
         assert!(v.get("archive_health").is_none() && v.get("disk_footprint").is_none());
@@ -9436,6 +9866,7 @@ mod tests {
                 os: "test".into(),
                 arch: "x86_64".into(),
             },
+            session_tmpdir: probe_session_tmpdir(None),
             claude_code: None,
             codex_cli: None,
             gemini_cli: None,
@@ -9483,6 +9914,7 @@ mod tests {
             archive_health: None,
             archive_health_error: None,
             disk_footprint: None,
+            memory_warn_sessions: Vec::new(),
             rescue_pending_slots: Vec::new(),
             session_logins: Vec::new(),
             sessions_undetermined: true,
@@ -9498,6 +9930,7 @@ mod tests {
             },
             refresh_failing: RefreshFailingInfo::default(),
             login_state_undetermined: false,
+            login_alerts_not_working: false,
             refresh_audit: Vec::new(),
             mixed_state_slots: MixedStateInfo {
                 count: 0,
@@ -9574,6 +10007,7 @@ mod tests {
             mcp_gate_outbox_backlog: None,
             custodian_identity_canary: CustodianIdentityCanary::default(),
             daemon_posture: DaemonPostureReport::default(),
+            auto_rotate: AutoRotateReport::default(),
         }
     }
 
@@ -10722,6 +11156,39 @@ mod tests {
         );
     }
 
+    /// An unreadable alert state file is reported by `csq doctor` through the
+    /// daemon's own reader; a missing or healthy file is not. Returning
+    /// `false` unconditionally (or a second parser) REDs the unreadable half.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_login_alert_state_is_reported_not_working() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        assert!(
+            !check_login_alerts_not_working(tmp.path()),
+            "no file: healthy"
+        );
+        let state = tmp.path().join("login-needed-alerts.json");
+        std::fs::write(&state, br#"{"version":1,"slots":[]}"#).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            !check_login_alerts_not_working(tmp.path()),
+            "readable: healthy"
+        );
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&state).is_ok() {
+            return; // privileges that bypass file modes
+        }
+        assert!(check_login_alerts_not_working(tmp.path()));
+        let line = login_alerts_section(true).expect("must print");
+        assert!(line.contains("login alerts: not working"));
+        assert!(
+            !line.contains(tmp.path().to_str().unwrap()),
+            "no path in the line"
+        );
+        assert!(login_alerts_section(false).is_none());
+    }
+
     /// An unreadable `credentials/` directory is UNDETERMINED, not empty:
     /// both lists stay empty but the report and its printed section say so.
     /// Collapsing to an empty report without the flag REDs this.
@@ -11429,7 +11896,7 @@ mod tests {
         }
 
         // Act: build the report (read-only; no daemon / CLI probe invocations).
-        let report = build_report(base);
+        let report = build_report(base, probe_session_tmpdir(None));
 
         // Assert: schema_version — both editions currently converge on v24
         // (unshared_handle_state, cross-edition). Pinned to the build-active const
@@ -11677,7 +12144,7 @@ mod tests {
         // Act: build the report on an empty base dir (no slots, no
         // credentials, no profiles.json). Doctor MUST still emit a
         // structurally valid report.
-        let report = build_report(base);
+        let report = build_report(base, probe_session_tmpdir(None));
 
         // Assert: schema_version equals the edition-active const (both editions
         // currently 23). Pinned to the const so it stays correct across bumps.
@@ -11723,7 +12190,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let base = dir.path();
 
-        let report = build_report(base);
+        let report = build_report(base, probe_session_tmpdir(None));
 
         // Struct-level: `schema` is present and derived, not duplicated by hand.
         assert_eq!(report.schema, doctor_schema_string());
@@ -11805,7 +12272,7 @@ mod tests {
         std::fs::write(config2.join(".csq-account"), "2").unwrap();
 
         // Act
-        let report = build_report(base);
+        let report = build_report(base, probe_session_tmpdir(None));
 
         // Assert: all four kinds present.
         let kinds: std::collections::HashSet<String> = report
@@ -11882,7 +12349,7 @@ mod tests {
         // fixture. Verify by running build_report on a fresh empty
         // tmpdir; the `legacy_compat_state` Vec must be empty.
         let empty_dir = tempfile::TempDir::new().unwrap();
-        let empty_report = build_report(empty_dir.path());
+        let empty_report = build_report(empty_dir.path(), probe_session_tmpdir(None));
         assert!(
             empty_report.legacy_compat_state.is_empty(),
             "empty base dir must produce empty legacy_compat_state; got: {:?}",
@@ -12125,7 +12592,7 @@ mod tests {
         std::env::remove_var("CSQ_AUDIT_EDITION");
         std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let dir = TempDir::new().unwrap();
-        let report = build_report(dir.path());
+        let report = build_report(dir.path(), probe_session_tmpdir(None));
         assert!(
             report.phase4_incomplete.is_none(),
             "phase4_incomplete MUST be None when profiles.json is absent"
@@ -12177,7 +12644,7 @@ mod tests {
         std::fs::write(legacy_creds_dir.join("1.json"), b"{}").unwrap();
         std::fs::write(legacy_creds_dir.join("2.json"), b"{}").unwrap();
 
-        let report = build_report(dir.path());
+        let report = build_report(dir.path(), probe_session_tmpdir(None));
         let alarm = report.phase4_incomplete.as_ref().expect(
             "phase4_incomplete MUST be Some when UUID-mapped slots have missing identity files",
         );
@@ -12211,7 +12678,7 @@ mod tests {
         std::env::remove_var("CSQ_AUDIT_EDITION");
         std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let dir = TempDir::new().unwrap();
-        let report = build_report(dir.path());
+        let report = build_report(dir.path(), probe_session_tmpdir(None));
         assert_eq!(report.schema_version, DOCTOR_SCHEMA_VERSION);
     }
 
@@ -12439,7 +12906,7 @@ mod tests {
         std::fs::create_dir_all(&pdir).unwrap();
         std::fs::write(pdir.join("parked-001.json"), b"{}").unwrap();
 
-        let report = build_report(base);
+        let report = build_report(base, probe_session_tmpdir(None));
         assert_eq!(
             report.seam_quarantine_count,
             Some(1),
@@ -12775,7 +13242,7 @@ mod tests {
         std::env::remove_var("CSQ_AUDIT_EDITION");
         std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let dir = TempDir::new().unwrap();
-        let report = build_report(dir.path());
+        let report = build_report(dir.path(), probe_session_tmpdir(None));
         assert_eq!(
             report.seam_capture_conformance,
             SeamConformanceState::NotConfigured,
@@ -12810,7 +13277,7 @@ mod tests {
         std::fs::create_dir_all(&audit_dir).unwrap();
         std::fs::write(audit_dir.join("required-hooks.json"), br#"["cc","codex"]"#).unwrap();
 
-        let report = build_report(base);
+        let report = build_report(base, probe_session_tmpdir(None));
         let drift = match &report.seam_capture_conformance {
             SeamConformanceState::Drift { drift } => drift,
             other => panic!(
@@ -12851,7 +13318,7 @@ mod tests {
         std::fs::create_dir_all(&audit_dir).unwrap();
         std::fs::write(audit_dir.join("required-hooks.json"), b"[]").unwrap();
 
-        let report = build_report(base);
+        let report = build_report(base, probe_session_tmpdir(None));
         // Empty `[]` is treated as "no surfaces required" = NotConfigured (spec §12.20).
         assert_eq!(
             report.seam_capture_conformance,
@@ -12882,7 +13349,7 @@ mod tests {
         // Write garbage — not a JSON array.
         std::fs::write(audit_dir.join("required-hooks.json"), b"not-json{{{").unwrap();
 
-        let report = build_report(base);
+        let report = build_report(base, probe_session_tmpdir(None));
         assert!(
             matches!(
                 &report.seam_capture_conformance,
@@ -12923,7 +13390,7 @@ mod tests {
         let oversized = vec![b'x'; 65 * 1024 + 1];
         std::fs::write(audit_dir.join("required-hooks.json"), &oversized).unwrap();
 
-        let report = build_report(base);
+        let report = build_report(base, probe_session_tmpdir(None));
         match &report.seam_capture_conformance {
             SeamConformanceState::PolicyUnreadable { reason } => {
                 assert!(
@@ -12954,7 +13421,7 @@ mod tests {
         let base = dir.path();
 
         // Without required-hooks.json → NotConfigured.
-        let r1 = build_report(base);
+        let r1 = build_report(base, probe_session_tmpdir(None));
         assert_eq!(
             r1.schema_version, DOCTOR_SCHEMA_VERSION,
             "schema_version must match edition-active const"
@@ -12969,7 +13436,7 @@ mod tests {
         let audit_dir = base.join("audit");
         std::fs::create_dir_all(&audit_dir).unwrap();
         std::fs::write(audit_dir.join("required-hooks.json"), br#"["cc"]"#).unwrap();
-        let r2 = build_report(base);
+        let r2 = build_report(base, probe_session_tmpdir(None));
         assert_eq!(
             r2.schema_version, DOCTOR_SCHEMA_VERSION,
             "schema_version must match edition-active const"
@@ -13051,7 +13518,7 @@ mod tests {
         std::fs::write(&sentinel, b"").unwrap();
 
         // Act
-        let report = build_report(base);
+        let report = build_report(base, probe_session_tmpdir(None));
 
         // Assert: warning field is non-empty and names slot 3.
         assert!(
@@ -13169,7 +13636,7 @@ mod tests {
         std::fs::write(&sentinel, br#"{"schema":2}"#).unwrap();
 
         // Act
-        let report = build_report(base);
+        let report = build_report(base, probe_session_tmpdir(None));
 
         // Assert: pass0_skipped_slots non-empty and names slot 5.
         assert!(
@@ -13218,7 +13685,7 @@ mod tests {
         let base = dir.path();
         csq_core::accounts::launch_block::fixture::seed_shared_grant(base, 1, 2);
 
-        let json = serde_json::to_value(build_report(base)).unwrap();
+        let json = serde_json::to_value(build_report(base, probe_session_tmpdir(None))).unwrap();
         let rows = json["launch_blocked_slots"]
             .as_array()
             .expect("launch_blocked_slots must be present while a slot is suppressed");
@@ -13227,7 +13694,7 @@ mod tests {
         assert_eq!(rows[0]["holder"], 1);
 
         csq_core::accounts::launch_block::fixture::simulate_login(base, 2);
-        let json = serde_json::to_value(build_report(base)).unwrap();
+        let json = serde_json::to_value(build_report(base, probe_session_tmpdir(None))).unwrap();
         assert!(
             json.get("launch_blocked_slots").is_none(),
             "omitted once nothing is blocked: {json}"
@@ -13244,14 +13711,14 @@ mod tests {
         std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
         let dir = tempfile::TempDir::new().unwrap();
         let base = dir.path();
-        let json = serde_json::to_value(build_report(base)).unwrap();
+        let json = serde_json::to_value(build_report(base, probe_session_tmpdir(None))).unwrap();
         assert!(
             json.get("launch_blocked_unknown_state").is_none(),
             "a fresh install (no record) is not the unknown state: {json}"
         );
         csq_core::accounts::launch_block::fixture::seed_shared_grant(base, 1, 2);
         csq_core::accounts::launch_block::fixture::destroy_suppression_state(base);
-        let json = serde_json::to_value(build_report(base)).unwrap();
+        let json = serde_json::to_value(build_report(base, probe_session_tmpdir(None))).unwrap();
         assert_eq!(json["launch_blocked_unknown_state"], true, "{json}");
         let text = csq_core::accounts::launch_block::doctor_damaged_line();
         assert!(
@@ -13561,7 +14028,7 @@ mod tests {
         };
         write_record_v2(seed, Some(base)).unwrap();
 
-        let report = build_report(base);
+        let report = build_report(base, probe_session_tmpdir(None));
 
         // The grade must be reachable (the leveled chain → CONFORMANT or better).
         assert!(
@@ -14657,5 +15124,355 @@ mod tests {
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("the native-homes directory is a symlink (not followed)"));
         assert!(lines[0].contains(warn()));
+    }
+
+    #[test]
+    fn auto_rotate_check_sees_a_live_on_override_with_the_machine_setting_off() {
+        use super::{check_auto_rotate, AutoRotateReport};
+        let dir = tempfile::TempDir::new().unwrap();
+        let handle = dir.path().join(format!("term-{}", std::process::id()));
+        std::fs::create_dir_all(&handle).unwrap();
+        csq_core::accounts::markers::write_csq_account_legacy(
+            &handle,
+            csq_core::types::AccountNum::try_from(1u16).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(check_auto_rotate(dir.path()), AutoRotateReport::Off);
+        csq_core::rotation::session_override::write_override(
+            &handle,
+            csq_core::rotation::session_override::SessionRotationMode::On,
+        )
+        .unwrap();
+        assert_eq!(
+            check_auto_rotate(dir.path()),
+            AutoRotateReport::OffSessionsOn { live_on: 1 }
+        );
+    }
+
+    /// N5: an unlisted per-terminal state is a warning row, never "off".
+    #[test]
+    fn auto_rotate_report_is_unknown_when_terminals_cannot_be_listed() {
+        use super::{auto_rotate_operator_detail, auto_rotate_report, AutoRotateReport};
+        let off = csq_core::rotation::config::RotationConfig::default();
+        let report = auto_rotate_report::<()>(Ok(off.clone()), || None);
+        assert_eq!(report, AutoRotateReport::OffSessionsUnknown);
+        let (icon, text) = auto_rotate_operator_detail(&report, true);
+        assert_eq!(icon, warn());
+        assert!(text.contains("could not be listed"), "{text}");
+        assert_eq!(
+            auto_rotate_report::<()>(Ok(off.clone()), || Some(0)),
+            AutoRotateReport::Off
+        );
+    }
+
+    #[test]
+    fn auto_rotate_row_reflects_the_setting_and_the_daemon() {
+        use super::{auto_rotate_operator_detail, check_auto_rotate, AutoRotateReport};
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(check_auto_rotate(dir.path()), AutoRotateReport::Off);
+
+        csq_core::rotation::config::update(dir.path(), Some(80.0), Some(120)).unwrap();
+        csq_core::rotation::config::set_enabled(dir.path(), true).unwrap();
+        let on = check_auto_rotate(dir.path());
+        assert_eq!(
+            on,
+            AutoRotateReport::On {
+                threshold_percent: 80.0,
+                cooldown_secs: 120
+            }
+        );
+        let (_, serving) = auto_rotate_operator_detail(&on, true);
+        assert_eq!(serving, "on (threshold 80%, cooldown 120s)");
+        let (_, down) = auto_rotate_operator_detail(&on, false);
+        assert!(down.contains("no terminal will be moved"), "{down}");
+
+        let (_, off) = auto_rotate_operator_detail(&AutoRotateReport::Off, false);
+        assert!(off.starts_with("off"), "{off}");
+
+        // C3: machine off, but a live terminal carries its own `on`.
+        let (_, sessions_up) =
+            auto_rotate_operator_detail(&AutoRotateReport::OffSessionsOn { live_on: 2 }, true);
+        assert!(
+            sessions_up.contains("2 terminal(s) are set to on"),
+            "{sessions_up}"
+        );
+        let (icon_down, sessions_down) =
+            auto_rotate_operator_detail(&AutoRotateReport::OffSessionsOn { live_on: 2 }, false);
+        assert_eq!(icon_down, warn());
+        assert!(
+            sessions_down.contains("no terminal will be moved"),
+            "{sessions_down}"
+        );
+
+        std::fs::write(
+            csq_core::rotation::config::config_path(dir.path()),
+            b"{not valid json",
+        )
+        .unwrap();
+        assert_eq!(check_auto_rotate(dir.path()), AutoRotateReport::Unreadable);
+        let (_, bad) = auto_rotate_operator_detail(&AutoRotateReport::Unreadable, true);
+        assert!(bad.contains("unreadable"), "{bad}");
+        assert!(!bad.contains(dir.path().to_str().unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod memory_warn_row_tests {
+    use super::*;
+    use csq_core::session::recycle::{memory_record, write_memory};
+
+    #[test]
+    fn only_fresh_warn_terminals_get_a_row() {
+        let base = tempfile::tempdir().unwrap();
+        let t = "2026-11-03T00:00:00Z";
+        for (name, rec) in [
+            ("term-1", memory_record(Ok(3 << 30), 5 << 29, t)),
+            ("term-2", memory_record(Ok(1 << 30), 5 << 29, t)),
+            (
+                "term-3",
+                memory_record(Err("rss_sample_failed"), 5 << 29, t),
+            ),
+            ("config-9", memory_record(Ok(3 << 30), 5 << 29, t)),
+        ] {
+            let d = base.path().join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            write_memory(&d, &rec).unwrap();
+        }
+        assert_eq!(
+            check_memory_warn_sessions(base.path(), "2026-11-03T00:01:00Z"),
+            vec![MemoryWarnRow {
+                handle: "term-1".into(),
+                rss_bytes: 3 << 30,
+                warn_bytes: 5 << 29
+            }]
+        );
+        assert!(
+            check_memory_warn_sessions(base.path(), "2026-11-03T02:00:00Z").is_empty(),
+            "stale"
+        );
+        let lines = memory_warn_lines(&check_memory_warn_sessions(
+            base.path(),
+            "2026-11-03T00:01:00Z",
+        ));
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].starts_with("Session memory: term-1 at 3.0 GiB (warn 2.5 GiB)"),
+            "{lines:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_tmpdir_report_tests {
+    use super::*;
+
+    /// AC5: a terminal whose launch created `tmp/` 0700 reports the path, the
+    /// presence and the mode on both surfaces.
+    #[cfg(unix)]
+    #[test]
+    fn present_dir_reports_path_and_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let handle = tempfile::tempdir().unwrap();
+        let tmp = handle.path().join("tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let info = probe_session_tmpdir(Some(handle.path()));
+        assert_eq!(info.state, "present");
+        assert_eq!(info.mode.as_deref(), Some("0700"));
+        // The row carries the REDACTED path (`redact_path`), which equals the
+        // raw path only when the temp dir is outside `$HOME`.
+        let expected = csq_core::cli_deps::sanitize::redact_path(&tmp);
+        assert_eq!(info.path.as_deref(), Some(expected.as_str()));
+
+        let line = session_tmpdir_line(&info);
+        assert!(line.contains("present, mode 0700"), "{line}");
+
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["state"], "present");
+        assert_eq!(json["mode"], "0700");
+        assert_eq!(json["path"], expected);
+    }
+
+    /// A mode other than the launch-created 0700 is shown verbatim and flagged;
+    /// the probe never "corrects" it.
+    #[cfg(unix)]
+    #[test]
+    fn a_mode_other_than_0700_is_reported_verbatim_and_flagged() {
+        use std::os::unix::fs::PermissionsExt;
+        let handle = tempfile::tempdir().unwrap();
+        let tmp = handle.path().join("tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let info = probe_session_tmpdir(Some(handle.path()));
+        assert_eq!(info.state, "present");
+        assert_eq!(info.mode.as_deref(), Some("0755"));
+        let line = session_tmpdir_line(&info);
+        assert!(line.contains("present, mode 0755"), "{line}");
+        assert!(line.contains("expected 0700"), "{line}");
+        assert!(!line.contains(ok()), "{line}");
+    }
+
+    /// The resolved handle dir is still reported when its `tmp/` is missing, so
+    /// the operator sees WHICH dir is absent rather than a bare "unknown".
+    #[test]
+    fn absent_dir_reads_absent_with_a_known_path() {
+        let handle = tempfile::tempdir().unwrap();
+        let info = probe_session_tmpdir(Some(handle.path()));
+        assert_eq!(info.state, "absent");
+        assert!(info.mode.is_none());
+        let path = info
+            .path
+            .as_deref()
+            .expect("the path is known even when the dir is absent");
+        assert!(path.ends_with("/tmp") || path.ends_with("\\tmp"), "{path}");
+
+        let line = session_tmpdir_line(&info);
+        assert!(line.contains("(absent"), "{line}");
+
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["state"], "absent");
+        assert_eq!(json["path"], path);
+        assert!(json.get("mode").is_none(), "{json}");
+    }
+
+    /// An unresolvable terminal renders `unknown` with no path and no mode —
+    /// the "no failure may abort the rest of the report" arm.
+    #[test]
+    fn unresolvable_terminal_reads_unknown_without_a_path() {
+        let info = probe_session_tmpdir(None);
+        assert_eq!(info.state, "unknown");
+        assert!(info.path.is_none());
+        assert!(info.mode.is_none());
+
+        let line = session_tmpdir_line(&info);
+        assert!(line.contains("unknown"), "{line}");
+        assert!(line.contains("could not be resolved"), "{line}");
+
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["state"], "unknown");
+        assert!(json.get("path").is_none(), "{json}");
+        assert!(json.get("mode").is_none(), "{json}");
+    }
+
+    /// A non-directory at `<handle>/tmp` is not a usable per-session TMPDIR:
+    /// the launch refuses it, so the probe must not report it as present.
+    #[test]
+    fn a_file_at_the_path_is_not_a_per_session_tmpdir() {
+        let handle = tempfile::tempdir().unwrap();
+        std::fs::write(handle.path().join("tmp"), b"not a dir").unwrap();
+        let info = probe_session_tmpdir(Some(handle.path()));
+        assert_eq!(info.state, "invalid");
+        assert!(info.mode.is_none());
+        let line = session_tmpdir_line(&info);
+        assert!(line.contains("invalid"), "{line}");
+        assert!(line.contains("session_tmpdir_unavailable"), "{line}");
+    }
+
+    /// A symlinked `tmp/` is refused by the launch (never followed), so the
+    /// probe reports `invalid` and never the foreign target's mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_path_is_invalid_and_its_target_is_not_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let handle = tempfile::tempdir().unwrap();
+        let target = handle.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&target, handle.path().join("tmp")).unwrap();
+
+        let info = probe_session_tmpdir(Some(handle.path()));
+        assert_eq!(info.state, "invalid");
+        assert!(
+            info.mode.is_none(),
+            "the symlink target's mode must not be reported: {info:?}"
+        );
+    }
+
+    /// an internal ticket R1 F1: the non-Claude launch surfaces resolve through their own
+    /// environment (`CODEX_HOME` / `GEMINI_CLI_HOME` / `TMPDIR`), so the
+    /// candidate check must accept a `term-<pid>` dir under the accounts base
+    /// and reject everything else instead of guessing.
+    #[test]
+    fn a_term_handle_under_the_base_is_a_candidate_and_anything_else_is_not() {
+        let base = tempfile::tempdir().unwrap();
+        let handle = base.path().join("term-4242");
+        std::fs::create_dir(&handle).unwrap();
+
+        assert_eq!(
+            handle_dir_candidate(base.path(), &handle),
+            Some(handle.canonicalize().unwrap())
+        );
+        let legacy = base.path().join("config-3");
+        std::fs::create_dir(&legacy).unwrap();
+        assert_eq!(handle_dir_candidate(base.path(), &legacy), None);
+        let outside = tempfile::tempdir().unwrap();
+        assert_eq!(handle_dir_candidate(base.path(), outside.path()), None);
+        assert_eq!(
+            handle_dir_candidate(base.path(), &base.path().join("term-missing")),
+            None,
+            "a candidate that does not resolve is never returned"
+        );
+    }
+
+    /// an internal ticket R2 N5: the TMPDIR row is `redact_path`-reduced, never the raw
+    /// path. A path under `$HOME` renders with `~`, so neither the text row nor
+    /// the JSON field prints the host username. `HOME` is process-global; the
+    /// test restores it before returning.
+    #[test]
+    fn the_session_tmpdir_row_redacts_the_home_prefix() {
+        let home = tempfile::tempdir().unwrap();
+        let handle = home.path().join("term-4242");
+        std::fs::create_dir(&handle).unwrap();
+        std::fs::create_dir(handle.join("tmp")).unwrap();
+
+        let _env = csq_core::platform::test_env::lock();
+        let previous = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let info = probe_session_tmpdir(Some(&handle));
+        match previous {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let path = info.path.as_deref().unwrap();
+        assert!(
+            path.starts_with("~/"),
+            "the home prefix must be redacted: {path}"
+        );
+        assert!(
+            !path.contains(home.path().to_str().unwrap()),
+            "the raw home path must never be rendered: {path}"
+        );
+    }
+
+    /// The probed row is carried into the assembled report and its JSON
+    /// envelope — the wire contract, not just the helper's return value.
+    #[test]
+    fn build_report_carries_the_probed_row_into_json() {
+        let base = tempfile::tempdir().unwrap();
+        let handle = tempfile::tempdir().unwrap();
+        let tmp = handle.path().join("tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let report = build_report(base.path(), probe_session_tmpdir(Some(handle.path())));
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["session_tmpdir"]["state"], "present");
+        // The wire value is the REDACTED path (`redact_path`), not the raw one:
+        // on Windows a temp dir lives under `C:\Users\<user>` and is reduced to
+        // `~`, while macOS/Linux temp dirs sit outside `$HOME`. Pin the
+        // contract, not the platform.
+        assert_eq!(
+            json["session_tmpdir"]["path"],
+            csq_core::cli_deps::sanitize::redact_path(&tmp)
+        );
+        #[cfg(unix)]
+        assert_eq!(json["session_tmpdir"]["mode"], "0700");
     }
 }

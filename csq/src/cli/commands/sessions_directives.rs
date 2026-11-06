@@ -252,6 +252,13 @@ fn resolve_calling_session(
             attempts: None,
             next_allowed_at: None,
         },
+        CallerError::HandleDirUnlisted => DirectiveError {
+            code: SdkErrorCode::Undetermined,
+            message: "no live session owns the handle dir this process names".to_string(),
+            cause: None,
+            attempts: None,
+            next_allowed_at: None,
+        },
     })
 }
 

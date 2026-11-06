@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, cleanup } from "@testing-library/svelte";
+import { render, cleanup, fireEvent } from "@testing-library/svelte";
 import { tick } from "svelte";
 
 // ── Tauri IPC mocks ────────────────────────────────────────────────
@@ -113,19 +113,50 @@ describe("Header", () => {
   // daemon status info (with the longer "daemon running" phrasing) lives
   // in the SettingsPopover About section.
 
-  it("surfaces the keychain orphan sweep's warning and action-needed states", async () => {
+  it("surfaces the keychain orphan sweep's warning and action-needed states in plain language", async () => {
+    const summary =
+      "needs action: the keychain could not be enumerated (enumeration_unavailable) for 31 min";
+    for (const [level, label] of [
+      ["needs_action", "Keychain: needs attention"],
+      ["warn", "Keychain: cleanup incomplete"],
+    ] as const) {
+      cleanup();
+      setupMocks({
+        get_daemon_status: {
+          running: true,
+          pid: 42,
+          keychain_orphans: { level, summary, status: { undetermined: "enumeration_unavailable" } },
+        },
+      });
+      const { container } = render(Header);
+      await settle();
+      const badge = container.querySelector('[data-testid="keychain-orphans"]');
+      expect(badge?.textContent?.trim()).toBe(label);
+      // The tooltip is one short line, never the backend's counter summary.
+      expect(badge?.getAttribute("title")).not.toContain("enumeration_unavailable");
+      expect(badge?.getAttribute("title")?.length).toBeLessThan(80);
+    }
+  });
+
+  it("opens the keychain details popover from the header chip", async () => {
     setupMocks({
       get_daemon_status: {
         running: true,
         pid: 42,
-        keychain_orphans: { level: "needs_action", summary: "needs action: enumeration_unavailable" },
+        keychain_orphans: {
+          level: "warn",
+          summary: "wall of counters",
+          status: { orphan_candidates: 1, kept_sole_copy: 1, pending: 0 },
+        },
       },
     });
     const { container } = render(Header);
     await settle();
-    const badge = container.querySelector('[data-testid="keychain-orphans"]');
-    expect(badge?.textContent?.trim()).toBe("Keychain: action needed");
-    expect(badge?.getAttribute("title")).toContain("enumeration_unavailable");
+    await fireEvent.click(container.querySelector('[data-testid="keychain-orphans"]')!);
+    await settle();
+    const panel = container.querySelector('[data-testid="keychain-orphans-panel"]');
+    expect(panel?.querySelectorAll("li")).toHaveLength(2);
+    expect(panel?.textContent).not.toContain("wall of counters");
   });
 
   it("shows nothing for the orphan sweep when it is ok, info, or never published", async () => {

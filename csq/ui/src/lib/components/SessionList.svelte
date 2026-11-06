@@ -2,6 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { homeDir, join } from "@tauri-apps/api/path";
   import { untrack } from "svelte";
+  import SessionRotationControl from "./SessionRotationControl.svelte";
 
   // ── Types ─────────────────────────────────────────────────
   //
@@ -44,6 +45,13 @@
     term_pane: number | null;
     iterm_profile: string | null;
     terminal_title: string | null;
+    /// The csq terminal number (`term-<pid>`) parsed from the basename of
+    /// `config_dir`; `null` for a session not in a handle dir. Per-session
+    /// auto-swap is keyed on THIS, never on `pid` (the `claude` process).
+    handle_pid?: number | null;
+    /// Whether the daemon rotator can ever move this terminal (Claude Code
+    /// sign-in session). Gates the per-session control.
+    rotation_eligible?: boolean;
   }
 
   // ── State ─────────────────────────────────────────────────
@@ -379,6 +387,15 @@
                 {/if}
               {/if}
             </div>
+            <!--
+              The control addresses the terminal's handle dir (`handle_pid`,
+              from `config_dir`), not the `claude` process, and shows only where
+              the backend says the rotator can move the session
+              (`rotation_eligible`): not a third-party or native-CLI terminal.
+            -->
+            {#if session.handle_pid != null && session.rotation_eligible === true}
+              <SessionRotationControl pid={session.handle_pid} />
+            {/if}
           </div>
         </div>
       {/each}

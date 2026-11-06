@@ -14,7 +14,10 @@ use super::{state::SlashCmd, types::SessionIdentity};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::{fmt, sync::Arc};
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
 const DOMAIN: &[u8] = b"csq.relay.owner-telegram.command.v1\0";
@@ -92,7 +95,10 @@ pub(crate) enum OwnerAuthError {
 /// at `OwnerVerifier::verify` and delivery consumption at `authorize_delivery`.
 pub(crate) struct AuthorizedOwnerCommand {
     fields: OwnerCommandFields,
-    instance: Arc<()>,
+    instance: Arc<AtomicBool>,
+    deadline: Instant,
+    clock: WallClock,
+    time_high_water: Arc<Mutex<Option<u64>>>,
 }
 
 impl fmt::Debug for AuthorizedOwnerCommand {
@@ -107,6 +113,104 @@ impl AuthorizedOwnerCommand {
     pub(in crate::relay) fn command(&self) -> SlashCmd {
         self.fields.command.slash()
     }
+
+    pub(in crate::relay) fn target(&self) -> SessionIdentity {
+        SessionIdentity {
+            pid: self.fields.target_pid,
+            started_at: self.fields.target_started_at,
+        }
+    }
+
+    pub(in crate::relay) fn relay(&self) -> SessionIdentity {
+        SessionIdentity {
+            pid: self.fields.relay_pid,
+            started_at: self.fields.relay_started_at,
+        }
+    }
+
+    pub(in crate::relay) const fn deadline(&self) -> Instant {
+        self.deadline
+    }
+}
+
+type WallClock = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+fn wall_clock_ms() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis()
+        .try_into()
+        .ok()
+}
+
+fn observe_time(high_water: &Mutex<Option<u64>>, now: Option<u64>) -> Result<u64, OwnerAuthError> {
+    let now = now.ok_or(OwnerAuthError::ClockUnavailable)?;
+    let mut last = high_water
+        .lock()
+        .map_err(|_| OwnerAuthError::ClockUnavailable)?;
+    if last.is_some_and(|last| now < last) {
+        return Err(OwnerAuthError::ClockUnavailable);
+    }
+    *last = Some(now);
+    Ok(now)
+}
+
+/// Consumed provenance with live revocation. It owns no verifier borrow, so an
+/// operator can disable the verifier between command bytes and submission.
+pub(crate) struct DeliveryAuthority {
+    token: AuthorizedOwnerCommand,
+    failure: Mutex<Option<OwnerAuthError>>,
+}
+
+impl fmt::Debug for DeliveryAuthority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DeliveryAuthority(<revocable>)")
+    }
+}
+
+impl DeliveryAuthority {
+    pub(in crate::relay) fn command(&self) -> SlashCmd {
+        self.token.command()
+    }
+    pub(in crate::relay) const fn deadline(&self) -> Instant {
+        self.token.deadline()
+    }
+    pub(in crate::relay) fn target(&self) -> SessionIdentity {
+        self.token.target()
+    }
+    pub(in crate::relay) fn relay(&self) -> SessionIdentity {
+        self.token.relay()
+    }
+
+    /// Re-read wall time even when monotonic time stopped during suspend. Any
+    /// observed loss is terminal for this handle; it cannot recover on retry.
+    pub(in crate::relay) fn check(&self) -> Result<(), OwnerAuthError> {
+        let mut failure = self
+            .failure
+            .lock()
+            .map_err(|_| OwnerAuthError::ClockUnavailable)?;
+        if let Some(error) = *failure {
+            return Err(error);
+        }
+        let result = (|| {
+            if self.token.instance.load(Ordering::Acquire) {
+                return Err(OwnerAuthError::Disabled);
+            }
+            let now = observe_time(&self.token.time_high_water, (self.token.clock)())?;
+            if now < self.token.fields.issued_at_ms {
+                return Err(OwnerAuthError::ClockUnavailable);
+            }
+            if now >= self.token.fields.expires_at_ms || Instant::now() >= self.token.deadline {
+                return Err(OwnerAuthError::Expired);
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            *failure = Some(error);
+        }
+        result
+    }
 }
 
 /// Owned by one relay control loop. Key custody is supplied by the trusted
@@ -116,10 +220,11 @@ pub(crate) struct OwnerVerifier {
     target: SessionIdentity,
     relay: SessionIdentity,
     generation: [u8; 32],
-    instance: Arc<()>,
+    instance: Arc<AtomicBool>,
     enabled: bool,
     update_high_water: Option<u64>,
-    time_high_water: Option<u64>,
+    time_high_water: Arc<Mutex<Option<u64>>>,
+    clock: WallClock,
 }
 
 impl OwnerVerifier {
@@ -138,10 +243,11 @@ impl OwnerVerifier {
             target,
             relay,
             generation: fresh_generation(None)?,
-            instance: Arc::new(()),
+            instance: Arc::new(AtomicBool::new(false)),
             enabled: true,
             update_high_water: None,
-            time_high_water: None,
+            time_high_water: Arc::new(Mutex::new(None)),
+            clock: Arc::new(wall_clock_ms),
         })
     }
 
@@ -183,11 +289,17 @@ impl OwnerVerifier {
         {
             return Err(OwnerAuthError::Replay);
         }
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(wire.fields.expires_at_ms - now))
+            .ok_or(OwnerAuthError::ClockUnavailable)?;
         // Only a fully authenticated, live claim can advance the replay cursor.
         self.update_high_water = Some(wire.fields.update_id);
         Ok(AuthorizedOwnerCommand {
             fields: wire.fields,
             instance: Arc::clone(&self.instance),
+            deadline,
+            clock: Arc::clone(&self.clock),
+            time_high_water: Arc::clone(&self.time_high_water),
         })
     }
 
@@ -204,20 +316,23 @@ impl OwnerVerifier {
         self.check_fields(&token.fields, now)
     }
 
-    /// Consumes the non-Clone token and checks revocation/time again. Returning
-    /// the enum does not bypass the per-CLI table or any Enter gate.
+    /// Consumes provenance without renewing its verification-time deadline.
+    /// The returned authority still grants neither Idle nor an Enter bypass.
     pub(crate) fn authorize_delivery(
         &mut self,
         token: AuthorizedOwnerCommand,
         now_ms: Option<u64>,
-    ) -> Result<SlashCmd, OwnerAuthError> {
+    ) -> Result<DeliveryAuthority, OwnerAuthError> {
         self.revalidate(&token, now_ms)?;
-        Ok(token.command())
+        Ok(DeliveryAuthority {
+            token,
+            failure: Mutex::new(None),
+        })
     }
 
     pub(crate) fn disable(&mut self) {
         self.enabled = false;
-        self.instance = Arc::new(());
+        self.instance.store(true, Ordering::Release);
     }
 
     /// Only trusted local integration may call this; no control wire operation
@@ -234,6 +349,7 @@ impl OwnerVerifier {
         let generation = fresh_generation(Some(self.generation))?;
         self.key = key;
         self.generation = generation;
+        self.instance = Arc::new(AtomicBool::new(false));
         self.enabled = true;
         Ok(())
     }
@@ -247,12 +363,16 @@ impl OwnerVerifier {
     }
 
     fn read_time(&mut self, now_ms: Option<u64>) -> Result<u64, OwnerAuthError> {
-        let now = now_ms.ok_or(OwnerAuthError::ClockUnavailable)?;
-        if self.time_high_water.is_some_and(|last| now < last) {
-            return Err(OwnerAuthError::ClockUnavailable);
-        }
-        self.time_high_water = Some(now);
-        Ok(now)
+        observe_time(&self.time_high_water, now_ms)
+    }
+
+    #[cfg(test)]
+    pub(in crate::relay) fn set_clock_for_test(&mut self, clock: WallClock) {
+        assert!(
+            self.update_high_water.is_none(),
+            "clock fixture must precede verification"
+        );
+        self.clock = clock;
     }
 
     fn check_fields(&self, f: &OwnerCommandFields, now: u64) -> Result<(), OwnerAuthError> {
@@ -276,6 +396,12 @@ impl OwnerVerifier {
             return Err(OwnerAuthError::Expired);
         }
         Ok(())
+    }
+}
+
+impl Drop for OwnerVerifier {
+    fn drop(&mut self) {
+        self.disable();
     }
 }
 
@@ -343,10 +469,11 @@ mod tests {
                 started_at: 44,
             },
             generation: [0x77; 32],
-            instance: Arc::new(()),
+            instance: Arc::new(AtomicBool::new(false)),
             enabled: true,
             update_high_water: None,
-            time_high_water: None,
+            time_high_water: Arc::new(Mutex::new(None)),
+            clock: Arc::new(|| Some(NOW)),
         }
     }
 
@@ -419,7 +546,11 @@ mod tests {
             let raw = serde_json::to_vec(&mint(f, &KEY).unwrap()).unwrap();
             let wire = serde_json::from_slice(&raw).unwrap();
             let token = v.verify(wire, Some(NOW)).unwrap();
-            assert_eq!(v.authorize_delivery(token, Some(NOW + 1)), Ok(slash));
+            assert_eq!(
+                v.authorize_delivery(token, Some(NOW + 1))
+                    .map(|a| a.command()),
+                Ok(slash)
+            );
         }
     }
 
@@ -578,14 +709,15 @@ mod tests {
         let mut v = verifier();
         let token = verified(&mut v);
         assert_eq!(
-            v.authorize_delivery(token, Some(NOW + MAX_COMMAND_LIFETIME_MS)),
+            v.authorize_delivery(token, Some(NOW + MAX_COMMAND_LIFETIME_MS))
+                .map(|a| a.command()),
             Err(OwnerAuthError::Expired)
         );
         let mut v = verifier();
         let token = verified(&mut v);
         v.disable();
         assert_eq!(
-            v.authorize_delivery(token, Some(NOW)),
+            v.authorize_delivery(token, Some(NOW)).map(|a| a.command()),
             Err(OwnerAuthError::Disabled)
         );
         assert_eq!(
@@ -597,7 +729,9 @@ mod tests {
         let token = verified(&mut first);
         let mut second = verifier();
         assert_eq!(
-            second.authorize_delivery(token, Some(NOW)),
+            second
+                .authorize_delivery(token, Some(NOW))
+                .map(|a| a.command()),
             Err(OwnerAuthError::Invalid)
         );
     }
@@ -624,7 +758,8 @@ mod tests {
             Err(OwnerAuthError::Expired)
         );
         assert_eq!(
-            v.authorize_delivery(token, Some(NOW + 1)),
+            v.authorize_delivery(token, Some(NOW + 1))
+                .map(|a| a.command()),
             Err(OwnerAuthError::ClockUnavailable)
         );
     }
@@ -637,7 +772,7 @@ mod tests {
         v.reenable_local(Zeroizing::new(KEY)).unwrap();
         assert_ne!(v.generation(), old_fields.generation);
         assert_eq!(
-            v.authorize_delivery(token, Some(NOW)),
+            v.authorize_delivery(token, Some(NOW)).map(|a| a.command()),
             Err(OwnerAuthError::Invalid)
         );
         assert_eq!(
@@ -655,6 +790,96 @@ mod tests {
             ..fields(&v)
         };
         assert!(v.verify(mint(next, &KEY).unwrap(), Some(NOW)).is_ok());
+    }
+
+    #[test]
+    fn owner_delivery_authority_disable_reenable_and_drop_revoke_existing_handles() {
+        let mut v = verifier();
+        let token = verified(&mut v);
+        let deadline = token.deadline();
+        assert_eq!(token.target(), v.target());
+        assert_eq!(token.relay(), v.relay());
+        let delivery = v.authorize_delivery(token, Some(NOW)).unwrap();
+        assert_eq!(
+            delivery.deadline(),
+            deadline,
+            "R1_H2: authorization must not renew verification-time deadline"
+        );
+        assert_eq!(delivery.target(), v.target());
+        assert_eq!(delivery.relay(), v.relay());
+        assert_eq!(delivery.check(), Ok(()));
+        v.disable();
+        assert_eq!(
+            delivery.check(),
+            Err(OwnerAuthError::Disabled),
+            "R1_H2: disable between body and CR must revoke the held authority"
+        );
+        v.reenable_local(Zeroizing::new(KEY)).unwrap();
+        assert_eq!(
+            delivery.check(),
+            Err(OwnerAuthError::Disabled),
+            "R1_H2: fresh generation cannot resurrect an old handle"
+        );
+        let next = OwnerCommandFields {
+            update_id: 8,
+            ..fields(&v)
+        };
+        let token = v.verify(mint(next, &KEY).unwrap(), Some(NOW)).unwrap();
+        let replacement = v.authorize_delivery(token, Some(NOW)).unwrap();
+        assert_eq!(replacement.check(), Ok(()));
+        drop(v);
+        assert_eq!(
+            replacement.check(),
+            Err(OwnerAuthError::Disabled),
+            "R1_H2: verifier drop must revoke outstanding authority"
+        );
+    }
+
+    #[test]
+    fn owner_delivery_authority_checks_wall_expiry_rollback_and_unknown_on_every_call() {
+        use std::sync::atomic::AtomicU64;
+        for (changed, expected) in [
+            (NOW + MAX_COMMAND_LIFETIME_MS, OwnerAuthError::Expired),
+            (NOW - 1, OwnerAuthError::ClockUnavailable),
+            (0, OwnerAuthError::ClockUnavailable),
+        ] {
+            let mut v = verifier();
+            let now = Arc::new(AtomicU64::new(NOW));
+            let reader = Arc::clone(&now);
+            v.set_clock_for_test(Arc::new(move || match reader.load(Ordering::Acquire) {
+                0 => None,
+                value => Some(value),
+            }));
+            let token = verified(&mut v);
+            let delivery = v.authorize_delivery(token, Some(NOW)).unwrap();
+            assert_eq!(delivery.check(), Ok(()));
+            assert!(Instant::now() < delivery.deadline());
+            now.store(changed, Ordering::Release);
+            assert_eq!(
+                delivery.check(),
+                Err(expected),
+                "R1_LI: wall loss must revoke even while monotonic deadline is live"
+            );
+            now.store(NOW, Ordering::Release);
+            assert_eq!(
+                delivery.check(),
+                Err(expected),
+                "R1_H2: observed owner-authority loss must be terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_delivery_authority_preserves_deadline_across_authorization_delay() {
+        let mut v = verifier();
+        let token = verified(&mut v);
+        let deadline = token.deadline();
+        let delivery = v.authorize_delivery(token, Some(NOW + 1000)).unwrap();
+        assert_eq!(
+            delivery.deadline(),
+            deadline,
+            "R1_H2: audit delay must not remint the owner lifetime"
+        );
     }
 
     #[test]

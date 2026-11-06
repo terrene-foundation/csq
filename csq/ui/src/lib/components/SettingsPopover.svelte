@@ -4,6 +4,7 @@
   import { homeDir, join } from '@tauri-apps/api/path';
   import { tick } from 'svelte';
   import ApiKeyPoolPanel from './ApiKeyPoolPanel.svelte';
+  import AutoRotateSetting from './AutoRotateSetting.svelte';
 
   let { daemonRunning = false }: { daemonRunning?: boolean } = $props();
 
@@ -257,6 +258,8 @@
           to open the dashboard.
         </p>
       </section>
+
+      <AutoRotateSetting />
 
       {#if dockHideSupported}
         <section>

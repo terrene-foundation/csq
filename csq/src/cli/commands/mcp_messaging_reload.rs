@@ -291,6 +291,8 @@ mod native {
                     .env(MARKER, value)
                     .env(DIGEST, digest)
                     .exec();
+                // The server keeps serving after a refused reload.
+                csq_core::platform::process::restore_sigpipe_after_failed_exec();
                 Err(error)
             }
         }

@@ -296,6 +296,35 @@ pub fn handle_disable(base: &Path, args: &GateDisableArgs, json_output: bool) ->
     Ok(0)
 }
 
+/// True when this repository has a Gate activation on disk (with or without a
+/// pin). Used by the X1 `--sandbox` refusal: a sandbox launch cannot also honour
+/// the Gate, and silently dropping either one is not allowed. Any inspection
+/// error propagates so the caller can fail closed.
+pub(super) fn sandbox_gate_present(base: &Path) -> Result<bool> {
+    let repo = std::env::current_dir()
+        .and_then(fs::canonicalize)
+        .map_err(|_| anyhow!("gate launch directory unavailable"))?;
+    let repo = repository(&repo)?;
+    sandbox_gate_present_in(base, &repo)
+}
+
+/// [`sandbox_gate_present`] with the repository injected (tests).
+fn sandbox_gate_present_in(base: &Path, repo: &Path) -> Result<bool> {
+    let Some(dir) = directory(base, repo, false)? else {
+        return Ok(false);
+    };
+    let Some(bytes) = read_private(&config_path(&dir, repo))? else {
+        return Ok(false);
+    };
+    let activation: Activation = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow!("gate activation configuration invalid"))?;
+    if activation.repo != repo {
+        bail!("gate activation repository differs");
+    }
+    validate_metadata(&activation)?;
+    Ok(true)
+}
+
 /// Attach before passthrough arguments. No opt-in or missing pin leaves argv untouched.
 pub(super) fn attach(cmd: &mut Command, base: &Path, handle: &Path, rest: &[String]) -> Result<()> {
     let repo = std::env::current_dir()
@@ -303,6 +332,59 @@ pub(super) fn attach(cmd: &mut Command, base: &Path, handle: &Path, rest: &[Stri
         .map_err(|_| anyhow!("gate launch directory unavailable"))?;
     let repo = repository(&repo)?;
     attach_in_repo(cmd, base, handle, rest, &repo)
+}
+
+/// P2: a relaunch is a new launch. When a Gate is active for this repository
+/// AND its pin is present — the conditions under which [`attach`] would pin the
+/// child — the relaunch command must already carry the Gate-composed settings
+/// argument the original launch received. Otherwise a Gate that attached after
+/// the launch (or after the recycle gate recheck) would not be honoured by the
+/// relaunch. `Ok(())` when there is nothing to honour (no activation, or no pin:
+/// `attach` leaves argv untouched in both cases).
+#[cfg(unix)]
+pub(super) fn relaunch_gate_ok(cmd: &Command, base: &Path) -> Result<()> {
+    let repo = std::env::current_dir()
+        .and_then(fs::canonicalize)
+        .map_err(|_| anyhow!("gate launch directory unavailable"))?;
+    let repo = repository(&repo)?;
+    relaunch_gate_ok_in(cmd, base, &repo)
+}
+
+/// [`relaunch_gate_ok`] with the repository injected (tests).
+#[cfg(unix)]
+fn relaunch_gate_ok_in(cmd: &Command, base: &Path, repo: &Path) -> Result<()> {
+    let Some(dir) = directory(base, repo, false)? else {
+        return Ok(());
+    };
+    let Some(bytes) = read_private(&config_path(&dir, repo))? else {
+        return Ok(());
+    };
+    let activation: Activation = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow!("gate activation configuration invalid"))?;
+    if activation.repo != repo {
+        bail!("gate activation repository differs");
+    }
+    validate_metadata(&activation)?;
+    if !pin_present(&activation.pin)? {
+        return Ok(());
+    }
+    // `attach` writes its composed settings as `settings-<sha256(repo)>-<pid>.json`
+    // in the Gate state dir and appends `--settings <path>`; a command carrying
+    // such a path was pinned by the launch this relaunch replays.
+    let prefix = format!(
+        "settings-{}-",
+        csq_core::gate::registry::sha256(repo.as_os_str().as_encoded_bytes())
+    );
+    let pinned = cmd.get_args().any(|arg| {
+        Path::new(arg)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(&prefix))
+    });
+    if !pinned {
+        bail!("a Gate attached since the launch; the relaunch command is not Gate-pinned");
+    }
+    Ok(())
 }
 
 fn attach_in_repo(
@@ -459,6 +541,135 @@ mod tests {
         assert!(!base.path().join("gate").exists());
         fs::set_permissions(base.path(), fs::Permissions::from_mode(0o700)).unwrap();
     }
+    /// P2: a relaunch command must already carry the Gate-composed settings when
+    /// a Gate is active with a present pin; with no activation or no pin there is
+    /// nothing to honour (attach leaves argv untouched).
+    #[cfg(unix)]
+    #[test]
+    fn relaunch_gate_keeps_a_pinned_relaunch_and_refuses_an_unpinned_one() {
+        let base = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().canonicalize().unwrap();
+
+        let cmd = Command::new("claude");
+        assert!(
+            relaunch_gate_ok_in(&cmd, base.path(), &repo).is_ok(),
+            "no activation: nothing to honour"
+        );
+
+        let activation = Activation {
+            version: 1,
+            repo: repo.clone(),
+            pin: base.path().join("pin"),
+            adapter_manifest: base.path().join("manifest"),
+            expected_adapter_sha256: "a".repeat(64),
+        };
+        let dir = directory(base.path(), &repo, true).unwrap().unwrap();
+        write_private(
+            &config_path(&dir, &repo),
+            &serde_json::to_vec(&activation).unwrap(),
+        )
+        .unwrap();
+        let cmd = Command::new("claude");
+        assert!(
+            relaunch_gate_ok_in(&cmd, base.path(), &repo).is_ok(),
+            "an activation without a pin leaves argv untouched"
+        );
+
+        fs::write(&activation.pin, b"p").unwrap();
+        let cmd = Command::new("claude");
+        assert!(
+            relaunch_gate_ok_in(&cmd, base.path(), &repo).is_err(),
+            "a Gate that would pin, with an unpinned relaunch, refuses"
+        );
+
+        let sha = csq_core::gate::registry::sha256(repo.as_os_str().as_encoded_bytes());
+        let mut cmd = Command::new("claude");
+        cmd.arg("--settings")
+            .arg(dir.join(format!("settings-{sha}-{}", std::process::id())));
+        assert!(
+            relaunch_gate_ok_in(&cmd, base.path(), &repo).is_ok(),
+            "a relaunch carrying the Gate-composed settings is pinned"
+        );
+    }
+
+    /// R1 D1: `--sandbox` refuses exactly when a Gate activation exists.
+    /// The mechanism is a read-back of the same activation file `attach` uses.
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_gate_detection_sees_an_activation_and_absence() {
+        let base = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let repo = repo.path().canonicalize().unwrap();
+        assert!(
+            !sandbox_gate_present_in(base.path(), &repo).unwrap(),
+            "no activation => not present"
+        );
+        let activation = Activation {
+            version: 1,
+            repo: repo.clone(),
+            pin: base.path().join("pin"),
+            adapter_manifest: base.path().join("manifest"),
+            expected_adapter_sha256: "a".repeat(64),
+        };
+        let dir = directory(base.path(), &repo, true).unwrap().unwrap();
+        write_private(
+            &config_path(&dir, &repo),
+            &serde_json::to_vec(&activation).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            sandbox_gate_present_in(base.path(), &repo).unwrap(),
+            "a written activation must be detected"
+        );
+    }
+
+    /// R2 item 6: the `--sandbox` refusal fires against a REAL Gate activation
+    /// written by the production writer, not an injected boolean. Falsifier:
+    /// the detector returning false for a present activation would let the
+    /// launch proceed, and the tag assertions fail.
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_refuses_against_a_real_gate_activation_fixture() {
+        let base = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().canonicalize().unwrap();
+        let activation = Activation {
+            version: 1,
+            repo: repo.clone(),
+            pin: base.path().join("pin"),
+            adapter_manifest: base.path().join("manifest"),
+            expected_adapter_sha256: "a".repeat(64),
+        };
+        let dir = directory(base.path(), &repo, true).unwrap().unwrap();
+        write_private(
+            &config_path(&dir, &repo),
+            &serde_json::to_vec(&activation).unwrap(),
+        )
+        .unwrap();
+        let options = crate::cli::commands::launch_x1::X1Options {
+            sandbox: true,
+            ..Default::default()
+        };
+        let error = crate::cli::commands::run::x1_refusal_gate_with(
+            base.path(),
+            csq_core::cli_deps::SurfaceCli::Claude,
+            &options,
+            &[],
+            |base| sandbox_gate_present_in(base, &repo),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(crate::cli::commands::launch_x1::TAG_SANDBOX_GATE_ACTIVE),
+            "{error}"
+        );
+        assert!(
+            !error.contains(crate::cli::commands::launch_x1::TAG_SANDBOX_GATE_UNVERIFIABLE),
+            "{error}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn repository_local_base_without_opt_in_preserves_native_launch() {

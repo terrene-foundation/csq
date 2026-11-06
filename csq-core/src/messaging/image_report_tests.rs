@@ -296,11 +296,12 @@ mod file_tests {
         let who = VerifiedSession::from_resolved(Sender {
             pid: 44,
             started_at: 45,
-            surface: Surface::Codex,
+            surface: Surface::Codex.into(),
             handle_dir_hash: "a".repeat(64),
             handle_dir: path.to_string_lossy().into_owned(),
             name: None,
             started_exact: Some(46),
+            service: None,
         });
         let mut raw = serde_json::to_value(report()).unwrap();
         raw["child"]["pid"] = json!(std::process::id());

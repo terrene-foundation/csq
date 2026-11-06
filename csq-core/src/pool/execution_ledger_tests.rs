@@ -225,6 +225,50 @@ fn execution_ledger_monthly_day_boundary_is_utc_and_repeats() {
 }
 
 #[test]
+fn execution_ledger_day_31_resets_on_the_last_day_of_shorter_months() {
+    let base = TempDir::new().unwrap();
+    let mut key = candidate(1.0);
+    key.entry.reset = Some(Reset::Day { day_of_month: 31 });
+    let mut ledger = BudgetLedger::open(base.path()).unwrap();
+    let horizon = at("2199-01-01T00:00:00Z");
+    // Spend the whole cap on April 29, inside the 2100-03-31..2100-04-30 window.
+    let spent = held(ledger.reserve(&key, DOLLAR, at("2100-04-29T12:00:00Z"), horizon));
+    ledger.settle(&spent, DOLLAR).unwrap();
+    // Still the same window the instant before April 30 00:00 UTC.
+    assert!(matches!(
+        ledger.reserve(&key, 1, at("2100-04-29T23:59:59Z"), horizon),
+        Ok(ReserveResult::CapBlocked)
+    ));
+    // April has no 31st, so the window rolls over at April 30 00:00 UTC.
+    held(ledger.reserve(&key, DOLLAR, at("2100-04-30T00:00:00Z"), horizon));
+}
+
+#[test]
+fn execution_ledger_day_29_resets_on_feb_28_when_not_a_leap_year_and_feb_29_when_leap() {
+    // 2100 is not a leap year; 2104 is.
+    for (feb_last, before, probe) in [
+        ("2100-02-28", "2100-02-27T23:59:59Z", "2100-02-28T00:00:00Z"),
+        ("2104-02-29", "2104-02-28T23:59:59Z", "2104-02-29T00:00:00Z"),
+    ] {
+        let base = TempDir::new().unwrap();
+        let mut key = candidate(1.0);
+        key.entry.reset = Some(Reset::Day { day_of_month: 29 });
+        let mut ledger = BudgetLedger::open(base.path()).unwrap();
+        let horizon = at("2199-01-01T00:00:00Z");
+        let spent = held(ledger.reserve(&key, DOLLAR, at(before), horizon));
+        ledger.settle(&spent, DOLLAR).unwrap();
+        assert!(
+            matches!(
+                ledger.reserve(&key, 1, at(before), horizon),
+                Ok(ReserveResult::CapBlocked)
+            ),
+            "{feb_last}: spend inside the window must stay blocked"
+        );
+        held(ledger.reserve(&key, DOLLAR, at(probe), horizon));
+    }
+}
+
+#[test]
 fn execution_ledger_iso_reset_is_one_time_with_added_at_as_initial_window() {
     let base = TempDir::new().unwrap();
     let mut key = candidate(1.0);

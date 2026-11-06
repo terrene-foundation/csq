@@ -89,13 +89,20 @@ fn hook_json(event: HookEvent, text: &str) -> String {
 /// The notice for a message whose framed body cannot fit on its own. Header values are
 /// csq-authored (a uuid, a closed surface name, a pid); no peer text appears.
 fn too_large_notice(m: &MessageView) -> String {
+    // A service has no process identity: say what it is instead of printing a session
+    // shape (`service pid 0`) the recipient could misread. `is_service_sender` consults
+    // the record's ORIGIN as well as the surface, so an origin-Service record whose sender
+    // block disagrees is still described as a service (the frame withholds its body).
+    let sender = if m.is_service_sender() {
+        "a registered service (not a session)".to_string()
+    } else {
+        format!("{} pid {}", m.from_surface.as_str(), m.from_pid)
+    };
     format!(
-        "[csq: message {} from {} pid {} is waiting; it is too large to show here. \
+        "[csq: message {} from {} is waiting; it is too large to show here. \
 Read it with the csq inbox tool with mark:\"read\" or \
 `csq sessions inbox --messages --pending --mark-read`.]",
-        m.id,
-        m.from_surface.as_str(),
-        m.from_pid
+        m.id, sender
     )
 }
 
@@ -366,11 +373,12 @@ mod tests {
         Sender {
             pid,
             started_at: 5_000,
-            surface,
+            surface: surface.into(),
             handle_dir_hash: format!("h{pid}"),
             handle_dir: format!("/h/{pid}"),
             name: None,
             started_exact: None,
+            service: None,
         }
     }
     fn ses(pid: u32, surface: Surface) -> VerifiedSession {
@@ -973,5 +981,62 @@ mod tests {
                 out.chars().count()
             );
         }
+    }
+
+    /// an internal ticket — the oversized-pointer notice names a service as a service, never as a
+    /// session with pid 0.
+    #[test]
+    fn the_oversized_notice_never_presents_a_service_as_a_session() {
+        let id = "1a2b3c4d-abcd-4000-8000-000000000000";
+        let registration_id = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        let message: crate::messaging::model::Message = serde_json::from_value(serde_json::json!({
+            "schema": "csq.message.v1",
+            "id": id,
+            "from": {"pid": 0, "started_at": 7, "surface": "service",
+                     "handle_dir_hash": "", "handle_dir": "",
+                     "service": {"name": "nightly", "registration_id": registration_id}},
+            "to": {"pid": 2, "started_at": 5, "surface": "codex"},
+            "origin": {"Service": {"name": "nightly", "registration_id": registration_id}},
+            "thread": id,
+            "body": "nightly backup failed",
+            "created_at": 1
+        }))
+        .unwrap();
+        let notice = too_large_notice(&message.view());
+        assert!(
+            notice.contains("from a registered service (not a session)"),
+            "{notice}"
+        );
+        assert!(!notice.contains("pid 0"), "{notice}");
+        assert!(!notice.contains("[peer msg"), "{notice}");
+    }
+
+    /// LOW-1 — the ORIGIN decides service-ness as well as the surface: an origin-Service
+    /// record whose sender block claims a session surface is still described as a service
+    /// (the render path withholds its body rather than showing it as a peer). Falsifier: a
+    /// surface-only check prints `claude-code pid 0` here.
+    #[test]
+    fn a_service_origin_with_a_session_sender_block_is_never_a_pid_notice() {
+        let id = "1a2b3c4d-abcd-4000-8000-000000000001";
+        let registration_id = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        let message: crate::messaging::model::Message = serde_json::from_value(serde_json::json!({
+            "schema": "csq.message.v1",
+            "id": id,
+            "from": {"pid": 0, "started_at": 7, "surface": "claude-code",
+                     "handle_dir_hash": "", "handle_dir": ""},
+            "to": {"pid": 2, "started_at": 5, "surface": "codex"},
+            "origin": {"Service": {"name": "nightly", "registration_id": registration_id}},
+            "thread": id,
+            "body": "nightly backup failed",
+            "created_at": 1
+        }))
+        .unwrap();
+        let notice = too_large_notice(&message.view());
+        assert!(
+            notice.contains("from a registered service (not a session)"),
+            "{notice}"
+        );
+        assert!(!notice.contains("pid 0"), "{notice}");
+        assert!(!notice.contains("claude-code"), "{notice}");
     }
 }

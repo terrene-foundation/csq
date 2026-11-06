@@ -13,16 +13,48 @@ use std::{
 };
 use tempfile::TempDir;
 const NOW: u64 = 100_000;
+
+/// Falsifiers: a pid/start-dependent service id would differ between the two calls; using
+/// the session digest domain would collide with a session id.
+#[test]
+fn a_service_request_id_is_stable_across_processes_and_registration_bound() {
+    let record = crate::messaging::service::ServiceRecord {
+        v: 1,
+        name: "nightly".to_string(),
+        uid: 7,
+        registration_id: "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".to_string(),
+        created_at: 9,
+    };
+    let token = format!("{NOW}.{}", uuid::Uuid::new_v4());
+    let first = service_request_id(&record, &token).unwrap();
+    assert_eq!(first, service_request_id(&record, &token).unwrap());
+    assert!(crate::sessions::directives::canonical_uuid(&first));
+    let mut reregistered = record.clone();
+    reregistered.registration_id = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4e".to_string();
+    assert_ne!(
+        first,
+        service_request_id(&reregistered, &token).unwrap(),
+        "a new registration must not replay the old identity's key"
+    );
+    let session = who(1);
+    assert_ne!(
+        first,
+        request_id(session.sender(), &token).unwrap(),
+        "service and session digests are separate domains"
+    );
+}
+
 #[cfg(test)]
 fn who(pid: u32) -> VerifiedSession {
     VerifiedSession::from_resolved(Sender {
         pid,
         started_at: 100,
         started_exact: Some(100_000 + u64::from(pid)),
-        surface: Surface::Codex,
+        surface: Surface::Codex.into(),
         handle_dir_hash: format!("fixture{pid}"),
         handle_dir: "/fixture".into(),
         name: None,
+        service: None,
     })
 }
 fn live(_: &Recipient) -> Liveness {

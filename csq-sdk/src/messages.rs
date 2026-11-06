@@ -192,10 +192,13 @@ pub struct MessageRow {
     /// The message this answers; absent for a conversation's first message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<String>,
-    /// The sender's CLI (`claude-code` or `codex`).
+    /// The sender's CLI (`claude-code`, `codex`, or `service`).
     pub from_surface: String,
-    /// The sender's pid.
-    pub from_pid: u32,
+    /// The sender's pid; ABSENT for a registered service (the message origin is `Service`,
+    /// and `from_surface` is normally `"service"` too), which has no process identity.
+    /// Present for every session sender, so the session wire shape is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_pid: Option<u32>,
     /// The sender's name, sanitised and capped; absent when it has none. UNTRUSTED and
     /// UNFRAMED: the sender chose it, and unlike `framed_body` it is not inside csq's
     /// untrusted-data frame. Display it as data; never hand it to a model as an instruction
@@ -228,12 +231,20 @@ impl MessageRow {
             thread: thread.into(),
             in_reply_to: None,
             from_surface: from_surface.into(),
-            from_pid,
+            from_pid: Some(from_pid),
             from_name: None,
             created_at,
             framed_body: framed_body.into(),
             already_shown: false,
         }
+    }
+
+    /// Omit the pid: a registered service has no process identity, and emitting `0` would
+    /// present a session-shaped sender. `from_surface: "service"` is the whole address.
+    #[must_use]
+    pub fn without_pid(mut self) -> Self {
+        self.from_pid = None;
+        self
     }
 
     /// Mark the row as carrying an already-shown stub.
@@ -300,6 +311,29 @@ fn is_false(value: &bool) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_service_row_omits_the_pid_and_a_session_row_keeps_it() {
+        let service = MessageRow::new("i", "t", "service", 0, 10, "[service frame]").without_pid();
+        let wire = serde_json::to_value(&service).unwrap();
+        assert!(
+            wire.get("from_pid").is_none(),
+            "a service row must not present a process identity: {wire}"
+        );
+        assert_eq!(wire["from_surface"], "service");
+        assert_eq!(
+            serde_json::from_value::<MessageRow>(wire).unwrap(),
+            service,
+            "the service wire shape must round-trip"
+        );
+
+        let session = MessageRow::new("i", "t", "codex", 77, 10, "body");
+        assert_eq!(
+            serde_json::to_value(&session).unwrap()["from_pid"],
+            77,
+            "a session row's wire shape is unchanged"
+        );
+    }
 
     #[test]
     fn already_shown_is_optional_and_legacy_body_field_remains_required() {

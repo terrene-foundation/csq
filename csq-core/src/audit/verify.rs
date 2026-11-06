@@ -2914,6 +2914,152 @@ mod tests {
         let _ = LocalSigningKey::delete_from_keychain(&svc, chain_id);
     }
 
+    /// A `RecycleRequest` record is first-class for THIS build: it verifies as a KNOWN kind
+    /// (never counted unknown) and a tampered payload breaks the canonical hash.
+    #[test]
+    fn recycle_request_kind_is_typed_here_and_tamper_evident() {
+        let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let mut rec = sample_v2_record("R0");
+        rec.kind = EventKind::RecycleRequest;
+        rec.payload = EventPayload::RecycleRequest(crate::audit::types::RecycleRequestPayload {
+            requester_handle: "/h/req".to_string(),
+            requester_pid: 4242,
+            requester_session_id: "99999999-8888-7777-6666-555555555555".to_string(),
+            target_handle: "/h/target".to_string(),
+            session_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
+            nonce_sha256: Some("a".repeat(64)),
+            ttl_secs: Some(120),
+            outcome: crate::audit::types::RecycleRequestOutcome::Issued,
+        });
+        write_record_v2(rec, Some(base)).unwrap();
+        let cfg = sandbox_config(std::process::id());
+        let summary = verify_chain(base, &cfg, None).expect("the typed record must verify");
+        assert_eq!(summary.verified_count, 1);
+        assert_eq!(
+            summary.unknown_kind_count, 0,
+            "a kind this build knows is never counted unknown"
+        );
+        // Tamper the payload without re-sealing: canonical_hash no longer matches.
+        let chain_json: crate::audit::persist::ChainGenesis = serde_json::from_str(
+            &std::fs::read_to_string(base.join("csq-runs/chain.json")).unwrap(),
+        )
+        .unwrap();
+        let path = base
+            .join("csq-runs")
+            .join(format!("{}.jsonl", chain_json.chain_id));
+        let line = std::fs::read_to_string(&path).unwrap();
+        let needle = "\"requester_pid\":4242";
+        assert!(
+            line.contains(needle),
+            "fixture payload shape drifted: {line}"
+        );
+        std::fs::write(&path, line.replace(needle, "\"requester_pid\":4243")).unwrap();
+        assert!(
+            matches!(
+                verify_chain(base, &cfg, None),
+                Err(LedgerError::IntegrityBroken { .. })
+            ),
+            "a tampered RecycleRequest payload must be IntegrityBroken"
+        );
+    }
+
+    /// Build a signed record whose TOP-LEVEL kind is unknown to this build but whose payload is
+    /// the REAL `RecycleRequest` shape — what an older reader meets on a newer chain.
+    fn build_signed_future_recycle(
+        chain_id: &str,
+        record_id: &str,
+        kind: &str,
+        signing_key: &LocalSigningKey,
+    ) -> serde_json::Value {
+        use crate::audit::opaque::{canonical_bytes_for_opaque_check4, OpaqueRecord};
+        use crate::audit::persist::sha256_hex;
+        let mut rec = serde_json::json!({
+            "schema_version": "2",
+            "record_id": record_id,
+            "chain_id": chain_id,
+            "seq": 0,
+            "prev_hash": Sha256Hex::GENESIS,
+            "kind": kind,
+            "payload": { "kind": "recycle_request", "data": {
+                "requester_handle": "/h/req",
+                "requester_pid": 4242,
+                "target_handle": "/h/target",
+                "session_id": "123e4567-e89b-12d3-a456-426614174000",
+                "nonce_sha256": "a".repeat(64),
+                "ttl_secs": 120,
+                "outcome": "issued"
+            }},
+            "ts": "2026-05-28T12:00:00+00:00",
+            "key_id": signing_key.key_id().as_str(),
+            "canonical_hash": Sha256Hex::GENESIS,
+            "signature": "0".repeat(128),
+        });
+        let opaque: OpaqueRecord = serde_json::from_value(rec.clone()).expect("opaque parse");
+        let real_hash = sha256_hex(&canonical_bytes_for_opaque_check4(&opaque));
+        rec["canonical_hash"] = serde_json::Value::String(real_hash.clone());
+        let sig = signing_key.sign(&hex32(&real_hash)).unwrap();
+        rec["signature"] = serde_json::to_value(sig).unwrap();
+        rec
+    }
+
+    /// The OLD-READER view of a `RecycleRequest`. This build knows the kind, so the simulation is
+    /// the SAME payload under a top-level kind this build does not know — the opaque gate keys
+    /// only on kind unknownness. The record is not invisible: its integrity verifies and
+    /// `unknown_kind_count` reports it; tampering is still caught.
+    #[test]
+    fn an_older_reader_view_of_a_recycle_request_verifies_counts_and_catches_tampering() {
+        let _env_guard = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        let chain_id = "01JZ0000000000000000000C12";
+        let (tmp, svc, key) = setup_signed_chain("recycle_kind_opaque", chain_id);
+        let rec = build_signed_future_recycle(
+            chain_id,
+            "01JZ0000000000000000000D12",
+            "recycle_request_v9",
+            &key,
+        );
+        write_jsonl(
+            tmp.path(),
+            chain_id,
+            &[serde_json::to_string(&rec).unwrap()],
+        );
+        let cfg = VerifyConfig {
+            record_limit: 10_000,
+            keychain_service: svc.clone(),
+        };
+        let summary = verify_chain(tmp.path(), &cfg, None).expect("opaque record verifies");
+        assert_eq!(summary.verified_count, 1);
+        assert_eq!(
+            summary.unknown_kind_count, 1,
+            "an old reader must SEE the record, not skip it"
+        );
+        // Tamper the real payload field without re-sealing.
+        let path = tmp
+            .path()
+            .join("csq-runs")
+            .join(format!("{chain_id}.jsonl"));
+        let line = std::fs::read_to_string(&path).unwrap();
+        let needle = "\"requester_pid\":4242";
+        assert!(
+            line.contains(needle),
+            "fixture payload shape drifted: {line}"
+        );
+        std::fs::write(&path, line.replace(needle, "\"requester_pid\":4243")).unwrap();
+        assert!(
+            matches!(
+                verify_chain(tmp.path(), &cfg, None),
+                Err(LedgerError::IntegrityBroken { seq: 0, .. })
+            ),
+            "a tampered opaque RecycleRequest payload must be IntegrityBroken"
+        );
+        let _ = LocalSigningKey::delete_from_keychain(&svc, chain_id);
+    }
+
     /// T3 — an unknown-kind record with a VALID canonical_hash but a WRONG
     /// signature fails Check 5 → InvalidSignature (not accepted as opaque-intact).
     #[test]
@@ -6467,5 +6613,92 @@ mod tests {
         {
             let _ = out; // avoid unused warning in enterprise build
         }
+    }
+
+    /// an internal ticket — a `ServiceMessage` record is a KNOWN kind: `verify_chain` decodes it typed
+    /// and does NOT count it as unknown/opaque. Falsifier: without the `EventPayload`
+    /// variant or the `kind()` arm the record would fail to parse (`IntegrityBroken`) or be
+    /// counted in `unknown_kind_count`; both assertions below would move.
+    #[test]
+    fn service_message_kind_verifies_typed() {
+        use crate::audit::types::{
+            ServiceMessageOutcome, ServiceMessagePayload, ServiceTargetSurface,
+        };
+        let _lock = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        let chain_id = "01JZ0000000000000000000K01";
+        let (tmp, svc, key) = setup_signed_chain("service_message_typed", chain_id);
+        let mut record = sample_v2_record("S01");
+        record.chain_id = RecordId::try_new(chain_id).unwrap();
+        record.kind = EventKind::ServiceMessage;
+        record.payload = EventPayload::ServiceMessage(ServiceMessagePayload {
+            service: "nightly".to_string(),
+            registration_id: "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".to_string(),
+            service_uid: 501,
+            target_pid: 1234,
+            target_started_at: 1_700_000_000,
+            target_surface: ServiceTargetSurface::Codex,
+            key_sha256: Some("a".repeat(64)),
+            outcome: ServiceMessageOutcome::Admitted,
+        });
+        record.key_id = key.key_id();
+        let line = seal_known(record, &key);
+        write_jsonl(tmp.path(), chain_id, &[line]);
+        let result = verify_chain(
+            tmp.path(),
+            &VerifyConfig {
+                record_limit: 100,
+                keychain_service: svc.clone(),
+            },
+            None,
+        );
+        assert!(
+            matches!(&result, Ok(summary)
+                if summary.verified_count == 1 && summary.unknown_kind_count == 0),
+            "a ServiceMessage record must verify as a known/typed kind: {result:?}"
+        );
+        let _ = LocalSigningKey::delete_from_keychain(&svc, chain_id);
+    }
+
+    /// an internal ticket — a `ServiceMessageRefused` record is ALSO a KNOWN kind: `verify_chain` decodes
+    /// it typed and does NOT count it as unknown/opaque, even though its optional fields are
+    /// absent (a pre-load refusal has no service name and no registration). Falsifier:
+    /// without the `EventPayload` variant or the `kind()` arm the record would fail to parse
+    /// (`IntegrityBroken`) or be counted in `unknown_kind_count`; both assertions move.
+    #[test]
+    fn service_message_refused_kind_verifies_typed() {
+        use crate::audit::types::{ServiceMessageRefusalPayload, ServiceRefusal};
+        let _lock = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        let chain_id = "01JZ0000000000000000000K02";
+        let (tmp, svc, key) = setup_signed_chain("service_message_refused_typed", chain_id);
+        let mut record = sample_v2_record("S02");
+        record.chain_id = RecordId::try_new(chain_id).unwrap();
+        record.kind = EventKind::ServiceMessageRefused;
+        record.payload = EventPayload::ServiceMessageRefused(ServiceMessageRefusalPayload {
+            service: None,
+            service_uid: Some(501),
+            registration_id: None,
+            refusal: ServiceRefusal::ServiceNameInvalid,
+        });
+        record.key_id = key.key_id();
+        let line = seal_known(record, &key);
+        write_jsonl(tmp.path(), chain_id, &[line]);
+        let result = verify_chain(
+            tmp.path(),
+            &VerifyConfig {
+                record_limit: 100,
+                keychain_service: svc.clone(),
+            },
+            None,
+        );
+        assert!(
+            matches!(&result, Ok(summary)
+                if summary.verified_count == 1 && summary.unknown_kind_count == 0),
+            "a ServiceMessageRefused record must verify as a known/typed kind: {result:?}"
+        );
+        let _ = LocalSigningKey::delete_from_keychain(&svc, chain_id);
     }
 }

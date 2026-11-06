@@ -440,6 +440,26 @@ pub fn process_start_time(pid: u32) -> Option<u64> {
     }
 }
 
+/// `(parent pid, start time)` of `pid` read in ONE platform call (Linux: one `/proc/<pid>/stat`
+/// read; macOS: one `PROC_PIDTBSDINFO`), so a recycled pid cannot pair its new parent with
+/// the old start time or the reverse. `None` when either cannot be read.
+#[must_use]
+pub fn process_ppid_and_start(pid: u32) -> Option<(u32, u64)> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::ppid_and_start(pid)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::ppid_and_start(pid)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// The parent pid of `pid`, or `None` when it cannot be read (the process is gone or the
 /// platform call failed).
 #[must_use]
@@ -524,7 +544,10 @@ pub fn ancestor_path_with<T: Ord + Copy>(
             }
             child_start = parent_start;
         }
-        if cur == pid {
+        // `cur > 1`: pid 0/1 are the chain's ROOTS, never an ancestor of anything. The
+        // order matters — testing `cur == pid` first made pid 1 read as an ancestor of
+        // EVERY process.
+        if cur == pid && cur > 1 {
             return Some(Some(between));
         }
         if cur <= 1 {
@@ -914,6 +937,57 @@ pub(crate) fn between_hop_chain(
 #[must_use]
 pub fn is_session_hop(pid: u32, start: u64) -> Option<bool> {
     between_hop_is_session(pid, start, &ancestor_start, &hop_probe)
+}
+
+/// The nearest-session walk's predicate: a hop is a session if its IMAGE says so, or if a
+/// Claude registry entry exists for that pid.
+///
+/// The image test alone misses a RENAMED COPY of a CLI binary (a new basename, a different
+/// inode, outside the versioned dir, not `node`): `image_verdict` reads it as "not a
+/// session", so a nested conversation launched from such a copy is invisible to the walk and
+/// could recycle the session that launched it. The registry is the second signal, and it is
+/// consulted ONLY where the image did not already prove a session. An unreadable or
+/// ambiguous registry read is UNKNOWN — never "not a session".
+#[must_use]
+pub fn hop_is_session_with(
+    pid: u32,
+    start: u64,
+    image: &dyn Fn(u32, u64) -> Option<bool>,
+    registry: &dyn Fn(u32) -> Option<bool>,
+) -> Option<bool> {
+    match image(pid, start) {
+        Some(true) => Some(true),
+        known_image => match registry(pid) {
+            Some(true) => Some(true),
+            // A positively-absent registry entry only DECIDES anything when the image was
+            // itself readable; an unreadable image stays UNKNOWN.
+            Some(false) if known_image == Some(false) => Some(false),
+            _ => None,
+        },
+    }
+}
+
+/// [`hop_is_session_with`] over the real image probe and Claude's own session registry
+/// (`$HOME/.claude/sessions/<pid>.json`).
+///
+/// The registry consult is Unix-only (the reader is), so on a platform without one the
+/// registry port answers UNKNOWN — never "not a session". The predicate itself must exist
+/// everywhere: `resolve_caller` takes it unconditionally.
+#[must_use]
+pub fn hop_is_session(pid: u32, start: u64) -> Option<bool> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    hop_is_session_with(pid, start, &is_session_hop, &|p| {
+        #[cfg(unix)]
+        {
+            let home = home.as_deref()?;
+            crate::sessions::lifecycle::registry_entry_present(p, home).ok()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (&home, p);
+            None
+        }
+    })
 }
 
 fn hop_probe(pid: u32) -> HopProbe {
@@ -1441,6 +1515,12 @@ pub enum CallerError {
     Undetermined(String),
     /// Positively not the calling session: not an ancestor, or its pid was recycled.
     TargetMismatch,
+    /// The listing was COMPLETE (not restricted, not incomplete, no unreadable same-name
+    /// process) and positively carries no row for the handle dir the caller names. That is
+    /// the shape a HEADLESS session has: no controlling terminal, so the listing classifier
+    /// never makes it a row. It is a distinct class, not `Undetermined`, because a caller
+    /// that may retry by another proof must be able to tell this apart from "could not see".
+    HandleDirUnlisted,
 }
 
 /// The session a caller was proved to be running inside. Only [`resolve_caller`] builds one,
@@ -1489,7 +1569,7 @@ impl ResolvedCaller {
     /// or a limit key). A handle dir that could not be canonicalised is `Undetermined`: a
     /// different path is never hashed in its place.
     pub fn verified(&self) -> Result<crate::messaging::VerifiedSession, CallerError> {
-        use crate::messaging::{Sender, Surface, VerifiedSession};
+        use crate::messaging::{Sender, SenderSurface, VerifiedSession};
         use sha2::{Digest, Sha256};
         let canon = self.canonical.as_ref().ok_or_else(|| {
             CallerError::Undetermined("the session's handle dir could not be resolved".into())
@@ -1500,13 +1580,14 @@ impl ResolvedCaller {
             pid: self.pid,
             started_at: self.started_at,
             surface: match self.kind {
-                CliKind::Claude => Surface::ClaudeCode,
-                CliKind::Codex => Surface::Codex,
+                CliKind::Claude => SenderSurface::ClaudeCode,
+                CliKind::Codex => SenderSurface::Codex,
             },
             handle_dir_hash: hash,
             handle_dir: dir,
             name: None,
             started_exact: self.started_exact,
+            service: None,
         }))
     }
 }
@@ -1593,11 +1674,7 @@ pub fn resolve_caller(
         .filter(|s| canon(&s.config_dir) == want)
         .collect();
     let one = match owners.as_slice() {
-        [] => {
-            return Err(undetermined(&format!(
-                "no live {comm} session owns this handle dir"
-            )))
-        }
+        [] => return Err(CallerError::HandleDirUnlisted),
         [one] => *one,
         _ => {
             return Err(undetermined(&format!(
@@ -1711,7 +1788,9 @@ pub fn resolve_caller_from_env() -> Result<ResolvedCaller, CallerError> {
         listing.visibility(),
         Some(dir),
         &ancestor_path_of_current,
-        &is_session_hop,
+        // The walk's predicate, NOT the image-only probe: a renamed copy of a CLI binary is
+        // caught by its registry entry (see `hop_is_session_with`).
+        &hop_is_session,
         &process_start_time,
     )?;
     caller.started_exact = exact_start_if_unchanged(caller.pid, caller.started_at);
@@ -2226,7 +2305,7 @@ mod tests {
         );
         let v = r.verified().unwrap();
         let sender = v.sender();
-        assert_eq!(sender.surface, crate::messaging::Surface::Codex);
+        assert_eq!(sender.surface, crate::messaging::Surface::Codex.into());
         assert_eq!(sender.pid, 50);
         assert_eq!(sender.handle_dir, real_s);
         assert_eq!(sender.handle_dir_hash.len(), 64);
@@ -2236,7 +2315,10 @@ mod tests {
             .all(|c| c.is_ascii_hexdigit()));
         assert_eq!(sender.name, None);
         let c = go(CliKind::Claude).unwrap().verified().unwrap();
-        assert_eq!(c.sender().surface, crate::messaging::Surface::ClaudeCode);
+        assert_eq!(
+            c.sender().surface,
+            crate::messaging::Surface::ClaudeCode.into()
+        );
     }
 
     #[test]
@@ -2244,7 +2326,14 @@ mod tests {
         let ok = |s: &[SessionInfo], un: &[u32], v: Visibility| {
             resolve(CliKind::Codex, s, un, v, Some(true), Some(100))
         };
-        assert!(is_undetermined(ok(&[], &[], Visibility::WHOLE)), "no match");
+        // "No match" is its OWN class, not undetermined: the listing was complete and
+        // positively carries no row for this dir (the headless shape), and a caller may
+        // retry it by another proof. Every other case below stays undetermined.
+        assert_eq!(
+            ok(&[], &[], Visibility::WHOLE).unwrap_err(),
+            CallerError::HandleDirUnlisted,
+            "no match"
+        );
         let two = [cli_session(1, D, Some(100)), cli_session(2, D, Some(100))];
         assert!(is_undetermined(ok(&two, &[], Visibility::WHOLE)), "two");
         // two owners are ambiguous even when only one has a start time
@@ -2447,6 +2536,52 @@ mod tests {
             Some(Some(vec![]))
         );
         assert_eq!(ancestor_path_with(99, 10, &parents, &starts), Some(None));
+        // pid 0/1 are the chain's ROOTS, never an ancestor of anything. Testing
+        // `cur == pid` before `cur <= 1` made pid 1 read as an ancestor of EVERY process.
+        assert_eq!(ancestor_path_with(1, 10, &parents, &starts), Some(None));
+        assert_eq!(ancestor_path_with(0, 10, &parents, &starts), Some(None));
+    }
+
+    /// A renamed COPY of a CLI binary is not recognised by image name, so the nearest-session
+    /// walk would miss it and let a nested conversation reclaim its parent. The registry entry
+    /// is the second signal; an unreadable registry stays UNKNOWN (fail closed).
+    #[test]
+    fn a_renamed_cli_copy_is_a_session_hop_through_its_registry_entry() {
+        let not_a_session_image = |_: u32, _: u64| Some(false);
+        // The renamed copy: the image says "not a session", the registry says one owns it.
+        assert_eq!(
+            hop_is_session_with(100, 5, &not_a_session_image, &|_| Some(true)),
+            Some(true)
+        );
+        // Registry UNREADABLE ⇒ UNKNOWN, never "not a session".
+        assert_eq!(
+            hop_is_session_with(100, 5, &not_a_session_image, &|_| None),
+            None
+        );
+        // No entry and a readable non-session image ⇒ the walk continues as before.
+        assert_eq!(
+            hop_is_session_with(100, 5, &not_a_session_image, &|_| Some(false)),
+            Some(false)
+        );
+        // The image already proves a session: the registry is never consulted.
+        assert_eq!(
+            hop_is_session_with(100, 5, &|_, _| Some(true), &|_| panic!(
+                "the registry must not be read when the image already proves a session"
+            )),
+            Some(true)
+        );
+        // An UNREADABLE image with no registry entry stays UNKNOWN.
+        assert_eq!(
+            hop_is_session_with(100, 5, &|_, _| None, &|_| Some(false)),
+            None
+        );
+        // The pid and start reach the image probe unchanged (a stub that ignored them would
+        // hide a wiring bug that fed the wrong hop).
+        let bound = |p: u32, s: u64| Some(p == 100 && s == 5);
+        assert_eq!(
+            hop_is_session_with(100, 5, &bound, &|_| panic!("not consulted")),
+            Some(true)
+        );
     }
 
     /// Resolve `claimed` as the owner with `between` the processes the walk found between

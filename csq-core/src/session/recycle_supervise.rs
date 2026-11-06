@@ -2255,13 +2255,21 @@ mod tests {
         assert_eq!(res.outcome, Outcome::Interrupted);
         assert_eq!(res.tag.as_deref(), Some("recycle_interrupted_by_signal"));
         let new_pid = res.new_pid.unwrap();
-        assert_eq!(log_lines(&r).len(), 2, "the replacement WAS spawned");
+        // The spawn is evidenced by the supervisor's own record, not the stub's log: the forwarded
+        // SIGTERM can land before the replacement shell reaches its first `echo >> log`.
+        assert_ne!(new_pid, first_pid(&r), "the replacement WAS spawned");
         assert!(
             !alive(new_pid),
             "the forwarded SIGTERM stopped the replacement"
         );
         let out = String::from_utf8(s.out).unwrap();
         assert!(out.contains("RECYCLE INTERRUPTED by signal 15"), "{out}");
+        assert!(
+            out.contains(&format!(
+                "(pid {new_pid}) was started and the signal was forwarded to it"
+            )),
+            "{out}"
+        );
         assert!(
             !SignalWindow::handler_installed(libc::SIGTERM),
             "dispositions restored"

@@ -13,11 +13,13 @@ use csq_core::platform::env_check::{self, EnvIssue};
 use csq_core::providers::catalog::Surface;
 use csq_core::providers::codex::surface as codex_surface;
 use csq_core::refresh::sentinel::LoginNeededState;
+use csq_core::rotation::session_override::{self, SessionRotationMode};
 use csq_core::session;
 use csq_core::types::AccountNum;
 
 use super::codex_supervise;
-use std::collections::BTreeSet;
+use super::launch_x1::{self, X1Launch, X1Options};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -128,8 +130,18 @@ pub fn handle(
     no_auto_update_cli: bool,
     track_latest: bool,
     no_audit: bool,
+    auto_swap: Option<SessionRotationMode>,
+    sandbox: bool,
+    allow_env: &[String],
     rest: &[String],
 ) -> Result<()> {
+    // Fact Guard X1 options are decided once here and carried, unchanged, into
+    // every launch arm (including a codex swap relaunch). The plan and the
+    // receipt write happen inside each arm, after its handle dir exists.
+    let x1_options = X1Options {
+        sandbox,
+        allow_env: allow_env.iter().cloned().collect(),
+    };
     // Enterprise license gate (task #77 shard 3). `csq run` is the primary surface of
     // the enterprise binary; gating it here is what makes the pre-built use-only binary
     // "useless without a key" (see `csq_core::license` module docs). Full per-op
@@ -172,12 +184,38 @@ pub fn handle(
     let account = match account {
         Some(a) => a,
         None => {
-            // 0 accounts — launch vanilla claude
+            // 0 accounts — launch vanilla claude. Fact Guard X1's command-line
+            // refusals run BEFORE the preflight advisory and any side effect;
+            // there is no slot to write a receipt for on this arm, but a
+            // conflicting or Gate-colliding `--sandbox` must not be dropped.
+            if x1_options.sandbox {
+                if csq_core::launch_isolation::sandbox_conflict(rest) {
+                    return Err(anyhow!(
+                        "{}: --sandbox cannot be combined with a bypass, settings, \
+                         plugin, hook or approval-delegating flag; pass the CLI's own \
+                         flags after `--`",
+                        launch_x1::TAG_SANDBOX_CONFLICT
+                    ));
+                }
+                match super::gate_launch::sandbox_gate_present(base_dir) {
+                    Ok(false) => {}
+                    Ok(true) | Err(_) => {
+                        return Err(anyhow!(
+                            "{}: this repository has an active csq Gate; --sandbox and \
+                             the Gate cannot both be honoured",
+                            launch_x1::TAG_SANDBOX_GATE_ACTIVE
+                        ));
+                    }
+                }
+            }
             provider_session_policy::emit_warning(
                 provider_session_policy::check_unknown_launch_with_args(base_dir, rest)?,
             );
+            if auto_swap.is_some() {
+                return Err(anyhow!(AUTO_SWAP_NO_SESSION_MESSAGE));
+            }
             println!("No accounts configured — launching vanilla claude.");
-            return exec_claude(base_dir, &claude_home, rest);
+            return exec_claude(base_dir, &claude_home, rest, &x1_options);
         }
     };
 
@@ -188,6 +226,21 @@ pub fn handle(
     // are already open are not touched.
     csq_core::accounts::launch_block::check_launch(base_dir, account.get())
         .map_err(|message| anyhow!(message))?;
+
+    // M19b + H2/M3: determine the dispatch surface ONCE here, before BOTH the
+    // audit-record construction below (so the v1 `AuditRecord` carries the
+    // ACTUAL dispatched surface, not a hardcoded `cc`) AND the pre-flight /
+    // dispatch ladder farther down. Reusing this single value preserves the
+    // TOCTOU-closing "determine surface once" invariant (the pre-flight block
+    // below documents it) AND fixes the M19b mislabel bug where every
+    // codex/gemini run recorded `surface: cc` in its own audit record.
+    let surface_for_preflight = surface_cli_for_slot(base_dir, account);
+
+    // Fact Guard X1 command-line refusals (R1 D3): every refusal that depends
+    // only on flags runs HERE, before the Kimi migration writes its marker, the
+    // launch log, cli_deps' auto-update legs, the audit emitter, keychain sync
+    // and any handle-dir creation.
+    x1_refusal_gate(base_dir, surface_for_preflight, &x1_options, rest)?;
 
     // Move Kimi slots still on the retired csq default (`kimi-k3[1m]`) to
     // K3.1 Pro before the slot's settings are read for the launch. AFTER the
@@ -202,15 +255,6 @@ pub fn handle(
     // diagnostic, not load-bearing. Errors logged at WARN with redacted
     // context per security.md.
     append_launch_log(base_dir, "run", account);
-
-    // M19b + H2/M3: determine the dispatch surface ONCE here, before BOTH the
-    // audit-record construction below (so the v1 `AuditRecord` carries the
-    // ACTUAL dispatched surface, not a hardcoded `cc`) AND the pre-flight /
-    // dispatch ladder farther down. Reusing this single value preserves the
-    // TOCTOU-closing "determine surface once" invariant (the pre-flight block
-    // below documents it) AND fixes the M19b mislabel bug where every
-    // codex/gemini run recorded `surface: cc` in its own audit record.
-    let surface_for_preflight = surface_cli_for_slot(base_dir, account);
 
     // Audit trail (PR-CA10c): construct emitter with the true start_ts
     // captured here, before any spawn step.  All remaining fields are filled
@@ -291,6 +335,7 @@ pub fn handle(
     // 3P collision check: if the slot is marked 3P but also has a
     // Codex/Gemini canonical present, the on-disk state is incoherent.
     if is_third_party && surface_for_preflight != SurfaceCli::Claude {
+        end_run_before_spawn(&mut audit_emitter);
         return Err(anyhow!(
             "slot {account} is in an inconsistent state \
              (3P provider binding present AND Codex/Gemini canonical symlink present). \
@@ -299,30 +344,58 @@ pub fn handle(
         ));
     }
 
+    // `--auto-swap` is only meaningful where the daemon rotator can move the
+    // session: a Claude Code OAuth handle dir. Refuse everywhere else BEFORE any
+    // spawn, instead of recording a setting nothing will ever act on.
+    if auto_swap.is_some() {
+        let accounts = discovery::discover_all(base_dir);
+        if let Some(message) = auto_swap_refusal(
+            auto_swap,
+            base_dir,
+            &accounts,
+            account,
+            is_third_party,
+            surface_for_preflight,
+        ) {
+            end_run_before_spawn(&mut audit_emitter);
+            return Err(anyhow!(message));
+        }
+    }
+
     if surface_for_preflight == SurfaceCli::Claude {
-        let _ = provider_session_policy::check_claude_launch(
+        if let Err(error) = provider_session_policy::check_claude_launch(
             base_dir,
             &claude_home,
             account,
             None,
             rest,
-        )?;
+        ) {
+            end_run_before_spawn(&mut audit_emitter);
+            return Err(error);
+        }
     } else {
-        let _ = provider_session_policy::check_unknown_launch_with_args(base_dir, rest)?;
+        if let Err(error) = provider_session_policy::check_unknown_launch_with_args(base_dir, rest)
+        {
+            end_run_before_spawn(&mut audit_emitter);
+            return Err(error);
+        }
     }
 
     // Probe: skip for 3P slots (they redirect at the network layer, no
     // versioned CLI binary to probe). For all other surfaces, run the
     // shared pre-flight gate via cli_deps_gate::enforce (H4).
     if !is_third_party {
-        super::cli_deps_gate::enforce(
+        if let Err(error) = super::cli_deps_gate::enforce(
             surface_for_preflight,
             ignore_cli_version,
             no_auto_update_cli,
             track_latest,
             base_dir,
             &format!("csq run {account}"),
-        )?;
+        ) {
+            end_run_before_spawn(&mut audit_emitter);
+            return Err(error);
+        }
     }
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -365,6 +438,7 @@ pub fn handle(
             CodexLaunchAudit::First(Box::new(codex_pre_spawn)),
             /* swap_correlation */ None,
             /* messaging */ None,
+            &x1_options,
         );
     }
 
@@ -373,6 +447,7 @@ pub fn handle(
     // Gemini — no daemon prerequisite, no token refresh, no fanout.
     if surface_for_preflight == SurfaceCli::Gemini {
         if let Some(profile_id) = profile {
+            end_run_before_spawn(&mut audit_emitter);
             return Err(anyhow!(
                 "--profile is not supported for Gemini slots (slot {account} is Gemini, requested: {profile_id})"
             ));
@@ -389,6 +464,7 @@ pub fn handle(
             coc_cache_enabled,
             rest,
             &mut audit_emitter,
+            &x1_options,
         );
     }
 
@@ -406,6 +482,7 @@ pub fn handle(
     // `match` has no wildcard, so that omission is a build failure instead.
     if let Some(native_surface) = surface_for_preflight.native_surface() {
         if let Some(profile_id) = profile {
+            end_run_before_spawn(&mut audit_emitter);
             return Err(anyhow!(
                 "--profile is not supported for native-CLI slots (slot {account} is \
                  {native_surface}, requested: {profile_id})"
@@ -423,6 +500,7 @@ pub fn handle(
             coc_cache_enabled,
             rest,
             &mut audit_emitter,
+            &x1_options,
         );
     }
 
@@ -444,9 +522,11 @@ pub fn handle(
     // disk by construction, so gating it here would be a no-op at best.
     if !is_third_party {
         if let Some(refusal) = login_needed_launch_refusal(base_dir, account) {
+            end_run_before_spawn(&mut audit_emitter);
             return Err(anyhow!(refusal));
         }
         if csq_core::accounts::profiles::resolve_slot_to_uuid(base_dir, account.get()).is_none() {
+            end_run_before_spawn(&mut audit_emitter);
             return Err(anyhow!(
                 "no identity record for account {} — run `csq login {}` to authenticate",
                 account,
@@ -468,10 +548,17 @@ pub fn handle(
     // SEC-2.15 (unified, R1 M1): secure the accounts root (config-N's
     // parent) fail-closed first — create_dir_all below would otherwise
     // create a virgin root at the process umask.
-    csq_core::platform::fs::ensure_private_dir_root(base_dir)
-        .map_err(|e| anyhow::anyhow!("accounts_root_refused: {e}"))?;
+    if let Err(error) = csq_core::platform::fs::ensure_private_dir_root(base_dir)
+        .map_err(|e| anyhow::anyhow!("accounts_root_refused: {e}"))
+    {
+        end_run_before_spawn(&mut audit_emitter);
+        return Err(error);
+    }
     let config_dir = base_dir.join(format!("config-{}", account));
-    std::fs::create_dir_all(&config_dir)?;
+    if let Err(error) = std::fs::create_dir_all(&config_dir) {
+        end_run_before_spawn(&mut audit_emitter);
+        return Err(error.into());
+    }
 
     // Mark account on config-N (permanent identity).
     //
@@ -480,22 +567,46 @@ pub fn handle(
     // `profiles.json::by_slot` carries a mapping; otherwise we fall
     // back to the legacy decimal slot id. The filename is unchanged.
     match csq_core::accounts::profiles::resolve_slot_to_uuid(base_dir, account.get()) {
-        Some(uuid) => markers::write_csq_account(&config_dir, uuid)?,
-        None => markers::write_csq_account_legacy(&config_dir, account)?,
+        Some(uuid) => {
+            if let Err(error) = markers::write_csq_account(&config_dir, uuid) {
+                end_run_before_spawn(&mut audit_emitter);
+                return Err(error.into());
+            }
+        }
+        None => {
+            if let Err(error) = markers::write_csq_account_legacy(&config_dir, account) {
+                end_run_before_spawn(&mut audit_emitter);
+                return Err(error.into());
+            }
+        }
     }
-    markers::write_current_account(&config_dir, account)?;
+    if let Err(error) = markers::write_current_account(&config_dir, account) {
+        end_run_before_spawn(&mut audit_emitter);
+        return Err(error.into());
+    }
 
     // Mark onboarding complete on config-N
-    session::mark_onboarding_complete(&config_dir)?;
+    if let Err(error) = session::mark_onboarding_complete(&config_dir) {
+        end_run_before_spawn(&mut audit_emitter);
+        return Err(error.into());
+    }
 
     if is_third_party {
         if let Some(profile_id) = profile {
+            end_run_before_spawn(&mut audit_emitter);
             return Err(anyhow!(
                 "--profile is not supported for third-party slots (slot {account} is already provider-bound, requested: {profile_id})"
             ));
         }
 
-        launch_third_party(base_dir, &claude_home, account, rest, &mut audit_emitter)
+        launch_third_party(
+            base_dir,
+            &claude_home,
+            account,
+            rest,
+            &mut audit_emitter,
+            &x1_options,
+        )
     } else {
         // Anthropic OAuth path. The login-needed gate + the identity-record
         // check already ran above, before any write — re-resolve here only
@@ -517,9 +628,15 @@ pub fn handle(
                         account
                     )
                 })?;
-        let canonical = credentials::load(&canonical_path).with_context(|| {
-            format!("failed to load canonical credentials for account {account}")
-        })?;
+        let canonical = match credentials::load(&canonical_path) {
+            Ok(canonical) => canonical,
+            Err(error) => {
+                end_run_before_spawn(&mut audit_emitter);
+                return Err(error).with_context(|| {
+                    format!("failed to load canonical credentials for account {account}")
+                });
+            }
+        };
 
         // Warn if token is already expired
         if canonical
@@ -546,11 +663,26 @@ pub fn handle(
 
         // Profile support deferred
         if let Some(profile_id) = profile {
+            end_run_before_spawn(&mut audit_emitter);
             return Err(anyhow!(
                 "--profile support is not yet implemented (requested: {profile_id})"
             ));
         }
 
+        #[cfg(unix)]
+        RECYCLE_CTX.with(|c| {
+            *c.borrow_mut() = Some(RecycleCtx {
+                base_dir: base_dir.to_path_buf(),
+                rest: rest.to_vec(),
+                surface: surface_for_preflight,
+                ignore_cli_version,
+                track_latest,
+                layer_enabled: capability_layer_enabled,
+                toggles: persisted_toggles,
+                debug,
+                coc_cache_enabled,
+            });
+        });
         launch_anthropic(
             base_dir,
             &claude_home,
@@ -561,10 +693,131 @@ pub fn handle(
             debug,
             bench_mode,
             coc_cache_enabled,
+            auto_swap,
             rest,
             &mut audit_emitter,
+            &x1_options,
         )
     }
+}
+
+/// Fact Guard X1's flag-only refusals, checked before any launch side effect.
+///
+/// - `--sandbox` + a refused/bypass flag: `csq_run_sandbox_bypass_conflict`.
+/// - `--sandbox` on a non-Claude surface: `csq_run_sandbox_unsupported`.
+/// - `--sandbox` in a Gate-activated repository: `csq_run_sandbox_gate_active`
+///   (the Gate's hooks and a pinned `manual` mode cannot both be honoured; a
+///   failed Gate inspection also refuses, fail closed).
+/// - `--allow-env` on Gemini: `csq_run_allow_env_unsupported` (fixed allowlist).
+fn x1_refusal_gate(
+    base_dir: &Path,
+    surface: SurfaceCli,
+    options: &X1Options,
+    rest: &[String],
+) -> Result<()> {
+    x1_refusal_gate_with(
+        base_dir,
+        surface,
+        options,
+        rest,
+        super::gate_launch::sandbox_gate_present,
+    )
+}
+
+/// [`x1_refusal_gate`] with the Gate detector injected, so the ACTIVE and
+/// UNVERIFIABLE branches are directly testable without a real activation or a
+/// process-global cwd change. Visible to the sibling `gate_launch` module,
+/// whose tests drive the ACTIVE branch from a REAL activation fixture.
+pub(super) fn x1_refusal_gate_with<F>(
+    base_dir: &Path,
+    surface: SurfaceCli,
+    options: &X1Options,
+    rest: &[String],
+    gate_present: F,
+) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<bool>,
+{
+    if options.sandbox {
+        if csq_core::launch_isolation::sandbox_conflict(rest) {
+            return Err(anyhow!(
+                "{}: --sandbox cannot be combined with a bypass, settings, plugin, \
+                 hook or approval-delegating flag; pass the CLI's own flags after `--`",
+                launch_x1::TAG_SANDBOX_CONFLICT
+            ));
+        }
+        if surface != SurfaceCli::Claude {
+            return Err(anyhow!(
+                "{}: --sandbox applies to Claude Code launches; {surface:?} has no \
+                 Claude permission mode (if you meant the CLI's own --sandbox flag, \
+                 pass it after `--`)",
+                launch_x1::TAG_SANDBOX_UNSUPPORTED
+            ));
+        }
+        match gate_present(base_dir) {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(anyhow!(
+                    "{}: this repository has an active csq Gate; --sandbox and the \
+                     Gate cannot both be honoured",
+                    launch_x1::TAG_SANDBOX_GATE_ACTIVE
+                ));
+            }
+            Err(_) => {
+                return Err(anyhow!(
+                    "{}: the csq Gate state could not be inspected; --sandbox \
+                     refuses rather than launch without knowing",
+                    launch_x1::TAG_SANDBOX_GATE_UNVERIFIABLE
+                ));
+            }
+        }
+    }
+    if !options.allow_env.is_empty() && surface == SurfaceCli::Gemini {
+        return Err(anyhow!(
+            "{}: Gemini launches use a fixed environment allowlist; --allow-env \
+             cannot pass a key through to the child",
+            launch_x1::TAG_ALLOW_ENV_UNSUPPORTED
+        ));
+    }
+    Ok(())
+}
+
+/// R2 N4: `gate_launch::attach` runs AFTER the flag-only Gate refusal, so a
+/// Gate activation that appeared in between would add `--settings` to a
+/// `--sandbox` launch — the conflict D1 refuses. Refuse rather than run a
+/// sandbox launch with the Gate's hooks and a pinned mode at once.
+fn refuse_sandbox_gate_attach(sandboxed: bool, before: usize, after: usize) -> Result<()> {
+    if sandboxed && after != before {
+        return Err(anyhow!(
+            "{}: a csq Gate activation appeared between the launch checks and the \
+             CLI build; --sandbox and the Gate cannot both be honoured",
+            launch_x1::TAG_SANDBOX_GATE_ACTIVE
+        ));
+    }
+    Ok(())
+}
+
+/// Ends a run that was refused BEFORE its spawn: Fail/Reject, flushed now.
+/// Without this the owning emitter's Drop writes the pre-spawn default
+/// (Degraded/Bypass) for a launch that never started — the phantom record the
+/// codex path's `end_codex_run_before_spawn` already prevents.
+fn end_run_before_spawn(audit_emitter: &mut crate::cli::audit_emit::AuditEmitter) {
+    use csq_core::audit::{Decision, ResultState};
+    let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    audit_emitter.set_end_ts(end_ts);
+    audit_emitter.set_result(ResultState::Fail, Decision::Reject);
+    fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+}
+
+/// Ends a launch refused after [`session::create_handle_dir`] created its handle
+/// dir (R1 D3): the record is Fail/Reject (never the pre-spawn Degraded/Bypass
+/// default), and the dir THIS launch created is removed so a refused launch
+/// leaves no half-populated session behind. `create_handle_dir` refuses an
+/// existing live dir and removes a dead holder's leftovers first, so the dir
+/// here always belongs to this launch.
+fn end_refused_launch(audit_emitter: &mut crate::cli::audit_emit::AuditEmitter, handle_dir: &Path) {
+    end_run_before_spawn(audit_emitter);
+    let _ = std::fs::remove_dir_all(handle_dir);
 }
 
 /// Determine which CLI surface this slot launches into.
@@ -882,6 +1135,24 @@ pub fn handle_native(
 // The shared implementation now lives in super::cli_deps_gate::enforce,
 // which is called from the pre-flight block in `handle` above.
 
+/// The per-session `TMPDIR` under a terminal's handle dir (an internal ticket), or a
+/// launch refusal carrying the fixed `session_tmpdir_unavailable` tag.
+///
+/// Every csq-launched session gets its own temp dir so a leftover is
+/// attributable to a terminal and reaped with its handle dir. There is NO
+/// fallback to the shared system `$TMPDIR`: a creation failure refuses the
+/// launch, and a user-set parent `TMPDIR` is always overridden by the
+/// `cmd.env("TMPDIR", …)` this path feeds (the X1 scrub is a deny-list, so the
+/// parent value can survive in the map — SETTING the key is what wins).
+pub(crate) fn session_tmpdir_or_refuse(handle_dir: &Path) -> Result<PathBuf> {
+    csq_core::session::tmpdir::ensure_session_tmpdir(handle_dir).map_err(|tag| {
+        anyhow!(
+            "{tag}: could not create the per-session TMPDIR under {}",
+            redact_path(handle_dir)
+        )
+    })
+}
+
 /// Launches CC for a 3P slot. The slot's `config-<N>/settings.json`
 /// carries `env.ANTHROPIC_BASE_URL` + `env.ANTHROPIC_AUTH_TOKEN`, and
 /// CC reads both on startup. We strip the parent env as usual so a
@@ -890,12 +1161,44 @@ pub fn handle_native(
 /// `settings.json` symlink resolves back to `config-<N>`.
 /// Production Anthropic construction. Layer flags and user args remain appended
 /// by launch_anthropic after this builder, in their original order.
-fn build_anthropic_command(base_dir: &Path, handle_dir: &Path, rest: &[String]) -> Result<Command> {
+fn build_anthropic_command(
+    base_dir: &Path,
+    handle_dir: &Path,
+    rest: &[String],
+    x1: Option<&X1Launch>,
+) -> Result<Command> {
     let mut cmd = Command::new("claude");
+    // Fact Guard X1: env_clear + the scrubbed map MUST come first, so the arm's
+    // own `env`/`env_remove` calls below still refine the result.
+    if let Some(x1) = x1 {
+        launch_x1::apply_to_command(&mut cmd, x1);
+    }
     cmd.env("CLAUDE_CONFIG_DIR", handle_dir);
     strip_sensitive_env(&mut cmd);
-    attach_messaging_claude(&mut cmd, handle_dir);
+    // an internal ticket: the child's temp files belong to THIS terminal. Set AFTER
+    // the scrub/env_clear so neither can drop or override it.
+    cmd.env("TMPDIR", session_tmpdir_or_refuse(handle_dir)?);
+    // Sandbox mode (R1 D2) writes NO messaging auto-approve rules and adds NO
+    // `--mcp-config`: a pre-approved send/reply channel would make the receipt's
+    // `permission_mode: "manual"` false. The operator can still message from a
+    // non-sandboxed session.
+    if x1.is_none_or(|x1| !x1.sandbox_requested()) {
+        attach_messaging_claude(&mut cmd, handle_dir);
+    }
+    // The Gate is never skipped: a sandbox launch in a Gate-activated repo is
+    // refused before any side effect (`x1_refusal_gate`). If an activation
+    // APPEARED since that check, attaching it would add flags to a sandbox
+    // launch, so the post-attach arg count enforces the same refusal here.
+    let args_before_gate = cmd.get_args().count();
     super::gate_launch::attach(&mut cmd, base_dir, handle_dir, rest)?;
+    refuse_sandbox_gate_attach(
+        x1.is_some_and(X1Launch::sandbox_requested),
+        args_before_gate,
+        cmd.get_args().count(),
+    )?;
+    if let Some(x1) = x1 {
+        cmd.args(x1.sandbox_args());
+    }
     Ok(cmd)
 }
 /// Production 3P construction; messaging/Gate flags precede user arguments.
@@ -903,8 +1206,9 @@ fn build_third_party_command(
     base_dir: &Path,
     handle_dir: &Path,
     rest: &[String],
+    x1: Option<&X1Launch>,
 ) -> Result<Command> {
-    let mut cmd = build_anthropic_command(base_dir, handle_dir, rest)?;
+    let mut cmd = build_anthropic_command(base_dir, handle_dir, rest, x1)?;
     cmd.args(rest);
     Ok(cmd)
 }
@@ -913,12 +1217,56 @@ fn build_vanilla_claude_command(
     base_dir: &Path,
     claude_home: &Path,
     rest: &[String],
+    x1_options: &X1Options,
 ) -> Result<Command> {
+    // The `--sandbox` conflict and Gate refusals run in `handle`/`exec_claude`
+    // before any side effect. No slot exists on this path, so there is no
+    // receipt and no per-launch GH_CONFIG_DIR; the token scrub, the allowlist
+    // and the pinned permission mode still apply (spec §35.8).
+    //
+    // an internal ticket: a vanilla launch is still a terminal, so it gets a
+    // `term-<pid>` handle dir holding its per-session `tmp/`. The handle-dir
+    // reaper already understands that shape: the name carries THIS process's
+    // PID and `exec` keeps that PID for the child's whole lifetime, so a live
+    // session is never swept. Only the TMPDIR is created here — no slot
+    // binding, no settings overlay.
     let mut cmd = Command::new("claude");
+    launch_x1::apply_scrub_only(&mut cmd, &x1_options.allow_env);
     strip_sensitive_env(&mut cmd);
+    let handle_dir = vanilla_handle_dir(base_dir);
+    create_vanilla_handle_dir_or_refuse(&handle_dir)?;
+    cmd.env("TMPDIR", session_tmpdir_or_refuse(&handle_dir)?);
+    let args_before_gate = cmd.get_args().count();
     super::gate_launch::attach(&mut cmd, base_dir, claude_home, rest)?;
+    refuse_sandbox_gate_attach(x1_options.sandbox, args_before_gate, cmd.get_args().count())?;
+    if x1_options.sandbox {
+        cmd.args(csq_core::launch_isolation::sandbox_args());
+    }
     cmd.args(rest);
     Ok(cmd)
+}
+
+/// This process's no-slot terminal handle dir (`term-<pid>`), the one
+/// `build_vanilla_claude_command` creates and `exec_claude` removes.
+fn vanilla_handle_dir(base_dir: &Path) -> std::path::PathBuf {
+    base_dir.join(format!("term-{}", std::process::id()))
+}
+
+/// Creates the no-slot vanilla terminal's `term-<pid>` handle dir (0700,
+/// owner-only) that will hold its per-session `tmp/`. A creation failure is a
+/// launch refusal under the SAME fixed tag as the `TMPDIR` itself: without the
+/// handle dir there is no session temp dir, and falling back to the shared
+/// `$TMPDIR` is exactly what an internal ticket forbids.
+fn create_vanilla_handle_dir_or_refuse(handle_dir: &Path) -> Result<()> {
+    csq_core::platform::fs::ensure_private_dir(handle_dir).map_err(|_| {
+        // Fixed vocabulary only: the underlying error is never formatted,
+        // because its shape is the helper's to change and a path-bearing
+        // variant would put a host path into a launch error.
+        anyhow!(
+            "{}: could not create the vanilla terminal handle dir",
+            csq_core::session::tmpdir::SESSION_TMPDIR_TAG
+        )
+    })
 }
 
 fn launch_third_party(
@@ -927,6 +1275,7 @@ fn launch_third_party(
     account: AccountNum,
     rest: &[String],
     audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+    x1_options: &X1Options,
 ) -> Result<()> {
     let _ =
         provider_session_policy::check_claude_launch(base_dir, claude_home, account, None, rest)?;
@@ -956,8 +1305,13 @@ fn launch_third_party(
     }
 
     let pid = std::process::id();
-    let handle_dir = session::create_handle_dir(base_dir, claude_home, account, pid)
-        .context("failed to create handle dir")?;
+    let handle_dir = match session::create_handle_dir(base_dir, claude_home, account, pid) {
+        Ok(handle_dir) => handle_dir,
+        Err(error) => {
+            end_run_before_spawn(audit_emitter);
+            return Err(error).context("failed to create handle dir");
+        }
+    };
     // M3-3: the defensive re-materialize (an internal journal entry belt-and-suspenders)
     // was removed here.  `create_handle_dir` already calls
     // `materialize_handle_settings_inner` with the UUID-aware path (M2-3),
@@ -967,6 +1321,16 @@ fn launch_third_party(
 
     let handle_dir_abs = std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
 
+    // Fact Guard X1: 3P slots launch the same `claude` binary, so the receipt,
+    // scrub and `--sandbox` all apply exactly as on the Anthropic path.
+    let x1 = match launch_x1::plan(base_dir, &handle_dir_abs, account, x1_options, rest) {
+        Ok(x1) => x1,
+        Err(error) => {
+            end_refused_launch(audit_emitter, &handle_dir);
+            return Err(error);
+        }
+    };
+
     println!(
         "Launching claude for 3P slot {} (term-{}) via {}...",
         account,
@@ -974,16 +1338,28 @@ fn launch_third_party(
         redact_path(&settings_path)
     );
 
-    let cmd = build_third_party_command(base_dir, &handle_dir_abs, rest)?;
+    let cmd = match build_third_party_command(base_dir, &handle_dir_abs, rest, Some(&x1)) {
+        Ok(cmd) => cmd,
+        Err(error) => {
+            end_refused_launch(audit_emitter, &handle_dir);
+            return Err(error);
+        }
+    };
 
     // Check the actual merged settings read by the child before handoff as well.
-    provider_session_policy::emit_warning(provider_session_policy::check_claude_launch(
+    match provider_session_policy::check_claude_launch(
         base_dir,
         claude_home,
         account,
         Some(&handle_dir_abs.join("settings.json")),
         rest,
-    )?);
+    ) {
+        Ok(warning) => provider_session_policy::emit_warning(warning),
+        Err(error) => {
+            end_refused_launch(audit_emitter, &handle_dir);
+            return Err(error);
+        }
+    }
 
     // Spec 08 MED-03 host-isolation warning, generalized to every 3P
     // bearer provider (kimi included — the Wave 3 target) EXCEPT loopback
@@ -1007,6 +1383,10 @@ fn launch_third_party(
     {
         use csq_core::audit::{Decision, ResultState};
         audit_emitter.set_result(ResultState::Degraded, Decision::Bypass);
+    }
+    if let Err(error) = x1.commit() {
+        end_refused_launch(audit_emitter, &handle_dir);
+        return Err(error);
     }
     exec_or_spawn(cmd, &handle_dir, audit_emitter, true)
 }
@@ -1388,6 +1768,54 @@ fn note_scaffold_deferred(surface: Surface) {
     );
 }
 
+/// Fixed text for `--auto-swap` where no csq session will exist.
+const AUTO_SWAP_NO_SESSION_MESSAGE: &str =
+    "--auto-swap needs a csq account session; no account is configured";
+
+/// `--auto-swap` only applies to a Claude Code OAuth session: the daemon rotator
+/// never moves a 3P slot, a Codex handle dir or a native/Gemini session, so a
+/// setting recorded there would silently never act. `Some(text)` = refuse.
+fn auto_swap_refusal(
+    auto_swap: Option<SessionRotationMode>,
+    base_dir: &Path,
+    accounts: &[csq_core::accounts::AccountInfo],
+    account: AccountNum,
+    is_third_party: bool,
+    surface: SurfaceCli,
+) -> Option<String> {
+    auto_swap?;
+    // Two independent guards. The launch's own classification (any third-party
+    // binding, incl. cloud-Claude, or a non-Claude surface) AND the rotator's
+    // eligibility answer shared with the desktop control and
+    // `csq rotation session`, never re-derived.
+    if is_third_party
+        || surface != SurfaceCli::Claude
+        || !csq_core::rotation::eligibility::slot_rotation_eligible(
+            base_dir,
+            accounts,
+            account.get(),
+        )
+    {
+        return Some(
+            "--auto-swap applies to Claude Code sign-in sessions only; \
+             this slot is not one, so the daemon would never move it"
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// Records `--auto-swap` in the freshly created handle dir (no-op when unset).
+/// The error is the fixed core text: no path, no OS detail.
+fn record_auto_swap(handle_dir: &Path, auto_swap: Option<SessionRotationMode>) -> Result<()> {
+    match auto_swap {
+        Some(mode) => {
+            session_override::write_override(handle_dir, mode).map_err(|error| anyhow!("{error}"))
+        }
+        None => Ok(()),
+    }
+}
+
 /// Launches CC for an Anthropic OAuth slot. Assumes credentials have
 /// already been copied into `config-<N>` by the caller.
 #[allow(clippy::too_many_arguments)]
@@ -1401,8 +1829,10 @@ fn launch_anthropic(
     debug: bool,
     bench_mode: Option<&str>,
     coc_cache_enabled: bool,
+    auto_swap: Option<SessionRotationMode>,
     rest: &[String],
     audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+    x1_options: &X1Options,
 ) -> Result<()> {
     // Capability-layer pre-flight (spec 10 §10.4.2). When the flag
     let _ =
@@ -1464,14 +1894,29 @@ fn launch_anthropic(
     // (not CLAUDE_CONFIG_DIR) for session identity, so handle dirs
     // are compatible with --resume as long as the CWD matches.
     let pid = std::process::id();
-    let handle_dir = session::create_handle_dir(base_dir, claude_home, account, pid)
-        .context("failed to create handle dir")?;
+    let handle_dir = match session::create_handle_dir(base_dir, claude_home, account, pid) {
+        Ok(handle_dir) => handle_dir,
+        Err(error) => {
+            end_run_before_spawn(audit_emitter);
+            return Err(error).context("failed to create handle dir");
+        }
+    };
     // M3-3: the defensive re-materialize (an internal journal entry belt-and-suspenders)
     // was removed here.  `create_handle_dir` already calls
     // `materialize_handle_settings_inner` with the UUID-aware path (M2-3),
     // so a second call via the public `materialize_handle_settings` (no-UUID
     // variant) would silently downgrade the settings overlay to config-N,
     // undoing the identity-keyed path for coexisting-layout slots.
+
+    // `--auto-swap on|off`: written only after the handle dir exists, into the
+    // dir itself, so it lives and dies with this session. A write failure
+    // refuses the launch, so it must end Fail/Reject and remove the dir this
+    // launch created (a bare `?` here would leave a phantom Degraded/Bypass
+    // record and a half-populated handle dir).
+    if let Err(error) = record_auto_swap(&handle_dir, auto_swap) {
+        end_refused_launch(audit_emitter, &handle_dir);
+        return Err(error);
+    }
 
     // Security review 1386 M4: `canonicalize_for_keychain_sync` returns the
     // usual non-canonical fallback for `handle_dir_abs` (still the right
@@ -1481,13 +1926,19 @@ fn launch_anthropic(
     let (handle_dir_abs, handle_dir_is_canonical) =
         csq_core::credentials::keychain::canonicalize_for_keychain_sync(&handle_dir);
 
-    provider_session_policy::emit_warning(provider_session_policy::check_claude_launch(
+    match provider_session_policy::check_claude_launch(
         base_dir,
         claude_home,
         account,
         Some(&handle_dir_abs.join("settings.json")),
         rest,
-    )?);
+    ) {
+        Ok(warning) => provider_session_policy::emit_warning(warning),
+        Err(error) => {
+            end_refused_launch(audit_emitter, &handle_dir);
+            return Err(error);
+        }
+    }
 
     // Security review 1386 H1: opportunistically retry any keychain item a
     // prior `csq logout` could not confirm clearing (locked/unreachable
@@ -1525,16 +1976,34 @@ fn launch_anthropic(
         if let Err(msg) =
             csq_core::credentials::keychain::force_sync_for_launch(base_dir, &handle_dir_abs)
         {
+            end_refused_launch(audit_emitter, &handle_dir);
             anyhow::bail!("csq run: {msg}");
         }
     } else {
+        end_refused_launch(audit_emitter, &handle_dir);
         anyhow::bail!("csq run: keychain item could not be located; retry the launch");
     }
+
+    // Fact Guard X1: read the launch facts and prepare the child environment.
+    // The receipt itself is written by `commit` immediately before the spawn.
+    let x1 = match launch_x1::plan(base_dir, &handle_dir_abs, account, x1_options, rest) {
+        Ok(x1) => x1,
+        Err(error) => {
+            end_refused_launch(audit_emitter, &handle_dir);
+            return Err(error);
+        }
+    };
 
     println!("Launching claude for account {} (term-{})...", account, pid);
 
     // Strip ANTHROPIC_* (and related) env vars before exec.
-    let mut cmd = build_anthropic_command(base_dir, &handle_dir_abs, rest)?;
+    let mut cmd = match build_anthropic_command(base_dir, &handle_dir_abs, rest, Some(&x1)) {
+        Ok(cmd) => cmd,
+        Err(error) => {
+            end_refused_launch(audit_emitter, &handle_dir);
+            return Err(error);
+        }
+    };
     // NB: the user's `rest` args are appended LAST in each arm below — AFTER any
     // csq-injected top-level flags (`--plugin-dir`, `--append-system-prompt-file`).
     // Those flags MUST precede a `claude` SUBCOMMAND (e.g. `csq run N -- plugin
@@ -1554,6 +2023,10 @@ fn launch_anthropic(
             audit_emitter.set_result(ResultState::Degraded, Decision::Bypass);
             // Inherit adds no csq flags; append rest and go (byte-identical argv).
             cmd.args(rest);
+            if let Err(error) = x1.commit() {
+                end_refused_launch(audit_emitter, &handle_dir);
+                return Err(error);
+            }
             exec_or_spawn(cmd, &handle_dir, audit_emitter, true)
         }
         LayerControl::WithLayer {
@@ -1679,11 +2152,18 @@ fn launch_anthropic(
                 // No plugin (or it failed) → full prose fallback (all kinds).
                 scaffold
             };
-            let scaffold_tmp = attach_scaffold(&mut cmd, prose_owned.as_deref());
+            let scaffold_tmp = attach_scaffold(&mut cmd, prose_owned.as_deref(), &handle_dir);
             // Append the user's args LAST — after --plugin-dir + the scaffold
             // flag — so a `claude` subcommand in `rest` still sees those as
             // top-level options (see the note at cmd construction above).
             cmd.args(rest);
+            if let Err(error) = x1.commit() {
+                if let Some(ref path) = scaffold_tmp {
+                    let _ = std::fs::remove_file(path);
+                }
+                end_refused_launch(audit_emitter, &handle_dir);
+                return Err(error);
+            }
             let result = spawn_with_layer(
                 cmd,
                 &handle_dir,
@@ -1785,7 +2265,12 @@ pub(crate) fn launch_codex(
     // (`Some`), so the relaunch never re-reads `CSQ_MESSAGING`. `None` for a fresh launch,
     // which decides once from the environment.
     messaging: Option<bool>,
+    // Fact Guard X1 options, carried from `handle` and through a swap relaunch.
+    x1_options: &X1Options,
 ) -> Result<()> {
+    // Codex has no Claude permission mode; `--sandbox` on this surface would make
+    // the receipt claim a guarantee csq cannot set.
+    launch_x1::refuse_sandbox_on("codex", x1_options)?;
     // Classify the caller's own arguments before csq derives account defaults.
     // Explicit resume policy must retain native semantics on the embedded path.
     let embedded_native_fallback = codex_supervise::requires_embedded_native(rest);
@@ -1969,6 +2454,17 @@ pub(crate) fn launch_codex(
         check_codex_token_freshness(&auth_json_link, account, now_secs)?;
     }
 
+    // Fact Guard X1: the receipt is written by `commit` just before the
+    // supervised spawn; the scrub is applied by the codex command builder.
+    let x1 = match launch_x1::plan(base_dir, &handle_dir_abs, account, x1_options, rest) {
+        Ok(x1) => x1,
+        Err(error) => {
+            end_codex_run_before_spawn(audit.emitter_mut(), is_relaunch);
+            let _ = std::fs::remove_dir_all(&handle_dir);
+            return Err(error);
+        }
+    };
+
     println!("Launching codex for account {} (term-{})...", account, pid);
 
     // Strip BEFORE `cmd.env(HOME_ENV_VAR, …)` so our explicit
@@ -1995,14 +2491,26 @@ pub(crate) fn launch_codex(
     // failed marker write cannot turn messaging off at this terminal's next supervised swap.
     let messaging_on =
         messaging.unwrap_or_else(|| csq_core::messaging::register::decision(&handle_dir_abs));
-    let mut cmd = build_codex_exec_command_with(
+    let mut cmd = match build_codex_exec_command_with_x1(
         base_dir,
         account,
         &handle_dir_abs,
         rest,
         messaging_wrap,
         Some(messaging_on),
-    )?;
+        Some(&x1.env),
+    ) {
+        Ok(cmd) => cmd,
+        // Includes the issue-an internal ticket per-session TMPDIR refusal: end the record
+        // through the same pre-spawn channel as an X1 plan failure and remove
+        // the dir this launch created, so a refused launch leaves no
+        // half-populated session behind.
+        Err(error) => {
+            end_codex_run_before_spawn(audit.emitter_mut(), is_relaunch);
+            let _ = std::fs::remove_dir_all(&handle_dir);
+            return Err(error);
+        }
+    };
     if messaging.is_some() {
         // Record the carried decision in the new handle dir so an exec-replace swap reads it
         // (a failure is logged with a fixed tag; the supervised path does not need the file).
@@ -2087,6 +2595,14 @@ pub(crate) fn launch_codex(
                         return Err(anyhow!("{e}"));
                     }
                 };
+            // Fact Guard X1: this is the last point before the supervised spawn.
+            // The emitter left the pre-spawn guard already, so a receipt refusal
+            // MUST end its record explicitly (parity with the share-lock refusal).
+            if let Err(error) = x1.commit() {
+                end_codex_run_before_spawn(audit_emitter, is_relaunch);
+                let _ = std::fs::remove_dir_all(&handle_dir);
+                return Err(error);
+            }
             supervise_codex_holding_share_lock(
                 codex_share_lock,
                 cmd,
@@ -2099,6 +2615,7 @@ pub(crate) fn launch_codex(
                 audit_emitter,
                 messaging_on,
                 embedded_native_fallback,
+                x1_options,
             )
         }
         LayerControl::WithLayer {
@@ -2218,15 +2735,24 @@ pub(crate) fn launch_codex(
             let mut spawning = audit.into_spawning();
             let audit_emitter = spawning.emitter_mut();
             let result = match mode {
-                SpawnMode::OneShot => spawn_one_shot_with_post_validate(
-                    cmd,
-                    &handle_dir,
-                    class,
-                    rule_ids_in_scope.clone(),
-                    toggles,
-                    debug,
-                    audit_emitter,
-                ),
+                SpawnMode::OneShot => {
+                    // Fact Guard X1: the one-shot arm spawns too, so it writes
+                    // the receipt before the child exists.
+                    if let Err(error) = x1.commit() {
+                        end_codex_run_before_spawn(audit_emitter, is_relaunch);
+                        let _ = std::fs::remove_dir_all(&handle_dir);
+                        return Err(error);
+                    }
+                    spawn_one_shot_with_post_validate(
+                        cmd,
+                        &handle_dir,
+                        class,
+                        rule_ids_in_scope.clone(),
+                        toggles,
+                        debug,
+                        audit_emitter,
+                    )
+                }
                 SpawnMode::Interactive => {
                     // F8: see the Inherit-branch call site's identical
                     // comment — held across the whole supervised run.
@@ -2240,6 +2766,12 @@ pub(crate) fn launch_codex(
                                 return Err(anyhow!("{e}"));
                             }
                         };
+                    // Fact Guard X1: the last point before the supervised spawn.
+                    if let Err(error) = x1.commit() {
+                        end_codex_run_before_spawn(audit_emitter, is_relaunch);
+                        let _ = std::fs::remove_dir_all(&handle_dir);
+                        return Err(error);
+                    }
                     supervise_codex_holding_share_lock(
                         codex_share_lock,
                         cmd,
@@ -2252,6 +2784,7 @@ pub(crate) fn launch_codex(
                         audit_emitter,
                         messaging_on,
                         embedded_native_fallback,
+                        x1_options,
                     )
                 }
             };
@@ -2504,6 +3037,7 @@ pub(crate) fn supervise_codex_holding_share_lock(
     audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
     messaging_on: bool,
     embedded_native_fallback: bool,
+    x1_options: &X1Options,
 ) -> Result<()> {
     let CodexLaunchSettings {
         capability_layer_enabled,
@@ -2537,6 +3071,7 @@ pub(crate) fn supervise_codex_holding_share_lock(
             CodexLaunchAudit::Relaunch(audit_emitter),
             swap_correlation,
             Some(messaging),
+            x1_options,
         )
     };
     // F2 (round 5) / D-F9 (round 7): `make_validate_relaunch` captures the
@@ -2606,6 +3141,11 @@ pub(crate) fn build_codex_exec_command(
 /// through `csq mcp-proxy` like every other stdio server, instead of registered direct.
 /// `messaging` is `Some(decision)` when the caller carries a terminal's launch decision (a
 /// swap), `None` for a fresh launch that reads it from the handle dir or the environment.
+/// Compiled for TESTS only: production callers (a `csq run` arm and a swap) pass
+/// their explicit environment straight to [`build_codex_exec_command_with_x1`],
+/// so a production build has no caller and the cross-lint treats the dead
+/// `pub(crate)` fn as an error.
+#[cfg(test)]
 pub(crate) fn build_codex_exec_command_with(
     base_dir: &Path,
     account: AccountNum,
@@ -2613,6 +3153,24 @@ pub(crate) fn build_codex_exec_command_with(
     rest: &[String],
     mcp_wrap: Option<(&str, &Path)>,
     messaging: Option<bool>,
+) -> Result<Command> {
+    build_codex_exec_command_with_x1(
+        base_dir, account, handle_dir, rest, mcp_wrap, messaging, None,
+    )
+}
+
+/// The Codex command builder with an explicit child environment: the
+/// test-only `build_codex_exec_command_with` passes `None`.
+/// `env = Some` is the `csq run` arm (`X1Launch::env`) or the swap arm (its
+/// scrub map); `None` keeps the builder's inherited environment (tests).
+pub(crate) fn build_codex_exec_command_with_x1(
+    base_dir: &Path,
+    account: AccountNum,
+    handle_dir: &Path,
+    rest: &[String],
+    mcp_wrap: Option<(&str, &Path)>,
+    messaging: Option<bool>,
+    env: Option<&BTreeMap<String, String>>,
 ) -> Result<Command> {
     // Admission must use the actual passthrough, before native spawn or MCP setup.
     let resume = codex_resume_route(rest)?;
@@ -2629,7 +3187,7 @@ pub(crate) fn build_codex_exec_command_with(
             CodexResumeRoute::Ordinary => {}
         }
     }
-    let mut cmd = codex_command(base_dir, account, handle_dir)?;
+    let mut cmd = codex_command_with_env(base_dir, account, handle_dir, env)?;
     match messaging {
         Some(on) => attach_messaging_codex_as(&mut cmd, handle_dir, mcp_wrap, on),
         None => attach_messaging_codex(&mut cmd, handle_dir, mcp_wrap),
@@ -3327,7 +3885,20 @@ fn repair_codex_resume_target(base_dir: &Path, sqlite_home: &Path, target: &str)
 /// `sqlite_home` is Codex's native state-location setting. It covers future DB
 /// names without a schema-version allowlist and survives materialized CoC
 /// config overlays. An explicit later `-c` in the user's passthrough still wins.
+#[cfg(test)]
 fn codex_command(base_dir: &Path, account: AccountNum, handle_dir: &Path) -> Result<Command> {
+    codex_command_with_env(base_dir, account, handle_dir, None)
+}
+
+/// `codex_command` with an explicit child environment applied FIRST (so the
+/// arm's own `strip_sensitive_env` / `env_remove` / `CODEX_HOME` calls still
+/// refine it). `None` keeps the inherited environment (tests).
+fn codex_command_with_env(
+    base_dir: &Path,
+    account: AccountNum,
+    handle_dir: &Path,
+    env: Option<&BTreeMap<String, String>>,
+) -> Result<Command> {
     let config = codex_surface::config_toml_path(base_dir, account);
     let sqlite_home = std::fs::canonicalize(config.parent().expect("slot config has a parent"))
         .context("resolve persistent Codex SQLite directory")?;
@@ -3337,10 +3908,17 @@ fn codex_command(base_dir: &Path, account: AccountNum, handle_dir: &Path) -> Res
     // TOML encoding is essential for spaces, quotes and Windows backslashes.
     let sqlite_value = toml::Value::String(sqlite_home.to_owned());
     let mut cmd = Command::new(codex_surface::CLI_BINARY);
+    if let Some(env) = env {
+        cmd.env_clear();
+        cmd.envs(env);
+    }
     strip_sensitive_env(&mut cmd);
     cmd.env_remove("CLAUDE_CONFIG_DIR");
     cmd.env_remove("CLAUDE_HOME");
     cmd.env(codex_surface::HOME_ENV_VAR, handle_dir);
+    // an internal ticket: per-session TMPDIR under the terminal handle dir, set after
+    // the explicit map / env_clear / scrub so a parent `TMPDIR` can never win.
+    cmd.env("TMPDIR", session_tmpdir_or_refuse(handle_dir)?);
     cmd.arg("-c").arg(format!("sqlite_home={sqlite_value}"));
     Ok(cmd)
 }
@@ -4501,17 +5079,29 @@ pub(crate) fn make_validate_relaunch(
     }
 }
 
-/// Requires the daemon to be `Healthy` before a Codex spawn. Spec 07
-/// §7.5 INV-P02: without the daemon, codex's on-expiry in-process
-/// refresh will fire and burn the refresh token. Exits with
-/// [`EXIT_CODE_DAEMON_REQUIRED`] on any non-Healthy state so scripts
-/// can distinguish "daemon-down" from other launch failures.
-///
-/// PR-C4 (H2 gate): cross-platform — `daemon::detect_daemon` already
-/// has a Windows named-pipe branch (`csq-core/src/daemon/detect.rs`
-/// `windows_health_check`), so the same DetectResult variants apply
-/// across Unix and Windows. This closes the an internal journal entry
-/// `#[cfg(not(unix))] Ok(())` carve-out.
+/// Hands the process to Gemini (`execute_spawn_plan`: exec on Unix, a waited
+/// child then `process::exit` on Windows), so it returns only when the hand-off
+/// FAILED. The launch record was already flushed as the hand-off; the launch
+/// never happened, so a corrective Fail/Reject record is written from
+/// `retained` (the clone taken before that flush) on every platform.
+fn hand_off_gemini_or_correct(
+    plan: csq_core::providers::gemini::spawn::SpawnPlan,
+    retained: Option<csq_core::audit::AuditRecord>,
+    audit_emitter: &crate::cli::audit_emit::AuditEmitter,
+    handle_dir: &Path,
+) -> csq_core::providers::gemini::spawn::SpawnError {
+    let e = match csq_core::providers::gemini::spawn::execute_spawn_plan(plan) {
+        Ok(never) => match never {},
+        Err(e) => e,
+    };
+    let _ = std::fs::remove_dir_all(handle_dir);
+    if let Some(record) = retained {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        fail_loud_on_audit_write_failure(audit_emitter.write_corrective_failure(record, &now));
+    }
+    e
+}
+
 /// Launches gemini-cli for a Gemini-surface slot.
 ///
 /// Spec 07 §7.2.3 / §7.5: Gemini does NOT require the daemon for
@@ -4563,14 +5153,17 @@ fn launch_gemini(
     coc_cache_enabled: bool,
     rest: &[String],
     audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+    x1_options: &X1Options,
 ) -> Result<()> {
     use csq_core::platform::secret;
+    launch_x1::refuse_sandbox_on("gemini", x1_options)?;
+    launch_x1::refuse_allow_env_on("gemini", x1_options)?;
     provider_session_policy::emit_warning(provider_session_policy::check_unknown_launch_with_args(
         base_dir, rest,
     )?);
     use csq_core::providers::gemini::spawn::{
-        build_spawn_plan_with_system_instruction, execute_plan_as_child,
-        execute_plan_as_child_piped, spawn_gemini,
+        build_spawn_plan_with_system_instruction_and_tmpdir, build_spawn_plan_with_tmpdir,
+        execute_plan_as_child, execute_plan_as_child_piped,
     };
 
     // PR-CA8b commit 4: build HostContext from the parent env BEFORE
@@ -4757,6 +5350,20 @@ fn launch_gemini(
     }
 
     let handle_dir_abs = std::fs::canonicalize(&handle_dir).unwrap_or_else(|_| handle_dir.clone());
+    // an internal ticket: the per-session TMPDIR is created BEFORE the plan/settings
+    // materialization, so a creation failure refuses the launch (fixed tag)
+    // with only the handle dir + marker written — nothing to roll back but
+    // this launch's own dir.
+    let session_tmpdir = match csq_core::session::tmpdir::ensure_session_tmpdir(&handle_dir_abs) {
+        Ok(tmpdir) => tmpdir,
+        Err(tag) => {
+            end_refused_launch(audit_emitter, &handle_dir);
+            return Err(anyhow!(
+                "{tag}: could not create the per-session TMPDIR under {}",
+                redact_path(&handle_dir_abs)
+            ));
+        }
+    };
     // Gemini's spawn env is a fixed allowlist, so the decision enters it explicitly through
     // `SpawnPlan::with_messaging_decision`.
     let messaging_on = record_launch_decision(&handle_dir_abs);
@@ -4768,6 +5375,19 @@ fn launch_gemini(
         let _ = std::fs::remove_dir_all(&handle_dir);
         anyhow!("secret vault unavailable ({}): {e}", e.error_kind_tag())
     })?;
+
+    // Fact Guard X1: Gemini's child env is a fixed allowlist, so the overlay is
+    // only the receipt path and the per-launch `gh` config dir. The scrub's
+    // removals are still what the receipt records; the allowlist never carried
+    // the GitHub tokens in the first place.
+    let x1 = match launch_x1::plan(base_dir, &handle_dir_abs, account, x1_options, rest) {
+        Ok(x1) => x1,
+        Err(error) => {
+            end_refused_launch(audit_emitter, &handle_dir);
+            return Err(error);
+        }
+    };
+    let x1_overlay = x1.env_overlay();
 
     println!("Launching gemini for account {} (term-{})...", account, pid);
 
@@ -4805,31 +5425,55 @@ fn launch_gemini(
             // over not-flushing because Windows process::exit on
             // non-zero child status would otherwise bypass Drop and
             // drop the record entirely.
+            // Build the plan FIRST: it writes `.gemini/settings.json`, and the
+            // X1 receipt must fingerprint the handle dir as it stands at exec,
+            // not as it stood before csq's own materialization. The audit
+            // pre-flush also moves AFTER the commit, so a refusal is recorded
+            // Fail/Reject rather than the pre-spawn Degraded/Bypass default.
+            let parent_env = env_utf8_map();
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let home = csq_core::platform::home::home_dir();
+            let plan = match build_spawn_plan_with_tmpdir(
+                base_dir,
+                &handle_dir_abs,
+                account,
+                &parent_env,
+                &cwd,
+                home.as_deref(),
+                vault.as_ref(),
+                rest.to_vec(),
+                &session_tmpdir,
+            ) {
+                Ok(plan) => plan
+                    .with_messaging_decision(messaging_on)
+                    .with_env_overlay(&x1_overlay),
+                Err(e) => {
+                    end_refused_launch(audit_emitter, &handle_dir);
+                    return Err(map_spawn_error(account, e));
+                }
+            };
+            if let Err(error) = x1.commit() {
+                end_refused_launch(audit_emitter, &handle_dir);
+                return Err(error);
+            }
+            // The flush below is required (a successful exec replaces the
+            // process) but records the hand-off as the outcome; a hand-off that
+            // fails writes a corrective record from this clone
+            // (`hand_off_gemini_or_correct`).
+            let retained = audit_emitter.retained_record();
             {
                 use csq_core::audit::{Decision, ResultState};
                 let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
                 audit_emitter.set_end_ts(end_ts);
                 audit_emitter.set_result(ResultState::Degraded, Decision::Bypass);
-                // M06 fail-loud: Gemini Inherit calls exec inside spawn_gemini
-                // (Unix) / process::exit (Windows) — Drop is bypassed. We still
-                // own the exit code here, so surface a `.pending/` total failure
-                // before handing off.
+                // M06 fail-loud: Gemini Inherit calls exec inside
+                // `execute_spawn_plan` (Unix) / process::exit (Windows) — Drop
+                // is bypassed. We still own the exit code here, so surface a
+                // `.pending/` total failure before handing off.
                 fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
             }
-            match spawn_gemini(
-                base_dir,
-                &handle_dir_abs,
-                account,
-                rest.to_vec(),
-                vault.as_ref(),
-                messaging_on,
-            ) {
-                Ok(_never) => unreachable!("spawn_gemini returns Infallible on success"),
-                Err(e) => {
-                    let _ = std::fs::remove_dir_all(&handle_dir);
-                    Err(map_spawn_error(account, e))
-                }
-            }
+            let e = hand_off_gemini_or_correct(plan, retained, audit_emitter, &handle_dir);
+            Err(map_spawn_error(account, e))
         }
         LayerControl::WithLayer {
             mode,
@@ -4854,7 +5498,7 @@ fn launch_gemini(
             // internally with the scaffold (overwrites any prior
             // system_instruction value — csq-owned during layer-on
             // per round-3 R3-H1).
-            let parent_env: std::collections::HashMap<String, String> = std::env::vars().collect();
+            let parent_env = env_utf8_map();
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             // The shared home resolver (`HOME` is usually unset on Windows), the same one
             // the gemini OAuth writer, the usage poller and the headless check use.
@@ -4937,7 +5581,7 @@ fn launch_gemini(
             };
             let system_instruction = prose_owned.as_deref().filter(|s| !s.is_empty());
 
-            let plan = match build_spawn_plan_with_system_instruction(
+            let plan = match build_spawn_plan_with_system_instruction_and_tmpdir(
                 base_dir,
                 &handle_dir_abs,
                 account,
@@ -4947,8 +5591,11 @@ fn launch_gemini(
                 vault.as_ref(),
                 rest.to_vec(),
                 system_instruction,
+                &session_tmpdir,
             ) {
-                Ok(p) => p.with_messaging_decision(messaging_on),
+                Ok(p) => p
+                    .with_messaging_decision(messaging_on)
+                    .with_env_overlay(&x1_overlay),
                 Err(e) => {
                     let _ = std::fs::remove_dir_all(&handle_dir);
                     return Err(map_spawn_error(account, e));
@@ -4959,6 +5606,14 @@ fn launch_gemini(
             // between settings.json materialization and gemini-cli
             // starting up.
             verify_gemini_handle_settings_is_regular_file(&handle_dir_abs)?;
+
+            // Fact Guard X1: materialization is complete; write the receipt and
+            // enforce the guard manifest before the child exists. A refusal is
+            // Fail/Reject, not the pre-spawn Degraded/Bypass default.
+            if let Err(error) = x1.commit() {
+                end_refused_launch(audit_emitter, &handle_dir);
+                return Err(error);
+            }
 
             // CU2 (an internal ticket): spawn shape is mode-driven BEFORE the child
             // is created. OneShot requires piped stdio for post-validate
@@ -5238,8 +5893,10 @@ fn launch_native(
     coc_cache_enabled: bool,
     rest: &[String],
     audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+    x1_options: &X1Options,
 ) -> Result<()> {
     use csq_core::providers::native;
+    launch_x1::refuse_sandbox_on("the native Kimi/Grok CLI", x1_options)?;
     provider_session_policy::emit_warning(provider_session_policy::check_unknown_launch_with_args(
         base_dir, rest,
     )?);
@@ -5388,7 +6045,70 @@ fn launch_native(
             )
         })?;
 
-    let mut cmd = Command::new(&binary_path);
+    // Fact Guard X1: native CLIs inherit the parent environment today, so the
+    // scrub replaces that inheritance with an explicit map (non-UTF-8 variables
+    // are dropped rather than passed unclassified).
+    let x1 = match launch_x1::plan(base_dir, &handle_dir, account, x1_options, rest) {
+        Ok(x1) => x1,
+        Err(error) => {
+            end_refused_launch(audit_emitter, &handle_dir);
+            return Err(error);
+        }
+    };
+    let cmd = match build_native_command(
+        descriptor,
+        &binary_path,
+        base_dir,
+        account,
+        &handle_dir,
+        messaging_on,
+        &x1,
+        rest,
+    ) {
+        Ok(cmd) => cmd,
+        Err(error) => {
+            end_refused_launch(audit_emitter, &handle_dir);
+            return Err(error);
+        }
+    };
+
+    {
+        use csq_core::audit::{Decision, ResultState};
+        // No rule validation runs on this path (no post-validate loop, see
+        // docstring above) — Degraded + Bypass mirrors every other
+        // surface's Inherit/no-layer classification.
+        audit_emitter.set_result(ResultState::Degraded, Decision::Bypass);
+    }
+    if let Err(error) = x1.commit() {
+        end_refused_launch(audit_emitter, &handle_dir);
+        return Err(error);
+    }
+    exec_or_spawn(cmd, &handle_dir, audit_emitter, false)
+}
+
+/// The native-CLI (`kimi`/`grok`) child command: the Fact Guard X1 scrub map,
+/// the launch's messaging decision, the csq-session-dir scrub, the slot's
+/// isolated vendor home, the pinned model, the operator's trailing args, and
+/// the per-session `TMPDIR` under the terminal handle dir (an internal ticket).
+///
+/// Extracted from `launch_native` so the env construction is directly testable
+/// without spawning a vendor binary — the same rationale as
+/// [`set_native_home_env`]'s extraction. `bin` is the vendor binary resolved by
+/// the caller; the caller maps a `TMPDIR` refusal through its launch-refusal
+/// channel (`end_refused_launch`).
+#[allow(clippy::too_many_arguments)]
+fn build_native_command(
+    descriptor: &csq_core::providers::native::NativeCli,
+    bin: &Path,
+    base_dir: &Path,
+    account: AccountNum,
+    handle_dir: &Path,
+    messaging_on: bool,
+    x1: &X1Launch,
+    rest: &[String],
+) -> Result<Command> {
+    let mut cmd = Command::new(bin);
+    launch_x1::apply_to_command(&mut cmd, x1);
     set_decision_env(&mut cmd, messaging_on);
     // Scrub csq-session-dir env so the native CLI never accidentally
     // resolves a stale csq-managed config dir from the parent shell
@@ -5400,6 +6120,9 @@ fn launch_native(
     // vendor home. See `set_native_home_env` doc comment for the
     // strip-both-then-set-one security rationale.
     set_native_home_env(&mut cmd, descriptor, base_dir, account);
+    // an internal ticket: per-session TMPDIR, set after env_clear/scrub so a
+    // parent-shell `TMPDIR` can never reach the child.
+    cmd.env("TMPDIR", session_tmpdir_or_refuse(handle_dir)?);
     // Pin the vendor model when the descriptor declares one (Kimi → K3;
     // the native kimi CLI otherwise self-defaults to K2.7). Injected BEFORE
     // the operator's trailing args and SUPPRESSED when the operator already
@@ -5408,15 +6131,7 @@ fn launch_native(
         cmd.arg("--model").arg(model);
     }
     cmd.args(rest);
-
-    {
-        use csq_core::audit::{Decision, ResultState};
-        // No rule validation runs on this path (no post-validate loop, see
-        // docstring above) — Degraded + Bypass mirrors every other
-        // surface's Inherit/no-layer classification.
-        audit_emitter.set_result(ResultState::Degraded, Decision::Bypass);
-    }
-    exec_or_spawn(cmd, &handle_dir, audit_emitter, false)
+    Ok(cmd)
 }
 
 /// Sets the vendor-isolation env var for a native-CLI spawn (`csq run` on a
@@ -5741,8 +6456,19 @@ fn spawn_gemini_with_layer_dispatch(
 /// invocation time (read-on-spawn matches doctor's read-on-invoke
 /// posture).
 fn detect_host_context() -> csq_core::coc::translate::gemini::HostContext {
-    let detected: BTreeSet<String> = std::env::vars()
-        .map(|(k, _v)| k)
+    host_context_from(std::env::vars_os())
+}
+
+/// [`detect_host_context`] over an explicit source. `vars_os` (not `vars`): a
+/// non-UTF-8 entry must not abort the launch; a non-UTF-8 name cannot be
+/// reported, so it is dropped.
+fn host_context_from<I>(vars: I) -> csq_core::coc::translate::gemini::HostContext
+where
+    I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+{
+    let detected: BTreeSet<String> = vars
+        .into_iter()
+        .filter_map(|(k, _v)| k.into_string().ok())
         .filter(|k| csq_core::env::looks_like_production_secret(k))
         .collect();
     csq_core::coc::translate::gemini::HostContext {
@@ -5859,9 +6585,26 @@ fn map_spawn_error(
             "Gemini secret vault read failed ({}) for slot {account}: {v}",
             v.error_kind_tag()
         ),
+        // Fixed tag; an internal ticket forbids any fallback to the shared $TMPDIR.
+        S::SessionTmpdirUnavailable => anyhow!(
+            "{}: could not create the per-session TMPDIR under the terminal handle dir",
+            csq_core::session::tmpdir::SESSION_TMPDIR_TAG
+        ),
     }
 }
 
+/// Requires the daemon to be `Healthy` before a Codex spawn. Spec 07
+/// §7.5 INV-P02: without the daemon, codex's on-expiry in-process
+/// refresh will fire and burn the refresh token. Exits with
+/// [`EXIT_CODE_DAEMON_REQUIRED`] on any non-Healthy state so scripts
+/// can distinguish "daemon-down" from other launch failures.
+///
+/// PR-C4 (H2 gate): cross-platform — `daemon::detect_daemon` already
+/// has a Windows named-pipe branch (`csq-core/src/daemon/detect.rs`
+/// `windows_health_check`), so the same DetectResult variants apply
+/// across Unix and Windows. This closes the an internal journal entry
+/// `#[cfg(not(unix))] Ok(())` carve-out.
+///
 /// FM-5: `is_relaunch` gates whether a refusal `return Err`s (so a cross-slot
 /// swap relaunch's caller — `codex_supervise`'s `relaunch` closure, and via
 /// it FM-6's flush + recovery-message handling — can catch this instead of
@@ -6493,21 +7236,27 @@ mod debug_record_tests {
 /// (macOS ARG_MAX = 1 MiB).  Large `.coc/` artifact flattens can exceed
 /// that limit, causing `cmd.spawn()` to return `os error 7`.  Writing the
 /// content to a file keeps argv small regardless of scaffold size.
-fn attach_scaffold(cmd: &mut Command, scaffold_text: Option<&str>) -> Option<PathBuf> {
-    use csq_core::platform::fs::unique_tmp_path;
+fn attach_scaffold(
+    cmd: &mut Command,
+    scaffold_text: Option<&str>,
+    handle_dir: &Path,
+) -> Option<PathBuf> {
+    use csq_core::platform::fs::write_private_tmp_synced_retained;
 
     let text = match scaffold_text {
         Some(s) if !s.is_empty() => s,
         _ => return None,
     };
 
-    let base = std::env::temp_dir().join("csq-coc-scaffold.md");
-    let tmp = unique_tmp_path(&base);
-
-    match std::fs::write(&tmp, text.as_bytes()) {
+    // The scaffold lives in the 0600 handle dir (owned by this user, never a shared /tmp), so a
+    // recycle's relaunch re-reads bytes nobody else could have replaced (spec 36 §36.6).
+    let target = handle_dir.join("csq-coc-scaffold.md");
+    let written = write_private_tmp_synced_retained(&target, text.as_bytes())
+        .and_then(|w| w.replace(&target));
+    match written {
         Ok(()) => {
-            cmd.arg("--append-system-prompt-file").arg(&tmp);
-            Some(tmp)
+            cmd.arg("--append-system-prompt-file").arg(&target);
+            Some(target)
         }
         Err(e) => {
             // Best-effort fallback: small scaffolds still reach CC via the
@@ -6515,7 +7264,8 @@ fn attach_scaffold(cmd: &mut Command, scaffold_text: Option<&str>) -> Option<Pat
             // but that is better than silently dropping the scaffold.
             tracing::warn!(
                 error_kind = "scaffold_tmp_write_failed",
-                "could not write scaffold temp file, falling back to env var: {e}"
+                "could not write scaffold file, falling back to env var: {}",
+                csq_core::error::redact_tokens(&e.to_string())
             );
             cmd.env("CLAUDE_SYSTEM_PROMPT_APPEND", text);
             None
@@ -6600,6 +7350,10 @@ fn spawn_one_shot_with_post_validate(
             // launch error.
             let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             audit_emitter.set_end_ts(end_ts);
+            audit_emitter.set_result(
+                csq_core::audit::ResultState::Fail,
+                csq_core::audit::Decision::Reject,
+            );
             fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
             return Err(anyhow!("failed to launch claude: {e}"));
         }
@@ -6760,7 +7514,7 @@ fn spawn_interactive_inherited(
 ) -> Result<()> {
     let handle_dir_abs =
         std::fs::canonicalize(handle_dir).unwrap_or_else(|_| handle_dir.to_path_buf());
-    let mut child = match cmd.spawn() {
+    let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             let _ = std::fs::remove_dir_all(handle_dir);
@@ -6771,6 +7525,10 @@ fn spawn_interactive_inherited(
             // launch error.
             let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             audit_emitter.set_end_ts(end_ts);
+            audit_emitter.set_result(
+                csq_core::audit::ResultState::Fail,
+                csq_core::audit::Decision::Reject,
+            );
             fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
             return Err(anyhow!("failed to launch claude: {e}"));
         }
@@ -6780,9 +7538,44 @@ fn spawn_interactive_inherited(
     if let Err(e) = markers::write_live_cc_pid(&handle_dir_abs, child_pid) {
         eprintln!("warning: could not record CC child PID: {e}");
     }
-    let status = child.wait();
-    if let Ok(status) = &status {
-        csq_core::sessions::lifecycle::waited(lifecycle.as_ref(), status);
+    #[cfg(unix)]
+    let (status, keep_handle, signal) =
+        supervise_claude(&cmd, child, lifecycle, handle_dir, audit_emitter);
+    #[cfg(not(unix))]
+    let (status, keep_handle, signal) = {
+        let mut child = child;
+        let status = child.wait();
+        if let Ok(status) = &status {
+            csq_core::sessions::lifecycle::waited(lifecycle.as_ref(), status);
+        }
+        (status, false, None::<i32>)
+    };
+    if keep_handle {
+        // Failed recycle (spec 36 §36.7): the operator's manual-resume path needs this
+        // handle dir, so it is NOT removed; the run ends as a failure.
+        use csq_core::audit::{Decision, ResultState};
+        let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        audit_emitter.set_end_ts(end_ts);
+        audit_emitter.set_result(ResultState::Fail, Decision::Accept);
+        fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+        let code = status.ok().and_then(|s| s.code()).filter(|c| *c != 0);
+        remove_scaffold_file(&cmd);
+        #[cfg(unix)]
+        if let Some(sig) = signal {
+            // Die by the same signal the operator sent, so the shell sees the conventional
+            // 128+sig status. The new child received it only when its pid was convertible and
+            // > 1 (see the supervisor's forwarder); this re-raise is unconditional either way.
+            // SAFETY: restoring the default disposition and re-raising a signal number csq
+            // itself received; no memory is touched.
+            unsafe {
+                libc::signal(sig, libc::SIG_DFL);
+                libc::raise(sig);
+            }
+            std::process::exit(128 + sig);
+        }
+        #[cfg(not(unix))]
+        let _ = signal;
+        std::process::exit(code.unwrap_or(1));
     }
     let _ = std::fs::remove_dir_all(handle_dir);
     match status {
@@ -6799,10 +7592,277 @@ fn spawn_interactive_inherited(
             audit_emitter.set_end_ts(end_ts);
             audit_emitter.set_result(ResultState::Fail, Decision::Accept);
             fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
+            remove_scaffold_file(&cmd);
             std::process::exit(s.code().unwrap_or(1))
         }
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            // Clean exit after one or more recycles: an end record whose flush failed at
+            // rotation time is retried NOW; a failure is reported, the exit code is unchanged.
+            #[cfg(unix)]
+            if let Err(e) = audit_emitter.flush_deferred_now() {
+                eprintln!("{}", e.remediation_message());
+            }
+            Ok(())
+        }
         Err(e) => Err(anyhow!("failed to wait for claude: {e}")),
+    }
+}
+
+/// Launch facts the supervised claude arm records for `csq session recycle` (spec 36 §36.6):
+/// the user's own arguments (so a relaunch can drop the initial prompt) and everything the
+/// launch gates need to be re-run before a relaunch.
+#[cfg(unix)]
+#[derive(Clone)]
+pub(crate) struct RecycleCtx {
+    base_dir: PathBuf,
+    rest: Vec<String>,
+    surface: SurfaceCli,
+    ignore_cli_version: bool,
+    track_latest: bool,
+    layer_enabled: bool,
+    toggles: CapabilityLayerToggles,
+    debug: bool,
+    coc_cache_enabled: bool,
+}
+
+#[cfg(unix)]
+thread_local! {
+    // Set by `handle` immediately before `launch_anthropic`, consumed (taken) by
+    // `supervise_claude`; an arm that never sets it has no recycle context ⇒ recycle disabled.
+    static RECYCLE_CTX: std::cell::RefCell<Option<RecycleCtx>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A recycle is a NEW launch for gating (owner decision, spec 36 §36.6): re-run every launch
+/// gate BEFORE the child is stopped. Any refusal is a fixed tag and the child stays untouched.
+#[cfg(unix)]
+fn recycle_gate_recheck(ctx: &RecycleCtx, handle_dir: &Path) -> Result<(), &'static str> {
+    recycle_gate_recheck_with(ctx, handle_dir, &|base| {
+        #[cfg(feature = "enterprise")]
+        {
+            super::super::enforce_enterprise_license(base)
+        }
+        #[cfg(not(feature = "enterprise"))]
+        {
+            let _ = base;
+            Ok(())
+        }
+    })
+}
+
+/// [`recycle_gate_recheck`] with the licence gate injectable (the enterprise gate reads a
+/// live licence, so tests substitute a refusal).
+#[cfg(unix)]
+fn recycle_gate_recheck_with(
+    ctx: &RecycleCtx,
+    handle_dir: &Path,
+    license: &dyn Fn(&Path) -> Result<()>,
+) -> Result<(), &'static str> {
+    // The licence gate is the FIRST check, exactly as at launch: a recycle is a new launch.
+    license(&ctx.base_dir).map_err(|_| "recycle_gate_license_refused")?;
+    // The account is re-read from the handle's marker NOW: a `csq swap` since launch changes
+    // which account this terminal is, and the gates must judge that one (never the launch copy).
+    let account = csq_core::accounts::markers::resolve_marker_to_slot(&ctx.base_dir, handle_dir)
+        .ok_or("recycle_gate_account_unresolved")?;
+    csq_core::accounts::launch_block::check_launch(&ctx.base_dir, account.get())
+        .map_err(|_| "recycle_gate_launch_blocked")?;
+    // A recycle is a new launch: an account that flipped to LOGIN-NEEDED since
+    // the original launch must not be relaunched on a dead credential.
+    if login_needed_launch_refusal(&ctx.base_dir, account).is_some() {
+        return Err("recycle_gate_login_needed");
+    }
+    // Never auto-update the CLI in the middle of a session: `no_auto_update_cli = true`.
+    super::cli_deps_gate::enforce(
+        ctx.surface,
+        ctx.ignore_cli_version,
+        true,
+        ctx.track_latest,
+        &ctx.base_dir,
+        &format!("csq run {account}"),
+    )
+    .map_err(|_| "recycle_gate_cli_deps_refused")?;
+    super::gate_launch::attach(
+        &mut Command::new("claude"),
+        &ctx.base_dir,
+        handle_dir,
+        &ctx.rest,
+    )
+    .map_err(|_| "recycle_gate_pin_refused")?;
+    // `layer_is_auto = false`: suppresses the one-time "auto-engaged" note on a relaunch.
+    run_capability_layer_preflight(
+        &ctx.base_dir,
+        account,
+        ctx.layer_enabled,
+        false,
+        &ctx.toggles,
+        ctx.debug,
+        Surface::ClaudeCode,
+        ctx.coc_cache_enabled,
+        &ctx.rest,
+    )
+    .map_err(|_| "recycle_gate_layer_refused")?;
+    // X1's guard-manifest check refuses a present manifest that no longer
+    // matches at every launch instant; a recycle is a new launch (spec 36), so
+    // it runs here too, BEFORE the child is stopped.
+    recycle_guard_manifest_refusal(ctx, handle_dir)?;
+    Ok(())
+}
+
+/// The X1 guard-manifest re-check for a recycle. The repo root is the same cwd
+/// the launch used, with the same fail-closed fallback as `launch_x1::plan`.
+#[cfg(unix)]
+fn recycle_guard_manifest_refusal(ctx: &RecycleCtx, handle_dir: &Path) -> Result<(), &'static str> {
+    let repo_root = std::env::current_dir().unwrap_or_else(|_| ctx.base_dir.clone());
+    match csq_core::launch_isolation::verify_manifest(&ctx.base_dir, handle_dir, &repo_root) {
+        csq_core::launch_isolation::ManifestCheck::Mismatch { .. }
+        | csq_core::launch_isolation::ManifestCheck::Invalid { .. } => {
+            Err("recycle_gate_guard_manifest_refused")
+        }
+        csq_core::launch_isolation::ManifestCheck::Verified
+        | csq_core::launch_isolation::ManifestCheck::Absent => Ok(()),
+    }
+}
+
+/// Removes csq's own scaffold temp file named by an `--append-system-prompt-file` argument.
+/// `process::exit` skips the caller's cleanup, so the exit paths call this first.
+fn remove_scaffold_file(cmd: &Command) {
+    let mut args = cmd.get_args();
+    while let Some(a) = args.next() {
+        if a == "--append-system-prompt-file" {
+            if let Some(p) = args.next().map(Path::new) {
+                let ours = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("csq-coc-scaffold"));
+                if ours {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+    }
+}
+
+/// Supervises the interactive claude child (spec 36): memory sampling and
+/// request-driven in-place recycle. Returns the final wait result and whether
+/// the handle dir must be kept (failed recycle).
+#[cfg(unix)]
+fn supervise_claude(
+    cmd: &Command,
+    child: std::process::Child,
+    lifecycle: Option<csq_core::sessions::lifecycle::LaunchTicket>,
+    handle_dir: &Path,
+    audit_emitter: &mut crate::cli::audit_emit::AuditEmitter,
+) -> (std::io::Result<std::process::ExitStatus>, bool, Option<i32>) {
+    use csq_core::session::recycle::{build_plan, record_artifacts, RegistryProbe};
+    use csq_core::session::recycle_supervise::{supervise, Exit, Hooks, Launch, Timing};
+    let ctx = RECYCLE_CTX.with(|c| c.borrow_mut().take());
+    let cwd = cmd
+        .get_current_dir()
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
+    let plan = match &ctx {
+        Some(c) => {
+            let user: Vec<std::ffi::OsString> = c.rest.iter().map(Into::into).collect();
+            build_plan(cmd, &user)
+        }
+        None => Err("recycle_context_missing"),
+    };
+    let artifacts = match &plan {
+        Ok(p) => record_artifacts(&p.prefix),
+        Err(t) => Err(*t),
+    };
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let abs = std::fs::canonicalize(handle_dir).unwrap_or_else(|_| handle_dir.to_path_buf());
+    let display_handle = match home.as_deref().and_then(|h| abs.strip_prefix(h).ok()) {
+        Some(rel) => format!("~/{}", rel.display()),
+        None => abs
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    };
+    let probe = RegistryProbe {
+        base: handle_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default(),
+        home: home.unwrap_or_default(),
+    };
+    let launch = Launch {
+        handle: handle_dir,
+        cwd,
+        // Every marker form `csq swap` writes (numeric and UUID), never the numeric-only reader.
+        account: csq_core::accounts::markers::resolve_marker_to_slot(&probe.base, handle_dir)
+            .map(|a| a.get()),
+        display_handle,
+        timing: Timing::default(),
+        plan,
+        artifacts,
+        probe: &probe,
+    };
+    let mut rotate = || {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        if audit_emitter.rotate_run(&now).is_err() {
+            // The old run's end record is retained and retried at the final flush.
+            eprintln!(
+                "csq: WARNING: the audit record of the recycled run could not be written yet; it will be retried at exit."
+            );
+        }
+    };
+    let mut preflight = || match &ctx {
+        Some(c) => recycle_gate_recheck(c, handle_dir),
+        None => Err("recycle_context_missing"),
+    };
+    // P2: at the spawn instant a Gate may have attached since the preflight;
+    // the relaunch command cannot be repinned then, so refuse loudly instead.
+    let mut gate_recheck = |cmd: &Command| -> Result<(), &'static str> {
+        match &ctx {
+            Some(c) => super::gate_launch::relaunch_gate_ok(cmd, &c.base_dir)
+                .map_err(|_| "recycle_gate_attached_refused"),
+            None => Err("recycle_context_missing"),
+        }
+    };
+    let mut notify = |text: &str| {
+        use csq_core::bridge::notify::NotifyError;
+        match csq_core::bridge::notify::send_owner_ping(text) {
+            // Not enrolled in the owner bridge: nothing to report, nothing to log.
+            Ok(_)
+            | Err(NotifyError::NotConfigured | NotifyError::Disabled | NotifyError::Unpinned) => {}
+            Err(_) => tracing::warn!(
+                error_kind = "recycle_owner_ping_failed",
+                "owner ping was not sent"
+            ),
+        }
+    };
+    // The capability layer's readiness verdict (its route-B contract). Until the contract
+    // lands, `fresh_context_at` refuses by construction, so a fresh recycle cannot run against a
+    // half-installed capability layer.
+    let mut fresh = |root: &std::path::Path, cfg: &std::path::Path, sid: &str| {
+        csq_core::session::recycle::fresh_context_at(root, cfg, sid)
+    };
+    let mut err = std::io::stderr();
+    let mut hooks = Hooks {
+        rotate_audit: &mut rotate,
+        preflight: &mut preflight,
+        gate_recheck: &mut gate_recheck,
+        notify_owner: &mut notify,
+        fresh: &mut fresh,
+        out: &mut err,
+    };
+    match supervise(cmd, child, lifecycle, &launch, &mut hooks) {
+        Exit::Exited(s) => (Ok(s), false, None),
+        Exit::RecycleFailed(s) => (
+            s.ok_or_else(|| std::io::Error::other("recycle_failed")),
+            true,
+            None,
+        ),
+        // A signal arrived in the stop-to-spawn window; it was forwarded to the new child.
+        Exit::Interrupted(sig) => (
+            Err(std::io::Error::other("recycle_interrupted")),
+            true,
+            Some(sig),
+        ),
+        Exit::WaitFailed => (Err(std::io::Error::other("wait_failed")), false, None),
     }
 }
 
@@ -6857,6 +7917,11 @@ fn exec_or_spawn(
         // exit code here (exec has not happened yet), so a `.pending/` total
         // failure MUST surface the multi-line remediation and exit non-zero
         // BEFORE `cmd.exec()` replaces the process image.
+        // P1: retain the record so an exec that RETURNS can write a corrective
+        // Fail/Reject record. The flush below is required (a successful exec
+        // replaces the process), but it leaves the pre-spawn intent as the
+        // outcome when exec fails.
+        let retained = audit_emitter.retained_record();
         let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         audit_emitter.set_end_ts(end_ts);
         fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
@@ -6864,8 +7929,14 @@ fn exec_or_spawn(
             .then(|| csq_core::sessions::lifecycle::prepare_exec(handle_dir))
             .flatten();
         let err = cmd.exec();
+        // Before the corrective write and the error report below.
+        csq_core::platform::process::restore_sigpipe_after_failed_exec();
         csq_core::sessions::lifecycle::cancel_exec(lifecycle.as_ref());
         let _ = std::fs::remove_dir_all(handle_dir);
+        if let Some(record) = retained {
+            let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            fail_loud_on_audit_write_failure(audit_emitter.write_corrective_failure(record, &now));
+        }
         Err(anyhow!("exec failed: {err}"))
     }
 
@@ -6886,6 +7957,10 @@ fn exec_or_spawn(
                 // when the launch attempt terminated even on spawn error.
                 let end_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
                 audit_emitter.set_end_ts(end_ts);
+                audit_emitter.set_result(
+                    csq_core::audit::ResultState::Fail,
+                    csq_core::audit::Decision::Reject,
+                );
                 fail_loud_on_audit_write_failure(audit_emitter.try_flush_now());
                 return Err(anyhow!("failed to launch claude: {e}"));
             }
@@ -7012,19 +8087,49 @@ fn run_env_preflight(claude_home: &Path) {
     eprintln!();
 }
 
-fn exec_claude(base_dir: &Path, claude_home: &Path, rest: &[String]) -> Result<()> {
-    let mut cmd = build_vanilla_claude_command(base_dir, claude_home, rest)?;
+fn exec_claude(
+    base_dir: &Path,
+    claude_home: &Path,
+    rest: &[String],
+    x1_options: &X1Options,
+) -> Result<()> {
+    let mut cmd = match build_vanilla_claude_command(base_dir, claude_home, rest, x1_options) {
+        Ok(cmd) => cmd,
+        Err(error) => {
+            // The builder created this process's `term-<pid>` (an internal ticket);
+            // a refused vanilla launch must not leave it behind.
+            let _ = std::fs::remove_dir_all(vanilla_handle_dir(base_dir));
+            return Err(error);
+        }
+    };
 
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         let err = cmd.exec();
+        csq_core::platform::process::restore_sigpipe_after_failed_exec();
+        // `exec` only returns on failure, and the process is still ours:
+        // remove the terminal dir (its `tmp/` may already hold files) rather
+        // than leaving a dead `term-<pid>` behind, exactly as `exec_or_spawn`
+        // does on the same path.
+        let _ = std::fs::remove_dir_all(vanilla_handle_dir(base_dir));
         Err(anyhow!("exec failed: {err}"))
     }
 
     #[cfg(not(unix))]
     {
-        let status = cmd.status()?;
+        let handle_dir = vanilla_handle_dir(base_dir);
+        let status = match cmd.status() {
+            Ok(status) => status,
+            Err(error) => {
+                // A spawn/wait failure must not leave the terminal dir behind.
+                let _ = std::fs::remove_dir_all(&handle_dir);
+                return Err(error.into());
+            }
+        };
+        // Windows only: `exec` is emulated by a child + `process::exit`, so
+        // the terminal dir is removed here, mirroring `exec_or_spawn`.
+        let _ = std::fs::remove_dir_all(&handle_dir);
         std::process::exit(status.code().unwrap_or(1));
     }
 }
@@ -7054,14 +8159,27 @@ fn exec_claude(base_dir: &Path, claude_home: &Path, rest: &[String]) -> Result<(
 /// parent-shell env var. `csq exec` (`commands::exec`) reuses it for the
 /// same reason — it is the single source of truth for the spawn env allowlist.
 pub(crate) fn strip_sensitive_env(cmd: &mut Command) {
+    strip_sensitive_env_with(cmd, std::env::vars_os());
+}
+
+/// [`strip_sensitive_env`] with an explicit environment source. `vars_os` (not
+/// `vars`): a non-UTF-8 entry must not panic the launch. A non-UTF-8 NAME
+/// cannot be classified, so it is left to the X1 scrub, which drops it outright
+/// (`scrub_os_env`).
+fn strip_sensitive_env_with<I>(cmd: &mut Command, vars: I)
+where
+    I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+{
     // Collect into a Vec first so we don't mutate env vars during iteration.
-    let to_strip: Vec<String> = std::env::vars()
+    let to_strip: Vec<std::ffi::OsString> = vars
+        .into_iter()
         .filter_map(|(k, _)| {
-            if k.starts_with("ANTHROPIC_")
-                || k.starts_with("OPENAI_")
-                || k == "AWS_BEARER_TOKEN_BEDROCK"
-                || k == "CLAUDE_API_KEY"
-                || k == "CODEX_HOME"
+            let name = k.to_str()?;
+            if name.starts_with("ANTHROPIC_")
+                || name.starts_with("OPENAI_")
+                || name == "AWS_BEARER_TOKEN_BEDROCK"
+                || name == "CLAUDE_API_KEY"
+                || name == "CODEX_HOME"
             {
                 Some(k)
             } else {
@@ -7073,6 +8191,24 @@ pub(crate) fn strip_sensitive_env(cmd: &mut Command) {
     for key in to_strip {
         cmd.env_remove(&key);
     }
+}
+
+/// The inherited environment as UTF-8 pairs. `std::env::vars()` panics on a
+/// non-UTF-8 entry; Gemini's plan builder takes a `HashMap<String, String>`, so
+/// an unrepresentable entry is dropped (the X1 receipt's `scrubbed_env_keys`
+/// already lists it from `scrub_os_env`).
+fn env_utf8_map() -> std::collections::HashMap<String, String> {
+    utf8_map(std::env::vars_os())
+}
+
+/// [`env_utf8_map`] over an explicit source. One implementation with the
+/// Gemini path: [`csq_core::env::utf8_env_map`]. The X1 receipt's
+/// `scrubbed_env_keys` lists the same dropped entries from `scrub_os_env`.
+fn utf8_map<I>(vars: I) -> std::collections::HashMap<String, String>
+where
+    I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+{
+    csq_core::env::utf8_env_map(vars)
 }
 
 // ---------------------------------------------------------------------------
@@ -7489,6 +8625,22 @@ mod tests {
         assert!(plugin_dir.join("commands/COMMAND-W.md").is_file());
         // Rules are Level-1 prose — never materialized.
         assert!(!plugin_dir.join("rules").exists());
+        // R1 C10: csq's own `--plugin-dir` is the documented `--sandbox`
+        // exception BECAUSE this plugin cannot carry a hook that approves.
+        // Falsifier: a new emitter branch writing `hooks/` reddens here.
+        assert!(
+            !plugin_dir.join("hooks").exists(),
+            "the csq plugin must never carry hooks (the --sandbox exception's mechanism)"
+        );
+        let mut top_level: Vec<String> = std::fs::read_dir(&plugin_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        top_level.sort();
+        assert_eq!(
+            top_level,
+            [".claude-plugin", "agents", "commands", "skills"]
+        );
 
         #[cfg(unix)]
         {
@@ -11865,7 +13017,8 @@ mod tests {
     fn attach_scaffold_nonempty_uses_file_carrier() {
         let scaffold = "## Compliance rules\n\nCite RULE_IDs.\n";
         let mut cmd = Command::new("echo"); // dummy executable
-        let tmp_path = attach_scaffold(&mut cmd, Some(scaffold))
+        let hd = tempfile::tempdir().unwrap();
+        let tmp_path = attach_scaffold(&mut cmd, Some(scaffold), hd.path())
             .expect("non-empty scaffold must return Some(path)");
 
         // The temp file must exist and contain the exact scaffold text.
@@ -11910,11 +13063,29 @@ mod tests {
         );
     }
 
+    /// Item 3d: the scaffold is written INTO the handle dir, owner-only, never to a shared /tmp.
+    #[cfg(unix)]
+    #[test]
+    fn attach_scaffold_lives_in_the_handle_dir_with_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let hd = tempfile::tempdir().unwrap();
+        let mut cmd = Command::new("echo");
+        let p = attach_scaffold(&mut cmd, Some("rules"), hd.path()).unwrap();
+        assert_eq!(p.parent().unwrap(), hd.path());
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let strays: Vec<_> = std::fs::read_dir(hd.path()).unwrap().flatten().collect();
+        assert_eq!(strays.len(), 1, "no temp leftovers beside the scaffold");
+    }
+
     /// Empty scaffold: no flag, no file, no env var.
     #[test]
     fn attach_scaffold_empty_is_noop() {
         let mut cmd = Command::new("echo");
-        let result = attach_scaffold(&mut cmd, Some(""));
+        let hd = tempfile::tempdir().unwrap();
+        let result = attach_scaffold(&mut cmd, Some(""), hd.path());
         assert!(result.is_none(), "empty scaffold must return None");
         let dbg = format!("{cmd:?}");
         assert!(
@@ -11931,7 +13102,8 @@ mod tests {
     #[test]
     fn attach_scaffold_none_is_noop() {
         let mut cmd = Command::new("echo");
-        let result = attach_scaffold(&mut cmd, None);
+        let hd = tempfile::tempdir().unwrap();
+        let result = attach_scaffold(&mut cmd, None, hd.path());
         assert!(result.is_none(), "None scaffold must return None");
         let dbg = format!("{cmd:?}");
         assert!(
@@ -11947,7 +13119,8 @@ mod tests {
     fn attach_scaffold_cleanup_removes_temp_file() {
         let scaffold = "rule-1: cite IDs\n";
         let mut cmd = Command::new("echo");
-        let tmp_path = attach_scaffold(&mut cmd, Some(scaffold))
+        let hd = tempfile::tempdir().unwrap();
+        let tmp_path = attach_scaffold(&mut cmd, Some(scaffold), hd.path())
             .expect("non-empty scaffold must return Some(path)");
         assert!(tmp_path.exists(), "file must exist before cleanup");
         let _ = std::fs::remove_file(&tmp_path);
@@ -12136,6 +13309,11 @@ mod messaging_registration_tests {
         fixture_in(TempDir::new().unwrap())
     }
 
+    #[cfg(unix)]
+    fn acc(n: u16) -> AccountNum {
+        AccountNum::try_from(n).unwrap()
+    }
+
     fn fixture_in(dir: TempDir) -> Fixture {
         let home = dir.path().join("home");
         std::fs::create_dir_all(home.join(".claude")).unwrap();
@@ -12301,13 +13479,14 @@ mod messaging_registration_tests {
                 std::fs::create_dir_all(&config).unwrap();
                 std::fs::write(config.join("settings.json"), overlay).unwrap();
                 csq_core::session::materialize_handle_settings(&f.handle, home, &config).unwrap();
-                let mut anthropic = build_anthropic_command(&base, &f.handle, &rest).unwrap();
+                let mut anthropic = build_anthropic_command(&base, &f.handle, &rest, None).unwrap();
                 // Match the Inherit arm's final user-argument placement.
                 anthropic.args(&rest);
                 let commands = [
                     anthropic,
-                    build_third_party_command(&base, &f.handle, &rest).unwrap(),
-                    build_vanilla_claude_command(&base, home, &rest).unwrap(),
+                    build_third_party_command(&base, &f.handle, &rest, None).unwrap(),
+                    build_vanilla_claude_command(&base, home, &rest, &X1Options::default())
+                        .unwrap(),
                 ];
                 for cmd in &commands {
                     assert_eq!(cmd.get_program(), "claude");
@@ -12339,6 +13518,935 @@ mod messaging_registration_tests {
                 );
             }
         });
+    }
+
+    // ── Fact Guard X1 wiring (R1 fix pass) ────────────────────────────────
+
+    #[cfg(unix)]
+    fn fake_cli(dir: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = bin.join(name);
+        std::fs::write(
+            &script,
+            b"#!/bin/sh\nfor a in \"$@\"; do printf 'ARG=%s\\n' \"$a\"; done\n/usr/bin/env\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        bin
+    }
+
+    /// Restores the process variables it sets, even on panic.
+    #[cfg(unix)]
+    /// Restores the process variables it sets, even on panic.
+    ///
+    /// Owns the workspace-wide `test_env` lock (R2 N7): the guard mutates
+    /// PATH/HOME/credential variables every other spawn test reads, so it must
+    /// hold the lock for its whole lifetime. Taking the lock as a constructor
+    /// argument makes forgetting it a compile error, and removing a second,
+    /// nested `lock()` call prevents self-deadlock.
+    #[cfg(unix)]
+    struct X1EnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _lock: csq_core::platform::test_env::EnvTestGuard,
+    }
+
+    #[cfg(unix)]
+    impl X1EnvGuard {
+        fn apply(
+            lock: csq_core::platform::test_env::EnvTestGuard,
+            values: &[(&'static str, &std::ffi::OsStr)],
+        ) -> Self {
+            let saved = values
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect();
+            for (key, value) in values {
+                std::env::set_var(key, value);
+            }
+            Self { saved, _lock: lock }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for X1EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    /// The REAL Anthropic builder, spawned against a harness: the child sees
+    /// only the X1 map (a parent `GITHUB_TOKEN` and a parent session's
+    /// `CSQ_LAUNCH_RECEIPT`/`GH_CONFIG_DIR` are gone), `--sandbox` reaches the
+    /// built argv, and messaging auto-approve is suppressed under sandbox while
+    /// a non-sandbox baseline still adds it.
+    #[cfg(unix)]
+    #[test]
+    fn sandboxed_anthropic_child_sees_only_the_x1_environment_and_no_messaging_channel() {
+        let dir = TempDir::new().unwrap();
+        let bin = fake_cli(dir.path(), "claude");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _guard = X1EnvGuard::apply(
+            csq_core::platform::test_env::lock(),
+            &[
+                ("PATH", bin.as_os_str()),
+                ("HOME", home.as_os_str()),
+                (
+                    "GITHUB_TOKEN",
+                    std::ffi::OsStr::new("ghp_canary_never_reaches_child"),
+                ),
+                (
+                    "CSQ_LAUNCH_RECEIPT",
+                    std::ffi::OsStr::new("/parent/session/receipt.json"),
+                ),
+                ("GH_CONFIG_DIR", std::ffi::OsStr::new("/parent/session/gh")),
+            ],
+        );
+
+        let f = fixture();
+        let base = f._dir.path().join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        let handle_abs = std::fs::canonicalize(&f.handle).unwrap();
+        csq_core::messaging::register::record_decision(&f.handle, true).unwrap();
+        let rest: Vec<String> = Vec::new();
+
+        let plain =
+            launch_x1::plan(&base, &handle_abs, acc(1), &X1Options::default(), &rest).unwrap();
+        let mut plain_cmd =
+            build_anthropic_command(&base, &handle_abs, &rest, Some(&plain)).unwrap();
+        let plain_out = String::from_utf8_lossy(&plain_cmd.output().unwrap().stdout).into_owned();
+        assert!(
+            plain_out.contains("ARG=--mcp-config"),
+            "messaging-on baseline must add its MCP channel: {plain_out}"
+        );
+        assert!(
+            plain_out.contains(&format!(
+                "CSQ_LAUNCH_RECEIPT={}/launch-receipt.json",
+                handle_abs.display()
+            )),
+            "the child must point at ITS OWN receipt: {plain_out}"
+        );
+        for forbidden in [
+            "ghp_canary_never_reaches_child",
+            "CSQ_LAUNCH_RECEIPT=/parent/session/receipt.json",
+            "GH_CONFIG_DIR=/parent/session/gh",
+        ] {
+            assert!(
+                !plain_out.contains(forbidden),
+                "leaked {forbidden}: {plain_out}"
+            );
+        }
+
+        let sandbox = X1Options {
+            sandbox: true,
+            allow_env: BTreeSet::new(),
+        };
+        // A SEPARATE handle dir: production gives every launch a fresh one, so
+        // the baseline's messaging settings must not colour this assertion.
+        let sandbox_handle = base.join("term-4343");
+        std::fs::create_dir_all(&sandbox_handle).unwrap();
+        std::fs::write(sandbox_handle.join("settings.json"), "{}").unwrap();
+        let sandbox_handle = std::fs::canonicalize(&sandbox_handle).unwrap();
+        let planned = launch_x1::plan(&base, &sandbox_handle, acc(1), &sandbox, &rest).unwrap();
+        let mut cmd =
+            build_anthropic_command(&base, &sandbox_handle, &rest, Some(&planned)).unwrap();
+        let out = String::from_utf8_lossy(&cmd.output().unwrap().stdout).into_owned();
+        assert!(
+            out.contains("ARG=--permission-mode") && out.contains("ARG=manual"),
+            "--sandbox must reach the built argv: {out}"
+        );
+        assert!(
+            !out.contains("ARG=--mcp-config"),
+            "sandbox must not pre-approve the messaging channel: {out}"
+        );
+        assert!(!out.contains("ghp_canary_never_reaches_child"), "{out}");
+    }
+
+    /// The REAL vanilla builder, spawned: the scrub applies even with no account
+    /// and no receipt, and an inherited parent session pointer is removed.
+    #[cfg(unix)]
+    #[test]
+    fn vanilla_launch_drops_admin_tokens_and_a_parent_session_pointer() {
+        let dir = TempDir::new().unwrap();
+        let bin = fake_cli(dir.path(), "claude");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _guard = X1EnvGuard::apply(
+            csq_core::platform::test_env::lock(),
+            &[
+                ("PATH", bin.as_os_str()),
+                ("HOME", home.as_os_str()),
+                (
+                    "GITHUB_TOKEN",
+                    std::ffi::OsStr::new("ghp_canary_never_reaches_child"),
+                ),
+                (
+                    "CSQ_LAUNCH_RECEIPT",
+                    std::ffi::OsStr::new("/parent/session/receipt.json"),
+                ),
+                ("GH_CONFIG_DIR", std::ffi::OsStr::new("/parent/session/gh")),
+            ],
+        );
+        let base = dir.path().join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        let rest: Vec<String> = Vec::new();
+        let mut cmd =
+            build_vanilla_claude_command(&base, &home, &rest, &X1Options::default()).unwrap();
+        let out = String::from_utf8_lossy(&cmd.output().unwrap().stdout).into_owned();
+        for forbidden in [
+            "ghp_canary_never_reaches_child",
+            "CSQ_LAUNCH_RECEIPT",
+            "GH_CONFIG_DIR",
+        ] {
+            assert!(!out.contains(forbidden), "leaked {forbidden}: {out}");
+        }
+
+        let sandbox = X1Options {
+            sandbox: true,
+            allow_env: BTreeSet::new(),
+        };
+        let mut cmd = build_vanilla_claude_command(&base, &home, &rest, &sandbox).unwrap();
+        let out = String::from_utf8_lossy(&cmd.output().unwrap().stdout).into_owned();
+        assert!(
+            out.contains("ARG=--permission-mode") && out.contains("ARG=manual"),
+            "vanilla --sandbox must reach the built argv: {out}"
+        );
+    }
+
+    /// The REAL codex builder, spawned: only the supplied map reaches the child.
+    #[cfg(unix)]
+    #[test]
+    fn codex_builder_child_sees_only_the_supplied_environment() {
+        let dir = TempDir::new().unwrap();
+        let bin = fake_cli(dir.path(), "codex");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _guard = X1EnvGuard::apply(
+            csq_core::platform::test_env::lock(),
+            &[
+                ("PATH", bin.as_os_str()),
+                ("HOME", home.as_os_str()),
+                (
+                    "GITHUB_TOKEN",
+                    std::ffi::OsStr::new("ghp_canary_never_reaches_child"),
+                ),
+            ],
+        );
+        let base = dir.path().join("accounts");
+        std::fs::create_dir_all(base.join("config-1")).unwrap();
+        std::fs::write(base.join("config-1").join("config.toml"), "model = \"x\"\n").unwrap(); // CI-ALLOW-fs-write-config-toml
+        let handle = dir.path().join("term-4242");
+        std::fs::create_dir_all(&handle).unwrap();
+        let handle_abs = std::fs::canonicalize(&handle).unwrap();
+        let mut map = BTreeMap::new();
+        map.insert("CSQ_CANARY_KEPT".to_owned(), "kept".to_owned());
+        map.insert("HOME".to_owned(), home.to_string_lossy().into_owned());
+        map.insert("PATH".to_owned(), bin.to_string_lossy().into_owned());
+        let rest: Vec<String> = Vec::new();
+        let mut cmd = build_codex_exec_command_with_x1(
+            &base,
+            acc(1),
+            &handle_abs,
+            &rest,
+            None,
+            Some(false),
+            Some(&map),
+        )
+        .unwrap();
+        let out = String::from_utf8_lossy(&cmd.output().unwrap().stdout).into_owned();
+        assert!(out.contains("CSQ_CANARY_KEPT=kept"), "{out}");
+        assert!(
+            !out.contains("ghp_canary_never_reaches_child"),
+            "the builder must not inherit the parent environment: {out}"
+        );
+    }
+
+    /// The values a built `Command` carries for `key` (one per explicit
+    /// setting; `Command::env` replaces, so a healthy build has exactly one).
+    fn env_values(cmd: &Command, key: &str) -> Vec<Option<String>> {
+        cmd.get_envs()
+            .filter(|(name, _)| *name == key)
+            .map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+            .collect()
+    }
+
+    /// an internal ticket AC1/AC4/AC6: the Anthropic/3P builder exports the
+    /// per-session `TMPDIR` (`<handle_dir>/tmp`) and SETS it after the X1
+    /// scrub map, so a parent-shell `TMPDIR` carried by that map loses.
+    /// Falsifier: without the `cmd.env("TMPDIR", …)` call the parent value is
+    /// the only one present (and no session temp dir is created).
+    #[test]
+    fn anthropic_builder_sets_the_session_tmpdir_and_overrides_a_parent_one() {
+        let f = fixture();
+        let base = f._dir.path().join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        let handle_abs = std::fs::canonicalize(&f.handle).unwrap();
+        let rest: Vec<String> = Vec::new();
+        let base_abs = std::fs::canonicalize(&base).unwrap();
+        let x1 = launch_x1::plan_with_env(
+            &base_abs,
+            &handle_abs,
+            AccountNum::try_from(1u16).unwrap(),
+            &X1Options::default(),
+            &rest,
+            [
+                (
+                    std::ffi::OsString::from("TMPDIR"),
+                    std::ffi::OsString::from("/parent/shared/tmp"),
+                ),
+                (
+                    std::ffi::OsString::from("PATH"),
+                    std::ffi::OsString::from("/usr/bin"),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let cmd = build_anthropic_command(&base_abs, &handle_abs, &rest, Some(&x1)).unwrap();
+        let expected = handle_abs.join("tmp");
+        assert_eq!(
+            env_values(&cmd, "TMPDIR"),
+            vec![Some(expected.to_string_lossy().into_owned())],
+            "the child's TMPDIR must be <handle>/tmp, never the parent's"
+        );
+        assert!(expected.is_dir(), "the session TMPDIR exists before spawn");
+    }
+
+    /// an internal ticket AC1/AC6: a creation failure refuses the launch with the
+    /// fixed tag and creates nothing in the shared `$TMPDIR`. The fixture
+    /// occupies `<handle>/tmp` with a regular file so directory creation
+    /// cannot succeed (deterministic even when tests run as root).
+    #[test]
+    fn anthropic_builder_refuses_with_the_fixed_tag_when_the_session_tmpdir_cannot_be_created() {
+        let f = fixture();
+        let base = f._dir.path().join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(f.handle.join("tmp"), b"not a directory").unwrap();
+        let error = build_anthropic_command(&base, &f.handle, &[], None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(csq_core::session::tmpdir::SESSION_TMPDIR_TAG),
+            "refusal must carry the fixed tag: {error}"
+        );
+    }
+
+    /// an internal ticket AC1/AC4/AC6 for the no-account vanilla path: it still gets
+    /// a `term-<pid>` handle dir under the accounts root and exports
+    /// `<handle>/tmp` as `TMPDIR`.
+    ///
+    /// This deliberately does NOT mutate the process `TMPDIR` to simulate a
+    /// parent value: a process-wide `TMPDIR` mutator makes every parallel
+    /// test's `TempDir::new()` land in the mutated (possibly deleted) path —
+    /// see `tmpdir_outlives_test_support` for that hazard class. The
+    /// override is still exercised: the scrub map is applied first and
+    /// `cmd.env("TMPDIR", …)` replaces it, so exactly ONE entry exists and it
+    /// is the session path even when the harness exports a `TMPDIR`.
+    #[test]
+    fn vanilla_builder_sets_the_session_tmpdir_under_the_handle_dir() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let base = dir.path().join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        let rest: Vec<String> = Vec::new();
+        let cmd = build_vanilla_claude_command(&base, &home, &rest, &X1Options::default()).unwrap();
+        let expected = base
+            .join(format!("term-{}", std::process::id()))
+            .join("tmp");
+        assert_eq!(
+            env_values(&cmd, "TMPDIR"),
+            vec![Some(expected.to_string_lossy().into_owned())],
+            "vanilla must get a per-session TMPDIR"
+        );
+        assert!(expected.is_dir());
+    }
+
+    /// an internal ticket AC1/AC4/AC6 for Codex: the builder exports `<handle>/tmp`
+    /// and overrides a `TMPDIR` carried by the caller-supplied env map.
+    #[test]
+    fn codex_builder_sets_the_session_tmpdir_and_overrides_a_parent_one() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("accounts");
+        std::fs::create_dir_all(base.join("config-1")).unwrap();
+        let handle = dir.path().join("term-4242");
+        std::fs::create_dir_all(&handle).unwrap();
+        let map = BTreeMap::from([("TMPDIR".to_owned(), "/parent/shared/tmp".to_owned())]);
+        let cmd = codex_command_with_env(
+            &base,
+            AccountNum::try_from(1u16).unwrap(),
+            &handle,
+            Some(&map),
+        )
+        .unwrap();
+        let expected = handle.join("tmp");
+        assert_eq!(
+            env_values(&cmd, "TMPDIR"),
+            vec![Some(expected.to_string_lossy().into_owned())]
+        );
+        assert!(expected.is_dir());
+    }
+
+    /// an internal ticket AC1/AC4/AC6 for the native (Kimi/Grok) path: the extracted
+    /// command builder exports `<handle>/tmp` after the X1 scrub, so a parent
+    /// `TMPDIR` never reaches the vendor CLI.
+    #[test]
+    fn native_builder_sets_the_session_tmpdir_and_overrides_a_parent_one() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("accounts");
+        std::fs::create_dir_all(&base).unwrap();
+        let handle = dir.path().join("term-4242");
+        std::fs::create_dir_all(&handle).unwrap();
+        let descriptor = csq_core::providers::native::descriptor(Surface::Kimi).unwrap();
+        let rest: Vec<String> = Vec::new();
+        let x1 = launch_x1::plan_with_env(
+            &base,
+            &handle,
+            AccountNum::try_from(1u16).unwrap(),
+            &X1Options::default(),
+            &rest,
+            [(
+                std::ffi::OsString::from("TMPDIR"),
+                std::ffi::OsString::from("/parent/shared/tmp"),
+            )],
+        )
+        .unwrap();
+        let cmd = build_native_command(
+            descriptor,
+            Path::new("/bin/true"),
+            &base,
+            AccountNum::try_from(1u16).unwrap(),
+            &handle,
+            false,
+            &x1,
+            &rest,
+        )
+        .unwrap();
+        let expected = handle.join("tmp");
+        assert_eq!(
+            env_values(&cmd, "TMPDIR"),
+            vec![Some(expected.to_string_lossy().into_owned())]
+        );
+        assert!(expected.is_dir());
+    }
+
+    /// Flag-only refusals carry their fixed tags, and the pass-through hint names
+    /// `--` so a Codex/Gemini `--sandbox <mode>` is not swallowed.
+    #[test]
+    fn x1_flag_refusals_carry_fixed_tags_and_the_pass_through_hint() {
+        let base = TempDir::new().unwrap();
+        let rest = vec!["--dangerously-skip-permissions".to_owned()];
+        let sandbox = X1Options {
+            sandbox: true,
+            allow_env: BTreeSet::new(),
+        };
+        let error = x1_refusal_gate(base.path(), SurfaceCli::Claude, &sandbox, &rest)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(launch_x1::TAG_SANDBOX_CONFLICT), "{error}");
+        assert!(error.contains("after `--`"), "{error}");
+
+        let error = x1_refusal_gate(base.path(), SurfaceCli::Gemini, &sandbox, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(launch_x1::TAG_SANDBOX_UNSUPPORTED),
+            "{error}"
+        );
+        assert!(error.contains("after `--`"), "{error}");
+
+        let allow = X1Options {
+            sandbox: false,
+            allow_env: ["GH_TOKEN".to_owned()].into_iter().collect(),
+        };
+        let error = x1_refusal_gate(base.path(), SurfaceCli::Gemini, &allow, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(launch_x1::TAG_ALLOW_ENV_UNSUPPORTED),
+            "{error}"
+        );
+        assert!(launch_x1::refuse_allow_env_on("gemini", &allow)
+            .unwrap_err()
+            .to_string()
+            .contains(launch_x1::TAG_ALLOW_ENV_UNSUPPORTED));
+        assert!(launch_x1::refuse_sandbox_on("gemini", &sandbox)
+            .unwrap_err()
+            .to_string()
+            .contains(launch_x1::TAG_SANDBOX_UNSUPPORTED));
+    }
+
+    /// R2 item 7: an unreadable Gate state refuses with its OWN tag and
+    /// wording, distinct from "this repository has an active Gate". Both
+    /// branches still refuse; a verifiably inactive Gate proceeds.
+    #[cfg(unix)]
+    #[test]
+    fn x1_gate_refusals_distinguish_active_from_unverifiable() {
+        let base = TempDir::new().unwrap();
+        let sandbox = X1Options {
+            sandbox: true,
+            allow_env: BTreeSet::new(),
+        };
+        let active =
+            x1_refusal_gate_with(base.path(), SurfaceCli::Claude, &sandbox, &[], |_| Ok(true))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            active.contains(launch_x1::TAG_SANDBOX_GATE_ACTIVE),
+            "{active}"
+        );
+        assert!(
+            !active.contains(launch_x1::TAG_SANDBOX_GATE_UNVERIFIABLE),
+            "{active}"
+        );
+        assert!(active.contains("active csq Gate"), "{active}");
+
+        let unknown = x1_refusal_gate_with(base.path(), SurfaceCli::Claude, &sandbox, &[], |_| {
+            Err(anyhow::anyhow!("unreadable"))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            unknown.contains(launch_x1::TAG_SANDBOX_GATE_UNVERIFIABLE),
+            "{unknown}"
+        );
+        assert!(
+            !unknown.contains(launch_x1::TAG_SANDBOX_GATE_ACTIVE),
+            "{unknown}"
+        );
+        assert!(unknown.contains("could not be inspected"), "{unknown}");
+
+        x1_refusal_gate_with(base.path(), SurfaceCli::Claude, &sandbox, &[], |_| {
+            Ok(false)
+        })
+        .expect("a verifiably inactive Gate must not refuse");
+    }
+
+    /// R2 item 4: under `--sandbox`, a Gate that appears between the refusal
+    /// gate and the CLI build (a TOCTOU attach) is refused, because its hooks
+    /// and the pinned permission mode cannot both hold. Without `--sandbox`
+    /// the attach is allowed to proceed.
+    #[test]
+    fn sandbox_refuses_a_gate_attached_after_the_refusal_gate() {
+        refuse_sandbox_gate_attach(false, 1, 3).expect("non-sandbox attach proceeds");
+        refuse_sandbox_gate_attach(true, 2, 2).expect("an unchanged argv is not an attach");
+        let error = refuse_sandbox_gate_attach(true, 2, 3)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(launch_x1::TAG_SANDBOX_GATE_ACTIVE),
+            "{error}"
+        );
+        assert!(
+            error.contains("--sandbox and the Gate cannot both be honoured"),
+            "{error}"
+        );
+    }
+
+    /// R2 item 6 — wiring census. Each count is a call site the launch contract
+    /// cannot do without: deleting one drops its count by exactly one and
+    /// reddens this test. Building the needles with `concat!` keeps this test's
+    /// OWN text from matching them. (The arms' BEHAVIOUR is covered by the
+    /// spawned-builder tests; this proves the wiring is still present at every
+    /// site the review enumerated.)
+    #[test]
+    fn x1_launch_wiring_census_sees_every_required_call_site() {
+        let source = include_str!("run.rs");
+        let census = |needle: &str| source.matches(needle).count();
+
+        let handle_gate = concat!(
+            "x1_refusal_gate(base_dir, surface_for_preflight, &x1_options, ",
+            "rest)?"
+        );
+        assert_eq!(
+            census(handle_gate),
+            1,
+            "handle must run the X1 refusal gate before the surface dispatch"
+        );
+
+        let commit = concat!("if let Err(error) = x1.commit", "() {");
+        assert_eq!(
+            census(commit),
+            9,
+            "every launch arm must commit its receipt before spawning"
+        );
+
+        let refused = concat!("end_refused_launch(audit_emitter, &handle_", "dir);");
+        // 18 formerly enumerated + 2 from an internal ticket: a per-session TMPDIR
+        // creation failure is a refused launch on the Gemini and native arms
+        // (`launch_gemini`, and `launch_native`'s builder-error match).
+        assert_eq!(
+            census(refused),
+            20,
+            "every refused launch must end Fail/Reject and remove its handle dir"
+        );
+
+        // Refusals BEFORE the handle dir exists end the record through the
+        // plain helper. The 18 enumerated exits: 3P collision, --auto-swap,
+        // both policy checks (Claude and non-Claude surfaces), the CLI deps
+        // gate, login-needed, missing identity, the four --profile refusals,
+        // the accounts-root/config-dir/marker/onboarding writes, the canonical
+        // credential load, and both create_handle_dir calls. The count pins
+        // these call sites — deleting any one reddens this test; it is not a
+        // proof that no OTHER pre-spawn exit lacks one.
+        let ended_before_handle = concat!("end_run_before_spawn(&mut audit_", "emitter);");
+        assert_eq!(
+            census(ended_before_handle),
+            18,
+            "every enumerated pre-handle-dir refusal must end Fail/Reject"
+        );
+
+        let codex_ended = concat!(
+            "end_codex_run_before_spawn(audit_emitter, is_rela",
+            "unch);"
+        );
+        assert_eq!(
+            census(codex_ended),
+            5,
+            "every refused codex launch must end Fail/Reject before spawning"
+        );
+
+        // 1 definition + 2 build-site calls + 3 calls in this module's tests.
+        let toctou = concat!("refuse_sandbox_gate_", "attach(");
+        assert!(
+            census(toctou) >= 6,
+            "both Claude builders must refuse a Gate attached after the check (found {})",
+            census(toctou)
+        );
+
+        let cli = include_str!("../mod.rs");
+        // Distinct tags: the --sandbox and --auto-swap refusals share prose, so
+        // anchoring on the shared sentence would keep matching after either
+        // guard was deleted.
+        let native_sandbox = concat!("csq_run_sandbox_", "unsupported");
+        assert!(
+            cli.contains(native_sandbox),
+            "cli/mod.rs must refuse --native --sandbox"
+        );
+        let native_auto_swap = concat!("csq_run_auto_swap_", "unsupported");
+        assert!(
+            cli.contains(native_auto_swap),
+            "cli/mod.rs must refuse --native --auto-swap"
+        );
+        let native_allow = concat!("TAG_ALLOW_ENV_UNSUP", "PORTED");
+        assert!(
+            cli.contains(native_allow),
+            "cli/mod.rs must refuse --native --allow-env"
+        );
+    }
+
+    /// A refused launch is recorded `Fail`/`Reject` (never the pre-spawn
+    /// `Degraded`/`Bypass` default) and its freshly created handle dir is gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_launch_ends_fail_reject_and_removes_its_handle_dir() {
+        let dir = TempDir::new().unwrap();
+        let handle = dir.path().join("term-4242");
+        std::fs::create_dir_all(&handle).unwrap();
+        let record = csq_core::audit::AuditRecord {
+            schema_version: "1".to_string(),
+            run_id: "00000000-0000-4000-a000-000000000011".to_string(),
+            fixture_sha256: "0".repeat(64),
+            coc_sha256: "0".repeat(64),
+            csq_version: "2.21.6".to_string(),
+            cli_version: "unknown".to_string(),
+            surface: csq_core::audit::Surface::Cc,
+            model: "unknown".to_string(),
+            start_ts: "2026-11-03T00:00:00Z".to_string(),
+            end_ts: "2026-11-03T00:00:00Z".to_string(),
+            result_state: csq_core::audit::ResultState::Degraded,
+            score_delta_vs_baseline: None,
+            rule_ids_cited_original: vec![],
+            rule_ids_cited_after_repair: vec![],
+            rule_ids_dropped_invalid_format: 0,
+            decision: csq_core::audit::Decision::Bypass,
+            spawn_gate: None,
+        };
+        let pending = dir.path().join("runs").join(".pending");
+        let mut emitter = crate::cli::audit_emit::AuditEmitter::new(
+            record,
+            dir.path().join("absent.sock"),
+            pending.clone(),
+            "csq run account 1".to_string(),
+        );
+        end_refused_launch(&mut emitter, &handle);
+        assert!(
+            !handle.exists(),
+            "the refused launch's handle dir must be removed"
+        );
+        let written = pending.join("00000000-0000-4000-a000-000000000011.jsonl");
+        let parsed: csq_core::audit::AuditRecord =
+            serde_json::from_str(&std::fs::read_to_string(&written).unwrap()).unwrap();
+        assert_eq!(parsed.result_state, csq_core::audit::ResultState::Fail);
+        assert_eq!(parsed.decision, csq_core::audit::Decision::Reject);
+    }
+
+    /// A first-launch spawn failure must record Fail/Reject, not the pre-spawn
+    /// Degraded/Bypass default (the phantom-record class the teardown sweep closed).
+    #[test]
+    fn a_spawn_failure_ends_the_audit_record_fail_reject() {
+        let dir = TempDir::new().unwrap();
+        let handle = dir.path().join("term-4243");
+        std::fs::create_dir_all(&handle).unwrap();
+        let record = csq_core::audit::AuditRecord {
+            schema_version: "1".to_string(),
+            run_id: "00000000-0000-4000-a000-000000000012".to_string(),
+            fixture_sha256: "0".repeat(64),
+            coc_sha256: "0".repeat(64),
+            csq_version: "2.21.6".to_string(),
+            cli_version: "unknown".to_string(),
+            surface: csq_core::audit::Surface::Cc,
+            model: "unknown".to_string(),
+            start_ts: "2026-11-03T00:00:00Z".to_string(),
+            end_ts: "2026-11-03T00:00:00Z".to_string(),
+            result_state: csq_core::audit::ResultState::Degraded,
+            score_delta_vs_baseline: None,
+            rule_ids_cited_original: vec![],
+            rule_ids_cited_after_repair: vec![],
+            rule_ids_dropped_invalid_format: 0,
+            decision: csq_core::audit::Decision::Bypass,
+            spawn_gate: None,
+        };
+        let pending = dir.path().join("runs").join(".pending");
+        let mut emitter = crate::cli::audit_emit::AuditEmitter::new(
+            record,
+            dir.path().join("absent.sock"),
+            pending.clone(),
+            "csq run account 1".to_string(),
+        );
+        let cmd = Command::new(dir.path().join("no-such-claude-binary"));
+        let err = spawn_interactive_inherited(cmd, &handle, &mut emitter).unwrap_err();
+        assert!(err.to_string().contains("failed to launch claude"), "{err}");
+        let written = pending.join("00000000-0000-4000-a000-000000000012.jsonl");
+        let parsed: csq_core::audit::AuditRecord =
+            serde_json::from_str(&std::fs::read_to_string(&written).unwrap()).unwrap();
+        assert_eq!(parsed.result_state, csq_core::audit::ResultState::Fail);
+        assert_eq!(parsed.decision, csq_core::audit::Decision::Reject);
+    }
+
+    /// The Gemini hand-off that FAILS writes the corrective Fail/Reject record
+    /// next to the flushed hand-off record, on every platform. Runs in a
+    /// re-executed single-test child: a failed exec applies std's pre-exec
+    /// setup (cwd, SIGPIPE) to the calling process.
+    #[test]
+    fn a_failed_gemini_hand_off_writes_a_corrective_fail_reject_record() {
+        const CHILD: &str = "CSQ_TEST_GEMINI_HAND_OFF_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::commands::run::messaging_registration_tests::a_failed_gemini_hand_off_writes_a_corrective_fail_reject_record",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "child run failed: {:?}\n{stdout}\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let handle = dir.path().join("term-4246");
+        std::fs::create_dir_all(&handle).unwrap();
+        let empty_path = dir.path().join("empty-path");
+        std::fs::create_dir_all(&empty_path).unwrap();
+        let record = csq_core::audit::AuditRecord {
+            schema_version: "1".to_string(),
+            run_id: "00000000-0000-4000-a000-000000000014".to_string(),
+            fixture_sha256: "0".repeat(64),
+            coc_sha256: "0".repeat(64),
+            csq_version: "2.21.6".to_string(),
+            cli_version: "unknown".to_string(),
+            surface: csq_core::audit::Surface::Gemini,
+            model: "unknown".to_string(),
+            start_ts: "2026-11-04T00:00:00Z".to_string(),
+            end_ts: "2026-11-04T00:00:00Z".to_string(),
+            result_state: csq_core::audit::ResultState::Pass,
+            score_delta_vs_baseline: None,
+            rule_ids_cited_original: vec![],
+            rule_ids_cited_after_repair: vec![],
+            rule_ids_dropped_invalid_format: 0,
+            decision: csq_core::audit::Decision::Accept,
+            spawn_gate: None,
+        };
+        let pending = dir.path().join("runs").join(".pending");
+        let mut emitter = crate::cli::audit_emit::AuditEmitter::new(
+            record,
+            dir.path().join("absent.sock"),
+            pending.clone(),
+            "csq run account 1".to_string(),
+        );
+        // The launch arm's order: clone, mark the hand-off, flush, hand off.
+        let retained = emitter.retained_record();
+        emitter.set_result(
+            csq_core::audit::ResultState::Degraded,
+            csq_core::audit::Decision::Bypass,
+        );
+        emitter.try_flush_now().unwrap();
+        let plan = csq_core::providers::gemini::spawn::SpawnPlan {
+            binary: "csq-test-no-such-gemini-binary",
+            envs: vec![(
+                "PATH".to_string(),
+                empty_path.to_string_lossy().into_owned(),
+            )],
+            args: vec![],
+            handle_dir: handle.clone(),
+        };
+        let _err = hand_off_gemini_or_correct(plan, retained, &emitter, &handle);
+        assert!(
+            !handle.exists(),
+            "the failed hand-off removes the handle dir"
+        );
+
+        let mut records = Vec::new();
+        for entry in std::fs::read_dir(&pending).unwrap() {
+            let path = entry.unwrap().path();
+            let parsed: csq_core::audit::AuditRecord =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            records.push(parsed);
+        }
+        assert_eq!(
+            records.len(),
+            2,
+            "the hand-off record and the corrective record"
+        );
+        assert!(records
+            .iter()
+            .any(|r| r.result_state == csq_core::audit::ResultState::Fail
+                && r.decision == csq_core::audit::Decision::Reject));
+        assert!(records
+            .iter()
+            .any(|r| r.result_state == csq_core::audit::ResultState::Degraded
+                && r.decision == csq_core::audit::Decision::Bypass));
+        assert_ne!(records[0].run_id, records[1].run_id);
+    }
+
+    /// P1: an exec that RETURNS means the launch never ran. The pre-exec flush
+    /// (required for a successful exec) must be followed by a corrective
+    /// Fail/Reject record with its own run id.
+    #[cfg(unix)]
+    #[test]
+    fn an_exec_failure_writes_a_corrective_fail_reject_record() {
+        // The failed exec runs std's pre-exec setup IN THIS PROCESS, so it
+        // runs in a re-executed single-test child: a SIGPIPE disposition
+        // left at SIG_DFL in the shared test binary would kill every later
+        // test that writes to a closed pipe.
+        const CHILD: &str = "CSQ_TEST_EXEC_FAILURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::commands::run::messaging_registration_tests::an_exec_failure_writes_a_corrective_fail_reject_record",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "child run failed: {:?}\n{stdout}\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let handle = dir.path().join("term-4245");
+        std::fs::create_dir_all(&handle).unwrap();
+        let record = csq_core::audit::AuditRecord {
+            schema_version: "1".to_string(),
+            run_id: "00000000-0000-4000-a000-000000000013".to_string(),
+            fixture_sha256: "0".repeat(64),
+            coc_sha256: "0".repeat(64),
+            csq_version: "2.21.6".to_string(),
+            cli_version: "unknown".to_string(),
+            surface: csq_core::audit::Surface::Cc,
+            model: "unknown".to_string(),
+            start_ts: "2026-11-03T00:00:00Z".to_string(),
+            end_ts: "2026-11-03T00:00:00Z".to_string(),
+            result_state: csq_core::audit::ResultState::Degraded,
+            score_delta_vs_baseline: None,
+            rule_ids_cited_original: vec![],
+            rule_ids_cited_after_repair: vec![],
+            rule_ids_dropped_invalid_format: 0,
+            decision: csq_core::audit::Decision::Bypass,
+            spawn_gate: None,
+        };
+        let pending = dir.path().join("runs").join(".pending");
+        let mut emitter = crate::cli::audit_emit::AuditEmitter::new(
+            record,
+            dir.path().join("absent.sock"),
+            pending.clone(),
+            "csq run account 1".to_string(),
+        );
+        let cmd = Command::new(dir.path().join("no-such-claude-binary"));
+        let err = exec_or_spawn(cmd, &handle, &mut emitter, false).unwrap_err();
+        assert!(err.to_string().contains("exec failed"), "{err}");
+        // The returned exec restored the runtime's SIGPIPE disposition.
+        // SAFETY: a query-only sigaction into a zeroed out-struct.
+        let sigpipe = unsafe {
+            let mut current: libc::sigaction = std::mem::zeroed();
+            assert_eq!(
+                libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut current),
+                0
+            );
+            current.sa_sigaction
+        };
+        assert_eq!(sigpipe, libc::SIG_IGN, "SIGPIPE left at the exec default");
+
+        let mut records = Vec::new();
+        for entry in std::fs::read_dir(&pending).unwrap() {
+            let path = entry.unwrap().path();
+            let parsed: csq_core::audit::AuditRecord =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            records.push(parsed);
+        }
+        assert_eq!(
+            records.len(),
+            2,
+            "the pre-exec intent record and the corrective record"
+        );
+        assert!(records
+            .iter()
+            .any(|r| r.result_state == csq_core::audit::ResultState::Fail
+                && r.decision == csq_core::audit::Decision::Reject));
+        assert!(records
+            .iter()
+            .any(|r| r.result_state == csq_core::audit::ResultState::Degraded
+                && r.decision == csq_core::audit::Decision::Bypass));
+        assert_ne!(records[0].run_id, records[1].run_id);
+    }
+
+    /// `vars_os` at the three run.rs process-env readers: a non-UTF-8 entry is
+    /// dropped, never a panic. (`vars()` panics on it; `vars_os()` cannot.)
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_environment_entries_are_dropped_not_panicked() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad_name = std::ffi::OsString::from_vec(b"CSQ_BAD_\xff".to_vec());
+        let bad_value = std::ffi::OsString::from_vec(b"\xff".to_vec());
+        let vars = vec![(bad_name, bad_value)];
+        assert!(utf8_map(vars.clone()).is_empty());
+        let mut cmd = Command::new("claude");
+        strip_sensitive_env_with(&mut cmd, vars.clone());
+        let ctx = host_context_from(vars);
+        assert!(!ctx.production_secrets_present, "{ctx:?}");
+        assert!(ctx.detected_var_names.is_empty(), "{ctx:?}");
     }
 
     fn argv(cmd: &Command) -> Vec<String> {
@@ -12701,6 +14809,7 @@ mod codex_pre_spawn_guard_tests {
             audit,
             /* swap_correlation */ None,
             /* messaging */ None,
+            &X1Options::default(),
         );
         let err = result.expect_err("an expired codex token must refuse the launch");
         let msg = format!("{err:#}");
@@ -12722,5 +14831,344 @@ mod codex_pre_spawn_guard_tests {
             "a Degraded run record: {records:?}"
         );
         let _ = std::fs::remove_dir_all(base.path().join(format!("term-{}", std::process::id())));
+    }
+}
+
+#[cfg(test)]
+mod auto_swap_tests {
+    use super::*;
+    use csq_core::rotation::session_override::SessionRotationState;
+
+    #[test]
+    fn auto_swap_is_refused_wherever_the_rotator_never_moves_a_session() {
+        use csq_core::accounts::{AccountInfo, AccountSource, BillingMode};
+        use csq_core::providers::catalog::Surface;
+        let base = tempfile::tempdir().unwrap();
+        let info = |id: u16, surface: Surface| AccountInfo {
+            id,
+            label: format!("a{id}"),
+            oauth_email: None,
+            source: AccountSource::Anthropic,
+            surface,
+            method: "oauth".into(),
+            has_credentials: true,
+            billing_mode: BillingMode::default(),
+        };
+        let slot = |n: u16| AccountNum::try_from(n).unwrap();
+        // A 3P slot: settings.json pins ANTHROPIC_BASE_URL (VP-F1 guard).
+        let cfg = base.path().join("config-9");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.z.ai/api/anthropic"}}"#,
+        )
+        .unwrap();
+        let accounts = [
+            info(1, Surface::ClaudeCode),
+            info(2, Surface::Codex),
+            info(3, Surface::Gemini),
+            info(4, Surface::Kimi),
+            info(5, Surface::Grok),
+            info(9, Surface::ClaudeCode),
+        ];
+        for mode in [SessionRotationMode::On, SessionRotationMode::Off] {
+            // The one surface the rotator can move: a Claude Code OAuth session.
+            assert_eq!(
+                auto_swap_refusal(
+                    Some(mode),
+                    base.path(),
+                    &accounts,
+                    slot(1),
+                    false,
+                    SurfaceCli::Claude
+                ),
+                None
+            );
+            for n in [2u16, 3, 4, 5, 9] {
+                assert!(
+                    auto_swap_refusal(
+                        Some(mode),
+                        base.path(),
+                        &accounts,
+                        slot(n),
+                        false,
+                        SurfaceCli::Claude
+                    )
+                    .is_some(),
+                    "slot {n}"
+                );
+            }
+        }
+        // A cloud-Claude slot (Vertex/Bedrock): Claude surface, no base URL, but
+        // third-party. Refused by the launch classification AND by eligibility.
+        let mut cloud = info(6, Surface::ClaudeCode);
+        cloud.source = AccountSource::ThirdParty {
+            provider: "claude-vertex".into(),
+        };
+        let cloud_accounts = [cloud];
+        for mode in [SessionRotationMode::On, SessionRotationMode::Off] {
+            assert!(
+                auto_swap_refusal(
+                    Some(mode),
+                    base.path(),
+                    &cloud_accounts,
+                    slot(6),
+                    true,
+                    SurfaceCli::Claude
+                )
+                .is_some(),
+                "launch classification refuses a cloud-Claude slot"
+            );
+            assert!(
+                auto_swap_refusal(
+                    Some(mode),
+                    base.path(),
+                    &cloud_accounts,
+                    slot(6),
+                    false,
+                    SurfaceCli::Claude
+                )
+                .is_some(),
+                "eligibility alone refuses a cloud-Claude slot"
+            );
+        }
+        // No flag: nothing to refuse, on any slot.
+        for n in [1u16, 2, 9] {
+            assert_eq!(
+                auto_swap_refusal(
+                    None,
+                    base.path(),
+                    &accounts,
+                    slot(n),
+                    true,
+                    SurfaceCli::Codex
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn record_auto_swap_writes_into_the_handle_dir_only_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = dir.path().join("term-4242");
+        std::fs::create_dir_all(&handle).unwrap();
+
+        record_auto_swap(&handle, None).unwrap();
+        assert_eq!(
+            session_override::read_override(&handle),
+            SessionRotationState::Default
+        );
+        assert!(!handle.join(session_override::OVERRIDE_FILE).exists());
+
+        record_auto_swap(&handle, Some(SessionRotationMode::On)).unwrap();
+        assert_eq!(
+            session_override::read_override(&handle),
+            SessionRotationState::On
+        );
+        record_auto_swap(&handle, Some(SessionRotationMode::Off)).unwrap();
+        assert_eq!(
+            session_override::read_override(&handle),
+            SessionRotationState::Off
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(handle.join(session_override::OVERRIDE_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn record_auto_swap_failure_is_fixed_text_without_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("term-4242-does-not-exist");
+        let err = record_auto_swap(&missing, Some(SessionRotationMode::On)).unwrap_err();
+        let text = err.to_string();
+        assert!(!text.contains(dir.path().to_str().unwrap()), "{text}");
+        assert!(text.contains("per-session auto-swap"), "{text}");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod recycle_ctx_tests {
+    use super::*;
+
+    fn ctx(base: &Path) -> RecycleCtx {
+        RecycleCtx {
+            base_dir: base.to_path_buf(),
+            rest: vec![],
+            surface: SurfaceCli::Claude,
+            ignore_cli_version: true,
+            track_latest: false,
+            layer_enabled: false,
+            toggles: CapabilityLayerToggles::default(),
+            debug: false,
+            coc_cache_enabled: false,
+        }
+    }
+
+    /// M-B: a recycle is a new launch for the launch-block gate; a slot that shares its
+    /// sign-in is refused BEFORE the child would be stopped.
+    #[test]
+    fn recycle_gate_recheck_refuses_a_slot_the_launch_block_refuses() {
+        let base = tempfile::tempdir().unwrap();
+        csq_core::accounts::launch_block::fixture::seed_shared_grant(base.path(), 1, 2);
+        let handle = base.path().join("term-1");
+        std::fs::create_dir_all(&handle).unwrap();
+        std::fs::write(handle.join(".csq-account"), "2").unwrap();
+        assert_eq!(
+            recycle_gate_recheck(&ctx(base.path()), &handle),
+            Err("recycle_gate_launch_blocked")
+        );
+    }
+
+    /// Item 1: a refused licence is the FIRST refusal (it wins over a launch-block that would
+    /// also refuse) and a passing licence lets the next gate speak.
+    #[test]
+    fn recycle_gate_recheck_refuses_first_on_a_refused_license() {
+        let base = tempfile::tempdir().unwrap();
+        csq_core::accounts::launch_block::fixture::seed_shared_grant(base.path(), 1, 2);
+        let handle = base.path().join("term-1");
+        std::fs::create_dir_all(&handle).unwrap();
+        std::fs::write(handle.join(".csq-account"), "2").unwrap();
+        let c = ctx(base.path());
+        assert_eq!(
+            recycle_gate_recheck_with(&c, &handle, &|_| Err(anyhow!("revoked"))),
+            Err("recycle_gate_license_refused")
+        );
+        assert_eq!(
+            recycle_gate_recheck_with(&c, &handle, &|_| Ok(())),
+            Err("recycle_gate_launch_blocked"),
+            "with the licence passing, the launch-block gate is reached"
+        );
+    }
+
+    /// Item 4: the gates judge the account the handle is bound to NOW (a swap since launch),
+    /// and an unreadable marker refuses.
+    #[test]
+    fn recycle_gate_recheck_judges_the_swapped_account_not_the_launch_copy() {
+        let base = tempfile::tempdir().unwrap();
+        csq_core::accounts::launch_block::fixture::seed_shared_grant(base.path(), 1, 2);
+        let handle = base.path().join("term-1");
+        std::fs::create_dir_all(&handle).unwrap();
+        let launch_ctx = ctx(base.path()); // the launch copy carries no account at all
+        assert_eq!(
+            recycle_gate_recheck_with(&launch_ctx, &handle, &|_| Ok(())),
+            Err("recycle_gate_account_unresolved"),
+            "no marker: refuse"
+        );
+        std::fs::write(handle.join(".csq-account"), "2").unwrap(); // swapped to blocked slot 2
+        assert_eq!(
+            recycle_gate_recheck_with(&launch_ctx, &handle, &|_| Ok(())),
+            Err("recycle_gate_launch_blocked")
+        );
+    }
+
+    /// X1 integration: a recycle is a new launch, so a present guard manifest
+    /// that no longer matches refuses BEFORE the child is stopped; a matching
+    /// or absent manifest passes, and the gate really calls this check.
+    #[test]
+    fn recycle_gate_recheck_refuses_a_guard_manifest_that_no_longer_matches() {
+        let base = tempfile::tempdir().unwrap();
+        let handle = base.path().join("term-1");
+        std::fs::create_dir_all(&handle).unwrap();
+        let c = ctx(base.path());
+        let digest = csq_core::launch_isolation::sha256_hex(b"{}");
+        let manifest = |sha: &str| {
+            std::fs::write(
+                base.path().join(csq_core::launch_isolation::MANIFEST_FILE),
+                format!(
+                    r#"{{"manifest_version":1,"source":"local","entries":[{{"path":"settings.json","sha256":"{sha}","scope":"handle-dir"}}]}}"#
+                ),
+            )
+            .unwrap();
+        };
+
+        manifest(&digest);
+        std::fs::write(handle.join("settings.json"), b"changed").unwrap();
+        assert_eq!(
+            recycle_guard_manifest_refusal(&c, &handle),
+            Err("recycle_gate_guard_manifest_refused"),
+            "a mismatch refuses the recycle"
+        );
+
+        std::fs::write(handle.join("settings.json"), b"{}").unwrap();
+        assert_eq!(
+            recycle_guard_manifest_refusal(&c, &handle),
+            Ok(()),
+            "a matching manifest passes"
+        );
+
+        std::fs::write(
+            base.path().join(csq_core::launch_isolation::MANIFEST_FILE),
+            r#"{"manifest_version":1,"source":"local","entries":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            recycle_guard_manifest_refusal(&c, &handle),
+            Err("recycle_gate_guard_manifest_refused"),
+            "an empty (invalid) manifest refuses"
+        );
+
+        std::fs::remove_file(base.path().join(csq_core::launch_isolation::MANIFEST_FILE)).unwrap();
+        assert_eq!(
+            recycle_guard_manifest_refusal(&c, &handle),
+            Ok(()),
+            "an absent manifest is not a refusal"
+        );
+
+        // Wiring: the gate really runs the check (a helper-only green would not
+        // prove the recycle path calls it). `concat!` keeps this test's own text
+        // from matching the needle.
+        let source = include_str!("run.rs");
+        let needle = concat!("recycle_guard_manifest_refusal(ctx, handle_", "dir)?;");
+        assert_eq!(
+            source.matches(needle).count(),
+            1,
+            "the recycle gate must call the guard-manifest recheck"
+        );
+    }
+
+    /// A recycle is a new launch: an account that flipped to LOGIN-NEEDED after
+    /// the original launch is refused before the child is stopped.
+    #[test]
+    fn recycle_gate_recheck_refuses_a_login_needed_account() {
+        let base = tempfile::tempdir().unwrap();
+        let handle = base.path().join("term-1");
+        std::fs::create_dir_all(&handle).unwrap();
+        std::fs::write(handle.join(".csq-account"), "1").unwrap();
+        std::fs::create_dir_all(base.path().join("credentials")).unwrap();
+        let sentinel = base.path().join("credentials/1.broker-failed");
+        std::fs::write(&sentinel, "invalid_grant").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(
+            recycle_gate_recheck(&ctx(base.path()), &handle),
+            Err("recycle_gate_login_needed")
+        );
+    }
+
+    /// L-H: `process::exit` skips the caller's scaffold cleanup, so the exit paths remove it.
+    #[test]
+    fn remove_scaffold_file_removes_only_csq_scaffold_files() {
+        let d = tempfile::tempdir().unwrap();
+        let ours = d.path().join("csq-coc-scaffold.tmp.1.0");
+        let theirs = d.path().join("user-prompt.md");
+        std::fs::write(&ours, b"x").unwrap();
+        std::fs::write(&theirs, b"x").unwrap();
+        let mut cmd = Command::new("claude");
+        cmd.args(["--append-system-prompt-file"]).arg(&ours);
+        cmd.args(["--append-system-prompt-file"]).arg(&theirs);
+        remove_scaffold_file(&cmd);
+        assert!(!ours.exists(), "csq's own scaffold is removed");
+        assert!(theirs.exists(), "a user-named prompt file is never touched");
     }
 }

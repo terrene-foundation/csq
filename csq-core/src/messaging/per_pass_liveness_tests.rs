@@ -23,11 +23,12 @@ fn sender(to: Recipient) -> Sender {
     Sender {
         pid: to.pid,
         started_at: to.started_at,
-        surface: to.surface,
+        surface: to.surface.into(),
         handle_dir_hash: "fixture101".to_owned(),
         handle_dir: "/fixture/101".to_owned(),
         name: None,
         started_exact: to.started_exact,
+        service: None,
     }
 }
 impl Fixture {

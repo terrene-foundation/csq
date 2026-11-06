@@ -1055,6 +1055,11 @@ fn managed_commands(
     config.extend(permission_flags);
     let clone_base = || {
         let mut command = Command::new(source.get_program());
+        // `get_envs()` exposes only the EXPLICIT mappings; it does not expose
+        // `env_clear()`. Without this call the app-server and the TUI inherit
+        // csq's whole parent environment, silently undoing X1's scrub while the
+        // launch receipt says the tokens were removed (R1 S1, CRITICAL).
+        command.env_clear();
         for (key, value) in source.get_envs() {
             if let Some(value) = value {
                 command.env(key, value);
@@ -7322,6 +7327,49 @@ mod managed_backend_tests {
             .unwrap()
     }
 
+    /// R1 S1: `clone_base` must carry the source's `env_clear()`. `get_envs()`
+    /// cannot expose a cleared environment, so this test SPAWNS through the real
+    /// clone path and asserts the child saw ONLY the explicit map.
+    #[test]
+    fn managed_children_inherit_only_the_explicit_environment() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = socket_fixture_dir();
+        let state = temp.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let plan = ManagedBackendPlan::prepare(temp.path(), &state).unwrap();
+        let harness = temp.path().join("env-harness");
+        std::fs::write(&harness, b"#!/bin/sh\nenv\n").unwrap();
+        std::fs::set_permissions(&harness, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut source = Command::new(&harness);
+        source.env_clear().env("CSQ_S1_CANARY", "present");
+        let (mut server, mut tui) = managed_commands(&source, &plan).unwrap();
+        // The production children stream to the terminal; capture it here.
+        server.stdout(std::process::Stdio::piped());
+        tui.stdout(std::process::Stdio::piped());
+        for mut command in [server, tui] {
+            // A sibling test's fork can still hold the just-written harness open
+            // for writing (ETXTBSY); retry briefly, as cli_shim's exec_retrying_etxtbsy.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            let output = loop {
+                match command.output() {
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    other => break other.unwrap(),
+                }
+            };
+            let text = String::from_utf8_lossy(&output.stdout).into_owned();
+            assert!(text.contains("CSQ_S1_CANARY=present"), "{text}");
+            // The test process has both; without `env_clear()` the child
+            // inherits them — the S1 CRITICAL shape.
+            assert!(!text.contains("HOME="), "the child inherited HOME: {text}");
+            assert!(!text.contains("PATH="), "the child inherited PATH: {text}");
+        }
+    }
+
     #[test]
     fn managed_launch_preserves_resume_prompt_account_and_backend_config() {
         let temp = socket_fixture_dir();
@@ -7394,14 +7442,18 @@ mod managed_backend_tests {
         );
         assert_eq!(server.get_current_dir(), source.get_current_dir());
         assert_eq!(tui.get_current_dir(), source.get_current_dir());
-        assert_eq!(
-            server.get_envs().collect::<Vec<_>>(),
-            source.get_envs().collect::<Vec<_>>()
-        );
-        assert_eq!(
-            tui.get_envs().collect::<Vec<_>>(),
-            source.get_envs().collect::<Vec<_>>()
-        );
+        // `clone_base` now calls `env_clear()` first (R1 S1). A
+        // `(key, None)` removal after a clear is implied — the child cannot
+        // inherit the key at all — so compare the explicit SET entries, and
+        // the spawn test below proves the inheritance half.
+        let set = |cmd: &Command| {
+            cmd.get_envs()
+                .map(|(key, value)| (key.to_os_string(), value.map(std::ffi::OsStr::to_os_string)))
+                .filter(|(_, value)| value.is_some())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(set(&server), set(&source));
+        assert_eq!(set(&tui), set(&source));
         source.arg("--remote=unix:///unowned");
         // After -- it is literal prompt text. An actual conflicting flag before
         // the delimiter is refused rather than silently commandeered.

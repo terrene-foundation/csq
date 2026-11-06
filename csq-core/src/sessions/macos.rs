@@ -1079,6 +1079,14 @@ pub(crate) fn probe_start_time(pid: u32) -> Probe<u64> {
     }
 }
 
+/// `(pbi_ppid, pbi_start_tvsec)` of `pid` from ONE `proc_pidinfo(PROC_PIDTBSDINFO)` read, so
+/// the parent and the start time describe the same process incarnation. `None` on any
+/// failure or an unpopulated (zero) start.
+pub(crate) fn ppid_and_start(pid: u32) -> Option<(u32, u64)> {
+    let i = read_bsd_info(pid)?;
+    (i.pbi_start_tvsec != 0).then_some((i.pbi_ppid, i.pbi_start_tvsec))
+}
+
 /// The parent pid of `pid` (`pbi_ppid`), or `None` when the process cannot be read.
 ///
 /// A process the full read refuses (setuid-root `/usr/bin/login` as a non-root caller) still

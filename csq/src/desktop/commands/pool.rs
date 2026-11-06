@@ -746,7 +746,7 @@ mod tests {
             ipc(
                 &window,
                 "pool_set_reset",
-                serde_json::json!({"name":"valid","reset":{"day_of_month":31}}),
+                serde_json::json!({"name":"valid","reset":{"day_of_month":32}}),
                 None,
                 "tauri://localhost"
             )

@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { resolve, join, delimiter, basename, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
-import { scrubShellEnvironment, capture, parseFooter, retainOutput, LEG_QUEUE_WAIT_S, LEG_ATTEMPTS, attemptMsFor, budgetDeadlineMsFor, admissionWaitMsFor } from './preflight-runtime.mjs';
+import { scrubShellEnvironment, capture, parseFooter, retainOutput, LEG_QUEUE_WAIT_S, LEG_ATTEMPTS, attemptMsFor, budgetDeadlineMsFor, admissionWaitMsFor, gateClock } from './preflight-runtime.mjs';
 import { installStopHandlers, exitAfterBackstops, stopSignal } from './child-supervisor.mjs';
 // FIRST statement after the imports, before any spawn: this module is also the
 // shard-leg worker entry point, whose per-test capture('bash') would otherwise
@@ -411,7 +411,11 @@ export async function runShellGate(root, { local = false, ceilingMs = 900000, pe
     const shards = Math.min(configured, names.length);
     const parts = await Promise.all(Array.from({ length: shards }, async (_, shard) => {
       const label = `self-test shard ${shard + 1}/${shards}`;
-      const deadline = performance.now() + shardDeadlineMs(ceilingMs);
+      // issue 1763 (same class, sibling site): a shard queued for a caller slot has
+      // not started, so its deadline is ARMED AT THE FIRST ADMISSION, never
+      // before. Queueing behind the run's leg cap therefore cannot spend the
+      // shard's budget; the admission wait itself is bounded below.
+      const clock = gateClock(shardDeadlineMs(ceilingMs));
       for (let attempt = 0; attempt < LEG_ATTEMPTS; attempt++) {
         // A stop during attempt 0 must never start attempt 1 (or a spawn that
         // outlives the stop): the retry path is where a detached group used to
@@ -419,9 +423,9 @@ export async function runShellGate(root, { local = false, ceilingMs = 900000, pe
         if (stopWhen()) return { error: 'self-test shard stopped by signal' };
         // The caller-slot wait comes out of this shard's deadline (never a
         // fixed cap): it may last as long as a full attempt bound still fits.
-        const plan = shardAttemptFor({ shard, shards, ceilingMs, perTestMs, remainingMs: deadline - performance.now() });
+        const plan = shardAttemptFor({ shard, shards, ceilingMs, perTestMs, remainingMs: clock.remainingMs() });
         if (plan.admissionWaitMs <= 0) return { error: `${label} deadline exhausted — no room for a full ${Math.round(plan.timeoutMs / 1000)}s attempt${attempt ? ' after one retry' : ''} (nothing ran)` };
-        const r = await capture('trestle', plan.args, { cwd: root, timeoutMs: plan.timeoutMs, admissionWaitMs: plan.admissionWaitMs, stopWhen }); evidence.push(r.evidence);
+        const r = await capture('trestle', plan.args, { cwd: root, timeoutMs: plan.timeoutMs, admissionWaitMs: plan.admissionWaitMs, stopWhen, onAdmitted: () => clock.admitted() }); evidence.push(r.evidence);
         if (stopWhen()) return { error: 'self-test shard stopped by signal' };
         const f = parseFooter(r);
         // Same retry set as dev-preflight's runHeavy: 113/104/116 mean nothing

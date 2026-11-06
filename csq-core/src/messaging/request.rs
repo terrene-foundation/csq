@@ -2,6 +2,7 @@
 use super::{
     limits::{check_body, Limits, Liveness},
     model::{Message, Receipt, Recipient, Sender, VerifiedSession},
+    service::ServiceRecord,
     store::{self, Dest},
 };
 use crate::sessions::directives::{
@@ -200,6 +201,17 @@ pub fn with_key_recovery<T>(
 /// True selects keyed admission; false selects an automatic unprotected legacy send.
 pub const UNPROTECTED_WARNING: &str =
     "sent without duplicate protection: sender identity not pinned";
+
+/// Validate a caller-supplied idempotency key's shape and freshness without touching the
+/// ledger. The daemon's service route runs this BEFORE its append-first admission record,
+/// so a malformed or expired key is refused without an `Admitted` record for a send that
+/// could never start. (A service is always pinned by its `registration_id`, so
+/// [`protection`]'s unpinned-sender rule never applies to it — this is the service path's
+/// key gate, not a relaxation of the session one.)
+pub fn check_supplied_key(token: &str, now: u64) -> Result<(), DirectiveError> {
+    supplied_key(token, Some(now)).map(|_| ())
+}
+
 pub fn protection(supplied: bool, session: &VerifiedSession) -> Result<bool, DirectiveError> {
     if session.as_recipient().started_exact.is_some() {
         return Ok(true);
@@ -213,7 +225,43 @@ pub fn protection(supplied: bool, session: &VerifiedSession) -> Result<bool, Dir
     tracing::warn!(reason = "duplicate_protection_sender_unpinned");
     Ok(false)
 }
+/// Shape a 64-hex digest into the UUID form a message id must have (a v4-shaped,
+/// variant-set id). The id is derived from the digest, so it is stable across processes
+/// for a stable identity + token; it is not a random UUID.
+fn shaped_request_id(hash: &str) -> Result<String, DirectiveError> {
+    let mut bytes = [0u8; 16];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hash[i * 2..i * 2 + 2], 16).map_err(|_| uncertain())?;
+    }
+    bytes[6] = (bytes[6] & 15) | 64;
+    bytes[8] = (bytes[8] & 63) | 128;
+    Ok(uuid::Uuid::from_bytes(bytes).to_string())
+}
+
+/// The service idempotency digest (design an internal ticket §5): the registered identity plus the
+/// caller's token, with NO process identity, so a retry from a different process (the
+/// scheduled-job case) maps to the same request id and replays the stored answer.
+fn service_digest(
+    name: &str,
+    registration_id: &str,
+    token: &str,
+) -> Result<String, DirectiveError> {
+    digest(("csq.request.v1.service", name, registration_id, token))
+}
+
+/// The request id for a registered service. Stable across processes, unlike the session
+/// digest (pid/start), and pinned by the registration id: a re-registration mints a new id,
+/// so the old identity's keys cannot replay against the new one.
+pub fn service_request_id(record: &ServiceRecord, token: &str) -> Result<String, DirectiveError> {
+    let hash = service_digest(&record.name, &record.registration_id, token)?;
+    shaped_request_id(&hash)
+}
+
 pub(super) fn request_id(from: &Sender, token: &str) -> Result<String, DirectiveError> {
+    if let Some(service) = &from.service {
+        let hash = service_digest(&service.name, &service.registration_id, token)?;
+        return shaped_request_id(&hash);
+    }
     from.started_exact.ok_or(
         DirectiveError::undet("sender identity unpinned; key refused")
             .with_cause(Cause::SenderIdentity),
@@ -226,13 +274,7 @@ pub(super) fn request_id(from: &Sender, token: &str) -> Result<String, Directive
         from.surface,
         token,
     ))?;
-    let mut bytes = [0u8; 16];
-    for (i, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hash[i * 2..i * 2 + 2], 16).map_err(|_| uncertain())?;
-    }
-    bytes[6] = (bytes[6] & 15) | 64;
-    bytes[8] = (bytes[8] & 63) | 128;
-    Ok(uuid::Uuid::from_bytes(bytes).to_string())
+    shaped_request_id(&hash)
 }
 fn record_digest(m: &Message) -> Result<String, DirectiveError> {
     digest((
@@ -491,6 +533,15 @@ fn intent_digest(intent: Intent<'_>) -> Result<String, DirectiveError> {
     }
     digest(intent)
 }
+
+/// Validate an intent's shape (target bounds, canonical parent, body screen) WITHOUT
+/// touching the request ledger. The service send path runs this in its validate phase,
+/// after every other store refusal check and BEFORE it appends the admission record, so a
+/// malformed intent can never be recorded as admitted. The same check runs again inside
+/// [`prepare`], under the same lock, before the ledger entry is written.
+pub(super) fn validate_intent(intent: Intent<'_>) -> Result<(), DirectiveError> {
+    intent_digest(intent).map(|_| ())
+}
 pub(super) fn begin(
     dir: &Path,
     now: u64,
@@ -518,16 +569,20 @@ pub(super) fn begin(
         Lookup::Stored(r, to) => Ok(Some((r, to))),
     }
 }
-pub(super) fn prepare(
+/// Every predicate [`prepare`] can refuse on, evaluated WITHOUT inserting a ledger entry.
+///
+/// This is not a pure read: `open` publishes the ledger clock and prunes expired entries
+/// (its own housekeeping persistence). It writes no message and inserts no entry, so a
+/// caller may run it before committing to the send.
+fn prepare_checks(
     dir: &Path,
     now: u64,
     upper: u64,
     fs: &FsOps<'_>,
     token: &str,
-    intent: Intent<'_>,
     m: &Message,
-) -> Result<(), DirectiveError> {
-    let mut ledger = open(dir, now, upper, fs, false)?;
+) -> Result<Ledger, DirectiveError> {
+    let ledger = open(dir, now, upper, fs, false)?;
     validate(token, upper)?;
     if issued(token)? <= ledger.floor {
         return Err(uncertain());
@@ -541,6 +596,43 @@ pub(super) fn prepare(
     if request_id(&m.from, token)? != m.id {
         return Err(uncertain());
     }
+    Ok(ledger)
+}
+
+/// The feasibility half of [`prepare`] for the service route: all predicates, no insert.
+///
+/// The store runs this under its lock BEFORE the daemon appends the admission record, and
+/// then [`prepare`] repeats the same checks before it writes. Nothing else can change the
+/// ledger or the public record between the two calls (the store lock is held throughout),
+/// so a STATE refusal (capacity, a public-record collision, a bad key such as an
+/// already-used or malformed one, an id mismatch) can no longer land after an `Admitted`
+/// record.
+///
+/// The token DEADLINE is deliberately not frozen here: `prepare` re-evaluates `upper`
+/// (which rounds elapsed time upward) at the publication step, so a request that crosses
+/// the 600 s window while the admission record is being appended is still refused — with
+/// no message written, so the refusal record is truthful.
+pub(super) fn validate_prepare(
+    dir: &Path,
+    now: u64,
+    upper: u64,
+    fs: &FsOps<'_>,
+    token: &str,
+    m: &Message,
+) -> Result<(), DirectiveError> {
+    prepare_checks(dir, now, upper, fs, token, m).map(|_| ())
+}
+
+pub(super) fn prepare(
+    dir: &Path,
+    now: u64,
+    upper: u64,
+    fs: &FsOps<'_>,
+    token: &str,
+    intent: Intent<'_>,
+    m: &Message,
+) -> Result<(), DirectiveError> {
+    let mut ledger = prepare_checks(dir, now, upper, fs, token, m)?;
     ledger.entries.insert(
         m.id.clone(),
         Entry {
@@ -568,6 +660,45 @@ pub(super) fn commit(
         .ok_or_else(uncertain)?
         .committed = true;
     persist(&dir.join("requests"), &ledger, fs)
+}
+/// Test-only fixture: fill the keyed-request ledger to its count bound with entries that
+/// pass every strict decode check, so the next keyed send meets the capacity refusal. Its
+/// only caller is the Unix-gated daemon service-send test.
+#[cfg(all(test, unix))]
+pub(crate) fn saturate_ledger_for_test(base: &Path, now: u64) {
+    let fs = crate::sessions::directives::real_fs();
+    initialize(base, now, &fs).expect("initialize the request ledger");
+    let dir = store::store_dir(base);
+    let mut ledger = open(&dir, now, now, &fs, false).expect("read the request ledger");
+    while ledger.entries.len() < CAPACITY {
+        let id = uuid::Uuid::new_v4().hyphenated().to_string();
+        ledger.entries.insert(
+            id.clone(),
+            Entry {
+                issued: now,
+                intent: "a".repeat(64),
+                record: "b".repeat(64),
+                receipt: Receipt {
+                    id: id.clone(),
+                    thread: id,
+                    status: super::model::Status::Queued,
+                    created_at: now,
+                    surfaced_at: None,
+                    read_at: None,
+                    acked_at: None,
+                    ack_note_framed: None,
+                },
+                to: Recipient {
+                    pid: 2,
+                    started_at: now,
+                    surface: super::model::Surface::ClaudeCode,
+                    started_exact: None,
+                },
+                committed: true,
+            },
+        );
+    }
+    persist(&dir.join("requests"), &ledger, &fs).expect("write the saturated request ledger");
 }
 /// Advance captured time through the operation; round elapsed time upward to refuse late retries.
 pub fn decision_time(now: u64, started: std::time::Instant) -> u64 {

@@ -34,6 +34,7 @@ use super::limits::{
 use super::model::{
     Message, MessageView, Origin, Receipt, Recipient, Sender, Status, VerifiedSession, SCHEMA,
 };
+use super::service::VerifiedService;
 use crate::error::PlatformError;
 use crate::platform::fs::WrittenPrivateFile;
 use crate::sessions::directives::{
@@ -990,17 +991,45 @@ fn parent_for(
     from: &Sender,
     now: u64,
 ) -> Result<Message, DirectiveError> {
+    // A service has no inbox, so no message can have been addressed to it: a service
+    // cannot answer one. Refuse instead of fabricating an address.
+    let Some(from_recipient) = from.as_recipient() else {
+        return Err(DirectiveError::invalid(SERVICE_NO_INBOX));
+    };
     let parent = match records.iter().find(|m| m.id == parent_id) {
         Some(m) => m.clone(),
         None => archived_one(dir, parent_id, now)?
             .ok_or_else(|| DirectiveError::invalid(GONE_MESSAGE))?,
     };
-    if !parent.to.same_session(&from.as_recipient()) {
+    if !parent.to.same_session(&from_recipient) {
         return Err(DirectiveError::invalid(
             "reply must answer a message addressed to you",
         ));
     }
     Ok(parent)
+}
+
+/// The fixed refusal for a reply that would have to reach a service (design an internal ticket §5).
+/// A service has no inbox by design; the caller's message stays addressed to a session.
+pub const SERVICE_NO_INBOX: &str = "a service has no inbox; it cannot send or receive a reply";
+
+/// The §11.6 fixed tag for [`SERVICE_NO_INBOX`]. Surfaces that render a `DirectiveError` to
+/// a caller MUST replace the prose sentinel with this token, so client logic written
+/// against the documented vocabulary matches instead of seeing a generic `invalid_input`.
+/// ONE spelling lives in [`crate::audit::SERVICE_NO_INBOX_TAG`]; this is the store-side
+/// alias the CLI/MCP surfaces import.
+pub const SERVICE_NO_INBOX_TAG: &str = crate::audit::SERVICE_NO_INBOX_TAG;
+
+/// Normalise a store error for a CALLER-FACING surface: the service-no-inbox prose becomes
+/// its fixed §11.6 tag; every other error passes through untouched. The daemon's
+/// service-send route does its own mapping (`service_directive_failure`) and never needs
+/// this; the session-facing surfaces (CLI envelope, MCP tool result) do.
+#[must_use]
+pub fn caller_facing(mut error: DirectiveError) -> DirectiveError {
+    if error.message == SERVICE_NO_INBOX {
+        error.message = SERVICE_NO_INBOX_TAG.to_string();
+    }
+    error
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1026,6 +1055,8 @@ pub(super) fn do_send(
         body,
         Origin::Peer,
         request,
+        None,
+        None,
         None,
     )
 }
@@ -1054,13 +1085,28 @@ pub(super) fn do_send_with_admission_clock(
         Origin::Peer,
         request,
         admission,
+        None,
+        None,
     )
 }
 
 /// The one send implementation every surface shares. `from` and `origin` are supplied by
-/// the caller: peer sends pass the resolver-proved session and [`Origin::Peer`], and the
-/// daemon's bridge ingress is the only caller that passes a synthetic sender with an
-/// [`Origin::OwnerTelegram`].
+/// the caller: peer sends pass the resolver-proved session and [`Origin::Peer`], the
+/// daemon's bridge ingress passes a synthetic sender with an [`Origin::OwnerTelegram`], and
+/// the service route passes its registered service sender with [`Origin::Service`].
+///
+/// `admit` is the service route's admission-record hook and is `None` everywhere else. It
+/// runs INSIDE the store lock, after every STATE refusal check in the operation closure
+/// (including the keyed-request ledger feasibility pass) and before the first MESSAGE write,
+/// so a state refusal cannot land after the record it appends. The token deadline is
+/// re-evaluated at the publication step: a request that crosses the window during the
+/// append is refused `undetermined` with no message written. A keyed replay (resolved before
+/// the records were loaded) never reaches it. The ledger's own clock and pruning housekeeping
+/// may already have been persisted by the feasibility pass, which writes no message.
+///
+/// `published` is set as soon as the message record is durable. The service wrapper uses it
+/// to decide whether a later failure may be recorded as a REFUSAL: a refusal record must
+/// never describe a send the store wrote.
 #[allow(clippy::too_many_arguments)]
 fn do_send_core(
     base_dir: &Path,
@@ -1074,6 +1120,8 @@ fn do_send_core(
     origin: Origin,
     request: Option<(&str, super::request::Clock, super::request::Intent<'_>)>,
     admission: Option<&super::request::AdmissionClock<'_>>,
+    admit: Option<&dyn Fn() -> Result<(), DirectiveError>>,
+    published: Option<&std::cell::Cell<bool>>,
 ) -> Result<(Receipt, Recipient), DirectiveError> {
     let decision_started = std::time::Instant::now();
     with_denial_hint(fs0, |fs| {
@@ -1093,8 +1141,12 @@ fn do_send_core(
                     let parent = parent_for(dir, records, p, from, now)?;
                     // A reply goes back to the sender of the message it answers: a different
                     // explicit target would put a third session into someone else's thread
-                    // and hand it the thread id.
-                    if !to.same_session(&parent.from.as_recipient()) {
+                    // and hand it the thread id. A service sender has no address, so a
+                    // service-authored message can never be answered.
+                    let Some(parent_sender) = parent.from.as_recipient() else {
+                        return Err(DirectiveError::invalid(SERVICE_NO_INBOX));
+                    };
+                    if !to.same_session(&parent_sender) {
                         return Err(DirectiveError::invalid(
                             "a reply must go to the sender of the message it answers",
                         ));
@@ -1103,7 +1155,10 @@ fn do_send_core(
                 }
                 (Dest::ReplyTo(_), Some(p)) => {
                     let parent = parent_for(dir, records, p, from, now)?;
-                    (parent.from.as_recipient(), Some(parent))
+                    let Some(parent_sender) = parent.from.as_recipient() else {
+                        return Err(DirectiveError::invalid(SERVICE_NO_INBOX));
+                    };
+                    (parent_sender, Some(parent))
                 }
                 (Dest::ReplyTo(_), None) => return Err(DirectiveError::invalid(GONE_MESSAGE)),
             };
@@ -1125,7 +1180,7 @@ fn do_send_core(
             }
             check_rate(records, from, &to, now, limits)?;
             check_pending(records, &to, limits)?;
-            check_sender_pending(records, &from.as_recipient(), limits)?;
+            check_sender_pending(records, from, limits)?;
             let overflow = (records.len() + 1).saturating_sub(limits.max_records);
             let evict = if overflow > 0 {
                 let order = eviction_order(records, now, liveness);
@@ -1161,8 +1216,48 @@ fn do_send_core(
                 ack_note: None,
                 ack_nonce: None,
             };
-            // Save first, evict after: a failed save deletes nothing. The store may exceed its
-            // cap by one record between the two steps.
+            // SERVICE ADMISSION POINT (the `send_service` route only). Every refusal check
+            // above has passed and the keyed replay (if any) was resolved before the
+            // records were loaded, so the store is now committed to writing this message.
+            // The daemon appends its signed admission record HERE, under the store lock
+            // and before the first MESSAGE write, which is what makes `Admitted` true by
+            // construction.
+            //
+            // The intent AND the keyed-request ledger are validated first. The ledger
+            // feasibility pass applies every STATE predicate `prepare` does — open,
+            // token validity/floor, public-record absence, capacity/containment, id
+            // match — without inserting an entry. Nothing else can change the ledger or
+            // the public record between the two calls (this lock is held), so no state
+            // refusal can land after the admission record.
+            //
+            // The token DEADLINE is different by design: `upper` rounds elapsed time
+            // upward, so `prepare` (and the explicit validate after it) re-evaluate it as
+            // publication steps. A token that crosses the 600 s window while the
+            // admission record is being appended is therefore refused `undetermined`
+            // AFTER the record — with nothing written, so the refusal record is truthful
+            // (the admission decision itself was timely). `published` guards the other
+            // direction below.
+            //
+            // `open` in the feasibility pass publishes the ledger clock and prunes expired
+            // entries (ledger housekeeping, never a message write).
+            if let Some(admit) = admit {
+                if let Some((token, clock, intent)) = request {
+                    let observed = match admission {
+                        Some(clock) => clock.observe()?,
+                        None => now,
+                    };
+                    super::request::validate_intent(intent)?;
+                    super::request::validate_prepare(
+                        dir,
+                        observed,
+                        clock.upper(decision_started).max(observed),
+                        fs,
+                        token,
+                        &m,
+                    )?;
+                }
+                admit()?;
+            }
             if let Some((token, clock, intent)) = request {
                 let observed = match admission {
                     Some(clock) => clock.observe()?,
@@ -1177,9 +1272,18 @@ fn do_send_core(
                     intent,
                     &m,
                 )?;
+                // Deliberately a FRESH `upper` (elapsed time rounded up): a preparation
+                // that crossed the request window must not publish.
                 super::request::validate(token, clock.upper(decision_started).max(observed))?;
             }
+            // Save first, evict after: a failed save deletes nothing. The store may exceed
+            // its cap by one record between the two steps.
             save(dir, &m, fs)?;
+            // The message is durable from here on, whatever the keyed-request commit below
+            // answers: the service wrapper must never append a refusal record for it.
+            if let Some(published) = published {
+                published.set(true);
+            }
             if let Some((token, _, _)) = request {
                 let observed = match admission {
                     Some(clock) => clock.observe()?,
@@ -1359,8 +1463,86 @@ pub(crate) fn send_owner(
         origin,
         None,
         None,
+        None,
+        None,
     )
     .map(|(receipt, _)| receipt)
+}
+
+/// Store a message a registered service sent (design an internal ticket §5).
+///
+/// Shares [`do_send_core`] with every peer send, so body, liveness, rate, pending and
+/// store-cap checks apply unchanged, and the record is stored before the caller's delivery
+/// attempt. `service` must be a [`VerifiedService`], which only the daemon route builds
+/// after [`super::service::load`] validated the registry record against the peer uid; the
+/// sender block is the synthetic [`super::model::service_sender`] (pid `0`, no handle dir),
+/// and provenance is [`Origin::Service`], a variant no session-facing surface can produce.
+///
+/// `key`, when supplied, is the caller's idempotency token. A service is always pinned by
+/// its `registration_id`, so the request id is stable across processes; a retry with the
+/// same key replays the stored receipt instead of storing a duplicate.
+///
+/// `admit` is the daemon's admission-record hook. It runs under the store lock after EVERY
+/// state refusal check (body, reply/`SERVICE_NO_INBOX`, liveness, rate, pending, store
+/// caps, intent and the keyed-request ledger feasibility pass) and before the first
+/// message write, so a state refusal can never land after the record it appends. The token
+/// deadline is re-evaluated at the publication step by design; a request that crosses the
+/// window during the append is refused `undetermined` with no message written (and so a
+/// truthful refusal record). A keyed replay stores nothing and does not call `admit`.
+///
+/// `published` is set once the message record is durable. The caller MUST NOT append a
+/// refusal record when it is set: a commit failure after the write reports `undetermined`
+/// to the caller, but the send itself happened.
+#[cfg_attr(not(unix), allow(dead_code))] // the only production caller is the Unix-only service route
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn send_service(
+    base_dir: &Path,
+    now: u64,
+    fs: &FsOps<'_>,
+    limits: &Limits,
+    liveness: &dyn Fn(&Recipient) -> Liveness,
+    service: &VerifiedService,
+    to: Recipient,
+    raw_target: &str,
+    parent: Option<&str>,
+    body: &str,
+    key: Option<&str>,
+    wake: bool,
+    admit: &dyn Fn() -> Result<(), DirectiveError>,
+    published: &std::cell::Cell<bool>,
+) -> Result<(Receipt, Recipient), DirectiveError> {
+    let record = service.record();
+    let origin = Origin::Service {
+        name: record.name.clone(),
+        registration_id: record.registration_id.clone(),
+    };
+    let request = key.map(|token| {
+        (
+            token,
+            super::request::Clock::from(now),
+            super::request::Intent::Send {
+                target: raw_target,
+                parent,
+                body,
+                wake,
+            },
+        )
+    });
+    do_send_core(
+        base_dir,
+        now,
+        fs,
+        limits,
+        liveness,
+        &super::model::service_sender(record),
+        Dest::To(to, parent),
+        body,
+        origin,
+        request,
+        None,
+        Some(admit),
+        Some(published),
+    )
 }
 
 /// The messages addressed to `who` and no others (INV-32-02), oldest first, as views with
@@ -1555,7 +1737,11 @@ pub fn inbox_view_counted(
 pub struct Consumed {
     pub id: String,
     pub from_pid: u32,
-    pub from_surface: super::model::Surface,
+    pub from_surface: super::model::SenderSurface,
+    /// The record's ORIGIN says a registered service wrote it. A reader that shows a sender
+    /// must key service-ness off this flag, not the surface alone (a malformed record can
+    /// carry a session surface).
+    pub service_origin: bool,
 }
 
 /// Bulk mark-read for `inbox(mark:"read", count_only:true)`: consumes ONLY live records
@@ -1594,6 +1780,7 @@ pub fn consume_shown(
                         id: m.id.clone(),
                         from_pid: m.from.pid,
                         from_surface: m.from.surface,
+                        service_origin: matches!(m.origin, Origin::Service { .. }),
                     });
                 }
                 Ok(done)
@@ -2159,11 +2346,12 @@ mod tests {
         Sender {
             pid,
             started_at: 5_000,
-            surface,
+            surface: surface.into(),
             handle_dir_hash: format!("h{pid}"),
             handle_dir: format!("/h/{pid}"),
             name: None,
             started_exact: None,
+            service: None,
         }
     }
     fn v(s: &Sender) -> VerifiedSession {
@@ -2378,7 +2566,15 @@ mod tests {
         let d = TempDir::new().unwrap();
         let a = snd(1, Surface::ClaudeCode);
         let b = snd(2, Surface::Codex);
-        let parent = put(d.path(), T0, &a, b.as_recipient(), "question", None).unwrap();
+        let parent = put(
+            d.path(),
+            T0,
+            &a,
+            b.as_recipient().unwrap(),
+            "question",
+            None,
+        )
+        .unwrap();
         inbox(
             d.path(),
             T0 + 1,
@@ -2406,7 +2602,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(answer.thread, parent.thread);
-        assert!(to.same_session(&a.as_recipient()));
+        assert!(to.same_session(&a.as_recipient().unwrap()));
         assert_eq!(
             put(
                 d.path(),
@@ -3491,10 +3687,26 @@ mod tests {
             snd(2, Surface::Codex),
             snd(3, Surface::Codex),
         );
-        let m1 = put(d.path(), T0, &a, b.as_recipient(), "q", None).unwrap();
-        let e = put(d.path(), T0 + 1, &c, a.as_recipient(), "x", Some(&m1.id)).unwrap_err();
+        let m1 = put(d.path(), T0, &a, b.as_recipient().unwrap(), "q", None).unwrap();
+        let e = put(
+            d.path(),
+            T0 + 1,
+            &c,
+            a.as_recipient().unwrap(),
+            "x",
+            Some(&m1.id),
+        )
+        .unwrap_err();
         assert_eq!(code(&e), SdkErrorCode::InvalidInput);
-        let e = put(d.path(), T0 + 1, &a, b.as_recipient(), "x", Some(&m1.id)).unwrap_err();
+        let e = put(
+            d.path(),
+            T0 + 1,
+            &a,
+            b.as_recipient().unwrap(),
+            "x",
+            Some(&m1.id),
+        )
+        .unwrap_err();
         assert_eq!(
             code(&e),
             SdkErrorCode::InvalidInput,
@@ -3504,23 +3716,47 @@ mod tests {
             d.path(),
             T0 + 1,
             &b,
-            a.as_recipient(),
+            a.as_recipient().unwrap(),
             "x",
             Some("0e0f2a4c-8b5d-4c1a-9a3e-2f6b7c8d9e0f"),
         )
         .unwrap_err();
         assert_eq!(code(&e), SdkErrorCode::InvalidInput);
         assert_eq!(record_count(d.path()), 1);
-        assert!(put(d.path(), T0 + 2, &b, a.as_recipient(), "a", Some(&m1.id)).is_ok());
+        assert!(put(
+            d.path(),
+            T0 + 2,
+            &b,
+            a.as_recipient().unwrap(),
+            "a",
+            Some(&m1.id)
+        )
+        .is_ok());
     }
 
     #[test]
     fn thread_is_the_parents_thread() {
         let d = TempDir::new().unwrap();
         let (a, b) = (snd(1, Surface::ClaudeCode), snd(2, Surface::Codex));
-        let m1 = put(d.path(), T0, &a, b.as_recipient(), "q", None).unwrap();
-        let m2 = put(d.path(), T0 + 1, &b, a.as_recipient(), "a", Some(&m1.id)).unwrap();
-        let m3 = put(d.path(), T0 + 2, &a, b.as_recipient(), "b", Some(&m2.id)).unwrap();
+        let m1 = put(d.path(), T0, &a, b.as_recipient().unwrap(), "q", None).unwrap();
+        let m2 = put(
+            d.path(),
+            T0 + 1,
+            &b,
+            a.as_recipient().unwrap(),
+            "a",
+            Some(&m1.id),
+        )
+        .unwrap();
+        let m3 = put(
+            d.path(),
+            T0 + 2,
+            &a,
+            b.as_recipient().unwrap(),
+            "b",
+            Some(&m2.id),
+        )
+        .unwrap();
         assert_eq!(m2.thread, m1.id);
         assert_eq!(m3.thread, m1.id);
         let stored = inbox(d.path(), T0, &real_fs(), &live, &v(&b), false, None).unwrap();
@@ -3539,7 +3775,7 @@ mod tests {
         let mut a = snd(1, Surface::Codex);
         a.started_exact = Some(777_000_123);
         let b = snd(2, Surface::Codex);
-        let m1 = put(d.path(), T0, &a, b.as_recipient(), "q", None).unwrap();
+        let m1 = put(d.path(), T0, &a, b.as_recipient().unwrap(), "q", None).unwrap();
         let (_, to) = reply(
             d.path(),
             T0 + 1,
@@ -3551,7 +3787,7 @@ mod tests {
             "ans",
         )
         .unwrap();
-        assert_eq!(to, a.as_recipient());
+        assert_eq!(to, a.as_recipient().unwrap());
         assert_eq!(to.started_exact, Some(777_000_123));
     }
 
@@ -3581,7 +3817,7 @@ mod tests {
             snd(2, Surface::Codex),
             snd(3, Surface::Codex),
         );
-        let m1 = put(d.path(), T0, &a, b.as_recipient(), "q", None).unwrap();
+        let m1 = put(d.path(), T0, &a, b.as_recipient().unwrap(), "q", None).unwrap();
         let ok = reply(
             d.path(),
             T0 + 1,
@@ -4038,7 +4274,15 @@ mod tests {
         use std::os::unix::fs::{symlink, PermissionsExt};
         let d = TempDir::new().unwrap();
         let (a, b) = (snd(1, Surface::ClaudeCode), snd(2, Surface::Codex));
-        let first = put(d.path(), T0, &a, b.as_recipient(), "survivor", None).unwrap();
+        let first = put(
+            d.path(),
+            T0,
+            &a,
+            b.as_recipient().unwrap(),
+            "survivor",
+            None,
+        )
+        .unwrap();
         let dir = store_dir(d.path());
         let good = std::fs::read_to_string(rec_path(d.path())).unwrap();
         let name = |n: u8| dir.join(format!("00000000-0000-4000-8000-00000000000{n}.json"));
@@ -4070,7 +4314,15 @@ mod tests {
             "an unlocked read quarantines nothing"
         );
         // The next mutating call moves them all away and the send goes through.
-        put(d.path(), T0 + 1, &a, b.as_recipient(), "after", None).unwrap();
+        put(
+            d.path(),
+            T0 + 1,
+            &a,
+            b.as_recipient().unwrap(),
+            "after",
+            None,
+        )
+        .unwrap();
         assert_eq!(rejected_count(d.path()), 8);
         let json: Vec<_> = files(d.path())
             .into_iter()
@@ -4514,7 +4766,15 @@ mod tests {
         let d = TempDir::new().unwrap();
         let a = snd(1, Surface::ClaudeCode);
         let b = snd(2, Surface::Codex);
-        let parent = put(d.path(), T0, &a, b.as_recipient(), "question", None).unwrap();
+        let parent = put(
+            d.path(),
+            T0,
+            &a,
+            b.as_recipient().unwrap(),
+            "question",
+            None,
+        )
+        .unwrap();
         let ended = |_: &Recipient| Liveness::Ended;
         let marked_at = T0 + 5;
 
@@ -5124,7 +5384,15 @@ mod tests {
         for (what, edit) in cases {
             let d = TempDir::new().unwrap();
             let (a, b) = (snd(1, Surface::ClaudeCode), snd(2, Surface::Codex));
-            put(d.path(), T0, &a, b.as_recipient(), "survivor", None).unwrap();
+            put(
+                d.path(),
+                T0,
+                &a,
+                b.as_recipient().unwrap(),
+                "survivor",
+                None,
+            )
+            .unwrap();
             let planted = plant(d.path(), 9, edit);
             let e = inbox(d.path(), T0 + 1, &real_fs(), &live, &v(&b), false, None).unwrap_err();
             assert_eq!(code(&e), SdkErrorCode::Undetermined, "{what}: lock-free");
@@ -5133,7 +5401,15 @@ mod tests {
                 0,
                 "{what}: lock-free moves nothing"
             );
-            put(d.path(), T0 + 1, &a, b.as_recipient(), "after", None).unwrap();
+            put(
+                d.path(),
+                T0 + 1,
+                &a,
+                b.as_recipient().unwrap(),
+                "after",
+                None,
+            )
+            .unwrap();
             assert!(!planted.exists(), "{what}: not quarantined");
             assert_eq!(rejected_count(d.path()), 1, "{what}");
             assert_eq!(record_count(d.path()), 2, "{what}");
@@ -5141,7 +5417,15 @@ mod tests {
         // The skew boundary: exactly MAX_CLOCK_SKEW_SECS ahead is accepted.
         let d = TempDir::new().unwrap();
         let (a, b) = (snd(1, Surface::ClaudeCode), snd(2, Surface::Codex));
-        put(d.path(), T0, &a, b.as_recipient(), "survivor", None).unwrap();
+        put(
+            d.path(),
+            T0,
+            &a,
+            b.as_recipient().unwrap(),
+            "survivor",
+            None,
+        )
+        .unwrap();
         plant(d.path(), 9, |v| v["created_at"] = (T0 + 1 + 300).into());
         let got = inbox(d.path(), T0 + 1, &real_fs(), &live, &v(&b), false, None).unwrap();
         assert_eq!(got.len(), 2);
@@ -5151,7 +5435,7 @@ mod tests {
     fn stale_tmp_files_are_swept_on_the_next_mutating_call_and_fresh_ones_kept() {
         let d = TempDir::new().unwrap();
         let (a, b) = (snd(1, Surface::ClaudeCode), snd(2, Surface::Codex));
-        put(d.path(), T0, &a, b.as_recipient(), "m", None).unwrap();
+        put(d.path(), T0, &a, b.as_recipient().unwrap(), "m", None).unwrap();
         let dir = store_dir(d.path());
         let set = |name: &str, secs: u64| {
             let p = dir.join(name);
@@ -5163,7 +5447,7 @@ mod tests {
         let now = T0 + 5;
         set("old.json.tmp.1", now - STALE_TMP_SECS - 5);
         set("fresh.json.tmp.2", now - 10);
-        put(d.path(), now, &a, b.as_recipient(), "m2", None).unwrap();
+        put(d.path(), now, &a, b.as_recipient().unwrap(), "m2", None).unwrap();
         let names = files(d.path());
         assert!(!names.contains(&"old.json.tmp.1".to_string()), "{names:?}");
         assert!(names.contains(&"fresh.json.tmp.2".to_string()), "{names:?}");
@@ -5987,13 +6271,32 @@ mod tests {
         }
 
         fn bind() -> (TempDir, std::os::unix::net::UnixListener, PathBuf) {
-            // The store's client bounds `sock_path` length the same way the daemon does;
-            // a tempdir path stays well inside the sun_path limit.
-            let dir = TempDir::new().unwrap();
+            // The store's client bounds `sock_path` length the same way the daemon does.
+            // A runner TMPDIR can be deeper than `sun_path` allows, so the socket lives
+            // under the shared short `/tmp` root (never an ad-hoc `TempDir::new()`).
+            let dir = crate::testing::socket_fixture::short_root("sv-").unwrap();
             let sock = dir.path().join("verify.sock");
             let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
             (dir, listener, sock)
         }
+    }
+
+    /// The fake daemon's socket must fit `sun_path` (104 bytes on macOS) whatever the
+    /// ambient `TMPDIR` is. Falsifier: `TempDir::new()` under a deep TMPDIR (CI layouts;
+    /// `scripts/verify/long-tmpdir-cargo.sh`) yields a path at or over the limit and
+    /// `bind` itself fails with `path must be shorter than SUN_LEN`.
+    #[cfg(unix)]
+    #[test]
+    fn fake_verify_daemon_socket_path_fits_sun_path_regardless_of_tmpdir() {
+        let (dir, _listener, sock) = FakeVerifyDaemon::bind();
+        assert!(
+            sock.as_os_str().len() < 104,
+            "socket path {} bytes must be under the macOS sun_path limit",
+            sock.as_os_str().len()
+        );
+        let root = dir.path().to_path_buf();
+        drop(dir);
+        assert!(!root.exists(), "the short socket root must not leak");
     }
 
     #[cfg(unix)]
@@ -6295,6 +6598,90 @@ mod tests {
                 "{body:?}"
             );
         }
+    }
+
+    /// A session replying to a service-authored message is refused by the CORE guard
+    /// (`service_no_inbox`) and stores nothing; a service cannot reply at all.
+    #[test]
+    fn a_reply_to_or_from_a_service_is_refused_with_service_no_inbox() {
+        let d = TempDir::new().unwrap();
+        let record = crate::messaging::service::ServiceRecord {
+            v: 1,
+            name: "nightly".to_string(),
+            uid: 7,
+            registration_id: "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".to_string(),
+            created_at: 9,
+        };
+        let service_sender = crate::messaging::model::service_sender(&record);
+        let origin = Origin::Service {
+            name: record.name.clone(),
+            registration_id: record.registration_id.clone(),
+        };
+        let (sent, _) = do_send_core(
+            d.path(),
+            T0,
+            &real_fs(),
+            &Limits::DEFAULT,
+            &live,
+            &service_sender,
+            Dest::To(rcp(2), None),
+            "nightly backup failed",
+            origin.clone(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(record_count(d.path()), 1);
+
+        // A session answering the service's message: there is no address to answer.
+        let error = reply(
+            d.path(),
+            T0 + 1,
+            &real_fs(),
+            &Limits::DEFAULT,
+            &live,
+            &ses(2),
+            &sent.id,
+            "answer",
+        )
+        .unwrap_err();
+        assert_eq!(error.message, SERVICE_NO_INBOX);
+        assert_eq!(record_count(d.path()), 1, "a refused reply stores nothing");
+
+        // A service sender answering anything: it has no inbox, so no parent was its own.
+        let error = do_send_core(
+            d.path(),
+            T0 + 1,
+            &real_fs(),
+            &Limits::DEFAULT,
+            &live,
+            &service_sender,
+            Dest::ReplyTo(&sent.id),
+            "answer",
+            origin,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.message, SERVICE_NO_INBOX);
+        assert_eq!(record_count(d.path()), 1);
+    }
+
+    /// The caller-facing normaliser: the service-no-inbox prose becomes its fixed §11.6
+    /// tag; every other store error passes through byte-for-byte (code included).
+    #[test]
+    fn caller_facing_replaces_only_the_service_no_inbox_sentinel() {
+        let no_inbox = caller_facing(DirectiveError::invalid(SERVICE_NO_INBOX));
+        assert_eq!(no_inbox.message, SERVICE_NO_INBOX_TAG);
+        assert_eq!(no_inbox.code, SdkErrorCode::InvalidInput);
+
+        let other = caller_facing(DirectiveError::invalid("message body length out of range"));
+        assert_eq!(other.message, "message body length out of range");
+        assert_eq!(other.code, SdkErrorCode::InvalidInput);
     }
 }
 

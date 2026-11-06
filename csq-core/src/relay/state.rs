@@ -559,6 +559,7 @@ impl SlashTable {
         cli: super::types::CliKind,
         cmd: SlashCmd,
     ) -> Result<(), SdkErrorCode> {
+        super::catalog::production_available(cli, cmd)?;
         let table = Self::for_cli(cli);
         let cell = table.cell(cmd).ok_or(SdkErrorCode::CliUnmeasured)?;
         cell.idle_return.ok_or(SdkErrorCode::ChainUnsupported)?;
@@ -595,12 +596,28 @@ pub enum EntryKind {
     Slash(SlashCmd),
 }
 
+/// Metadata from a live state transaction, not proof of owner authorization.
+/// Slash requests have no text role; their owner provenance must be checked
+/// separately by the trusted intake path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::relay) struct TxMetadata {
+    pub id: u64,
+    pub caller: SessionIdentity,
+    pub target: SessionIdentity,
+    pub kind: EntryKind,
+    pub byte_len: usize,
+    pub role: Option<Role>,
+    pub immediate: bool,
+    _sealed: (u64, u64, u64),
+}
+
 /// The resolved bytes and `\r` kind of a request. Private: only this module
 /// builds one, so bytes and kind cannot be mixed from different requests.
 struct Body {
     bytes: Zeroizing<Vec<u8>>,
     enter: CsqEnter,
     kind: EntryKind,
+    role: Option<Role>,
 }
 
 impl Body {
@@ -613,11 +630,15 @@ impl Body {
         id: u64,
     ) -> Result<Self, SdkErrorCode> {
         match req {
-            Request::Text(t) => Ok(Self {
-                bytes: t.framed(who, id)?,
-                enter: CsqEnter::Text,
-                kind: EntryKind::Text,
-            }),
+            Request::Text(t) => {
+                let role = Some(t.role);
+                Ok(Self {
+                    bytes: t.framed(who, id)?,
+                    enter: CsqEnter::Text,
+                    kind: EntryKind::Text,
+                    role,
+                })
+            }
             Request::Slash(cmd) => {
                 let cell = table.cell(cmd).ok_or(SdkErrorCode::CliUnmeasured)?;
                 let idle = cell.idle_return.ok_or(SdkErrorCode::ChainUnsupported)?;
@@ -628,6 +649,7 @@ impl Body {
                     bytes: Zeroizing::new(cell.bytes.to_vec()),
                     enter: CsqEnter::Slash(idle),
                     kind: EntryKind::Slash(cmd),
+                    role: None,
                 })
             }
         }
@@ -637,6 +659,7 @@ impl Body {
 /// One queued inject.
 struct Entry {
     id: u64,
+    caller: SessionIdentity,
     requester: Option<SessionIdentity>,
     body: Body,
     expires_at_ms: Option<u64>,
@@ -813,6 +836,11 @@ impl<W> WriterLock<W> {
             shared,
         }
     }
+
+    /// Inspect the physical writer's accounting without lending mutable access.
+    pub(in crate::relay) const fn inspect_guard(&self) -> &W {
+        &self.guard
+    }
 }
 
 impl<W> Drop for WriterLock<W> {
@@ -833,9 +861,9 @@ impl<W> fmt::Debug for WriterLock<W> {
 /// is a write error: the bytes may still sit in a buffer the gate never approved.
 ///
 /// Fail-fast: an error of any kind, `WouldBlock` included, ends the write at
-/// once. The writer's `W` is therefore expected to wait up to `INJECT_WRITE_MS`
-/// (spec 34 §34.4.4) inside `write` and return `WouldBlock` only past that
-/// budget; this function never spins.
+/// once. The writer's `W` may fail fast with `WouldBlock` within the original
+/// `INJECT_WRITE_MS` budget (spec 34 §34.4.4); it need not wait for the budget
+/// to elapse. Interrupted writes retry through `W` and its deadline checks.
 fn write_counted<W: Write>(w: &mut W, buf: &[u8]) -> (usize, io::Result<()>) {
     let mut done = 0;
     while done < buf.len() {
@@ -958,6 +986,31 @@ impl fmt::Debug for Transaction {
 }
 
 impl Transaction {
+    /// Read metadata only from this gate's live transaction and incarnation.
+    /// This does not authorize a writer or promote a slash caller to operator.
+    pub(in crate::relay) fn audit_metadata(
+        &self,
+        gate: &RelayState,
+    ) -> Result<TxMetadata, SdkErrorCode> {
+        if self.gate_id != gate.gate_id || !self.live() {
+            return Err(SdkErrorCode::NotAuthorized);
+        }
+        let entry = self.entry.as_ref().ok_or(SdkErrorCode::NotAuthorized)?;
+        if entry.epoch != gate.epoch || self.stale() {
+            return Err(SdkErrorCode::NotAuthorized);
+        }
+        Ok(TxMetadata {
+            id: entry.id,
+            caller: entry.caller,
+            target: gate.child,
+            kind: entry.body.kind,
+            byte_len: entry.body.bytes.len(),
+            role: entry.body.role,
+            immediate: !self.queued,
+            _sealed: (self.gate_id, entry.epoch, self.gen),
+        })
+    }
+
     fn kind(&self) -> EntryKind {
         self.entry.as_ref().map_or(EntryKind::Text, |e| e.body.kind)
     }
@@ -1180,15 +1233,16 @@ impl Transaction {
         cause
     }
 
-    /// Step 1: every check holds BEFORE anything is written, then the bracketed
-    /// paste (framing written here, around the validated payload) goes to the
+    /// Step 1: every check holds BEFORE anything is written, then text as a
+    /// bracketed paste or the slash table's constant keystrokes go to the
     /// master. The next state is returned only on a FULL write: any write error
     /// ends the transaction (with `line_dirty` set and a record if at least one
     /// byte was accepted), so there is no path from a failed paste to a `\r`.
     ///
-    /// A paste that fails after at least one byte also tries to close the
+    /// A text paste that fails after at least one byte also tries to close the
     /// bracketed paste (`ESC[201~`); if that cannot be written either the paste
-    /// is latched open (`line_dirty` stays set whatever the human types).
+    /// is latched open (`line_dirty` stays set whatever the human types). A
+    /// failed slash writes no paste-recovery framing.
     ///
     /// `foreground_ok` and `paste_on` are S1b's fresh `tcgetpgrp` and
     /// paste-mode reads under the lock (S1b replaces the bool with its proof);
@@ -1220,12 +1274,17 @@ impl Transaction {
         }
         self.stage = Stage::Pasting;
         self.mark_pasted();
+        let is_text = self.kind() == EntryKind::Text;
         let framed: Zeroizing<Vec<u8>> = match self.entry.as_ref() {
             Some(e) => {
                 let mut v = Vec::with_capacity(e.body.bytes.len() + 12);
-                v.extend_from_slice(PASTE_START);
+                if is_text {
+                    v.extend_from_slice(PASTE_START);
+                }
                 v.extend_from_slice(&e.body.bytes);
-                v.extend_from_slice(PASTE_END);
+                if is_text {
+                    v.extend_from_slice(PASTE_END);
+                }
                 Zeroizing::new(v)
             }
             None => {
@@ -1245,7 +1304,7 @@ impl Transaction {
         }
         if res.is_err() {
             if written > 0 {
-                if written < framed.len() {
+                if is_text && written < framed.len() {
                     // A part-written paste leaves the child inside it: close it
                     // best-effort, else latch the draft open.
                     let closed = written >= PASTE_START.len()
@@ -1724,6 +1783,7 @@ impl RelayState {
         let expires_at_ms = now_ms.saturating_add(ttl);
         self.queue.push_back(Entry {
             id,
+            caller: requester,
             requester: Some(requester),
             body,
             expires_at_ms: Some(expires_at_ms),
@@ -1782,6 +1842,7 @@ impl RelayState {
         self.next_id += 1;
         let entry = Entry {
             id,
+            caller: requester,
             requester: None,
             body,
             expires_at_ms: Some(self.clock.saturating_add(IMMEDIATE_TTL_MS)),
@@ -1959,8 +2020,13 @@ impl EnterGate for RelayState {
 }
 
 #[cfg(test)]
+pub(in crate::relay) use tests::{test_owner_queued_transaction, test_owner_transaction};
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    type SlashCase = (fn() -> Request, &'static [u8]);
     use crate::relay::types::test_support::{classified_key, run};
     use crate::relay::types::{route, InjectOutcome, InputClass, MASK_MS, QUIET_MS};
 
@@ -2032,6 +2098,34 @@ mod tests {
             InputFlushed::new(),
             zero_clock(),
         )
+    }
+
+    /// State-only slash fixture; it grants no production owner authority.
+    pub(in crate::relay) fn test_owner_transaction(
+        target: SessionIdentity,
+        caller: SessionIdentity,
+        cmd: SlashCmd,
+    ) -> (RelayState, Transaction, u64) {
+        let mut g = gate();
+        g.child = target;
+        let now = to_idle(&mut g, 100);
+        let tx = g.begin(Request::Slash(cmd), &tbl(), caller, now).unwrap();
+        (g, tx, now)
+    }
+
+    /// A real state-queue path for testing owner intake's immediate-only rule.
+    pub(in crate::relay) fn test_owner_queued_transaction(
+        target: SessionIdentity,
+        caller: SessionIdentity,
+        cmd: SlashCmd,
+    ) -> (RelayState, Transaction, u64) {
+        let mut g = gate();
+        g.child = target;
+        let now = to_idle(&mut g, 100);
+        g.enqueue(Request::Slash(cmd), &tbl(), caller, None, now)
+            .unwrap();
+        let tx = g.take(now).unwrap();
+        (g, tx, now)
     }
 
     /// Busy -> turn_end -> redraw at `t` -> quiet; returns the time Idle began.
@@ -2114,12 +2208,6 @@ mod tests {
     /// As `framed`, for requester `who` and request id `id`: the header is the
     /// literal spec 34 §34.4.1 form, written out here and not read from the
     /// module.
-    /// The bytes of a slash paste: the framing around the table's constant
-    /// bytes, with no header (a slash is not text).
-    fn framed_raw(body: &[u8]) -> Vec<u8> {
-        [&b"\x1b[200~"[..], body, &b"\x1b[201~"[..]].concat()
-    }
-
     fn framed_as(who: u32, id: u64, body: &[u8]) -> Vec<u8> {
         let header = format!("[csq inject operator {who}:1 #{id}] ");
         [
@@ -2209,6 +2297,126 @@ mod tests {
             m.budget = budget;
             m.zero = zero;
         })
+    }
+
+    #[test]
+    fn slash_transactions_write_only_table_keystrokes_and_one_cr() {
+        let cases: [SlashCase; 2] = [(slash_hook, b"/clear\r"), (slash_quiet, b"/compact\r")];
+        for (request, expected) in cases {
+            let mut g = gate();
+            let now = to_idle(&mut g, 100);
+            let mut lock = lock_for(&g);
+            let tx = g.begin(request(), &tbl(), req(7), now).unwrap();
+            chain(&mut g, &mut lock, tx, now, |_| {}).unwrap();
+            assert_eq!(lock_bytes(&lock), expected);
+            assert_eq!(g.drain_outcomes()[0].terminal, Terminal::Delivered);
+        }
+    }
+
+    #[test]
+    fn partial_slash_failure_never_writes_paste_recovery_or_a_cr() {
+        let cases: [SlashCase; 2] = [(slash_hook, b"/clear"), (slash_quiet, b"/compact")];
+        for (request, expected) in cases {
+            for budget in 1..expected.len() {
+                for zero in [false, true] {
+                    let mut g = gate();
+                    let now = to_idle(&mut g, 100);
+                    let mut lock = fake_with(&g, |m| {
+                        m.budget = budget;
+                        m.zero = zero;
+                        // A recovery attempt would succeed and expose itself.
+                        m.heal = true;
+                    });
+                    let tx = g.begin(request(), &tbl(), req(7), now).unwrap();
+                    assert_eq!(
+                        tx.paste(&mut g, &mut lock, true, true, now, || true).err(),
+                        Some(SdkErrorCode::Undetermined)
+                    );
+                    assert_eq!(lock.guard.buf, expected[..budget]);
+                    assert_eq!(lock.guard.calls, 2, "no recovery write is permitted");
+                    assert!(dirty(&g));
+                    assert_eq!(
+                        g.drain_outcomes()[0].terminal,
+                        Terminal::Dropped(DropReason::PastedNotSubmitted(PasteStall::WriteFailed))
+                    );
+                    key(&mut g, Key::CtrlU, now + 1);
+                    assert!(!dirty(&g), "slash failure must not latch a paste open");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transaction_audit_metadata_preserves_caller_and_optional_text_role() {
+        let mut g = gate();
+        let now = to_idle(&mut g, 100);
+        let tx = g.begin(text("HELLO"), &tbl(), req(7), now).unwrap();
+        let metadata = tx.audit_metadata(&g).unwrap();
+        assert_eq!(metadata.id, 1);
+        assert_eq!(metadata.caller, req(7));
+        assert_eq!(metadata.target, child());
+        assert_eq!(metadata.kind, EntryKind::Text);
+        assert_eq!(
+            metadata.byte_len,
+            b"[csq inject operator 7:1 #1] HELLO".len()
+        );
+        assert_eq!(metadata.role, Some(Role::Operator));
+        assert!(metadata.immediate);
+        assert_eq!(tx.entry.as_ref().unwrap().requester, None);
+        drop(tx);
+
+        let queued = g.enqueue(slash_hook(), &tbl(), req(8), None, now).unwrap();
+        let tx = g.take(now).unwrap();
+        let metadata = tx.audit_metadata(&g).unwrap();
+        assert_eq!(metadata.id, queued.id);
+        assert_eq!(metadata.caller, req(8));
+        assert_eq!(metadata.target, child());
+        assert_eq!(metadata.kind, EntryKind::Slash(SlashCmd::Clear));
+        assert_eq!(metadata.byte_len, b"/clear".len());
+        assert!(!metadata.immediate);
+        assert_eq!(
+            metadata.role, None,
+            "slash provenance is not an operator role"
+        );
+    }
+
+    #[test]
+    fn transaction_audit_metadata_rejects_wrong_gate_stale_epoch_and_reclaimed_slot() {
+        let mut g = gate();
+        let other = gate();
+        let now = to_idle(&mut g, 100);
+        let tx = g.begin(text("HELLO"), &tbl(), req(7), now).unwrap();
+        assert_eq!(tx.audit_metadata(&other), Err(SdkErrorCode::NotAuthorized));
+        assert!(tx.audit_metadata(&g).is_ok());
+        g.on_identity_change();
+        assert_eq!(tx.audit_metadata(&g), Err(SdkErrorCode::NotAuthorized));
+        drop(tx);
+
+        let mut g = gate();
+        let now = to_idle(&mut g, 100);
+        let tx = g.begin(text("HELLO"), &tbl(), req(7), now).unwrap();
+        g.on_tick(now + INFLIGHT_MAX_MS);
+        assert_eq!(g.drain_outcomes().len(), 1);
+        assert_eq!(tx.audit_metadata(&g), Err(SdkErrorCode::NotAuthorized));
+    }
+
+    #[test]
+    fn transaction_metadata_distinguishes_gates_with_identical_public_fields() {
+        let (a, tx_a, _) = test_owner_transaction(child(), req(7), SlashCmd::Clear);
+        let (b, tx_b, _) = test_owner_transaction(child(), req(7), SlashCmd::Clear);
+        let a = tx_a.audit_metadata(&a).unwrap();
+        let b = tx_b.audit_metadata(&b).unwrap();
+        assert_eq!(a.id, b.id);
+        assert_eq!(a.caller, b.caller);
+        assert_eq!(a.target, b.target);
+        assert_eq!(a.kind, b.kind);
+        assert_eq!(a.byte_len, b.byte_len);
+        assert_eq!(a.role, b.role);
+        assert_eq!(a.immediate, b.immediate);
+        assert_ne!(
+            a, b,
+            "the private seal binds the exact gate and transaction"
+        );
     }
 
     /// Both steps for a begun transaction, `between` running after the paste.
@@ -2924,10 +3132,7 @@ mod tests {
         let now = t + 10_000;
         submit_with(&mut g, &mut lock, slash_quiet(), now, |_| {}).unwrap();
         assert_eq!(phase(&g), Phase::TurnEnded);
-        assert_eq!(
-            lock_bytes(&lock),
-            [framed_raw(b"/compact"), b"\r".to_vec()].concat()
-        );
+        assert_eq!(lock_bytes(&lock), b"/compact\r");
         g.on_child_output(now + 100); // the `\r` echo, inside MASK_MS
         g.on_tick(now + 5_000);
         assert_eq!(phase(&g), Phase::TurnEnded, "the echo must not complete it");
@@ -4030,6 +4235,34 @@ mod tests {
         }
     }
 
+    /// Fixture evidence validates only the owned fake subject and grants no
+    /// production slash, input transaction or Enter capability.
+    #[test]
+    fn fixture_evidence_never_opens_production_slash_cells() {
+        use crate::relay::{catalog, types::CliKind};
+        for cmd in [SlashCmd::Clear, SlashCmd::Compact] {
+            catalog::validate_fixture(cmd).expect("reviewed owned-fake fixture");
+        }
+        for cli in [CliKind::Claude, CliKind::Codex, CliKind::Unknown] {
+            for cmd in [SlashCmd::Clear, SlashCmd::Compact] {
+                assert_eq!(
+                    catalog::production_available(cli, cmd),
+                    Err(SdkErrorCode::CliUnmeasured)
+                );
+                assert_eq!(
+                    SlashTable::availability(cli, cmd),
+                    Err(SdkErrorCode::CliUnmeasured)
+                );
+                assert_eq!(
+                    gate()
+                        .begin(Request::Slash(cmd), &SlashTable::for_cli(cli), req(7), 0)
+                        .err(),
+                    Some(SdkErrorCode::CliUnmeasured)
+                );
+            }
+        }
+    }
+
     /// A hostile or broken table cannot smuggle a control byte past the
     /// alphabet: the cell is checked where the bytes are resolved.
     #[test]
@@ -4191,8 +4424,8 @@ mod tests {
                 let now = to_idle(&mut g, 100) + 1_000;
                 let paste_len = match name {
                     "text" => framed(b"PASTE").len(),
-                    "slash hook" => framed_raw(b"/clear").len(),
-                    _ => framed_raw(b"/compact").len(),
+                    "slash hook" => b"/clear".len(),
+                    _ => b"/compact".len(),
                 };
                 let mut lock = fake(&g, paste_len, zero); // the paste fits, the `\r` does not
                 let tx = g.begin(make(), &tbl(), req(7), now).unwrap();

@@ -294,6 +294,7 @@ pub fn router(state: RouterState) -> Router {
         .route("/api/audit/record", post(audit_record_handler))
         .route("/api/audit/anchor", post(audit_anchor_handler))
         .route("/api/audit/health", get(audit_health_handler))
+        .route("/api/recycle/foreign", post(recycle_foreign_handler))
         .route("/api/provenance/anchor", post(provenance_anchor_handler))
         // Owner bridge (design §3): provenance verification for the message store's
         // render path, and the single-use owner-approval record the PreToolUse gate
@@ -303,6 +304,16 @@ pub fn router(state: RouterState) -> Router {
         .route(
             BRIDGE_VERIFY_AND_CONSUME_ROUTE,
             post(bridge_verify_and_consume_handler),
+        )
+        // an internal ticket — registered service send. One route on the existing per-user Unix
+        // socket, behind the accept-time peer-UID check that already guards every other
+        // route (`rules/security.md` MUST-7): no new listener, never TCP. Non-Unix builds
+        // compile the handler and answer `service_send_surface_unsupported`. A body over
+        // the router-wide limit is a TRANSPORT rejection (413), not a service-send
+        // decision: no tag and no record (spec 32h §11.5).
+        .route(
+            crate::messaging::service::SEND_SERVICE_ROUTE,
+            post(message_send_service_handler),
         );
 
     // an internal ticket/an internal ticket — interactive per-turn enforcement routes (enterprise-only,
@@ -683,6 +694,19 @@ fn approvals() -> &'static std::sync::Mutex<ApprovalStore> {
     APPROVALS.get_or_init(|| std::sync::Mutex::new(ApprovalStore::default()))
 }
 
+/// The issue-time throttle for `/api/recycle/foreign`: one window per (requester, target),
+/// held in the daemon process and reset by a restart. Unix-only, like the route's live arm.
+#[cfg(unix)]
+static RECYCLE_RATE: std::sync::OnceLock<
+    std::sync::Mutex<crate::session::recycle_foreign::RateWindow>,
+> = std::sync::OnceLock::new();
+
+#[cfg(unix)]
+fn recycle_rate_window() -> &'static std::sync::Mutex<crate::session::recycle_foreign::RateWindow> {
+    RECYCLE_RATE
+        .get_or_init(|| std::sync::Mutex::new(crate::session::recycle_foreign::RateWindow::new()))
+}
+
 // The peer pid of the current connection, captured by the accept loop.
 //
 // Set once per accepted Unix connection from the kernel's peer credential
@@ -788,6 +812,799 @@ async fn bridge_verify_and_consume_handler(
         BridgeApprovalResponse::refused("daemon_unreachable")
     });
     Json(answer)
+}
+
+/// Longest client-supplied string this route records in the signed chain. A refused ask carries
+/// REQUESTER-CHOSEN text, the chain is append-only and read-extend-rewrite, and the compliance
+/// report renders these fields into a Markdown table — an unbounded field is a growth vector and
+/// (through link syntax) an export-injection vector.
+///
+/// Unix-only, like the route it serves: gated so a non-Unix build neither uses it nor warns it
+/// as dead code.
+#[cfg(unix)]
+const AUDIT_FIELD_MAX: usize = 200;
+
+/// Caps a client-supplied field and strips control characters, for the signed chain.
+#[cfg(unix)]
+fn audit_field(s: &str) -> String {
+    let mut out = String::with_capacity(AUDIT_FIELD_MAX);
+    for c in s.chars().take(AUDIT_FIELD_MAX) {
+        if c.is_control() {
+            out.push('?');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Records ONE `/api/recycle/foreign` decision on the signed audit chain (design §B step 5,
+/// spec 36 §36.11) — issued and refused alike.
+///
+/// Fixed vocabulary only: handle dirs, pids, the target session id, a nonce DIGEST, the TTL and
+/// the outcome. The reason text and the relayed proof never enter the chain. Best-effort by
+/// design: `emit_outcome` skips rather than failing a request that is already on disk.
+#[cfg(unix)]
+fn emit_recycle_audit(
+    base: &std::path::Path,
+    ask: &crate::session::recycle_foreign::ForeignAsk,
+    issued: Option<&crate::session::recycle_foreign::Issued>,
+    now_unix: i64,
+) {
+    use crate::audit::types::{
+        EventKind, EventPayload, OpOutcome, RecycleRequestOutcome, RecycleRequestPayload,
+    };
+    let Ok(correlation) = crate::audit::op_emit::gen_correlation_id() else {
+        return;
+    };
+    let payload = RecycleRequestPayload {
+        requester_handle: audit_field(&ask.requester.handle),
+        requester_pid: ask.requester_pid,
+        requester_session_id: audit_field(&ask.requester.session_id),
+        target_handle: audit_field(&ask.target_handle),
+        session_id: audit_field(&ask.target_session),
+        nonce_sha256: issued.map(|i| crate::session::recycle_foreign::nonce_digest(&i.nonce)),
+        ttl_secs: issued.map(|i| i.expires_at_unix.saturating_sub(now_unix)),
+        outcome: match issued {
+            Some(_) => RecycleRequestOutcome::Issued,
+            None => RecycleRequestOutcome::Refused,
+        },
+    };
+    let chain_id = crate::audit::op_emit::load_chain_id(base);
+    let result = match issued {
+        Some(_) => OpOutcome::Ok,
+        None => OpOutcome::Failed {
+            reason: crate::audit::op_emit::redact_reason("recycle_request_refused"),
+        },
+    };
+    if crate::audit::op_emit::emit_outcome(
+        base,
+        &chain_id,
+        EventKind::RecycleRequest,
+        EventPayload::RecycleRequest(payload),
+        correlation,
+        result,
+    )
+    .is_err()
+    {
+        tracing::warn!(
+            error_kind = "recycle_audit_emit_failed",
+            "the recycle decision was not recorded in the audit chain"
+        );
+    }
+}
+
+/// The socket's existing layers authenticate the peer's UID (`security.md` MUST-7); this route adds
+/// no listener and never speaks TCP. Decisions, in order, and NOTHING is written unless all pass:
+/// the kernel's peer pid must have the claimed requester in its ANCESTOR chain (with that hop's
+/// start time matching, so a recycled pid cannot stand in), the requester's pid must actually run
+/// the conversation it claims (Claude Code's own registry), the target must be a live supervised
+/// session running exactly the session id the ask names, the target's own consent must name that
+/// requester and have a use left (spent under the consent lock at issue time), the target must not
+/// already have a queued or in-flight recycle, and the per-pair issue window must be open.
+async fn recycle_foreign_handler(
+    State(state): State<RouterState>,
+    Json(ask): Json<crate::session::recycle_foreign::ForeignAsk>,
+) -> Json<crate::session::recycle_foreign::Reply> {
+    use crate::session::recycle_foreign as foreign;
+    #[cfg(unix)]
+    let outcome = {
+        let base = std::sync::Arc::clone(&state.base_dir);
+        let peer_pid = PEER_PID.try_with(|pid| *pid).ok().flatten();
+        let now_unix = chrono::Utc::now().timestamp();
+        // Everything below blocks — the consent file lock, a process-table walk, a registry
+        // scan and the audit chain's keychain load — so it runs off the async workers, exactly
+        // like the sibling bridge route.
+        tokio::task::spawn_blocking(move || {
+            let base_path = base.as_path();
+            let home = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default();
+            let resolve = |pid: u32, expected: &std::path::Path| {
+                crate::sessions::lifecycle::registry_session_id(
+                    pid,
+                    base_path,
+                    &home,
+                    Some(expected),
+                )
+            };
+            // The rate window's mutex is held for the DECISION only. The audit append loads a
+            // keychain key and takes the chain lock (up to 5 s), and holding the global rate
+            // mutex across it would stall every other foreign ask behind one slow append.
+            let result = {
+                let mut rate = recycle_rate_window()
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                foreign::decide(
+                    &ask,
+                    now_unix,
+                    peer_pid,
+                    &resolve,
+                    // FULL-PRECISION accessors, the pair every other production caller of the
+                    // ancestry walk uses: the walk compares with no tolerance, so a one-second
+                    // start could not tell a pid reused within the same second from the original.
+                    &|pid| crate::sessions::parent_pid(pid),
+                    &|pid| crate::sessions::ancestor_start(pid),
+                    &mut rate,
+                )
+            };
+            emit_recycle_audit(base_path, &ask, result.as_ref().ok(), now_unix);
+            result
+        })
+        // A panic in the blocking task is an unusable reply, never a success.
+        .await
+        .unwrap_or(Err("xrecycle_daemon_response_invalid"))
+    };
+    #[cfg(not(unix))]
+    let outcome: Result<foreign::Issued, &'static str> = {
+        // No Claude Code registry or peer credential exists here, so the SURFACE itself is
+        // unsupported — §E's own tag, not a claim that this particular requester failed
+        // verification. Touch the parameters so the Windows build (which shares this router)
+        // stays warning-free under `-D warnings`.
+        let _ = (&state, &ask);
+        Err("xrecycle_requester_surface_unsupported")
+    };
+    match outcome {
+        Ok(issued) => Json(crate::session::recycle_foreign::Reply {
+            ok: true,
+            tag: None,
+            issued: Some(issued),
+        }),
+        Err(t) => Json(crate::session::recycle_foreign::Reply {
+            ok: false,
+            tag: Some(t.to_string()),
+            issued: None,
+        }),
+    }
+}
+
+// ── Registered service sends (design an internal ticket) ───────────────────────────────
+//
+// `POST /api/message/send-service` on the existing per-user Unix socket. The caller's
+// authority is the listener's accept-time peer-UID check (unchanged) plus the peer pid the
+// accept loop captured (`PEER_PID`, never a request field); the request names only a
+// registered SERVICE, never a surface. The daemon loads the registry record (fail closed),
+// RE-VERIFIES the client-supplied `<pid>:<started_at>` against the live session table (a
+// name/pid is a client-side convenience, never trusted), appends the admission record to
+// the audit chain FIRST (a failed append refuses: `service_audit_unavailable`), and only
+// then writes the message through the store. The response carries the ordinary receipt and
+// the re-verified recipient the daemon actually stored to.
+
+/// A fixed-tag refusal from the service-send path: one tag, one HTTP status, never text.
+#[derive(Debug)]
+struct ServiceFailure {
+    status: StatusCode,
+    tag: &'static str,
+}
+
+impl ServiceFailure {
+    /// A refusal at the given status.
+    fn bad(status: StatusCode, tag: &'static str) -> Self {
+        Self { status, tag }
+    }
+
+    /// A namespace tag with its conventional status: unreadable state, an unreadable
+    /// process table and an unwritable audit chain are service-side (503); every other
+    /// service/neutral tag is a refusal of this request (400). Unix-only like its callers.
+    #[cfg(unix)]
+    fn tag(tag: &'static str) -> Self {
+        let status = match tag {
+            "service_registry_unreadable" | "service_audit_unavailable" | "undetermined" => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            _ => StatusCode::BAD_REQUEST,
+        };
+        Self { status, tag }
+    }
+}
+
+fn service_error(
+    failure: ServiceFailure,
+) -> (
+    StatusCode,
+    Json<crate::messaging::service::SendServiceError>,
+) {
+    (
+        failure.status,
+        Json(crate::messaging::service::SendServiceError {
+            error: failure.tag.to_string(),
+        }),
+    )
+}
+
+/// The peer pid captured by the accept loop for THIS connection. Never from the body.
+#[cfg(unix)]
+fn service_peer_pid() -> Option<u32> {
+    PEER_PID.try_with(|pid| *pid).ok().flatten()
+}
+
+#[cfg(not(unix))]
+fn service_peer_pid() -> Option<u32> {
+    None
+}
+
+async fn message_send_service_handler(
+    State(state): State<RouterState>,
+    body: Bytes,
+) -> Result<
+    Json<crate::messaging::service::SendServiceResponse>,
+    (
+        StatusCode,
+        Json<crate::messaging::service::SendServiceError>,
+    ),
+> {
+    // A malformed body is refused with a fixed tag; axum's own rejection would carry a
+    // non-vocabulary message. The refusal is RECORDED too — the body never parsed, so the
+    // record carries no service name, only the caller's uid where the platform HAS one and
+    // the fixed tag.
+    let Ok(request) =
+        serde_json::from_slice::<crate::messaging::service::SendServiceRequest>(&body)
+    else {
+        let payload = service_refusal_payload(
+            "",
+            None,
+            crate::messaging::service::current_uid_opt(),
+            "invalid_input",
+        );
+        let dir = Arc::clone(&state.base_dir);
+        let _ = tokio::task::spawn_blocking(move || append_service_refusal(&dir, &payload)).await;
+        return Err(service_error(ServiceFailure::bad(
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+        )));
+    };
+    let base_dir = Arc::clone(&state.base_dir);
+    let peer_pid = service_peer_pid();
+    let outcome = match tokio::task::spawn_blocking(move || {
+        service_send_blocking(&base_dir, peer_pid, request)
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            // A join failure means the blocking task PANICKED, so this send's outcome is
+            // UNKNOWN, not refused: the task may have written the message (and its
+            // admission record) before it died. NO audit record is written here — a
+            // refusal record could describe a send the store wrote, and an admission
+            // record could describe one it did not. The fixed `internal` tag is the whole
+            // answer; the caller can retry with its idempotency key.
+            Err(ServiceFailure::bad(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+            ))
+        }
+    };
+    outcome.map(Json).map_err(service_error)
+}
+
+/// The wire surface of a re-verified recipient (fixed vocabulary).
+#[cfg(unix)]
+fn service_target_surface(
+    surface: crate::messaging::model::Surface,
+) -> crate::audit::ServiceTargetSurface {
+    match surface {
+        crate::messaging::model::Surface::ClaudeCode => {
+            crate::audit::ServiceTargetSurface::ClaudeCode
+        }
+        crate::messaging::model::Surface::Codex => crate::audit::ServiceTargetSurface::Codex,
+    }
+}
+
+/// The session kind for a messaging surface.
+#[cfg(unix)]
+fn service_cli_kind(surface: crate::messaging::model::Surface) -> crate::sessions::CliKind {
+    match surface {
+        crate::messaging::model::Surface::ClaudeCode => crate::sessions::CliKind::Claude,
+        crate::messaging::model::Surface::Codex => crate::sessions::CliKind::Codex,
+    }
+}
+
+/// Parse `<pid>:<started_at>`, both decimal (the CLI's target grammar).
+#[cfg(unix)]
+fn parse_service_target(target: &str) -> Option<(u32, u64)> {
+    let (pid, started_at) = target.split_once(':')?;
+    let digits = |value: &str| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
+    if !digits(pid) || !digits(started_at) {
+        return None;
+    }
+    Some((pid.parse().ok()?, started_at.parse().ok()?))
+}
+
+/// Re-verify the client's `<pid>:<started_at>` against the live session table, exactly as
+/// `csq sessions send` resolves a target: both CLIs are asked about that one pid, exactly
+/// one positive match at the same start is the recipient, a pid no CLI owns is
+/// `target_mismatch`, and an unreadable table is `undetermined` (never read as "gone").
+#[cfg(unix)]
+fn verify_service_target(
+    pid: u32,
+    started_at: u64,
+) -> Result<crate::messaging::model::Recipient, &'static str> {
+    let mut found = Vec::new();
+    let mut unknown = false;
+    for kind in [
+        crate::sessions::CliKind::Claude,
+        crate::sessions::CliKind::Codex,
+    ] {
+        match crate::sessions::session_info_for_pid_kind(kind, pid) {
+            Ok(Some(info)) => match info.started_at {
+                Some(start) if crate::sessions::same_start(start, started_at) => found.push(kind),
+                Some(_) => {}
+                None => unknown = true,
+            },
+            Ok(None) => {}
+            Err(_) => unknown = true,
+        }
+    }
+    let surface = match (found.as_slice(), unknown) {
+        ([kind], _) => match kind {
+            crate::sessions::CliKind::Claude => crate::messaging::model::Surface::ClaudeCode,
+            crate::sessions::CliKind::Codex => crate::messaging::model::Surface::Codex,
+        },
+        ([], false) => return Err("target_mismatch"),
+        _ => return Err("undetermined"),
+    };
+    // The full-precision start binds a later wake to this exact incarnation; `None` means
+    // "cannot bind exactly" (no wake), never a failed send.
+    let started_exact =
+        match crate::sessions::session_info_exact_for_pid_kind(service_cli_kind(surface), pid) {
+            Ok(Some((info, exact)))
+                if info
+                    .started_at
+                    .is_some_and(|start| crate::sessions::same_start(start, started_at)) =>
+            {
+                Some(exact)
+            }
+            _ => None,
+        };
+    Ok(crate::messaging::model::Recipient {
+        pid,
+        started_at,
+        surface,
+        started_exact,
+    })
+}
+
+/// The store's liveness seam: a lookup that cannot be made is `Unknown`, never `Ended`.
+#[cfg(unix)]
+fn service_liveness(
+    recipient: &crate::messaging::model::Recipient,
+) -> crate::messaging::limits::Liveness {
+    use crate::messaging::limits::Liveness;
+    match crate::sessions::session_info_for_pid_kind(
+        service_cli_kind(recipient.surface),
+        recipient.pid,
+    ) {
+        Ok(Some(info)) => match info.started_at {
+            Some(start) if crate::sessions::same_start(start, recipient.started_at) => {
+                Liveness::Live
+            }
+            Some(_) => Liveness::Ended,
+            None => Liveness::Unknown,
+        },
+        Ok(None) => Liveness::Ended,
+        Err(_) => Liveness::Unknown,
+    }
+}
+
+/// Append the APPEND-FIRST admission record; `Err(())` means the message MUST NOT be sent.
+#[cfg(unix)]
+fn append_service_audit(
+    base_dir: &Path,
+    payload: &crate::audit::ServiceMessagePayload,
+) -> Result<(), ()> {
+    use crate::audit::op_emit;
+    use crate::audit::types::{EventKind, EventPayload, OpOutcome};
+    let chain_id = op_emit::load_chain_id(base_dir);
+    let correlation = op_emit::gen_correlation_id().map_err(|_| ())?;
+    let result = match payload.outcome {
+        crate::audit::ServiceMessageOutcome::Admitted => OpOutcome::Ok,
+        crate::audit::ServiceMessageOutcome::Refused { .. } => OpOutcome::Failed {
+            reason: op_emit::redact_reason(payload.outcome.tag()),
+        },
+    };
+    match op_emit::emit_outcome_strict(
+        base_dir,
+        &chain_id,
+        EventKind::ServiceMessage,
+        EventPayload::ServiceMessage(payload.clone()),
+        correlation,
+        result,
+    ) {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => {
+            tracing::warn!(
+                error_kind = "service_audit_unavailable",
+                "the service admission could not be recorded; the message is not sent"
+            );
+            Err(())
+        }
+    }
+}
+
+/// Append the refusal record for a REFUSED service send (`EventKind::ServiceMessageRefused`).
+///
+/// Cross-platform: a refusal can be decided before any Unix-only seam (a malformed body, a
+/// non-Unix build), and the chain is not platform-specific. The append NEVER changes the
+/// tag the caller sees — the send is already refused — so a failure here is logged with its
+/// own fixed tag and the caller's refusal stands. (`service_audit_unavailable` is the one
+/// refusal that cannot be recorded: the chain that would hold the record is what failed.)
+fn append_service_refusal(
+    base_dir: &Path,
+    payload: &crate::audit::ServiceMessageRefusalPayload,
+) -> Result<(), ()> {
+    use crate::audit::op_emit;
+    use crate::audit::types::{EventKind, EventPayload, OpOutcome};
+    let refused = || {
+        tracing::warn!(
+            error_kind = "service_refusal_audit_unavailable",
+            "a refused service send could not be recorded on the audit chain"
+        );
+        Err(())
+    };
+    let chain_id = op_emit::load_chain_id(base_dir);
+    let Ok(correlation) = op_emit::gen_correlation_id() else {
+        return refused();
+    };
+    let result = OpOutcome::Failed {
+        reason: op_emit::redact_reason(payload.refusal.tag()),
+    };
+    match op_emit::emit_outcome_strict(
+        base_dir,
+        &chain_id,
+        EventKind::ServiceMessageRefused,
+        EventPayload::ServiceMessageRefused(payload.clone()),
+        correlation,
+        result,
+    ) {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => refused(),
+    }
+}
+
+/// The refusal record's payload: ONLY the facts the refusal established.
+///
+/// `requested_name` is echoed only when it passes the bare §11.4 grammar (a reserved but
+/// grammar-safe spelling is recorded — that is a session-label spoof attempt worth seeing;
+/// an invalid spelling is never echoed). `registration_id` is present only when the
+/// registry load had succeeded before the refusal. There is deliberately no target and no
+/// key digest: neither is known for most refusals, and a zero/empty placeholder would put
+/// a false statement on a signed record.
+fn service_refusal_payload(
+    requested_name: &str,
+    registration_id: Option<&str>,
+    peer_uid: Option<u32>,
+    tag: &'static str,
+) -> crate::audit::ServiceMessageRefusalPayload {
+    let refusal = crate::audit::ServiceRefusal::from_tag(tag).unwrap_or_else(|| {
+        // Unreachable while `every_service_route_tag_is_in_the_audit_vocabulary` holds;
+        // recorded as `internal` rather than silently dropping the refusal.
+        tracing::warn!(
+            error_kind = "service_refusal_tag_unmapped",
+            "a service refusal tag is outside the audit vocabulary"
+        );
+        crate::audit::ServiceRefusal::Internal
+    });
+    crate::audit::ServiceMessageRefusalPayload {
+        service: crate::messaging::service::grammar_ok(requested_name)
+            .then(|| requested_name.to_string()),
+        service_uid: peer_uid,
+        registration_id: registration_id.map(str::to_string),
+        refusal,
+    }
+}
+
+/// Hex SHA-256 (the idempotency key's digest — never the key itself).
+#[cfg(unix)]
+fn service_key_digest(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(token.as_bytes()))
+}
+
+/// The system clock. An unreadable clock refuses (an admission must carry a real time).
+#[cfg(unix)]
+fn service_now() -> Result<u64, ServiceFailure> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .map_err(|_| ServiceFailure::bad(StatusCode::SERVICE_UNAVAILABLE, "undetermined"))
+}
+
+/// Map a store refusal to `(status, fixed tag)`. `service_no_inbox` is a csq-authored
+/// constant, so the specific tag survives the DirectiveError's generic `invalid_input`.
+#[cfg(unix)]
+fn service_directive_failure(
+    error: &crate::sessions::directives::DirectiveError,
+) -> ServiceFailure {
+    use csq_sdk::SdkErrorCode;
+    if error.message == crate::messaging::store::SERVICE_NO_INBOX {
+        return ServiceFailure::bad(StatusCode::BAD_REQUEST, crate::audit::SERVICE_NO_INBOX_TAG);
+    }
+    let status = match error.code {
+        SdkErrorCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+        SdkErrorCode::InvalidInput
+        | SdkErrorCode::InvalidIdempotencyKey
+        | SdkErrorCode::TargetMismatch
+        | SdkErrorCode::NotFound => StatusCode::BAD_REQUEST,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    ServiceFailure::bad(status, error.code.as_str())
+}
+
+/// The seams of one service-send admission (design an internal ticket §4). Production uses the real
+/// session table, store liveness, audit chain and wake path; tests inject all four so the
+/// admission logic is exercised without a live session or a real chain.
+#[cfg(unix)]
+struct ServiceSendDeps<'a> {
+    /// The filesystem primitives the store writes through. Production is
+    /// [`crate::sessions::directives::real_fs`]; tests inject a fault (a post-save commit
+    /// failure) so the refusal/unknown-outcome split is exercised end to end.
+    fs: &'a crate::sessions::directives::FsOps<'a>,
+    /// Re-verify a client-supplied `(pid, started_at)` against the live session table.
+    verify_target: &'a dyn Fn(u32, u64) -> Result<crate::messaging::model::Recipient, &'static str>,
+    /// Store liveness seam.
+    liveness: &'a dyn Fn(&crate::messaging::model::Recipient) -> crate::messaging::limits::Liveness,
+    /// Append the admission record; `Err(())` refuses the send.
+    audit: &'a dyn Fn(&Path, &crate::audit::ServiceMessagePayload) -> Result<(), ()>,
+    /// Append the refusal record for a REFUSED send. Never changes the refusal the caller
+    /// sees; a failed append is logged by the production seam.
+    refusal_audit: &'a dyn Fn(&Path, &crate::audit::ServiceMessageRefusalPayload) -> Result<(), ()>,
+    /// Wake the stored recipient; the returned delivery is logged only.
+    wake: &'a dyn Fn(
+        &Path,
+        &crate::messaging::model::Recipient,
+        u64,
+    ) -> crate::messaging::wake::Delivery,
+    /// The daemon's clock; an unreadable clock refuses.
+    now: &'a dyn Fn() -> Result<u64, ServiceFailure>,
+    /// The uid the registry record must be bound to (the listener-verified peer uid).
+    peer_uid: u32,
+}
+
+#[cfg(unix)]
+fn service_send_blocking(
+    base_dir: &Path,
+    peer_pid: Option<u32>,
+    request: crate::messaging::service::SendServiceRequest,
+) -> Result<crate::messaging::service::SendServiceResponse, ServiceFailure> {
+    let fs = crate::sessions::directives::real_fs();
+    let deps = ServiceSendDeps {
+        fs: &fs,
+        verify_target: &verify_service_target,
+        liveness: &service_liveness,
+        audit: &append_service_audit,
+        refusal_audit: &append_service_refusal,
+        wake: &|base_dir, recipient, now| {
+            crate::daemon::telegram_bridge::wake_recipient(
+                base_dir,
+                recipient,
+                i64::try_from(now).unwrap_or(i64::MAX),
+            )
+        },
+        now: &service_now,
+        // On Linux/macOS the accept-time `SO_PEERCRED`/`LOCAL_PEERCRED` check proved the
+        // peer uid equals the daemon euid, so the daemon's euid IS the peer uid here. On
+        // the other Unix targets `verify_peer_uid` is a documented no-op (the 0600 socket
+        // is the boundary), so this value is the daemon's euid and the registry `uid`
+        // equality still gates the route to that euid.
+        peer_uid: crate::messaging::service::current_uid(),
+    };
+    service_send_with(base_dir, peer_pid, request, &deps)
+}
+
+/// The refusal-recording wrapper.
+///
+/// INVARIANT: a refusal record describes a refusal, so it is appended ONLY when the store
+/// wrote NOTHING. `published` is set by the store the moment the message record is durable;
+/// if a later failure occurs (a keyed-request commit I/O error), the caller still receives
+/// the `undetermined` tag, but NO refusal record is written — the send happened.
+///
+/// The one case with no record at all is an append that itself fails (`service_audit_unavailable`
+/// for an admission; a logged `service_refusal_audit_unavailable` for a refusal): the chain
+/// that would hold the record is what failed. The handler's join-failure arm also writes
+/// neither kind, because a panicked blocking task may have committed the send (unknown
+/// outcome, not a refusal).
+///
+/// Every other refusal path — pre-load (peer credential, body, name, registry) and
+/// post-load (target, clock, key, store) — appends ONE `EventKind::ServiceMessageRefused`
+/// record carrying only the facts the refusal established, then returns the SAME failure
+/// the caller would have seen. The admission record is appended inside the store's
+/// validate-then-commit sequence (`store::send_service`), after the store's state refusal
+/// checks, so a state refusal can never land after it; a request whose token deadline
+/// crosses during the append is refused with nothing written (a truthful refusal record).
+#[cfg(unix)]
+fn service_send_with(
+    base_dir: &Path,
+    peer_pid: Option<u32>,
+    request: crate::messaging::service::SendServiceRequest,
+    deps: &ServiceSendDeps<'_>,
+) -> Result<crate::messaging::service::SendServiceResponse, ServiceFailure> {
+    let mut resolved: Option<crate::messaging::service::ServiceRecord> = None;
+    let published = std::cell::Cell::new(false);
+    let answer = service_send_inner(
+        base_dir,
+        peer_pid,
+        &request,
+        deps,
+        &mut resolved,
+        &published,
+    );
+    if let Err(failure) = &answer {
+        if published.get() {
+            // The message is stored; a refusal record would be false. The caller keeps the
+            // undetermined tag and can retry with its idempotency key.
+            tracing::warn!(
+                error_kind = "service_send_post_save_failure",
+                "a service send failed after the message was stored; no refusal was recorded"
+            );
+        } else {
+            let payload = service_refusal_payload(
+                &request.service,
+                resolved
+                    .as_ref()
+                    .map(|record| record.registration_id.as_str()),
+                Some(deps.peer_uid),
+                failure.tag,
+            );
+            // Best-effort by design: the send is already refused. A failed refusal append
+            // is logged by the seam and must not replace the tag the caller received.
+            let _ = (deps.refusal_audit)(base_dir, &payload);
+        }
+    }
+    answer
+}
+
+#[cfg(unix)]
+fn service_send_inner(
+    base_dir: &Path,
+    peer_pid: Option<u32>,
+    request: &crate::messaging::service::SendServiceRequest,
+    deps: &ServiceSendDeps<'_>,
+    resolved: &mut Option<crate::messaging::service::ServiceRecord>,
+    published: &std::cell::Cell<bool>,
+) -> Result<crate::messaging::service::SendServiceResponse, ServiceFailure> {
+    use crate::messaging::model::Surface;
+    use crate::messaging::service;
+
+    // The peer pid is the accept loop's captured credential. Its ABSENCE is not a caller
+    // identity: refuse rather than treat an unknown peer as trusted.
+    if peer_pid.is_none() {
+        return Err(ServiceFailure::bad(
+            StatusCode::UNAUTHORIZED,
+            "not_authorized",
+        ));
+    }
+    // 1. Name grammar (a hand-edited/invalid stored name is refused by `load` too).
+    service::validate_service_name(&request.service).map_err(ServiceFailure::tag)?;
+    // 2. Registry load (fail closed) against the listener-verified peer uid.
+    let record =
+        service::load(base_dir, &request.service, deps.peer_uid).map_err(ServiceFailure::tag)?;
+    // The refusal record may carry the registration id ONLY from here on.
+    *resolved = Some(record.clone());
+    // 3. Re-verify the target against the live session table (a client-supplied surface is
+    //    never trusted; the target string names only pid + start).
+    let (pid, started_at) = parse_service_target(&request.target)
+        .ok_or_else(|| ServiceFailure::bad(StatusCode::BAD_REQUEST, "invalid_input"))?;
+    let recipient = (deps.verify_target)(pid, started_at).map_err(ServiceFailure::tag)?;
+    let now = (deps.now)()?;
+    // A supplied key is admitted for a service: it is always pinned by its registration
+    // id, so `protection`'s unpinned-sender rule never applies. The key is validated here
+    // as well as in the store, so a malformed key never reaches the admission record.
+    if let Some(token) = request.idempotency_key.as_deref() {
+        crate::messaging::request::check_supplied_key(token, now)
+            .map_err(|error| ServiceFailure::bad(StatusCode::BAD_REQUEST, error.code.as_str()))?;
+    }
+    let payload = crate::audit::ServiceMessagePayload {
+        service: record.name.clone(),
+        registration_id: record.registration_id.clone(),
+        service_uid: record.uid,
+        target_pid: recipient.pid,
+        target_started_at: recipient.started_at,
+        target_surface: service_target_surface(recipient.surface),
+        key_sha256: request.idempotency_key.as_deref().map(service_key_digest),
+        outcome: crate::audit::ServiceMessageOutcome::Admitted,
+    };
+    // 4. VALIDATE -> APPEND -> COMMIT, all inside the store's lock. The store proves every
+    //    STATE refusal condition first (the token deadline is re-evaluated at
+    //    publication), then calls this admission hook, then writes. A keyed replay
+    //    resolves before the hook, so a replay records no second admission.
+    let audit_refused = std::cell::Cell::new(false);
+    let admit = || {
+        if (deps.audit)(base_dir, &payload).is_ok() {
+            Ok(())
+        } else {
+            audit_refused.set(true);
+            Err(crate::sessions::directives::DirectiveError::undet(
+                "the admission record could not be appended",
+            ))
+        }
+    };
+    let verified = service::VerifiedService::from_record(record);
+    let (receipt, stored) = crate::messaging::store::send_service(
+        base_dir,
+        now,
+        deps.fs,
+        &crate::messaging::limits::Limits::DEFAULT,
+        deps.liveness,
+        &verified,
+        recipient,
+        &request.target,
+        request.reply_to.as_deref(),
+        &request.message,
+        request.idempotency_key.as_deref(),
+        request.wake,
+        &admit,
+        published,
+    )
+    .map_err(|error| {
+        if audit_refused.get() {
+            ServiceFailure::bad(StatusCode::SERVICE_UNAVAILABLE, "service_audit_unavailable")
+        } else {
+            service_directive_failure(&error)
+        }
+    })?;
+    // 5. Wake per the CLI rule: when asked, or always for a Codex recipient (Codex has no
+    //    turn hook, so a quiet send would never reach it). The message is already stored;
+    //    the delivery outcome is logged, never allowed to fail the admission.
+    let delivery = if request.wake || stored.surface == Surface::Codex {
+        (deps.wake)(base_dir, &stored, now)
+    } else {
+        crate::messaging::wake::Delivery::StoredNoWake
+    };
+    tracing::debug!(
+        event = "service_message",
+        stage = "wake",
+        outcome = delivery.as_str()
+    );
+    Ok(crate::messaging::service::SendServiceResponse {
+        receipt,
+        to: crate::messaging::service::SendServiceTo {
+            pid: stored.pid,
+            started_at: stored.started_at,
+            surface: stored.surface.as_str().to_string(),
+        },
+    })
+}
+
+/// No peer-credentialed Unix listener on this platform: the route refuses. This is a
+/// compile-time platform gate, not a runtime fallback. The refusal is recorded (a refusal
+/// record needs no listener), then the fixed tag is returned.
+#[cfg(not(unix))]
+fn service_send_blocking(
+    base_dir: &Path,
+    _peer_pid: Option<u32>,
+    request: crate::messaging::service::SendServiceRequest,
+) -> Result<crate::messaging::service::SendServiceResponse, ServiceFailure> {
+    let payload = service_refusal_payload(
+        &request.service,
+        None,
+        crate::messaging::service::current_uid_opt(),
+        "service_send_surface_unsupported",
+    );
+    let _ = append_service_refusal(base_dir, &payload);
+    Err(ServiceFailure::bad(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "service_send_surface_unsupported",
+    ))
 }
 
 async fn health_handler() -> Json<HealthResponse> {
@@ -4431,6 +5248,19 @@ mod tests {
     use super::*;
     use crate::testing::socket_fixture::UnixSocketFixture;
 
+    #[cfg(unix)]
+    #[test]
+    fn audit_field_caps_length_and_strips_control_characters() {
+        // Security R2 L6 / correctness M5: a refused ask carries requester-chosen text into the
+        // append-only signed chain. The record must be bounded and free of control characters.
+        let long = "a".repeat(AUDIT_FIELD_MAX + 50);
+        assert_eq!(audit_field(&long).chars().count(), AUDIT_FIELD_MAX);
+        assert_eq!(audit_field("/h/term-1"), "/h/term-1");
+        assert_eq!(audit_field("a\nb\0c"), "a?b?c");
+        // A Markdown link survives this fn (it is printable) — md_cell neutralizes that half.
+        assert_eq!(audit_field("[x](y)"), "[x](y)");
+    }
+
     #[test]
     fn oauth_login_outcomes_map_busy_to_409_retry_and_target_advance_to_explicit_500() {
         use crate::accounts::anthropic_identity::IdentityError as E;
@@ -4582,6 +5412,60 @@ mod tests {
             #[cfg(feature = "enterprise")]
             interactive: Arc::new(InteractiveSessionRegistry::empty()),
         }
+    }
+
+    /// AC5 / HIGH-1 — the handler's OWN refusal path: a body that never parses is still a
+    /// refused service send, so it lands a `ServiceMessageRefused` record (no name, the
+    /// daemon uid, the fixed `invalid_input` tag) even though the admission logic never
+    /// runs. Falsifier: removing the handler's `append_service_refusal` call leaves the
+    /// chain without a refusal record and reds the final assertion.
+    #[tokio::test]
+    async fn a_malformed_service_body_is_refused_and_recorded() {
+        let _env = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        crate::audit::key_custody::test_helpers::init_mock_keyring();
+        let dir = tempfile::TempDir::new().unwrap();
+        let service_name = format!("csq-audit-signing-test-svc-{}", std::process::id());
+        crate::audit::key_custody::audit_init(dir.path(), &service_name).unwrap();
+
+        let answer = message_send_service_handler(
+            State(test_state(dir.path())),
+            axum::body::Bytes::from_static(b"not json"),
+        )
+        .await;
+        let (status, Json(error)) = answer.expect_err("a malformed body must be refused");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.error, "invalid_input");
+
+        let mut records = Vec::new();
+        for entry in std::fs::read_dir(dir.path().join("csq-runs")).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+            {
+                let text = std::fs::read_to_string(&path).unwrap();
+                for line in text.lines().filter(|line| !line.trim().is_empty()) {
+                    records.push(serde_json::from_str::<crate::audit::SignedRecord>(line).unwrap());
+                }
+            }
+        }
+        let refused = records
+            .iter()
+            .find(|record| record.kind == crate::audit::EventKind::ServiceMessageRefused)
+            .expect("the malformed-body refusal must be on the chain");
+        assert_eq!(
+            refused.payload,
+            crate::audit::EventPayload::ServiceMessageRefused(
+                crate::audit::ServiceMessageRefusalPayload {
+                    service: None,
+                    service_uid: Some(crate::messaging::service::current_uid()),
+                    registration_id: None,
+                    refusal: crate::audit::ServiceRefusal::InvalidInput,
+                }
+            )
+        );
     }
 
     #[tokio::test]
@@ -6327,6 +7211,71 @@ mod tests {
     /// MED-3 regression: `POST /api/slot-swap` with `from == to` is a no-op
     /// request anomaly. The handler MUST return `{"invalidated": false}` and
     /// MUST NOT clear the discovery cache (no-op means no rename happened).
+    /// `/api/recycle/foreign` is wired and, with a requester whose pid no registry can
+    /// resolve, refuses as `xrecycle_requester_unverified` WITHOUT reading the target — the
+    /// bogus target handle and session in the body are never consulted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recycle_foreign_route_refuses_an_unverified_requester_first() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        let body = r#"{"target_handle":"/definitely/not/a/handle","target_session":"123e4567-e89b-12d3-a456-426614174000","requester":{"session_id":"99999999-8888-7777-6666-555555555555","handle":"/h/req"},"requester_pid":4294967295}"#;
+        let (status, reply) = http_post_json(&sock, "/api/recycle/foreign", body).await;
+        assert!(status.contains("200"), "expected 200, got: {status}");
+        assert!(
+            reply.contains("xrecycle_requester_unverified"),
+            "the requester must be judged before the target, got: {reply}"
+        );
+        assert!(reply.contains(r#""ok":false"#), "got: {reply}");
+
+        handle.shutdown();
+        let _ = join.await;
+    }
+
+    /// The socket peer's ancestry is the authority: a body naming a pid that is NOT an ancestor
+    /// of the connecting process is refused, even when its start time matches that pid.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recycle_foreign_route_refuses_a_requester_that_is_not_the_peers_ancestor() {
+        let dir = UnixSocketFixture::new().unwrap();
+        let sock = dir.socket_path();
+        let state = test_state(dir.path());
+        let (handle, join) = with_serve_env_lock(serve(&sock, state)).await.unwrap();
+
+        // A CHILD of this process: the chain from the peer goes UP, so it never reaches it.
+        //
+        // LIMIT (mutation-proved, 2026-11-05): this tag is ALSO what `verify_requester` returns
+        // when the named pid has no Claude Code registry row, and a real row needs a live
+        // `claude` process, so this test cannot isolate the ancestry check from the registry
+        // check behind it — neutering `peer_chain_reaches` leaves it green. The ancestry
+        // property itself is proved by `peer_chain_reaches`'s unit matrix; this test proves the
+        // ROUTE refuses instead of issuing (a handler that issues unconditionally reds it).
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
+        let not_an_ancestor = child.id();
+        let start = crate::sessions::process_start_time(not_an_ancestor)
+            .expect("the child's start time is readable");
+        let body = format!(
+            r#"{{"target_handle":"/definitely/not/a/handle","target_session":"123e4567-e89b-12d3-a456-426614174000","requester":{{"session_id":"99999999-8888-7777-6666-555555555555","handle":"/h/req"}},"requester_pid":{not_an_ancestor},"requester_start":{start}}}"#
+        );
+        let (status, reply) = http_post_json(&sock, "/api/recycle/foreign", &body).await;
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(status.contains("200"), "expected 200, got: {status}");
+        assert!(
+            reply.contains("xrecycle_requester_unverified"),
+            "a non-ancestor must be refused at the peer binding, got: {reply}"
+        );
+
+        handle.shutdown();
+        let _ = join.await;
+    }
+
     #[tokio::test]
     async fn slot_swap_handler_rejects_from_equals_to() {
         // Arrange: start a live server.
@@ -7843,7 +8792,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn the_approval_peer_pid_comes_from_the_kernel_credential() {
-        let dir = tempfile::TempDir::new().unwrap();
+        // Short root: a deep runner TMPDIR overflows sun_path at bind.
+        let dir = crate::testing::socket_fixture::short_root("pp-").unwrap();
         let sock = dir.path().join("peer.sock");
         let listener = tokio::net::UnixListener::bind(&sock).unwrap();
         let connect = tokio::net::UnixStream::connect(&sock);
@@ -8050,5 +9000,1095 @@ mod pool_startup_tests {
         // not certify cancellation of an already-running blocking operation.
         let _ = release.send(());
         assert_eq!(result, "pool_restart_recovery_timed_out");
+    }
+}
+
+/// an internal ticket — the service-send admission, exercised through the REAL store and registry with
+/// the session table, audit chain and wake path injected. Temp dirs only; no live session,
+/// no host chain, no network.
+#[cfg(all(test, unix))]
+mod service_send_tests {
+    use super::*;
+    use crate::messaging::limits::Liveness;
+    use crate::messaging::model::{Origin, Recipient, SenderSurface, ServiceRef, Surface};
+    use crate::messaging::service::{self, SendServiceRequest};
+    use crate::messaging::wake::Delivery;
+    use crate::messaging::{store, Message};
+    use tempfile::TempDir;
+
+    const NOW: u64 = 1_700_000_000;
+    const TARGET_PID: u32 = 424_242;
+    const TARGET_START: u64 = 1_699_999_000;
+
+    fn target(surface: Surface) -> Recipient {
+        Recipient {
+            pid: TARGET_PID,
+            started_at: TARGET_START,
+            surface,
+            started_exact: Some(123),
+        }
+    }
+
+    fn request(name: &str) -> SendServiceRequest {
+        SendServiceRequest {
+            service: name.to_string(),
+            target: format!("{TARGET_PID}:{TARGET_START}"),
+            message: "nightly backup failed".to_string(),
+            reply_to: None,
+            idempotency_key: None,
+            wake: true,
+        }
+    }
+
+    /// One record an injected audit seam received, in emission order.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Recorded {
+        Admitted(String),
+        Refused(Box<crate::audit::ServiceMessageRefusalPayload>),
+    }
+
+    impl Recorded {
+        fn refusal_tag(&self) -> Option<&'static str> {
+            match self {
+                Self::Admitted(_) => None,
+                Self::Refused(payload) => Some(payload.refusal.tag()),
+            }
+        }
+    }
+
+    type RecordedLog = std::rc::Rc<std::cell::RefCell<Vec<Recorded>>>;
+
+    /// How the injected target-verification / liveness seams behave.
+    #[derive(Clone, Copy)]
+    enum Reach {
+        /// The target re-verifies and the store sees it live.
+        Live(Recipient),
+        /// The target re-verifies but the store sees it gone.
+        Ended(Recipient),
+        /// The target re-verifies but liveness cannot be determined.
+        Unknown(Recipient),
+        /// Re-verification itself refuses `target_mismatch`.
+        Mismatch,
+        /// Re-verification itself refuses `undetermined`.
+        Undetermined,
+    }
+
+    /// The injected seams' behaviour for one call.
+    #[derive(Clone, Copy)]
+    struct Call {
+        peer_pid: Option<u32>,
+        admit_ok: bool,
+        refusal_ok: bool,
+        now_ok: bool,
+        reach: Reach,
+    }
+
+    impl Call {
+        fn live(recipient: Recipient) -> Self {
+            Self {
+                peer_pid: Some(std::process::id()),
+                admit_ok: true,
+                refusal_ok: true,
+                now_ok: true,
+                reach: Reach::Live(recipient),
+            }
+        }
+    }
+
+    /// Run one admission through the injected seams: the answer, the wake count, and the
+    /// ORDERED log of records the two audit seams received.
+    fn call(
+        base: &Path,
+        request: &SendServiceRequest,
+        peer_uid: u32,
+        spec: Call,
+    ) -> (
+        Result<crate::messaging::service::SendServiceResponse, ServiceFailure>,
+        usize,
+        RecordedLog,
+    ) {
+        let fs = crate::sessions::directives::real_fs();
+        call_with_fs(base, request, peer_uid, spec, &fs)
+    }
+
+    /// [`call`] with an injected filesystem (a fault around the message/ledger writes).
+    fn call_with_fs<'a>(
+        base: &Path,
+        request: &SendServiceRequest,
+        peer_uid: u32,
+        spec: Call,
+        fs: &'a crate::sessions::directives::FsOps<'a>,
+    ) -> (
+        Result<crate::messaging::service::SendServiceResponse, ServiceFailure>,
+        usize,
+        RecordedLog,
+    ) {
+        let wakes = std::cell::Cell::new(0usize);
+        let recorded: RecordedLog = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let verify = move |_pid: u32, _started: u64| match spec.reach {
+            Reach::Mismatch => Err("target_mismatch"),
+            Reach::Undetermined => Err("undetermined"),
+            Reach::Live(recipient) | Reach::Ended(recipient) | Reach::Unknown(recipient) => {
+                Ok(recipient)
+            }
+        };
+        let live = move |_r: &Recipient| match spec.reach {
+            Reach::Ended(_) => Liveness::Ended,
+            Reach::Unknown(_) => Liveness::Unknown,
+            _ => Liveness::Live,
+        };
+        let audit = {
+            let recorded = std::rc::Rc::clone(&recorded);
+            move |_base: &Path, payload: &crate::audit::ServiceMessagePayload| {
+                if !spec.admit_ok {
+                    return Err(());
+                }
+                recorded
+                    .borrow_mut()
+                    .push(Recorded::Admitted(payload.service.clone()));
+                Ok(())
+            }
+        };
+        let refusal_audit = {
+            let recorded = std::rc::Rc::clone(&recorded);
+            move |_base: &Path, payload: &crate::audit::ServiceMessageRefusalPayload| {
+                recorded
+                    .borrow_mut()
+                    .push(Recorded::Refused(Box::new(payload.clone())));
+                if spec.refusal_ok {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        let wake = |_base: &Path, _r: &Recipient, _now: u64| {
+            wakes.set(wakes.get() + 1);
+            Delivery::ClaudeWoken
+        };
+        let now = move || {
+            if spec.now_ok {
+                Ok(NOW)
+            } else {
+                Err(ServiceFailure::bad(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "undetermined",
+                ))
+            }
+        };
+        let deps = ServiceSendDeps {
+            fs,
+            verify_target: &verify,
+            liveness: &live,
+            audit: &audit,
+            refusal_audit: &refusal_audit,
+            wake: &wake,
+            now: &now,
+            peer_uid,
+        };
+        let answer = service_send_with(base, spec.peer_pid, request.clone(), &deps);
+        (answer, wakes.get(), recorded)
+    }
+
+    fn recorded_tags(recorded: &RecordedLog) -> Vec<&'static str> {
+        recorded
+            .borrow()
+            .iter()
+            .filter_map(Recorded::refusal_tag)
+            .collect()
+    }
+
+    fn admissions(recorded: &RecordedLog) -> usize {
+        recorded
+            .borrow()
+            .iter()
+            .filter(|record| matches!(record, Recorded::Admitted(_)))
+            .count()
+    }
+
+    fn last_refusal(recorded: &RecordedLog) -> crate::audit::ServiceMessageRefusalPayload {
+        recorded
+            .borrow()
+            .iter()
+            .rev()
+            .find_map(|record| match record {
+                Recorded::Refused(payload) => Some((**payload).clone()),
+                Recorded::Admitted(_) => None,
+            })
+            .expect("a refusal must be recorded")
+    }
+
+    fn message_files(base: &Path) -> Vec<std::path::PathBuf> {
+        match std::fs::read_dir(store::store_dir(base)) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "json")
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn stored_message(base: &Path) -> Message {
+        let files = message_files(base);
+        assert_eq!(
+            files.len(),
+            1,
+            "expected exactly one stored message: {files:?}"
+        );
+        serde_json::from_str(&std::fs::read_to_string(&files[0]).unwrap()).unwrap()
+    }
+
+    /// Every signed record on the op-chain under `base`, oldest first.
+    fn chain_records(base: &Path) -> Vec<crate::audit::SignedRecord> {
+        let Ok(entries) = std::fs::read_dir(base.join("csq-runs")) else {
+            return Vec::new();
+        };
+        let mut records = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+            {
+                let text = std::fs::read_to_string(&path).unwrap();
+                for line in text.lines().filter(|line| !line.trim().is_empty()) {
+                    records.push(serde_json::from_str::<crate::audit::SignedRecord>(line).unwrap());
+                }
+            }
+        }
+        records
+    }
+
+    #[test]
+    fn a_registered_service_send_stores_a_service_origin_and_returns_a_receipt() {
+        let dir = TempDir::new().unwrap();
+        let record = service::register(dir.path(), "nightly", NOW, false).unwrap();
+        let (answer, wakes, recorded) = call(
+            dir.path(),
+            &request("nightly"),
+            service::current_uid(),
+            Call::live(target(Surface::ClaudeCode)),
+        );
+        let answer = answer.unwrap();
+        assert_eq!(
+            *recorded.borrow(),
+            vec![Recorded::Admitted("nightly".to_string())],
+            "an admitted send records exactly one admission and no refusal"
+        );
+        assert_eq!(answer.to.pid, TARGET_PID);
+        assert_eq!(answer.to.started_at, TARGET_START);
+        assert_eq!(answer.to.surface, "claude-code");
+        assert!(!answer.receipt.id.is_empty());
+        assert_eq!(wakes, 1, "the CLI wake rule wakes a requested recipient");
+
+        let message = stored_message(dir.path());
+        assert_eq!(message.from.surface, SenderSurface::Service);
+        assert_eq!(message.from.pid, 0, "a service has no process identity");
+        assert_eq!(
+            message.from.service,
+            Some(ServiceRef {
+                name: "nightly".to_string(),
+                registration_id: record.registration_id.clone(),
+            })
+        );
+        assert_eq!(
+            message.origin,
+            Origin::Service {
+                name: "nightly".to_string(),
+                registration_id: record.registration_id,
+            }
+        );
+        assert_eq!(message.to.pid, TARGET_PID);
+        assert_eq!(message.body, "nightly backup failed");
+        // The recipient's render never shows a session surface and says what it is not.
+        let rendered = crate::messaging::frame::render(&message);
+        assert!(rendered.contains("from service:nightly"), "{rendered}");
+        assert!(
+            rendered.contains("not a session and never an approval"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("[peer msg"), "{rendered}");
+        assert!(!rendered.contains("claude-code"), "{rendered}");
+    }
+
+    #[test]
+    fn an_unregistered_name_stores_nothing() {
+        let dir = TempDir::new().unwrap();
+        let (answer, wakes, recorded) = call(
+            dir.path(),
+            &request("nightly"),
+            service::current_uid(),
+            Call::live(target(Surface::ClaudeCode)),
+        );
+        let failure = answer.unwrap_err();
+        assert_eq!(failure.tag, "service_unknown");
+        assert_eq!(failure.status, StatusCode::BAD_REQUEST);
+        assert!(message_files(dir.path()).is_empty());
+        assert_eq!(wakes, 0);
+        let refusal = last_refusal(&recorded);
+        assert_eq!(refusal.refusal.tag(), "service_unknown");
+        assert_eq!(refusal.service.as_deref(), Some("nightly"));
+        assert_eq!(
+            refusal.registration_id, None,
+            "a pre-load refusal has no resolved registration"
+        );
+        assert_eq!(refusal.service_uid, Some(service::current_uid()));
+        assert_eq!(admissions(&recorded), 0);
+    }
+
+    #[test]
+    fn a_uid_mismatch_refuses_and_stores_nothing() {
+        let dir = TempDir::new().unwrap();
+        service::register(dir.path(), "nightly", NOW, false).unwrap();
+        let other_uid = service::current_uid().wrapping_add(1);
+        let (answer, _, recorded) = call(
+            dir.path(),
+            &request("nightly"),
+            other_uid,
+            Call::live(target(Surface::ClaudeCode)),
+        );
+        let failure = answer.unwrap_err();
+        assert_eq!(failure.tag, "service_uid_mismatch");
+        assert_eq!(failure.status, StatusCode::BAD_REQUEST);
+        assert!(message_files(dir.path()).is_empty());
+        let refusal = last_refusal(&recorded);
+        assert_eq!(refusal.refusal.tag(), "service_uid_mismatch");
+        assert_eq!(
+            refusal.service_uid,
+            Some(other_uid),
+            "the CALLER's uid is recorded"
+        );
+        assert_eq!(
+            refusal.registration_id, None,
+            "the record was refused at load, so no registration id is known"
+        );
+        assert_eq!(admissions(&recorded), 0);
+    }
+
+    #[test]
+    fn a_failed_audit_append_refuses_before_the_store_write() {
+        let dir = TempDir::new().unwrap();
+        service::register(dir.path(), "nightly", NOW, false).unwrap();
+        let spec = Call {
+            admit_ok: false,
+            ..Call::live(target(Surface::ClaudeCode))
+        };
+        let (answer, wakes, recorded) = call(
+            dir.path(),
+            &request("nightly"),
+            service::current_uid(),
+            spec,
+        );
+        let failure = answer.unwrap_err();
+        assert_eq!(failure.tag, "service_audit_unavailable");
+        assert_eq!(failure.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            message_files(dir.path()).is_empty(),
+            "append-first: a failed audit append must not write the message"
+        );
+        assert_eq!(wakes, 0);
+        assert_eq!(
+            recorded_tags(&recorded),
+            vec!["service_audit_unavailable"],
+            "the refusal is recorded; no admission record was written"
+        );
+        assert_eq!(admissions(&recorded), 0);
+        let refusal = last_refusal(&recorded);
+        assert_eq!(
+            refusal.registration_id.as_deref(),
+            Some(
+                service::load(dir.path(), "nightly", service::current_uid())
+                    .unwrap()
+                    .registration_id
+                    .as_str()
+            ),
+            "the registry load succeeded before the audit refusal"
+        );
+    }
+
+    #[test]
+    fn idempotency_is_stable_across_processes_and_resets_on_re_registration() {
+        let dir = TempDir::new().unwrap();
+        service::register(dir.path(), "nightly", NOW, false).unwrap();
+        let mut request = request("nightly");
+        request.idempotency_key = Some(format!("{NOW}.{}", uuid::Uuid::new_v4()));
+        let key = request.idempotency_key.clone().unwrap();
+        // Two "processes" (the seam carries no process identity): the same key must replay
+        // the stored receipt, not store a duplicate.
+        let (first, _, first_log) = call(
+            dir.path(),
+            &request,
+            service::current_uid(),
+            Call::live(target(Surface::ClaudeCode)),
+        );
+        let (second, _, second_log) = call(
+            dir.path(),
+            &request,
+            service::current_uid(),
+            Call::live(target(Surface::ClaudeCode)),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.receipt.id, second.receipt.id);
+        assert_eq!(message_files(dir.path()).len(), 1);
+        assert_eq!(admissions(&first_log), 1);
+        assert_eq!(
+            admissions(&second_log),
+            0,
+            "a keyed replay admits nothing new, so it records no second admission"
+        );
+        assert!(recorded_tags(&second_log).is_empty());
+
+        // A re-registration mints a new identity; the old key must NOT replay against it.
+        service::register(dir.path(), "nightly", NOW, true).unwrap();
+        let (third, _, third_log) = call(
+            dir.path(),
+            &request,
+            service::current_uid(),
+            Call::live(target(Surface::ClaudeCode)),
+        );
+        let third = third.unwrap();
+        assert_ne!(third.receipt.id, first.receipt.id, "key={key}");
+        assert_eq!(message_files(dir.path()).len(), 2);
+        assert_eq!(admissions(&third_log), 1);
+    }
+
+    #[test]
+    fn wake_skips_when_disabled_but_always_wakes_codex() {
+        let dir = TempDir::new().unwrap();
+        service::register(dir.path(), "nightly", NOW, false).unwrap();
+        let mut quiet = request("nightly");
+        quiet.wake = false;
+        let (answer, wakes, _) = call(
+            dir.path(),
+            &quiet,
+            service::current_uid(),
+            Call::live(target(Surface::ClaudeCode)),
+        );
+        assert!(answer.is_ok());
+        assert_eq!(wakes, 0, "--no-wake is honoured for a Claude recipient");
+
+        // A Codex recipient has no turn hook, so the wake is forced.
+        let (answer, wakes, _) = call(
+            dir.path(),
+            &quiet,
+            service::current_uid(),
+            Call::live(target(Surface::Codex)),
+        );
+        assert!(answer.is_ok());
+        assert_eq!(wakes, 1, "a Codex recipient is always woken");
+    }
+
+    /// The REAL append (not the injected seam): `emit_outcome_strict` writes a signed
+    /// `ServiceMessage` record whose payload round-trips exactly. Falsifier: a skipped
+    /// append returns Ok(false) and `append_service_audit` maps it to Err, so this test
+    /// would fail on a broken/absent chain rather than silently pass.
+    #[test]
+    fn the_real_append_writes_a_typed_service_message_record() {
+        let _lock = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        crate::audit::key_custody::test_helpers::init_mock_keyring();
+        let dir = TempDir::new().unwrap();
+        let service_name = format!("csq-audit-signing-test-svc-{}", std::process::id());
+        crate::audit::key_custody::audit_init(dir.path(), &service_name).unwrap();
+        let payload = crate::audit::ServiceMessagePayload {
+            service: "nightly".to_string(),
+            registration_id: "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".to_string(),
+            service_uid: 501,
+            target_pid: TARGET_PID,
+            target_started_at: TARGET_START,
+            target_surface: crate::audit::ServiceTargetSurface::ClaudeCode,
+            key_sha256: Some("a".repeat(64)),
+            outcome: crate::audit::ServiceMessageOutcome::Admitted,
+        };
+        append_service_audit(dir.path(), &payload).unwrap();
+
+        let stored = chain_records(dir.path())
+            .into_iter()
+            .find(|record| record.kind == crate::audit::EventKind::ServiceMessage)
+            .expect("the admission record must be on the chain");
+        assert_eq!(
+            stored.payload,
+            crate::audit::EventPayload::ServiceMessage(payload),
+            "the typed payload must round-trip byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn a_missing_peer_credential_refuses_and_is_recorded() {
+        let dir = TempDir::new().unwrap();
+        service::register(dir.path(), "nightly", NOW, false).unwrap();
+        let spec = Call {
+            peer_pid: None,
+            ..Call::live(target(Surface::ClaudeCode))
+        };
+        let (answer, _, recorded) = call(
+            dir.path(),
+            &request("nightly"),
+            service::current_uid(),
+            spec,
+        );
+        let failure = answer.unwrap_err();
+        assert_eq!(failure.tag, "not_authorized");
+        assert_eq!(failure.status, StatusCode::UNAUTHORIZED);
+        assert!(message_files(dir.path()).is_empty());
+        let refusal = last_refusal(&recorded);
+        assert_eq!(refusal.refusal.tag(), "not_authorized");
+        assert_eq!(refusal.service.as_deref(), Some("nightly"));
+        assert_eq!(refusal.registration_id, None);
+        assert_eq!(admissions(&recorded), 0);
+    }
+
+    /// Every route refusal path records ONE refusal with its fixed tag and records NO
+    /// admission. Each assertion fails if the corresponding emit is removed.
+    #[test]
+    fn every_route_refusal_is_recorded_with_its_tag() {
+        let uid = service::current_uid();
+        let live = || Call::live(target(Surface::ClaudeCode));
+
+        // Name grammar: an invalid spelling is NOT echoed; a reserved but grammar-safe
+        // spelling IS recorded (it is a session-label spoof attempt worth seeing).
+        let dir = TempDir::new().unwrap();
+        let (answer, _, recorded) = call(dir.path(), &request("Bad_Name"), uid, live());
+        assert_eq!(answer.unwrap_err().tag, "service_name_invalid");
+        let refusal = last_refusal(&recorded);
+        assert_eq!(refusal.refusal.tag(), "service_name_invalid");
+        assert_eq!(refusal.service, None, "an invalid spelling is never echoed");
+        assert_eq!(admissions(&recorded), 0);
+
+        let dir = TempDir::new().unwrap();
+        let (answer, _, recorded) = call(dir.path(), &request("term-34743"), uid, live());
+        assert_eq!(answer.unwrap_err().tag, "service_name_reserved");
+        let refusal = last_refusal(&recorded);
+        assert_eq!(refusal.refusal.tag(), "service_name_reserved");
+        assert_eq!(
+            refusal.service.as_deref(),
+            Some("term-34743"),
+            "a reserved spelling passes the grammar and is safe to record"
+        );
+        assert_eq!(admissions(&recorded), 0);
+
+        // Registry unreadable: a loose-mode record, refused before any registration id is
+        // trusted.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = TempDir::new().unwrap();
+            service::register(dir.path(), "nightly", NOW, false).unwrap();
+            std::fs::set_permissions(
+                service::record_path(dir.path(), "nightly"),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+            let (answer, _, recorded) = call(dir.path(), &request("nightly"), uid, live());
+            assert_eq!(answer.unwrap_err().tag, "service_registry_unreadable");
+            let refusal = last_refusal(&recorded);
+            assert_eq!(refusal.refusal.tag(), "service_registry_unreadable");
+            assert_eq!(refusal.service.as_deref(), Some("nightly"));
+            assert_eq!(refusal.registration_id, None);
+            assert_eq!(admissions(&recorded), 0);
+        }
+
+        // Target parse — AFTER a successful load, so the registration id IS known.
+        let dir = TempDir::new().unwrap();
+        let record = service::register(dir.path(), "nightly", NOW, false).unwrap();
+        let mut malformed = request("nightly");
+        malformed.target = "not-a-target".to_string();
+        let (answer, _, recorded) = call(dir.path(), &malformed, uid, live());
+        assert_eq!(answer.unwrap_err().tag, "invalid_input");
+        let refusal = last_refusal(&recorded);
+        assert_eq!(refusal.refusal.tag(), "invalid_input");
+        assert_eq!(
+            refusal.registration_id.as_deref(),
+            Some(record.registration_id.as_str())
+        );
+
+        // Target re-verification (mismatch and undetermined).
+        let (answer, _, recorded) = call(
+            dir.path(),
+            &request("nightly"),
+            uid,
+            Call {
+                reach: Reach::Mismatch,
+                ..live()
+            },
+        );
+        assert_eq!(answer.unwrap_err().tag, "target_mismatch");
+        assert_eq!(last_refusal(&recorded).refusal.tag(), "target_mismatch");
+        assert_eq!(admissions(&recorded), 0);
+
+        let (answer, _, recorded) = call(
+            dir.path(),
+            &request("nightly"),
+            uid,
+            Call {
+                reach: Reach::Undetermined,
+                ..live()
+            },
+        );
+        assert_eq!(answer.unwrap_err().tag, "undetermined");
+        assert_eq!(last_refusal(&recorded).refusal.tag(), "undetermined");
+        assert_eq!(admissions(&recorded), 0);
+
+        // Clock.
+        let (answer, _, recorded) = call(
+            dir.path(),
+            &request("nightly"),
+            uid,
+            Call {
+                now_ok: false,
+                ..live()
+            },
+        );
+        assert_eq!(answer.unwrap_err().tag, "undetermined");
+        assert_eq!(last_refusal(&recorded).refusal.tag(), "undetermined");
+        assert_eq!(admissions(&recorded), 0);
+
+        // Idempotency key shape (post-load: the registration id is known).
+        let mut keyed = request("nightly");
+        keyed.idempotency_key = Some("not-a-key".to_string());
+        let (answer, _, recorded) = call(dir.path(), &keyed, uid, live());
+        assert_eq!(answer.unwrap_err().tag, "invalid_idempotency_key");
+        let refusal = last_refusal(&recorded);
+        assert_eq!(refusal.refusal.tag(), "invalid_idempotency_key");
+        assert_eq!(
+            refusal.registration_id.as_deref(),
+            Some(record.registration_id.as_str())
+        );
+        assert_eq!(admissions(&recorded), 0);
+        assert!(message_files(dir.path()).is_empty());
+    }
+
+    /// The refusal vocabulary is closed in both directions: every fixed tag the route can
+    /// return has an audit variant, so `service_refusal_payload` never falls back.
+    #[test]
+    fn every_service_route_tag_is_in_the_audit_vocabulary() {
+        for tag in [
+            "service_name_invalid",
+            "service_name_reserved",
+            "service_unknown",
+            "service_registry_unreadable",
+            "service_uid_mismatch",
+            "service_audit_unavailable",
+            "service_no_inbox",
+            "service_send_surface_unsupported",
+            "invalid_input",
+            "invalid_idempotency_key",
+            "target_mismatch",
+            "rate_limited",
+            "not_found",
+            "undetermined",
+            "not_authorized",
+            "internal",
+        ] {
+            assert_eq!(
+                crate::audit::ServiceRefusal::from_tag(tag).map(crate::audit::ServiceRefusal::tag),
+                Some(tag),
+                "{tag} must be in the audit refusal vocabulary"
+            );
+        }
+    }
+
+    /// A refusal INSIDE the store's validate phase records ONLY that refusal — never an
+    /// `Admitted` record for a send that was not stored. This is the MEDIUM-1 regression:
+    /// the admission used to be appended before the store ran every check.
+    #[test]
+    fn a_store_refusal_records_only_a_refusal_never_an_admission() {
+        let uid = service::current_uid();
+        let recipient = target(Surface::ClaudeCode);
+        let live = || Call::live(recipient);
+
+        // A service cannot reply: the store refuses SERVICE_NO_INBOX.
+        let dir = TempDir::new().unwrap();
+        service::register(dir.path(), "nightly", NOW, false).unwrap();
+        let mut reply = request("nightly");
+        reply.reply_to = Some("33333333-3333-4333-8333-333333333333".to_string());
+        let (answer, _, recorded) = call(dir.path(), &reply, uid, live());
+        assert_eq!(answer.unwrap_err().tag, "service_no_inbox");
+        assert_eq!(recorded_tags(&recorded), vec!["service_no_inbox"]);
+        assert_eq!(admissions(&recorded), 0);
+        assert!(message_files(dir.path()).is_empty());
+
+        // A body the store refuses (over the 4,000-character cap).
+        let dir = TempDir::new().unwrap();
+        service::register(dir.path(), "nightly", NOW, false).unwrap();
+        let mut oversize = request("nightly");
+        oversize.message = "x".repeat(crate::messaging::limits::MAX_BODY_CHARS + 1);
+        let (answer, _, recorded) = call(dir.path(), &oversize, uid, live());
+        assert_eq!(answer.unwrap_err().tag, "invalid_input");
+        assert_eq!(recorded_tags(&recorded), vec!["invalid_input"]);
+        assert_eq!(admissions(&recorded), 0);
+        assert!(message_files(dir.path()).is_empty());
+
+        // A non-canonical reply id (the store's intent validation).
+        let dir = TempDir::new().unwrap();
+        service::register(dir.path(), "nightly", NOW, false).unwrap();
+        let mut bad_parent = request("nightly");
+        bad_parent.reply_to = Some("not-a-message-id".to_string());
+        let (answer, _, recorded) = call(dir.path(), &bad_parent, uid, live());
+        assert_eq!(answer.unwrap_err().tag, "invalid_input");
+        assert_eq!(recorded_tags(&recorded), vec!["invalid_input"]);
+        assert_eq!(admissions(&recorded), 0);
+
+        // Liveness is the STORE's decision (the route's re-verification passed).
+        let dir = TempDir::new().unwrap();
+        service::register(dir.path(), "nightly", NOW, false).unwrap();
+        let (answer, _, recorded) = call(
+            dir.path(),
+            &request("nightly"),
+            uid,
+            Call {
+                reach: Reach::Ended(recipient),
+                ..live()
+            },
+        );
+        assert_eq!(answer.unwrap_err().tag, "target_mismatch");
+        assert_eq!(recorded_tags(&recorded), vec!["target_mismatch"]);
+        assert_eq!(admissions(&recorded), 0);
+
+        let (answer, _, recorded) = call(
+            dir.path(),
+            &request("nightly"),
+            uid,
+            Call {
+                reach: Reach::Unknown(recipient),
+                ..live()
+            },
+        );
+        assert_eq!(answer.unwrap_err().tag, "undetermined");
+        assert_eq!(recorded_tags(&recorded), vec!["undetermined"]);
+        assert_eq!(admissions(&recorded), 0);
+
+        // The store's rate cap: the 31st send in the window is refused and records ONLY
+        // that refusal; the 30 prior sends each recorded exactly one admission.
+        let dir = TempDir::new().unwrap();
+        service::register(dir.path(), "nightly", NOW, false).unwrap();
+        let cap = crate::messaging::limits::Limits::DEFAULT.max_send_per_pair;
+        for n in 0..cap {
+            let mut ok = request("nightly");
+            ok.message = format!("backup {n}");
+            let (answer, _, recorded) = call(dir.path(), &ok, uid, live());
+            assert!(answer.is_ok(), "send {n} must be admitted");
+            assert_eq!(admissions(&recorded), 1);
+            assert!(recorded_tags(&recorded).is_empty());
+        }
+        let (answer, _, recorded) = call(dir.path(), &request("nightly"), uid, live());
+        assert_eq!(answer.unwrap_err().tag, "rate_limited");
+        assert_eq!(recorded_tags(&recorded), vec!["rate_limited"]);
+        assert_eq!(admissions(&recorded), 0);
+        assert_eq!(message_files(dir.path()).len(), cap);
+    }
+
+    /// AC8 — removal takes effect on the NEXT SEND through the daemon route, not merely on
+    /// a registry load.
+    #[test]
+    fn revocation_takes_effect_on_the_next_send_through_the_route() {
+        let dir = TempDir::new().unwrap();
+        service::register(dir.path(), "nightly", NOW, false).unwrap();
+        let uid = service::current_uid();
+        let (answer, _, recorded) = call(
+            dir.path(),
+            &request("nightly"),
+            uid,
+            Call::live(target(Surface::ClaudeCode)),
+        );
+        assert!(answer.is_ok());
+        assert_eq!(admissions(&recorded), 1);
+        assert_eq!(message_files(dir.path()).len(), 1);
+
+        service::revoke(dir.path(), "nightly").unwrap();
+        let (answer, _, recorded) = call(
+            dir.path(),
+            &request("nightly"),
+            uid,
+            Call::live(target(Surface::ClaudeCode)),
+        );
+        assert_eq!(answer.unwrap_err().tag, "service_unknown");
+        assert_eq!(recorded_tags(&recorded), vec!["service_unknown"]);
+        assert_eq!(admissions(&recorded), 0);
+        assert_eq!(
+            message_files(dir.path()).len(),
+            1,
+            "a revoked send stores nothing new"
+        );
+    }
+
+    /// `emit_outcome_strict` returns `Ok(false)` when the chain is broken (a benign skip);
+    /// the service path must turn that into `service_audit_unavailable` and write nothing.
+    /// This drives the REAL seam — an injected-seam test cannot red if the mapping changes.
+    #[test]
+    fn a_broken_chain_refuses_the_send_and_stores_nothing() {
+        let _lock = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        crate::audit::key_custody::test_helpers::init_mock_keyring();
+        let dir = TempDir::new().unwrap();
+        service::register(dir.path(), "nightly", NOW, false).unwrap();
+        crate::audit::health::set_chain_broken(dir.path(), "test");
+
+        let recipient = target(Surface::ClaudeCode);
+        let verify = move |_pid: u32, _started: u64| Ok(recipient);
+        let live = |_r: &Recipient| Liveness::Live;
+        let wake = |_b: &Path, _r: &Recipient, _n: u64| Delivery::ClaudeWoken;
+        let now = || Ok(NOW);
+        let fs = crate::sessions::directives::real_fs();
+        let deps = ServiceSendDeps {
+            fs: &fs,
+            verify_target: &verify,
+            liveness: &live,
+            audit: &append_service_audit,
+            refusal_audit: &append_service_refusal,
+            wake: &wake,
+            now: &now,
+            peer_uid: service::current_uid(),
+        };
+        let failure = service_send_with(
+            dir.path(),
+            Some(std::process::id()),
+            request("nightly"),
+            &deps,
+        )
+        .unwrap_err();
+        assert_eq!(failure.tag, "service_audit_unavailable");
+        assert_eq!(failure.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            message_files(dir.path()).is_empty(),
+            "no store write on a refused admission"
+        );
+    }
+
+    /// AC5's refusal half, end to end: a refusal driven through the REAL seams lands a
+    /// signed `ServiceMessageRefused` record carrying exactly the facts the refusal
+    /// established — and no `ServiceMessage` admission record.
+    #[test]
+    fn a_refused_send_lands_a_signed_refusal_record_on_the_chain() {
+        let _lock = crate::platform::test_env::lock();
+        std::env::remove_var("CSQ_AUDIT_EDITION");
+        std::env::remove_var("CSQ_AUDIT_ROSTER_ROOT_PUBKEY");
+        crate::audit::key_custody::test_helpers::init_mock_keyring();
+        let dir = TempDir::new().unwrap();
+        let service_name = format!("csq-audit-signing-test-svc-{}", std::process::id());
+        crate::audit::key_custody::audit_init(dir.path(), &service_name).unwrap();
+        let record = service::register(dir.path(), "nightly", NOW, false).unwrap();
+
+        let live = |_r: &Recipient| Liveness::Live;
+        let verify = |_pid: u32, _started: u64| Err("target_mismatch");
+        let wake = |_b: &Path, _r: &Recipient, _n: u64| Delivery::ClaudeWoken;
+        let now = || Ok(NOW);
+        let fs = crate::sessions::directives::real_fs();
+        let deps = ServiceSendDeps {
+            fs: &fs,
+            verify_target: &verify,
+            liveness: &live,
+            audit: &append_service_audit,
+            refusal_audit: &append_service_refusal,
+            wake: &wake,
+            now: &now,
+            peer_uid: service::current_uid(),
+        };
+        let failure = service_send_with(
+            dir.path(),
+            Some(std::process::id()),
+            request("nightly"),
+            &deps,
+        )
+        .unwrap_err();
+        assert_eq!(failure.tag, "target_mismatch");
+
+        let records = chain_records(dir.path());
+        let refused = records
+            .iter()
+            .find(|record| record.kind == crate::audit::EventKind::ServiceMessageRefused)
+            .expect("the refusal must be on the chain");
+        assert_eq!(
+            refused.payload,
+            crate::audit::EventPayload::ServiceMessageRefused(
+                crate::audit::ServiceMessageRefusalPayload {
+                    service: Some("nightly".to_string()),
+                    service_uid: Some(service::current_uid()),
+                    registration_id: Some(record.registration_id),
+                    refusal: crate::audit::ServiceRefusal::TargetMismatch,
+                }
+            )
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.kind == crate::audit::EventKind::ServiceMessage),
+            "a send refused at target re-verification must not record an admission"
+        );
+        assert!(message_files(dir.path()).is_empty());
+    }
+
+    /// MEDIUM-1 — a deterministic store refusal that only `prepare` used to see (the
+    /// keyed-request ledger at its count bound) now refuses BEFORE the admission record:
+    /// no `ServiceMessage`, exactly one `ServiceMessageRefused`.
+    ///
+    /// Falsifier: with the pre-admission feasibility pass removed, the admission hook runs
+    /// first, so this test sees one admission beside the refusal (and, without the wrapper
+    /// split, still one message file would be absent).
+    #[test]
+    fn a_saturated_request_ledger_refuses_before_the_admission_record() {
+        let dir = TempDir::new().unwrap();
+        service::register(dir.path(), "nightly", NOW, false).unwrap();
+        crate::messaging::request::saturate_ledger_for_test(dir.path(), NOW);
+        let mut request = request("nightly");
+        request.idempotency_key = Some(crate::messaging::request::mint(NOW));
+        let (answer, wakes, recorded) = call(
+            dir.path(),
+            &request,
+            service::current_uid(),
+            Call::live(target(Surface::ClaudeCode)),
+        );
+        let failure = answer.unwrap_err();
+        assert_eq!(failure.tag, "undetermined");
+        assert_eq!(failure.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            message_files(dir.path()).is_empty(),
+            "the ledger capacity refusal stores no message"
+        );
+        assert_eq!(wakes, 0);
+        assert_eq!(
+            admissions(&recorded),
+            0,
+            "no admission record may describe a send the store refuses"
+        );
+        assert_eq!(
+            recorded_tags(&recorded),
+            vec!["undetermined"],
+            "exactly one refusal record"
+        );
+        let refusal = last_refusal(&recorded);
+        assert!(
+            refusal.registration_id.is_some(),
+            "the registry load succeeded before the store refusal"
+        );
+    }
+
+    /// MEDIUM-1 — a keyed-request commit I/O failure AFTER the store wrote the message is
+    /// an UNKNOWN outcome for the caller, not a refusal: the admission record stands, the
+    /// message is stored, and NO refusal record is appended.
+    ///
+    /// Fault: once the message record has been staged, every request-ledger replace fails.
+    /// Falsifier: without the `published` flag the wrapper appends `undetermined` beside
+    /// the stored message, and this test sees a refusal tag.
+    #[test]
+    fn a_commit_failure_after_the_store_write_records_no_refusal() {
+        use crate::error::PlatformError;
+        use crate::platform::fs::WrittenPrivateFile;
+        let dir = TempDir::new().unwrap();
+        service::register(dir.path(), "nightly", NOW, false).unwrap();
+        let mut request = request("nightly");
+        request.idempotency_key = Some(crate::messaging::request::mint(NOW));
+        let real = crate::sessions::directives::real_fs();
+        let message_staged = std::cell::Cell::new(false);
+        let write_tmp = |path: &Path, bytes: &[u8]| {
+            if path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .is_some_and(|name| name == "messages")
+            {
+                message_staged.set(true);
+            }
+            (real.write_tmp)(path, bytes)
+        };
+        let replace = |tmp: &Path, target: &Path, identity: WrittenPrivateFile| {
+            if message_staged.get()
+                && target
+                    .parent()
+                    .and_then(|parent| parent.file_name())
+                    .is_some_and(|name| name == "requests")
+                && target.file_name().is_some_and(|name| name == "ledger.json")
+            {
+                return Err(PlatformError::Io(std::io::Error::from(
+                    std::io::ErrorKind::PermissionDenied,
+                )));
+            }
+            (real.replace)(tmp, target, identity)
+        };
+        let fs = crate::sessions::directives::FsOps {
+            write_tmp: &write_tmp,
+            secure: real.secure,
+            replace: &replace,
+        };
+        let (answer, wakes, recorded) = call_with_fs(
+            dir.path(),
+            &request,
+            service::current_uid(),
+            Call::live(target(Surface::ClaudeCode)),
+            &fs,
+        );
+        let failure = answer.unwrap_err();
+        assert_eq!(
+            failure.tag, "undetermined",
+            "the caller still sees the unknown outcome"
+        );
+        assert_eq!(failure.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            message_files(dir.path()).len(),
+            1,
+            "the message was durable before the commit failed"
+        );
+        assert_eq!(
+            admissions(&recorded),
+            1,
+            "the admitted send keeps its admission record"
+        );
+        assert!(
+            recorded_tags(&recorded).is_empty(),
+            "a refusal record must never describe a send the store wrote"
+        );
+        assert_eq!(wakes, 0, "a failed send does not wake");
+    }
+
+    /// LOW-6 — a failed refusal append is best-effort: the caller's fixed tag never
+    /// changes. Falsifier: a wrapper that propagated the seam's `Err(())` would return a
+    /// different tag (or panic) here.
+    #[test]
+    fn a_failed_refusal_append_never_changes_the_caller_tag() {
+        let dir = TempDir::new().unwrap();
+        let (answer, _, recorded) = call(
+            dir.path(),
+            &request("nightly"),
+            service::current_uid(),
+            Call {
+                refusal_ok: false,
+                ..Call::live(target(Surface::ClaudeCode))
+            },
+        );
+        assert_eq!(answer.unwrap_err().tag, "service_unknown");
+        assert_eq!(
+            recorded_tags(&recorded),
+            vec!["service_unknown"],
+            "the seam ran; its failure was ignored"
+        );
+    }
+
+    /// L2-5 — `service_no_inbox` has ONE spelling: the audit vocabulary, the store's
+    /// caller-facing normaliser and the daemon's route mapping all agree. Falsifier: a
+    /// drift in any of the three reds here, so the route cannot return a tag the chain
+    /// records under another name (and `service_refusal_payload` cannot fall back to
+    /// `internal` while the caller sees a different tag).
+    #[test]
+    fn the_service_no_inbox_tag_has_one_spelling() {
+        let canonical = crate::audit::SERVICE_NO_INBOX_TAG;
+        assert_eq!(
+            crate::audit::ServiceRefusal::ServiceNoInbox.tag(),
+            canonical
+        );
+        assert_eq!(crate::messaging::store::SERVICE_NO_INBOX_TAG, canonical);
+        let error = crate::sessions::directives::DirectiveError::invalid(
+            crate::messaging::store::SERVICE_NO_INBOX,
+        );
+        assert_eq!(service_directive_failure(&error).tag, canonical);
+        assert_eq!(
+            crate::messaging::store::caller_facing(error).message,
+            canonical
+        );
     }
 }

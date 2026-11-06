@@ -51,7 +51,9 @@ pub enum Reset {
 impl Reset {
     pub fn validate(&self) -> Result<()> {
         let valid = match self {
-            Self::Day { day_of_month } => (1..=28).contains(day_of_month),
+            // 29..=31 are valid: a month shorter than the day resets on its last day
+            // (see `execution_ledger::reset_bounds`).
+            Self::Day { day_of_month } => (1..=31).contains(day_of_month),
             Self::Date { date } => {
                 date.len() == 10
                     && NaiveDate::parse_from_str(date, "%Y-%m-%d")

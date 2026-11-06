@@ -1934,11 +1934,12 @@ mod tests {
         let sender = Sender {
             pid: std::process::id(),
             started_at: 1_000,
-            surface: SessionSurface::ClaudeCode,
+            surface: SessionSurface::ClaudeCode.into(),
             handle_dir_hash: handle_dir_hash(&canonical),
             handle_dir: fixture.target_handle.to_string_lossy().into_owned(),
             name: None,
             started_exact: Some(9_999),
+            service: None,
         };
         let verified = VerifiedSession::from_resolved(sender);
         let denied =
@@ -2008,11 +2009,12 @@ mod tests {
         let sender = Sender {
             pid: std::process::id(),
             started_at: 1_000,
-            surface: SessionSurface::ClaudeCode,
+            surface: SessionSurface::ClaudeCode.into(),
             handle_dir_hash: "0".repeat(64),
             handle_dir: fixture.target_handle.to_string_lossy().into_owned(),
             name: None,
             started_exact: Some(9_999),
+            service: None,
         };
         let verified = VerifiedSession::from_resolved(sender);
         let lookup = live_lookup(std::process::id(), fixture.target_handle.clone());
@@ -2041,11 +2043,12 @@ mod tests {
         let sender = Sender {
             pid: std::process::id(),
             started_at: 1_000,
-            surface: SessionSurface::ClaudeCode,
+            surface: SessionSurface::ClaudeCode.into(),
             handle_dir_hash: handle_dir_hash(&canonical),
             handle_dir: fixture.target_handle.to_string_lossy().into_owned(),
             name: None,
             started_exact: Some(9_999),
+            service: None,
         };
         let verified = VerifiedSession::from_resolved(sender);
         let lookup = live_lookup(std::process::id(), fixture.target_handle.clone());

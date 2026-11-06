@@ -1493,6 +1493,8 @@ pub fn run() {
             commands::get_account_usage,
             commands::get_rotation_config,
             commands::set_rotation_enabled,
+            commands::get_session_rotation,
+            commands::set_session_rotation,
             // M6 PR-CA12 — capability-layer toggles persisted at
             // <base>/capability_layer.json. Tray submenu writes via
             // set_capability_layer_toggles; csq run reads at startup.

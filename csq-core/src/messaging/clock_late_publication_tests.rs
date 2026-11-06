@@ -15,10 +15,11 @@ fn session(pid: u32) -> VerifiedSession {
         pid,
         started_at: 100,
         started_exact: Some(100_000 + u64::from(pid)),
-        surface: Surface::Codex,
+        surface: Surface::Codex.into(),
         handle_dir_hash: format!("fixture{pid}"),
         handle_dir: "/fixture".into(),
         name: None,
+        service: None,
     })
 }
 

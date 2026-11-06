@@ -61,6 +61,7 @@ use std::time::{Duration, Instant};
 
 use super::term::{self, Decline, RawGuard};
 use super::types::SessionIdentity;
+use super::writer::MasterWriter;
 
 /// How long the relay keeps draining the master after the child exits
 /// (spec 34 §34.2.1 (g), CHOSEN). The bound covers reading AND writing the
@@ -69,9 +70,6 @@ pub const DRAIN_MS: u64 = 200;
 
 /// How long an abandoned child gets after `SIGHUP`+`SIGCONT` before `SIGKILL`.
 pub const TERMINATE_GRACE_MS: u64 = 2000;
-
-/// Upper bound on terminal input held while the child is not reading.
-const IN_QUEUE_MAX: usize = 64 * 1024;
 
 /// Upper bound on child output held while the terminal is not accepting it.
 const OUT_QUEUE_MAX: usize = 64 * 1024;
@@ -1110,7 +1108,7 @@ const FD_FALLBACK_CEILING: u64 = 1 << 20;
 /// descriptor opened after this point has a number below the limit in force
 /// when it was opened, which the loop also covers. If the listing cannot be
 /// read, the answer is [`FD_FALLBACK_CEILING`]: everything gets closed.
-fn open_fd_ceiling() -> u64 {
+pub(super) fn open_fd_ceiling() -> u64 {
     let listing = match std::fs::read_dir("/dev/fd") {
         Ok(l) => l,
         Err(_) => return fd_listing_failed(),
@@ -1139,7 +1137,7 @@ fn fd_listing_failed() -> u64 {
 
 /// Close every descriptor from `low` up to `ceiling` (see
 /// [`open_fd_ceiling`]) and to the process's limits. Async-signal-safe.
-unsafe fn close_from(low: libc::c_int, ceiling: u64) {
+pub(super) unsafe fn close_from(low: libc::c_int, ceiling: u64) {
     // SAFETY: closing descriptors this forked child owns copies of.
     unsafe {
         #[cfg(target_os = "linux")]
@@ -2950,13 +2948,12 @@ impl Relay {
             up,
         } = spawn_on_slave(&self.spec, slave).map_err(SpawnFailure::into_relay_error)?;
         let mut pump = Pump {
-            master,
+            master: MasterWriter::new(master),
             pid,
             ctl,
             up,
             guard,
             signals,
-            pending: Vec::new(),
             out,
             reaped: false,
             fault: None,
@@ -2980,7 +2977,7 @@ impl Relay {
 }
 
 struct Pump {
-    master: OwnedFd,
+    master: MasterWriter,
     pid: libc::pid_t,
     /// Control pipe to the shim: `R` resumes the CLI; closing it (however
     /// the relay dies) makes the shim end the CLI's group.
@@ -2990,8 +2987,6 @@ struct Pump {
     up: OwnedFd,
     guard: RawGuard,
     signals: SignalGuard,
-    /// Terminal input waiting for the master.
-    pending: Vec<u8>,
     out: OutQueue,
     /// The child has been reaped (or is not ours): never signal its pid.
     reaped: bool,
@@ -3043,13 +3038,9 @@ impl Pump {
                     revents: 0,
                 },
                 libc::pollfd {
-                    fd: if master_open && self.out.has_room() && !self.master_deaf() {
-                        self.master.as_raw_fd()
-                    } else {
-                        -1
-                    },
+                    fd: -1, // MasterWriter installs its descriptor only during poll.
                     events: libc::POLLIN
-                        | if self.pending.is_empty() {
+                        | if self.master.pending_len() == 0 {
                             0
                         } else {
                             libc::POLLOUT
@@ -3066,7 +3057,7 @@ impl Pump {
                     // input either: the outer line discipline would echo what
                     // is typed into a prompt that echoes nothing.
                     fd: if stdin_open
-                        && self.pending.len() < IN_QUEUE_MAX
+                        && self.master.pending_room() > 0
                         && (self.ending.is_none() || self.guard.is_raw())
                         && term::is_foreground(STDIN)
                     {
@@ -3100,16 +3091,12 @@ impl Pump {
                     revents: 0,
                 },
             ];
-            // SAFETY: valid pollfd array of the stated length.
-            let rc = unsafe {
-                libc::poll(
-                    fds.as_mut_ptr(),
-                    fds.len() as libc::nfds_t,
-                    POLL_BACKSTOP_MS,
-                )
-            };
-            if rc == -1 {
-                let e = io::Error::last_os_error();
+            if let Err(e) = self.master.poll(
+                &mut fds,
+                1,
+                master_open && self.out.has_room() && !self.master_deaf(),
+                POLL_BACKSTOP_MS,
+            ) {
                 if e.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
@@ -3179,7 +3166,6 @@ impl Pump {
                 "terminal restore failed"
             );
         }
-        let fd = self.master.as_raw_fd();
         // A relay ending in the background must not write to the terminal at
         // all (spec 34 §34.2.1 (f)): the screen belongs to whichever job is in
         // the foreground. Blocking SIGTTOU does NOT refuse such a write (POSIX
@@ -3197,9 +3183,13 @@ impl Pump {
             libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
             old
         };
-        drain_master(fd, &mut self.out, self.cfg.drain, &mut buf, &|| {
-            term::is_foreground(STDIN)
-        });
+        drain_master(
+            &self.master,
+            &mut self.out,
+            self.cfg.drain,
+            &mut buf,
+            &|| term::is_foreground(STDIN),
+        );
         // SAFETY: restoring the mask saved above.
         unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
         Ok(exit)
@@ -3305,7 +3295,7 @@ impl Pump {
     fn propagate_winsize(&self) {
         match term::get_winsize(STDIN) {
             Ok(ws) => {
-                if let Err(e) = term::set_winsize(self.master.as_raw_fd(), &ws) {
+                if let Err(e) = self.master.set_winsize(&ws) {
                     tracing::warn!(
                         error_kind = "winsize_set_failed",
                         errno = e.raw_os_error().unwrap_or(0),
@@ -3453,7 +3443,7 @@ impl Pump {
 
     /// Master to terminal queue. `true` when the master reached EOF.
     fn pump_output(&mut self, buf: &mut [u8]) -> Result<bool, RelayError> {
-        match classify_master_read(read_fd(self.master.as_raw_fd(), buf)) {
+        match classify_master_read(self.master.read(buf)) {
             MasterRead::Data(n) => {
                 self.out.queue(&buf[..n]);
                 // A relay in the background writes nothing: the write would
@@ -3476,7 +3466,7 @@ impl Pump {
 
     /// Terminal to master. `false` when terminal input ended.
     fn pump_input(&mut self, buf: &mut [u8]) -> Result<bool, RelayError> {
-        let room = IN_QUEUE_MAX - self.pending.len();
+        let room = self.master.pending_room();
         let take = room.min(buf.len());
         match read_fd(STDIN, &mut buf[..take]) {
             Ok(0) => Ok(false),
@@ -3485,7 +3475,9 @@ impl Pump {
                 if self.cfg.panic_on_input {
                     panic!("relay test fault: input byte received");
                 }
-                self.pending.extend_from_slice(&buf[..n]);
+                self.master
+                    .queue_human(&buf[..n])
+                    .map_err(|e| started("queue_input", e))?;
                 self.write_pending_input()?;
                 Ok(true)
             }
@@ -3505,8 +3497,8 @@ impl Pump {
 
     /// Write as much queued input to the master as it accepts.
     fn write_pending_input(&mut self) -> Result<(), RelayError> {
-        while !self.pending.is_empty() {
-            match write_fd(self.master.as_raw_fd(), &self.pending) {
+        while self.master.pending_len() != 0 {
+            match self.master.forward_pending() {
                 // A write that moves nothing and is not EAGAIN would spin.
                 Ok(0) => {
                     return Err(RelayError::ChildStarted {
@@ -3514,14 +3506,12 @@ impl Pump {
                         errno: 0,
                     })
                 }
-                Ok(n) => {
-                    self.pending.drain(..n);
-                }
+                Ok(_) => {}
                 Err(e) => match e.raw_os_error() {
                     Some(libc::EAGAIN) => return Ok(()),
                     Some(libc::EINTR) => {}
                     // The slave side is gone; the input has no reader.
-                    Some(libc::EIO) => self.pending.clear(),
+                    Some(libc::EIO) => self.master.discard_pending(),
                     errno => {
                         return Err(RelayError::ChildStarted {
                             op: "write_master",
@@ -3545,7 +3535,7 @@ impl Pump {
 /// longer the terminal's foreground job) the queue is discarded, counted and
 /// never logged, and the drain ends.
 fn drain_master(
-    fd: RawFd,
+    master: &MasterWriter,
     out: &mut OutQueue,
     window: Duration,
     buf: &mut [u8],
@@ -3573,11 +3563,7 @@ fn drain_master(
         }
         let mut fds = [
             libc::pollfd {
-                fd: if master_done || !out.has_room() {
-                    -1
-                } else {
-                    fd
-                },
+                fd: -1, // Installed and cleared by MasterWriter::poll.
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -3588,19 +3574,14 @@ fn drain_master(
             },
         ];
         let ms = left.as_millis().min(i32::MAX as u128) as libc::c_int;
-        // SAFETY: valid pollfd array of the stated length.
-        let r = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms.max(1)) };
-        if r == 0 {
-            break;
-        }
-        if r == -1 {
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            break;
+        match master.poll(&mut fds, 0, !master_done && out.has_room(), ms.max(1)) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
         }
         if fds[0].revents != 0 {
-            match classify_master_read(read_fd(fd, buf)) {
+            match classify_master_read(master.read(buf)) {
                 MasterRead::Data(n) => out.queue(&buf[..n]),
                 MasterRead::Again => {}
                 MasterRead::Eof => master_done = true,
@@ -3628,6 +3609,17 @@ mod tests {
     //! hands it the foreground like an interactive shell would, and reports
     //! how it ended on the outer terminal. The test plays the user at the
     //! outer master and inspects the outer terminal's attributes.
+
+    #[test]
+    fn pty_source_line_budget_after_writer_queue_extraction() {
+        // About 10% headroom after the queue/descriptor ownership extraction;
+        // keep this in the ordinary test path so reinlining cannot grow unchecked.
+        let count = include_str!("pty.rs").lines().count();
+        assert!(
+            count <= 10_200,
+            "relay/pty.rs has {count} lines (limit 10200)"
+        );
+    }
 
     use super::*;
     use crate::relay::term::{get_termios, set_winsize};
@@ -4712,7 +4704,7 @@ mod tests {
     // -- the harness (runs in the real test process) -------------------------
 
     struct Outer {
-        master: OwnedFd,
+        outer_master: OwnedFd,
         orig: libc::termios,
         acc: Vec<u8>,
         pos: usize,
@@ -4822,7 +4814,7 @@ mod tests {
             };
             set_nonblock(pty.master.as_raw_fd()).expect("nonblock");
             Outer {
-                master: pty.master,
+                outer_master: pty.master,
                 orig,
                 acc: Vec::new(),
                 pos: 0,
@@ -4839,7 +4831,7 @@ mod tests {
                 String::from_utf8_lossy(&self.acc)
             );
             let mut pfd = libc::pollfd {
-                fd: self.master.as_raw_fd(),
+                fd: self.outer_master.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             };
@@ -4847,7 +4839,7 @@ mod tests {
             unsafe { libc::poll(&mut pfd, 1, 100) };
             let mut buf = [0u8; 4096];
             if let MasterRead::Data(n) =
-                classify_master_read(read_fd(self.master.as_raw_fd(), &mut buf))
+                classify_master_read(read_fd(self.outer_master.as_raw_fd(), &mut buf))
             {
                 self.acc.extend_from_slice(&buf[..n]);
             }
@@ -4894,15 +4886,18 @@ mod tests {
         /// Close the outer master, as a closed terminal tab does.
         fn hang_up(&mut self) {
             let null = std::fs::File::open("/dev/null").expect("/dev/null");
-            drop(std::mem::replace(&mut self.master, OwnedFd::from(null)));
+            drop(std::mem::replace(
+                &mut self.outer_master,
+                OwnedFd::from(null),
+            ));
         }
 
         fn send(&self, bytes: &[u8]) {
-            write_all_blocking_nb(self.master.as_raw_fd(), bytes);
+            write_all_blocking_nb(self.outer_master.as_raw_fd(), bytes);
         }
 
         fn termios(&self) -> libc::termios {
-            get_termios(self.master.as_raw_fd()).expect("outer termios")
+            get_termios(self.outer_master.as_raw_fd()).expect("outer termios")
         }
 
         fn is_raw_now(&self) -> bool {
@@ -4910,7 +4905,7 @@ mod tests {
         }
 
         fn resize(&self, rows: u16, cols: u16) {
-            set_winsize(self.master.as_raw_fd(), &winsize(rows, cols)).expect("resize outer");
+            set_winsize(self.outer_master.as_raw_fd(), &winsize(rows, cols)).expect("resize outer");
         }
 
         fn relay_pid(&mut self) -> libc::pid_t {
@@ -6065,12 +6060,18 @@ mod tests {
 
     /// Run `drain_master` in a thread so a drain that does not end fails the
     /// test by deadline instead of hanging it.
-    fn drain_with_deadline(master: RawFd, out: OutQueue, window: Duration) -> OutQueue {
+    fn drain_with_deadline(master: OwnedFd, out: OutQueue, window: Duration) -> OutQueue {
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let mut out = out;
             let mut buf = [0u8; 64];
-            drain_master(master, &mut out, window, &mut buf, &|| true);
+            drain_master(
+                &MasterWriter::new(master),
+                &mut out,
+                window,
+                &mut buf,
+                &|| true,
+            );
             tx.send(out).unwrap();
         });
         let out = rx
@@ -6087,11 +6088,7 @@ mod tests {
         // The slave stays open for the whole drain: no EOF ever.
         write_fd(pty.slave.as_raw_fd(), b"left-over").unwrap();
         let (r, w) = nonblocking_pipe();
-        let out = drain_with_deadline(
-            pty.master.as_raw_fd(),
-            OutQueue::over(w),
-            Duration::from_millis(100),
-        );
+        let out = drain_with_deadline(pty.master, OutQueue::over(w), Duration::from_millis(100));
         drop(out);
         let mut got = [0u8; 64];
         let n = read_fd(r.as_raw_fd(), &mut got).unwrap();
@@ -6107,11 +6104,7 @@ mod tests {
         let chunk = [b'x'; 4096];
         while write_fd(w.as_raw_fd(), &chunk).is_ok() {}
         write_fd(pty.slave.as_raw_fd(), b"more").unwrap();
-        let out = drain_with_deadline(
-            pty.master.as_raw_fd(),
-            OutQueue::over(w),
-            Duration::from_millis(100),
-        );
+        let out = drain_with_deadline(pty.master, OutQueue::over(w), Duration::from_millis(100));
         assert!(
             out.wants_write(),
             "output the terminal never took is discarded, not forced"
@@ -6896,7 +6889,7 @@ mod tests {
         // The shell hands the terminal back before it continues the relay.
         let deadline = Instant::now() + WAIT;
         // SAFETY: tcgetpgrp only reads the outer terminal's state.
-        while unsafe { libc::tcgetpgrp(o.master.as_raw_fd()) } != relay {
+        while unsafe { libc::tcgetpgrp(o.outer_master.as_raw_fd()) } != relay {
             assert!(
                 Instant::now() < deadline,
                 "the relay never got the terminal"
@@ -8569,7 +8562,7 @@ mod tests {
         out.queue(b"queued");
         let mut buf = [0u8; 64];
         drain_master(
-            pty.master.as_raw_fd(),
+            &MasterWriter::new(pty.master),
             &mut out,
             Duration::from_millis(100),
             &mut buf,
@@ -8799,10 +8792,22 @@ mod tests {
         println!("MEMBER {}", member.id());
         // SAFETY: getpid has no preconditions.
         let me = unsafe { libc::getpid() };
-        let calls = std::sync::atomic::AtomicUsize::new(0);
+        // The listing is real until the reap has recorded (and so stopped) its
+        // first frozen pid, and wedged from then on: a sync point on the reap's
+        // own state, not a call count (a first real listing that failed on a
+        // loaded host and was retried would otherwise consume the real one).
+        // `CSQ_S1A_BLOCK_LISTING` wedges inside the listing call itself, so no
+        // spawn can fail early and end the reap before the alarm.
+        let block = env("CSQ_S1A_BLOCK_LISTING").is_some();
         let ps = || {
-            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            if FROZEN_PIDS_N.load(Ordering::SeqCst) == 0 {
                 system_ps()
+            } else if block {
+                loop {
+                    // SAFETY: pause has no preconditions; the alarm handler
+                    // ends the process.
+                    unsafe { libc::pause() };
+                }
             } else {
                 let mut c = Command::new("/bin/sh");
                 c.args(["-c", "exec sleep 30"]);
@@ -8816,14 +8821,22 @@ mod tests {
 
     /// Run the slow reaper; returns its output, its exit code and the pid of
     /// the member it froze. The member is ended here if it survived.
-    fn run_slow_reaper(alarm: u32, freeze_ms: u64) -> (String, Option<i32>, libc::pid_t, bool) {
+    fn run_slow_reaper(
+        alarm: u32,
+        freeze_ms: u64,
+        block_listing: bool,
+    ) -> (String, Option<i32>, libc::pid_t, bool) {
         // A valid `sleep` operand (one dot): an invalid one would end at once and
         // leave nothing to freeze.
         let mark = format!("733.{}{alarm}", std::process::id());
-        let out = helper_command("slowreaper")
-            .env("CSQ_S1A_ALARM", alarm.to_string())
+        let mut role = helper_command("slowreaper");
+        role.env("CSQ_S1A_ALARM", alarm.to_string())
             .env("CSQ_S1A_FREEZE_MS", freeze_ms.to_string())
-            .env("CSQ_S1A_MARK", &mark)
+            .env("CSQ_S1A_MARK", &mark);
+        if block_listing {
+            role.env("CSQ_S1A_BLOCK_LISTING", "1");
+        }
+        let out = role
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .output()
@@ -8851,7 +8864,7 @@ mod tests {
     /// and reports (exit 0, not the alarm's 137).
     #[test]
     fn a_wedged_listing_still_reaches_the_kill_phase_inside_the_alarm() {
-        let (text, code, member, gone) = run_slow_reaper(8, 1000);
+        let (text, code, member, gone) = run_slow_reaper(8, 1000, false);
         assert!(gone, "member {member} stayed behind (stopped?): {text:?}");
         assert!(
             text.contains("REAP err") && code == Some(0),
@@ -8861,10 +8874,12 @@ mod tests {
 
     /// With a freeze deadline far beyond the alarm, the alarm's handler is the
     /// only thing between a stopped member and a stopped survivor: it kills
-    /// every frozen pid before it ends the role.
+    /// every frozen pid before it ends the role. The wedge sits inside the
+    /// listing call (no spawn that could fail early), and starts only once the
+    /// member is frozen, so the role can end only by the alarm.
     #[test]
     fn the_cleanup_alarm_kills_what_the_freeze_stopped() {
-        let (text, code, member, gone) = run_slow_reaper(3, 60_000);
+        let (text, code, member, gone) = run_slow_reaper(3, 60_000, true);
         assert!(
             gone,
             "member {member} survived the alarm (stopped?): {text:?}"
@@ -9016,7 +9031,7 @@ mod tests {
         };
         let mut buf = [0u8; 64];
         drain_master(
-            pty.master.as_raw_fd(),
+            &MasterWriter::new(pty.master),
             &mut out,
             Duration::from_millis(300),
             &mut buf,

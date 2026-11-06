@@ -109,7 +109,19 @@ impl OpClass {
             // chat, not a governed credential/authority action. Its authority is
             // the owner pin plus the single-sig chain signature, so it carries no
             // M12 multi-sig roster class (same rationale as the inbound delivery).
-            | EventKind::TelegramOwnerPing => None,
+            | EventKind::TelegramOwnerPing
+            // Delivery metadata observes separately verified authority; it grants none.
+            | EventKind::SessionInject
+            // A recycle-request observation records attribution, not authority.
+            | EventKind::RecycleRequest
+            // A registered-service message admission is a passive observation of a send
+            // the daemon already admitted through the peer-UID socket and the registry
+            // record. Its authority is that admission, not an M12 multi-sig roster
+            // decision; the record is single-sig chain-signed (same rationale as
+            // GovernanceTurn / the Telegram bridge records). A REFUSAL record is the
+            // same passive observation of a decision the route already made.
+            | EventKind::ServiceMessage
+            | EventKind::ServiceMessageRefused => None,
         }
     }
 }
@@ -161,9 +173,13 @@ mod tests {
             EventKind::GovernanceTurn,
             EventKind::EatpAttestation,
             EventKind::McpGateDecision,
+            // An observation of a foreign recycle decision (spec 36 §36.11): it grants nothing.
+            EventKind::RecycleRequest,
             EventKind::PolicyBundleInstall,
             EventKind::OrgRootCeremony,
             EventKind::SeatKeyReanchor,
+            EventKind::ServiceMessage,
+            EventKind::ServiceMessageRefused,
         ] {
             assert!(
                 OpClass::from_event_kind(&kind).is_none(),

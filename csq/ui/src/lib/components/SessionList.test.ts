@@ -20,6 +20,7 @@ vi.mock("@tauri-apps/api/path", () => ({
 }));
 
 import SessionList from "./SessionList.svelte";
+import { setMachineRotationEnabled } from "../stores/machineRotation.svelte";
 
 // Flush async effects: the component's $effect fires fetchSessions
 // which awaits homeDir → join → Promise.all(invoke, invoke), then
@@ -59,6 +60,8 @@ const SESSION_1 = {
   term_pane: 0,
   iterm_profile: "Default",
   terminal_title: null,
+  handle_pid: 1234,
+  rotation_eligible: true,
 };
 
 const SESSION_2 = {
@@ -76,13 +79,25 @@ const SESSION_2 = {
   term_pane: 0,
   iterm_profile: "Default",
   terminal_title: "My Session",
+  handle_pid: 5678,
+  rotation_eligible: true,
 };
+
+function rotationView(
+  mode: "default" | "on" | "off" | "unreadable",
+  machine_enabled: boolean,
+  effective: boolean,
+  pid = 1234,
+) {
+  return { pid, mode, machine_enabled, effective };
+}
 
 let mockResponses: Record<string, unknown> = {};
 
 function setupMocks(overrides: Record<string, unknown> = {}) {
   mockResponses = {
     list_sessions: [SESSION_1, SESSION_2],
+    get_session_rotation: rotationView("default", false, false),
     ...overrides,
   };
   mockInvoke.mockImplementation((cmd: string) => {
@@ -96,6 +111,7 @@ function setupMocks(overrides: Record<string, unknown> = {}) {
 describe("SessionList", () => {
   beforeEach(() => {
     mockInvoke.mockReset();
+    setMachineRotationEnabled(null);
     mockHomeDir.mockReset().mockResolvedValue("/home/test");
     setupMocks();
     try {
@@ -378,5 +394,194 @@ describe("SessionList", () => {
     const { container } = render(SessionList);
     await settle();
     expect(container.textContent).toContain("daemon unavailable");
+  });
+  // ── Per-session auto-swap control ───────────────────────────
+
+  function rotationCalls(cmd: string) {
+    return mockInvoke.mock.calls.filter(([c]) => c === cmd);
+  }
+  function rotationText(container: HTMLElement, pid: number) {
+    return container.querySelector(`[data-testid="session-rotation-${pid}"]`)?.textContent ?? "";
+  }
+
+  it.each([
+    ["default", false, false, "Auto-swap: off (following machine setting)"],
+    ["default", true, true, "Auto-swap: on (following machine setting)"],
+    ["on", false, true, "Auto-swap: on (this session)"],
+    ["off", true, false, "Auto-swap: off (this session)"],
+    ["unreadable", true, false, "Setting damaged \u2014 treated as off"],
+  ] as const)("renders rotation mode %s (machine %s)", async (mode, machine, effective, text) => {
+    setupMocks({ get_session_rotation: rotationView(mode, machine, effective) });
+    const { container } = render(SessionList);
+    await settle();
+    expect(rotationText(container, 1234)).toContain(text);
+    expect(rotationCalls("get_session_rotation")[0][1]).toEqual({
+      baseDir: "/home/test/.claude/accounts",
+      pid: 1234,
+    });
+  });
+
+  it("clicking On calls set_session_rotation and renders the returned view", async () => {
+    const { container, getByTestId } = render(SessionList);
+    await settle();
+    // The mock answers the write with a view that differs from any local guess
+    // (effective stays reported by the backend), proving no optimistic render.
+    mockResponses.set_session_rotation = rotationView("on", false, true);
+    getByTestId("session-rotation-1234-on").click();
+    await settle();
+    const calls = rotationCalls("set_session_rotation");
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1]).toEqual({
+      baseDir: "/home/test/.claude/accounts",
+      pid: 1234,
+      mode: "on",
+    });
+    expect(rotationText(container, 1234)).toContain("Auto-swap: on (this session)");
+    expect(getByTestId("session-rotation-1234-on").getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("does not show the clicked value before the backend answers", async () => {
+    const { container, getByTestId } = render(SessionList);
+    await settle();
+    const pending = deferred<unknown>();
+    mockInvoke.mockImplementation((cmd: string) =>
+      cmd === "set_session_rotation" ? pending.promise : Promise.resolve(mockResponses[cmd]),
+    );
+    getByTestId("session-rotation-1234-on").click();
+    await settle();
+    expect(rotationText(container, 1234)).toContain("following machine setting");
+    pending.resolve(rotationView("on", false, true));
+    await settle();
+    expect(rotationText(container, 1234)).toContain("(this session)");
+  });
+
+  it("renders an inline plain-language error when the write is refused", async () => {
+    const { container, getByTestId } = render(SessionList);
+    await settle();
+    mockInvoke.mockImplementation((cmd: string) =>
+      cmd === "set_session_rotation"
+        ? Promise.reject("rotation settings are unreadable")
+        : Promise.resolve(mockResponses[cmd]),
+    );
+    getByTestId("session-rotation-1234-off").click();
+    await settle();
+    const err = getByTestId("session-rotation-1234-error");
+    expect(err.textContent).toContain("Couldn't change this session's auto-swap setting.");
+    expect(err.textContent).toContain("rotation settings are unreadable");
+    // The stored value stays what the backend last reported.
+    expect(rotationText(container, 1234)).toContain("following machine setting");
+  });
+
+  it("renders an inline error when the read fails", async () => {
+    setupMocks();
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_session_rotation") return Promise.reject("rotation settings are unreadable");
+      return Promise.resolve(mockResponses[cmd]);
+    });
+    const { getByTestId } = render(SessionList);
+    await settle();
+    expect(getByTestId("session-rotation-1234-error").textContent).toContain(
+      "Couldn't read this session's auto-swap setting.",
+    );
+  });
+
+  it("offers a reset to default for a damaged setting", async () => {
+    setupMocks({ get_session_rotation: rotationView("unreadable", true, false) });
+    const { container, getByTestId } = render(SessionList);
+    await settle();
+    expect(container.querySelector('[data-testid="session-rotation-1234-on"]')).toBeNull();
+    mockResponses.set_session_rotation = rotationView("default", true, true);
+    getByTestId("session-rotation-1234-reset").click();
+    await settle();
+    expect(rotationCalls("set_session_rotation")[0][1]).toMatchObject({ mode: "default" });
+    expect(rotationText(container, 1234)).toContain("Auto-swap: on (following machine setting)");
+  });
+
+  // C2: the backend's one eligibility answer gates the control.
+  it("shows no control on a row the rotator can never move", async () => {
+    setupMocks({ list_sessions: [{ ...SESSION_1, rotation_eligible: false }] });
+    const { container } = render(SessionList);
+    await settle();
+    expect(container.querySelector('[data-testid="session-rotation-1234"]')).toBeNull();
+    expect(rotationCalls("get_session_rotation")).toHaveLength(0);
+  });
+
+  it("shows no control when the backend omits the eligibility answer", async () => {
+    const { rotation_eligible: _drop, ...older } = SESSION_1;
+    setupMocks({ list_sessions: [older] });
+    const { container } = render(SessionList);
+    await settle();
+    expect(container.querySelector('[data-testid="session-rotation-1234"]')).toBeNull();
+  });
+
+  // C1: the control addresses the terminal's handle dir, not the claude process.
+  it("reads and writes rotation by handle_pid, not the claude process id", async () => {
+    setupMocks({
+      list_sessions: [{ ...SESSION_1, pid: 99, handle_pid: 1200 }],
+      get_session_rotation: rotationView("default", false, false, 1200),
+    });
+    const { getByTestId } = render(SessionList);
+    await settle();
+    expect(rotationCalls("get_session_rotation")[0][1]).toEqual({
+      baseDir: "/home/test/.claude/accounts",
+      pid: 1200,
+    });
+    mockResponses.set_session_rotation = rotationView("on", false, true, 1200);
+    getByTestId("session-rotation-1200-on").click();
+    await settle();
+    expect(rotationCalls("set_session_rotation")[0][1]).toMatchObject({ pid: 1200, mode: "on" });
+    expect(rotationCalls("get_session_rotation").some(([, a]) => a.pid === 99)).toBe(false);
+  });
+
+  it("shows no control for a session without a handle dir", async () => {
+    setupMocks({ list_sessions: [{ ...SESSION_1, handle_pid: null }] });
+    const { container } = render(SessionList);
+    await settle();
+    expect(container.querySelector('[data-testid="session-rotation-1234"]')).toBeNull();
+    expect(rotationCalls("get_session_rotation")).toHaveLength(0);
+  });
+
+  // C6: a row following the machine setting tracks the Settings toggle.
+  it("a row following the machine setting re-derives when the machine setting changes", async () => {
+    setupMocks({ get_session_rotation: rotationView("default", false, false) });
+    const { container } = render(SessionList);
+    await settle();
+    expect(rotationText(container, 1234)).toContain("Auto-swap: off (following machine setting)");
+    setMachineRotationEnabled(true);
+    await settle();
+    expect(rotationText(container, 1234)).toContain("Auto-swap: on (following machine setting)");
+    // A row with its own setting does not follow it.
+    setMachineRotationEnabled(false);
+    await settle();
+    expect(rotationText(container, 1234)).toContain("Auto-swap: off (following machine setting)");
+  });
+
+  // Corr N3: the CLI changed the machine setting after Settings last loaded it.
+  it("a stale stored machine setting does not override a fresher backend read", async () => {
+    setMachineRotationEnabled(true); // stale: Settings loaded it before the CLI turned it off
+    setupMocks({ get_session_rotation: rotationView("default", false, false) });
+    const { container } = render(SessionList);
+    await settle();
+    expect(rotationText(container, 1234)).toContain("Auto-swap: off (following machine setting)");
+  });
+
+  it("a row with its own setting ignores the machine setting", async () => {
+    setupMocks({ get_session_rotation: rotationView("on", false, true) });
+    const { container } = render(SessionList);
+    await settle();
+    setMachineRotationEnabled(false);
+    await settle();
+    expect(rotationText(container, 1234)).toContain("Auto-swap: on (this session)");
+  });
+
+  it("reads rotation once per row, not on the poll", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    render(SessionList);
+    await settle();
+    const before = rotationCalls("get_session_rotation").length;
+    vi.advanceTimersByTime(15000);
+    await settle();
+    expect(before).toBe(2);
+    expect(rotationCalls("get_session_rotation")).toHaveLength(before);
   });
 });

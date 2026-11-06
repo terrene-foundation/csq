@@ -440,6 +440,19 @@ async fn run_loop(
             ),
         }
 
+        // Login-needed owner alert: reads the sentinel state this tick just
+        // classified and pings the owner once per transition. Detached
+        // (`spawn_pass` is not awaited; the pass holds its own lock), so a slow or
+        // failing ping can never delay the next refresh or this loop's wait.
+        drop(crate::daemon::login_needed_alert::spawn_pass(
+            base_dir.clone(),
+            Arc::new(crate::daemon::login_needed_alert::ProductionPinger {
+                base_dir: base_dir.clone(),
+            }),
+            Arc::new(crate::daemon::login_needed_alert::unix_now),
+            shutdown.clone(),
+        ));
+
         // M20 (F-SEAM-09): sweep timed-out held provenance events. The seam's
         // intra-source counter-gap hold links a held event past an unfilled gap
         // once its wait exceeds PREDECESSOR_WAIT_SECS (300s). This is the
@@ -4352,6 +4365,56 @@ mod tests {
             0,
             "shutdown during startup delay should prevent any HTTP"
         );
+    }
+
+    /// Wiring proof: the production `run_loop` runs the login-needed alert pass
+    /// after a tick. The temp base is not the canonical per-user dir, so the
+    /// production pinger refuses before any send (no real config or token is
+    /// read); the persisted state entry is the observable. The refresh itself
+    /// still ran.
+    #[tokio::test]
+    async fn run_loop_runs_the_login_needed_alert_pass_without_blocking_refresh() {
+        let dir = TempDir::new().unwrap();
+        let counter = Arc::new(AtomicU32::new(0));
+        let http = counting_success(Arc::clone(&counter));
+        let shutdown = CancellationToken::new();
+
+        install_account(dir.path(), 1, 0);
+        crate::refresh::sentinel::set_broker_failed(
+            dir.path(),
+            AccountNum::try_from(2u16).unwrap(),
+            "invalid_grant",
+        )
+        .unwrap();
+
+        let handle = spawn_with_config(
+            dir.path().to_path_buf(),
+            Arc::new(TtlCache::with_default_age()),
+            http,
+            noop_codex_http(Arc::new(AtomicU32::new(0))),
+            shutdown.clone(),
+            Duration::from_secs(60),
+            Duration::from_millis(0),
+        );
+
+        let state_path = dir
+            .path()
+            .join(crate::daemon::login_needed_alert::STATE_FILE);
+        for _ in 0..200 {
+            if state_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), handle.join)
+            .await
+            .expect("refresher did not shut down in time")
+            .expect("refresher panicked");
+
+        let state = std::fs::read_to_string(&state_path).expect("alert pass ran");
+        assert!(state.contains("\"slot\":2"), "state: {state}");
+        assert!(counter.load(Ordering::SeqCst) >= 1, "refresh still ran");
     }
 
     #[tokio::test]

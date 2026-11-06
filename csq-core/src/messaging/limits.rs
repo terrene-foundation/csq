@@ -2,7 +2,8 @@
 //! Nothing here touches the filesystem; `store` calls these under its lock.
 
 use super::frame::contains_frame_phrase;
-use super::model::{Message, Recipient, Sender};
+use super::model::{Message, Recipient, Sender, SenderSurface};
+use super::service;
 use crate::sessions::directives::{is_forbidden_char, DirectiveError};
 
 /// Longest body, in characters.
@@ -108,7 +109,32 @@ pub fn check_note(note: &str) -> Result<(), DirectiveError> {
 
 /// `Ok` when the sender block's text fields may be stored: bounded length, no forbidden
 /// character, no frame phrase; the hash is ASCII alphanumerics only.
+///
+/// A service sender is checked against its own shape: the identity fields are the
+/// grammar-checked name + a canonical UUIDv4 registration from a validated registry
+/// record, and the synthetic process block must be empty (pid 0, no handle dir, no name,
+/// no exact start). An inconsistent record — surface `service` without a service ref, or
+/// a service ref with a session surface/process fields — is refused, never treated as a
+/// session.
 pub fn check_sender(from: &Sender) -> Result<(), DirectiveError> {
+    if let Some(service_ref) = &from.service {
+        let ok = from.surface == SenderSurface::Service
+            && from.pid == 0
+            && from.handle_dir.is_empty()
+            && from.handle_dir_hash.is_empty()
+            && from.name.is_none()
+            && from.started_exact.is_none()
+            && service::validate_service_name(&service_ref.name).is_ok()
+            && service::is_registration_id(&service_ref.registration_id);
+        return if ok {
+            Ok(())
+        } else {
+            Err(DirectiveError::invalid("sender fields not allowed"))
+        };
+    }
+    if from.surface == SenderSurface::Service {
+        return Err(DirectiveError::invalid("sender fields not allowed"));
+    }
     let text_ok = |s: &str, cap: usize| {
         s.chars().count() <= cap && !s.chars().any(is_forbidden_char) && !contains_frame_phrase(s)
     };
@@ -149,10 +175,9 @@ pub fn check_rate(
             None,
         ));
     }
-    let me = from.as_recipient();
     let mut in_window: Vec<u64> = records
         .iter()
-        .filter(|m| m.from.as_recipient().same_session(&me) && m.to.same_session(to))
+        .filter(|m| m.from.same_identity(from) && m.to.same_session(to))
         .map(|m| m.created_at)
         .filter(|t| now.saturating_sub(*t) < RATE_WINDOW_SECS)
         .collect();
@@ -189,17 +214,18 @@ pub fn check_pending(
 }
 
 /// Refuse the send when `from` already has `limits.max_pending_per_sender` queued messages
-/// outstanding across all recipients, so one session cannot fill the store with unread
-/// mail for many peers. Surfaced records no longer consume this admission cap. Keyed by pid and
-/// start time, never the name.
+/// outstanding across all recipients, so one sender cannot fill the store with unread
+/// mail for many peers. Surfaced records no longer consume this admission cap. Sessions are
+/// keyed by pid and start time (never the name); a service by `(name, registration_id)`
+/// ([`Sender::same_identity`]).
 pub fn check_sender_pending(
     records: &[Message],
-    from: &Recipient,
+    from: &Sender,
     limits: &Limits,
 ) -> Result<(), DirectiveError> {
     let n = records
         .iter()
-        .filter(|m| m.counts_toward_pending_caps() && m.from.as_recipient().same_session(from))
+        .filter(|m| m.counts_toward_pending_caps() && m.from.same_identity(from))
         .count();
     if n >= limits.max_pending_per_sender {
         return Err(DirectiveError::rate_limited(
@@ -267,4 +293,95 @@ pub fn eviction_order(
         .chain(read)
         .map(|m| m.id.clone())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record() -> crate::messaging::service::ServiceRecord {
+        crate::messaging::service::ServiceRecord {
+            v: 1,
+            name: "nightly".to_string(),
+            uid: 7,
+            registration_id: "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".to_string(),
+            created_at: 9,
+        }
+    }
+
+    /// A service sender passes ONLY its own shape: a process field or a missing service
+    /// reference is refused, never reinterpreted as a session.
+    #[test]
+    fn a_service_sender_passes_only_its_own_shape() {
+        let sender = crate::messaging::model::service_sender(&record());
+        assert!(check_sender(&sender).is_ok());
+
+        let mut with_pid = sender.clone();
+        with_pid.pid = 9;
+        assert!(check_sender(&with_pid).is_err());
+
+        let mut without_ref = sender.clone();
+        without_ref.service = None;
+        assert!(
+            check_sender(&without_ref).is_err(),
+            "a `service` surface with no service reference must not pass as a session"
+        );
+
+        let mut session_shaped = crate::messaging::model::owner_sender();
+        session_shaped.service = sender.service.clone();
+        assert!(check_sender(&session_shaped).is_err());
+    }
+
+    fn service_message(record: &crate::messaging::service::ServiceRecord) -> Message {
+        let sender = crate::messaging::model::service_sender(record);
+        let id = "1a2b3c4d-abcd-4000-8000-000000000000";
+        serde_json::from_value(serde_json::json!({
+            "schema": "csq.message.v1",
+            "id": id,
+            "from": sender,
+            "to": {"pid": 2, "started_at": 5, "surface": "codex"},
+            "origin": {"Service": {
+                "name": record.name.clone(),
+                "registration_id": record.registration_id.clone(),
+            }},
+            "thread": id,
+            "body": "nightly backup failed",
+            "created_at": 1
+        }))
+        .unwrap()
+    }
+
+    /// Pending and rate accounting both key a service by `(name, registration_id)`: a
+    /// re-registration is a NEW identity with a fresh window, not a continuation.
+    #[test]
+    fn service_rate_and_pending_are_keyed_by_registration_not_by_name() {
+        let first = record();
+        let message = service_message(&first);
+        let mut reregistered = first.clone();
+        reregistered.registration_id = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4e".to_string();
+
+        let pending = Limits {
+            max_pending_per_sender: 1,
+            ..Limits::DEFAULT
+        };
+        let at_cap = crate::messaging::model::service_sender(&first);
+        assert!(check_sender_pending(std::slice::from_ref(&message), &at_cap, &pending).is_err());
+        let fresh = crate::messaging::model::service_sender(&reregistered);
+        assert!(check_sender_pending(std::slice::from_ref(&message), &fresh, &pending).is_ok());
+
+        let rate = Limits {
+            max_send_per_pair: 1,
+            ..Limits::DEFAULT
+        };
+        let recipient = message.to;
+        assert!(check_rate(
+            std::slice::from_ref(&message),
+            &at_cap,
+            &recipient,
+            2,
+            &rate
+        )
+        .is_err());
+        assert!(check_rate(std::slice::from_ref(&message), &fresh, &recipient, 2, &rate).is_ok());
+    }
 }

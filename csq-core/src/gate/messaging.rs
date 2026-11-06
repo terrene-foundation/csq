@@ -74,10 +74,11 @@ mod tests {
             pid,
             started_at: NOW - 10,
             started_exact: Some(NOW - 10),
-            surface: Surface::ClaudeCode,
+            surface: Surface::ClaudeCode.into(),
             handle_dir_hash: format!("handle{pid}"),
             handle_dir: format!("/private/term-{pid}"),
             name: None,
+            service: None,
         })
     }
 

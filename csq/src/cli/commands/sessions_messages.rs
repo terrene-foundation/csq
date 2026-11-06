@@ -37,7 +37,7 @@ use serde::Serialize;
 /// 4 000-character body cap, so the store's own check is what refuses an oversize body.
 const MAX_STDIN_BYTES: u64 = 256 * 1024;
 
-fn err(code: SdkErrorCode, message: &str) -> DirectiveError {
+pub(crate) fn err(code: SdkErrorCode, message: &str) -> DirectiveError {
     DirectiveError {
         code,
         message: message.to_string(),
@@ -61,11 +61,20 @@ fn build<T: Serialize>(
                 SdkError::trusted(SdkErrorCode::Undetermined, "result could not be serialized"),
             ),
         },
-        Err(e) => Envelope::failure(schema, None, SdkError::trusted(e.code, e.message)),
+        // The store's prose sentinel for a reply that would reach a service becomes its
+        // fixed §11.6 tag, so client logic matches the documented vocabulary (spec 32h
+        // §11.4: the CLI shape must handle a service explicitly, never fall through).
+        Err(e) => {
+            let e = store::caller_facing(e);
+            Envelope::failure(schema, None, SdkError::trusted(e.code, e.message))
+        }
     }
 }
 
-fn finish<T: Serialize>(schema: &'static str, result: Result<T, DirectiveError>) -> Result<()> {
+pub(crate) fn finish<T: Serialize>(
+    schema: &'static str,
+    result: Result<T, DirectiveError>,
+) -> Result<()> {
     let code = sdk::emit(&build(schema, result))?;
     if code != 0 {
         std::process::exit(code);
@@ -131,6 +140,11 @@ pub(crate) fn caller_error(e: CallerError) -> DirectiveError {
             SdkErrorCode::TargetMismatch,
             "caller is not running inside that session",
         ),
+        CallerError::HandleDirUnlisted => err(
+            SdkErrorCode::Undetermined,
+            "no live session owns the handle dir this process names",
+        )
+        .with_cause(Cause::SenderIdentity),
     }
 }
 
@@ -277,7 +291,7 @@ fn status_str(s: csq_core::messaging::Status) -> String {
     s.as_str().to_string()
 }
 
-fn receipt_dto(r: &Receipt) -> MessageReceipt {
+pub(crate) fn receipt_dto(r: &Receipt) -> MessageReceipt {
     MessageReceipt::new(&r.id, &r.thread, status_str(r.status), r.created_at)
         .with_surfaced_at(r.surfaced_at)
         .with_read_at(r.read_at)
@@ -298,6 +312,15 @@ fn entry_dto(v: &MessageView) -> MessageInboxEntry {
     .with_in_reply_to(v.in_reply_to.clone())
     .with_from_name(v.from_name.clone())
     .with_already_shown(v.already_shown);
+    // A service has no process identity: `from_pid: 0` would present a session shape
+    // (`spec 32h §11.4` — every reader must handle `service` explicitly). The view's
+    // ORIGIN flag is the authority; the surface arm keeps a record that merely CLAIMS
+    // `service` from printing a session shape (the frame withholds it).
+    let row = if v.is_service_sender() {
+        row.without_pid()
+    } else {
+        row
+    };
     let receipt = MessageReceipt::new(&v.id, &v.thread, status_str(v.status), v.created_at)
         .with_surfaced_at(v.surfaced_at)
         .with_read_at(v.read_at)
@@ -328,7 +351,7 @@ fn parse_send_target(t: &str) -> Result<SendTarget, DirectiveError> {
 }
 
 /// The live sessions with their registry names, and whether the listing was whole.
-type NameListing = Result<(Vec<Candidate>, bool), DirectiveError>;
+pub(crate) type NameListing = Result<(Vec<Candidate>, bool), DirectiveError>;
 
 /// The real listing for name resolution: both CLIs, enriched with names, repo and branch.
 pub(crate) fn real_candidates(base_dir: &Path) -> NameListing {
@@ -357,7 +380,7 @@ pub(crate) fn real_candidates(base_dir: &Path) -> NameListing {
     result.map_err(|e: DirectiveError| e.with_cause(Cause::RegistryRead))
 }
 
-fn read_stdin_bounded(mut input: impl Read) -> Result<String, DirectiveError> {
+pub(crate) fn read_stdin_bounded(mut input: impl Read) -> Result<String, DirectiveError> {
     let mut buf = Vec::new();
     input
         .by_ref()
@@ -1684,6 +1707,9 @@ mod tests {
     include!("sessions_clock_admission_tests.rs");
     use super::*;
     use csq_core::messaging::frame::end_line;
+    // Only the Unix-gated matrix tests name a sender surface.
+    #[cfg(unix)]
+    use csq_core::messaging::model::SenderSurface;
     use csq_core::sessions::{resolve_caller, SessionInfo, Visibility};
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -2091,7 +2117,7 @@ mod tests {
         let m = &p.messages[0];
         assert_eq!(m.receipt.status, "read");
         assert_eq!(m.message.from_surface, "codex");
-        assert_eq!(m.message.from_pid, 100);
+        assert_eq!(m.message.from_pid, Some(100));
         assert!(m.message.framed_body.contains("hello from codex"));
 
         let b = w.b();
@@ -2111,6 +2137,56 @@ mod tests {
         assert!(env.ok);
     }
 
+    /// LOW-6 — the CLI-side normaliser: a store `service_no_inbox` error becomes the fixed
+    /// §11.6 tag in the envelope a client parses. Falsifier: without `store::caller_facing`
+    /// the envelope's message is the prose sentinel, not the documented tag.
+    #[test]
+    fn a_reply_to_a_service_reports_the_fixed_tag_in_the_cli_envelope() {
+        let envelope = serde_json::to_value(build(
+            SCHEMA_MESSAGE_RECEIPT_V1,
+            Err::<MessageReceipt, _>(err(
+                SdkErrorCode::InvalidInput,
+                csq_core::messaging::store::SERVICE_NO_INBOX,
+            )),
+        ))
+        .unwrap();
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error"]["code"], "invalid_input");
+        assert_eq!(
+            envelope["error"]["message"],
+            csq_core::messaging::store::SERVICE_NO_INBOX_TAG
+        );
+    }
+
+    /// LOW-1 / LOW-6 — the CLI inbox row keys service-ness off the record's ORIGIN, not the
+    /// sender surface alone: an origin-Service record whose sender block claims a session
+    /// surface still omits `from_pid`. Falsifier: a surface-only check emits `Some(0)` and
+    /// presents a session shape.
+    #[test]
+    fn a_service_origin_row_never_carries_a_process_pid() {
+        let id = "1a2b3c4d-abcd-4000-8000-000000000001";
+        let registration_id = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        let message: csq_core::messaging::model::Message =
+            serde_json::from_value(serde_json::json!({
+                "schema": "csq.message.v1",
+                "id": id,
+                "from": {"pid": 0, "started_at": 7, "surface": "claude-code",
+                         "handle_dir_hash": "", "handle_dir": ""},
+                "to": {"pid": 200, "started_at": 6000, "surface": "claude-code"},
+                "origin": {"Service": {"name": "nightly", "registration_id": registration_id}},
+                "thread": id,
+                "body": "nightly backup failed",
+                "created_at": 1
+            }))
+            .unwrap();
+        let entry = entry_dto(&message.view());
+        assert_eq!(entry.message.from_surface, "claude-code");
+        assert_eq!(
+            entry.message.from_pid, None,
+            "a service has no process identity; `from_pid: 0` is a session shape"
+        );
+    }
+
     /// S3 criterion 2 / INV-32-01. The stored sender is the resolved caller, whatever the
     /// body, target string or reply id say; and the CLI has no argument that could name one.
     #[test]
@@ -2128,7 +2204,7 @@ mod tests {
         assert_eq!(rec["from"]["started_at"], 5_000);
         let b = w.b();
         let m = &w.inbox(true, None).messages[0];
-        assert_eq!(m.message.from_pid, 100, "{m:?}");
+        assert_eq!(m.message.from_pid, Some(100), "{m:?}");
         drop(b);
         // a forged target-embedded sender is not a target
         assert_eq!(
@@ -2753,7 +2829,8 @@ mod tests {
         let inbox = w.inbox(false, None);
         assert_eq!(inbox.messages.len(), 1);
         assert_eq!(
-            inbox.messages[0].message.from_pid, 100,
+            inbox.messages[0].message.from_pid,
+            Some(100),
             "sender is the proven caller"
         );
     }
@@ -3698,7 +3775,7 @@ mod tests {
             assert_eq!(c2.len(), 1);
             assert_eq!(
                 (c2[0].from_pid, c2[0].from_surface),
-                (300, Surface::ClaudeCode)
+                (300, SenderSurface::ClaudeCode)
             );
             assert!(
                 f.inbox_of(f.claude(0)).is_empty(),
@@ -4588,7 +4665,7 @@ mod tests {
             assert_eq!(c1.len(), 1);
             assert_eq!(
                 (c1[0].from_pid, c1[0].from_surface),
-                (f.x1.pid, Surface::Codex)
+                (f.x1.pid, SenderSurface::Codex)
             );
             assert!(f.inbox_of(f.claude(1)).is_empty());
         }
@@ -4614,7 +4691,7 @@ mod tests {
             assert_eq!(got.len(), 1);
             assert_eq!(
                 (got[0].from_pid, got[0].from_surface),
-                (f.x1.pid, Surface::Codex)
+                (f.x1.pid, SenderSurface::Codex)
             );
             assert!(f.inbox_of(f.codex_caller(&f.x1)).is_empty());
         }
@@ -4791,7 +4868,7 @@ mod tests {
             assert_eq!(got.len(), 1);
             assert_eq!(
                 (got[0].from_pid, got[0].from_surface),
-                (f.x1.pid, Surface::Codex)
+                (f.x1.pid, SenderSurface::Codex)
             );
             assert!(
                 f.inbox_of(f.claude(1)).len() == 1,

@@ -10,7 +10,9 @@
 //! get a `term-<pid>` handle dir before they can swap.
 
 pub mod config;
+pub mod eligibility;
 pub mod picker;
+pub mod session_override;
 
 pub use config::RotationConfig;
 pub use picker::{pick_best, suggest, Suggestion};

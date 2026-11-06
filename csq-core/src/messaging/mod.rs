@@ -13,6 +13,7 @@
 //! * [`store`] — the locked, atomic, fail-closed store operations.
 //! * [`mcp`] — the `csq mcp-messaging` stdio MCP server (spec 32 §4.2).
 //! * [`register`] — per-terminal registration of that server and the hooks (spec 32 §6).
+//! * [`service`] — registered service identities and the daemon send-service route (an internal ticket).
 
 pub mod deferred;
 pub mod fleet_directory;
@@ -27,10 +28,16 @@ pub mod register;
 pub mod registry;
 pub mod request;
 pub mod request_retry;
+pub mod service;
 pub mod storage;
 pub mod store;
 pub mod wake;
 
 pub use model::{
-    Message, MessageView, Receipt, Recipient, Sender, Status, Surface, VerifiedSession,
+    Message, MessageView, Origin, Receipt, Recipient, Sender, SenderSurface, ServiceRef, Status,
+    Surface, VerifiedSession,
+};
+pub use service::{
+    SendServiceError, SendServiceRequest, SendServiceResponse, SendServiceTo, ServiceRecord,
+    VerifiedService, SEND_SERVICE_ROUTE,
 };

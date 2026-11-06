@@ -90,6 +90,27 @@ fn csq_program_matches(program: &str) -> bool {
         || base.starts_with("csq_")
 }
 
+/// Restores the Rust runtime's `SIGPIPE` disposition after a
+/// `CommandExt::exec` that RETURNED (the exec failed).
+///
+/// std's exec path resets `SIGPIPE` to `SIG_DFL` in the CALLING process before
+/// `execve` and does not restore it on failure, so a process that keeps running
+/// (to report the error, write a corrective audit record, or keep serving) would
+/// be killed by the next write to a closed pipe instead of getting `EPIPE`.
+/// Call this immediately after every in-process `exec()` returns.
+///
+/// Only `SIGPIPE` is restored, to `SIG_IGN` — the disposition the Rust runtime
+/// gives csq at startup (no `on_broken_pipe` override). The other pre-exec
+/// effects (the thread's signal mask, `current_dir`, `pre_exec` closures) stay
+/// applied; no caller depends on them after a failed exec.
+#[cfg(unix)]
+pub fn restore_sigpipe_after_failed_exec() {
+    // SAFETY: setting a signal disposition to SIG_IGN touches no memory.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+}
+
 /// Spawns a long-lived process that is definitely NOT csq, and does not
 /// return until [`is_pid_foreign`] actually observes it as foreign.
 ///

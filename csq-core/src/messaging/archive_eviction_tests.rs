@@ -23,11 +23,12 @@ fn sender(pid: u32) -> Sender {
     Sender {
         pid,
         started_at: 5_000,
-        surface: Surface::Codex,
+        surface: Surface::Codex.into(),
         handle_dir_hash: format!("fixture{pid}"),
         handle_dir: format!("/fixture/{pid}"),
         name: None,
         started_exact: None,
+        service: None,
     }
 }
 #[cfg(test)]
@@ -204,7 +205,7 @@ fn full_archive_moves_128_with_two_equal_duplicates_and_exact_126_oldest_evictio
     )
     .unwrap();
     assert_eq!(answer.thread, id(9_001));
-    assert!(to.same_session(&sender(1).as_recipient()));
+    assert!(to.same_session(&sender(1).as_recipient().unwrap()));
     let gone_ack = ack(
         temp.path(),
         NOW + 3,

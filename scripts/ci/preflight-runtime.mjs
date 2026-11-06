@@ -27,7 +27,92 @@ export function scrubShellEnvironment(env = process.env) {
   return removed;
 }
 
-export const FLEET_SHARE_CAP = 6;
+// ── issue 1827 + issue 1763: LEG FAN-OUT PER RUN, FROM THE ENFORCED BOUND ─────────────
+// trestle owns host placement and csq never pins (offload-discipline.md), so the
+// ONE bound a preflight run can enforce on "legs on a host" is how many legs IT
+// has in flight: no host receives more than that total FROM THIS RUN. This is a
+// per-run bound, not a fleet-wide one: a concurrent preflight creates its own
+// admission scope and admits independently (the incident's six copies were six
+// runs, so the per-run cap bounds one run's contribution, not their sum).
+//
+// The per-leg divisor is the ENFORCED cap, not a measured peak: one leg's build
+// tree peaked at ~28 GiB (six concurrent sign-off copies, ~170 GiB total, on
+// one fleet host, 2026-11-03 — artifact-identity.md MUST-5: a measurement is a
+// typical value, so it cannot bound a worst case), while
+// scripts/ci/cargo-target-highwater.sh REFUSES a target above 32 GiB
+// (cap=34359738368, "no greater than 32 GiB"). The derivation therefore uses
+// 32 GiB: floor(host headroom / 32 GiB), minimum 1.
+//
+// Where a host's headroom is readable (trestle's own disk admission for the run
+// root: free_kib - floor_kib), the derivation is per host; the run's cap is the
+// MINIMUM of those, because placement is unpinned and the smallest host may
+// receive every leg. A host whose run-root numbers are ABSENT is UNREADABLE and
+// contributes LEG_FANOUT_DEFAULT, the same 2 the smallest named host yields
+// (the smallest fleet host's run root: 88.0 GiB above its 10.0 GiB floor →
+// floor(88 / 32) = 2); a host at or below its floor is readable and contributes
+// the minimum 1. The self-test pins LEG_DISK_BOUND_GIB to the enforced
+// constant in cargo-target-highwater.sh, so a drifted divisor reds.
+//
+// LEG_FANOUT_MAX is the pre-issue-1827 caller share; an override may not exceed it.
+export const LEG_DISK_BOUND_GIB = 32;
+export const LEG_FANOUT_DEFAULT = 2;
+export const LEG_FANOUT_MAX = 6;
+const KIB_PER_GIB = 1024 * 1024;
+// One host's cap from its own headroom above the trestle floor. Below one leg's
+// enforced cap the answer is 1, never 0: a host that cannot admit a full leg is
+// still bounded at one leg, and trestle's disk gate decides whether it runs.
+export function legCapForHeadroomKib(headroomKib) {
+  if (!Number.isSafeInteger(headroomKib) || headroomKib < 0) return 1;
+  return Math.max(1, Math.floor(headroomKib / (LEG_DISK_BOUND_GIB * KIB_PER_GIB)));
+}
+// Derive the run's cap from `trestle run --status --json`. TOTAL by design: a
+// malformed status, a host without disk admission, or a missing run root is an
+// UNREADABLE headroom (cap 2, named in the log), never a crash and never a
+// silent 6 — an unreadable fleet must not widen the blast radius.
+export function legFanoutFromStatus(status) {
+  const hosts = Array.isArray(status?.hosts) ? status.hosts : [];
+  const rows = hosts.map((host) => {
+    const name = typeof host?.name === 'string' && /^[A-Za-z0-9._-]{1,64}$/.test(host.name) ? host.name : 'unnamed';
+    const root = host?.disk_admission?.run_root;
+    const free = root?.free_kib, floor = root?.floor_kib;
+    // READABLE means the two numbers are present and sane; a host at (or below)
+    // its floor is still readable and derives the minimum 1 — treating it as
+    // unreadable would grant it the default 2 while it has no headroom at all.
+    const readable = Number.isSafeInteger(free) && Number.isSafeInteger(floor);
+    const headroomKib = readable ? free - floor : null;
+    const cap = readable ? Math.min(LEG_FANOUT_MAX, legCapForHeadroomKib(headroomKib)) : LEG_FANOUT_DEFAULT;
+    return { name, readable, headroom_kib: headroomKib, cap };
+  });
+  // The run's cap is the MINIMUM across hosts: placement is unpinned, so the
+  // smallest host may receive every leg. A single pass avoids a spread into
+  // Math.min (a hostile status can carry ~1.3M hosts under the 4 MiB capture
+  // cap, above the engine's argument limit); an empty fleet is the default.
+  let cap = LEG_FANOUT_DEFAULT;
+  if (rows.length) {
+    cap = LEG_FANOUT_MAX;
+    for (const row of rows) cap = Math.min(cap, Math.max(1, row.cap));
+  }
+  return { cap, hosts: rows };
+}
+// The effective cap. Precedence: the operator override, then the cap the
+// canonical parent DERIVED from the fleet status and carried to every worker
+// (CSQ_PREFLIGHT_LEG_CAP — the derivation is computed once, so a worker must not
+// re-read a moving fleet and disagree with the scope it admitted against), then
+// the unreadable-headroom default. A malformed or oversized value is REFUSED by
+// name, never clamped: a silent clamp hides a broken operator input.
+function validatedCap(raw, variable) {
+  if (typeof raw !== 'string' || !/^[1-9][0-9]*$/.test(raw)) throw new Error(`invalid ${variable} (a positive integer is required)`);
+  const cap = Number(raw);
+  if (cap > LEG_FANOUT_MAX) throw new Error(`invalid ${variable} (at most ${LEG_FANOUT_MAX}; one leg builds up to ${LEG_DISK_BOUND_GIB} GiB)`);
+  return cap;
+}
+export function legFanoutCap(env = process.env) {
+  const override = env.DEV_PREFLIGHT_MAX_LEGS_PER_HOST;
+  if (override !== undefined && override !== '') return validatedCap(override, 'DEV_PREFLIGHT_MAX_LEGS_PER_HOST');
+  const derived = env.CSQ_PREFLIGHT_LEG_CAP;
+  if (derived !== undefined && derived !== '') return validatedCap(derived, 'CSQ_PREFLIGHT_LEG_CAP');
+  return LEG_FANOUT_DEFAULT;
+}
 // Captured-output cap for a supervised child's stdout+stderr, in CHARACTERS.
 // ONE cap for capture() and for gate workers: unbounded concatenation reaches
 // V8's string limit and crashes the supervisor with a RangeError — the crash
@@ -106,11 +191,23 @@ export const IPC_SETTLE_BOUND_MS = 2_000;
 export const LEG_ATTEMPTS = 2;
 // The caller-slot admission SHARE each attempt contributes to the deadline. It
 // is a budget term, never a cap on one wait: a caller slot is held for a whole
-// attempt (queue wait + leg), so with FLEET_SHARE_CAP 6 and more legs than
-// that, a fixed 30-minute cap refused legs 7+ ("caller fleet admission failed")
-// exactly while the fleet was cooling. An attempt instead waits for a slot as
-// long as one FULL attempt bound still fits in what remains afterwards
-// (admissionWaitMsFor).
+// attempt (queue wait + leg), so a gate may need to wait for the cap to free.
+//
+// issue 1763 removed the queueing that forced the issue 1827 R1 raise (30 → 120 min):
+// runGateWorkers now forks at most legFanoutCap(env) workers (worker POOL), and
+// one worker holds at most one leg at a time (every runHeavy call site awaits
+// its leg before the next), so a forked worker's first admission is against a
+// slot it can have. The per-gate clock also starts at ADMISSION (gateClock
+// below), so a wait that still happens does not spend the gate budget. With the
+// queueing gone the deadline only has to fit its two attempts, derived from the
+// enforced inputs (A = 30 min; attempt = queue wait 45 + leg 65 = 110 min):
+//   2 × (30 + 110) = 280 min.
+// The admission term remains so a retry can still queue for a slot without being
+// refused; the pre-admission wait bound is admissionWaitMsFor(deadline, attempt)
+// = 170 min, and the worker watchdog covers admission + deadline + grace.
+// A queue that still exhausts either bound ends as the NAMED "gate deadline
+// exhausted … NOT a verdict" — never a wrong verdict — and the run is
+// re-runnable. Overload is always a named UNDETERMINED (exit 2), never a RED.
 export const LEG_ADMISSION_WAIT_MS = 30 * 60 * 1000;
 // Trestle's own queue wait, passed as `--wait-s` on EVERY attempt (the first
 // one included) and spent INSIDE the trestle invocation. Trestle withholds a
@@ -160,12 +257,14 @@ export function attemptMsFor(legMs, queueWaitMs = QUEUE_WAIT_MS) {
 }
 // The deadline: every attempt's admission share plus its full bound. A slow
 // admission spends the share of a later attempt (and so may forfeit the retry),
-// never extends the deadline.
-export function budgetDeadlineMsFor(attemptMs) {
-  return LEG_ATTEMPTS * (LEG_ADMISSION_WAIT_MS + attemptMs);
+// never extends the deadline. `admissionMs` is a FIXTURE-ONLY seam: a gate that
+// waits on admission must not spend this clock, and the self-test needs a
+// deadline small enough to observe its retry fitting (or not) in seconds.
+export function budgetDeadlineMsFor(attemptMs, admissionMs = LEG_ADMISSION_WAIT_MS) {
+  return LEG_ATTEMPTS * (admissionMs + attemptMs);
 }
-export function gateDeadlineMsFor(legMs, queueWaitMs = QUEUE_WAIT_MS) {
-  return budgetDeadlineMsFor(attemptMsFor(legMs, queueWaitMs));
+export function gateDeadlineMsFor(legMs, queueWaitMs = QUEUE_WAIT_MS, admissionMs = LEG_ADMISSION_WAIT_MS) {
+  return budgetDeadlineMsFor(attemptMsFor(legMs, queueWaitMs), admissionMs);
 }
 // How long an attempt may wait for a caller slot: everything that remains
 // beyond one full attempt bound. 0 means the attempt cannot start.
@@ -182,15 +281,34 @@ export function attemptBoundMsFor(legMs, remainingMs, queueWaitMs = QUEUE_WAIT_M
 export function retryFits(remainingMs, legMs, queueWaitMs = QUEUE_WAIT_MS) {
   return admissionWaitMsFor(remainingMs, attemptMsFor(legMs, queueWaitMs)) > 0;
 }
+// ── issue 1763: THE PER-GATE CLOCK STARTS AT ADMISSION ───────────────────────────
+// A gate worker waiting for a caller slot has not started its gate: queueing for
+// admission is not work the gate's budget pays for. The clock is armed by the
+// FIRST admitted attempt and never re-armed (a retry draws from the same clock),
+// so the full deadline is available to the attempts that actually run. The
+// separate OVERALL bound is the worker watchdog, measured from fork.
+// `now` is injectable so the self-test measures the property directly instead of
+// waiting on a wall clock.
+export function gateClock(deadlineMs, now = () => performance.now()) {
+  let admittedAt = null;
+  return {
+    admitted() { if (admittedAt === null) admittedAt = now(); },
+    get admittedAt() { return admittedAt; },
+    remainingMs() { return admittedAt === null ? deadlineMs : deadlineMs - (now() - admittedAt); },
+  };
+}
 // Upper bound on one async caller-slot wait. It only rejects a nonsense value:
 // every caller derives its wait from a deadline far below this.
 export const FLEET_ADMISSION_MAX_WAIT_MS = 12 * 60 * 60 * 1000;
 let defaultFleetScope;
-export function createFleetScope() {
+export function createFleetScope(env = process.env) {
+  // Resolve the cap BEFORE creating the directory: an invalid override must not
+  // leave an unregistered 0700 scope behind.
+  const cap = legFanoutCap(env);
   const directory = realpathSync(mkdtempSync(join(tmpdir(), 'csq-preflight-fleet-')));
   chmodSync(directory, 0o700);
   const token = randomUUID();
-  writeFileSync(join(directory, 'scope.json'), JSON.stringify({ schema: 'csq.preflight_fleet.v1', token, cap: FLEET_SHARE_CAP }), { mode: 0o600, flag: 'wx' });
+  writeFileSync(join(directory, 'scope.json'), JSON.stringify({ schema: 'csq.preflight_fleet.v1', token, cap }), { mode: 0o600, flag: 'wx' });
   process.on('exit', () => {
     // A crashed holder is never silently reaped into extra capacity. Retain
     // occupied scopes as diagnostics; clean only the empty caller-owned scope.
@@ -221,18 +339,23 @@ function fleetScope(env) {
   let directory = env.CSQ_PREFLIGHT_FLEET_DIR, token = env.CSQ_PREFLIGHT_FLEET_TOKEN;
   if (!directory && !token) {
     if (env.CSQ_PREFLIGHT_CANONICAL_WORKER === '1') throw new Error('canonical worker missing caller fleet admission');
-    defaultFleetScope ||= createFleetScope();
+    defaultFleetScope ||= createFleetScope(env);
     directory = defaultFleetScope.CSQ_PREFLIGHT_FLEET_DIR; token = defaultFleetScope.CSQ_PREFLIGHT_FLEET_TOKEN;
   }
   if (typeof directory !== 'string' || typeof token !== 'string' || !/^[0-9a-f-]{36}$/.test(token)) throw new Error('invalid caller fleet admission');
   const info = lstatSync(directory);
   if (!info.isDirectory() || info.isSymbolicLink() || realpathSync(directory) !== directory || (process.getuid && info.uid !== process.getuid()) || info.mode & 0o077) throw new Error('unsafe caller fleet directory');
   const scope = readFleetIdentity(join(directory, 'scope.json')).value;
-  if (scope.schema !== 'csq.preflight_fleet.v1' || scope.token !== token || scope.cap !== FLEET_SHARE_CAP) throw new Error('caller fleet identity mismatch');
-  return directory;
+  // The cap travels IN the scope (issue 1827) and must equal the caller's own
+  // configured cap: the scope is authoritative for ADMISSION, but a scope whose
+  // recorded cap disagrees with this caller's env is a tampered or stale
+  // admission identity (same-uid tampering must stay detectable), not a licence
+  // to admit at a different fan-out.
+  if (scope?.schema !== 'csq.preflight_fleet.v1' || scope?.token !== token || !Number.isInteger(scope?.cap) || scope.cap !== legFanoutCap(env)) throw new Error('caller fleet identity mismatch');
+  return { directory, cap: scope.cap };
 }
-function claimFleetSlot(directory) {
-  for (let slot = 0; slot < FLEET_SHARE_CAP; slot++) {
+function claimFleetSlot(directory, cap) {
+  for (let slot = 0; slot < cap; slot++) {
     const path = join(directory, 'slot-' + slot), nonce = randomUUID();
     try { mkdirSync(path, { mode: 0o700 }); } catch (e) { if (e.code === 'EEXIST') continue; throw e; }
     try { writeFileSync(join(path, 'lease.json'), JSON.stringify({ nonce, pid: process.pid }), { mode: 0o600, flag: 'wx' }); }
@@ -248,9 +371,9 @@ function claimFleetSlot(directory) {
 }
 export function acquireFleetSlotSync({ env = process.env, waitMs = 30 * 60 * 1000 } = {}) {
   if (!Number.isFinite(waitMs) || waitMs <= 0 || waitMs > 30 * 60 * 1000) throw new Error('invalid fleet admission deadline');
-  const directory = fleetScope(env), deadline = performance.now() + waitMs;
+  const { directory, cap } = fleetScope(env), deadline = performance.now() + waitMs;
   do {
-    const release = claimFleetSlot(directory); if (release) return release;
+    const release = claimFleetSlot(directory, cap); if (release) return release;
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(25, Math.max(1, deadline - performance.now())));
   } while (performance.now() < deadline);
   throw new Error('caller fleet admission deadline exhausted');
@@ -261,10 +384,10 @@ export function acquireFleetSlotSync({ env = process.env, waitMs = 30 * 60 * 100
 // that cannot await (it cannot observe a signal).
 export async function acquireFleetSlot({ env = process.env, waitMs = 30 * 60 * 1000, stopWhen = () => false } = {}) {
   if (!Number.isFinite(waitMs) || waitMs <= 0 || waitMs > FLEET_ADMISSION_MAX_WAIT_MS) throw new Error('invalid fleet admission deadline');
-  const directory = fleetScope(env), deadline = performance.now() + waitMs;
+  const { directory, cap } = fleetScope(env), deadline = performance.now() + waitMs;
   do {
     if (stopWhen()) throw new Error('caller fleet admission stopped by signal');
-    const release = claimFleetSlot(directory); if (release) return release;
+    const release = claimFleetSlot(directory, cap); if (release) return release;
     await new Promise((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, deadline - performance.now()))));
   } while (performance.now() < deadline);
   throw new Error('caller fleet admission deadline exhausted');
@@ -503,8 +626,10 @@ function stoppedResult(started) {
 }
 // `admissionWaitMs`, when given, is the caller-slot wait a deadline-budgeted
 // caller derived (admissionWaitMsFor); otherwise the slot wait is the capture's
-// own timeout, capped at 30 min, as before.
-export async function capture(command, args, { cwd, env = process.env, timeoutMs = 0, admissionWaitMs = 0, onTimeout = null, stopWhen = () => false } = {}) {
+// own timeout, capped at 30 min, as before. `onAdmitted` runs once the slot is
+// held and the stop latch has been re-checked: a deadline-budgeted caller arms
+// its clock there (issue 1763), so queueing for admission never spends the budget.
+export async function capture(command, args, { cwd, env = process.env, timeoutMs = 0, admissionWaitMs = 0, onTimeout = null, onAdmitted = null, stopWhen = () => false } = {}) {
   const started = performance.now();
   // The latch is checked BEFORE admission and again before the spawn: a stop
   // that lands during either window must never start a new detached group.
@@ -517,6 +642,7 @@ export async function capture(command, args, { cwd, env = process.env, timeoutMs
     return r;
   }
   if (stopWhen()) { try { release?.(); } catch { /* best effort: the run is stopping */ } return stoppedResult(started); }
+  if (typeof onAdmitted === 'function') onAdmitted();
   return new Promise((resolve) => {
     const supervised = supervise(command, args, { spawn: { cwd, env, detached: process.platform !== 'win32' } });
     const child = supervised.child;
@@ -595,10 +721,14 @@ export function lockedScript(command, { fixture = false, testWatchdogMs = 0 } = 
   return `cargo() { local tc="" sub; if [[ "\${1:-}" == +* ]]; then tc="$1"; shift; fi; sub="\${1:-}"; shift || return 125; case "$sub" in build|check|clippy|doc|run|metadata|tree|fetch|update|generate-lockfile) ${lockedCargo} ;; test) ${plainTest} ;; fmt|clean|help|--help|-h|--version|-V) if [[ -n "$tc" ]]; then command cargo "$tc" "$sub" "$@"; else command cargo "$sub" "$@"; fi ;; *) printf '%s\\n' 'UNDETERMINED: unsupported Cargo subcommand' >&2; return 125 ;; esac; };\n${command}`;
 }
 // Each sign-off leg prints its own status after its build and workload finish.
-export function measuredScript(command) {
+export function measuredScript(command, { token }) {
+  if (!/^[a-z0-9-]+$/.test(token || '')) throw new Error('Preflight leg token must be token-safe');
   // These are measurements from the executing checkout, never expected values
-  // supplied by the parent. pipefail preserves a failed git status producer.
-  return `set -o pipefail\nprintf '\\nCSQ_PREFLIGHT_LEG_START measured\\n' >&2\ncsq_tree=$(git rev-parse 'HEAD^{tree}') || exit 125\nprintf 'TREE=%s\\n' "$csq_tree"\ncsq_porcelain=$(git status --porcelain | wc -l) || exit 125\nprintf 'PORCELAIN=%s\\n' "$((csq_porcelain))"\n${command}`;
+  // supplied by the parent. pipefail preserves a failed git status producer; a
+  // failed measurement names its cause, token-framed so no leg output can forge
+  // it. svelteResult reads the marker only before the first phase, so it can
+  // name a measured-git refusal in the operator detail.
+  return `set -o pipefail\nprintf '\\nCSQ_PREFLIGHT_LEG_START measured\\n' >&2\ncsq_tree=$(git rev-parse 'HEAD^{tree}') || { printf 'CSQ_PREFLIGHT_LEG_REFUSED ${token} git-tree-unresolved\\n' >&2; exit 125; }\nprintf 'TREE=%s\\n' "$csq_tree"\ncsq_porcelain=$(git status --porcelain | wc -l) || { printf 'CSQ_PREFLIGHT_LEG_REFUSED ${token} git-status-unresolved\\n' >&2; exit 125; }\nprintf 'PORCELAIN=%s\\n' "$((csq_porcelain))"\n${command}`;
 }
 // Sign-off legs that are repo shell gates, not a cargo argv: they run verbatim
 // (each script drives its own cargo invocations, e.g. cargo-about's --locked).
@@ -869,7 +999,109 @@ export function signoffVerdict(result, { token, tree }) {
 // 2026-10-24 on linux, cargo 1.98.1: a config build.rustc-wrapper stub ran 4
 // times, 0 with RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER=
 // — so cargo can never reach the shared default server.
-export function cachedScript(command, { targetBudget = null } = {}) {
+// issue 1827: each leg removes the build output it created — AFTER its workload has
+// returned, on the leg's normal exit path (success or command failure). It is
+// deliberately NOT part of the EXIT trap that the stop ladder bounds: a 28 GiB
+// delete can outlive the trap's asserted 2 s kill grace, and a delete charged to
+// that ladder is killed silently mid-way. The caller's own leg bound covers
+// payload + cleanup; a stop that kills the leg leaves the host-side reap to
+// trestle (the same owner as the shipped tree).
+//
+// The log names EACH outcome: `removing` BEFORE the delete (so a kill during it
+// is not silence), then `removed` / `absent` / `FAILED` / `external`. A resolved
+// cargo target outside this leg's workspace (a worktree whose untracked
+// .cargo/config.toml points at its shared slot) is LEFT IN PLACE and named
+// `external`: deleting it would destroy a shared, sccache-warm directory this
+// leg did not create. Resolution failure leaves it in place too — a destructive
+// path fails closed (guard-reader-writer-parity.md MUST-2).
+//
+// The cleanup outcome the leg reported, from the TOKEN-BEARING single-record
+// channel only. The wrapper writes the state once into a leg-private file it
+// creates with O_EXCL semantics (a pre-created path or symlink makes that fail
+// closed to UNDETERMINED), then echoes that one record as
+// `CSQ_PREFLIGHT_LEG_OUTCOME <leg-token> target=<state>`. Workload stderr can
+// append anything it likes — a legacy cleanup line, an outcome line with a
+// foreign token — and none of it is read: absence or an unparsable record is
+// null (the caller renders UNDETERMINED when it expected a cleanup), never
+// `removed`. UPPERCASE matters: FAILED is a real outcome.
+export function legCleanupOutcome(stderr, token) {
+  if (typeof token !== 'string' || !/^[a-z0-9-]+$/.test(token)) return null;
+  const prefix = `CSQ_PREFLIGHT_LEG_OUTCOME ${token} target=`;
+  const matches = (typeof stderr === 'string' ? stderr : '').split(/\r?\n/)
+    .filter((line) => line.startsWith(prefix));
+  const state = matches.at(-1)?.slice(prefix.length) ?? null;
+  return state && /^[A-Za-z]+$/.test(state) ? state : null;
+}
+export function legCleanupPrelude(token) {
+  if (typeof token !== 'string' || !/^[a-z0-9-]+$/.test(token)) throw new Error('invalid leg marker token');
+  return `csq_leg_workspace=$(pwd -P) || csq_leg_workspace=$PWD
+csq_leg_outcome_dir=
+# The single-record outcome writer: a 0700 dir of this leg's own, a file created
+# with noclobber (O_EXCL: an existing entry, symlink included, refuses) and read
+# back before it is echoed. Any failure prints UNDETERMINED, never a guessed
+# state; the legacy progress lines below are for the leg log only.
+csq_leg_record() {
+  csq_leg_state=$1
+  if [ -z "$csq_leg_outcome_dir" ]; then
+    csq_leg_outcome_dir=$(mktemp -d "\${TMPDIR:-/tmp}/csq-leg-outcome.XXXXXX" 2>/dev/null) || csq_leg_outcome_dir=
+    [ -z "$csq_leg_outcome_dir" ] || chmod 700 "$csq_leg_outcome_dir" 2>/dev/null || csq_leg_outcome_dir=
+  fi
+  if [ -n "$csq_leg_outcome_dir" ] && [ ! -L "$csq_leg_outcome_dir/outcome" ] &&
+    ( set -C; printf '%s\\n' "$csq_leg_state" > "$csq_leg_outcome_dir/outcome" ) 2>/dev/null &&
+    csq_leg_read=$(cat "$csq_leg_outcome_dir/outcome" 2>/dev/null) && [ "$csq_leg_read" = "$csq_leg_state" ]; then
+    printf 'CSQ_PREFLIGHT_LEG_OUTCOME ${token} target=%s\\n' "$csq_leg_read" >&2
+  else
+    printf 'CSQ_PREFLIGHT_LEG_OUTCOME ${token} target=UNDETERMINED\\n' >&2
+  fi
+  [ -z "$csq_leg_outcome_dir" ] || rm -rf -- "$csq_leg_outcome_dir" 2>/dev/null
+  return 0
+}
+csq_leg_cleanup() {
+  [ -n "\${csq_leg_cleanup_done:-}" ] && return 0
+  csq_leg_cleanup_done=1
+  if [ -z "$csq_leg_workspace" ] || [ "$csq_leg_workspace" = / ]; then
+    printf 'CSQ_PREFLIGHT_LEG_CLEANUP target=unresolved name=unknown\\n' >&2
+    csq_leg_record unresolved
+    return 0
+  fi
+  csq_leg_target="$csq_leg_workspace/target"
+  csq_leg_resolved=
+  if [ -f "$csq_leg_workspace/Cargo.toml" ] && [ -r "$csq_leg_workspace/scripts/lib/cargo-target-dir.sh" ]; then
+    csq_leg_resolve_command='. "$1/scripts/lib/cargo-target-dir.sh" >/dev/null 2>&1; cargo_target_dir "$1"'
+    if command -v timeout >/dev/null 2>&1; then
+      csq_leg_resolved=$(timeout --signal=TERM --kill-after=5s 60s /bin/bash --noprofile --norc -c "$csq_leg_resolve_command" csq-leg-cleanup "$csq_leg_workspace" 2>/dev/null) || csq_leg_resolved=
+    else
+      csq_leg_resolved=$(/bin/bash --noprofile --norc -c "$csq_leg_resolve_command" csq-leg-cleanup "$csq_leg_workspace" 2>/dev/null) || csq_leg_resolved=
+    fi
+  fi
+  if [ -z "$csq_leg_resolved" ]; then
+    printf 'CSQ_PREFLIGHT_LEG_CLEANUP target=unresolved name=unknown\\n' >&2
+    csq_leg_record unresolved
+    return 0
+  fi
+  if [ "$csq_leg_resolved" != "$csq_leg_target" ]; then
+    printf 'CSQ_PREFLIGHT_LEG_CLEANUP target=external name=%s\\n' "$(basename -- "$csq_leg_resolved")" >&2
+    csq_leg_record external
+    return 0
+  fi
+  if [ ! -e "$csq_leg_target" ] && [ ! -L "$csq_leg_target" ]; then
+    printf 'CSQ_PREFLIGHT_LEG_CLEANUP target=absent name=target\\n' >&2
+    csq_leg_record absent
+    return 0
+  fi
+  printf 'CSQ_PREFLIGHT_LEG_CLEANUP target=removing name=target\\n' >&2
+  if rm -rf -- "$csq_leg_target"; then
+    printf 'CSQ_PREFLIGHT_LEG_CLEANUP target=removed name=target\\n' >&2
+    csq_leg_record removed
+  else
+    printf 'CSQ_PREFLIGHT_LEG_CLEANUP target=FAILED name=target\\n' >&2
+    csq_leg_record FAILED
+  fi
+  return 0
+}`;
+}
+export function cachedScript(command, { targetBudget = null, onExit = '' } = {}) {
+  if (onExit && !/^[a-z_][a-z0-9_]*$/.test(onExit)) throw new Error('invalid exit-hook name');
   // Opt in at the whole-leg boundary, once for helper build plus workload.
   // Callers export their final Cargo environment before invoking this shell.
   let payload = command;
@@ -880,16 +1112,27 @@ export function cachedScript(command, { targetBudget = null } = {}) {
     const quoted = "'" + command.replace(/'/g, "'\\''") + "'";
     payload = `bash scripts/ci/cargo-target-highwater.sh --workspace "$PWD"${capBytes === undefined ? '' : ` --cap-bytes ${capBytes}`} -- bash -c ${quoted}`;
   }
-  return `cache=""; csq_sccache_dir=""; unset SCCACHE_SERVER_UDS SCCACHE_SERVER_PORT SCCACHE_IDLE_TIMEOUT; if command -v timeout >/dev/null 2>&1 && command -v sccache >/dev/null 2>&1 && timeout --signal=TERM --kill-after=1s 3s sccache --version >/dev/null 2>&1; then csq_sccache_base="\${TMPDIR:-/tmp}"; case "$csq_sccache_base" in /*) ;; *) csq_sccache_base=/tmp ;; esac; [ "\${#csq_sccache_base}" -le 70 ] || csq_sccache_base=/tmp; if csq_sccache_dir=$(mktemp -d "$csq_sccache_base/csq-sccache.XXXXXX") && trap '[ -z "$csq_sccache_dir" ] || { [ -z "\${SCCACHE_SERVER_UDS:-}" ] || timeout --signal=TERM --kill-after=${trapSeconds(TRAP_STOP_KILL_AFTER_MS)} ${trapSeconds(TRAP_STOP_TIMEOUT_MS)} sccache --stop-server >/dev/null 2>&1 || echo CSQ_CACHE_STOP_UNDETERMINED >&2; rm -rf -- "$csq_sccache_dir"; }' EXIT && trap 'exit 143' TERM && trap 'exit 130' INT && trap 'exit 129' HUP && chmod 700 "$csq_sccache_dir"; then export SCCACHE_SERVER_UDS="$csq_sccache_dir/s" SCCACHE_IDLE_TIMEOUT=5400; if timeout --signal=TERM --kill-after=1s 10s sccache --start-server >&2; then cache="$(command -v sccache)"; export RUSTC_WRAPPER="$cache" CARGO_INCREMENTAL=0; printf '%s\\n' 'CSQ_CACHE_BEFORE' >&2; timeout --signal=TERM --kill-after=1s 3s sccache --show-stats >&2 || printf '%s\\n' 'CSQ_CACHE_STATS_UNDETERMINED' >&2; else printf '%s\\n' 'CSQ_CACHE_START_FAILED' >&2; timeout --signal=TERM --kill-after=1s 3s sccache --stop-server >/dev/null 2>&1 || printf '%s\\n' 'CSQ_CACHE_STOP_UNDETERMINED' >&2; { rm -rf -- "$csq_sccache_dir" && csq_sccache_dir=""; } || printf '%s\\n' 'CSQ_CACHE_SOCKET_CLEANUP_UNDETERMINED' >&2; unset SCCACHE_SERVER_UDS SCCACHE_IDLE_TIMEOUT; export RUSTC_WRAPPER='' CARGO_BUILD_RUSTC_WRAPPER='' RUSTC_WORKSPACE_WRAPPER='' CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER=''; printf '%s\\n' 'CSQ_CACHE_UNAVAILABLE' >&2; fi; else [ -z "$csq_sccache_dir" ] || rm -rf -- "$csq_sccache_dir"; csq_sccache_dir=""; export RUSTC_WRAPPER='' CARGO_BUILD_RUSTC_WRAPPER='' RUSTC_WORKSPACE_WRAPPER='' CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER=''; printf '%s\\n' 'CSQ_CACHE_UNAVAILABLE' >&2; fi; else export RUSTC_WRAPPER='' CARGO_BUILD_RUSTC_WRAPPER='' RUSTC_WORKSPACE_WRAPPER='' CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER=''; printf '%s\\n' 'CSQ_CACHE_UNAVAILABLE' >&2; fi\n( ${payload}\n); rc=$?; if [[ -n "$cache" ]]; then printf '%s\\n' 'CSQ_CACHE_AFTER' >&2; timeout --signal=TERM --kill-after=1s 3s sccache --show-stats >&2 || printf '%s\\n' 'CSQ_CACHE_STATS_UNDETERMINED' >&2; timeout --signal=TERM --kill-after=1s 3s sccache --stop-server >&2 || printf '%s\\n' 'CSQ_CACHE_STOP_UNDETERMINED' >&2; unset SCCACHE_SERVER_UDS; fi; [ -z "$csq_sccache_dir" ] || { rm -rf -- "$csq_sccache_dir" && csq_sccache_dir=""; } || printf '%s\\n' 'CSQ_CACHE_SOCKET_CLEANUP_UNDETERMINED' >&2; exit "$rc"`;
+  return `cache=""; csq_sccache_dir=""; unset SCCACHE_SERVER_UDS SCCACHE_SERVER_PORT SCCACHE_IDLE_TIMEOUT; if command -v timeout >/dev/null 2>&1 && command -v sccache >/dev/null 2>&1 && timeout --signal=TERM --kill-after=1s 3s sccache --version >/dev/null 2>&1; then csq_sccache_base="\${TMPDIR:-/tmp}"; case "$csq_sccache_base" in /*) ;; *) csq_sccache_base=/tmp ;; esac; [ "\${#csq_sccache_base}" -le 70 ] || csq_sccache_base=/tmp; if csq_sccache_dir=$(mktemp -d "$csq_sccache_base/csq-sccache.XXXXXX") && trap '[ -z "$csq_sccache_dir" ] || { [ -z "\${SCCACHE_SERVER_UDS:-}" ] || timeout --signal=TERM --kill-after=${trapSeconds(TRAP_STOP_KILL_AFTER_MS)} ${trapSeconds(TRAP_STOP_TIMEOUT_MS)} sccache --stop-server >/dev/null 2>&1 || echo CSQ_CACHE_STOP_UNDETERMINED >&2; rm -rf -- "$csq_sccache_dir"; }' EXIT && trap 'exit 143' TERM && trap 'exit 130' INT && trap 'exit 129' HUP && chmod 700 "$csq_sccache_dir"; then export SCCACHE_SERVER_UDS="$csq_sccache_dir/s" SCCACHE_IDLE_TIMEOUT=5400; if timeout --signal=TERM --kill-after=1s 10s sccache --start-server >&2; then cache="$(command -v sccache)"; export RUSTC_WRAPPER="$cache" CARGO_INCREMENTAL=0; printf '%s\\n' 'CSQ_CACHE_BEFORE' >&2; timeout --signal=TERM --kill-after=1s 3s sccache --show-stats >&2 || printf '%s\\n' 'CSQ_CACHE_STATS_UNDETERMINED' >&2; else printf '%s\\n' 'CSQ_CACHE_START_FAILED' >&2; timeout --signal=TERM --kill-after=1s 3s sccache --stop-server >/dev/null 2>&1 || printf '%s\\n' 'CSQ_CACHE_STOP_UNDETERMINED' >&2; { rm -rf -- "$csq_sccache_dir" && csq_sccache_dir=""; } || printf '%s\\n' 'CSQ_CACHE_SOCKET_CLEANUP_UNDETERMINED' >&2; unset SCCACHE_SERVER_UDS SCCACHE_IDLE_TIMEOUT; export RUSTC_WRAPPER='' CARGO_BUILD_RUSTC_WRAPPER='' RUSTC_WORKSPACE_WRAPPER='' CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER=''; printf '%s\\n' 'CSQ_CACHE_UNAVAILABLE' >&2; fi; else [ -z "$csq_sccache_dir" ] || rm -rf -- "$csq_sccache_dir"; csq_sccache_dir=""; export RUSTC_WRAPPER='' CARGO_BUILD_RUSTC_WRAPPER='' RUSTC_WORKSPACE_WRAPPER='' CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER=''; printf '%s\\n' 'CSQ_CACHE_UNAVAILABLE' >&2; fi; else export RUSTC_WRAPPER='' CARGO_BUILD_RUSTC_WRAPPER='' RUSTC_WORKSPACE_WRAPPER='' CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER=''; printf '%s\\n' 'CSQ_CACHE_UNAVAILABLE' >&2; fi\n( ${payload}\n); rc=$?; if [[ -n "$cache" ]]; then printf '%s\\n' 'CSQ_CACHE_AFTER' >&2; timeout --signal=TERM --kill-after=1s 3s sccache --show-stats >&2 || printf '%s\\n' 'CSQ_CACHE_STATS_UNDETERMINED' >&2; timeout --signal=TERM --kill-after=1s 3s sccache --stop-server >&2 || printf '%s\\n' 'CSQ_CACHE_STOP_UNDETERMINED' >&2; unset SCCACHE_SERVER_UDS; fi; [ -z "$csq_sccache_dir" ] || { rm -rf -- "$csq_sccache_dir" && csq_sccache_dir=""; } || printf '%s\\n' 'CSQ_CACHE_SOCKET_CLEANUP_UNDETERMINED' >&2; ${onExit ? `${onExit}; ` : ''}exit "$rc"`;
 }
 export function aggregateExit(rows) {
   if (rows.some((r) => r.state === 'RED')) return 1;
   if (rows.some((r) => r.state === 'UNDETERMINED')) return 2;
   return 0;
 }
-export async function runGateWorkers(names, { script, cwd, env, fingerprint, onComplete, timeoutMs = 35 * 60 * 1000 }) {
-  const children = new Set();
-  const fleetEnv = env.CSQ_PREFLIGHT_FLEET_DIR ? env : { ...env, ...(defaultFleetScope ||= createFleetScope()) };
+export async function runGateWorkers(names, { script, cwd, env, fingerprint, onComplete, timeoutMs = 35 * 60 * 1000, poolSize = null }) {  const children = new Set();
+  const fleetEnv = env.CSQ_PREFLIGHT_FLEET_DIR ? env : { ...env, ...(defaultFleetScope ||= createFleetScope(env)) };
+  // issue 1763: the worker POOL is bounded too. A forked worker whose gate needs a
+  // caller slot only waits if the run already has `cap` legs in flight; forking
+  // every gate at once (the pre-issue-1763 shape, ≥13 workers against a cap of 2)
+  // parked workers on admission, and each parked worker both held its gate and
+  // spent its deadline while unable to start. The pool is the admission cap:
+  // with one leg per worker (every runHeavy call site awaits its leg) a forked
+  // worker's attempt is against a slot it can have. A gate not yet forked holds
+  // nothing and burns no clock; the worker watchdog starts at fork.
+  // A caller-supplied pool size must be a positive integer: NaN or 0 would
+  // silently fork zero workers and resolve with a sparse result set.
+  if (poolSize !== null && (!Number.isInteger(poolSize) || poolSize < 1)) throw new Error('invalid gate worker pool size (a positive integer is required)');
+  const pool = Math.max(1, Math.min(names.length, poolSize ?? legFanoutCap(fleetEnv)));
   // Every worker is ADOPTED by the one supervisor: liveness (exit-keyed), the
   // group probe and the KILL backstop are owned there, and the process-wide
   // stop handlers drain this set too (D237 R3 — this site's own timer/probe
@@ -899,7 +1142,7 @@ export async function runGateWorkers(names, { script, cwd, env, fingerprint, onC
     const childEnv = { ...fleetEnv, DEV_PREFLIGHT_ONLY: name, CSQ_PREFLIGHT_WORKER_TOKEN: token,
       CSQ_PREFLIGHT_PARENT_FINGERPRINT: fingerprint, CSQ_PREFLIGHT_CANONICAL_WORKER: env.DEV_PREFLIGHT_ONLY ? '0' : '1' };
     if (!env.DEV_PREFLIGHT_ONLY) {
-      for (const key of ['DEV_PREFLIGHT_SELFTEST_LOCAL','CSQ_PREFLIGHT_LOCAL','DEV_PREFLIGHT_SELFTEST_CEILING_MS','DEV_PREFLIGHT_SELFTEST_PER_TEST_MS','DEV_PREFLIGHT_FORCE_NO_BASH','DEV_PREFLIGHT_FORCE_WINGNU','DEV_PREFLIGHT_FORCE_NO_WINGNU','DEV_PREFLIGHT_LEG_TIMEOUT_MS']) delete childEnv[key];
+      for (const key of ['DEV_PREFLIGHT_SELFTEST_LOCAL','CSQ_PREFLIGHT_LOCAL','DEV_PREFLIGHT_SELFTEST_CEILING_MS','DEV_PREFLIGHT_SELFTEST_PER_TEST_MS','DEV_PREFLIGHT_FORCE_NO_BASH','DEV_PREFLIGHT_FORCE_WINGNU','DEV_PREFLIGHT_FORCE_NO_WINGNU','DEV_PREFLIGHT_LEG_TIMEOUT_MS','DEV_PREFLIGHT_ADMISSION_WAIT_MS']) delete childEnv[key];
     }
     const child = fork(script, [], { cwd, env: childEnv, execArgv: [], stdio: ['ignore', 'pipe', 'pipe', 'ipc'], detached: process.platform !== 'win32' });
     const supervised = adopt(child, { graceMs: WORKER_KILL_GRACE_MS });
@@ -993,5 +1236,20 @@ export async function runGateWorkers(names, { script, cwd, env, fingerprint, onC
     });
     child.on('close', () => { stdioClosed = true; children.delete(child); if (exited && ipcClosed) doSettleNow(); });
   });
-  return Promise.all(names.map(launch));
+  // Slots are handed out in dispatch order and results come back in NAME order
+  // (the parent's receipt and summary are ordered, not completion-ordered). A
+  // stop that lands while names are still queued ends with those gates never
+  // forked: the stop handlers drain the live set and exit, so no unforked gate
+  // can hold a child or a slot.
+  const results = new Array(names.length);
+  let next = 0;
+  const drain = async () => {
+    for (;;) {
+      const index = next++;
+      if (index >= names.length) return;
+      results[index] = await launch(names[index]);
+    }
+  };
+  await Promise.all(Array.from({ length: pool }, drain));
+  return results;
 }

@@ -1026,6 +1026,13 @@ pub fn emit_gemini_native(
 ///   destroys the slot's OAuth credentials and logs the account out. The
 ///   caller's only remaining job on `Err` is to fall back to Level-1 prose
 ///   delivery — there is nothing left to clean up on its side.
+///
+/// **Blocking.** This function does synchronous file I/O and, on a failed
+/// emit, may sleep up to the cleanup retry budget ([`RESTORE_BUDGET`]) plus
+/// the in-flight attempts. An async caller MUST run it off the runtime
+/// (`tokio::task::spawn_blocking`), never on a worker thread or while holding
+/// an async lock. (No production caller exists yet; this is a wiring-shard
+/// requirement.)
 pub fn emit_kimi_native(
     arts: &SurfaceArtifacts,
     dest: &Path,
@@ -1040,7 +1047,9 @@ pub fn emit_kimi_native(
             // doc comment above) — self-clean ONLY the files this call
             // wrote so far (restoring any it overwrote); never touch
             // anything else under `dest`.
-            cleanup_partial_write(dest, &manifest, &prior);
+            // The original error is what the caller needs; the restore
+            // summary is diagnostic (tracing warn + test hook) only.
+            let _ = cleanup_partial_write(dest, &manifest, &prior);
             Err(e)
         }
     }
@@ -1092,19 +1101,129 @@ fn emit_kimi_native_inner(
     Ok(())
 }
 
-/// Fixed-vocabulary classification of a restore failure for logging: the
-/// `std::io::ErrorKind` name for I/O errors, otherwise `"other"`. Never
-/// carries the error's message (which can embed paths or payloads).
-fn platform_error_kind(e: &crate::error::PlatformError) -> &'static str {
+/// One restore attempt's failure, in a fixed vocabulary: the stage, the OS
+/// error kind and whether the kind can clear on its own. Never carries an
+/// error message (which can embed paths or payloads).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RestoreFailure {
+    stage: &'static str,
+    io_kind: &'static str,
+    /// Retry-worthy: a foreign handle (antivirus, indexer) can release it.
+    transient: bool,
+}
+
+/// Marker error: the path exists but is not a regular file (a FIFO, device,
+/// directory, ...). Carried inside an `std::io::Error` so both read sites can
+/// refuse it without ever blocking on it.
+#[derive(Debug)]
+struct NotRegularFile;
+
+impl std::fmt::Display for NotRegularFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("not a regular file")
+    }
+}
+
+impl std::error::Error for NotRegularFile {}
+
+fn not_regular_file() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, NotRegularFile)
+}
+
+/// Unix: open `abs` for reading without following a final symlink
+/// (`O_NOFOLLOW`) and without blocking (`O_NONBLOCK`, so opening a FIFO with
+/// no writer returns instead of waiting forever), then `fstat` the OPENED
+/// descriptor and refuse anything that is not a regular file. A regular file
+/// ignores `O_NONBLOCK`, so the following read is an ordinary blocking read.
+/// Open errors (`ELOOP`, `ENOENT`, ...) pass through unchanged.
+#[cfg(unix)]
+fn open_regular_nofollow(abs: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(abs)?;
+    if !f.metadata()?.is_file() {
+        return Err(not_regular_file());
+    }
+    Ok(f)
+}
+
+/// Classify an `std::io::Error`.
+///
+/// On Windows, std (`sys/io/error/windows.rs` `decode_error_kind`) maps
+/// `ERROR_ACCESS_DENIED` (5) to `PermissionDenied` and `ERROR_BUSY` to
+/// `ResourceBusy`, but leaves `ERROR_SHARING_VIOLATION` (32) and
+/// `ERROR_LOCK_VIOLATION` (33) unmapped (they surface as `Uncategorized`), so
+/// those are recognised by raw code on Windows only (on Unix 32/33 are
+/// EPIPE/EDOM). `NotFound`, `StorageFull`, `AlreadyExists` and every other
+/// kind are permanent for this purpose and are never retried.
+fn classify_io(stage: &'static str, e: &std::io::Error) -> RestoreFailure {
+    use std::io::ErrorKind;
+    if e.get_ref()
+        .is_some_and(|inner| inner.is::<NotRegularFile>())
+    {
+        return RestoreFailure {
+            stage,
+            io_kind: "not_regular_file",
+            transient: false,
+        };
+    }
+    let win_code = if cfg!(windows) {
+        e.raw_os_error()
+    } else {
+        None
+    };
+    let (io_kind, transient) = match (e.kind(), win_code) {
+        (ErrorKind::PermissionDenied, _) => ("permission_denied", true),
+        (ErrorKind::ResourceBusy, _) => ("resource_busy", true),
+        (_, Some(32)) => ("sharing_violation", true),
+        (_, Some(33)) => ("lock_violation", true),
+        (ErrorKind::NotFound, _) => ("not_found", false),
+        (ErrorKind::AlreadyExists, _) => ("already_exists", false),
+        (ErrorKind::StorageFull, _) => ("storage_full", false),
+        _ => ("io_other", false),
+    };
+    RestoreFailure {
+        stage,
+        io_kind,
+        transient,
+    }
+}
+
+/// Classify a [`crate::error::PlatformError`]. On Windows a refused publish
+/// surfaces as `Win32 { code, .. }` (not `Io`); 5 / 32 / 33 are marked
+/// transient.
+///
+/// This is deliberately WIDER than what `windows_publish` retries internally,
+/// which is per stage: 32/33 only at its Open stage, and 5 only at its Rename
+/// stage and only when the target is not a directory (`windows_replace_retry`;
+/// the Validate stage is never retried). The outer loop here also retries a 5
+/// that came from the Validate stage or a directory target. That is bounded
+/// by [`RESTORE_ATTEMPTS`] and [`RESTORE_BUDGET`] and harmless: every retry
+/// first re-reads the target and compares it with the published digest, so a
+/// retry costs time but cannot write over a changed file.
+fn classify_platform(stage: &'static str, e: &crate::error::PlatformError) -> RestoreFailure {
     match e {
-        crate::error::PlatformError::Io(io) => match io.kind() {
-            std::io::ErrorKind::NotFound => "not_found",
-            std::io::ErrorKind::PermissionDenied => "permission_denied",
-            std::io::ErrorKind::AlreadyExists => "already_exists",
-            std::io::ErrorKind::StorageFull => "storage_full",
-            _ => "io_other",
+        crate::error::PlatformError::Io(io) => classify_io(stage, io),
+        crate::error::PlatformError::Win32 { code, .. } => {
+            let (io_kind, transient) = match code {
+                5 => ("win32_access_denied", true),
+                32 => ("win32_sharing_violation", true),
+                33 => ("win32_lock_violation", true),
+                _ => ("other", false),
+            };
+            RestoreFailure {
+                stage,
+                io_kind,
+                transient,
+            }
+        }
+        _ => RestoreFailure {
+            stage,
+            io_kind: "other",
+            transient: false,
         },
-        _ => "other",
     }
 }
 
@@ -1124,7 +1243,225 @@ fn platform_error_kind(e: &crate::error::PlatformError) -> &'static str {
 /// carve-out): the ORIGINAL [`MaterializeError`] is what the caller needs
 /// to see, and a cleanup failure here must not mask it or abort the unwind
 /// partway through.
-fn cleanup_partial_write(dest: &Path, manifest: &MaterializedManifest, prior: &PriorContents) {
+///
+/// Returns a [`RestoreSummary`] of each overwritten artifact's restore
+/// outcome. The emitters ignore it (the original error is what they return);
+/// it exists so a test can print which stage failed, with what `io_kind`, after
+/// how many attempts.
+fn cleanup_partial_write(
+    dest: &Path,
+    manifest: &MaterializedManifest,
+    prior: &PriorContents,
+) -> RestoreSummary {
+    let summary = cleanup_partial_write_with(
+        dest,
+        manifest,
+        prior,
+        RESTORE_BACKOFF,
+        RESTORE_BUDGET,
+        &mut restore_prior_once,
+    );
+    #[cfg(test)]
+    LAST_RESTORE_SUMMARY.with(|slot| *slot.borrow_mut() = Some(summary.clone()));
+    summary
+}
+
+/// Outcome of restoring one overwritten prior artifact. Fixed vocabulary only:
+/// attempt counts, the stage name and the `std::io::ErrorKind` name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RestoreOutcome {
+    /// Restored to the prior bytes; `attempts` is the number of attempts made.
+    Restored { attempts: u32 },
+    /// The file was kept. `stage`/`io_kind` are the LAST attempt's failure, or
+    /// `changed_since_publish` / `none` when a third party edited the file
+    /// after this call published it (nothing was written). `attempts` is the
+    /// number of attempts actually made.
+    Kept {
+        stage: &'static str,
+        io_kind: &'static str,
+        attempts: u32,
+    },
+}
+
+/// Per-file restore outcomes, in manifest order (`rel` path, outcome). Files
+/// this call newly created (no prior content) are removed, not restored, and
+/// do not appear.
+type RestoreSummary = Vec<(String, RestoreOutcome)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the summary of the most recent `cleanup_partial_write` on
+    /// this thread, so the emitter tests can report it without changing the
+    /// emitters' error type.
+    static LAST_RESTORE_SUMMARY: std::cell::RefCell<Option<RestoreSummary>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Enforced cap on restore attempts per overwritten artifact (an attempt that
+/// reads, verifies and re-stages counts once).
+///
+/// 3, not more: on Windows each attempt's `replace` already runs
+/// `windows_publish`, which retries a transient rename/open refusal 5 times
+/// with 100 ms pauses. The outer loop exists for what that inner loop does
+/// not cover (a refused STAGE create, a refusal that clears between the inner
+/// loop's last try and ours, the validate stage); stacking the full 5 on top
+/// would multiply the inner waits for no added coverage.
+const RESTORE_ATTEMPTS: u32 = 3;
+const _: () = assert!(RESTORE_ATTEMPTS >= 1);
+
+/// Pause between restore attempts.
+const RESTORE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Budget for ALL retries in one cleanup, measured from the start of the
+/// cleanup. A retry (never a first attempt) whose pause would end after it is
+/// not started.
+///
+/// The composite bound, from enforced limits: every overwritten artifact gets
+/// its first attempt regardless of the budget; retries add at most
+/// `(RESTORE_ATTEMPTS - 1) * RESTORE_BACKOFF` (200 ms) of csq sleeping per
+/// artifact, and all retry pauses together end by `RESTORE_BUDGET` (2 s).
+/// On Windows one attempt can ITSELF wait up to 4 x 100 ms inside
+/// `windows_publish` plus its holder probe (`HOLDER_PROBE_BUDGET`, 500 ms),
+/// about 0.9 s, so the total is at most
+/// `RESTORE_BUDGET + N_overwritten * (one in-flight attempt)` for N artifacts.
+/// The duration of the OS calls themselves is not bounded by csq.
+const RESTORE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Outcome of one restore attempt.
+type RestoreResult = Result<(), RestoreFailure>;
+
+/// One restore attempt: stage the prior bytes beside `abs` and publish them.
+/// A failed publish drops the writer, which removes only its own staging file,
+/// so each attempt re-stages from scratch.
+fn restore_prior_once(abs: &Path, bytes: &[u8]) -> RestoreResult {
+    // Prior bytes are unrestricted. The private creator owns failure
+    // cleanup; do not unlink an unowned create-new collision.
+    match write_private_tmp_retained(abs, bytes) {
+        Ok(writer) => writer
+            .replace(abs)
+            .map_err(|e| classify_platform("replace", &e)),
+        Err(e) => Err(classify_platform("stage", &e)),
+    }
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).into()
+}
+
+/// Read `abs` as it is NOW, refusing (never reading through) a symlink at the
+/// final component with the same `O_NOFOLLOW` open [`snapshot_prior_if_exists`]
+/// uses (non-Unix: its `symlink_metadata`-then-read form).
+fn read_current_nofollow(abs: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use std::io::Read as _;
+        let mut f = open_regular_nofollow(abs)?;
+        let mut bytes = Vec::new();
+        f.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        let meta = std::fs::symlink_metadata(abs)?;
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "symlink at restore target",
+            ));
+        }
+        if !meta.is_file() {
+            return Err(not_regular_file());
+        }
+        std::fs::read(abs)
+    }
+}
+
+/// Restore one overwritten artifact. Before EVERY attempt (the first
+/// included) the file is re-read and compared with the digest of the bytes
+/// THIS call published: if a third party changed it since, nothing is written
+/// (`changed_since_publish`); an unreadable file is never written either.
+/// A file already holding the prior bytes counts as restored (a replace that
+/// reported an error after its rename took effect).
+fn restore_one(
+    abs: &Path,
+    prior_bytes: &[u8],
+    published: Option<[u8; 32]>,
+    backoff: std::time::Duration,
+    deadline: std::time::Instant,
+    restore: &mut dyn FnMut(&Path, &[u8]) -> RestoreResult,
+) -> RestoreOutcome {
+    let prior_digest = sha256(prior_bytes);
+    let mut last: Option<RestoreFailure> = None;
+    let mut attempts = 0u32;
+    for attempt in 0..RESTORE_ATTEMPTS {
+        if attempt > 0 {
+            let retryable = last.is_some_and(|f| f.transient);
+            if !retryable || std::time::Instant::now() + backoff > deadline {
+                break;
+            }
+            std::thread::sleep(backoff);
+        }
+        attempts = attempt + 1;
+        match read_current_nofollow(abs) {
+            Err(e) => {
+                last = Some(classify_io("read_before_restore", &e));
+                continue;
+            }
+            Ok(current) => {
+                let digest = sha256(&current);
+                if digest == prior_digest {
+                    return RestoreOutcome::Restored { attempts };
+                }
+                if published != Some(digest) {
+                    return RestoreOutcome::Kept {
+                        stage: "changed_since_publish",
+                        io_kind: "none",
+                        attempts,
+                    };
+                }
+            }
+        }
+        match restore(abs, prior_bytes) {
+            Ok(()) => return RestoreOutcome::Restored { attempts },
+            Err(f) => last = Some(f),
+        }
+    }
+    let f = last.unwrap_or(RestoreFailure {
+        stage: "restore",
+        io_kind: "other",
+        transient: false,
+    });
+    RestoreOutcome::Kept {
+        stage: f.stage,
+        io_kind: f.io_kind,
+        attempts,
+    }
+}
+
+/// [`cleanup_partial_write`] with its restore attempt, backoff and retry
+/// budget injectable, so the retry contract is testable without a platform
+/// fault.
+///
+/// A restore failure can be a transient foreign handle (antivirus or indexer
+/// holding the file this call just published; native Windows CI saw the
+/// restore leave this call's bytes in place on one run in a sequence that
+/// otherwise passed). A TRANSIENT failure ([`RestoreFailure::transient`]) is
+/// retried, re-staging each time, up to [`RESTORE_ATTEMPTS`] with `backoff`
+/// between attempts and within `budget` for all retries together (see
+/// [`RESTORE_BUDGET`] for the composite bound). A permanent failure, an
+/// exhausted cap or budget, a third-party edit, or an unreadable file ends
+/// with the an internal ticket keep-and-warn path.
+fn cleanup_partial_write_with(
+    dest: &Path,
+    manifest: &MaterializedManifest,
+    prior: &PriorContents,
+    backoff: std::time::Duration,
+    budget: std::time::Duration,
+    restore: &mut dyn FnMut(&Path, &[u8]) -> RestoreResult,
+) -> RestoreSummary {
+    let mut summary = RestoreSummary::new();
+    let deadline = std::time::Instant::now() + budget;
     for rel in manifest.files.keys() {
         if let Some(bytes) = prior.get(rel) {
             // Round-6 MED: this call OVERWROTE a prior artifact and then
@@ -1133,33 +1470,34 @@ fn cleanup_partial_write(dest: &Path, manifest: &MaterializedManifest, prior: &P
             // when the restore succeeds; on failure the file is kept (see
             // the an internal ticket note below), holding this call's complete bytes.
             let abs = dest.join(rel);
-            // Prior bytes are unrestricted. The private creator owns failure
-            // cleanup; do not unlink an unowned create-new collision.
-            let failure = match write_private_tmp_retained(&abs, bytes) {
-                Ok(writer) => writer
-                    .replace(&abs)
-                    .err()
-                    .map(|e| ("replace", platform_error_kind(&e))),
-                Err(e) => Some(("stage", platform_error_kind(&e))),
-            };
-            if let Some((stage, kind)) = failure {
+            let outcome = restore_one(
+                &abs,
+                bytes,
+                prior.published_digest(rel),
+                backoff,
+                deadline,
+                restore,
+            );
+            if let RestoreOutcome::Kept { stage, io_kind, .. } = outcome {
                 // an internal ticket: a failed restore (transient foreign handle, ENOSPC
                 // correlated with the emit's own failure) MUST NEVER remove
                 // the artifact. `abs` currently holds either the prior bytes
                 // or this call's complete replacement (`atomic_replace`
-                // publishes whole files, never torn ones); deleting it
-                // turned a transient failure into permanent loss of a
-                // previously working artifact. Leave it in place and make
-                // the failure observable. Fixed-vocabulary fields only: the
-                // stage and the OS error kind, never file contents.
+                // publishes whole files, never torn ones), or a third
+                // party's edit; deleting it turned a transient failure into
+                // permanent loss of a previously working artifact. Leave it
+                // in place and make the failure observable. Fixed-vocabulary
+                // fields only: the stage and the OS error kind, never file
+                // contents.
                 tracing::warn!(
                     error_kind = "materialize_restore_failed",
                     stage,
-                    io_kind = kind,
+                    io_kind,
                     rel_path = rel.as_str(),
                     "emit cleanup could not restore the prior artifact; the file was left in place (it may hold this call's content) — re-run the emit to regenerate it"
                 );
             }
+            summary.push((rel.clone(), outcome));
             continue;
         }
         let _ = std::fs::remove_file(dest.join(rel));
@@ -1218,6 +1556,7 @@ fn cleanup_partial_write(dest: &Path, manifest: &MaterializedManifest, prior: &P
             }
         }
     }
+    summary
 }
 
 /// Emit the Grok-native artifact tree for `arts` rooted at `dest` (`dest` is
@@ -1274,6 +1613,10 @@ fn cleanup_partial_write(dest: &Path, manifest: &MaterializedManifest, prior: &P
 /// SELF-CLEANS on any [`MaterializeError`] — only the files THIS call
 /// wrote are removed before the error is returned; the caller's only job
 /// on `Err` is to fall back to Level-1 prose delivery.
+///
+/// **Blocking.** Same contract as [`emit_kimi_native`]: synchronous I/O with a
+/// bounded cleanup sleep ([`RESTORE_BUDGET`]); an async caller MUST run it via
+/// `tokio::task::spawn_blocking`.
 pub fn emit_grok_native(
     arts: &SurfaceArtifacts,
     dest: &Path,
@@ -1288,7 +1631,9 @@ pub fn emit_grok_native(
             // doc comment above) — self-clean ONLY the files this call
             // wrote so far (restoring any it overwrote); never touch
             // anything else under `dest`.
-            cleanup_partial_write(dest, &manifest, &prior);
+            // The original error is what the caller needs; the restore
+            // summary is diagnostic (tracing warn + test hook) only.
+            let _ = cleanup_partial_write(dest, &manifest, &prior);
             Err(e)
         }
     }
@@ -1399,7 +1744,33 @@ pub fn check_no_template_dsl(
 /// paths.
 /// Prior content of a file an emit overwrote, for restore-on-failure
 /// (round-6 MED). Keyed by the same POSIX relative path as the manifest.
-type PriorContents = BTreeMap<String, Vec<u8>>;
+///
+/// Also records a SHA-256 of the bytes THIS call published over each
+/// snapshotted file, so a restore can tell "still what this call wrote" from
+/// "a third party edited it since" before it writes anything.
+#[derive(Default)]
+struct PriorContents {
+    bytes: BTreeMap<String, Vec<u8>>,
+    published: BTreeMap<String, [u8; 32]>,
+}
+
+impl PriorContents {
+    fn new() -> Self {
+        Self::default()
+    }
+    fn get(&self, rel: &str) -> Option<&[u8]> {
+        self.bytes.get(rel).map(Vec::as_slice)
+    }
+    fn insert(&mut self, rel: String, bytes: Vec<u8>) {
+        self.bytes.insert(rel, bytes);
+    }
+    fn record_published(&mut self, rel: &str, published: &[u8]) {
+        self.published.insert(rel.to_string(), sha256(published));
+    }
+    fn published_digest(&self, rel: &str) -> Option<[u8; 32]> {
+        self.published.get(rel).copied()
+    }
+}
 
 /// [`write_file`] plus the snapshot the persistent-dest emitters need to
 /// honor their "leave `dest` as found" contract (which holds when the
@@ -1411,14 +1782,18 @@ type PriorContents = BTreeMap<String, Vec<u8>>;
 /// would delete the file outright, silently unloading the prior
 /// artifact (the round-6 MED: overwrite-then-fail lost the valid
 /// previous version).
-/// NOTE (R7 NIT): the restore in [`cleanup_partial_write`] is
-/// unconditional — if a same-UID third party edits the file BETWEEN this
-/// call's overwrite and a later failure in the same call, the stale
-/// snapshot is written back over their edit. The window is sub-second
-/// (the emit is in-process, no awaits; the vendor CLI writes its home at
-/// spawn/exit, not during csq's pre-spawn emit) and the wiring shard's
-/// per-slot write lock (see `launch_native`) closes the realistic racer
-/// (a concurrent `csq run` on the same slot).
+/// NOTE (R7 NIT, superseded): the restore in [`cleanup_partial_write`] no
+/// longer writes unconditionally. [`PriorContents`] records a digest of the
+/// bytes THIS call published, and before EVERY restore attempt the file is
+/// re-read (same `O_NOFOLLOW` open as the snapshot) and compared with it: a
+/// same-UID third-party edit between this call's overwrite and the restore
+/// stops the restore for that file (`changed_since_publish`, nothing
+/// written). The remaining window is the gap between that read and the
+/// restore's rename inside one attempt, which csq does not lock; the retry
+/// loop itself is bounded by [`RESTORE_ATTEMPTS`] and [`RESTORE_BUDGET`]
+/// (composite bound documented there), and the wiring shard's per-slot write
+/// lock (see `launch_native`) closes the realistic racer (a concurrent
+/// `csq run` on the same slot).
 ///
 /// R11 MED-1, hardened by R-toctou (round-7 review): the pre-write snapshot
 /// read refuses a symlink at `abs`, and does so WITHOUT the check-then-read
@@ -1453,7 +1828,14 @@ fn write_file_restorable(
 ) -> Result<(), MaterializeError> {
     let abs = dest.join(&rel);
     snapshot_prior_if_exists(&abs, &rel, prior)?;
-    write_file(dest, rel, content, kind, manifest, seen)
+    let key = rel.clone();
+    write_file(dest, rel, content, kind, manifest, seen)?;
+    // Only after the publish succeeded: the digest of exactly the bytes
+    // `write_file` published (`content.as_bytes()`).
+    if prior.get(&key).is_some() {
+        prior.record_published(&key, content.as_bytes());
+    }
+    Ok(())
 }
 
 /// Records `abs`'s current content into `prior` (keyed by `rel`) if a
@@ -1478,8 +1860,8 @@ fn write_file_restorable(
 /// same-UID racer with a sub-syscall window could still swap a symlink in
 /// between the two calls on this platform. Documented, not claimed closed;
 /// the realistic racer (a concurrent `csq run` on the same slot) is the
-/// wiring shard's per-slot write lock, same as the sub-second window noted
-/// above for the overwrite-restore race.
+/// wiring shard's per-slot write lock, the same lock that bounds the
+/// overwrite-restore window described on [`write_file_restorable`].
 fn snapshot_prior_if_exists(
     abs: &Path,
     rel: &str,
@@ -1488,13 +1870,12 @@ fn snapshot_prior_if_exists(
     #[cfg(unix)]
     {
         use std::io::Read as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
 
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(abs)
-        {
+        // Non-regular files (FIFO, device, directory) are refused as
+        // `MaterializeError::Io` by the generic arm below — the existing
+        // contract for a directory at `abs` — and a FIFO can no longer block
+        // the open (`open_regular_nofollow`).
+        match open_regular_nofollow(abs) {
             Ok(mut f) => {
                 let mut bytes = Vec::new();
                 match f.read_to_end(&mut bytes) {
@@ -1567,6 +1948,14 @@ fn snapshot_prior_if_exists(
             Ok(meta) if meta.file_type().is_symlink() => {
                 return Err(MaterializeError::SymlinkAtDest {
                     path: redact_path(abs),
+                });
+            }
+            // Not a regular file (directory, device, ...): refused as `Io`,
+            // matching the unix arm.
+            Ok(meta) if !meta.is_file() => {
+                return Err(MaterializeError::Io {
+                    path: redact_path(abs),
+                    source: not_regular_file(),
                 });
             }
             Ok(_) => {}
@@ -1850,8 +2239,58 @@ mod tests {
         assert!(manifest.files.contains_key("artifact.md"));
     }
 
+    fn last_summary() -> Option<RestoreSummary> {
+        LAST_RESTORE_SUMMARY.with(|slot| slot.borrow().clone())
+    }
+
+    fn reset_summary() {
+        LAST_RESTORE_SUMMARY.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    fn denial(stage: &'static str) -> RestoreFailure {
+        RestoreFailure {
+            stage,
+            io_kind: "permission_denied",
+            transient: true,
+        }
+    }
+
+    /// Fixture: `artifact.md` holds this call's bytes (`version-two`, with its
+    /// published digest recorded), `prior` holds v1.
+    fn restore_fixture() -> (tempfile::TempDir, MaterializedManifest, PriorContents) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut manifest = MaterializedManifest::default();
+        manifest
+            .files
+            .insert("artifact.md".into(), MaterializedKind::Agent);
+        let mut prior = PriorContents::new();
+        prior.insert("artifact.md".into(), b"version-one".to_vec());
+        prior.record_published("artifact.md", b"version-two");
+        fs::write(dir.path().join("artifact.md"), b"version-two").unwrap();
+        (dir, manifest, prior)
+    }
+
+    fn run_with(
+        dir: &tempfile::TempDir,
+        manifest: &MaterializedManifest,
+        prior: &PriorContents,
+        budget: std::time::Duration,
+        restore: &mut dyn FnMut(&Path, &[u8]) -> RestoreResult,
+    ) -> RestoreSummary {
+        cleanup_partial_write_with(
+            dir.path(),
+            manifest,
+            prior,
+            std::time::Duration::ZERO,
+            budget,
+            restore,
+        )
+    }
+
     /// an internal ticket: a restore that fails (staging file cannot be created) must
-    /// leave the artifact on disk, never delete it.
+    /// leave the artifact on disk, never delete it. The real production path
+    /// (`restore_prior_once`) fails NotFound, which is permanent, so exactly
+    /// one attempt is made.
     #[test]
     fn cleanup_partial_write_restore_failure_never_deletes_artifact() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1861,10 +2300,12 @@ mod tests {
             .insert("artifact.md".into(), MaterializedKind::Agent);
         let mut prior = PriorContents::new();
         prior.insert("artifact.md".into(), b"prior-artifact-bytes".to_vec());
+        prior.record_published("artifact.md", b"complete-new-artifact");
         fs::write(dir.path().join("artifact.md"), b"complete-new-artifact").unwrap();
         // Every staging candidate lives in a directory that does not exist,
         // so the restore's create fails deterministically (NotFound).
         let missing = dir.path().join("no-such-dir");
+        reset_summary();
         crate::platform::fs::with_private_tmp_candidates_for_test(
             move |_, attempt| missing.join(format!("stage-{attempt}")),
             || cleanup_partial_write(dir.path(), &manifest, &prior),
@@ -1873,6 +2314,408 @@ mod tests {
             fs::read(dir.path().join("artifact.md")).ok().as_deref(),
             Some(b"complete-new-artifact".as_slice()),
             "a failed restore must leave the existing artifact, not delete it"
+        );
+        assert_eq!(
+            last_summary(),
+            Some(vec![(
+                "artifact.md".to_string(),
+                RestoreOutcome::Kept {
+                    stage: "stage",
+                    io_kind: "not_found",
+                    attempts: 1,
+                }
+            )]),
+            "NotFound is permanent: one attempt, kept"
+        );
+    }
+
+    /// A transient denial (stage or publish) below the attempt cap must still
+    /// leave `dest` as found: the restore re-stages and succeeds. Shared by
+    /// the Kimi and Grok emitters through `cleanup_partial_write`.
+    #[test]
+    fn restore_survives_transient_denials_below_the_cap() {
+        let (dir, manifest, prior) = restore_fixture();
+        let mut calls = 0u32;
+        let summary = run_with(
+            &dir,
+            &manifest,
+            &prior,
+            RESTORE_BUDGET,
+            &mut |abs, bytes| {
+                calls += 1;
+                match calls {
+                    1 => Err(denial("replace")),
+                    2 => Err(denial("stage")),
+                    _ => restore_prior_once(abs, bytes),
+                }
+            },
+        );
+        assert_eq!(calls, 3, "two denials then one success");
+        assert_eq!(
+            summary,
+            vec![(
+                "artifact.md".to_string(),
+                RestoreOutcome::Restored { attempts: 3 }
+            )]
+        );
+        assert_eq!(
+            fs::read(dir.path().join("artifact.md")).unwrap(),
+            b"version-one",
+            "a transient denial below the cap must not leave this call's bytes"
+        );
+    }
+
+    /// A persistent denial exhausts exactly `RESTORE_ATTEMPTS`, then keeps the
+    /// file (an internal ticket) rather than deleting or looping.
+    #[test]
+    fn restore_persistent_denial_is_bounded_and_keeps_the_file() {
+        let (dir, manifest, prior) = restore_fixture();
+        let mut calls = 0u32;
+        let summary = run_with(&dir, &manifest, &prior, RESTORE_BUDGET, &mut |_, _| {
+            calls += 1;
+            Err(denial("replace"))
+        });
+        assert_eq!(calls, RESTORE_ATTEMPTS, "the retry cap is enforced");
+        assert_eq!(
+            summary,
+            vec![(
+                "artifact.md".to_string(),
+                RestoreOutcome::Kept {
+                    stage: "replace",
+                    io_kind: "permission_denied",
+                    attempts: RESTORE_ATTEMPTS,
+                }
+            )],
+            "the summary must report kept, with the failing stage and io_kind"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("artifact.md")).unwrap(),
+            b"version-two",
+            "a persistent failure keeps the file holding this call's bytes"
+        );
+    }
+
+    /// A permanent kind (not_found, storage_full, other) is never retried.
+    #[test]
+    fn restore_does_not_retry_a_permanent_failure() {
+        let (dir, manifest, prior) = restore_fixture();
+        let mut calls = 0u32;
+        let summary = run_with(&dir, &manifest, &prior, RESTORE_BUDGET, &mut |_, _| {
+            calls += 1;
+            Err(RestoreFailure {
+                stage: "stage",
+                io_kind: "storage_full",
+                transient: false,
+            })
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(
+            summary,
+            vec![(
+                "artifact.md".to_string(),
+                RestoreOutcome::Kept {
+                    stage: "stage",
+                    io_kind: "storage_full",
+                    attempts: 1,
+                }
+            )]
+        );
+    }
+
+    /// The retry budget stops retries (never the first attempt).
+    #[test]
+    fn restore_budget_stops_retries_but_not_the_first_attempt() {
+        let (dir, manifest, prior) = restore_fixture();
+        let mut calls = 0u32;
+        let summary = run_with(
+            &dir,
+            &manifest,
+            &prior,
+            std::time::Duration::ZERO,
+            &mut |_, _| {
+                calls += 1;
+                Err(denial("replace"))
+            },
+        );
+        assert_eq!(
+            calls, 1,
+            "an exhausted budget still allows the first attempt"
+        );
+        assert_eq!(
+            summary,
+            vec![(
+                "artifact.md".to_string(),
+                RestoreOutcome::Kept {
+                    stage: "replace",
+                    io_kind: "permission_denied",
+                    attempts: 1,
+                }
+            )]
+        );
+    }
+
+    /// A third party edits the file between this call's publish and the
+    /// restore: nothing is written and the edit survives.
+    #[test]
+    fn restore_never_clobbers_a_third_party_edit() {
+        let (dir, manifest, prior) = restore_fixture();
+        fs::write(dir.path().join("artifact.md"), b"third-party-edit").unwrap();
+        let mut calls = 0u32;
+        let summary = run_with(
+            &dir,
+            &manifest,
+            &prior,
+            RESTORE_BUDGET,
+            &mut |abs, bytes| {
+                calls += 1;
+                restore_prior_once(abs, bytes)
+            },
+        );
+        assert_eq!(calls, 0, "no restore may be attempted over a foreign edit");
+        assert_eq!(
+            summary,
+            vec![(
+                "artifact.md".to_string(),
+                RestoreOutcome::Kept {
+                    stage: "changed_since_publish",
+                    io_kind: "none",
+                    attempts: 1,
+                }
+            )]
+        );
+        assert_eq!(
+            fs::read(dir.path().join("artifact.md")).unwrap(),
+            b"third-party-edit"
+        );
+    }
+
+    /// The edit lands BETWEEN attempts (after a transient denial): the
+    /// re-check before the retry must still catch it.
+    #[test]
+    fn restore_rechecks_before_every_attempt() {
+        let (dir, manifest, prior) = restore_fixture();
+        let path = dir.path().join("artifact.md");
+        let mut calls = 0u32;
+        let summary = run_with(&dir, &manifest, &prior, RESTORE_BUDGET, &mut |_, _| {
+            calls += 1;
+            fs::write(&path, b"late-third-party-edit").unwrap();
+            Err(denial("replace"))
+        });
+        assert_eq!(calls, 1, "the retry must not write over the late edit");
+        assert_eq!(
+            summary,
+            vec![(
+                "artifact.md".to_string(),
+                RestoreOutcome::Kept {
+                    stage: "changed_since_publish",
+                    io_kind: "none",
+                    attempts: 2,
+                }
+            )]
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"late-third-party-edit");
+    }
+
+    /// An unreadable target is never written.
+    #[test]
+    fn restore_does_not_write_when_the_target_is_unreadable() {
+        let (dir, manifest, prior) = restore_fixture();
+        fs::remove_file(dir.path().join("artifact.md")).unwrap();
+        let mut calls = 0u32;
+        let summary = run_with(&dir, &manifest, &prior, RESTORE_BUDGET, &mut |_, _| {
+            calls += 1;
+            Ok(())
+        });
+        assert_eq!(calls, 0);
+        assert_eq!(
+            summary,
+            vec![(
+                "artifact.md".to_string(),
+                RestoreOutcome::Kept {
+                    stage: "read_before_restore",
+                    io_kind: "not_found",
+                    attempts: 1,
+                }
+            )]
+        );
+    }
+
+    fn fail(stage: &'static str, io_kind: &'static str, transient: bool) -> RestoreFailure {
+        RestoreFailure {
+            stage,
+            io_kind,
+            transient,
+        }
+    }
+
+    /// The classifier is the oracle for "which failures are retried": pin every
+    /// arm's (tag, transient) pair.
+    #[test]
+    fn classify_io_and_platform_tables() {
+        use std::io::{Error, ErrorKind};
+        let mut io_cases: Vec<(Error, RestoreFailure)> = vec![
+            (
+                Error::from(ErrorKind::PermissionDenied),
+                fail("s", "permission_denied", true),
+            ),
+            (
+                Error::from(ErrorKind::ResourceBusy),
+                fail("s", "resource_busy", true),
+            ),
+            (
+                Error::from(ErrorKind::NotFound),
+                fail("s", "not_found", false),
+            ),
+            (
+                Error::from(ErrorKind::AlreadyExists),
+                fail("s", "already_exists", false),
+            ),
+            (
+                Error::from(ErrorKind::StorageFull),
+                fail("s", "storage_full", false),
+            ),
+            (
+                Error::from(ErrorKind::InvalidData),
+                fail("s", "io_other", false),
+            ),
+            (
+                Error::from(ErrorKind::Interrupted),
+                fail("s", "io_other", false),
+            ),
+            (not_regular_file(), fail("s", "not_regular_file", false)),
+        ];
+        #[cfg(windows)]
+        {
+            io_cases.push((
+                Error::from_raw_os_error(32),
+                fail("s", "sharing_violation", true),
+            ));
+            io_cases.push((
+                Error::from_raw_os_error(33),
+                fail("s", "lock_violation", true),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            // 32/33 are EPIPE/EDOM on Unix: NOT sharing/lock violations.
+            io_cases.push((
+                Error::from_raw_os_error(libc::EPIPE),
+                fail("s", "io_other", false),
+            ));
+            io_cases.push((Error::from_raw_os_error(33), fail("s", "io_other", false)));
+        }
+        for (e, want) in &io_cases {
+            assert_eq!(&classify_io("s", e), want, "classify_io({e:?})");
+            assert_eq!(
+                &classify_platform("s", &crate::error::PlatformError::Io(Error::from(e.kind()))),
+                &classify_io("s", &Error::from(e.kind())),
+                "the Io arm of classify_platform must delegate"
+            );
+        }
+        let win32 = |code| crate::error::PlatformError::Win32 {
+            code,
+            message: String::new(),
+        };
+        for (code, tag, transient) in [
+            (5u32, "win32_access_denied", true),
+            (32, "win32_sharing_violation", true),
+            (33, "win32_lock_violation", true),
+            (87, "other", false),
+        ] {
+            assert_eq!(
+                classify_platform("s", &win32(code)),
+                fail("s", tag, transient),
+                "Win32 {code}"
+            );
+        }
+        assert_eq!(
+            classify_platform(
+                "s",
+                &crate::error::PlatformError::ProcessNotFound { pid: 1 }
+            ),
+            fail("s", "other", false)
+        );
+    }
+
+    /// Run `f` on a thread; fail (instead of hanging) if it does not finish.
+    #[cfg(unix)]
+    fn within_5s<T: Send + 'static>(fifo: &Path, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(v) => v,
+            Err(_) => {
+                // Release a reader blocked on the FIFO so the thread can end.
+                let _ = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(fifo);
+                panic!("blocked on a FIFO: a read of a non-regular file must not wait");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    }
+
+    /// A FIFO at the artifact path must make the pre-restore read refuse, not
+    /// block forever (no writer will ever open it).
+    #[cfg(unix)]
+    #[test]
+    fn restore_refuses_a_fifo_without_blocking() {
+        let (dir, manifest, prior) = restore_fixture();
+        let path = dir.path().join("artifact.md");
+        fs::remove_file(&path).unwrap();
+        make_fifo(&path);
+        let root = dir.path().to_path_buf();
+        let summary = within_5s(&path, move || {
+            cleanup_partial_write_with(
+                &root,
+                &manifest,
+                &prior,
+                std::time::Duration::ZERO,
+                RESTORE_BUDGET,
+                &mut |_, _| panic!("no restore may be attempted over a FIFO"),
+            )
+        });
+        assert_eq!(
+            summary,
+            vec![(
+                "artifact.md".to_string(),
+                RestoreOutcome::Kept {
+                    stage: "read_before_restore",
+                    io_kind: "not_regular_file",
+                    attempts: 1,
+                }
+            )]
+        );
+    }
+
+    /// The pre-write snapshot has the same hazard: a FIFO must be refused as
+    /// `Io` (the existing contract for any non-regular file), not block.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_refuses_a_fifo_without_blocking() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("fifo");
+        make_fifo(&path);
+        let probe = path.clone();
+        let result = within_5s(&path, move || {
+            let mut prior = PriorContents::new();
+            let r = snapshot_prior_if_exists(&probe, "fifo", &mut prior);
+            (r.is_err(), prior.bytes.is_empty())
+        });
+        assert_eq!(
+            result,
+            (true, true),
+            "refused as an error, nothing recorded"
         );
     }
 
@@ -1885,12 +2728,22 @@ mod tests {
             .insert("artifact.md".into(), MaterializedKind::Agent);
         let mut prior = PriorContents::new();
         prior.insert("artifact.md".into(), b"prior-artifact-bytes".to_vec());
+        prior.record_published("artifact.md", b"partial-new-artifact");
         fs::write(dir.path().join("artifact.md"), b"partial-new-artifact").unwrap();
+        reset_summary();
         collide_first_create(|| cleanup_partial_write(dir.path(), &manifest, &prior));
         assert_eq!(
             fs::read(dir.path().join("artifact.md")).ok().as_deref(),
             Some(b"prior-artifact-bytes".as_slice()),
             "rollback must retry a planted create collision"
+        );
+        assert_eq!(
+            last_summary(),
+            Some(vec![(
+                "artifact.md".to_string(),
+                RestoreOutcome::Restored { attempts: 1 }
+            )]),
+            "the collision must be absorbed by the factory's own retry, not by an outer attempt"
         );
     }
 
@@ -3082,12 +3935,17 @@ mod tests {
         second.skills.push(art("SKILL-A", "version two"));
         second.skills.push(art("SKILL-B", "new this call"));
         second.commands.push(art("../escape", "unsafe id"));
+        LAST_RESTORE_SUMMARY.with(|slot| *slot.borrow_mut() = None);
         let err = emit_kimi_native(&second, dest).unwrap_err();
         assert!(matches!(err, MaterializeError::UnsafeId { .. }));
+        let summary = LAST_RESTORE_SUMMARY.with(|slot| slot.borrow().clone());
 
         let after = fs::read_to_string(dest.join("skills/csq-SKILL-A/SKILL.md"))
             .expect("prior artifact must be RESTORED, not deleted");
-        assert_eq!(after, v1, "the overwrite must be rolled back to v1");
+        assert_eq!(
+            after, v1,
+            "the overwrite must be rolled back to v1; restore summary: {summary:?}"
+        );
         assert!(
             !dest.join("skills/csq-SKILL-B/SKILL.md").exists(),
             "this call's new partial write must be removed"
@@ -3392,12 +4250,17 @@ mod tests {
         second.skills.push(art("SKILL-A", "version two"));
         second.skills.push(art("SKILL-B", "new this call"));
         second.commands.push(art("../escape", "unsafe id"));
+        LAST_RESTORE_SUMMARY.with(|slot| *slot.borrow_mut() = None);
         let err = emit_grok_native(&second, dest).unwrap_err();
         assert!(matches!(err, MaterializeError::UnsafeId { .. }));
+        let summary = LAST_RESTORE_SUMMARY.with(|slot| slot.borrow().clone());
 
         let after = fs::read_to_string(dest.join("skills/csq-SKILL-A/SKILL.md"))
             .expect("prior artifact must be RESTORED, not deleted");
-        assert_eq!(after, v1, "the overwrite must be rolled back to v1");
+        assert_eq!(
+            after, v1,
+            "the overwrite must be rolled back to v1; restore summary: {summary:?}"
+        );
         assert!(
             !dest.join("skills/csq-SKILL-B/SKILL.md").exists(),
             "this call's new partial write must be removed"
@@ -3541,7 +4404,7 @@ mod tests {
             "a directory at the leaf path must surface as Io, not be swallowed: {err:?}"
         );
         assert!(
-            prior.is_empty(),
+            prior.bytes.is_empty(),
             "no snapshot must be recorded when the read itself failed"
         );
     }

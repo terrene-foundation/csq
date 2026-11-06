@@ -1144,6 +1144,18 @@ mod capture_tests {
         );
     }
 
+    /// The role classifier with a budget a loaded sign-off host cannot exhaust.
+    /// `read_thread_roles` gives up after 250 ms (correctly: it returns `None`
+    /// rather than guess). Tests here assert the classification, not the
+    /// budget, so they must not depend on the host being idle; the budget's
+    /// own refusal is covered by the execution-budget tests above.
+    fn read_roles_unhurried(
+        sqlite_home: &std::path::Path,
+        held: &std::collections::HashSet<String>,
+    ) -> Option<M<String, ThreadRole>> {
+        read_thread_roles_with_budget(sqlite_home, held, Duration::from_secs(30))
+    }
+
     #[test]
     fn code_red_native_child_source_shape_is_validated() {
         let t = TempDir::new().unwrap();
@@ -1153,7 +1165,7 @@ mod capture_tests {
         let held = [B.to_owned()].into_iter().collect();
         for source in ["{\"subagent\":null}","{\"subagent\":\"child\"}","{\"subagent\":{}}","{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"bad\",\"depth\":1}}}","{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"0198f1a2-3b4c-7d5e-8f9a-0b1c2d3e4f5c\",\"depth\":0}}}"] {
             db.execute("INSERT OR REPLACE INTO threads VALUES(?1,?2)",[B,source]).unwrap();
-            assert_eq!(read_thread_roles(t.path(),&held).unwrap().get(B),Some(&ThreadRole::Unknown));
+            assert_eq!(read_roles_unhurried(t.path(),&held).unwrap().get(B),Some(&ThreadRole::Unknown));
         }
         let source = format!(
             "{{\"subagent\":{{\"thread_spawn\":{{\"parent_thread_id\":\"{A}\",\"depth\":1}}}}}}"
@@ -1161,7 +1173,7 @@ mod capture_tests {
         db.execute("INSERT OR REPLACE INTO threads VALUES(?1,?2)", [B, &source])
             .unwrap();
         assert_eq!(
-            read_thread_roles(t.path(), &held).unwrap().get(B),
+            read_roles_unhurried(t.path(), &held).unwrap().get(B),
             Some(&ThreadRole::Subagent)
         );
     }

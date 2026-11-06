@@ -99,19 +99,39 @@ printf '\\nCSQ_PREFLIGHT_SVELTE_PHASE ${token} ${spec.phase} RC %s\\n' "$csq_sve
   const body = `set -o pipefail
 # -p imported no function; drop any defined anyway, then prove none survived,
 # and that no exported-function string reaches a child.
-for csq_svelte_fn in $(compgen -A function); do builtin unset -f -- "$csq_svelte_fn" || exit 125; done
-[ -z "$(compgen -A function)" ] || exit 125
-# Defined only after the function purge above, which would remove it.
+for csq_svelte_fn in $(compgen -A function); do builtin unset -f -- "$csq_svelte_fn" || { printf 'CSQ_PREFLIGHT_SVELTE_REFUSED ${token} function-unset-failed\\n' >&2; exit 125; }; done
+# The purge check runs BEFORE any helper function is defined: a helper defined
+# above this line would itself be the surviving function (measured 2026-11-03).
+[ -z "$(compgen -A function)" ] || { printf 'CSQ_PREFLIGHT_SVELTE_REFUSED ${token} function-survived\\n' >&2; exit 125; }
+# Defined only after the function purge above, which would remove it. A silent
+# 125 hid WHICH prerequisite refused (a Darwin-only fixture failure went
+# undiagnosed through a whole lane); every refusal in this leg names its cause on
+# stderr in fixed vocabulary before exiting; reason words never carry
+# tree-controlled text.
+csq_svelte_refuse() {
+  printf 'CSQ_PREFLIGHT_SVELTE_REFUSED ${token} %s\\n' "$1" >&2
+  exit 125
+}
 # Every environment name must be on the allowlist (NUL-separated entries).
 csq_svelte_env_only() {
   csq_svelte_env_seen=
   while IFS= read -r -d '' csq_svelte_entry; do
-    case " $1 " in *" \${csq_svelte_entry%%=*} "*) ;; *) return 125 ;; esac
+    csq_svelte_env_name=\${csq_svelte_entry%%=*}
+    case " $1 " in
+      *" $csq_svelte_env_name "*) ;;
+      *) case "$csq_svelte_env_name" in
+           [ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_]*)
+             case "$csq_svelte_env_name" in *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_0123456789]*) csq_svelte_env_name=non-identifier ;; esac ;;
+           *) csq_svelte_env_name=non-identifier ;;
+         esac
+         printf 'CSQ_PREFLIGHT_SVELTE_REFUSED ${token} env-name %s\\n' "$csq_svelte_env_name" >&2
+         return 125 ;;
+    esac
     csq_svelte_env_seen=1
   done < <(/usr/bin/env -0)
   [ -n "$csq_svelte_env_seen" ]
 }
-csq_svelte_env_only '${ENV_BEFORE_EXPORTS}' || exit 125
+csq_svelte_env_only '${ENV_BEFORE_EXPORTS}' || csq_svelte_refuse env-allowlist-before
 # Only absolute PATH entries: an empty or relative entry resolves a tool from
 # the cwd, which is tree-controlled once the leg is inside the clone.
 csq_svelte_path=
@@ -119,10 +139,10 @@ IFS=: read -r -a csq_svelte_entries <<< "$PATH"
 for csq_svelte_entry in "\${csq_svelte_entries[@]}"; do
   case "$csq_svelte_entry" in /*) csq_svelte_path="\${csq_svelte_path:+$csq_svelte_path:}$csq_svelte_entry" ;; esac
 done
-[ -n "$csq_svelte_path" ] || exit 125
+[ -n "$csq_svelte_path" ] || csq_svelte_refuse path-not-absolute
 PATH=$csq_svelte_path
 export PATH
-csq_svelte_source=$(pwd -P) || exit 125
+csq_svelte_source=$(pwd -P) || csq_svelte_refuse source-unresolved
 csq_svelte_tmp=
 # Resolve a tool once, by absolute path. The REAL file (symlinks resolved) must
 # lie outside the source and the private tree, and it and every ancestor up to
@@ -137,32 +157,32 @@ done
 for csq_svelte_cand in /usr/bin/realpath /bin/realpath; do
   if [ -f "$csq_svelte_cand" ] && [ -x "$csq_svelte_cand" ]; then csq_svelte_realpath=$csq_svelte_cand; break; fi
 done
-[ -n "$csq_svelte_find" ] && [ -n "$csq_svelte_realpath" ] || exit 125
+[ -n "$csq_svelte_find" ] && [ -n "$csq_svelte_realpath" ] || csq_svelte_refuse missing-find-realpath
 csq_svelte_trusted() {
   csq_svelte_walk=$1
   while :; do
-    csq_svelte_unsafe=$("$csq_svelte_find" "$csq_svelte_walk" -maxdepth 0 \\( \\( \\( -perm -020 -o -perm -002 \\) ! -perm -1000 \\) -o \\( ! -user 0 ! -user "$EUID" \\) \\) -print) || return 125
-    [ -z "$csq_svelte_unsafe" ] || return 125
+    csq_svelte_unsafe=$("$csq_svelte_find" "$csq_svelte_walk" -maxdepth 0 \\( \\( \\( -perm -020 -o -perm -002 \\) ! -perm -1000 \\) -o \\( ! -user 0 ! -user "$EUID" \\) \\) -print) || { printf 'CSQ_PREFLIGHT_SVELTE_REFUSED ${token} unsafe-ancestor-unreadable\\n' >&2; return 125; }
+    [ -z "$csq_svelte_unsafe" ] || { printf 'CSQ_PREFLIGHT_SVELTE_REFUSED ${token} unsafe-ancestor\\n' >&2; return 125; }
     [ "$csq_svelte_walk" != / ] || break
     csq_svelte_walk=\${csq_svelte_walk%/*}
     csq_svelte_walk=\${csq_svelte_walk:-/}
   done
 }
 csq_svelte_tool() {
-  csq_svelte_found=$(type -P "$1") || return 125
-  case "$csq_svelte_found" in /*) ;; *) return 125 ;; esac
-  csq_svelte_real=$("$csq_svelte_realpath" "$csq_svelte_found") || return 125
-  case "$csq_svelte_real" in /*) ;; *) return 125 ;; esac
-  case "$csq_svelte_real" in "$csq_svelte_source"/*) return 125 ;; esac
-  if [ -n "$csq_svelte_tmp" ]; then case "$csq_svelte_real" in "$csq_svelte_tmp"/*) return 125 ;; esac; fi
-  csq_svelte_trusted "$csq_svelte_real" || return 125
+  csq_svelte_found=$(type -P "$1") || { printf 'CSQ_PREFLIGHT_SVELTE_REFUSED ${token} tool-unresolved %s\\n' "$1" >&2; return 125; }
+  case "$csq_svelte_found" in /*) ;; *) printf 'CSQ_PREFLIGHT_SVELTE_REFUSED ${token} tool-not-absolute %s\\n' "$1" >&2; return 125 ;; esac
+  csq_svelte_real=$("$csq_svelte_realpath" "$csq_svelte_found") || { printf 'CSQ_PREFLIGHT_SVELTE_REFUSED ${token} tool-unreadable %s\\n' "$1" >&2; return 125; }
+  case "$csq_svelte_real" in /*) ;; *) printf 'CSQ_PREFLIGHT_SVELTE_REFUSED ${token} tool-not-absolute %s\\n' "$1" >&2; return 125 ;; esac
+  case "$csq_svelte_real" in "$csq_svelte_source"/*) printf 'CSQ_PREFLIGHT_SVELTE_REFUSED ${token} tool-inside-source %s\\n' "$1" >&2; return 125 ;; esac
+  if [ -n "$csq_svelte_tmp" ]; then case "$csq_svelte_real" in "$csq_svelte_tmp"/*) printf 'CSQ_PREFLIGHT_SVELTE_REFUSED ${token} tool-inside-tmp %s\\n' "$1" >&2; return 125 ;; esac; fi
+  csq_svelte_trusted "$csq_svelte_real" || { printf 'CSQ_PREFLIGHT_SVELTE_REFUSED ${token} tool-untrusted %s\\n' "$1" >&2; return 125; }
   printf '%s' "$csq_svelte_found"
 }
-csq_svelte_trusted "$("$csq_svelte_realpath" "$csq_svelte_find")" && csq_svelte_trusted "$("$csq_svelte_realpath" "$csq_svelte_realpath")" || exit 125
+csq_svelte_trusted "$("$csq_svelte_realpath" "$csq_svelte_find")" && csq_svelte_trusted "$("$csq_svelte_realpath" "$csq_svelte_realpath")" || csq_svelte_refuse untrusted-coreutils
 csq_svelte_git=$(csq_svelte_tool git) && csq_svelte_mktemp=$(csq_svelte_tool mktemp) &&
   csq_svelte_rm=$(csq_svelte_tool rm) && csq_svelte_mkdir=$(csq_svelte_tool mkdir) &&
-  csq_svelte_timeout=$(csq_svelte_tool timeout) || exit 125
-for csq_svelte_git_key in \${!GIT_@}; do unset "$csq_svelte_git_key" || exit 125; done
+  csq_svelte_timeout=$(csq_svelte_tool timeout) || csq_svelte_refuse tool-resolution
+for csq_svelte_git_key in \${!GIT_@}; do unset "$csq_svelte_git_key" || csq_svelte_refuse git-env-unset-failed; done
 csq_svelte_tree='${tree}'
 umask 077
 csq_svelte_tmpbase=\${TMPDIR:-/tmp}
@@ -171,14 +191,14 @@ csq_svelte_tmpbase=\${TMPDIR:-/tmp}
 # base, never an entry, and -type d skips symlinks.
 "$csq_svelte_find" -H "$csq_svelte_tmpbase" -mindepth 1 -maxdepth 1 -type d -name 'csq-svelte.??????' -user "$EUID" -perm 700 -mmin +1440 -exec "$csq_svelte_rm" -rf -- {} + ||
   printf '\\nCSQ_PREFLIGHT_SVELTE_NOTE ${token} PRUNE_INCOMPLETE\\n'
-csq_svelte_tmp=$("$csq_svelte_mktemp" -d "$csq_svelte_tmpbase/csq-svelte.XXXXXX") || exit 125
-trap 'csq_svelte_rc=$?; "$csq_svelte_rm" -rf -- "$csq_svelte_tmp" || exit 125; exit "$csq_svelte_rc"' EXIT
+csq_svelte_tmp=$("$csq_svelte_mktemp" -d "$csq_svelte_tmpbase/csq-svelte.XXXXXX") || csq_svelte_refuse mktemp-failed
+trap 'csq_svelte_rc=$?; "$csq_svelte_rm" -rf -- "$csq_svelte_tmp" || { printf "CSQ_PREFLIGHT_SVELTE_REFUSED ${token} tmp-cleanup-failed\\n" >&2; exit 125; }; exit "$csq_svelte_rc"' EXIT
 # Compare physical paths on both sides, including Darwin's /var -> /private/var.
-csq_svelte_physical_tmp=$(cd "$csq_svelte_tmp" && pwd -P) || exit 125
+csq_svelte_physical_tmp=$(cd "$csq_svelte_tmp" && pwd -P) || csq_svelte_refuse tmp-unresolved
 csq_svelte_tmp="$csq_svelte_physical_tmp"
-"$csq_svelte_mkdir" -m 700 "$csq_svelte_tmp/home" "$csq_svelte_tmp/tmp" || exit 125
+"$csq_svelte_mkdir" -m 700 "$csq_svelte_tmp/home" "$csq_svelte_tmp/tmp" || csq_svelte_refuse tmp-dirs-failed
 while IFS= read -r csq_svelte_env; do
-  case "$csq_svelte_env" in PATH|PWD|LANG|LC_ALL|TERM) ;; *) unset "$csq_svelte_env" || exit 125 ;; esac
+  case "$csq_svelte_env" in PATH|PWD|LANG|LC_ALL|TERM) ;; *) unset "$csq_svelte_env" || csq_svelte_refuse env-unset-failed ;; esac
 done < <(compgen -e)
 export HOME="$csq_svelte_tmp/home" USERPROFILE="$csq_svelte_tmp/home" XDG_CONFIG_HOME="$csq_svelte_tmp/home/.config"
 export TMPDIR="$csq_svelte_tmp/tmp" TMP="$csq_svelte_tmp/tmp" TEMP="$csq_svelte_tmp/tmp"
@@ -187,11 +207,11 @@ export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/
 export CI=true
 # npm refuses to load the same config path in both user and global scopes.
 # Fresh HOME plus umask 077 gives these distinct empty files private modes.
-{ : > "$HOME/.npmrc" && : > "$HOME/.npmrc-global"; } || { printf '%s\\n' 'CSQ_PREFLIGHT_SVELTE_CONFIG_UNAVAILABLE' >&2; exit 125; }
+{ : > "$HOME/.npmrc" && : > "$HOME/.npmrc-global"; } || csq_svelte_refuse npm-config-unavailable
 export NPM_CONFIG_USERCONFIG="$HOME/.npmrc" NPM_CONFIG_GLOBALCONFIG="$HOME/.npmrc-global"
-csq_svelte_env_only '${ENV_AFTER_EXPORTS}' || exit 125
+csq_svelte_env_only '${ENV_AFTER_EXPORTS}' || csq_svelte_refuse env-allowlist-after
 # Trestle's carried HEAD may be synthetic; the parent's tree is authoritative.
-csq_svelte_head=$("$csq_svelte_git" rev-parse --verify HEAD^{commit}) || exit 125
+csq_svelte_head=$("$csq_svelte_git" rev-parse --verify HEAD^{commit}) || csq_svelte_refuse head-unresolved
 csq_svelte_source_guard() {
   [ "$("$csq_svelte_git" -C "$csq_svelte_source" rev-parse --show-toplevel)" = "$csq_svelte_source" ] || return 125
   [ "$("$csq_svelte_git" -C "$csq_svelte_source" rev-parse --verify HEAD^{commit})" = "$csq_svelte_head" ] || return 125
@@ -200,36 +220,38 @@ csq_svelte_source_guard() {
   [ -z "$csq_svelte_status" ] || return 125
 }
 csq_svelte_config() { "$csq_svelte_git" -C "$1" config --null --show-origin --list | "$csq_svelte_git" hash-object --stdin; }
-csq_svelte_source_guard || exit 125
-csq_svelte_source_config=$(csq_svelte_config "$csq_svelte_source") || exit 125
+csq_svelte_source_guard || csq_svelte_refuse source-guard
+csq_svelte_source_config=$(csq_svelte_config "$csq_svelte_source") || csq_svelte_refuse source-config-unavailable
 csq_svelte_cleanup() {
   csq_svelte_rc=$?
-  csq_svelte_source_guard || csq_svelte_rc=125
-  [ "$(csq_svelte_config "$csq_svelte_source")" = "$csq_svelte_source_config" ] || csq_svelte_rc=125
+  # Post-run invariants: keep the original RC unless a guard trips, and name the
+  # tripped guard so a 125 never arrives without its cause.
+  csq_svelte_source_guard || { printf 'CSQ_PREFLIGHT_SVELTE_REFUSED ${token} source-guard-failed-in-cleanup\\n' >&2; csq_svelte_rc=125; }
+  [ "$(csq_svelte_config "$csq_svelte_source")" = "$csq_svelte_source_config" ] || { printf 'CSQ_PREFLIGHT_SVELTE_REFUSED ${token} source-config-mismatch-in-cleanup\\n' >&2; csq_svelte_rc=125; }
   if [ -n "\${csq_svelte_clone_config:-}" ]; then
-    [ "$(csq_svelte_config "$csq_svelte_tmp/tree")" = "$csq_svelte_clone_config" ] || csq_svelte_rc=125
-    [ "$("$csq_svelte_git" -C "$csq_svelte_tmp/tree" rev-parse HEAD^{commit})" = "$csq_svelte_head" ] || csq_svelte_rc=125
-    [ "$("$csq_svelte_git" -C "$csq_svelte_tmp/tree" rev-parse HEAD^{tree})" = "$csq_svelte_tree" ] || csq_svelte_rc=125
-    csq_svelte_clone_status=$("$csq_svelte_git" -C "$csq_svelte_tmp/tree" status --porcelain=v1 --untracked-files=all --ignore-submodules=none) || csq_svelte_rc=125
-    [ -z "$csq_svelte_clone_status" ] || csq_svelte_rc=125
+    [ "$(csq_svelte_config "$csq_svelte_tmp/tree")" = "$csq_svelte_clone_config" ] || { printf 'CSQ_PREFLIGHT_SVELTE_REFUSED ${token} clone-config-mismatch-in-cleanup\\n' >&2; csq_svelte_rc=125; }
+    [ "$("$csq_svelte_git" -C "$csq_svelte_tmp/tree" rev-parse HEAD^{commit})" = "$csq_svelte_head" ] || { printf 'CSQ_PREFLIGHT_SVELTE_REFUSED ${token} clone-head-mismatch-in-cleanup\\n' >&2; csq_svelte_rc=125; }
+    [ "$("$csq_svelte_git" -C "$csq_svelte_tmp/tree" rev-parse HEAD^{tree})" = "$csq_svelte_tree" ] || { printf 'CSQ_PREFLIGHT_SVELTE_REFUSED ${token} clone-tree-mismatch-in-cleanup\\n' >&2; csq_svelte_rc=125; }
+    csq_svelte_clone_status=$("$csq_svelte_git" -C "$csq_svelte_tmp/tree" status --porcelain=v1 --untracked-files=all --ignore-submodules=none) || { printf 'CSQ_PREFLIGHT_SVELTE_REFUSED ${token} clone-status-unresolved-in-cleanup\\n' >&2; csq_svelte_rc=125; }
+    [ -z "$csq_svelte_clone_status" ] || { printf 'CSQ_PREFLIGHT_SVELTE_REFUSED ${token} clone-dirty-in-cleanup\\n' >&2; csq_svelte_rc=125; }
   fi
-  cd "$csq_svelte_source" || csq_svelte_rc=125
-  "$csq_svelte_rm" -rf -- "$csq_svelte_tmp" || csq_svelte_rc=125
+  cd "$csq_svelte_source" || { printf 'CSQ_PREFLIGHT_SVELTE_REFUSED ${token} cd-source-failed-in-cleanup\\n' >&2; csq_svelte_rc=125; }
+  "$csq_svelte_rm" -rf -- "$csq_svelte_tmp" || { printf 'CSQ_PREFLIGHT_SVELTE_REFUSED ${token} tmp-cleanup-failed\\n' >&2; csq_svelte_rc=125; }
   exit "$csq_svelte_rc"
 }
 trap csq_svelte_cleanup EXIT
 # One commit is all the leg needs; the clone is bounded like every phase.
-"$csq_svelte_timeout" --signal=TERM --kill-after=5s 300s "$csq_svelte_git" clone --quiet --no-local --depth 1 --no-checkout "$csq_svelte_source" "$csq_svelte_tmp/tree" || exit 125
-cd "$csq_svelte_tmp/tree" || exit 125
-"$csq_svelte_git" checkout --quiet --detach "$csq_svelte_head" || exit 125
-[ "$("$csq_svelte_git" rev-parse HEAD^{tree})" = "$csq_svelte_tree" ] && [ -z "$("$csq_svelte_git" status --porcelain --untracked-files=all)" ] || exit 125
-csq_svelte_clone_config=$(csq_svelte_config "$csq_svelte_tmp/tree") || exit 125
-csq_svelte_source_guard || exit 125
-[ "$(csq_svelte_config "$csq_svelte_source")" = "$csq_svelte_source_config" ] || exit 125
-cd csq/ui || exit 125
-[ "$(pwd -P)" = "$csq_svelte_tmp/tree/csq/ui" ] || exit 125
-csq_svelte_node=$(csq_svelte_tool node) && csq_svelte_npm=$(csq_svelte_tool npm) && csq_svelte_npx=$(csq_svelte_tool npx) || exit 125
-[ "$("$csq_svelte_node" -p 'process.versions.node.split(".")[0]')" = 24 ] || exit 125
+"$csq_svelte_timeout" --signal=TERM --kill-after=5s 300s "$csq_svelte_git" clone --quiet --no-local --depth 1 --no-checkout "$csq_svelte_source" "$csq_svelte_tmp/tree" || csq_svelte_refuse clone-failed
+cd "$csq_svelte_tmp/tree" || csq_svelte_refuse clone-cd-failed
+"$csq_svelte_git" checkout --quiet --detach "$csq_svelte_head" || csq_svelte_refuse clone-checkout-failed
+[ "$("$csq_svelte_git" rev-parse HEAD^{tree})" = "$csq_svelte_tree" ] && [ -z "$("$csq_svelte_git" status --porcelain --untracked-files=all)" ] || csq_svelte_refuse clone-tree-mismatch
+csq_svelte_clone_config=$(csq_svelte_config "$csq_svelte_tmp/tree") || csq_svelte_refuse clone-config-unavailable
+csq_svelte_source_guard || csq_svelte_refuse source-guard-after-clone
+[ "$(csq_svelte_config "$csq_svelte_source")" = "$csq_svelte_source_config" ] || csq_svelte_refuse source-config-changed
+cd csq/ui || csq_svelte_refuse ui-missing
+[ "$(pwd -P)" = "$csq_svelte_tmp/tree/csq/ui" ] || csq_svelte_refuse ui-path-mismatch
+csq_svelte_node=$(csq_svelte_tool node) && csq_svelte_npm=$(csq_svelte_tool npm) && csq_svelte_npx=$(csq_svelte_tool npx) || csq_svelte_refuse js-tool-resolution
+[ "$("$csq_svelte_node" -p 'process.versions.node.split(".")[0]')" = 24 ] || csq_svelte_refuse node-version
 ${phases}`;
   return `( printf '\\nCSQ_PREFLIGHT_LEG_START ${token}\\n' >&2
 ( csq_svelte_keep=("PATH=$PATH" "TMPDIR=\${TMPDIR:-/tmp}")
@@ -245,10 +267,26 @@ exec /usr/bin/env -i "\${csq_svelte_keep[@]}" /bin/bash --noprofile --norc -p -c
 
 export function svelteResult(result, { token }) {
   const out = String(result.out || '');
-  const refused = out.split(/\r?\n/).find(l => l.startsWith(`CSQ_PREFLIGHT_SVELTE_REFUSED ${token} `))?.split(' ')[2];
-  const note = out.split(/\r?\n/).includes(`CSQ_PREFLIGHT_SVELTE_NOTE ${token} PRUNE_INCOMPLETE`)
+  const refusedPrefix = `CSQ_PREFLIGHT_SVELTE_REFUSED ${token} `;
+  const lines = out.split(/\r?\n/);
+  // Only evidence printed before the first phase marker is a refusal: the phase
+  // commands run checkout code, which can echo a token-bearing line into stderr.
+  // Fixed vocabulary only: a length-bounded reason word plus an optional
+  // identifier-like value (an environment NAME or a tool name). Neither half can
+  // carry a path, quote or control character, and the first VALID line wins so a
+  // malformed line ahead of a real one cannot erase the reason.
+  const phaseAt = lines.findIndex(l => l.startsWith('CSQ_PREFLIGHT_SVELTE_PHASE '));
+  const REFUSAL_RE = /^(?:[A-Za-z][A-Za-z0-9-]{0,63})(?: [A-Za-z_][A-Za-z0-9_.-]{0,63})?$/;
+  const refusalPrefixes = [refusedPrefix, `CSQ_PREFLIGHT_LEG_REFUSED ${token} `];
+  let refused = null;
+  for (const line of lines.slice(0, phaseAt < 0 ? lines.length : phaseAt)) {
+    const prefix = refusalPrefixes.find(p => line.startsWith(p));
+    if (prefix && REFUSAL_RE.test(line.slice(prefix.length))) { refused = line.slice(prefix.length); break; }
+  }
+  const note = lines.includes(`CSQ_PREFLIGHT_SVELTE_NOTE ${token} PRUNE_INCOMPLETE`)
     ? '; stale csq-svelte temp prune incomplete (see retained output)' : '';
   let und = result.und || (/^(SHELLOPTS|BASHOPTS)$/.test(refused || '') ? `Svelte leg refused an exported ${refused}` : null) ||
+    (result.leg_rc === 125 && refused ? `Svelte leg refused: ${refused}` : null) ||
     ([124, 125, 126, 127].includes(result.leg_rc) || result.leg_rc >= 128
     ? 'Svelte prerequisites, source guards or bounded execution unavailable' : null);
   let failed = null;

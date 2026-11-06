@@ -471,7 +471,7 @@ fn ping_payload(
 }
 
 /// Shape checks that need no state.
-fn validate_text(text: &str) -> Result<(), NotifyError> {
+pub(crate) fn validate_text(text: &str) -> Result<(), NotifyError> {
     if text.trim().is_empty() {
         return Err(NotifyError::TextEmpty);
     }

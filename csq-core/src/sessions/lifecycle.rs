@@ -318,6 +318,62 @@ pub fn reconcile_owned(base: &Path, home: Option<&Path>) -> io::Result<usize> {
     }
 }
 
+/// The session id Claude Code's own registry records for the live claude process `pid`
+/// (the SAME row source `bind` uses), or `None` when the process, its registry entry or
+/// the id is absent, unreadable or not a canonical uuid. When `expected_handle` is `Some`,
+/// the process's `CLAUDE_CONFIG_DIR` must also canonicalize to it (mirrors `bind`'s
+/// `config_dir == handle` check). Fails toward `None`.
+#[cfg(unix)]
+pub fn registry_session_id(
+    pid: u32,
+    base: &Path,
+    home: &Path,
+    expected_handle: Option<&Path>,
+) -> Option<String> {
+    let (info, _exact) = super::session_info_exact_for_pid_kind(super::CliKind::Claude, pid)
+        .ok()
+        .flatten()?;
+    if let Some(handle) = expected_handle {
+        let same = fs::canonicalize(&info.config_dir)
+            .ok()
+            .zip(fs::canonicalize(handle).ok())
+            .is_some_and(|(a, b)| a == b);
+        if !same {
+            return None;
+        }
+    }
+    let ctx = super::rows::RowContext {
+        base_dir: base.to_owned(),
+        home: home.to_owned(),
+        tmp_root: scratch_tmp(),
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        uid: Some(unsafe { libc::geteuid() }),
+        now_secs: now()?,
+    };
+    super::rows::enrich_kind(super::CliKind::Claude, vec![info], &ctx)
+        .into_iter()
+        .next()?
+        .session_id
+        .filter(|x| valid_uuid(x))
+}
+
+/// Whether Claude Code's registry has an entry file for `pid` at all. `Ok(false)` ONLY when
+/// the file is truly absent; an entry that exists but cannot be read as a bounded regular
+/// file is `Err` — a torn or unreadable entry for a live claude must never read as "not
+/// holding a session".
+#[cfg(unix)]
+pub fn registry_entry_present(pid: u32, home: &Path) -> io::Result<bool> {
+    let path = home
+        .join(".claude")
+        .join("sessions")
+        .join(format!("{pid}.json"));
+    match crate::platform::fs::read_regular_nofollow_bounded(&path, 64 * 1024) {
+        Ok(None) => Ok(false),
+        Ok(Some(_)) => Ok(true),
+        Err(_) => Err(io::Error::other("registry_entry_unreadable")),
+    }
+}
+
 #[cfg(unix)]
 fn bind(l: &Launch, base: &Path, home: &Path) -> io::Result<Option<Binding>> {
     let Ok(Some((info, exact))) =

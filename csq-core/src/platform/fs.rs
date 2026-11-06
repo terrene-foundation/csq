@@ -1188,6 +1188,19 @@ impl WrittenPrivateFile {
             .ok_or_else(|| PlatformError::Io(std::io::Error::other("private writer is closed")))
     }
 
+    /// Sync the original retained file after any permission changes, before publication.
+    pub(crate) fn sync_all(&self) -> Result<(), PlatformError> {
+        self.file
+            .as_ref()
+            .ok_or_else(|| PlatformError::Io(std::io::Error::other("private writer is closed")))?
+            .sync_all()?;
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(observer) = PRIVATE_SYNC_OBSERVER.with(|slot| slot.borrow().clone()) {
+            observer(&self.path);
+        }
+        Ok(())
+    }
+
     /// Atomically replace the target, retaining the writer through Windows rename.
     pub fn replace(mut self, target: &Path) -> Result<(), PlatformError> {
         #[cfg(windows)]

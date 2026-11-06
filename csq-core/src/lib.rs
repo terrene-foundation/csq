@@ -22,6 +22,7 @@ pub mod env;
 pub mod error;
 pub mod gate;
 pub mod http;
+pub mod launch_isolation;
 pub mod messaging;
 pub mod oauth;
 /// Whether THIS csq-core was compiled with `native-harness`. Cargo unifies

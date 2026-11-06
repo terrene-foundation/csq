@@ -701,36 +701,38 @@ fn window(entry: &PoolEntry, now: i64) -> Result<(i64, i64)> {
         Some(Reset::Day { day_of_month }) => u32::from(*day_of_month),
         _ => 1,
     };
-    let (year, month) = if now_date.day() >= day {
-        (now_date.year(), now_date.month())
-    } else if now_date.month() == 1 {
-        (
-            now_date
-                .year()
-                .checked_sub(1)
-                .ok_or(BudgetError::CandidateUnavailable)?,
-            12,
-        )
+    let (start_date, end_date) =
+        reset_bounds(now_date, day).ok_or(BudgetError::CandidateUnavailable)?;
+    Ok((midnight(start_date)?, midnight(end_date)?))
+}
+
+/// The reset date of `day` in `year`-`month`: a month shorter than `day` resets on its
+/// last day (day 31 in April is April 30; day 29 in a non-leap February is the 28th).
+/// `None` only for an out-of-range month or a zero `day`.
+fn reset_date_in_month(year: i32, month: u32, day: u32) -> Option<NaiveDate> {
+    (1..=day.min(31))
+        .rev()
+        .find_map(|candidate| NaiveDate::from_ymd_opt(year, month, candidate))
+}
+
+/// The reset period containing `today`: `(start, end)` where `start` is the latest reset
+/// date on or before `today` and `end` the next one, both clamped per
+/// [`reset_date_in_month`].
+fn reset_bounds(today: NaiveDate, day: u32) -> Option<(NaiveDate, NaiveDate)> {
+    let this_month = reset_date_in_month(today.year(), today.month(), day)?;
+    let start = if today >= this_month {
+        this_month
+    } else if today.month() == 1 {
+        reset_date_in_month(today.year().checked_sub(1)?, 12, day)?
     } else {
-        (now_date.year(), now_date.month() - 1)
+        reset_date_in_month(today.year(), today.month() - 1, day)?
     };
-    let (next_year, next_month) = if month == 12 {
-        (
-            year.checked_add(1)
-                .ok_or(BudgetError::CandidateUnavailable)?,
-            1,
-        )
+    let end = if start.month() == 12 {
+        reset_date_in_month(start.year().checked_add(1)?, 1, day)?
     } else {
-        (year, month + 1)
+        reset_date_in_month(start.year(), start.month() + 1, day)?
     };
-    let start = midnight(
-        NaiveDate::from_ymd_opt(year, month, day).ok_or(BudgetError::CandidateUnavailable)?,
-    )?;
-    let end = midnight(
-        NaiveDate::from_ymd_opt(next_year, next_month, day)
-            .ok_or(BudgetError::CandidateUnavailable)?,
-    )?;
-    Ok((start, end))
+    Some((start, end))
 }
 
 #[cfg(unix)]
@@ -886,6 +888,90 @@ pub(super) fn sync_directory(_: &Path) -> Result<()> {
 /// measured, reviewed change, never an assumption about the platform.
 fn fullfsync_satisfied(value: i64) -> bool {
     value == 1
+}
+
+#[cfg(test)]
+mod reset_day_clamping {
+    use super::{reset_bounds, reset_date_in_month};
+    use chrono::NaiveDate;
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    #[test]
+    fn a_month_shorter_than_the_day_resets_on_its_last_day() {
+        // Non-leap and leap February, a 30-day month and a 31-day month.
+        assert_eq!(reset_date_in_month(2027, 2, 29), Some(d(2027, 2, 28)));
+        assert_eq!(reset_date_in_month(2027, 2, 31), Some(d(2027, 2, 28)));
+        assert_eq!(reset_date_in_month(2028, 2, 29), Some(d(2028, 2, 29)));
+        assert_eq!(reset_date_in_month(2028, 2, 30), Some(d(2028, 2, 29)));
+        assert_eq!(reset_date_in_month(2028, 2, 31), Some(d(2028, 2, 29)));
+        assert_eq!(reset_date_in_month(2027, 4, 31), Some(d(2027, 4, 30)));
+        assert_eq!(reset_date_in_month(2027, 4, 30), Some(d(2027, 4, 30)));
+        assert_eq!(reset_date_in_month(2027, 1, 31), Some(d(2027, 1, 31)));
+        assert_eq!(reset_date_in_month(2027, 3, 29), Some(d(2027, 3, 29)));
+        assert_eq!(reset_date_in_month(2027, 3, 0), None);
+    }
+
+    #[test]
+    fn periods_chain_without_gap_or_overlap_for_every_day_across_a_leap_cycle() {
+        for day in 1..=31u32 {
+            let mut today = d(2027, 1, 1);
+            let mut previous_end: Option<NaiveDate> = None;
+            while today < d(2029, 3, 1) {
+                let (start, end) = reset_bounds(today, day).unwrap();
+                assert!(start <= today && today < end, "day {day} today {today}");
+                if today == start {
+                    if let Some(prev) = previous_end {
+                        assert_eq!(prev, start, "day {day}: adjacent periods must abut");
+                    }
+                }
+                previous_end = Some(end);
+                today = today.succ_opt().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn day_31_and_29_period_edges_match_the_clamped_calendar() {
+        // Day 31: April 30 is the April reset, so May 1 starts after it.
+        assert_eq!(
+            reset_bounds(d(2027, 4, 29), 31),
+            Some((d(2027, 3, 31), d(2027, 4, 30)))
+        );
+        assert_eq!(
+            reset_bounds(d(2027, 4, 30), 31),
+            Some((d(2027, 4, 30), d(2027, 5, 31)))
+        );
+        // Day 29 across a non-leap February: the 28th resets, March 28 is still in March's period.
+        assert_eq!(
+            reset_bounds(d(2027, 2, 28), 29),
+            Some((d(2027, 2, 28), d(2027, 3, 29)))
+        );
+        assert_eq!(
+            reset_bounds(d(2027, 2, 27), 29),
+            Some((d(2027, 1, 29), d(2027, 2, 28)))
+        );
+        // Leap February keeps the 29th.
+        assert_eq!(
+            reset_bounds(d(2028, 2, 28), 29),
+            Some((d(2028, 1, 29), d(2028, 2, 29)))
+        );
+        assert_eq!(
+            reset_bounds(d(2028, 2, 29), 29),
+            Some((d(2028, 2, 29), d(2028, 3, 29)))
+        );
+        // Year boundaries in both directions.
+        assert_eq!(
+            reset_bounds(d(2027, 1, 5), 31),
+            Some((d(2026, 12, 31), d(2027, 1, 31)))
+        );
+        assert_eq!(
+            reset_bounds(d(2027, 12, 31), 31),
+            Some((d(2027, 12, 31), d(2028, 1, 31)))
+        );
+    }
 }
 
 #[cfg(test)]
